@@ -1551,10 +1551,15 @@ fn emby_media_source_json(
     let is_remote = source.source_kind == "STRM_URL";
     json!({
         "Id": source.id,
+        "Name": source.edition_name,
+        "Edition": source.edition_name,
+        "Quality": source.quality_label,
+        "VideoType": source.quality_label,
         "Container": source.container,
         "Size": source.size,
         "Bitrate": source.bitrate,
         "RunTimeTicks": source.duration_ticks,
+        "IsDefault": source.is_default,
         "Protocol": if is_remote { "Http" } else { "File" },
         "Type": "Default",
         "IsRemote": is_remote,
@@ -3104,6 +3109,8 @@ fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) 
         "bitrate": source.bitrate,
         "durationTicks": source.duration_ticks,
         "externalUrl": source.external_url,
+        "editionName": source.edition_name,
+        "qualityLabel": source.quality_label,
         "isDefault": source.is_default,
         "probeStatus": source.probe_status,
         "streams": source.streams.iter().map(|stream| json!({

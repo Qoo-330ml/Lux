@@ -95,7 +95,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定本地媒体源。
 - `GET|HEAD /Items/{itemId}/Download`：需要 `can_download` 和媒体库 ACL，返回附件下载流。
 - `GET|HEAD /api/v1/items/{itemId}/download`：Lux 下载端点，需要 Web session、`can_download` 和媒体库 ACL。
-- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流和 DirectPlay 能力；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。
+- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流和 DirectPlay 能力；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。每个媒体源可带 `Edition`/`Quality` 版本标签。
 
 `.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 和原始 `DirectStreamUrl` 返回；服务端不请求、不验证、不代理该 URL。具有媒体库访问权限的客户端会直接获得该地址，因此 URL 中的令牌也会按产品设计暴露给客户端。
 

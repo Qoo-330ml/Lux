@@ -1940,6 +1940,7 @@ impl Database {
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
@@ -2019,6 +2020,7 @@ impl Database {
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
@@ -2062,6 +2064,7 @@ impl Database {
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                          ORDER BY image_index LIMIT 1) AS fanart_image_tag,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                        ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
@@ -2098,6 +2101,7 @@ impl Database {
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                          ORDER BY image_index LIMIT 1) AS fanart_image_tag,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                        ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
@@ -2138,6 +2142,7 @@ impl Database {
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
@@ -2193,6 +2198,8 @@ impl Database {
                         container: row.get("container"),
                         size: row.get("size"),
                         external_url: row.get("external_url"),
+                        edition_name: row.get("edition_name"),
+                        quality_label: row.get("quality_label"),
                         bitrate: row.get("bitrate"),
                         duration_ticks: row.get("duration_ticks"),
                         is_default: row
@@ -3092,6 +3099,8 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) container: Option<String>,
     pub(crate) size: Option<i64>,
     pub(crate) external_url: Option<String>,
+    pub(crate) edition_name: Option<String>,
+    pub(crate) quality_label: Option<String>,
     pub(crate) bitrate: Option<i64>,
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) is_default: Option<bool>,

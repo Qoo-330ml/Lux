@@ -48,6 +48,21 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+    let high_media_path = root.join("Range.Movie.2024.2160p.mkv");
+    tokio::fs::write(&high_media_path, b"high-quality").await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let high_source_id: String = sqlx::query_scalar(
+        "SELECT ms.id
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE ms.item_id = ? AND fe.relative_path = ?",
+    )
+    .bind(&item_id)
+    .bind("Range.Movie.2024.2160p.mkv")
+    .fetch_one(database.pool())
+    .await?;
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -99,6 +114,12 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert_eq!(playback_info.status(), reqwest::StatusCode::OK);
     let playback_body = playback_info.json::<Value>().await?;
     assert_eq!(playback_body["MediaSources"][0]["Id"], source_id);
+    assert_eq!(
+        playback_body["MediaSources"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(playback_body["MediaSources"][0]["Quality"], Value::Null);
+    assert_eq!(playback_body["MediaSources"][1]["Quality"], "2160p");
     assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(
         playback_body["MediaSources"][0]["SupportsDirectStream"],
@@ -112,6 +133,18 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         playback_body["MediaSources"][0]["DirectStreamUrl"],
         format!("/Videos/{item_id}/{source_id}/stream.mkv")
     );
+    let selected_playback = client
+        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .query(&[
+            ("api_key", token.as_str()),
+            ("mediaSourceId", high_source_id.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(selected_playback.status(), reqwest::StatusCode::OK);
+    let selected_body = selected_playback.json::<Value>().await?;
+    assert_eq!(selected_body["MediaSources"][0]["Id"], high_source_id);
+    assert_eq!(selected_body["MediaSources"][0]["Quality"], "2160p");
     let playback_post = client
         .post(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
         .query(&[("api_key", token.as_str())])
