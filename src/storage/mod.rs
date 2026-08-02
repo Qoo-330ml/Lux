@@ -1809,6 +1809,100 @@ impl Database {
         })
     }
 
+    pub(crate) async fn search_catalog_item_ids(
+        &self,
+        query: &str,
+        like_query: &str,
+        library_ids: Option<&[String]>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<String>, i64), StorageError> {
+        if let Some(library_ids) = library_ids
+            && library_ids.is_empty()
+        {
+            return Ok((Vec::new(), 0));
+        }
+        let library_filter = library_ids.map(|ids| {
+            format!(
+                " AND mi.library_id IN ({})",
+                std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+        let fts_query = format!(
+            "SELECT mi.id FROM media_search
+             JOIN media_items mi ON mi.id = media_search.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE media_search MATCH ? AND mi.removed_at IS NULL{}",
+            library_filter.as_deref().unwrap_or_default()
+        );
+        let like_query_sql = format!(
+            "SELECT mi.id FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE (mi.title LIKE ? OR COALESCE(mi.original_title, '') LIKE ?
+                    OR EXISTS (SELECT 1 FROM item_aliases ia
+                               WHERE ia.item_id = mi.id AND ia.alias LIKE ?))
+               AND mi.removed_at IS NULL{}",
+            library_filter.as_deref().unwrap_or_default()
+        );
+        let union_query = format!("{fts_query} UNION {like_query_sql}");
+        let count_query = format!("SELECT COUNT(*) FROM ({union_query}) matches");
+        let mut count_statement =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_query)).bind(query);
+        if let Some(library_ids) = library_ids {
+            for library_id in library_ids {
+                count_statement = count_statement.bind(library_id);
+            }
+        }
+        count_statement = count_statement
+            .bind(like_query)
+            .bind(like_query)
+            .bind(like_query);
+        if let Some(library_ids) = library_ids {
+            for library_id in library_ids {
+                count_statement = count_statement.bind(library_id);
+            }
+        }
+        let total = count_statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let list_query = format!(
+            "SELECT matches.id FROM ({union_query}) matches
+             JOIN media_items mi ON mi.id = matches.id
+             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+        );
+        let mut list_statement = sqlx::query(sqlx::AssertSqlSafe(list_query)).bind(query);
+        if let Some(library_ids) = library_ids {
+            for library_id in library_ids {
+                list_statement = list_statement.bind(library_id);
+            }
+        }
+        list_statement = list_statement
+            .bind(like_query)
+            .bind(like_query)
+            .bind(like_query);
+        if let Some(library_ids) = library_ids {
+            for library_id in library_ids {
+                list_statement = list_statement.bind(library_id);
+            }
+        }
+        let rows = list_statement
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
+    }
+
     pub(crate) async fn count_catalog_children(
         &self,
         parent_id: &str,

@@ -213,6 +213,62 @@ impl CatalogService {
             limit,
         })
     }
+
+    pub async fn search_items(
+        &self,
+        principal: AccessPrincipal,
+        query: &str,
+        like_query: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        let library_ids = if principal.is_admin {
+            None
+        } else {
+            Some(self.access.accessible_library_ids(principal).await?)
+        };
+        let library_filter = library_ids.as_deref();
+        let (ids, total) = self
+            .database
+            .search_catalog_item_ids(query, like_query, library_filter, offset, limit)
+            .await?;
+        let mut items = Vec::with_capacity(ids.len());
+        for item_id in ids {
+            if let Some(item) = self.find_item(principal, &item_id).await? {
+                items.push(item);
+            }
+        }
+        Ok(CatalogPage {
+            items,
+            total,
+            offset,
+            limit,
+        })
+    }
+}
+
+pub fn normalize_search_query(value: &str) -> Option<String> {
+    let tokens = value
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(tokens.join(" OR "))
+}
+
+pub fn normalize_search_like_query(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    Some(format!("%{escaped}%"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

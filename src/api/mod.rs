@@ -31,7 +31,10 @@ use crate::{
             MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
         },
-        catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
+        catalog::{
+            CatalogError, CatalogItem, CatalogPage, CatalogService, normalize_search_like_query,
+            normalize_search_query,
+        },
         images::{ImageError, ImageService, ImageWriteService, normalize_image_type},
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         scanner::{ScanJobError, ScanJobService},
@@ -150,6 +153,7 @@ pub fn app_with_state(state: AppState) -> Router {
             get(admin_settings).patch(admin_update_settings),
         )
         .route("/api/v1/libraries", get(lux_list_libraries))
+        .route("/api/v1/search", get(lux_search))
         .route(
             "/api/v1/libraries/{library_id}/items",
             get(lux_list_library_items),
@@ -213,6 +217,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Shows/{series_id}/Seasons", get(emby_show_seasons))
         .route("/Shows/{series_id}/Episodes", get(emby_show_episodes))
         .route("/Items", get(emby_items))
+        .route("/Search/Hints", get(emby_search_hints))
         .route("/Items/{item_id}", get(emby_item))
         .route(
             "/Items/{item_id}/Images/{image_type}",
@@ -1855,6 +1860,137 @@ async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserR
         )
         .into_response()),
     }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LuxSearchQuery {
+    #[serde(alias = "query")]
+    q: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+async fn lux_search(
+    headers: HeaderMap,
+    Query(query): Query<LuxSearchQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(raw_query) = query.q.as_deref() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(search_query) = normalize_search_query(raw_query) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(like_query) = normalize_search_like_query(raw_query) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog
+        .search_items(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &search_query,
+            &like_query,
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct EmbySearchQuery {
+    #[serde(rename = "api_key")]
+    api_key: Option<String>,
+    #[serde(rename = "SearchTerm", alias = "searchTerm")]
+    search_term: Option<String>,
+    #[serde(rename = "StartIndex", alias = "startIndex")]
+    start_index: Option<i64>,
+    #[serde(rename = "Limit", alias = "limit")]
+    limit: Option<i64>,
+}
+
+async fn emby_search_hints(
+    headers: HeaderMap,
+    Query(query): Query<EmbySearchQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Some(raw_query) = query.search_term.as_deref() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(search_query) = normalize_search_query(raw_query) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(like_query) = normalize_search_like_query(raw_query) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let page_query = EmbyItemsQuery {
+        start_index: query.start_index,
+        limit: query.limit,
+        ..EmbyItemsQuery::default()
+    };
+    let (offset, limit) = match emby_page_params(&page_query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let page = match catalog
+        .search_items(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &search_query,
+            &like_query,
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    };
+    let hints = page
+        .items
+        .iter()
+        .map(|item| {
+            json!({
+                "Id": item.id,
+                "Name": item.title,
+                "Type": emby_item_type(&item.item_type),
+                "MediaType": "Video",
+                "ProductionYear": item.production_year,
+                "RunTimeTicks": item.runtime_ticks,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "SearchHints": hints,
+        "TotalRecordCount": page.total,
+    }))
+    .into_response()
 }
 
 async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -> Response {
