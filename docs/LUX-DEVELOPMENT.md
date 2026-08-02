@@ -1273,7 +1273,8 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - PATCH /api/v1/admin/users/{id}/policy
 - GET /api/v1/admin/metadata/pending
 - GET /api/v1/admin/items/{id}/identify/candidates
-- POST /api/v1/admin/items/{id}/identify
+- POST /api/v1/admin/items/{id}/identify/candidates
+- POST /api/v1/admin/items/{id}/identify/candidates/{candidateId}/select
 - PATCH /api/v1/admin/items/{id}/metadata
 - POST /api/v1/admin/items/{id}/metadata/refresh
 - GET/PATCH /api/v1/admin/settings

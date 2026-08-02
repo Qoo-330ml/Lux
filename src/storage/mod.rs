@@ -2060,6 +2060,31 @@ impl Database {
             })
     }
 
+    pub(crate) async fn insert_metadata_candidate(
+        &self,
+        candidate: NewMetadataCandidate<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                id, item_id, provider, provider_id, candidate_json, score, status, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        )
+        .bind(candidate.id)
+        .bind(candidate.item_id)
+        .bind(candidate.provider)
+        .bind(candidate.provider_id)
+        .bind(candidate.candidate_json)
+        .bind(candidate.score)
+        .bind(candidate.expires_at)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_pending_metadata_candidates(
         &self,
         offset: i64,
@@ -3741,6 +3766,16 @@ pub(crate) struct StoredMetadataCandidate {
     pub(crate) status: String,
     pub(crate) expires_at: Option<i64>,
     pub(crate) item_title: String,
+}
+
+pub(crate) struct NewMetadataCandidate<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) item_id: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) provider_id: &'a str,
+    pub(crate) candidate_json: &'a str,
+    pub(crate) score: f64,
+    pub(crate) expires_at: Option<i64>,
 }
 
 fn stored_metadata_candidate(row: sqlx::sqlite::SqliteRow) -> StoredMetadataCandidate {

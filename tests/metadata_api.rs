@@ -1,8 +1,14 @@
 use std::time::Duration;
 
+use axum::{Json, Router, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    application::{
+        libraries::LibraryService,
+        scanner::LibraryScanner,
+        setup::SetupService,
+        tmdb::{TmdbClient, TmdbClientConfig},
+    },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
     library::LibraryKind,
@@ -17,17 +23,58 @@ async fn start_server(
     config: Config,
     database: Database,
     setup: SetupService,
+    tmdb: Option<TmdbClient>,
 ) -> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
 {
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let state = AppState::ready(config, database, setup, auth, emby_auth);
+    let state = tmdb.map_or(state.clone(), |tmdb| state.with_tmdb_client(tmdb));
+    let app = app_with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     Ok((
         format!("http://{address}"),
         tokio::spawn(async move { axum::serve(listener, app).await }),
     ))
+}
+
+async fn tmdb_search_stub() -> Json<Value> {
+    Json(json!({
+        "page": 1,
+        "total_pages": 1,
+        "total_results": 1,
+        "results": [{
+            "id": 999,
+            "title": "Example Movie",
+            "original_title": "Example Movie",
+            "overview": "A local stub result.",
+            "release_date": "2020-04-01",
+            "original_language": "en"
+        }]
+    }))
+}
+
+async fn start_tmdb_stub()
+-> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
+{
+    let app = Router::new().fallback(any(tmdb_search_stub));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    Ok((
+        format!("http://{address}"),
+        tokio::spawn(async move { axum::serve(listener, app).await }),
+    ))
+}
+
+fn cookie_from_request(cookie: &str, name: &str) -> String {
+    cookie
+        .split("; ")
+        .find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            (key == name).then(|| value.to_owned())
+        })
+        .expect("expected request cookie")
 }
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
@@ -121,7 +168,15 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     .execute(database.pool())
     .await?;
 
-    let (base_url, server) = start_server(config, database, setup).await?;
+    let (tmdb_url, tmdb_server) = start_tmdb_stub().await?;
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: tmdb_url,
+        read_access_token: Some("stub-token".to_owned()),
+        requests_per_second: 0,
+        max_retries: 0,
+        ..TmdbClientConfig::default()
+    })?;
+    let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
@@ -162,6 +217,28 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     );
     assert_eq!(searched_body["items"][0]["score"], 82.5);
 
+    let reidentified = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{item_id}/identify/candidates"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header(
+            "x-csrf-token",
+            cookie_from_request(&admin_cookie, "lux_csrf"),
+        )
+        .json(&json!({ "query": "Example Movie", "year": 2020 }))
+        .send()
+        .await?;
+    assert_eq!(reidentified.status(), reqwest::StatusCode::OK);
+    let reidentified_body: Value = reidentified.json().await?;
+    assert!(reidentified_body["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["providerId"] == "999"
+                && item["candidate"]["productionYear"] == 2020
+                && item["score"] == 80.0
+        })
+    }));
+
     let forbidden = client
         .get(format!("{base_url}/api/v1/admin/metadata/pending"))
         .header(COOKIE, &viewer_cookie)
@@ -189,5 +266,6 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     assert_eq!(missing_item.status(), reqwest::StatusCode::NOT_FOUND);
 
     server.abort();
+    tmdb_server.abort();
     Ok(())
 }

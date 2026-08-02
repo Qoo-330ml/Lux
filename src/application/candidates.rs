@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -8,9 +11,10 @@ use crate::{
         images::{ImageWriteError, ImageWriteService},
         metadata::{MetadataCandidate, MetadataSource, MetadataState, NfoMetadata},
         nfo::{NfoWriteError, NfoWriteService},
+        tmdb::{TmdbClient, TmdbError},
     },
     storage::{
-        Database, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
+        Database, NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
         StoredMetadataCandidate,
     },
 };
@@ -83,6 +87,82 @@ impl MetadataCandidateService {
             limit,
         })
     }
+
+    pub async fn search_and_store(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        tmdb: &TmdbClient,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        let current = self
+            .database
+            .find_media_item_metadata(item_id)
+            .await?
+            .ok_or(MetadataCandidateError::ItemNotFound)?;
+        let query = query.trim();
+        if query.is_empty() || query.chars().count() > 128 {
+            return Err(MetadataCandidateError::InvalidSearch);
+        }
+        if year.is_some_and(|value| !(1800..=2200).contains(&value)) {
+            return Err(MetadataCandidateError::InvalidSearch);
+        }
+
+        let response = tmdb
+            .search_movies_with_english_fallback(query, year)
+            .await
+            .map_err(MetadataCandidateError::Tmdb)?;
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+            .and_then(|now| now.checked_add(24 * 60 * 60));
+        for result in response.results.into_iter().take(20) {
+            let title = result
+                .title
+                .clone()
+                .or_else(|| result.original_title.clone())
+                .unwrap_or_else(|| query.to_owned());
+            let score = if same_title(&current.title, &title)
+                || result
+                    .original_title
+                    .as_deref()
+                    .is_some_and(|value| same_title(&current.title, value))
+            {
+                80.0
+            } else {
+                0.0
+            };
+            let production_year = result
+                .release_date
+                .as_deref()
+                .and_then(|value| value.get(..4))
+                .and_then(|value| value.parse::<i32>().ok());
+            let candidate_json = json!({
+                "title": title,
+                "originalTitle": result.original_title,
+                "overview": result.overview,
+                "releaseDate": result.release_date,
+                "productionYear": production_year,
+                "originalLanguage": result.original_language,
+            })
+            .to_string();
+            let id = uuid::Uuid::now_v7().to_string();
+            let provider_id = result.id.to_string();
+            self.database
+                .insert_metadata_candidate(NewMetadataCandidate {
+                    id: &id,
+                    item_id,
+                    provider: "TMDB",
+                    provider_id: &provider_id,
+                    candidate_json: &candidate_json,
+                    score,
+                    expires_at,
+                })
+                .await?;
+        }
+        self.list_for_item(item_id, None, 0, 50).await
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +200,7 @@ pub enum MetadataCandidateError {
     ItemNotFound,
     InvalidSearch,
     InvalidCandidateJson(String),
+    Tmdb(TmdbError),
     Storage(StorageError),
 }
 
@@ -131,6 +212,7 @@ impl fmt::Display for MetadataCandidateError {
             Self::InvalidCandidateJson(error) => {
                 write!(formatter, "candidate JSON is invalid: {error}")
             }
+            Self::Tmdb(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -142,6 +224,10 @@ impl From<StorageError> for MetadataCandidateError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
+}
+
+fn same_title(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

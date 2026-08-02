@@ -12,6 +12,7 @@
 - [x] 将候选 JSON 的 common metadata、provider ID 和 poster/fanart URL 转换为写回任务。
 - [x] 所有 NFO/图片成功后，在短事务中更新 metadata、provider ID、`ONLINE_CONFIRMED`，选中候选并拒绝同条目其他 pending 候选。
 - [x] 写回失败返回可重试错误，候选仍为 `PENDING`，不谎报确认成功。
+- [x] 管理员可通过 `POST /api/v1/admin/items/{itemId}/identify/candidates` 使用标题和可选年份搜索 TMDb；搜索结果最多 20 条，写入 24 小时 pending 候选，并通过现有候选预览/选择流程继续处理。
 
 ## 验证
 
@@ -21,5 +22,5 @@
 
 ## 明确不做
 
-- 本阶段不从 HTTP handler 直接调用 TMDb 搜索；候选由已有识别任务写入，候选中的图片 URL 由后续任务提供。
+- HTTP handler 只负责鉴权、CSRF、参数校验和 DTO 映射；TMDb 调用由 `MetadataCandidateService` 通过 `TmdbClient` 边界完成，搜索失败不会写入条目元数据。
 - 本阶段不实现批量选择、任务队列化或剧集识别；后续阶段扩展。

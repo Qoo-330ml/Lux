@@ -43,7 +43,7 @@ use crate::{
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         scanner::{ScanJobError, ScanJobService},
         settings::{read_tmdb_token, write_tmdb_token},
-        tmdb::TmdbClient,
+        tmdb::{TmdbClient, TmdbError},
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
@@ -74,6 +74,7 @@ pub struct AppState {
     metadata_candidates: Option<MetadataCandidateService>,
     metadata_selection: Option<MetadataSelectionService>,
     scan_jobs: Option<ScanJobService>,
+    tmdb: Option<TmdbClient>,
     collections: Option<CollectionService>,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
@@ -93,8 +94,9 @@ impl AppState {
         let metadata_selection = image_writes
             .clone()
             .map(|images| MetadataSelectionService::new(database.clone(), images));
-        let collections = TmdbClient::from_env_or_token(read_tmdb_token(&config.config_dir))
-            .ok()
+        let tmdb = TmdbClient::from_env_or_token(read_tmdb_token(&config.config_dir)).ok();
+        let collections = tmdb
+            .clone()
             .map(|tmdb| CollectionService::new(database.clone(), tmdb));
         Self {
             database: Some(database.clone()),
@@ -111,6 +113,7 @@ impl AppState {
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
             scan_jobs: Some(ScanJobService::new(database.clone())),
+            tmdb,
             collections,
             remote_access: RemoteAccessPolicy::from_env(),
             login_rate_limiter: LoginRateLimiter::default(),
@@ -121,6 +124,7 @@ impl AppState {
         let Some(database) = self.database.clone() else {
             return self;
         };
+        self.tmdb = Some(tmdb.clone());
         self.collections = Some(CollectionService::new(database, tmdb));
         self
     }
@@ -180,7 +184,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/api/v1/admin/items/{item_id}/identify/candidates",
-            get(admin_list_item_candidates),
+            get(admin_list_item_candidates).post(admin_search_item_candidates),
         )
         .route(
             "/api/v1/admin/items/{item_id}/identify/candidates/{candidate_id}/select",
@@ -3871,6 +3875,13 @@ struct MetadataCandidateQuery {
     search: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetadataCandidateSearchRequest {
+    query: String,
+    year: Option<i32>,
+}
+
 async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -4902,6 +4913,62 @@ async fn admin_list_item_candidates(
     }
 }
 
+async fn admin_search_item_candidates(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MetadataCandidateSearchRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(tmdb) = state.tmdb.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "TMDb 尚未配置",
+        )
+        .into_response();
+    };
+    let Some(candidates) = state.metadata_candidates.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据候选服务尚未就绪",
+        )
+        .into_response();
+    };
+    match candidates
+        .search_and_store(&item_id, &request.query, request.year, tmdb)
+        .await
+    {
+        Ok(page) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "METADATA_SEARCHED",
+                Some("item"),
+                Some(&item_id),
+                "{}",
+            )
+            .await;
+            Json(metadata_candidate_page_json(&page)).into_response()
+        }
+        Err(error) => metadata_candidate_error(&headers, error),
+    }
+}
+
 async fn admin_list_item_images(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -5174,6 +5241,20 @@ fn metadata_candidate_error(headers: &HeaderMap, error: MetadataCandidateError) 
             StatusCode::INTERNAL_SERVER_ERROR,
             lux::ApiErrorCode::Internal,
             "候选数据损坏",
+        )
+        .into_response(),
+        MetadataCandidateError::Tmdb(TmdbError::InvalidRequest(_)) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "TMDb 搜索条件无效",
+        )
+        .into_response(),
+        MetadataCandidateError::Tmdb(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "TMDb 暂时不可用，请稍后重试",
         )
         .into_response(),
         MetadataCandidateError::Storage(_) => api_error(
