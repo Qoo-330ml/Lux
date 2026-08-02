@@ -11,6 +11,7 @@ argon2 = "0.5.3"
 axum = "0.8"
 base64 = "0.22"
 quick-xml = "0.38"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -18,7 +19,7 @@ notify = "8"
 sha2 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "sqlite", "migrate"] }
 subtle = "2"
-tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["request-id", "trace", "util"] }
@@ -27,7 +28,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
 
 [lib]
