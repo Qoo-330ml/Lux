@@ -1555,6 +1555,227 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_tmdb_movie_identity(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredTmdbMovieIdentity>, StorageError> {
+        sqlx::query(
+            "SELECT library_id,
+                    json_extract(provider_ids_json, '$.tmdb') AS provider_id
+             FROM media_items
+             WHERE id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+               AND json_valid(provider_ids_json)
+               AND json_extract(provider_ids_json, '$.tmdb') IS NOT NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredTmdbMovieIdentity {
+                library_id: row.get("library_id"),
+                provider_id: row.get("provider_id"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn upsert_tmdb_collection(
+        &self,
+        collection: NewTmdbCollection<'_>,
+    ) -> Result<StoredCollectionRefresh, StorageError> {
+        let NewTmdbCollection {
+            library_id,
+            provider_id,
+            title,
+            overview,
+            poster_path,
+            backdrop_path,
+            member_provider_ids,
+        } = collection;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let existing = sqlx::query(
+            "SELECT id, item_id
+             FROM collections
+             WHERE library_id = ? AND provider = 'TMDB' AND provider_id = ?",
+        )
+        .bind(library_id)
+        .bind(provider_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let (collection_id, item_id) = if let Some(row) = existing {
+            (row.get::<String, _>("id"), row.get::<String, _>("item_id"))
+        } else {
+            let collection_id = Uuid::now_v7().to_string();
+            let item_id = Uuid::now_v7().to_string();
+            let identity_key = format!("collection:tmdb:{library_id}:{provider_id}");
+            let provider_ids_json = format!(r#"{{"tmdbCollection":"{provider_id}"}}"#);
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, original_title,
+                    overview, provider_ids_json, identification_status, identity_key
+                ) VALUES (?, ?, 'BOX_SET', ?, ?, ?, ?, ?, 'ONLINE_CONFIRMED', ?)",
+            )
+            .bind(&item_id)
+            .bind(library_id)
+            .bind(title)
+            .bind(title.to_ascii_lowercase())
+            .bind(title)
+            .bind(overview)
+            .bind(provider_ids_json)
+            .bind(identity_key)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            sqlx::query(
+                "INSERT INTO collections (
+                    id, item_id, library_id, provider, provider_id,
+                    title, overview, poster_path, backdrop_path
+                ) VALUES (?, ?, ?, 'TMDB', ?, ?, ?, ?, ?)",
+            )
+            .bind(&collection_id)
+            .bind(&item_id)
+            .bind(library_id)
+            .bind(provider_id)
+            .bind(title)
+            .bind(overview)
+            .bind(poster_path)
+            .bind(backdrop_path)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            (collection_id, item_id)
+        };
+        sqlx::query(
+            "UPDATE collections
+             SET title = ?, overview = ?, poster_path = ?, backdrop_path = ?,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(title)
+        .bind(overview)
+        .bind(poster_path)
+        .bind(backdrop_path)
+        .bind(&collection_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        sqlx::query(
+            "UPDATE media_items
+             SET title = ?, sort_title = ?, original_title = ?, overview = ?
+             WHERE id = ?",
+        )
+        .bind(title)
+        .bind(title.to_ascii_lowercase())
+        .bind(title)
+        .bind(overview)
+        .bind(&item_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        sqlx::query("DELETE FROM collection_items WHERE collection_id = ?")
+            .bind(&collection_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut member_count = 0_usize;
+        for (member_provider_id, sort_order) in member_provider_ids {
+            let member_provider_id = member_provider_id.to_string();
+            let Some(member_item_id) = sqlx::query_scalar::<_, String>(
+                "SELECT id
+                 FROM media_items
+                 WHERE library_id = ? AND item_type = 'MOVIE'
+                   AND removed_at IS NULL AND json_valid(provider_ids_json)
+                   AND json_extract(provider_ids_json, '$.tmdb') = ?
+                 LIMIT 1",
+            )
+            .bind(library_id)
+            .bind(&member_provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            else {
+                continue;
+            };
+            sqlx::query(
+                "INSERT INTO collection_items (collection_id, item_id, sort_order)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&collection_id)
+            .bind(member_item_id)
+            .bind(*sort_order)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            member_count += 1;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(StoredCollectionRefresh {
+            collection_item_id: item_id,
+            member_count,
+        })
+    }
+
+    pub(crate) async fn list_collection_member_ids(
+        &self,
+        collection_item_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT ci.item_id
+             FROM collection_items ci
+             JOIN collections c ON c.id = ci.collection_id
+             WHERE c.item_id = ?
+             ORDER BY ci.sort_order, ci.item_id",
+        )
+        .bind(collection_item_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn count_pending_metadata_candidates(&self) -> Result<i64, StorageError> {
         sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE status = 'PENDING'")
             .fetch_one(&self.pool)
@@ -3034,6 +3255,28 @@ fn stored_filesystem_entry(row: sqlx::sqlite::SqliteRow) -> StoredFilesystemEntr
 #[derive(Debug)]
 pub(crate) struct StoredMediaItem {
     pub(crate) id: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredTmdbMovieIdentity {
+    pub(crate) library_id: String,
+    pub(crate) provider_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredCollectionRefresh {
+    pub(crate) collection_item_id: String,
+    pub(crate) member_count: usize,
+}
+
+pub(crate) struct NewTmdbCollection<'a> {
+    pub(crate) library_id: &'a str,
+    pub(crate) provider_id: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) overview: Option<&'a str>,
+    pub(crate) poster_path: Option<&'a str>,
+    pub(crate) backdrop_path: Option<&'a str>,
+    pub(crate) member_provider_ids: &'a [(i64, i64)],
 }
 
 #[derive(Debug)]
