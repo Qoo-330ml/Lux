@@ -24,16 +24,16 @@
 
 ### Slice 1：模型、migration、路径检查和 storage
 
-- [ ] 新增 `LibraryRootId`、`LibraryKind`、library/root record。
-- [ ] 新增 `0005_libraries.sql`，建立约束、唯一键和外键。
-- [ ] 实现目录可用性、可读性、写权限和同库/跨库重叠判定。
-- [ ] 用临时目录和 SQLite 集成测试验证持久化与重启可读。
+- [x] 新增 `LibraryRootId`、`LibraryKind`、library/root record。
+- [x] 新增 `0005_libraries.sql`，建立约束、唯一键和外键。
+- [x] 实现目录可用性、可读性、写权限和同库/跨库重叠判定。
+- [x] 用临时目录和 SQLite 集成测试验证持久化与重启可读。
 
 ### Slice 2：管理员 API
 
-- [ ] 实现管理员 Web session + CSRF 授权边界。
-- [ ] 实现创建/列出媒体库和添加根路径。
-- [ ] 覆盖未登录、非管理员、CSRF 失败、无效路径、重复/重叠路径和只读警告。
+- [x] 实现管理员 Web session + CSRF 授权边界。
+- [x] 实现创建/列出媒体库和添加根路径。
+- [x] 覆盖未登录、非管理员、CSRF 失败、无效路径、重复/重叠路径和只读警告。
 
 ## 验证门
 
@@ -41,6 +41,8 @@
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - 本机 `arm64` 上用临时目录创建两个库、添加多个根路径、重启数据库并核对状态。
+
+以上验证已于 2026-08-02 在 `arm64` 本机通过。
 
 ## 明确不做
 

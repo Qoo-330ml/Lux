@@ -29,6 +29,16 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 当前阶段的 cookie 始终标记 `Secure`，部署时应使用 HTTPS；本机 HTTP 集成测试只验证协议和服务端行为，不代表浏览器会在不安全来源发送 Secure cookie。
 
+## 媒体库管理（LUX-030）
+
+以下接口要求有效 Web session；写操作还要求 `X-CSRF-Token`，并检查当前用户的 `canManageServer` 权限：
+
+- `GET /api/v1/admin/libraries`：列出媒体库及其根路径。
+- `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`。
+- `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`。
+
+根路径会先 canonicalize，再检查目录存在且可读；`isWritable` 独立返回。只读目录可以保存，但返回 `LIBRARY_PATH_NOT_WRITABLE` 警告。同一库的重复/重叠路径分别返回冲突/不可处理实体错误，跨库重叠返回结构化警告。
+
 ## Emby 认证（LUX-024）
 
 - `GET /Users/Public`：返回未禁用用户的公开登录信息。
