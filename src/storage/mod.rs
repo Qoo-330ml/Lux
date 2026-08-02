@@ -397,7 +397,7 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         sqlx::query(
-            "SELECT id
+            "SELECT id, size, modified_at
              FROM filesystem_entries
              WHERE library_root_id = ? AND relative_path = ?",
         )
@@ -406,6 +406,54 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_filesystem_entry))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_filesystem_entry(
+        &self,
+        id: &str,
+        size: i64,
+        modified_at: i64,
+        last_seen_generation: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET size = ?, modified_at = ?, last_seen_generation = ?,
+                 is_missing = 0, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(size)
+        .bind(modified_at)
+        .bind(last_seen_generation)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn reset_media_probe_for_filesystem_entry(
+        &self,
+        filesystem_entry_id: &str,
+        size: i64,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE media_sources
+             SET size = ?, probe_status = 'PENDING', probe_error = NULL,
+                 updated_at = unixepoch()
+             WHERE filesystem_entry_id = ?",
+        )
+        .bind(size)
+        .bind(filesystem_entry_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -533,7 +581,8 @@ impl Database {
         library_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
         sqlx::query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
@@ -547,12 +596,104 @@ impl Database {
         .map(|rows| {
             rows.into_iter()
                 .map(|row| StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
                     item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                 })
                 .collect()
         })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn save_media_probe(
+        &self,
+        update: MediaProbeUpdate<'_>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "UPDATE media_sources
+             SET container = ?, duration_ticks = ?, bitrate = ?,
+                 probe_status = 'READY', probe_error = NULL,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(update.container)
+        .bind(update.duration_ticks)
+        .bind(update.bitrate)
+        .bind(update.source_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        sqlx::query("DELETE FROM media_streams WHERE media_source_id = ?")
+            .bind(update.source_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for stream in update.streams {
+            sqlx::query(
+                "INSERT INTO media_streams (
+                    id, media_source_id, stream_index, stream_type,
+                    codec, language, title
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(update.source_id)
+            .bind(stream.stream_index)
+            .bind(stream.stream_type)
+            .bind(stream.codec)
+            .bind(stream.language)
+            .bind(stream.title)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn mark_media_probe_failed(
+        &self,
+        source_id: &str,
+        status: &str,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE media_sources
+             SET probe_status = ?, probe_error = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(source_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -834,11 +975,18 @@ fn stored_library_root(row: sqlx::sqlite::SqliteRow) -> StoredLibraryRoot {
 }
 
 #[derive(Debug)]
-pub(crate) struct StoredFilesystemEntry {}
+pub(crate) struct StoredFilesystemEntry {
+    pub(crate) id: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+}
 
 fn stored_filesystem_entry(row: sqlx::sqlite::SqliteRow) -> StoredFilesystemEntry {
-    let _id: String = row.get("id");
-    StoredFilesystemEntry {}
+    StoredFilesystemEntry {
+        id: row.get("id"),
+        size: row.get("size"),
+        modified_at: row.get("modified_at"),
+    }
 }
 
 #[derive(Debug)]
@@ -852,7 +1000,9 @@ fn stored_media_item(row: sqlx::sqlite::SqliteRow) -> StoredMediaItem {
 
 #[derive(Debug)]
 pub(crate) struct StoredMediaSourcePath {
+    pub(crate) source_id: String,
     pub(crate) item_id: String,
+    pub(crate) probe_status: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
 }
@@ -927,6 +1077,22 @@ pub(crate) struct NewMediaSource<'a> {
     pub(crate) container: &'a str,
     pub(crate) size: i64,
     pub(crate) is_default: bool,
+}
+
+pub(crate) struct MediaProbeUpdate<'a> {
+    pub(crate) source_id: &'a str,
+    pub(crate) container: Option<&'a str>,
+    pub(crate) duration_ticks: Option<i64>,
+    pub(crate) bitrate: Option<i64>,
+    pub(crate) streams: &'a [MediaStreamUpdate<'a>],
+}
+
+pub(crate) struct MediaStreamUpdate<'a> {
+    pub(crate) stream_index: i64,
+    pub(crate) stream_type: &'a str,
+    pub(crate) codec: Option<&'a str>,
+    pub(crate) language: Option<&'a str>,
+    pub(crate) title: Option<&'a str>,
 }
 
 async fn ensure_server_id(pool: &SqlitePool) -> Result<String, sqlx::Error> {

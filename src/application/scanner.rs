@@ -59,17 +59,6 @@ impl LibraryScanner {
                     .to_str()
                     .ok_or(ScannerError::NonUtf8Path)?
                     .to_owned();
-                report.discovered_files += 1;
-                if self
-                    .database
-                    .find_filesystem_entry(&root.id, &relative_path)
-                    .await?
-                    .is_some()
-                {
-                    report.skipped_files += 1;
-                    continue;
-                }
-
                 let metadata = fs::metadata(&path)
                     .await
                     .map_err(|source| ScannerError::Io {
@@ -84,6 +73,25 @@ impl LibraryScanner {
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
                     .unwrap_or(0);
+                report.discovered_files += 1;
+                if let Some(existing_entry) = self
+                    .database
+                    .find_filesystem_entry(&root.id, &relative_path)
+                    .await?
+                {
+                    if existing_entry.size == size && existing_entry.modified_at == modified_at {
+                        report.skipped_files += 1;
+                        continue;
+                    }
+                    self.database
+                        .update_filesystem_entry(&existing_entry.id, size, modified_at, &generation)
+                        .await?;
+                    self.database
+                        .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
+                        .await?;
+                    report.changed_files += 1;
+                    continue;
+                }
                 let entry_id = FilesystemEntryId::new();
                 let entry_id_text = entry_id.to_string();
                 self.database
@@ -160,6 +168,7 @@ pub struct ScanReport {
     pub discovered_files: usize,
     pub created_items: usize,
     pub created_sources: usize,
+    pub changed_files: usize,
     pub skipped_files: usize,
 }
 
