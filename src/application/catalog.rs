@@ -134,6 +134,44 @@ impl CatalogService {
         })
     }
 
+    pub async fn list_collection_items(
+        &self,
+        principal: AccessPrincipal,
+        collection_item_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        if !self
+            .access
+            .can_view_item(principal, collection_item_id)
+            .await?
+        {
+            return Err(CatalogError::AccessDenied);
+        }
+        let member_ids = self
+            .database
+            .list_collection_member_ids(collection_item_id)
+            .await?;
+        let mut items = Vec::new();
+        for member_id in member_ids {
+            if let Some(item) = self.find_item(principal, &member_id).await? {
+                items.push(item);
+            }
+        }
+        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        let items = items
+            .into_iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(usize::try_from(limit).unwrap_or(0))
+            .collect();
+        Ok(CatalogPage {
+            items,
+            total,
+            offset,
+            limit,
+        })
+    }
+
     pub async fn list_next_up(
         &self,
         principal: AccessPrincipal,

@@ -80,6 +80,37 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
     if state.invalid_schema {
         return axum::Json(json!({ "page": 1 })).into_response();
     }
+    if request.uri().path().contains("/3/collection/10") {
+        return axum::Json(json!({
+            "id": 10,
+            "name": "Stub Collection",
+            "overview": "Collection overview",
+            "poster_path": "/poster.jpg",
+            "backdrop_path": "/backdrop.jpg",
+            "parts": [{
+                "id": 7,
+                "title": "Stub title",
+                "release_date": "2020-01-01",
+                "poster_path": "/part.jpg"
+            }]
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/movie/7") {
+        return axum::Json(json!({
+            "id": 7,
+            "title": "Stub title",
+            "original_title": "Original title",
+            "overview": "Stub overview",
+            "release_date": "2020-01-01",
+            "original_language": "en",
+            "belongs_to_collection": {
+                "id": 10,
+                "name": "Stub Collection"
+            }
+        }))
+        .into_response();
+    }
     let language = request
         .uri()
         .query()
@@ -107,7 +138,11 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
             "overview": overview,
             "release_date": "2020-01-01",
             "original_language": "en"
-        }]
+        }],
+        "belongs_to_collection": {
+            "id": 10,
+            "name": "Stub Collection"
+        }
     }))
     .into_response()
 }
@@ -232,6 +267,24 @@ async fn tmdb_client_falls_back_from_zh_cn_per_missing_field()
         Some("English overview")
     );
     assert_eq!(state.attempts.load(Ordering::Relaxed), 2);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn tmdb_client_reads_collection_details() -> Result<(), Box<dyn std::error::Error>> {
+    let (base_url, _, server) =
+        start_stub(vec![StatusCode::OK, StatusCode::OK], None, false, false).await;
+    let client = TmdbClient::new(client_config(base_url, Duration::from_secs(1), 0))?;
+
+    let movie = client.movie_details(7, "zh-CN").await?;
+    assert_eq!(
+        movie.belongs_to_collection.as_ref().map(|item| item.id),
+        Some(10)
+    );
+    let collection = client.collection_details(10, "zh-CN").await?;
+    assert_eq!(collection.id, 10);
+    assert_eq!(collection.parts[0].id, 7);
     server.abort();
     Ok(())
 }

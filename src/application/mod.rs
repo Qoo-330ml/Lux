@@ -1,6 +1,7 @@
 pub mod access;
 pub mod candidates;
 pub mod catalog;
+pub mod collections;
 pub mod identification;
 pub mod images;
 pub mod libraries;

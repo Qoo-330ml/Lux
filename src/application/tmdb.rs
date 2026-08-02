@@ -187,6 +187,27 @@ impl TmdbClient {
         Ok(details)
     }
 
+    pub async fn collection_details(
+        &self,
+        collection_id: i64,
+        language: &str,
+    ) -> Result<TmdbCollectionDetails, TmdbError> {
+        if collection_id <= 0 || language.trim().is_empty() {
+            return Err(TmdbError::InvalidRequest(
+                "collection ID and language are required".to_owned(),
+            ));
+        }
+        let endpoint = format!("3/collection/{collection_id}");
+        let params = [("language", language.trim().to_owned())];
+        let details: TmdbCollectionDetails = self.request_json(&endpoint, &params).await?;
+        if details.id <= 0 || details.parts.iter().any(|part| part.id <= 0) {
+            return Err(TmdbError::InvalidResponse(
+                "TMDb collection details ID is invalid".to_owned(),
+            ));
+        }
+        Ok(details)
+    }
+
     async fn request_json<T>(
         &self,
         endpoint: &str,
@@ -331,6 +352,31 @@ pub struct TmdbMovieSummary {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbCollectionReference {
+    pub id: i64,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbCollectionPart {
+    pub id: i64,
+    pub title: Option<String>,
+    pub release_date: Option<String>,
+    pub poster_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbCollectionDetails {
+    pub id: i64,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    #[serde(default)]
+    pub parts: Vec<TmdbCollectionPart>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct TmdbMovieDetails {
     pub id: i64,
     pub title: Option<String>,
@@ -338,6 +384,7 @@ pub struct TmdbMovieDetails {
     pub overview: Option<String>,
     pub release_date: Option<String>,
     pub original_language: Option<String>,
+    pub belongs_to_collection: Option<TmdbCollectionReference>,
 }
 
 fn validate_search_response(response: &TmdbMovieSearchResponse) -> Result<(), TmdbError> {

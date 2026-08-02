@@ -35,9 +35,11 @@ use crate::{
             CatalogError, CatalogItem, CatalogPage, CatalogService, normalize_search_like_query,
             normalize_search_query,
         },
+        collections::{CollectionError, CollectionService},
         images::{ImageError, ImageService, ImageWriteService, normalize_image_type},
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         scanner::{ScanJobError, ScanJobService},
+        tmdb::TmdbClient,
     },
     auth::users::{UserRecord, UserStoreError},
     auth::{
@@ -65,6 +67,7 @@ pub struct AppState {
     metadata_candidates: Option<MetadataCandidateService>,
     metadata_selection: Option<MetadataSelectionService>,
     scan_jobs: Option<ScanJobService>,
+    collections: Option<CollectionService>,
 }
 
 impl AppState {
@@ -80,6 +83,9 @@ impl AppState {
         let metadata_selection = ImageWriteService::new(database.clone())
             .ok()
             .map(|images| MetadataSelectionService::new(database.clone(), images));
+        let collections = TmdbClient::from_env()
+            .ok()
+            .map(|tmdb| CollectionService::new(database.clone(), tmdb));
         Self {
             database: Some(database.clone()),
             config_dir: Some(config.config_dir),
@@ -94,7 +100,16 @@ impl AppState {
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
             scan_jobs: Some(ScanJobService::new(database.clone())),
+            collections,
         }
+    }
+
+    pub fn with_tmdb_client(mut self, tmdb: TmdbClient) -> Self {
+        let Some(database) = self.database.clone() else {
+            return self;
+        };
+        self.collections = Some(CollectionService::new(database, tmdb));
+        self
     }
 }
 
@@ -133,6 +148,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_select_candidate),
         )
         .route(
+            "/api/v1/admin/items/{item_id}/collection/refresh",
+            post(admin_refresh_collection),
+        )
+        .route(
             "/api/v1/admin/libraries/{library_id}/roots",
             post(admin_add_library_root),
         )
@@ -160,6 +179,10 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_list_library_items),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route(
+            "/api/v1/collections/{collection_id}",
+            get(lux_get_collection),
+        )
         .route(
             "/api/v1/items/{item_id}/images/{image_type}",
             get(lux_image).head(lux_image),
@@ -225,6 +248,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Items", get(emby_items))
         .route("/Search/Hints", get(emby_search_hints))
         .route("/Items/{item_id}", get(emby_item))
+        .route("/Items/{item_id}/Children", get(emby_collection_children))
         .route(
             "/Items/{item_id}/Images/{image_type}",
             get(emby_image).head(emby_image),
@@ -734,6 +758,40 @@ async fn emby_show_episodes(
             AccessPrincipal::new(user.id, user.is_admin),
             &series_id,
             query.season_id.as_deref(),
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => emby_catalog_page_for_user(&state, &user.id.to_string(), &page).await,
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_collection_children(
+    headers: HeaderMap,
+    Path(collection_id): Path<String>,
+    Query(query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let (offset, limit) = match emby_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog
+        .list_collection_items(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &collection_id,
             offset,
             limit,
         )
@@ -1499,7 +1557,8 @@ fn emby_catalog_item_json_with_state(
         "ServerId": server_id,
         "Type": emby_item_type(&item.item_type),
         "MediaType": "Video",
-        "IsFolder": matches!(item.item_type.as_str(), "SERIES" | "SEASON"),
+        "IsFolder": matches!(item.item_type.as_str(), "SERIES" | "SEASON" | "BOX_SET"),
+        "CollectionType": (item.item_type == "BOX_SET").then_some("movies"),
         "ParentId": item.parent_id,
         "SeriesId": item.series_id,
         "ParentIndexNumber": item.season_number,
@@ -1598,6 +1657,7 @@ fn emby_item_type(item_type: &str) -> &'static str {
         "SERIES" => "Series",
         "SEASON" => "Season",
         "EPISODE" => "Episode",
+        "BOX_SET" => "BoxSet",
         _ => "Folder",
     }
 }
@@ -2356,6 +2416,60 @@ async fn lux_get_item(
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
             unreachable!("inaccessible item is returned as not found")
         }
+    }
+}
+
+async fn lux_get_collection(
+    headers: HeaderMap,
+    Path(collection_id): Path<String>,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let Some(collection) = (match catalog.find_item(principal, &collection_id).await {
+        Ok(collection) => collection,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if collection.item_type != "BOX_SET" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match catalog
+        .list_collection_items(principal, &collection_id, offset, limit)
+        .await
+    {
+        Ok(page) => Json(json!({
+            "collection": lux_catalog_item_json(&collection),
+            "items": page.items.iter().map(lux_catalog_item_json).collect::<Vec<_>>(),
+            "total": page.total,
+            "page": page.offset / page.limit + 1,
+            "pageSize": page.limit,
+        }))
+        .into_response(),
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -3393,6 +3507,57 @@ async fn admin_start_scan(
         Json(json!({ "job": scan_job_json(&job) })),
     )
         .into_response()
+}
+
+async fn admin_refresh_collection(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(collections) = state.collections.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "TMDb 合集服务尚未配置",
+        )
+        .into_response();
+    };
+    match collections.refresh_for_item(&item_id).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({
+                "sourceItemId": report.source_item_id,
+                "collectionItemId": report.collection_item_id,
+                "memberCount": report.member_count,
+            })),
+        )
+            .into_response(),
+        Err(CollectionError::MovieProviderIdMissing | CollectionError::NoCollection) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "电影没有可用的 TMDb 合集",
+        )
+        .into_response(),
+        Err(CollectionError::InvalidProviderId) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "TMDb provider ID 无效",
+        )
+        .into_response(),
+        Err(CollectionError::Tmdb(_) | CollectionError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "TMDb 合集刷新失败，可重试",
+        )
+        .into_response(),
+    }
 }
 
 async fn admin_cancel_scan(
