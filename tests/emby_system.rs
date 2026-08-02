@@ -1,7 +1,7 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::setup::SetupService,
-    auth::sessions::WebAuthService,
+    auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     storage::Database,
 };
@@ -18,16 +18,36 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
     let app = app_with_state(AppState::ready(
         config.clone(),
         database.clone(),
         setup,
         auth,
+        emby_auth,
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::new();
+
+    let login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .header(
+            "Authorization",
+            r#"Emby Client="Infuse", Device="iPhone", DeviceId="device-1", Version="1.2.3""#,
+        )
+        .json(&serde_json::json!({ "Username": "Admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let login_body: serde_json::Value = login.json().await?;
+    let token = login_body["AccessToken"]
+        .as_str()
+        .ok_or("missing token")?
+        .to_owned();
 
     let public = client
         .get(format!("http://{address}/System/Info/Public"))
@@ -54,6 +74,7 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
 
     let info = client
         .get(format!("http://{address}/System/Info"))
+        .header("X-Emby-Token", &token)
         .send()
         .await?;
     assert_eq!(info.status(), reqwest::StatusCode::OK);
@@ -63,13 +84,18 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
     assert!(info_body.get("InternalMetadataPath").is_none());
 
     for path in ["/System/Ping", "/emby/System/Ping"] {
-        let response = client.get(format!("http://{address}{path}")).send().await?;
+        let response = client
+            .get(format!("http://{address}{path}"))
+            .header("X-Emby-Token", &token)
+            .send()
+            .await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert!(response.text().await?.is_empty());
     }
     for path in ["/System/Ping", "/emby/System/Ping"] {
         let response = client
             .post(format!("http://{address}{path}"))
+            .header("X-Emby-Token", &token)
             .send()
             .await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);

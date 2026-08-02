@@ -3,7 +3,7 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::setup::SetupService,
-    auth::sessions::WebAuthService,
+    auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     observability,
     storage::Database,
@@ -20,11 +20,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(schema_version, "database migrations applied");
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
         config.clone(),
         database.clone(),
         setup,
         auth,
+        emby_auth,
     ));
 
     let listener = TcpListener::bind(config.http_addr).await?;

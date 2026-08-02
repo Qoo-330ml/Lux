@@ -19,4 +19,5 @@
 
 - LUX-000 至 LUX-003：仅完成仓库工程检查，尚未连接任何真实客户端。
 - LUX-023：已完成根路径/`/emby` 前缀的 System/Ping 本地协议 shape 测试，尚未进行真实客户端探针。
+- LUX-024：已完成 Users/Public、AuthenticateByName、Sessions/Logout 的本地协议 shape 和 token 脱敏测试，尚未进行真实客户端探针。
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。

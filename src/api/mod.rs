@@ -4,10 +4,10 @@ use std::path::PathBuf;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{COOKIE, SET_COOKIE},
+        header::{AUTHORIZATION, COOKIE, SET_COOKIE},
     },
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -20,8 +20,11 @@ use tower_http::{ServiceBuilderExt, request_id::MakeRequestUuid, trace::TraceLay
 use crate::{
     COMMIT, VERSION,
     application::setup::{SetupError, SetupService},
-    auth::sessions::WebAuthService,
     auth::users::{UserRecord, UserStoreError},
+    auth::{
+        emby::{EmbyAuthService, EmbyDeviceInfo},
+        sessions::WebAuthService,
+    },
     config::Config,
     storage::Database,
 };
@@ -33,6 +36,7 @@ pub struct AppState {
     server_id: String,
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
+    emby_auth: Option<EmbyAuthService>,
 }
 
 impl AppState {
@@ -41,6 +45,7 @@ impl AppState {
         database: Database,
         setup: SetupService,
         auth: WebAuthService,
+        emby_auth: EmbyAuthService,
     ) -> Self {
         let server_id = database.server_id().to_owned();
         Self {
@@ -49,6 +54,7 @@ impl AppState {
             server_id,
             setup: Some(setup),
             auth: Some(auth),
+            emby_auth: Some(emby_auth),
         }
     }
 }
@@ -83,6 +89,9 @@ fn emby_routes() -> Router<AppState> {
         .route("/System/Info/Public", get(emby_public_system_info))
         .route("/System/Info", get(emby_system_info))
         .route("/System/Ping", get(emby_ping).post(emby_ping))
+        .route("/Users/Public", get(emby_public_users))
+        .route("/Users/AuthenticateByName", post(emby_authenticate))
+        .route("/Sessions/Logout", post(emby_logout))
 }
 
 async fn emby_public_system_info(State(state): State<AppState>) -> Json<Value> {
@@ -99,7 +108,17 @@ async fn emby_public_system_info(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn emby_system_info(State(state): State<AppState>) -> Json<Value> {
+async fn emby_system_info(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if let Err(status) = require_emby_token(&headers, &query, auth).await {
+        return status.into_response();
+    }
     Json(json!({
         "LocalAddress": "",
         "ServerName": "Lux",
@@ -113,10 +132,127 @@ async fn emby_system_info(State(state): State<AppState>) -> Json<Value> {
         "IsShuttingDown": false,
         "HttpServerPortNumber": 8097
     }))
+    .into_response()
 }
 
-async fn emby_ping() -> StatusCode {
-    StatusCode::OK
+async fn emby_ping(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match require_emby_token(&headers, &query, auth).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn emby_public_users(State(state): State<AppState>) -> Json<Value> {
+    let Some(auth) = state.emby_auth else {
+        return Json(json!([]));
+    };
+    let users = auth.public_users().await.unwrap_or_default();
+    Json(Value::Array(users.iter().map(emby_user_json).collect()))
+}
+
+#[derive(Deserialize)]
+struct EmbyAuthenticateRequest {
+    #[serde(rename = "Username")]
+    username: String,
+    #[serde(rename = "Pw")]
+    password: String,
+}
+
+async fn emby_authenticate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<EmbyAuthenticateRequest>,
+) -> Response {
+    let Some(auth) = state.emby_auth else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let device = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(EmbyDeviceInfo::parse)
+        .unwrap_or_default();
+    match auth
+        .authenticate(&request.username, &request.password, &device)
+        .await
+    {
+        Ok(Some(result)) => Json(json!({
+            "User": emby_user_json(&result.user),
+            "SessionInfo": {
+                "Client": result.device.client,
+                "DeviceId": result.device.device_id,
+                "DeviceName": result.device.device,
+                "ApplicationVersion": result.device.version,
+                "UserId": result.user.id.to_string()
+            },
+            "AccessToken": result.token,
+            "ServerId": state.server_id
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct EmbyTokenQuery {
+    #[serde(rename = "api_key")]
+    api_key: Option<String>,
+}
+
+async fn require_emby_token(
+    headers: &HeaderMap,
+    query: &EmbyTokenQuery,
+    auth: &EmbyAuthService,
+) -> Result<(), StatusCode> {
+    let token = headers
+        .get("X-Emby-Token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| query.api_key.clone())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    match auth.verify_token(&token).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StatusCode::UNAUTHORIZED),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn emby_logout(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> StatusCode {
+    let Some(auth) = state.emby_auth else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    let token = headers
+        .get("X-Emby-Token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or(query.api_key);
+    let Some(token) = token else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    match auth.logout(&token).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn emby_user_json(user: &UserRecord) -> Value {
+    json!({
+        "Id": user.id.to_string(),
+        "Name": user.display_name,
+        "HasPassword": true,
+        "Policy": { "IsAdministrator": user.is_admin }
+    })
 }
 
 async fn live() -> Json<Value> {

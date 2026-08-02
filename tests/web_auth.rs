@@ -1,7 +1,7 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::setup::SetupService,
-    auth::sessions::WebAuthService,
+    auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     storage::Database,
 };
@@ -16,7 +16,8 @@ async fn test_server(
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(config, database, setup, auth));
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });

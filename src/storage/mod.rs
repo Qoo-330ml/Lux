@@ -186,6 +186,98 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_users(&self) -> Result<Vec<StoredUser>, StorageError> {
+        sqlx::query(
+            "SELECT id, username_normalized, display_name, password_hash,
+                    is_disabled, is_admin, can_manage_server,
+                    can_remote_access, can_download
+             FROM users WHERE is_disabled = 0 ORDER BY username_normalized",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredUser {
+                    id: row.get("id"),
+                    username_normalized: row.get("username_normalized"),
+                    display_name: row.get("display_name"),
+                    password_hash: row.get("password_hash"),
+                    is_disabled: row.get::<i64, _>("is_disabled") != 0,
+                    is_admin: row.get::<i64, _>("is_admin") != 0,
+                    can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
+                    can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
+                    can_download: row.get::<i64, _>("can_download") != 0,
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn create_access_token(
+        &self,
+        token: NewAccessToken<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name,
+                device_name, client_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(token.id)
+        .bind(token.token_hash)
+        .bind(token.user_id)
+        .bind(token.device_id)
+        .bind(token.client_name)
+        .bind(token.device_name)
+        .bind(token.client_version)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn revoke_access_token(&self, token_hash: &[u8]) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE access_tokens
+             SET revoked_at = unixepoch(), updated_at = unixepoch()
+             WHERE token_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn has_valid_access_token(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<bool, StorageError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM access_tokens
+                WHERE token_hash = ? AND revoked_at IS NULL
+            )",
+        )
+        .bind(token_hash)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn create_web_session(
         &self,
         id: &str,
@@ -309,6 +401,16 @@ pub(crate) struct StoredWebSession {
     pub(crate) can_manage_server: bool,
     pub(crate) can_remote_access: bool,
     pub(crate) can_download: bool,
+}
+
+pub(crate) struct NewAccessToken<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) token_hash: &'a [u8],
+    pub(crate) user_id: &'a str,
+    pub(crate) device_id: &'a str,
+    pub(crate) client_name: &'a str,
+    pub(crate) device_name: &'a str,
+    pub(crate) client_version: &'a str,
 }
 
 async fn ensure_server_id(pool: &SqlitePool) -> Result<String, sqlx::Error> {
