@@ -14,7 +14,7 @@ use axum::{
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
     },
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -145,6 +145,10 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/jobs/{job_id}/cancel",
             post(admin_cancel_scan),
         )
+        .route(
+            "/api/v1/admin/settings",
+            get(admin_settings).patch(admin_update_settings),
+        )
         .route("/api/v1/libraries", get(lux_list_libraries))
         .route(
             "/api/v1/libraries/{library_id}/items",
@@ -169,6 +173,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/items/{item_id}/playback", get(lux_get_playback))
         .route("/api/v1/items/{item_id}/progress", post(lux_post_progress))
+        .route("/api/v1/items/{item_id}/favorite", put(lux_set_favorite))
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
@@ -249,6 +254,14 @@ fn emby_routes() -> Router<AppState> {
         .route("/Sessions/Playing", post(emby_playing))
         .route("/Sessions/Playing/Progress", post(emby_playing_progress))
         .route("/Sessions/Playing/Stopped", post(emby_playing_stopped))
+        .route(
+            "/Users/{user_id}/PlayedItems/{item_id}",
+            post(emby_mark_played).delete(emby_unmark_played),
+        )
+        .route(
+            "/Users/{user_id}/FavoriteItems/{item_id}",
+            post(emby_mark_favorite).delete(emby_unmark_favorite),
+        )
         .route("/Sessions/Logout", post(emby_logout))
 }
 
@@ -492,7 +505,7 @@ async fn emby_user_views(
 async fn emby_user_resume(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    Query(query): Query<EmbyTokenQuery>,
+    Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
@@ -502,10 +515,78 @@ async fn emby_user_resume(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
+    let (offset, limit) = match emby_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let page = match catalog.list_all_items(principal, 0, i64::MAX).await {
+        Ok(page) => page,
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    };
+    let (played_percent, minimum_ticks) = match database.resume_settings().await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut resume_items = Vec::new();
+    for item in page.items {
+        if !matches!(item.item_type.as_str(), "MOVIE" | "EPISODE") {
+            continue;
+        }
+        let Some(item_state) = (match database.find_user_item_state(&user_id, &item.id).await {
+            Ok(state) => state,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }) else {
+            continue;
+        };
+        let runtime_ticks = item.runtime_ticks.or_else(|| {
+            item.media_sources
+                .iter()
+                .find(|source| source.is_default)
+                .or_else(|| item.media_sources.first())
+                .and_then(|source| source.duration_ticks)
+        });
+        let Some(runtime_ticks) = runtime_ticks.filter(|value| *value > 0) else {
+            continue;
+        };
+        let below_played_threshold = i128::from(item_state.position_ticks) * 100
+            < i128::from(runtime_ticks) * i128::from(played_percent);
+        if !item_state.is_played
+            && item_state.position_ticks >= minimum_ticks
+            && below_played_threshold
+        {
+            resume_items.push((item, item_state));
+        }
+    }
+    resume_items.sort_by(|(left, left_state), (right, right_state)| {
+        right_state
+            .last_played_at
+            .cmp(&left_state.last_played_at)
+            .then_with(|| left.sort_title.cmp(&right.sort_title))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let total = resume_items.len();
+    let items = resume_items
+        .into_iter()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .take(usize::try_from(limit).unwrap_or(0))
+        .map(|(item, item_state)| {
+            emby_catalog_item_json_with_state(&item, &state.server_id, Some(&item_state))
+        })
+        .collect::<Vec<_>>();
     Json(json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-        "StartIndex": 0,
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": offset,
     }))
     .into_response()
 }
@@ -1110,6 +1191,126 @@ async fn lux_post_progress(
             duration_ticks: request.duration_ticks,
             is_paused: false,
         })
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_mark_played(
+    headers: HeaderMap,
+    Path((user_id, item_id)): Path<(String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    handle_emby_user_flag(headers, user_id, item_id, query, state, true, true).await
+}
+
+async fn emby_unmark_played(
+    headers: HeaderMap,
+    Path((user_id, item_id)): Path<(String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    handle_emby_user_flag(headers, user_id, item_id, query, state, true, false).await
+}
+
+async fn emby_mark_favorite(
+    headers: HeaderMap,
+    Path((user_id, item_id)): Path<(String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    handle_emby_user_flag(headers, user_id, item_id, query, state, false, true).await
+}
+
+async fn emby_unmark_favorite(
+    headers: HeaderMap,
+    Path((user_id, item_id)): Path<(String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    handle_emby_user_flag(headers, user_id, item_id, query, state, false, false).await
+}
+
+async fn handle_emby_user_flag(
+    headers: HeaderMap,
+    user_id: String,
+    item_id: String,
+    query: EmbyTokenQuery,
+    state: AppState,
+    played: bool,
+    value: bool,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = if played {
+        database
+            .set_user_item_played(&user_id, &item_id, value)
+            .await
+    } else {
+        database
+            .set_user_item_favorite(&user_id, &item_id, value)
+            .await
+    };
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LuxFavoriteRequest {
+    favorite: bool,
+}
+
+async fn lux_set_favorite(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<LuxFavoriteRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .set_user_item_favorite(&user.id.to_string(), &item_id, request.favorite)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -2562,6 +2763,60 @@ struct MetadataCandidateQuery {
     page_size: Option<i64>,
     #[serde(alias = "q")]
     search: Option<String>,
+}
+
+async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.resume_settings().await {
+        Ok((played_percent, minimum_ticks)) => Json(json!({
+            "resumePlayedPercent": played_percent,
+            "resumeMinTicks": minimum_ticks,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdatePlaybackSettingsRequest {
+    resume_played_percent: Option<i64>,
+    resume_min_ticks: Option<i64>,
+}
+
+async fn admin_update_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<UpdatePlaybackSettingsRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (current_percent, current_ticks) = match database.resume_settings().await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let percent = request.resume_played_percent.unwrap_or(current_percent);
+    let minimum_ticks = request.resume_min_ticks.unwrap_or(current_ticks);
+    if !(1..=100).contains(&percent) || minimum_ticks < 0 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match database.set_resume_settings(percent, minimum_ticks).await {
+        Ok(()) => Json(json!({
+            "resumePlayedPercent": percent,
+            "resumeMinTicks": minimum_ticks,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn admin_set_library_access(

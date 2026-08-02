@@ -669,6 +669,133 @@ impl Database {
         })
     }
 
+    pub(crate) async fn resume_settings(&self) -> Result<(i64, i64), StorageError> {
+        let values: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM server_settings
+             WHERE key IN ('resume_played_percent', 'resume_min_ticks')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let percent = values
+            .iter()
+            .find(|(key, _)| key == "resume_played_percent")
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(90)
+            .clamp(1, 100);
+        let min_ticks = values
+            .iter()
+            .find(|(key, _)| key == "resume_min_ticks")
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(1_200_000_000)
+            .max(0);
+        Ok((percent, min_ticks))
+    }
+
+    pub(crate) async fn set_resume_settings(
+        &self,
+        percent: i64,
+        min_ticks: i64,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for (key, value) in [
+            ("resume_played_percent", percent.to_string()),
+            ("resume_min_ticks", min_ticks.to_string()),
+        ] {
+            sqlx::query(
+                "INSERT INTO server_settings (key, value)
+                 VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn set_user_item_played(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        played: bool,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
+             VALUES (?, ?, ?, CASE WHEN ? = 1 THEN 1 ELSE 0 END,
+                     CASE WHEN ? = 1 THEN unixepoch() ELSE NULL END)
+             ON CONFLICT(user_id, item_id) DO UPDATE SET
+                 is_played = excluded.is_played,
+                 play_count = CASE
+                     WHEN excluded.is_played = 1 AND user_item_state.is_played = 0
+                     THEN user_item_state.play_count + 1 ELSE user_item_state.play_count END,
+                 last_played_at = CASE
+                     WHEN excluded.is_played = 1 THEN unixepoch()
+                     ELSE user_item_state.last_played_at END,
+                 version = user_item_state.version + CASE
+                     WHEN excluded.is_played != user_item_state.is_played THEN 1 ELSE 0 END",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .bind(played)
+        .bind(played)
+        .bind(played)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_user_item_favorite(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        favorite: bool,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO user_item_state (user_id, item_id, is_favorite)
+             VALUES (?, ?, ?)
+             ON CONFLICT(user_id, item_id) DO UPDATE SET
+                 is_favorite = excluded.is_favorite,
+                 version = user_item_state.version + CASE
+                     WHEN excluded.is_favorite != user_item_state.is_favorite THEN 1 ELSE 0 END",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .bind(favorite)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn record_playback_event(
         &self,
         event: NewPlaybackEvent<'_>,
