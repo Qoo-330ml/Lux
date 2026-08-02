@@ -4,6 +4,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use quick_xml::{events::Event, reader::Reader};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -141,6 +142,86 @@ impl LibraryScanner {
         Ok(report)
     }
 
+    pub async fn scan_mixed_library(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<ScanReport, ScannerError> {
+        let library_id_text = library_id.to_string();
+        if self
+            .database
+            .find_library(&library_id_text)
+            .await?
+            .is_none()
+        {
+            return Err(ScannerError::LibraryNotFound);
+        }
+        let generation = Uuid::now_v7().to_string();
+        let roots = self.database.list_library_roots(&library_id_text).await?;
+        let mut report = ScanReport::default();
+        for root in roots {
+            let root_path = PathBuf::from(&root.canonical_path);
+            let root_is_available = fs::metadata(&root_path)
+                .await
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+            if !root_is_available {
+                self.database
+                    .update_library_root_availability(&root.id, false)
+                    .await?;
+                report.unavailable_roots += 1;
+                continue;
+            }
+            if !root.is_available {
+                self.database
+                    .update_library_root_availability(&root.id, true)
+                    .await?;
+            }
+            for path in collect_series_files(&root_path).await? {
+                let classification = classify_mixed_file(&root_path, &path).await;
+                let result = match classification {
+                    MixedClassification::Movie => {
+                        self.scan_movie_file(
+                            &library_id_text,
+                            &root,
+                            &root_path,
+                            &path,
+                            &generation,
+                        )
+                        .await?
+                    }
+                    MixedClassification::Episode => {
+                        self.scan_episode_file(
+                            &library_id_text,
+                            &root,
+                            &root_path,
+                            &path,
+                            &generation,
+                        )
+                        .await?
+                    }
+                    MixedClassification::Unresolved => {
+                        self.scan_unresolved_file(
+                            &library_id_text,
+                            &root,
+                            &root_path,
+                            &path,
+                            &generation,
+                        )
+                        .await?
+                    }
+                };
+                report.merge(result);
+            }
+            report.marked_missing += usize::try_from(
+                self.database
+                    .mark_missing_filesystem_entries(&root.id, &generation)
+                    .await?,
+            )
+            .unwrap_or(usize::MAX);
+        }
+        Ok(report)
+    }
+
     async fn scan_episode_file(
         &self,
         library_id_text: &str,
@@ -235,6 +316,7 @@ impl LibraryScanner {
                 sort_title: &series_sort_title,
                 original_title: Some(&series_title),
                 production_year: None,
+                identification_status: "LOCAL_CONFIRMED",
                 identity_key: &series_identity,
             })
             .await?;
@@ -261,6 +343,7 @@ impl LibraryScanner {
                 sort_title: &season_sort_title,
                 original_title: Some(&season_title),
                 production_year: None,
+                identification_status: "LOCAL_CONFIRMED",
                 identity_key: &season_identity,
             })
             .await?;
@@ -282,6 +365,7 @@ impl LibraryScanner {
                 sort_title: &episode_sort_title,
                 original_title: Some(&episode_title),
                 production_year: None,
+                identification_status: "LOCAL_CONFIRMED",
                 identity_key: &episode_identity,
             })
             .await?;
@@ -319,6 +403,138 @@ impl LibraryScanner {
             created_items: usize::from(series_created)
                 + usize::from(season_created)
                 + usize::from(episode_created),
+            created_sources: 1,
+            ..ScanReport::default()
+        })
+    }
+
+    async fn scan_unresolved_file(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        generation: &str,
+    ) -> Result<ScanReport, ScannerError> {
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let size = i64::try_from(metadata.len())
+            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        let (device, inode) = file_identity(&metadata);
+        let fingerprint =
+            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        if let Some(existing_entry) = self
+            .database
+            .find_filesystem_entry(&root.id, &relative_path)
+            .await?
+        {
+            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+                self.database
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .await?;
+                return Ok(ScanReport {
+                    discovered_files: 1,
+                    skipped_files: 1,
+                    ..ScanReport::default()
+                });
+            }
+            self.database
+                .update_filesystem_entry(
+                    &existing_entry.id,
+                    size,
+                    modified_at,
+                    &fingerprint,
+                    generation,
+                )
+                .await?;
+            self.database
+                .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
+                .await?;
+            return Ok(ScanReport {
+                discovered_files: 1,
+                changed_files: 1,
+                ..ScanReport::default()
+            });
+        }
+        let file_name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Unresolved");
+        let title = clean_hierarchy_title(file_name);
+        let title = if title.is_empty() {
+            "Unresolved".to_owned()
+        } else {
+            title
+        };
+        let sort_title = title.to_lowercase();
+        let identity_key = format!("unresolved:{}:{}", root.id, relative_path);
+        let item_id = ItemId::new().to_string();
+        self.database
+            .insert_hierarchy_item(NewHierarchyItem {
+                id: &item_id,
+                library_id: library_id_text,
+                item_type: "UNRESOLVED",
+                parent_id: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+                absolute_number: None,
+                title: &title,
+                sort_title: &sort_title,
+                original_title: Some(&title),
+                production_year: None,
+                identification_status: "PENDING",
+                identity_key: &identity_key,
+            })
+            .await?;
+        let entry_id = FilesystemEntryId::new().to_string();
+        self.database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &entry_id,
+                library_root_id: &root.id,
+                relative_path: &relative_path,
+                entry_kind: "FILE",
+                size,
+                modified_at,
+                fingerprint: &fingerprint,
+                last_seen_generation: generation,
+            })
+            .await?;
+        let source_id = SourceId::new().to_string();
+        let container = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        self.database
+            .insert_media_source(NewMediaSource {
+                id: &source_id,
+                item_id: &item_id,
+                filesystem_entry_id: &entry_id,
+                container: &container,
+                size,
+                is_default: true,
+            })
+            .await?;
+        Ok(ScanReport {
+            discovered_files: 1,
+            created_items: 1,
             created_sources: 1,
             ..ScanReport::default()
         })
@@ -568,10 +784,20 @@ impl ScanJobService {
             return Err(ScanJobError::AlreadyActive(active.id));
         }
         let roots = self.database.list_library_roots(&library_id_text).await?;
+        let library_kind = self
+            .database
+            .find_library(&library_id_text)
+            .await?
+            .map(|library| library.kind)
+            .unwrap_or_else(|| "MOVIE".to_owned());
         let mut total_count = 0_i64;
         for root in roots {
             if root.is_available {
-                let files = collect_movie_files(Path::new(&root.canonical_path)).await?;
+                let files = if library_kind == "MOVIE" {
+                    collect_movie_files(Path::new(&root.canonical_path)).await?
+                } else {
+                    collect_series_files(Path::new(&root.canonical_path)).await?
+                };
                 total_count =
                     total_count.saturating_add(i64::try_from(files.len()).unwrap_or(i64::MAX));
             }
@@ -623,13 +849,24 @@ impl ScanJobService {
         }
 
         let roots = self.database.list_library_roots(&job.library_id).await?;
+        let library_kind = self
+            .database
+            .find_library(&job.library_id)
+            .await?
+            .map(|library| library.kind)
+            .unwrap_or_else(|| "MOVIE".to_owned());
         let mut candidates = Vec::new();
         for (root_index, root) in roots.iter().enumerate() {
             if !root.is_available {
                 continue;
             }
             let root_path = Path::new(&root.canonical_path);
-            for path in collect_movie_files(root_path).await? {
+            let files = if library_kind == "MOVIE" {
+                collect_movie_files(root_path).await?
+            } else {
+                collect_series_files(root_path).await?
+            };
+            for path in files {
                 let relative = path
                     .strip_prefix(root_path)
                     .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
@@ -680,17 +917,67 @@ impl ScanJobService {
         let mut last_cursor = None;
         for (cursor, root_index, path) in &batch {
             let root = &roots[*root_index];
-            if let Err(error) = self
-                .scanner
-                .scan_movie_file(
-                    &job.library_id,
-                    root,
-                    Path::new(&root.canonical_path),
-                    path,
-                    &job.generation,
-                )
-                .await
-            {
+            let result = match library_kind.as_str() {
+                "MOVIE" => {
+                    self.scanner
+                        .scan_movie_file(
+                            &job.library_id,
+                            root,
+                            Path::new(&root.canonical_path),
+                            path,
+                            &job.generation,
+                        )
+                        .await
+                }
+                "SERIES" => {
+                    self.scanner
+                        .scan_episode_file(
+                            &job.library_id,
+                            root,
+                            Path::new(&root.canonical_path),
+                            path,
+                            &job.generation,
+                        )
+                        .await
+                }
+                "MIXED" => match classify_mixed_file(Path::new(&root.canonical_path), path).await {
+                    MixedClassification::Movie => {
+                        self.scanner
+                            .scan_movie_file(
+                                &job.library_id,
+                                root,
+                                Path::new(&root.canonical_path),
+                                path,
+                                &job.generation,
+                            )
+                            .await
+                    }
+                    MixedClassification::Episode => {
+                        self.scanner
+                            .scan_episode_file(
+                                &job.library_id,
+                                root,
+                                Path::new(&root.canonical_path),
+                                path,
+                                &job.generation,
+                            )
+                            .await
+                    }
+                    MixedClassification::Unresolved => {
+                        self.scanner
+                            .scan_unresolved_file(
+                                &job.library_id,
+                                root,
+                                Path::new(&root.canonical_path),
+                                path,
+                                &job.generation,
+                            )
+                            .await
+                    }
+                },
+                _ => Err(ScannerError::LibraryNotFound),
+            };
+            if let Err(error) = result {
                 self.database
                     .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
                     .await?;
@@ -888,6 +1175,69 @@ pub struct ParsedEpisodeFilename {
     pub season: u32,
     pub episode: u32,
     pub absolute_number: Option<u32>,
+}
+
+enum MixedClassification {
+    Movie,
+    Episode,
+    Unresolved,
+}
+
+async fn classify_mixed_file(root: &Path, path: &Path) -> MixedClassification {
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return MixedClassification::Unresolved;
+    };
+    if parse_episode_filename(file_name).is_some() {
+        return MixedClassification::Episode;
+    }
+    let series_nfo = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .map(|first| root.join(first.as_os_str()).join("tvshow.nfo"));
+    if let Some(series_nfo) = series_nfo
+        && nfo_root_is(&series_nfo, "tvshow").await
+    {
+        return MixedClassification::Unresolved;
+    }
+    let movie_nfo = path
+        .parent()
+        .map(|directory| directory.join("movie.nfo"))
+        .filter(|candidate| candidate.exists())
+        .or_else(|| {
+            let candidate = path.with_extension("nfo");
+            candidate.exists().then_some(candidate)
+        });
+    if let Some(movie_nfo) = movie_nfo
+        && nfo_root_is(&movie_nfo, "movie").await
+    {
+        return MixedClassification::Movie;
+    }
+    if parse_movie_filename(file_name).is_some_and(|parsed| parsed.production_year.is_some()) {
+        MixedClassification::Movie
+    } else {
+        MixedClassification::Unresolved
+    }
+}
+
+async fn nfo_root_is(path: &Path, expected: &str) -> bool {
+    let Ok(bytes) = fs::read(path).await else {
+        return false;
+    };
+    let mut reader = Reader::from_reader(bytes.as_slice());
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) | Ok(Event::Empty(event)) => {
+                return event
+                    .name()
+                    .as_ref()
+                    .eq_ignore_ascii_case(expected.as_bytes());
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            Ok(_) => buffer.clear(),
+        }
+    }
 }
 
 pub fn parse_movie_filename(filename: &str) -> Option<ParsedMovieFilename> {

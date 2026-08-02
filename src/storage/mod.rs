@@ -2029,7 +2029,7 @@ impl Database {
                 season_number, episode_number, absolute_number,
                 title, sort_title, original_title, production_year,
                 identification_status, identity_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(item.id)
         .bind(item.library_id)
@@ -2043,6 +2043,7 @@ impl Database {
         .bind(item.sort_title)
         .bind(item.original_title)
         .bind(item.production_year)
+        .bind(item.identification_status)
         .bind(item.identity_key)
         .execute(&self.pool)
         .await
@@ -2733,6 +2734,7 @@ pub(crate) struct NewHierarchyItem<'a> {
     pub(crate) sort_title: &'a str,
     pub(crate) original_title: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) identification_status: &'a str,
     pub(crate) identity_key: &'a str,
 }
 
