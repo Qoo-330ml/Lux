@@ -171,6 +171,72 @@ impl MetadataState {
         }
     }
 
+    pub fn apply_fill_missing(&mut self, candidate: &MetadataCandidate) {
+        for field in [
+            MetadataField::Title,
+            MetadataField::OriginalTitle,
+            MetadataField::Overview,
+            MetadataField::ProductionYear,
+        ] {
+            if self.locked_fields.contains(&field) || self.has_value(field) {
+                continue;
+            }
+            self.apply_value(field, candidate, false);
+        }
+    }
+
+    pub fn apply_refresh_unlocked(&mut self, candidate: &MetadataCandidate) {
+        for field in [
+            MetadataField::Title,
+            MetadataField::OriginalTitle,
+            MetadataField::Overview,
+            MetadataField::ProductionYear,
+        ] {
+            if self.locked_fields.contains(&field) {
+                continue;
+            }
+            self.apply_value(field, candidate, true);
+        }
+    }
+
+    fn apply_value(&mut self, field: MetadataField, candidate: &MetadataCandidate, force: bool) {
+        let source = candidate.source;
+        match field {
+            MetadataField::Title => {
+                if let Some(value) = non_empty(candidate.metadata.title.as_deref())
+                    && (force || !self.has_value(field))
+                {
+                    self.metadata.title = Some(value.to_owned());
+                    self.provenance.insert(field, source);
+                }
+            }
+            MetadataField::OriginalTitle => {
+                if let Some(value) = non_empty(candidate.metadata.original_title.as_deref())
+                    && (force || !self.has_value(field))
+                {
+                    self.metadata.original_title = Some(value.to_owned());
+                    self.provenance.insert(field, source);
+                }
+            }
+            MetadataField::Overview => {
+                if let Some(value) = non_empty(candidate.metadata.overview.as_deref())
+                    && (force || !self.has_value(field))
+                {
+                    self.metadata.overview = Some(value.to_owned());
+                    self.provenance.insert(field, source);
+                }
+            }
+            MetadataField::ProductionYear => {
+                if let Some(value) = candidate.metadata.production_year
+                    && (force || !self.has_value(field))
+                {
+                    self.metadata.production_year = Some(value);
+                    self.provenance.insert(field, source);
+                }
+            }
+        }
+    }
+
     pub fn provenance_json(&self) -> String {
         serde_json::to_string(&self.provenance).unwrap_or_else(|_| "{}".to_owned())
     }

@@ -66,6 +66,34 @@ impl ImageWriteService {
         })
     }
 
+    pub async fn download_item_image_if_missing(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
+        if self.local_image_exists(item_id, image_type).await? {
+            return Ok(None);
+        }
+        self.download_item_image(item_id, image_type, image_url)
+            .await
+            .map(Some)
+    }
+
+    async fn local_image_exists(
+        &self,
+        item_id: &str,
+        image_type: &str,
+    ) -> Result<bool, ImageWriteError> {
+        let image_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        let directory = self.media_directory(item_id).await?;
+        let Some(path) = find_any_image_path(&directory, image_type).await? else {
+            return Ok(false);
+        };
+        image_file_stamp(&path).await.map(|_| true)
+    }
+
     pub async fn download_item_image(
         &self,
         item_id: &str,
@@ -135,30 +163,15 @@ impl ImageWriteService {
         }
         validate_image_payload(format, &body)?;
 
-        let source = self
+        let directory = self.media_directory(item_id).await?;
+        let root = self
             .database
             .find_media_source_path(item_id)
             .await?
             .ok_or(ImageWriteError::ItemNotFound)?;
-        let root = fs::canonicalize(&source.root_path)
+        let root = fs::canonicalize(&root.root_path)
             .await
-            .map_err(|error| image_io_error(Path::new(&source.root_path), error))?;
-        let media_path = root.join(&source.relative_path);
-        let media_path = fs::canonicalize(&media_path)
-            .await
-            .map_err(|error| image_io_error(&media_path, error))?;
-        if !media_path.starts_with(&root) {
-            return Err(ImageWriteError::PathOutsideRoot(media_path));
-        }
-        let directory = media_path
-            .parent()
-            .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?;
-        let directory = fs::canonicalize(directory)
-            .await
-            .map_err(|error| image_io_error(directory, error))?;
-        if !directory.starts_with(&root) {
-            return Err(ImageWriteError::PathOutsideRoot(directory));
-        }
+            .map_err(|error| image_io_error(Path::new(&root.root_path), error))?;
         let target = image_target(&directory, image_type, format).await?;
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
@@ -189,6 +202,34 @@ impl ImageWriteService {
             file_size,
             content_tag,
         })
+    }
+
+    async fn media_directory(&self, item_id: &str) -> Result<PathBuf, ImageWriteError> {
+        let source = self
+            .database
+            .find_media_source_path(item_id)
+            .await?
+            .ok_or(ImageWriteError::ItemNotFound)?;
+        let root = fs::canonicalize(&source.root_path)
+            .await
+            .map_err(|error| image_io_error(Path::new(&source.root_path), error))?;
+        let media_path = root.join(&source.relative_path);
+        let media_path = fs::canonicalize(&media_path)
+            .await
+            .map_err(|error| image_io_error(&media_path, error))?;
+        if !media_path.starts_with(&root) {
+            return Err(ImageWriteError::PathOutsideRoot(media_path));
+        }
+        let directory = media_path
+            .parent()
+            .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?;
+        let directory = fs::canonicalize(directory)
+            .await
+            .map_err(|error| image_io_error(directory, error))?;
+        if !directory.starts_with(&root) {
+            return Err(ImageWriteError::PathOutsideRoot(directory));
+        }
+        Ok(directory)
     }
 }
 
@@ -316,6 +357,46 @@ async fn image_target(
         return Ok(existing);
     }
     Ok(directory.join(format!("{stem}.{}", format.extension())))
+}
+
+async fn find_any_image_path(
+    directory: &Path,
+    image_type: &str,
+) -> Result<Option<PathBuf>, ImageWriteError> {
+    let stem = match image_type {
+        "POSTER" => "poster",
+        "FANART" => "fanart",
+        _ => return Err(ImageWriteError::InvalidImageType(image_type.to_owned())),
+    };
+    let mut candidates = Vec::new();
+    let mut entries = fs::read_dir(directory)
+        .await
+        .map_err(|source| image_io_error(directory, source))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| image_io_error(directory, source))?
+    {
+        let path = entry.path();
+        let matches_stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(stem));
+        let known_extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "jpg" | "jpeg" | "png" | "webp"
+                )
+            });
+        if matches_stem && known_extension {
+            candidates.push(path);
+        }
+    }
+    candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    Ok(candidates.into_iter().next())
 }
 
 pub async fn write_image_atomically(target: &Path, bytes: &[u8]) -> Result<(), ImageWriteError> {

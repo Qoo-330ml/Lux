@@ -1263,6 +1263,112 @@ impl Database {
             })
     }
 
+    pub(crate) async fn find_metadata_candidate(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+    ) -> Result<Option<StoredMetadataCandidate>, StorageError> {
+        sqlx::query(
+            "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                    mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                    mi.title AS item_title
+             FROM metadata_candidates mc
+             JOIN media_items mi ON mi.id = mc.item_id
+             WHERE mc.id = ? AND mc.item_id = ?
+               AND mi.removed_at IS NULL
+             LIMIT 1",
+        )
+        .bind(candidate_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_metadata_candidate))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn select_metadata_candidate(
+        &self,
+        update: SelectedMetadataUpdate<'_>,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "UPDATE media_items
+             SET title = ?, original_title = ?, overview = ?, production_year = ?,
+                 provider_ids_json = ?, identification_status = 'ONLINE_CONFIRMED',
+                 metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?
+             WHERE id = ? AND removed_at IS NULL",
+        )
+        .bind(update.title)
+        .bind(update.original_title)
+        .bind(update.overview)
+        .bind(update.production_year)
+        .bind(update.provider_ids_json)
+        .bind(update.metadata_fingerprint)
+        .bind(update.provenance_json)
+        .bind(update.locked_fields_json)
+        .bind(update.item_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let selected = sqlx::query(
+            "UPDATE metadata_candidates
+             SET status = 'SELECTED', updated_at = unixepoch()
+             WHERE id = ? AND item_id = ? AND status = 'PENDING'",
+        )
+        .bind(update.candidate_id)
+        .bind(update.item_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if selected.rows_affected() != 1 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE metadata_candidates
+             SET status = 'REJECTED', updated_at = unixepoch()
+             WHERE item_id = ? AND status = 'PENDING' AND id <> ?",
+        )
+        .bind(update.item_id)
+        .bind(update.candidate_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn count_catalog_items(
         &self,
         library_id: Option<&str>,
@@ -2206,6 +2312,19 @@ pub(crate) struct MediaMetadataUpdate<'a> {
     pub(crate) original_title: Option<&'a str>,
     pub(crate) overview: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) metadata_fingerprint: &'a [u8],
+    pub(crate) provenance_json: &'a str,
+    pub(crate) locked_fields_json: &'a str,
+}
+
+pub(crate) struct SelectedMetadataUpdate<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) candidate_id: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) original_title: Option<&'a str>,
+    pub(crate) overview: Option<&'a str>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) provider_ids_json: &'a str,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,

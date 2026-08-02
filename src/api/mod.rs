@@ -23,9 +23,12 @@ use crate::{
     application::setup::{SetupError, SetupService},
     application::{
         access::{AccessPrincipal, MediaAccessService},
-        candidates::{MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService},
+        candidates::{
+            MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
+            MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
+        },
         catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
-        images::{ImageError, ImageService, normalize_image_type},
+        images::{ImageError, ImageService, ImageWriteService, normalize_image_type},
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         scanner::{ScanJobError, ScanJobService},
     },
@@ -52,6 +55,7 @@ pub struct AppState {
     images: Option<ImageService>,
     access: Option<MediaAccessService>,
     metadata_candidates: Option<MetadataCandidateService>,
+    metadata_selection: Option<MetadataSelectionService>,
     scan_jobs: Option<ScanJobService>,
 }
 
@@ -65,6 +69,9 @@ impl AppState {
     ) -> Self {
         let server_id = database.server_id().to_owned();
         let access = MediaAccessService::new(database.clone());
+        let metadata_selection = ImageWriteService::new(database.clone())
+            .ok()
+            .map(|images| MetadataSelectionService::new(database.clone(), images));
         Self {
             database: Some(database.clone()),
             config_dir: Some(config.config_dir),
@@ -77,6 +84,7 @@ impl AppState {
             images: Some(ImageService::new(database.clone(), access.clone())),
             access: Some(access),
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
+            metadata_selection,
             scan_jobs: Some(ScanJobService::new(database.clone())),
         }
     }
@@ -111,6 +119,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/items/{item_id}/identify/candidates",
             get(admin_list_item_candidates),
+        )
+        .route(
+            "/api/v1/admin/items/{item_id}/identify/candidates/{candidate_id}/select",
+            post(admin_select_candidate),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/roots",
@@ -1893,6 +1905,96 @@ async fn admin_list_item_candidates(
     {
         Ok(page) => Json(metadata_candidate_page_json(&page)).into_response(),
         Err(error) => metadata_candidate_error(&headers, error),
+    }
+}
+
+#[derive(Deserialize)]
+struct MetadataSelectionRequest {
+    mode: MetadataSelectionMode,
+}
+
+async fn admin_select_candidate(
+    headers: HeaderMap,
+    Path((item_id, candidate_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<MetadataSelectionRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(selection) = state.metadata_selection.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据写回服务尚未就绪",
+        )
+        .into_response();
+    };
+    match selection
+        .select(&item_id, &candidate_id, request.mode)
+        .await
+    {
+        Ok(report) => Json(json!({
+            "itemId": report.item_id,
+            "candidateId": report.candidate_id,
+            "mode": report.mode.as_str(),
+            "status": report.status,
+            "imageTypes": report.image_types,
+        }))
+        .into_response(),
+        Err(error) => metadata_selection_error(&headers, error),
+    }
+}
+
+fn metadata_selection_error(headers: &HeaderMap, error: MetadataSelectionError) -> Response {
+    match error {
+        MetadataSelectionError::ItemNotFound | MetadataSelectionError::CandidateNotFound => {
+            api_error(
+                headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体条目或候选不存在",
+            )
+            .into_response()
+        }
+        MetadataSelectionError::CandidateNotPending(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "候选已处理，不能重复选择",
+        )
+        .into_response(),
+        MetadataSelectionError::InvalidCandidate(_) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "候选数据无效",
+        )
+        .into_response(),
+        MetadataSelectionError::Nfo(_) | MetadataSelectionError::Image(_) => api_error(
+            headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            "元数据写回失败，可重试",
+        )
+        .into_response(),
+        MetadataSelectionError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据保存暂时不可用，可重试",
+        )
+        .into_response(),
     }
 }
 

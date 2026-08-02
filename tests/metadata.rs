@@ -171,6 +171,43 @@ fn metadata_state_round_trip_keeps_provenance_and_locks() {
 }
 
 #[test]
+fn explicit_selection_modes_fill_or_refresh_only_unlocked_fields() {
+    let candidate = MetadataCandidate {
+        source: MetadataSource::TmdbLocalized,
+        metadata: NfoMetadata {
+            title: Some("在线标题".to_owned()),
+            overview: Some("在线简介".to_owned()),
+            production_year: Some(2025),
+            ..NfoMetadata::default()
+        },
+    };
+    let mut fill = MetadataState::from_metadata(NfoMetadata {
+        title: Some("本地标题".to_owned()),
+        production_year: Some(2020),
+        ..NfoMetadata::default()
+    });
+    fill.apply_fill_missing(&candidate);
+    assert_eq!(fill.metadata.title.as_deref(), Some("本地标题"));
+    assert_eq!(fill.metadata.overview.as_deref(), Some("在线简介"));
+    assert_eq!(fill.metadata.production_year, Some(2020));
+
+    let mut refresh = fill.clone();
+    refresh.apply_refresh_unlocked(&candidate);
+    assert_eq!(refresh.metadata.title.as_deref(), Some("在线标题"));
+    assert_eq!(refresh.metadata.overview.as_deref(), Some("在线简介"));
+    assert_eq!(refresh.metadata.production_year, Some(2025));
+    refresh.lock(MetadataField::Title);
+    refresh.apply_refresh_unlocked(&MetadataCandidate {
+        source: MetadataSource::TmdbLocalized,
+        metadata: NfoMetadata {
+            title: Some("再次在线标题".to_owned()),
+            ..NfoMetadata::default()
+        },
+    });
+    assert_eq!(refresh.metadata.title.as_deref(), Some("在线标题"));
+}
+
+#[test]
 fn nfo_parser_reads_local_fields_and_ignores_unknown_fields() {
     let metadata = parse_nfo(
         r#"<movie><title>本地标题</title><originaltitle>Original</originaltitle><year>2021</year><plot>简介</plot><unknown>忽略</unknown></movie>"#.as_bytes(),
