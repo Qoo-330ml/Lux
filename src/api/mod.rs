@@ -26,6 +26,7 @@ use crate::{
         catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
         images::{ImageError, ImageService, normalize_image_type},
         libraries::{LibraryService, LibraryServiceError},
+        scanner::{ScanJobError, ScanJobService},
     },
     auth::users::{UserRecord, UserStoreError},
     auth::{
@@ -49,6 +50,7 @@ pub struct AppState {
     catalog: Option<CatalogService>,
     images: Option<ImageService>,
     access: Option<MediaAccessService>,
+    scan_jobs: Option<ScanJobService>,
 }
 
 impl AppState {
@@ -70,8 +72,9 @@ impl AppState {
             emby_auth: Some(emby_auth),
             libraries: Some(LibraryService::new(database.clone())),
             catalog: Some(CatalogService::new(database.clone(), access.clone())),
-            images: Some(ImageService::new(database, access.clone())),
+            images: Some(ImageService::new(database.clone(), access.clone())),
             access: Some(access),
+            scan_jobs: Some(ScanJobService::new(database.clone())),
         }
     }
 }
@@ -101,6 +104,14 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/users/{user_id}/libraries/{library_id}",
             patch(admin_set_library_access),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}/scan",
+            post(admin_start_scan),
+        )
+        .route(
+            "/api/v1/admin/jobs/{job_id}/cancel",
+            post(admin_cancel_scan),
         )
         .route("/api/v1/libraries", get(lux_list_libraries))
         .route(
@@ -1549,6 +1560,99 @@ async fn admin_set_library_access(
         )
         .into_response(),
     }
+}
+
+async fn admin_start_scan(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let job = match scan_jobs.create_movie_scan_job(library_id).await {
+        Ok(job) => job,
+        Err(ScanJobError::LibraryNotFound) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在",
+            )
+            .into_response();
+        }
+        Err(ScanJobError::AlreadyActive(_)) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库已有扫描任务运行",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let worker = scan_jobs.clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        loop {
+            match worker.run_batch(&job_id, 100).await {
+                Ok(report) if report.completed => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": scan_job_json(&job) })),
+    )
+        .into_response()
+}
+
+async fn admin_cancel_scan(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match scan_jobs.cancel(&job_id).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(ScanJobError::JobNotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+fn scan_job_json(job: &crate::application::scanner::ScanJob) -> Value {
+    json!({
+        "id": job.id,
+        "libraryId": job.library_id,
+        "jobType": job.job_type,
+        "status": job.status,
+        "generation": job.generation,
+        "cursor": job.cursor,
+        "processedCount": job.processed_count,
+        "totalCount": job.total_count,
+        "cancelRequested": job.cancel_requested,
+        "error": job.error,
+    })
 }
 
 async fn require_admin(

@@ -524,6 +524,196 @@ impl Database {
         })
     }
 
+    pub(crate) async fn create_scan_job(
+        &self,
+        id: &str,
+        library_id: &str,
+        job_type: &str,
+        generation: &str,
+        total_count: i64,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, total_count)
+             VALUES (?, ?, ?, 'PENDING', ?, ?)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(job_type)
+        .bind(generation)
+        .bind(total_count)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_scan_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredScanJob>, StorageError> {
+        sqlx::query(
+            "SELECT id, library_id, job_type, status, generation, cursor,
+                    processed_count, total_count, cancel_requested, error
+             FROM scan_jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_scan_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_active_scan_job(
+        &self,
+        library_id: &str,
+        job_type: &str,
+    ) -> Result<Option<StoredScanJob>, StorageError> {
+        sqlx::query(
+            "SELECT id, library_id, job_type, status, generation, cursor,
+                    processed_count, total_count, cancel_requested, error
+             FROM scan_jobs
+             WHERE library_id = ? AND job_type = ? AND status IN ('PENDING', 'RUNNING')
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(library_id)
+        .bind(job_type)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_scan_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_scan_job(&self, id: &str) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE scan_jobs
+             SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'PENDING'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_scan_job_progress(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+        processed_count: i64,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE scan_jobs
+             SET cursor = ?, processed_count = ?, updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING'",
+        )
+        .bind(cursor)
+        .bind(processed_count)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn scan_job_cancel_requested(&self, id: &str) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT cancel_requested FROM scan_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value: i64| value != 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn request_scan_job_cancel(&self, id: &str) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE scan_jobs SET cancel_requested = 1, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_scan_job(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE scan_jobs
+             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_library_last_scan(
+        &self,
+        library_id: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query("UPDATE libraries SET last_scan_at = unixepoch() WHERE id = ?")
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn update_root_scan_cursor(
+        &self,
+        root_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query("UPDATE library_roots SET scan_cursor = ? WHERE id = ?")
+            .bind(cursor)
+            .bind(root_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn find_library_root(
         &self,
         id: &str,
@@ -1404,6 +1594,35 @@ pub(crate) struct StoredLibraryRoot {
     pub(crate) last_checked_at: i64,
     pub(crate) unavailable_since: Option<i64>,
     pub(crate) scan_cursor: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanJob {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) job_type: String,
+    pub(crate) status: String,
+    pub(crate) generation: String,
+    pub(crate) cursor: Option<String>,
+    pub(crate) processed_count: i64,
+    pub(crate) total_count: i64,
+    pub(crate) cancel_requested: bool,
+    pub(crate) error: Option<String>,
+}
+
+fn stored_scan_job(row: sqlx::sqlite::SqliteRow) -> StoredScanJob {
+    StoredScanJob {
+        id: row.get("id"),
+        library_id: row.get("library_id"),
+        job_type: row.get("job_type"),
+        status: row.get("status"),
+        generation: row.get("generation"),
+        cursor: row.get("cursor"),
+        processed_count: row.get("processed_count"),
+        total_count: row.get("total_count"),
+        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
+        error: row.get("error"),
+    }
 }
 
 fn stored_library_root(row: sqlx::sqlite::SqliteRow) -> StoredLibraryRoot {

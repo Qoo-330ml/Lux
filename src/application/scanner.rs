@@ -12,7 +12,10 @@ use uuid::Uuid;
 
 use crate::{
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
-    storage::{Database, NewFilesystemEntry, NewMediaItem, NewMediaSource, StorageError},
+    storage::{
+        Database, NewFilesystemEntry, NewMediaItem, NewMediaSource, StorageError,
+        StoredLibraryRoot, StoredScanJob,
+    },
 };
 
 #[derive(Clone)]
@@ -46,133 +49,13 @@ impl LibraryScanner {
             if !root.is_available {
                 continue;
             }
-            let root_path = PathBuf::from(root.canonical_path);
+            let root_path = PathBuf::from(&root.canonical_path);
             let files = collect_movie_files(&root_path).await?;
             for path in files {
-                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                let Some(parsed_name) = parse_movie_filename(file_name) else {
-                    continue;
-                };
-                let relative_path = path
-                    .strip_prefix(&root_path)
-                    .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?;
-                let relative_path = relative_path
-                    .to_str()
-                    .ok_or(ScannerError::NonUtf8Path)?
-                    .to_owned();
-                let metadata = fs::metadata(&path)
-                    .await
-                    .map_err(|source| ScannerError::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
-                let size = i64::try_from(metadata.len())
-                    .map_err(|_| ScannerError::FileSizeOverflow(path.clone()))?;
-                let modified_at = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
-                    .unwrap_or(0);
-                let (device, inode) = file_identity(&metadata);
-                let fingerprint =
-                    compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
-                report.discovered_files += 1;
-                if let Some(existing_entry) = self
-                    .database
-                    .find_filesystem_entry(&root.id, &relative_path)
-                    .await?
-                {
-                    if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
-                        self.database
-                            .mark_filesystem_entry_seen(&existing_entry.id, &generation)
-                            .await?;
-                        report.skipped_files += 1;
-                        continue;
-                    }
-                    self.database
-                        .update_filesystem_entry(
-                            &existing_entry.id,
-                            size,
-                            modified_at,
-                            &fingerprint,
-                            &generation,
-                        )
-                        .await?;
-                    self.database
-                        .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
-                        .await?;
-                    report.changed_files += 1;
-                    continue;
-                }
-                let entry_id = FilesystemEntryId::new();
-                let entry_id_text = entry_id.to_string();
-                self.database
-                    .insert_filesystem_entry(NewFilesystemEntry {
-                        id: &entry_id_text,
-                        library_root_id: &root.id,
-                        relative_path: &relative_path,
-                        entry_kind: "FILE",
-                        size,
-                        modified_at,
-                        fingerprint: &fingerprint,
-                        last_seen_generation: &generation,
-                    })
-                    .await?;
-
-                let existing_item = self
-                    .database
-                    .find_media_item(
-                        &library_id_text,
-                        &parsed_name.sort_title,
-                        parsed_name.production_year.map(i64::from),
-                    )
-                    .await?;
-                let (item_id, created_item) = if let Some(item) = existing_item {
-                    (
-                        item.id
-                            .parse::<ItemId>()
-                            .map_err(|error| ScannerError::InvalidItemId(error.to_string()))?,
-                        false,
-                    )
-                } else {
-                    let item_id = ItemId::new();
-                    let item_id_text = item_id.to_string();
-                    self.database
-                        .insert_media_item(NewMediaItem {
-                            id: &item_id_text,
-                            library_id: &library_id_text,
-                            title: &parsed_name.title,
-                            sort_title: &parsed_name.sort_title,
-                            original_title: Some(&parsed_name.title),
-                            production_year: parsed_name.production_year.map(i64::from),
-                        })
-                        .await?;
-                    (item_id, true)
-                };
-                let item_id_text = item_id.to_string();
-                let source_id = SourceId::new().to_string();
-                let container = path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                self.database
-                    .insert_media_source(NewMediaSource {
-                        id: &source_id,
-                        item_id: &item_id_text,
-                        filesystem_entry_id: &entry_id_text,
-                        container: &container,
-                        size,
-                        is_default: created_item,
-                    })
-                    .await?;
-                report.created_sources += 1;
-                if created_item {
-                    report.created_items += 1;
-                }
+                report.merge(
+                    self.scan_movie_file(&library_id_text, &root, &root_path, &path, &generation)
+                        .await?,
+                );
             }
             report.marked_missing += usize::try_from(
                 self.database
@@ -182,6 +65,428 @@ impl LibraryScanner {
             .unwrap_or(usize::MAX);
         }
         Ok(report)
+    }
+
+    pub(crate) async fn scan_movie_file(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        generation: &str,
+    ) -> Result<ScanReport, ScannerError> {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(ScanReport::default());
+        };
+        let Some(parsed_name) = parse_movie_filename(file_name) else {
+            return Ok(ScanReport::default());
+        };
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let size = i64::try_from(metadata.len())
+            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        let (device, inode) = file_identity(&metadata);
+        let fingerprint =
+            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let mut report = ScanReport {
+            discovered_files: 1,
+            ..ScanReport::default()
+        };
+        if let Some(existing_entry) = self
+            .database
+            .find_filesystem_entry(&root.id, &relative_path)
+            .await?
+        {
+            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+                self.database
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .await?;
+                report.skipped_files = 1;
+                return Ok(report);
+            }
+            self.database
+                .update_filesystem_entry(
+                    &existing_entry.id,
+                    size,
+                    modified_at,
+                    &fingerprint,
+                    generation,
+                )
+                .await?;
+            self.database
+                .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
+                .await?;
+            report.changed_files = 1;
+            return Ok(report);
+        }
+
+        let entry_id = FilesystemEntryId::new().to_string();
+        self.database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &entry_id,
+                library_root_id: &root.id,
+                relative_path: &relative_path,
+                entry_kind: "FILE",
+                size,
+                modified_at,
+                fingerprint: &fingerprint,
+                last_seen_generation: generation,
+            })
+            .await?;
+        let existing_item = self
+            .database
+            .find_media_item(
+                library_id_text,
+                &parsed_name.sort_title,
+                parsed_name.production_year.map(i64::from),
+            )
+            .await?;
+        let (item_id, created_item) = if let Some(item) = existing_item {
+            (
+                item.id
+                    .parse::<ItemId>()
+                    .map_err(|error| ScannerError::InvalidItemId(error.to_string()))?,
+                false,
+            )
+        } else {
+            let item_id = ItemId::new();
+            let item_id_text = item_id.to_string();
+            self.database
+                .insert_media_item(NewMediaItem {
+                    id: &item_id_text,
+                    library_id: library_id_text,
+                    title: &parsed_name.title,
+                    sort_title: &parsed_name.sort_title,
+                    original_title: Some(&parsed_name.title),
+                    production_year: parsed_name.production_year.map(i64::from),
+                })
+                .await?;
+            (item_id, true)
+        };
+        let item_id_text = item_id.to_string();
+        let source_id = SourceId::new().to_string();
+        let container = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        self.database
+            .insert_media_source(NewMediaSource {
+                id: &source_id,
+                item_id: &item_id_text,
+                filesystem_entry_id: &entry_id,
+                container: &container,
+                size,
+                is_default: created_item,
+            })
+            .await?;
+        report.created_sources = 1;
+        report.created_items = if created_item { 1 } else { 0 };
+        Ok(report)
+    }
+}
+
+#[derive(Clone)]
+pub struct ScanJobService {
+    scanner: LibraryScanner,
+    database: Database,
+}
+
+impl ScanJobService {
+    pub fn new(database: Database) -> Self {
+        Self {
+            scanner: LibraryScanner::new(database.clone()),
+            database,
+        }
+    }
+
+    pub async fn create_movie_scan_job(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<ScanJob, ScanJobError> {
+        let library_id_text = library_id.to_string();
+        if self
+            .database
+            .find_library(&library_id_text)
+            .await?
+            .is_none()
+        {
+            return Err(ScanJobError::LibraryNotFound);
+        }
+        if let Some(active) = self
+            .database
+            .find_active_scan_job(&library_id_text, "RECONCILE_LIBRARY")
+            .await?
+        {
+            return Err(ScanJobError::AlreadyActive(active.id));
+        }
+        let roots = self.database.list_library_roots(&library_id_text).await?;
+        let mut total_count = 0_i64;
+        for root in roots {
+            if root.is_available {
+                let files = collect_movie_files(Path::new(&root.canonical_path)).await?;
+                total_count =
+                    total_count.saturating_add(i64::try_from(files.len()).unwrap_or(i64::MAX));
+            }
+        }
+        let id = Uuid::now_v7().to_string();
+        let generation = Uuid::now_v7().to_string();
+        self.database
+            .create_scan_job(
+                &id,
+                &library_id_text,
+                "RECONCILE_LIBRARY",
+                &generation,
+                total_count,
+            )
+            .await?;
+        self.get_job(&id).await
+    }
+
+    pub async fn run_batch(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        if batch_size == 0 {
+            return Err(ScanJobError::InvalidBatchSize);
+        }
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
+        if matches!(job.status.as_str(), "COMPLETED" | "CANCELLED" | "FAILED") {
+            return Ok(ScanBatchReport {
+                status: job.status,
+                processed: 0,
+                completed: true,
+            });
+        }
+        if job.status == "PENDING" && !self.database.claim_scan_job(job_id).await? {
+            return Err(ScanJobError::AlreadyActive(job_id.to_owned()));
+        }
+        if self.database.scan_job_cancel_requested(job_id).await? {
+            self.database
+                .finish_scan_job(job_id, "CANCELLED", None)
+                .await?;
+            return Ok(ScanBatchReport {
+                status: "CANCELLED".to_owned(),
+                processed: 0,
+                completed: true,
+            });
+        }
+
+        let roots = self.database.list_library_roots(&job.library_id).await?;
+        let mut candidates = Vec::new();
+        for (root_index, root) in roots.iter().enumerate() {
+            if !root.is_available {
+                continue;
+            }
+            let root_path = Path::new(&root.canonical_path);
+            for path in collect_movie_files(root_path).await? {
+                let relative = path
+                    .strip_prefix(root_path)
+                    .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                    .to_str()
+                    .ok_or(ScannerError::NonUtf8Path)?
+                    .to_owned();
+                let cursor = format!("{}\0{}", root.canonical_path, relative);
+                if job
+                    .cursor
+                    .as_deref()
+                    .is_some_and(|value| cursor.as_str() <= value)
+                {
+                    continue;
+                }
+                candidates.push((cursor, root_index, path));
+            }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        let batch = candidates.into_iter().take(batch_size).collect::<Vec<_>>();
+        if batch.is_empty() {
+            for root in &roots {
+                if root.is_available {
+                    self.database
+                        .mark_missing_filesystem_entries(&root.id, &job.generation)
+                        .await?;
+                    self.database
+                        .update_root_scan_cursor(&root.id, None)
+                        .await?;
+                }
+            }
+            self.database
+                .update_library_last_scan(&job.library_id)
+                .await?;
+            self.database
+                .update_scan_job_progress(job_id, None, job.processed_count)
+                .await?;
+            self.database
+                .finish_scan_job(job_id, "COMPLETED", None)
+                .await?;
+            return Ok(ScanBatchReport {
+                status: "COMPLETED".to_owned(),
+                processed: 0,
+                completed: true,
+            });
+        }
+
+        let mut processed = 0_usize;
+        let mut last_cursor = None;
+        for (cursor, root_index, path) in &batch {
+            let root = &roots[*root_index];
+            if let Err(error) = self
+                .scanner
+                .scan_movie_file(
+                    &job.library_id,
+                    root,
+                    Path::new(&root.canonical_path),
+                    path,
+                    &job.generation,
+                )
+                .await
+            {
+                self.database
+                    .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
+                    .await?;
+                return Err(error.into());
+            }
+            last_cursor = Some(cursor.as_str());
+            processed += 1;
+        }
+        let next_count = job
+            .processed_count
+            .saturating_add(i64::try_from(processed).unwrap_or(i64::MAX));
+        self.database
+            .update_scan_job_progress(job_id, last_cursor, next_count)
+            .await?;
+        if let Some((cursor, root_index, path)) = batch.last() {
+            let root = &roots[*root_index];
+            let relative = path
+                .strip_prefix(Path::new(&root.canonical_path))
+                .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                .to_str()
+                .ok_or(ScannerError::NonUtf8Path)?;
+            self.database
+                .update_root_scan_cursor(&root.id, Some(relative))
+                .await?;
+            let _ = cursor;
+        }
+        if self.database.scan_job_cancel_requested(job_id).await? {
+            self.database
+                .finish_scan_job(job_id, "CANCELLED", None)
+                .await?;
+            return Ok(ScanBatchReport {
+                status: "CANCELLED".to_owned(),
+                processed,
+                completed: true,
+            });
+        }
+        Ok(ScanBatchReport {
+            status: "RUNNING".to_owned(),
+            processed,
+            completed: false,
+        })
+    }
+
+    pub async fn cancel(&self, job_id: &str) -> Result<(), ScanJobError> {
+        self.database.request_scan_job_cancel(job_id).await?;
+        Ok(())
+    }
+
+    async fn get_job(&self, id: &str) -> Result<ScanJob, ScanJobError> {
+        self.database
+            .find_scan_job(id)
+            .await?
+            .map(scan_job)
+            .ok_or(ScanJobError::JobNotFound)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanJob {
+    pub id: String,
+    pub library_id: String,
+    pub job_type: String,
+    pub status: String,
+    pub generation: String,
+    pub cursor: Option<String>,
+    pub processed_count: i64,
+    pub total_count: i64,
+    pub cancel_requested: bool,
+    pub error: Option<String>,
+}
+
+fn scan_job(job: StoredScanJob) -> ScanJob {
+    ScanJob {
+        id: job.id,
+        library_id: job.library_id,
+        job_type: job.job_type,
+        status: job.status,
+        generation: job.generation,
+        cursor: job.cursor,
+        processed_count: job.processed_count,
+        total_count: job.total_count,
+        cancel_requested: job.cancel_requested,
+        error: job.error,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanBatchReport {
+    pub status: String,
+    pub processed: usize,
+    pub completed: bool,
+}
+
+#[derive(Debug)]
+pub enum ScanJobError {
+    LibraryNotFound,
+    JobNotFound,
+    AlreadyActive(String),
+    InvalidBatchSize,
+    Scanner(ScannerError),
+    Storage(StorageError),
+}
+
+impl std::fmt::Display for ScanJobError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LibraryNotFound => formatter.write_str("library not found"),
+            Self::JobNotFound => formatter.write_str("scan job not found"),
+            Self::AlreadyActive(id) => write!(formatter, "scan job already active: {id}"),
+            Self::InvalidBatchSize => formatter.write_str("scan batch size must be positive"),
+            Self::Scanner(error) => error.fmt(formatter),
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ScanJobError {}
+
+impl From<ScannerError> for ScanJobError {
+    fn from(error: ScannerError) -> Self {
+        Self::Scanner(error)
+    }
+}
+
+impl From<StorageError> for ScanJobError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
     }
 }
 
@@ -193,6 +498,17 @@ pub struct ScanReport {
     pub changed_files: usize,
     pub marked_missing: usize,
     pub skipped_files: usize,
+}
+
+impl ScanReport {
+    fn merge(&mut self, other: Self) {
+        self.discovered_files += other.discovered_files;
+        self.created_items += other.created_items;
+        self.created_sources += other.created_sources;
+        self.changed_files += other.changed_files;
+        self.marked_missing += other.marked_missing;
+        self.skipped_files += other.skipped_files;
+    }
 }
 
 pub fn compute_file_fingerprint(
@@ -267,7 +583,7 @@ pub fn parse_movie_filename(filename: &str) -> Option<ParsedMovieFilename> {
     })
 }
 
-async fn collect_movie_files(root: &Path) -> Result<Vec<PathBuf>, ScannerError> {
+pub(crate) async fn collect_movie_files(root: &Path) -> Result<Vec<PathBuf>, ScannerError> {
     let mut files = Vec::new();
     let mut entries = fs::read_dir(root)
         .await

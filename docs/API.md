@@ -37,6 +37,8 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`。
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
+- `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
+- `POST /api/v1/admin/jobs/{jobId}/cancel`：请求取消扫描任务，返回 202。
 
 根路径会先 canonicalize，再检查目录存在且可读；`isWritable` 独立返回。只读目录可以保存，但返回 `LIBRARY_PATH_NOT_WRITABLE` 警告。同一库的重复/重叠路径分别返回冲突/不可处理实体错误，跨库重叠返回结构化警告。
 
