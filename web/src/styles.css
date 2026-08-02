@@ -77,6 +77,20 @@ p { color: var(--muted); line-height: 1.6; }
 .source-list button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 .player { width: 100%; max-height: 72vh; background: #050808; border-radius: var(--radius); }
 .back-link { display: inline-flex; margin-bottom: 1.2rem; color: var(--accent); text-decoration: none; }
+.admin-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.admin-card { display: grid; gap: .45rem; padding: 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.admin-card strong { font-size: 1.5rem; }
+.admin-card span:last-child, .admin-list span, td small { color: var(--muted); font-size: .82rem; }
+.admin-form { display: flex; flex-wrap: wrap; gap: .6rem; }
+.admin-form input { min-width: 160px; flex: 1; padding: .65rem .75rem; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: #101c1e; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+table { width: 100%; border-collapse: collapse; background: var(--surface); }
+th, td { padding: .8rem; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+th { color: var(--muted); font-size: .8rem; font-weight: 500; }
+td small { display: block; margin-top: .25rem; }
+.admin-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+.admin-list { display: grid; gap: .65rem; margin: 0; padding: 0; list-style: none; }
+.admin-list li { display: flex; justify-content: space-between; gap: 1rem; padding: .75rem; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
 .mobile-nav { display: none; }
 @media (max-width: 760px) {
   .shell { display: block; }
@@ -88,4 +102,6 @@ p { color: var(--muted); line-height: 1.6; }
   .detail { grid-template-columns: 1fr; gap: 1.25rem; }
   .detail-poster { width: min(56vw, 220px); }
   .library-grid, .media-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; }
+  .admin-cards, .admin-columns { grid-template-columns: 1fr; }
+  .admin-form { display: grid; }
 }

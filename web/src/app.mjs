@@ -1,5 +1,5 @@
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, route: "home", item: null, error: "", setupNotice: "" };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", item: null, error: "", setupNotice: "" };
 
 const api = {
   async request(path, options = {}) {
@@ -21,6 +21,12 @@ const api = {
   libraryItems(id) { return this.request("/api/v1/libraries/" + encodeURIComponent(id) + "/items?page=1&pageSize=60"); },
   item(id) { return this.request("/api/v1/items/" + encodeURIComponent(id)); },
   search(query) { return this.request("/api/v1/search?q=" + encodeURIComponent(query) + "&page=1&pageSize=60"); },
+  adminUsers() { return this.request("/api/v1/admin/users"); },
+  createUser(data) { return this.request("/api/v1/admin/users", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
+  disableUser(id) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
+  adminLibraries() { return this.request("/api/v1/admin/libraries"); },
+  audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
+  ready() { return fetch("/health/ready", { credentials: "same-origin" }).then((response) => response.json()); },
 };
 
 function readCookie(name) {
@@ -48,6 +54,7 @@ function titleForRoute() {
   if (state.route === "libraries") return "媒体库";
   if (state.route === "search") return "搜索";
   if (state.route === "item") return state.item?.title || "详情";
+  if (state.route === "admin") return "管理控制台";
   return "你的片单";
 }
 
@@ -64,7 +71,8 @@ function brand() { return "<div class=\"brand\"><strong>Lux</strong><span>quietl
 function nav() {
   const homeCurrent = state.route === "home" ? "page" : "false";
   const libraryCurrent = state.route === "libraries" ? "page" : "false";
-  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\">首页</button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\">媒体库</button></nav>";
+  const admin = state.user.canManageServer ? "<button data-route=\"admin\" aria-current=\"" + (state.route === "admin" ? "page" : "false") + "\">管理</button>" : "";
+  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\">首页</button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\">媒体库</button>" + admin + "</nav>";
 }
 function account() {
   return "<div class=\"sidebar-footer\"><small>" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</small><button class=\"button secondary\" data-action=\"logout\" style=\"margin-top:.7rem;width:100%\">退出登录</button></div>";
@@ -100,6 +108,9 @@ async function loadRoute() {
     } else if (state.route === "item") {
       state.item = await api.item(state.itemId);
       view.innerHTML = renderDetail(state.item);
+    } else if (state.route === "admin") {
+      state.admin = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit()]);
+      view.innerHTML = renderAdmin();
     }
     bind();
   } catch (error) {
@@ -140,6 +151,17 @@ function renderDetail(item) {
   return "<a class=\"back-link\" href=\"#home\" data-route=\"home\">← 返回</a><article class=\"detail\"><div>" + poster(item, "detail-poster") + "</div><div class=\"detail-copy\"><span class=\"eyebrow\">" + escapeHtml(item.itemType || item.type || "media") + "</span><h2 style=\"margin-top:.6rem\">" + escapeHtml(item.title || item.name) + "</h2><div class=\"chips\">" + (item.productionYear ? "<span class=\"chip\">" + item.productionYear + "</span>" : "") + chips + "</div><p>" + escapeHtml(item.overview || "暂无简介。") + "</p>" + player + "</div></article>";
 }
 
+function renderAdmin() {
+  const ready = state.admin[0] || {};
+  const libraries = state.admin[1]?.libraries || [];
+  const users = state.admin[2]?.users || [];
+  const events = state.admin[3]?.events || [];
+  const userRows = users.map((user) => "<tr><td>" + escapeHtml(user.displayName) + "<small>" + escapeHtml(user.usernameNormalized) + "</small></td><td>" + (user.isDisabled ? "已禁用" : user.canManageServer ? "管理员" : "普通用户") + "</td><td>" + (user.isDisabled ? "" : "<button class=\"button secondary\" data-disable-user=\"" + escapeHtml(user.id) + "\">禁用</button>") + "</td></tr>").join("");
+  const libraryRows = libraries.map((library) => "<li><strong>" + escapeHtml(library.name) + "</strong><span>" + escapeHtml(library.kind) + " · " + (library.isEnabled ? "启用" : "停用") + "</span></li>").join("");
+  const auditRows = events.slice(0, 8).map((event) => "<li><strong>" + escapeHtml(event.eventType) + "</strong><span>" + escapeHtml(event.actorUsername || "system") + " · " + escapeHtml(event.targetId || "") + "</span></li>").join("");
+  return "<section class=\"section\"><div class=\"admin-cards\"><div class=\"admin-card\"><span class=\"eyebrow\">Health</span><strong>" + escapeHtml(ready.status || "unknown") + "</strong><span>schema " + escapeHtml(ready.schemaVersion || "—") + "</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Libraries</span><strong>" + libraries.length + "</strong><span>已配置媒体库</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Users</span><strong>" + users.length + "</strong><span>账户</span></div></div></section><section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>禁用不会删除历史状态</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" required><input name=\"password\" type=\"password\" placeholder=\"临时密码\" aria-label=\"临时密码\" required><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div></section><section class=\"section admin-columns\"><div><div class=\"section-heading\"><h2>媒体库</h2></div><ul class=\"admin-list\">" + libraryRows + "</ul></div><div><div class=\"section-heading\"><h2>最近审计</h2></div><ul class=\"admin-list\">" + auditRows + "</ul></div></section>";
+}
+
 function bind() {
   document.querySelectorAll("[data-route]").forEach((element) => element.addEventListener("click", (event) => { event.preventDefault(); state.route = element.dataset.route; state.error = ""; render(); }));
   document.querySelectorAll("[data-library]").forEach((element) => element.addEventListener("click", async () => {
@@ -153,6 +175,10 @@ function bind() {
     player.src = "/api/v1/items/" + encodeURIComponent(state.item.id) + "/stream?sourceId=" + encodeURIComponent(element.dataset.source);
     document.querySelectorAll("[data-source]").forEach((button) => button.setAttribute("aria-pressed", String(button === element)));
     player.play().catch(() => {});
+  }));
+  document.querySelectorAll("[data-disable-user]").forEach((element) => element.addEventListener("click", async () => {
+    if (!window.confirm("确认禁用这个用户？")) return;
+    try { await api.disableUser(element.dataset.disableUser); state.error = ""; render(); } catch (error) { state.error = error.message; render(); }
   }));
   document.querySelectorAll("[data-action='logout']").forEach((element) => element.addEventListener("click", async () => { try { await api.logout(); } finally { state.user = null; render(); } }));
   document.querySelectorAll("[data-action='retry']").forEach((element) => element.addEventListener("click", () => { state.error = ""; render(); }));
@@ -169,6 +195,11 @@ function bind() {
       await api.setup(form.username.value, form.displayName.value, form.password.value);
       state.initialized = true; state.error = ""; state.setupNotice = "初始化完成，请使用刚创建的管理员登录。"; render();
     } catch (error) { state.error = error.message; render(); }
+  }));
+  document.querySelectorAll("form[data-action='create-user']").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await api.createUser({ username: form.username.value, password: form.password.value }); state.route = "admin"; state.error = ""; render(); }
+    catch (error) { state.error = error.message; render(); }
   }));
   document.querySelectorAll("form[data-action='search']").forEach((form) => form.addEventListener("submit", (event) => {
     event.preventDefault(); const query = form.q.value.trim(); if (!query) return;
