@@ -600,7 +600,7 @@ pub struct MetadataReport {
     pub images_found: usize,
 }
 
-async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     let metadata = fs::metadata(path).await?;
     let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
     let modified_at = metadata
@@ -619,7 +619,7 @@ async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     ))
 }
 
-async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
+pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
     let directory = media_path.parent()?;
     let movie_nfo = directory.join("movie.nfo");
     if fs::try_exists(&movie_nfo).await.ok()? {

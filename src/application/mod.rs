@@ -5,6 +5,7 @@ pub mod identification;
 pub mod images;
 pub mod libraries;
 pub mod metadata;
+pub mod nfo;
 pub mod probe;
 pub mod scanner;
 pub mod setup;
