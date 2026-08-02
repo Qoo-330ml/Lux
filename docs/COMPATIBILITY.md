@@ -31,3 +31,16 @@
 | Infuse | 未发现已安装应用 | 无法开始本机 UI 探针 | 未测试，需安装后再测 |
 
 本次 VidHub 探针使用临时本机 ARM 服务 `127.0.0.1`，未记录密码、token、Cookie 或真实媒体数据。完成密码交接后，仍需记录实际请求序列和登录结果；在此之前阶段 2 门保持未通过。
+
+### 可重复的本地协议探针
+
+`tools/compatibility-probe/probe.py` 可对本机 Lux 运行一次脱敏协议序列：
+
+1. `System/Info/Public`
+2. `Users/Public`
+3. `Users/AuthenticateByName`
+4. 带 token 的 `System/Info`、`System/Ping`
+5. `Sessions/Logout`
+6. logout 后再次访问 `System/Info`，应为 `401`
+
+密码通过 `LUX_PROBE_PASSWORD` 注入，token 只在进程内使用；输出只包含路径、状态码和响应字段摘要。该工具用于协议回归，不等同于 VidHub、SenPlayer 或 Infuse 的真实客户端兼容性结论。
