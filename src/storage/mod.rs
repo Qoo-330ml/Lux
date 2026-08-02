@@ -1118,6 +1118,34 @@ impl Database {
             })
     }
 
+    pub(crate) async fn find_media_item_metadata(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredMediaMetadata>, StorageError> {
+        sqlx::query(
+            "SELECT title, original_title, overview, production_year,
+                    metadata_provenance_json, locked_fields_json
+             FROM media_items WHERE id = ?",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredMediaMetadata {
+                title: row.get("title"),
+                original_title: row.get("original_title"),
+                overview: row.get("overview"),
+                production_year: row.get("production_year"),
+                provenance_json: row.get("metadata_provenance_json"),
+                locked_fields_json: row.get("locked_fields_json"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn count_catalog_items(
         &self,
         library_id: Option<&str>,
@@ -1473,29 +1501,27 @@ impl Database {
 
     pub(crate) async fn update_media_item_metadata(
         &self,
-        item_id: &str,
-        title: Option<&str>,
-        original_title: Option<&str>,
-        overview: Option<&str>,
-        production_year: Option<i64>,
-        metadata_fingerprint: &[u8],
+        update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
         sqlx::query(
             "UPDATE media_items
-             SET title = COALESCE(?, title),
-                 original_title = COALESCE(?, original_title),
-                 overview = COALESCE(?, overview),
-                 production_year = COALESCE(?, production_year),
+             SET title = ?,
+                 original_title = ?,
+                 overview = ?,
+                 production_year = ?,
                  metadata_fingerprint = ?,
-                 metadata_provenance_json = '{\"source\":\"LOCAL_NFO\"}'
+                 metadata_provenance_json = ?,
+                 locked_fields_json = ?
              WHERE id = ?",
         )
-        .bind(title)
-        .bind(original_title)
-        .bind(overview)
-        .bind(production_year)
-        .bind(metadata_fingerprint)
-        .bind(item_id)
+        .bind(update.title)
+        .bind(update.original_title)
+        .bind(update.overview)
+        .bind(update.production_year)
+        .bind(update.metadata_fingerprint)
+        .bind(update.provenance_json)
+        .bind(update.locked_fields_json)
+        .bind(update.item_id)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -1861,6 +1887,16 @@ pub(crate) struct StoredMediaItem {
     pub(crate) id: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredMediaMetadata {
+    pub(crate) title: String,
+    pub(crate) original_title: Option<String>,
+    pub(crate) overview: Option<String>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) provenance_json: Option<String>,
+    pub(crate) locked_fields_json: Option<String>,
+}
+
 fn stored_media_item(row: sqlx::sqlite::SqliteRow) -> StoredMediaItem {
     StoredMediaItem { id: row.get("id") }
 }
@@ -1948,6 +1984,17 @@ pub(crate) struct NewLibrary<'a> {
     pub(crate) metadata_schedule: Option<&'a str>,
     pub(crate) scan_concurrency: i64,
     pub(crate) probe_concurrency: i64,
+}
+
+pub(crate) struct MediaMetadataUpdate<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) original_title: Option<&'a str>,
+    pub(crate) overview: Option<&'a str>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) metadata_fingerprint: &'a [u8],
+    pub(crate) provenance_json: &'a str,
+    pub(crate) locked_fields_json: &'a str,
 }
 
 pub(crate) struct LibrarySettingsUpdate<'a> {

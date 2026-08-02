@@ -1,16 +1,18 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt,
     io::Cursor,
     path::{Path, PathBuf},
 };
 
 use quick_xml::{escape::unescape, events::Event, reader::Reader};
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::{
     application::scanner::compute_file_fingerprint,
     domain::ids::LibraryId,
-    storage::{Database, StorageError},
+    storage::{Database, MediaMetadataUpdate, StorageError},
 };
 
 const MAX_NFO_BYTES: usize = 1024 * 1024;
@@ -23,6 +25,206 @@ pub struct NfoMetadata {
     pub original_title: Option<String>,
     pub production_year: Option<i32>,
     pub overview: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MetadataField {
+    Title,
+    OriginalTitle,
+    Overview,
+    ProductionYear,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MetadataSource {
+    LocalNfo,
+    TmdbLocalized,
+    Fallback,
+    LockedLocal,
+}
+
+impl MetadataSource {
+    const fn priority(self) -> u8 {
+        match self {
+            Self::Fallback => 1,
+            Self::TmdbLocalized => 2,
+            Self::LocalNfo => 3,
+            Self::LockedLocal => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataCandidate {
+    pub source: MetadataSource,
+    pub metadata: NfoMetadata,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MetadataState {
+    pub metadata: NfoMetadata,
+    pub provenance: BTreeMap<MetadataField, MetadataSource>,
+    pub locked_fields: BTreeSet<MetadataField>,
+}
+
+impl MetadataState {
+    pub fn from_metadata(metadata: NfoMetadata) -> Self {
+        let mut state = Self {
+            metadata,
+            ..Self::default()
+        };
+        for field in [
+            MetadataField::Title,
+            MetadataField::OriginalTitle,
+            MetadataField::Overview,
+            MetadataField::ProductionYear,
+        ] {
+            if state.has_value(field) {
+                state.provenance.insert(field, MetadataSource::Fallback);
+            }
+        }
+        state
+    }
+
+    pub fn from_persisted(
+        metadata: NfoMetadata,
+        provenance_json: Option<&str>,
+        locked_fields_json: Option<&str>,
+    ) -> Self {
+        let mut state = Self::from_metadata(metadata);
+        if let Some(raw) = provenance_json {
+            if let Ok(provenance) =
+                serde_json::from_str::<BTreeMap<MetadataField, MetadataSource>>(raw)
+            {
+                state.provenance.extend(provenance);
+            } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+                let legacy_source = value
+                    .get("source")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<MetadataSource>(value).ok());
+                if let Some(source) = legacy_source {
+                    for field in [
+                        MetadataField::Title,
+                        MetadataField::OriginalTitle,
+                        MetadataField::Overview,
+                        MetadataField::ProductionYear,
+                    ] {
+                        if state.has_value(field) {
+                            state.provenance.insert(field, source);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(raw) = locked_fields_json {
+            if let Ok(locked_fields) = serde_json::from_str::<BTreeSet<MetadataField>>(raw) {
+                for field in locked_fields {
+                    state.lock(field);
+                }
+            }
+        }
+        state
+    }
+
+    pub fn lock(&mut self, field: MetadataField) {
+        self.locked_fields.insert(field);
+        self.provenance.insert(field, MetadataSource::LockedLocal);
+    }
+
+    pub fn apply_automatic(&mut self, candidate: &MetadataCandidate) {
+        for field in [
+            MetadataField::Title,
+            MetadataField::OriginalTitle,
+            MetadataField::Overview,
+            MetadataField::ProductionYear,
+        ] {
+            if self.locked_fields.contains(&field) {
+                continue;
+            }
+            match field {
+                MetadataField::Title => {
+                    if let Some(value) = non_empty(candidate.metadata.title.as_deref()) {
+                        self.apply_text(field, value, candidate.source);
+                    }
+                }
+                MetadataField::OriginalTitle => {
+                    if let Some(value) = non_empty(candidate.metadata.original_title.as_deref()) {
+                        self.apply_text(field, value, candidate.source);
+                    }
+                }
+                MetadataField::Overview => {
+                    if let Some(value) = non_empty(candidate.metadata.overview.as_deref()) {
+                        self.apply_text(field, value, candidate.source);
+                    }
+                }
+                MetadataField::ProductionYear => {
+                    if let Some(value) = candidate.metadata.production_year
+                        && self.can_apply(field, candidate.source)
+                    {
+                        self.metadata.production_year = Some(value);
+                        self.provenance.insert(field, candidate.source);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn provenance_json(&self) -> String {
+        serde_json::to_string(&self.provenance).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    pub fn locked_fields_json(&self) -> String {
+        serde_json::to_string(&self.locked_fields).unwrap_or_else(|_| "[]".to_owned())
+    }
+
+    fn has_value(&self, field: MetadataField) -> bool {
+        match field {
+            MetadataField::Title => self
+                .metadata
+                .title
+                .as_deref()
+                .is_some_and(|v| !v.is_empty()),
+            MetadataField::OriginalTitle => self
+                .metadata
+                .original_title
+                .as_deref()
+                .is_some_and(|v| !v.is_empty()),
+            MetadataField::Overview => self
+                .metadata
+                .overview
+                .as_deref()
+                .is_some_and(|v| !v.is_empty()),
+            MetadataField::ProductionYear => self.metadata.production_year.is_some(),
+        }
+    }
+
+    fn can_apply(&self, field: MetadataField, source: MetadataSource) -> bool {
+        let current = self
+            .provenance
+            .get(&field)
+            .copied()
+            .unwrap_or(MetadataSource::Fallback);
+        !self.has_value(field) || source.priority() >= current.priority()
+    }
+
+    fn apply_text(&mut self, field: MetadataField, value: &str, source: MetadataSource) {
+        if !self.can_apply(field, source) {
+            return;
+        }
+        match field {
+            MetadataField::Title => self.metadata.title = Some(value.to_owned()),
+            MetadataField::OriginalTitle => self.metadata.original_title = Some(value.to_owned()),
+            MetadataField::Overview => self.metadata.overview = Some(value.to_owned()),
+            MetadataField::ProductionYear => return,
+        }
+        self.provenance.insert(field, source);
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 pub fn parse_nfo(bytes: &[u8]) -> Result<NfoMetadata, NfoError> {
@@ -276,16 +478,53 @@ impl MetadataEnricher {
                         Ok(bytes) => match parse_nfo(&bytes) {
                             Ok(metadata) => {
                                 if let Some(fingerprint) = fingerprint.as_deref() {
-                                    self.database
-                                        .update_media_item_metadata(
-                                            &source.item_id,
-                                            metadata.title.as_deref(),
-                                            metadata.original_title.as_deref(),
-                                            metadata.overview.as_deref(),
-                                            metadata.production_year.map(i64::from),
-                                            fingerprint,
-                                        )
-                                        .await?;
+                                    if let Some(current) = self
+                                        .database
+                                        .find_media_item_metadata(&source.item_id)
+                                        .await?
+                                    {
+                                        let current_metadata = NfoMetadata {
+                                            title: Some(current.title.clone()),
+                                            original_title: current.original_title,
+                                            overview: current.overview,
+                                            production_year: current
+                                                .production_year
+                                                .and_then(|year| i32::try_from(year).ok()),
+                                        };
+                                        let mut state = MetadataState::from_persisted(
+                                            current_metadata,
+                                            current.provenance_json.as_deref(),
+                                            current.locked_fields_json.as_deref(),
+                                        );
+                                        state.apply_automatic(&MetadataCandidate {
+                                            source: MetadataSource::LocalNfo,
+                                            metadata,
+                                        });
+                                        let provenance_json = state.provenance_json();
+                                        let locked_fields_json = state.locked_fields_json();
+                                        self.database
+                                            .update_media_item_metadata(MediaMetadataUpdate {
+                                                item_id: &source.item_id,
+                                                title: state
+                                                    .metadata
+                                                    .title
+                                                    .as_deref()
+                                                    .unwrap_or(current.title.as_str()),
+                                                original_title: state
+                                                    .metadata
+                                                    .original_title
+                                                    .as_deref(),
+                                                overview: state.metadata.overview.as_deref(),
+                                                production_year: state
+                                                    .metadata
+                                                    .production_year
+                                                    .map(i64::from),
+                                                metadata_fingerprint: fingerprint,
+                                                provenance_json: &provenance_json,
+                                                locked_fields_json: &locked_fields_json,
+                                            })
+                                            .await?;
+                                    }
                                 }
                                 report.nfo_loaded += 1;
                             }

@@ -2,7 +2,8 @@ use luxd::{
     application::{
         libraries::LibraryService,
         metadata::{
-            ImageType, LocalImage, MetadataEnricher, NfoMetadata, find_local_images, parse_nfo,
+            ImageType, LocalImage, MetadataCandidate, MetadataEnricher, MetadataField,
+            MetadataSource, MetadataState, NfoMetadata, find_local_images, parse_nfo,
         },
         scanner::LibraryScanner,
     },
@@ -10,6 +11,164 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
+
+#[test]
+fn metadata_merge_table_preserves_local_and_locked_values() {
+    struct Case {
+        name: &'static str,
+        initial: NfoMetadata,
+        initial_source: Option<(MetadataField, MetadataSource)>,
+        locked: Option<MetadataField>,
+        candidate: MetadataCandidate,
+        expected: NfoMetadata,
+        expected_source_field: MetadataField,
+        expected_source: MetadataSource,
+    }
+
+    let cases = [
+        Case {
+            name: "local nfo wins over tmdb",
+            initial: NfoMetadata {
+                title: Some("本地标题".to_owned()),
+                ..NfoMetadata::default()
+            },
+            initial_source: Some((MetadataField::Title, MetadataSource::LocalNfo)),
+            locked: None,
+            candidate: MetadataCandidate {
+                source: MetadataSource::TmdbLocalized,
+                metadata: NfoMetadata {
+                    title: Some("在线标题".to_owned()),
+                    production_year: Some(2020),
+                    ..NfoMetadata::default()
+                },
+            },
+            expected: NfoMetadata {
+                title: Some("本地标题".to_owned()),
+                production_year: Some(2020),
+                ..NfoMetadata::default()
+            },
+            expected_source_field: MetadataField::ProductionYear,
+            expected_source: MetadataSource::TmdbLocalized,
+        },
+        Case {
+            name: "locked local value cannot be refreshed",
+            initial: NfoMetadata {
+                overview: Some("手工简介".to_owned()),
+                ..NfoMetadata::default()
+            },
+            initial_source: Some((MetadataField::Overview, MetadataSource::LocalNfo)),
+            locked: Some(MetadataField::Overview),
+            candidate: MetadataCandidate {
+                source: MetadataSource::TmdbLocalized,
+                metadata: NfoMetadata {
+                    overview: Some("在线简介".to_owned()),
+                    ..NfoMetadata::default()
+                },
+            },
+            expected: NfoMetadata {
+                overview: Some("手工简介".to_owned()),
+                ..NfoMetadata::default()
+            },
+            expected_source_field: MetadataField::Overview,
+            expected_source: MetadataSource::LockedLocal,
+        },
+        Case {
+            name: "tmdb wins over fallback",
+            initial: NfoMetadata {
+                title: Some("文件名标题".to_owned()),
+                ..NfoMetadata::default()
+            },
+            initial_source: Some((MetadataField::Title, MetadataSource::Fallback)),
+            locked: None,
+            candidate: MetadataCandidate {
+                source: MetadataSource::TmdbLocalized,
+                metadata: NfoMetadata {
+                    title: Some("在线标题".to_owned()),
+                    ..NfoMetadata::default()
+                },
+            },
+            expected: NfoMetadata {
+                title: Some("在线标题".to_owned()),
+                ..NfoMetadata::default()
+            },
+            expected_source_field: MetadataField::Title,
+            expected_source: MetadataSource::TmdbLocalized,
+        },
+        Case {
+            name: "blank online value does not erase local value",
+            initial: NfoMetadata {
+                overview: Some("有效简介".to_owned()),
+                ..NfoMetadata::default()
+            },
+            initial_source: Some((MetadataField::Overview, MetadataSource::LocalNfo)),
+            locked: None,
+            candidate: MetadataCandidate {
+                source: MetadataSource::TmdbLocalized,
+                metadata: NfoMetadata {
+                    overview: Some("   ".to_owned()),
+                    ..NfoMetadata::default()
+                },
+            },
+            expected: NfoMetadata {
+                overview: Some("有效简介".to_owned()),
+                ..NfoMetadata::default()
+            },
+            expected_source_field: MetadataField::Overview,
+            expected_source: MetadataSource::LocalNfo,
+        },
+    ];
+
+    for case in cases {
+        let mut state = MetadataState::from_metadata(case.initial);
+        if let Some((field, source)) = case.initial_source {
+            state.provenance.insert(field, source);
+        }
+        if let Some(field) = case.locked {
+            state.lock(field);
+        }
+        state.apply_automatic(&case.candidate);
+        assert_eq!(state.metadata, case.expected, "{}", case.name);
+        assert_eq!(
+            state.provenance.get(&case.expected_source_field).copied(),
+            Some(case.expected_source),
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn metadata_state_round_trip_keeps_provenance_and_locks() {
+    let mut state = MetadataState::from_metadata(NfoMetadata {
+        title: Some("锁定标题".to_owned()),
+        ..NfoMetadata::default()
+    });
+    state
+        .provenance
+        .insert(MetadataField::Title, MetadataSource::LocalNfo);
+    state.lock(MetadataField::Title);
+
+    let provenance_json = state.provenance_json();
+    let locked_fields_json = state.locked_fields_json();
+    let restored = MetadataState::from_persisted(
+        state.metadata.clone(),
+        Some(&provenance_json),
+        Some(&locked_fields_json),
+    );
+    let mut refreshed = restored;
+    refreshed.apply_automatic(&MetadataCandidate {
+        source: MetadataSource::TmdbLocalized,
+        metadata: NfoMetadata {
+            title: Some("在线标题".to_owned()),
+            ..NfoMetadata::default()
+        },
+    });
+    assert_eq!(refreshed.metadata.title.as_deref(), Some("锁定标题"));
+    assert_eq!(
+        refreshed.provenance.get(&MetadataField::Title),
+        Some(&MetadataSource::LockedLocal)
+    );
+}
 
 #[test]
 fn nfo_parser_reads_local_fields_and_ignores_unknown_fields() {
@@ -128,6 +287,25 @@ async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
             2021,
             "本地简介".to_owned()
         )
+    );
+    let provenance: String = sqlx::query_scalar(
+        "SELECT metadata_provenance_json FROM media_items WHERE sort_title = 'good movie'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let provenance: serde_json::Value = serde_json::from_str(&provenance)?;
+    assert_eq!(provenance["title"], "LOCAL_NFO");
+    assert_eq!(provenance["originalTitle"], "LOCAL_NFO");
+    assert_eq!(provenance["overview"], "LOCAL_NFO");
+    assert_eq!(provenance["productionYear"], "LOCAL_NFO");
+    let locked_fields: String = sqlx::query_scalar(
+        "SELECT locked_fields_json FROM media_items WHERE sort_title = 'good movie'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&locked_fields)?,
+        serde_json::json!([])
     );
     let image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_images")
         .fetch_one(database.pool())
