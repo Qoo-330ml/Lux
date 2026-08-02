@@ -1,5 +1,5 @@
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", item: null, error: "", notice: "", setupNotice: "" };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, playback: null, error: "", notice: "", setupNotice: "" };
 
 const api = {
   async request(path, options = {}) {
@@ -18,8 +18,10 @@ const api = {
   me() { return this.request("/api/v1/auth/me"); },
   home() { return this.request("/api/v1/home"); },
   libraries() { return this.request("/api/v1/libraries"); },
-  libraryItems(id) { return this.request("/api/v1/libraries/" + encodeURIComponent(id) + "/items?page=1&pageSize=60"); },
+  libraryItems(id, filters = {}) { const params = new URLSearchParams({ page: "1", pageSize: "60" }); Object.entries(filters).forEach(([key, value]) => { if (value !== "" && value !== null && value !== undefined) params.set(key, String(value)); }); return this.request("/api/v1/libraries/" + encodeURIComponent(id) + "/items?" + params.toString()); },
   item(id) { return this.request("/api/v1/items/" + encodeURIComponent(id)); },
+  playback(id) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/playback"); },
+  favorite(id, favorite) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/favorite", { method: "PUT", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ favorite }) }); },
   search(query) { return this.request("/api/v1/search?q=" + encodeURIComponent(query) + "&page=1&pageSize=60"); },
   adminUsers() { return this.request("/api/v1/admin/users"); },
   createUser(data) { return this.request("/api/v1/admin/users", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
@@ -62,6 +64,7 @@ function poster(item, className = "poster") {
 function loading() { return "<div class=\"loading\" aria-busy=\"true\">正在整理你的媒体…</div>"; }
 function titleForRoute() {
   if (state.route === "libraries") return "媒体库";
+  if (state.route === "library") return state.libraries.find((library) => library.id === state.libraryId)?.name || "媒体库内容";
   if (state.route === "search") return "搜索";
   if (state.route === "item") return state.item?.title || "详情";
   if (state.route === "admin") return "管理控制台";
@@ -113,12 +116,17 @@ async function loadRoute() {
     } else if (state.route === "libraries") {
       state.libraries = state.libraries.length ? state.libraries : (await api.libraries()).libraries || [];
       view.innerHTML = renderLibraries();
+    } else if (state.route === "library") {
+      state.libraries = state.libraries.length ? state.libraries : (await api.libraries()).libraries || [];
+      const result = await api.libraryItems(state.libraryId, state.libraryFilters);
+      const library = state.libraries.find((entry) => entry.id === state.libraryId);
+      view.innerHTML = renderLibraryItems(result, library);
     } else if (state.route === "search") {
       const result = await api.search(state.query);
       view.innerHTML = renderGrid(result.items || [], "搜索“" + escapeHtml(state.query) + "”");
     } else if (state.route === "item") {
-      state.item = await api.item(state.itemId);
-      view.innerHTML = renderDetail(state.item);
+      [state.item, state.playback] = await Promise.all([api.item(state.itemId), api.playback(state.itemId)]);
+      view.innerHTML = renderDetail(state.item, state.playback);
     } else if (state.route === "admin") {
       const [ready, libraries, users, audit, pending] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit(), api.pendingMetadata()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
@@ -148,6 +156,12 @@ function renderLibraries() {
   const content = state.libraries.length ? state.libraries.map(libraryCard).join("") : "<div class=\"empty\"><h2>没有媒体库</h2><p>当前账户没有可见媒体库。</p></div>";
   return "<section class=\"section\"><div class=\"library-grid\">" + content + "</div></section>";
 }
+function renderLibraryItems(result, library) {
+  const filters = state.libraryFilters || {};
+  const selected = (name, value) => filters[name] === value ? " selected" : "";
+  const form = `<form class="filter-form" data-action="library-filter"><label>类型 <select name="item_type"><option value="">全部</option><option value="movie"${selected("item_type", "movie")}>电影</option><option value="series"${selected("item_type", "series")}>剧集</option><option value="episode"${selected("item_type", "episode")}>单集</option></select></label><label>年份 <input name="year" type="number" min="1800" max="2200" value="${escapeHtml(filters.year || "")}" placeholder="2024"></label><label>观看 <select name="is_played"><option value="">全部</option><option value="true"${selected("is_played", "true")}>已看</option><option value="false"${selected("is_played", "false")}>未看</option></select></label><label>收藏 <select name="is_favorite"><option value="">全部</option><option value="true"${selected("is_favorite", "true")}>已收藏</option><option value="false"${selected("is_favorite", "false")}>未收藏</option></select></label><label>排序 <select name="sort_by"><option value="">名称</option><option value="DateCreated"${selected("sort_by", "DateCreated")}>最近添加</option></select></label><label>顺序 <select name="sort_order"><option value="Ascending"${selected("sort_order", "Ascending")}>正序</option><option value="Descending"${selected("sort_order", "Descending")}>倒序</option></select></label><button class="button" type="submit">应用筛选</button><button class="button secondary" type="button" data-action="clear-library-filter">清除</button></form>`;
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>" + escapeHtml(library?.name || "媒体库") + "</h2><span>" + (result.total || 0) + " 项</span></div>" + form + renderGrid(result.items || []) + "</section>";
+}
 function renderGrid(items, heading = "") {
   const title = heading ? "<div class=\"section-heading\" style=\"grid-column:1/-1\"><h2>" + heading + "</h2><span>" + items.length + " 项</span></div>" : "";
   const content = items.length ? items.map(mediaCard).join("") : "<div class=\"empty\" style=\"grid-column:1/-1\"><h3>没有找到内容</h3><p>试试其他关键词或筛选条件。</p></div>";
@@ -156,12 +170,14 @@ function renderGrid(items, heading = "") {
 function mediaCard(item) {
   return "<button class=\"media-card\" data-item=\"" + escapeHtml(item.id) + "\">" + poster(item) + "<span class=\"media-card-body\"><strong>" + escapeHtml(item.title || item.name) + "</strong><span class=\"media-meta\">" + escapeHtml(item.productionYear || item.itemType || "") + "</span></span></button>";
 }
-function renderDetail(item) {
+function renderDetail(item, playback = {}) {
   const sources = item.mediaSources || [];
   const chips = sources.map((source) => "<span class=\"chip\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "source") + "</span>").join("");
   const buttons = sources.map((source, index) => "<button class=\"button secondary\" data-source=\"" + escapeHtml(source.id) + "\" aria-pressed=\"" + (index === 0) + "\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "版本 " + (index + 1)) + "</button>").join("");
   const player = sources.length ? "<div class=\"source-list\" aria-label=\"媒体版本\">" + buttons + "</div><video class=\"player\" controls preload=\"metadata\" data-player src=\"/api/v1/items/" + encodeURIComponent(item.id) + "/stream?sourceId=" + encodeURIComponent(sources[0].id) + "\"></video>" : "";
-  return "<a class=\"back-link\" href=\"#home\" data-route=\"home\">← 返回</a><article class=\"detail\"><div>" + poster(item, "detail-poster") + "</div><div class=\"detail-copy\"><span class=\"eyebrow\">" + escapeHtml(item.itemType || item.type || "media") + "</span><h2 style=\"margin-top:.6rem\">" + escapeHtml(item.title || item.name) + "</h2><div class=\"chips\">" + (item.productionYear ? "<span class=\"chip\">" + item.productionYear + "</span>" : "") + chips + "</div><p>" + escapeHtml(item.overview || "暂无简介。") + "</p>" + player + "</div></article>";
+  const favoriteLabel = playback.isFavorite ? "取消收藏" : "收藏";
+  const userData = "<div class=\"chips\"><span class=\"chip\">" + (playback.isPlayed ? "已看" : "未看") + "</span>" + (playback.isFavorite ? "<span class=\"chip\">已收藏</span>" : "") + (playback.positionTicks ? "<span class=\"chip\">已播放 " + Math.round(playback.positionTicks / 10000000) + " 秒</span>" : "") + "</div>";
+  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail"><div>${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2 style="margin-top:.6rem">${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button>${player}</div></article>`;
 }
 
 function renderAdmin() {
@@ -201,8 +217,7 @@ function renderUserEditor(user, libraries, granted) {
 function bind() {
   document.querySelectorAll("[data-route]").forEach((element) => element.addEventListener("click", (event) => { event.preventDefault(); state.route = element.dataset.route; state.error = ""; render(); }));
   document.querySelectorAll("[data-library]").forEach((element) => element.addEventListener("click", async () => {
-    try { const result = await api.libraryItems(element.dataset.library); document.querySelector("#view").innerHTML = renderGrid(result.items || [], "媒体库内容"); bind(); }
-    catch (error) { state.error = error.message; render(); }
+    state.libraryId = element.dataset.library; state.libraryFilters = {}; state.route = "library"; state.error = ""; state.notice = ""; render();
   }));
   document.querySelectorAll("[data-item]").forEach((element) => element.addEventListener("click", () => { state.itemId = element.dataset.item; state.route = "item"; state.error = ""; render(); }));
   document.querySelectorAll("[data-source]").forEach((element) => element.addEventListener("click", () => {
@@ -211,6 +226,16 @@ function bind() {
     player.src = "/api/v1/items/" + encodeURIComponent(state.item.id) + "/stream?sourceId=" + encodeURIComponent(element.dataset.source);
     document.querySelectorAll("[data-source]").forEach((button) => button.setAttribute("aria-pressed", String(button === element)));
     player.play().catch(() => {});
+  }));
+  document.querySelectorAll("form[data-action='library-filter']").forEach((form) => form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    state.libraryFilters = Object.fromEntries(["item_type", "year", "is_played", "is_favorite", "sort_by", "sort_order"].map((name) => [name, form[name].value]).filter(([, value]) => value));
+    state.route = "library"; state.error = ""; state.notice = ""; render();
+  }));
+  document.querySelectorAll("[data-action='clear-library-filter']").forEach((element) => element.addEventListener("click", () => { state.libraryFilters = {}; state.route = "library"; state.error = ""; state.notice = ""; render(); }));
+  document.querySelectorAll("[data-action='toggle-favorite']").forEach((element) => element.addEventListener("click", async () => {
+    try { await api.favorite(state.item.id, !state.playback?.isFavorite); state.notice = state.playback?.isFavorite ? "已取消收藏。" : "已加入收藏。"; state.error = ""; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("[data-player]").forEach((player) => {
     let lastReport = 0;

@@ -72,6 +72,10 @@ p { color: var(--muted); line-height: 1.6; }
 .detail-poster { width: 100%; border-radius: var(--radius); }
 .detail-copy { max-width: 720px; }
 .detail-copy p { max-width: 65ch; }
+.filter-form { display: flex; flex-wrap: wrap; align-items: end; gap: .6rem; padding: .85rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.filter-form label { display: grid; gap: .35rem; min-width: 110px; color: var(--muted); font-size: .78rem; }
+.filter-form input, .filter-form select { width: 100%; padding: .55rem .65rem; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: #101c1e; }
+.filter-form .button { margin-top: 1rem; }
 .chips, .source-list { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
 .chip { padding: .35rem .55rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .8rem; }
 .source-list button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
