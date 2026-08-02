@@ -6,3 +6,4 @@ pub mod metadata;
 pub mod probe;
 pub mod scanner;
 pub mod setup;
+pub mod watch;
