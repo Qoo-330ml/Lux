@@ -8,6 +8,7 @@ use quick_xml::{escape::unescape, events::Event, reader::Reader};
 use tokio::fs;
 
 use crate::{
+    application::scanner::compute_file_fingerprint,
     domain::ids::LibraryId,
     storage::{Database, StorageError},
 };
@@ -257,24 +258,50 @@ impl MetadataEnricher {
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
             let nfo_path = find_nfo_path(&media_path).await;
             if let Some(nfo_path) = nfo_path {
-                match fs::read(&nfo_path)
-                    .await
-                    .map_err(NfoError::Io)
-                    .and_then(|bytes| parse_nfo(&bytes))
-                {
-                    Ok(metadata) => {
-                        self.database
-                            .update_media_item_metadata(
-                                &source.item_id,
-                                metadata.title.as_deref(),
-                                metadata.original_title.as_deref(),
-                                metadata.overview.as_deref(),
-                                metadata.production_year.map(i64::from),
-                            )
-                            .await?;
-                        report.nfo_loaded += 1;
+                let fingerprint = nfo_fingerprint(&nfo_path).await.ok();
+                let already_checked = if let Some(fingerprint) = fingerprint.as_deref() {
+                    self.database
+                        .media_item_metadata_fingerprint(&source.item_id)
+                        .await?
+                        .as_deref()
+                        == Some(fingerprint)
+                } else {
+                    false
+                };
+                if already_checked {
+                    report.nfo_skipped += 1;
+                } else {
+                    match fs::read(&nfo_path).await {
+                        Err(_) => report.nfo_failed += 1,
+                        Ok(bytes) => match parse_nfo(&bytes) {
+                            Ok(metadata) => {
+                                if let Some(fingerprint) = fingerprint.as_deref() {
+                                    self.database
+                                        .update_media_item_metadata(
+                                            &source.item_id,
+                                            metadata.title.as_deref(),
+                                            metadata.original_title.as_deref(),
+                                            metadata.overview.as_deref(),
+                                            metadata.production_year.map(i64::from),
+                                            fingerprint,
+                                        )
+                                        .await?;
+                                }
+                                report.nfo_loaded += 1;
+                            }
+                            Err(_) => {
+                                if let Some(fingerprint) = fingerprint.as_deref() {
+                                    self.database
+                                        .mark_media_item_metadata_checked(
+                                            &source.item_id,
+                                            fingerprint,
+                                        )
+                                        .await?;
+                                }
+                                report.nfo_failed += 1;
+                            }
+                        },
                     }
-                    Err(_) => report.nfo_failed += 1,
                 }
             }
             let mut entries = fs::read_dir(media_path.parent().unwrap_or(Path::new(".")))
@@ -330,7 +357,27 @@ impl MetadataEnricher {
 pub struct MetadataReport {
     pub nfo_loaded: usize,
     pub nfo_failed: usize,
+    pub nfo_skipped: usize,
     pub images_found: usize,
+}
+
+async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    let metadata = fs::metadata(path).await?;
+    let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0);
+    let path = path.to_string_lossy();
+    Ok(compute_file_fingerprint(
+        &path,
+        size,
+        modified_at,
+        None,
+        None,
+    ))
 }
 
 async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {

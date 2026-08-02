@@ -550,7 +550,7 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         sqlx::query(
-            "SELECT id, size, modified_at
+            "SELECT id, fingerprint
              FROM filesystem_entries
              WHERE library_root_id = ? AND relative_path = ?",
         )
@@ -570,21 +570,65 @@ impl Database {
         id: &str,
         size: i64,
         modified_at: i64,
+        fingerprint: &[u8],
         last_seen_generation: &str,
     ) -> Result<(), StorageError> {
         sqlx::query(
             "UPDATE filesystem_entries
-             SET size = ?, modified_at = ?, last_seen_generation = ?,
+             SET size = ?, modified_at = ?, fingerprint = ?, last_seen_generation = ?,
                  is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(size)
         .bind(modified_at)
+        .bind(fingerprint)
         .bind(last_seen_generation)
         .bind(id)
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_filesystem_entry_seen(
+        &self,
+        id: &str,
+        last_seen_generation: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET last_seen_generation = ?, is_missing = 0, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(last_seen_generation)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_missing_filesystem_entries(
+        &self,
+        library_root_id: &str,
+        generation: &str,
+    ) -> Result<u64, StorageError> {
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET is_missing = 1, updated_at = unixepoch()
+             WHERE library_root_id = ? AND last_seen_generation != ? AND is_missing = 0",
+        )
+        .bind(library_root_id)
+        .bind(generation)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -620,8 +664,8 @@ impl Database {
         sqlx::query(
             "INSERT INTO filesystem_entries (
                 id, library_root_id, relative_path, entry_kind, size,
-                modified_at, last_seen_generation, is_missing
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                modified_at, fingerprint, last_seen_generation, is_missing
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
         )
         .bind(entry.id)
         .bind(entry.library_root_id)
@@ -629,6 +673,7 @@ impl Database {
         .bind(entry.entry_kind)
         .bind(entry.size)
         .bind(entry.modified_at)
+        .bind(entry.fingerprint)
         .bind(entry.last_seen_generation)
         .execute(&self.pool)
         .await
@@ -1039,6 +1084,7 @@ impl Database {
         original_title: Option<&str>,
         overview: Option<&str>,
         production_year: Option<i64>,
+        metadata_fingerprint: &[u8],
     ) -> Result<(), StorageError> {
         sqlx::query(
             "UPDATE media_items
@@ -1046,6 +1092,7 @@ impl Database {
                  original_title = COALESCE(?, original_title),
                  overview = COALESCE(?, overview),
                  production_year = COALESCE(?, production_year),
+                 metadata_fingerprint = ?,
                  metadata_provenance_json = '{\"source\":\"LOCAL_NFO\"}'
              WHERE id = ?",
         )
@@ -1053,6 +1100,7 @@ impl Database {
         .bind(original_title)
         .bind(overview)
         .bind(production_year)
+        .bind(metadata_fingerprint)
         .bind(item_id)
         .execute(&self.pool)
         .await
@@ -1061,6 +1109,37 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn media_item_metadata_fingerprint(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn mark_media_item_metadata_checked(
+        &self,
+        item_id: &str,
+        metadata_fingerprint: &[u8],
+    ) -> Result<(), StorageError> {
+        sqlx::query("UPDATE media_items SET metadata_fingerprint = ? WHERE id = ?")
+            .bind(metadata_fingerprint)
+            .bind(item_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn insert_item_image(
@@ -1344,15 +1423,13 @@ fn stored_library_root(row: sqlx::sqlite::SqliteRow) -> StoredLibraryRoot {
 #[derive(Debug)]
 pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
-    pub(crate) size: i64,
-    pub(crate) modified_at: i64,
+    pub(crate) fingerprint: Option<Vec<u8>>,
 }
 
 fn stored_filesystem_entry(row: sqlx::sqlite::SqliteRow) -> StoredFilesystemEntry {
     StoredFilesystemEntry {
         id: row.get("id"),
-        size: row.get("size"),
-        modified_at: row.get("modified_at"),
+        fingerprint: row.get("fingerprint"),
     }
 }
 
@@ -1466,6 +1543,7 @@ pub(crate) struct NewFilesystemEntry<'a> {
     pub(crate) entry_kind: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) fingerprint: &'a [u8],
     pub(crate) last_seen_generation: &'a str,
 }
 

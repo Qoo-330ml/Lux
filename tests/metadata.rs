@@ -142,8 +142,9 @@ async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
     let second_report = MetadataEnricher::new(database.clone())
         .enrich_movie_library(library.id)
         .await?;
-    assert_eq!(second_report.nfo_loaded, 1);
-    assert_eq!(second_report.nfo_failed, 1);
+    assert_eq!(second_report.nfo_loaded, 0);
+    assert_eq!(second_report.nfo_failed, 0);
+    assert_eq!(second_report.nfo_skipped, 2);
     assert_eq!(second_report.images_found, 0);
     let image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_images")
         .fetch_one(database.pool())

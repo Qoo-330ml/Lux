@@ -4,6 +4,9 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use tokio::fs;
 use uuid::Uuid;
 
@@ -71,20 +74,32 @@ impl LibraryScanner {
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+                    .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
                     .unwrap_or(0);
+                let (device, inode) = file_identity(&metadata);
+                let fingerprint =
+                    compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
                 report.discovered_files += 1;
                 if let Some(existing_entry) = self
                     .database
                     .find_filesystem_entry(&root.id, &relative_path)
                     .await?
                 {
-                    if existing_entry.size == size && existing_entry.modified_at == modified_at {
+                    if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+                        self.database
+                            .mark_filesystem_entry_seen(&existing_entry.id, &generation)
+                            .await?;
                         report.skipped_files += 1;
                         continue;
                     }
                     self.database
-                        .update_filesystem_entry(&existing_entry.id, size, modified_at, &generation)
+                        .update_filesystem_entry(
+                            &existing_entry.id,
+                            size,
+                            modified_at,
+                            &fingerprint,
+                            &generation,
+                        )
                         .await?;
                     self.database
                         .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
@@ -102,6 +117,7 @@ impl LibraryScanner {
                         entry_kind: "FILE",
                         size,
                         modified_at,
+                        fingerprint: &fingerprint,
                         last_seen_generation: &generation,
                     })
                     .await?;
@@ -158,6 +174,12 @@ impl LibraryScanner {
                     report.created_items += 1;
                 }
             }
+            report.marked_missing += usize::try_from(
+                self.database
+                    .mark_missing_filesystem_entries(&root.id, &generation)
+                    .await?,
+            )
+            .unwrap_or(usize::MAX);
         }
         Ok(report)
     }
@@ -169,7 +191,38 @@ pub struct ScanReport {
     pub created_items: usize,
     pub created_sources: usize,
     pub changed_files: usize,
+    pub marked_missing: usize,
     pub skipped_files: usize,
+}
+
+pub fn compute_file_fingerprint(
+    relative_path: &str,
+    size: i64,
+    modified_at: i64,
+    device: Option<u64>,
+    inode: Option<u64>,
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"LUX-FP-1\0");
+    hasher.update((relative_path.len() as u64).to_le_bytes());
+    hasher.update(relative_path.as_bytes());
+    hasher.update(size.to_le_bytes());
+    hasher.update(modified_at.to_le_bytes());
+    hasher.update(device.unwrap_or_default().to_le_bytes());
+    hasher.update(inode.unwrap_or_default().to_le_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn file_identity(metadata: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
+    #[cfg(unix)]
+    {
+        (Some(metadata.dev()), Some(metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        (None, None)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
