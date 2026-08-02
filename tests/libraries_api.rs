@@ -185,3 +185,167 @@ async fn non_admin_cannot_manage_libraries() -> Result<(), Box<dyn std::error::E
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_update_independent_library_schedules_without_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let mut library_ids = Vec::new();
+    for name in ["Movies", "Series"] {
+        let response = client
+            .post(format!("{base_url}/api/v1/admin/libraries"))
+            .header(COOKIE, &cookies)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({ "name": name, "kind": "MIXED" }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        let body: Value = response.json().await?;
+        library_ids.push(
+            body["library"]["id"]
+                .as_str()
+                .ok_or("missing library ID")?
+                .to_owned(),
+        );
+    }
+
+    let first_update = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/libraries/{}",
+            library_ids[0]
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "realtimeWatchEnabled": true,
+            "incrementalSchedule": "interval:30s",
+            "reconciliationSchedule": "0 3 * * *",
+            "metadataSchedule": "interval:5m",
+            "scanConcurrency": 4,
+            "probeConcurrency": 3
+        }))
+        .send()
+        .await?;
+    assert_eq!(first_update.status(), reqwest::StatusCode::OK);
+    let first_body: Value = first_update.json().await?;
+    assert_eq!(first_body["library"]["incrementalSchedule"], "interval:30s");
+    assert_eq!(first_body["library"]["scanConcurrency"], 4);
+
+    let second_update = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/libraries/{}",
+            library_ids[1]
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "incrementalSchedule": "interval:2h",
+            "scanConcurrency": 7
+        }))
+        .send()
+        .await?;
+    assert_eq!(second_update.status(), reqwest::StatusCode::OK);
+
+    let listed = client
+        .get(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let listed_body: Value = listed.json().await?;
+    let libraries = listed_body["libraries"]
+        .as_array()
+        .ok_or("missing libraries")?;
+    let first = libraries
+        .iter()
+        .find(|library| library["id"] == library_ids[0])
+        .ok_or("missing first library")?;
+    let second = libraries
+        .iter()
+        .find(|library| library["id"] == library_ids[1])
+        .ok_or("missing second library")?;
+    assert_eq!(first["incrementalSchedule"], "interval:30s");
+    assert_eq!(first["reconciliationSchedule"], "0 3 * * *");
+    assert_eq!(first["metadataSchedule"], "interval:5m");
+    assert_eq!(first["scanConcurrency"], 4);
+    assert_eq!(first["probeConcurrency"], 3);
+    assert_eq!(second["incrementalSchedule"], "interval:2h");
+    assert_eq!(second["reconciliationSchedule"], Value::Null);
+    assert_eq!(second["scanConcurrency"], 7);
+
+    let scheduled_tasks: Vec<(String, String, Option<String>, i64, String)> = sqlx::query_as(
+        "SELECT owner_id, task_type, cron_or_interval, is_enabled, resource_limit_json
+         FROM scheduled_task_configs ORDER BY owner_id, task_type",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(scheduled_tasks.len(), 6);
+    assert!(
+        scheduled_tasks
+            .iter()
+            .any(|(owner, task, schedule, enabled, _)| {
+                owner == &library_ids[0]
+                    && task == "METADATA_PARSE"
+                    && schedule.as_deref() == Some("interval:5m")
+                    && *enabled == 1
+            })
+    );
+    assert!(
+        scheduled_tasks
+            .iter()
+            .any(|(owner, task, schedule, enabled, _)| {
+                owner == &library_ids[1]
+                    && task == "RECONCILIATION_SCAN"
+                    && schedule.is_none()
+                    && *enabled == 0
+            })
+    );
+
+    let cleared = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/libraries/{}",
+            library_ids[0]
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "metadataSchedule": null }))
+        .send()
+        .await?;
+    assert_eq!(cleared.status(), reqwest::StatusCode::OK);
+    let cleared_body: Value = cleared.json().await?;
+    assert_eq!(cleared_body["library"]["metadataSchedule"], Value::Null);
+
+    let invalid = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/libraries/{}",
+            library_ids[0]
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "scanConcurrency": 0 }))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+    Ok(())
+}

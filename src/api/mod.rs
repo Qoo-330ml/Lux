@@ -25,7 +25,7 @@ use crate::{
         access::{AccessPrincipal, MediaAccessService},
         catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
         images::{ImageError, ImageService, normalize_image_type},
-        libraries::{LibraryService, LibraryServiceError},
+        libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         scanner::{ScanJobError, ScanJobService},
     },
     auth::users::{UserRecord, UserStoreError},
@@ -96,6 +96,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries",
             get(admin_list_libraries).post(admin_create_library),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}",
+            patch(admin_update_library),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/roots",
@@ -1454,6 +1458,28 @@ struct AddLibraryRootRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UpdateLibraryRequest {
+    realtime_watch_enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    incremental_schedule: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    reconciliation_schedule: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    metadata_schedule: Option<Option<String>>,
+    scan_concurrency: Option<i64>,
+    probe_concurrency: Option<i64>,
+}
+
+fn deserialize_optional_optional<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetLibraryAccessRequest {
     can_view: bool,
 }
@@ -1804,6 +1830,53 @@ async fn admin_create_library(
     }
 }
 
+async fn admin_update_library(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateLibraryRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id,
+        Err(error) => {
+            return library_error(
+                &headers,
+                LibraryServiceError::InvalidLibraryId(error.to_string()),
+            );
+        }
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let settings = LibrarySettingsPatch {
+        realtime_watch_enabled: request.realtime_watch_enabled,
+        incremental_schedule: request.incremental_schedule,
+        reconciliation_schedule: request.reconciliation_schedule,
+        metadata_schedule: request.metadata_schedule,
+        scan_concurrency: request.scan_concurrency,
+        probe_concurrency: request.probe_concurrency,
+    };
+    match libraries.update_settings(library_id, settings).await {
+        Ok(view) => (
+            StatusCode::OK,
+            Json(json!({
+                "library": library_json(&view.library, &view.roots)
+            })),
+        )
+            .into_response(),
+        Err(error) => library_error(&headers, error),
+    }
+}
+
 async fn admin_add_library_root(
     headers: HeaderMap,
     Path(library_id): Path<String>,
@@ -1847,6 +1920,8 @@ async fn admin_add_library_root(
 fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
     let (status, code, message) = match error {
         LibraryServiceError::InvalidName
+        | LibraryServiceError::InvalidSchedule
+        | LibraryServiceError::InvalidConcurrency
         | LibraryServiceError::InvalidLibraryId(_)
         | LibraryServiceError::InvalidRootId(_)
         | LibraryServiceError::InvalidKind(_) => (

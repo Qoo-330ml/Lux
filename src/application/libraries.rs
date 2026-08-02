@@ -7,12 +7,15 @@ use crate::{
         classify_root_overlap, inspect_root_path,
     },
     storage::{
-        Database, NewLibrary, NewLibraryRoot, StorageError, StoredLibrary, StoredLibraryRoot,
+        Database, LibrarySettingsUpdate, NewLibrary, NewLibraryRoot, StorageError, StoredLibrary,
+        StoredLibraryRoot,
     },
 };
 
 const DEFAULT_SCAN_CONCURRENCY: i64 = 2;
 const DEFAULT_PROBE_CONCURRENCY: i64 = 1;
+const MAX_LIBRARY_CONCURRENCY: i64 = 64;
+const MAX_SCHEDULE_LENGTH: usize = 128;
 
 #[derive(Clone)]
 pub struct LibraryService {
@@ -72,6 +75,54 @@ impl LibraryService {
             views.push(LibraryView { library, roots });
         }
         Ok(views)
+    }
+
+    pub async fn update_settings(
+        &self,
+        library_id: LibraryId,
+        settings: LibrarySettingsPatch,
+    ) -> Result<LibraryView, LibraryServiceError> {
+        validate_concurrency(settings.scan_concurrency)?;
+        validate_concurrency(settings.probe_concurrency)?;
+        let incremental_schedule = normalize_schedule(settings.incremental_schedule)?;
+        let reconciliation_schedule = normalize_schedule(settings.reconciliation_schedule)?;
+        let metadata_schedule = normalize_schedule(settings.metadata_schedule)?;
+
+        let updated = self
+            .database
+            .update_library_settings(
+                &library_id.to_string(),
+                LibrarySettingsUpdate {
+                    realtime_watch_enabled: settings.realtime_watch_enabled,
+                    incremental_schedule: incremental_schedule
+                        .as_ref()
+                        .map(|value| value.as_deref()),
+                    reconciliation_schedule: reconciliation_schedule
+                        .as_ref()
+                        .map(|value| value.as_deref()),
+                    metadata_schedule: metadata_schedule.as_ref().map(|value| value.as_deref()),
+                    scan_concurrency: settings.scan_concurrency,
+                    probe_concurrency: settings.probe_concurrency,
+                },
+            )
+            .await?;
+        if !updated {
+            return Err(LibraryServiceError::LibraryNotFound);
+        }
+        let library = self
+            .database
+            .find_library(&library_id.to_string())
+            .await?
+            .ok_or(LibraryServiceError::LibraryNotFound)
+            .and_then(stored_library)?;
+        let roots = self
+            .database
+            .list_library_roots(&library_id.to_string())
+            .await?
+            .into_iter()
+            .map(stored_library_root)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LibraryView { library, roots })
     }
 
     pub async fn add_root(
@@ -145,6 +196,16 @@ pub struct AddRootResult {
     pub warnings: Vec<LibraryWarningCode>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LibrarySettingsPatch {
+    pub realtime_watch_enabled: Option<bool>,
+    pub incremental_schedule: Option<Option<String>>,
+    pub reconciliation_schedule: Option<Option<String>>,
+    pub metadata_schedule: Option<Option<String>>,
+    pub scan_concurrency: Option<i64>,
+    pub probe_concurrency: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LibraryWarningCode {
     CrossLibraryOverlap,
@@ -163,6 +224,8 @@ impl LibraryWarningCode {
 #[derive(Debug)]
 pub enum LibraryServiceError {
     InvalidName,
+    InvalidSchedule,
+    InvalidConcurrency,
     InvalidLibraryId(String),
     InvalidRootId(String),
     InvalidKind(String),
@@ -178,6 +241,15 @@ impl fmt::Display for LibraryServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidName => formatter.write_str("library name must be 1-128 characters"),
+            Self::InvalidSchedule => {
+                formatter.write_str("library schedule must be 1-128 non-whitespace characters")
+            }
+            Self::InvalidConcurrency => {
+                write!(
+                    formatter,
+                    "library concurrency must be between 1 and {MAX_LIBRARY_CONCURRENCY}"
+                )
+            }
             Self::InvalidLibraryId(error) => write!(formatter, "invalid library ID: {error}"),
             Self::InvalidRootId(error) => write!(formatter, "invalid library root ID: {error}"),
             Self::InvalidKind(error) => write!(formatter, "invalid library kind: {error}"),
@@ -201,6 +273,8 @@ impl std::error::Error for LibraryServiceError {
             Self::Path(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::InvalidName
+            | Self::InvalidSchedule
+            | Self::InvalidConcurrency
             | Self::InvalidLibraryId(_)
             | Self::InvalidRootId(_)
             | Self::InvalidKind(_)
@@ -210,6 +284,32 @@ impl std::error::Error for LibraryServiceError {
             | Self::OverlappingRoot => None,
         }
     }
+}
+
+fn validate_concurrency(value: Option<i64>) -> Result<(), LibraryServiceError> {
+    if value.is_some_and(|value| !(1..=MAX_LIBRARY_CONCURRENCY).contains(&value)) {
+        return Err(LibraryServiceError::InvalidConcurrency);
+    }
+    Ok(())
+}
+
+fn normalize_schedule(
+    value: Option<Option<String>>,
+) -> Result<Option<Option<String>>, LibraryServiceError> {
+    value
+        .map(|schedule| {
+            schedule
+                .map(|schedule| {
+                    let schedule = schedule.trim().to_owned();
+                    if schedule.is_empty() || schedule.chars().count() > MAX_SCHEDULE_LENGTH {
+                        Err(LibraryServiceError::InvalidSchedule)
+                    } else {
+                        Ok(schedule)
+                    }
+                })
+                .transpose()
+        })
+        .transpose()
 }
 
 impl From<RootPathError> for LibraryServiceError {

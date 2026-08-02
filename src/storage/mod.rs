@@ -449,6 +449,184 @@ impl Database {
         })
     }
 
+    pub(crate) async fn update_library_settings(
+        &self,
+        library_id: &str,
+        settings: LibrarySettingsUpdate<'_>,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM libraries WHERE id = ?)")
+            .bind(library_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if exists == 0 {
+            return Ok(false);
+        }
+
+        if let Some(value) = settings.realtime_watch_enabled {
+            sqlx::query(
+                "UPDATE libraries
+                 SET realtime_watch_enabled = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        if let Some(value) = settings.incremental_schedule {
+            sqlx::query(
+                "UPDATE libraries
+                 SET incremental_schedule = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        if let Some(value) = settings.reconciliation_schedule {
+            sqlx::query(
+                "UPDATE libraries
+                 SET reconciliation_schedule = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        if let Some(value) = settings.metadata_schedule {
+            sqlx::query(
+                "UPDATE libraries
+                 SET metadata_schedule = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        if let Some(value) = settings.scan_concurrency {
+            sqlx::query(
+                "UPDATE libraries
+                 SET scan_concurrency = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        if let Some(value) = settings.probe_concurrency {
+            sqlx::query(
+                "UPDATE libraries
+                 SET probe_concurrency = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+
+        let current: (Option<String>, Option<String>, Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT incremental_schedule, reconciliation_schedule, metadata_schedule,
+                    scan_concurrency, probe_concurrency
+             FROM libraries WHERE id = ?",
+        )
+        .bind(library_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let resources = format!(
+            "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
+            current.3, current.4
+        );
+        let task_configs = [
+            ("INCREMENTAL_SCAN", current.0.as_deref(), resources.as_str()),
+            (
+                "RECONCILIATION_SCAN",
+                current.1.as_deref(),
+                resources.as_str(),
+            ),
+            ("METADATA_PARSE", current.2.as_deref(), "{}"),
+        ];
+        for (task_type, schedule, resource_limit_json) in task_configs {
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, cron_or_interval,
+                    is_enabled, resource_limit_json, updated_at
+                ) VALUES ('LIBRARY', ?, ?, ?, ?, ?, unixepoch())
+                ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                    cron_or_interval = excluded.cron_or_interval,
+                    is_enabled = excluded.is_enabled,
+                    resource_limit_json = excluded.resource_limit_json,
+                    updated_at = unixepoch()",
+            )
+            .bind(library_id)
+            .bind(task_type)
+            .bind(schedule)
+            .bind(schedule.is_some())
+            .bind(resource_limit_json)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn library_exists(&self, library_id: &str) -> Result<bool, StorageError> {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM libraries WHERE id = ?)")
             .bind(library_id)
@@ -1770,6 +1948,15 @@ pub(crate) struct NewLibrary<'a> {
     pub(crate) metadata_schedule: Option<&'a str>,
     pub(crate) scan_concurrency: i64,
     pub(crate) probe_concurrency: i64,
+}
+
+pub(crate) struct LibrarySettingsUpdate<'a> {
+    pub(crate) realtime_watch_enabled: Option<bool>,
+    pub(crate) incremental_schedule: Option<Option<&'a str>>,
+    pub(crate) reconciliation_schedule: Option<Option<&'a str>>,
+    pub(crate) metadata_schedule: Option<Option<&'a str>>,
+    pub(crate) scan_concurrency: Option<i64>,
+    pub(crate) probe_concurrency: Option<i64>,
 }
 
 pub(crate) struct NewLibraryRoot<'a> {
