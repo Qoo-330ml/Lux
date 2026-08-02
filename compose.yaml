@@ -16,7 +16,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - lux-data:/data
-      - ${LUX_MEDIA_DIR:-./media}:/media:ro
+      - ${LUX_MEDIA_DIR:-./media}:/media:rw
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8097/health/live"]
       interval: 30s

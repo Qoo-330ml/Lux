@@ -4,12 +4,13 @@
 
 - [x] 多阶段 Dockerfile：Rust release builder 和 Debian runtime。
 - [x] runtime 使用非 root `lux` 用户，包含 `ffprobe`、Web 静态资源和 `/health/live` 健康检查。
-- [x] compose 提供 `/data` 持久化卷、只读媒体挂载、端口和 trusted proxy/TMDb 配置入口。
+- [x] compose 提供 `/data` 持久化卷、媒体挂载、端口和 trusted proxy/TMDb 配置入口。
+- [x] compose 媒体挂载使用读写模式，满足 NFO/图片回写要求。
 
 ## 已验证
 
 - [x] 本机 ARM64 Docker build/启动健康检查：`lux:arm64-local` 为 `arm64/linux`，非 root `uid=10001`，`ffprobe` 可执行，容器健康检查通过。
-- [ ] 全新卷初始化、升级迁移和媒体 Range 的 compose E2E。
+- [x] 全新数据卷初始化、扫描、媒体 Range、容器重启后迁移/数据保持的 compose E2E：健康检查、setup、媒体库、1 条 MP4 直放 Range（206/100 bytes）和重启后库/条目均通过。
 
 ## 未完成的发布门
 
