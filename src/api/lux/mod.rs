@@ -3,11 +3,14 @@ use serde::Serialize;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ApiErrorCode {
+    AuthenticationRequired,
+    CsrfFailed,
     DatabaseUnavailable,
     Internal,
     InvalidRequest,
     LibraryPathNotWritable,
     NotFound,
+    InvalidCredentials,
     SetupAlreadyCompleted,
 }
 

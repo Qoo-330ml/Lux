@@ -170,6 +170,89 @@ impl Database {
         })
     }
 
+    pub(crate) async fn create_web_session(
+        &self,
+        id: &str,
+        user_id: &str,
+        session_token_hash: &[u8],
+        csrf_token_hash: &[u8],
+        lifetime_seconds: i64,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO web_sessions (
+                id, user_id, session_token_hash, csrf_token_hash, expires_at
+            ) VALUES (?, ?, ?, ?, unixepoch() + ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(session_token_hash)
+        .bind(csrf_token_hash)
+        .bind(lifetime_seconds)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_web_session(
+        &self,
+        session_token_hash: &[u8],
+    ) -> Result<Option<StoredWebSession>, StorageError> {
+        sqlx::query(
+            "SELECT ws.csrf_token_hash, u.id AS user_id,
+                    u.username_normalized, u.display_name, u.is_disabled,
+                    u.is_admin, u.can_manage_server, u.can_remote_access,
+                    u.can_download
+             FROM web_sessions ws
+             JOIN users u ON u.id = ws.user_id
+             WHERE ws.session_token_hash = ?
+               AND ws.revoked_at IS NULL
+               AND ws.expires_at > unixepoch()",
+        )
+        .bind(session_token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredWebSession {
+                csrf_token_hash: row.get("csrf_token_hash"),
+                user_id: row.get("user_id"),
+                username_normalized: row.get("username_normalized"),
+                display_name: row.get("display_name"),
+                is_disabled: row.get::<i64, _>("is_disabled") != 0,
+                is_admin: row.get::<i64, _>("is_admin") != 0,
+                can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
+                can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
+                can_download: row.get::<i64, _>("can_download") != 0,
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn revoke_web_session(
+        &self,
+        session_token_hash: &[u8],
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE web_sessions
+             SET revoked_at = unixepoch(), updated_at = unixepoch()
+             WHERE session_token_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(session_token_hash)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub async fn schema_version(&self) -> Result<i64, StorageError> {
         sqlx::query("SELECT COALESCE(MAX(version), 0) AS version FROM _sqlx_migrations")
             .fetch_one(&self.pool)
@@ -192,6 +275,19 @@ pub(crate) struct StoredUser {
     pub(crate) username_normalized: String,
     pub(crate) display_name: String,
     pub(crate) password_hash: String,
+    pub(crate) is_disabled: bool,
+    pub(crate) is_admin: bool,
+    pub(crate) can_manage_server: bool,
+    pub(crate) can_remote_access: bool,
+    pub(crate) can_download: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredWebSession {
+    pub(crate) csrf_token_hash: Vec<u8>,
+    pub(crate) user_id: String,
+    pub(crate) username_normalized: String,
+    pub(crate) display_name: String,
     pub(crate) is_disabled: bool,
     pub(crate) is_admin: bool,
     pub(crate) can_manage_server: bool,
