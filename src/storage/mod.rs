@@ -11,6 +11,7 @@ use crate::config::Config;
 
 static MIGRATOR: Migrator = sqlx::migrate!();
 
+#[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
     path: PathBuf,
