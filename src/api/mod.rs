@@ -154,6 +154,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/libraries", get(lux_list_libraries))
         .route("/api/v1/search", get(lux_search))
+        .route("/api/v1/home", get(lux_home))
         .route(
             "/api/v1/libraries/{library_id}/items",
             get(lux_list_library_items),
@@ -211,6 +212,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Resume", get(emby_user_resume))
+        .route("/Users/{user_id}/Items/Latest", get(emby_user_latest))
         .route("/Users/{user_id}/Items/NextUp", get(emby_user_next_up))
         .route("/Users/{user_id}/Items", get(emby_user_items))
         .route("/Users/{user_id}/Items/{item_id}", get(emby_user_item))
@@ -604,6 +606,30 @@ async fn emby_user_resume(
         "StartIndex": offset,
     }))
     .into_response()
+}
+
+async fn emby_user_latest(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(mut query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    query.sort_by = Some("DateCreated".to_owned());
+    query.sort_order = Some("Descending".to_owned());
+    emby_list_items(
+        &headers,
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &query,
+    )
+    .await
 }
 
 async fn emby_user_next_up(
@@ -2014,6 +2040,58 @@ async fn lux_search(
             StatusCode::FORBIDDEN.into_response()
         }
     }
+}
+
+async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let continue_watching = match catalog
+        .list_next_up(principal, &user.id.to_string(), 0, 10)
+        .await
+    {
+        Ok(page) => page,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let views = match libraries.list_libraries().await {
+        Ok(views) => views,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut visible = Vec::new();
+    for view in views {
+        if !view.library.is_enabled {
+            continue;
+        }
+        match access
+            .can_view_library(principal, &view.library.id.to_string())
+            .await
+        {
+            Ok(true) => visible.push(json!({
+                "id": view.library.id,
+                "name": view.library.name,
+                "kind": view.library.kind.as_str(),
+            })),
+            Ok(false) => {}
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+    Json(json!({
+        "continueWatching": continue_watching.items.iter().map(lux_catalog_item_json).collect::<Vec<_>>(),
+        "continueWatchingTotal": continue_watching.total,
+        "libraries": visible,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize, Default)]

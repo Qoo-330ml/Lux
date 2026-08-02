@@ -70,6 +70,7 @@ Lux 电影查询要求有效 Web session：
 - `GET /api/v1/libraries`：返回已启用媒体库的基本信息，不暴露服务器路径。
 - `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回电影。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，结果执行媒体库 ACL。
+- `GET /api/v1/home`：返回当前用户继续观看摘要和可见媒体库入口。
 - `GET /api/v1/items/{itemId}`：返回电影详情、媒体源和已探测轨道。
 - `GET|HEAD /api/v1/items/{itemId}/images/{type}`、`/{type}/{index}`：读取本地 poster/fanart，支持 ETag 和 `If-None-Match`。
 
@@ -84,6 +85,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET /Users/{userId}/Items/NextUp`：按该用户的播放状态返回未看完单集。
 - `GET|HEAD /Items/{itemId}/Images/{Type}`、`/{Type}/{Index}`：读取与 Lux API 相同的本地图片记录，支持 `X-Emby-Token` 或 `api_key`。
 - `GET /Users/{userId}/Items/Resume`：按用户播放位置、已看状态和服务器 Resume 阈值返回继续观看列表。
+- `GET /Users/{userId}/Items/Latest`：按最近添加顺序返回当前用户可见媒体。
 - `GET /Search/Hints?SearchTerm=关键词&StartIndex=0&Limit=50`：返回 Emby 搜索提示，结果执行当前用户 ACL。
 - `GET|HEAD /api/v1/items/{itemId}/subtitles/{streamIndex}`：读取指定外挂字幕流；需要 Web session，并执行媒体库 ACL。
 - `GET|HEAD /api/v1/items/{itemId}/stream`：读取默认本地媒体源；可通过 `sourceId` 选择媒体源，需要 Web session 和媒体库 ACL。
