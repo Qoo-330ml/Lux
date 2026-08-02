@@ -83,6 +83,12 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
     assert!(info_body.get("ProgramDataPath").is_none());
     assert!(info_body.get("InternalMetadataPath").is_none());
 
+    let info_with_query_token = client
+        .get(format!("http://{address}/emby/System/Info?api_key={token}"))
+        .send()
+        .await?;
+    assert_eq!(info_with_query_token.status(), reqwest::StatusCode::OK);
+
     for path in ["/System/Ping", "/emby/System/Ping"] {
         let response = client
             .get(format!("http://{address}{path}"))
