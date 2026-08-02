@@ -176,6 +176,57 @@ async fn setup_can_skip_tmdb_and_first_library() -> Result<(), Box<dyn std::erro
 }
 
 #[tokio::test]
+async fn setup_rejects_invalid_first_library_before_creating_admin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server) = test_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let invalid = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Administrator",
+            "password": "correct horse battery staple",
+            "firstLibrary": {
+                "name": "Movies",
+                "kind": "MOVIE",
+                "rootPath": temp_dir.path().join("does-not-exist")
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        client
+            .get(format!("{base_url}/api/v1/setup/status"))
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?["initialized"],
+        false
+    );
+
+    let valid = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Administrator",
+            "password": "correct horse battery staple"
+        }))
+        .send()
+        .await?;
+    assert_eq!(valid.status(), reqwest::StatusCode::CREATED);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_setup_requests_only_allow_one_admin() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

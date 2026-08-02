@@ -1972,6 +1972,22 @@ async fn setup_complete(
             .into_response();
         }
     };
+    if let Some(first_library) = request.first_library.as_ref() {
+        if first_library.name.trim().is_empty() || first_library.name.chars().count() > 128 {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库名称无效",
+            )
+            .into_response();
+        }
+        if let Some(root_path) = first_library.root_path.as_deref() {
+            if let Err(error) = crate::library::inspect_root_path(FsPath::new(root_path)).await {
+                return library_error(&headers, LibraryServiceError::from(error));
+            }
+        }
+    }
 
     match setup
         .complete(&request.username, &request.display_name, &request.password)
