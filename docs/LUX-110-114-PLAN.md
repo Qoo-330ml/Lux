@@ -16,6 +16,9 @@
 - [ ] 不支持浏览器编码的明确错误提示和可播放/不可播放 fixture 验证。
 - [x] `scripts/browser-smoke.mjs` 固化登录、普通用户无管理入口、直放 metadata、收藏写回、390/768/1440 viewport 横向溢出和基础语义可访问性扫描。
 
+脚本运行示例：
+`LUX_E2E_BASE_URL=http://127.0.0.1:18503 LUX_E2E_USERNAME=viewer LUX_E2E_PASSWORD='…' LUX_E2E_LIBRARY=Movies LUX_E2E_ITEM='<item-id>' NODE_PATH='<bundled-node-modules>' node scripts/browser-smoke.mjs`
+
 ## 边界
 
 - 直放播放器不会触发服务端转码；浏览器自身不支持的编码仍需显示可诊断提示。
