@@ -209,6 +209,7 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_list_library_items),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route("/api/v1/items/{item_id}/children", get(lux_get_children))
         .route(
             "/api/v1/collections/{collection_id}",
             get(lux_get_collection),
@@ -2594,6 +2595,91 @@ async fn lux_get_item(
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
             unreachable!("inaccessible item is returned as not found")
         }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LuxChildrenQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    item_type: Option<String>,
+    season_id: Option<String>,
+}
+
+async fn lux_get_children(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<LuxChildrenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let Some(parent) = (match catalog.find_item(principal, &item_id).await {
+        Ok(parent) => parent,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let result = match parent.item_type.as_str() {
+        "BOX_SET" => {
+            catalog
+                .list_collection_items(principal, &item_id, offset, limit)
+                .await
+        }
+        "SERIES"
+            if query
+                .item_type
+                .as_deref()
+                .is_some_and(|item_type| item_type.eq_ignore_ascii_case("EPISODE"))
+                || query.season_id.is_some() =>
+        {
+            catalog
+                .list_series_episodes(
+                    principal,
+                    &item_id,
+                    query.season_id.as_deref(),
+                    offset,
+                    limit,
+                )
+                .await
+        }
+        "SERIES" => {
+            catalog
+                .list_children(principal, &item_id, "SEASON", offset, limit)
+                .await
+        }
+        _ => Ok(CatalogPage {
+            items: Vec::new(),
+            total: 0,
+            offset,
+            limit,
+        }),
+    };
+    match result {
+        Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 

@@ -76,6 +76,7 @@ Lux 电影查询要求有效 Web session：
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，结果执行媒体库 ACL。
 - `GET /api/v1/home`：返回当前用户继续观看摘要和可见媒体库入口。
 - `GET /api/v1/items/{itemId}`：返回电影详情、媒体源和已探测轨道。
+- `GET /api/v1/items/{itemId}/children?itemType=SEASON|EPISODE&seasonId=...`：Web 同源读取剧集季度/单集或合集成员，结果执行当前用户 ACL。
 - `GET /api/v1/collections/{collectionId}`：返回可访问 BOX_SET 及按媒体库 ACL 过滤后的成员。
 - `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；删除为禁用语义，最后一个服务器管理账户受保护。
 - `GET /api/v1/admin/users/{userId}/libraries`：读取该用户当前可访问的媒体库 ID，用于管理控制台展示 ACL；不返回服务器路径。

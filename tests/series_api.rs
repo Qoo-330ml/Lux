@@ -6,7 +6,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{AUTHORIZATION, COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -154,6 +154,32 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(next_up_body["Items"][0]["UserData"]["IsFavorite"], true);
 
+    let web_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(web_login.status(), reqwest::StatusCode::OK);
+    let web_cookie = cookie_pair(web_login.headers());
+    let web_seasons = client
+        .get(format!(
+            "{base_url}/api/v1/items/{series_id}/children?itemType=SEASON"
+        ))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(web_seasons.status(), reqwest::StatusCode::OK);
+    assert_eq!(web_seasons.json::<Value>().await?["total"], 1);
+    let web_episodes = client
+        .get(format!(
+            "{base_url}/api/v1/items/{series_id}/children?itemType=EPISODE&seasonId={season_id}"
+        ))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(web_episodes.status(), reqwest::StatusCode::OK);
+    assert_eq!(web_episodes.json::<Value>().await?["total"], 3);
+
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -177,4 +203,26 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     server.abort();
     assert_ne!(admin.id, viewer.id);
     Ok(())
+}
+
+fn cookie_pair(headers: &reqwest::header::HeaderMap) -> String {
+    format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(headers, "lux_session"),
+        cookie_value(headers, "lux_csrf")
+    )
+}
+
+fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+    headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value
+                .strip_prefix(&format!("{name}="))
+                .and_then(|value| value.split(';').next())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }

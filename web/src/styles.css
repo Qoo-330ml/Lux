@@ -72,6 +72,8 @@ p { color: var(--muted); line-height: 1.6; }
 .detail-poster { width: 100%; border-radius: var(--radius); }
 .detail-copy { max-width: 720px; }
 .detail-copy p { max-width: 65ch; }
+.children-panel { margin-top: 1.5rem; }
+.children-panel .media-grid { margin-top: .8rem; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
 .filter-form { display: flex; flex-wrap: wrap; align-items: end; gap: .6rem; padding: .85rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .filter-form label { display: grid; gap: .35rem; min-width: 110px; color: var(--muted); font-size: .78rem; }
 .filter-form input, .filter-form select { width: 100%; padding: .55rem .65rem; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: #101c1e; }

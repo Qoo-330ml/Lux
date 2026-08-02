@@ -1,5 +1,5 @@
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, playback: null, error: "", notice: "", setupNotice: "" };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, playback: null, children: null, error: "", notice: "", setupNotice: "" };
 
 const api = {
   async request(path, options = {}) {
@@ -20,6 +20,7 @@ const api = {
   libraries() { return this.request("/api/v1/libraries"); },
   libraryItems(id, filters = {}) { const params = new URLSearchParams({ page: "1", pageSize: "60" }); Object.entries(filters).forEach(([key, value]) => { if (value !== "" && value !== null && value !== undefined) params.set(key, String(value)); }); return this.request("/api/v1/libraries/" + encodeURIComponent(id) + "/items?" + params.toString()); },
   item(id) { return this.request("/api/v1/items/" + encodeURIComponent(id)); },
+  children(id, filters = {}) { const params = new URLSearchParams({ page: "1", pageSize: "60" }); Object.entries(filters).forEach(([key, value]) => { if (value !== "" && value !== null && value !== undefined) params.set(key, String(value)); }); return this.request("/api/v1/items/" + encodeURIComponent(id) + "/children?" + params.toString()); },
   playback(id) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/playback"); },
   favorite(id, favorite) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/favorite", { method: "PUT", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ favorite }) }); },
   search(query) { return this.request("/api/v1/search?q=" + encodeURIComponent(query) + "&page=1&pageSize=60"); },
@@ -128,8 +129,10 @@ async function loadRoute() {
       const result = await api.search(state.query);
       view.innerHTML = renderGrid(result.items || [], "搜索“" + escapeHtml(state.query) + "”");
     } else if (state.route === "item") {
-      [state.item, state.playback] = await Promise.all([api.item(state.itemId), api.playback(state.itemId)]);
-      view.innerHTML = renderDetail(state.item, state.playback);
+      state.item = await api.item(state.itemId);
+      state.playback = await api.playback(state.itemId);
+      state.children = ["SERIES", "BOX_SET"].includes(state.item.itemType) ? await api.children(state.itemId) : null;
+      view.innerHTML = renderDetail(state.item, state.playback, state.children);
     } else if (state.route === "admin") {
       const [ready, libraries, users, audit, pending, jobs] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit(), api.pendingMetadata(), api.adminJobs()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
@@ -173,14 +176,23 @@ function renderGrid(items, heading = "") {
 function mediaCard(item) {
   return "<button class=\"media-card\" data-item=\"" + escapeHtml(item.id) + "\">" + poster(item) + "<span class=\"media-card-body\"><strong>" + escapeHtml(item.title || item.name) + "</strong><span class=\"media-meta\">" + escapeHtml(item.productionYear || item.itemType || "") + "</span></span></button>";
 }
-function renderDetail(item, playback = {}) {
+function renderDetail(item, playback = {}, children = null) {
   const sources = item.mediaSources || [];
   const chips = sources.map((source) => "<span class=\"chip\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "source") + "</span>").join("");
   const buttons = sources.map((source, index) => "<button class=\"button secondary\" data-source=\"" + escapeHtml(source.id) + "\" aria-pressed=\"" + (index === 0) + "\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "版本 " + (index + 1)) + "</button>").join("");
   const player = sources.length ? "<div class=\"source-list\" aria-label=\"媒体版本\">" + buttons + "</div><video class=\"player\" controls preload=\"metadata\" data-player src=\"/api/v1/items/" + encodeURIComponent(item.id) + "/stream?sourceId=" + encodeURIComponent(sources[0].id) + "\"></video>" : "";
   const favoriteLabel = playback.isFavorite ? "取消收藏" : "收藏";
   const userData = "<div class=\"chips\"><span class=\"chip\">" + (playback.isPlayed ? "已看" : "未看") + "</span>" + (playback.isFavorite ? "<span class=\"chip\">已收藏</span>" : "") + (playback.positionTicks ? "<span class=\"chip\">已播放 " + Math.round(playback.positionTicks / 10000000) + " 秒</span>" : "") + "</div>";
-  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail"><div>${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2 style="margin-top:.6rem">${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button>${player}</div></article>`;
+  const childrenPanel = children ? `<section class="children-panel" id="children-panel">${renderChildrenPanel(item, children)}</section>` : "";
+  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail"><div>${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2 style="margin-top:.6rem">${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button>${childrenPanel}${player}</div></article>`;
+}
+
+function renderChildrenPanel(item, result, showingEpisodes = false) {
+  const items = result.items || [];
+  if (item.itemType === "BOX_SET") return `<div class="section-heading"><h3>合集成员</h3><span>${result.total || items.length} 项</span></div>${renderGrid(items)}`;
+  if (showingEpisodes) return `<div class="section-heading"><h3>单集</h3><button class="button secondary" type="button" data-show-seasons>返回季度</button></div>${renderGrid(items)}`;
+  const seasons = items.map((season) => `<button class="library-card" data-season="${escapeHtml(season.id)}"><span class="eyebrow">Season</span><strong>${escapeHtml(season.title || season.name)}</strong><span class="media-meta">打开单集 →</span></button>`).join("");
+  return `<div class="section-heading"><h3>季度</h3><span>${result.total || items.length} 个季度</span></div><div class="library-grid">${seasons || "<div class=\"empty\"><span>暂无季度</span></div>"}</div>`;
 }
 
 function renderAdmin() {
@@ -251,6 +263,14 @@ function bind() {
   document.querySelectorAll("[data-action='toggle-favorite']").forEach((element) => element.addEventListener("click", async () => {
     try { await api.favorite(state.item.id, !state.playback?.isFavorite); state.notice = state.playback?.isFavorite ? "已取消收藏。" : "已加入收藏。"; state.error = ""; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-season]").forEach((element) => element.addEventListener("click", async () => {
+    try { state.children = await api.children(state.item.id, { itemType: "EPISODE", seasonId: element.dataset.season }); document.querySelector("#children-panel").innerHTML = renderChildrenPanel(state.item, state.children, true); bind(); }
+    catch (error) { state.error = error.message; render(); }
+  }));
+  document.querySelectorAll("[data-show-seasons]").forEach((element) => element.addEventListener("click", async () => {
+    try { state.children = await api.children(state.item.id); document.querySelector("#children-panel").innerHTML = renderChildrenPanel(state.item, state.children); bind(); }
+    catch (error) { state.error = error.message; render(); }
   }));
   document.querySelectorAll("[data-player]").forEach((player) => {
     let lastReport = 0;
