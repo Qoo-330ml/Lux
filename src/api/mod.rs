@@ -763,15 +763,21 @@ async fn emby_user_resume(
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let item_ids = page
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let user_states = match database.list_user_item_states(&user_id, &item_ids).await {
+        Ok(states) => states,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let mut resume_items = Vec::new();
     for item in page.items {
         if !matches!(item.item_type.as_str(), "MOVIE" | "EPISODE") {
             continue;
         }
-        let Some(item_state) = (match database.find_user_item_state(&user_id, &item.id).await {
-            Ok(state) => state,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }) else {
+        let Some(item_state) = user_states.get(&item.id).cloned() else {
             continue;
         };
         let runtime_ticks = item.runtime_ticks.or_else(|| {
@@ -990,16 +996,21 @@ async fn emby_catalog_page_for_user(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let item_ids = page
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let user_states = match database.list_user_item_states(user_id, &item_ids).await {
+        Ok(states) => states,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let mut items = Vec::with_capacity(page.items.len());
     for item in &page.items {
-        let user_state = match database.find_user_item_state(user_id, &item.id).await {
-            Ok(state) => state,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
         items.push(emby_catalog_item_json_with_state(
             item,
             &state.server_id,
-            user_state.as_ref(),
+            user_states.get(&item.id),
         ));
     }
     Json(json!({
@@ -1107,6 +1118,15 @@ async fn filter_emby_catalog_page(
             .filter_map(|year| year.trim().parse::<i64>().ok())
             .collect::<Vec<_>>()
     });
+    let item_ids = page
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let user_states = database
+        .list_user_item_states(&principal.user_id.to_string(), &item_ids)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mut items = Vec::new();
     for item in page.items {
         let item_type = emby_item_type(&item.item_type).to_ascii_lowercase();
@@ -1121,10 +1141,7 @@ async fn filter_emby_catalog_page(
         }) {
             continue;
         }
-        let item_state = database
-            .find_user_item_state(&principal.user_id.to_string(), &item.id)
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let item_state = user_states.get(&item.id);
         if query.is_played.is_some_and(|value| {
             item_state
                 .as_ref()
@@ -3977,10 +3994,14 @@ async fn lux_catalog_items_json_for_user(
     user_id: &str,
     items: &[CatalogItem],
 ) -> Result<Vec<Value>, StorageError> {
+    let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+    let states = database.list_user_item_states(user_id, &item_ids).await?;
     let mut values = Vec::with_capacity(items.len());
     for item in items {
-        let state = database.find_user_item_state(user_id, &item.id).await?;
-        values.push(lux_catalog_item_json_with_user_state(item, state.as_ref()));
+        values.push(lux_catalog_item_json_with_user_state(
+            item,
+            states.get(&item.id),
+        ));
     }
     Ok(values)
 }

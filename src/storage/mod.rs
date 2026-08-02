@@ -1,7 +1,7 @@
-use std::{path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use sqlx::{
-    Row,
+    QueryBuilder, Row,
     migrate::{MigrateError, Migrator},
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions},
 };
@@ -887,6 +887,52 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_user_item_states(
+        &self,
+        user_id: &str,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, StoredUserItemState>, StorageError> {
+        let mut states = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut query_builder = QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT item_id, position_ticks, is_played, is_favorite, play_count,
+                        last_played_at, version
+                 FROM user_item_state WHERE user_id = ",
+            );
+            query_builder.push_bind(user_id).push(" AND item_id IN (");
+            let mut separated = query_builder.separated(", ");
+            for item_id in chunk {
+                separated.push_bind(item_id);
+            }
+            separated.push_unseparated(")");
+            let rows = query_builder
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                states.insert(
+                    row.get("item_id"),
+                    StoredUserItemState {
+                        position_ticks: row.get("position_ticks"),
+                        is_played: row.get::<i64, _>("is_played") != 0,
+                        is_favorite: row.get::<i64, _>("is_favorite") != 0,
+                        play_count: row.get("play_count"),
+                        last_played_at: row.get("last_played_at"),
+                        version: row.get("version"),
+                    },
+                );
+            }
+        }
+        Ok(states)
     }
 
     pub(crate) async fn resume_settings(&self) -> Result<(i64, i64), StorageError> {
