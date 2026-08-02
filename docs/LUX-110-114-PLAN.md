@@ -8,12 +8,13 @@
 - [x] 同源 Web API 支持剧集季度/单集和合集成员，详情页可展开浏览。
 - [x] 2026-08-03 本机 Chrome 150 headless smoke：普通用户无管理入口、MP4 直放 metadata readyState=4、stream 返回 206、390px 无横向溢出、控制台/页面错误为 0。
 - [x] 浏览器直放和每 10 秒进度上报已连接服务端。
+- [x] 播放器监听 `video.error`，给出明确的“不支持该媒体编码/尝试其他版本或客户端”提示。
 
 ## 待完成
 
 - [ ] 剧集季度/单集、合集详情和更完整的 UserData 操作。
 - [ ] 不支持浏览器编码的明确错误提示和可播放/不可播放 fixture 验证。
-- [ ] 多 viewport Playwright 流程和自动可访问性扫描。
+- [x] `scripts/browser-smoke.mjs` 固化登录、普通用户无管理入口、直放 metadata、收藏写回、390/768/1440 viewport 横向溢出和基础语义可访问性扫描。
 
 ## 边界
 

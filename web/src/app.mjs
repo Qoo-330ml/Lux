@@ -184,7 +184,7 @@ function renderDetail(item, playback = {}, children = null) {
   const sources = item.mediaSources || [];
   const chips = sources.map((source) => "<span class=\"chip\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "source") + "</span>").join("");
   const buttons = sources.map((source, index) => "<button class=\"button secondary\" data-source=\"" + escapeHtml(source.id) + "\" aria-pressed=\"" + (index === 0) + "\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "版本 " + (index + 1)) + "</button>").join("");
-  const player = sources.length ? "<div class=\"source-list\" aria-label=\"媒体版本\">" + buttons + "</div><video class=\"player\" controls preload=\"metadata\" data-player src=\"/api/v1/items/" + encodeURIComponent(item.id) + "/stream?sourceId=" + encodeURIComponent(sources[0].id) + "\"></video>" : "";
+  const player = sources.length ? "<div class=\"source-list\" aria-label=\"媒体版本\">" + buttons + "</div><p class=\"player-status\" data-player-status role=\"status\"></p><video class=\"player\" controls preload=\"metadata\" data-player aria-label=\"播放 " + escapeHtml(item.title || item.name) + "\" src=\"/api/v1/items/" + encodeURIComponent(item.id) + "/stream?sourceId=" + encodeURIComponent(sources[0].id) + "\"></video>" : "";
   const favoriteLabel = playback.isFavorite ? "取消收藏" : "收藏";
   const userData = "<div class=\"chips\"><span class=\"chip\">" + (playback.isPlayed ? "已看" : "未看") + "</span>" + (playback.isFavorite ? "<span class=\"chip\">已收藏</span>" : "") + (playback.positionTicks ? "<span class=\"chip\">已播放 " + Math.round(playback.positionTicks / 10000000) + " 秒</span>" : "") + "</div>";
   const childrenPanel = children ? `<section class="children-panel" id="children-panel">${renderChildrenPanel(item, children)}</section>` : "";
@@ -278,6 +278,10 @@ function bind() {
   }));
   document.querySelectorAll("[data-player]").forEach((player) => {
     let lastReport = 0;
+    player.addEventListener("error", () => {
+      const status = document.querySelector("[data-player-status]");
+      if (status) status.textContent = "浏览器无法播放此媒体编码，请尝试其他版本或使用支持该编码的客户端。";
+    });
     player.addEventListener("timeupdate", () => {
       if (!state.item || player.currentTime - lastReport < 10) return;
       lastReport = player.currentTime;

@@ -85,6 +85,7 @@ p { color: var(--muted); line-height: 1.6; }
 .chip { padding: .35rem .55rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .8rem; }
 .source-list button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 .player { width: 100%; max-height: 72vh; background: #050808; border-radius: var(--radius); }
+.player-status { min-height: 1.4rem; color: var(--danger); font-size: .86rem; }
 .back-link { display: inline-flex; margin-bottom: 1.2rem; color: var(--accent); text-decoration: none; }
 .admin-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
 .admin-card { display: grid; gap: .45rem; padding: 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
