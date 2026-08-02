@@ -14,6 +14,19 @@ fn movie_filename_parser_handles_year_and_quality_suffix() {
 
     assert_eq!(parsed.title, "Movie Name");
     assert_eq!(parsed.production_year, Some(2020));
+    assert_eq!(parsed.edition_name, None);
+    assert_eq!(parsed.quality_label.as_deref(), Some("1080p"));
+}
+
+#[test]
+fn movie_filename_parser_extracts_explicit_edition_and_quality() {
+    let parsed =
+        parse_movie_filename("Movie.Name.2020.Directors.Cut.2160p.WEB-DL.mkv").expect("movie name");
+
+    assert_eq!(parsed.title, "Movie Name (Director's Cut)");
+    assert_eq!(parsed.production_year, Some(2020));
+    assert_eq!(parsed.edition_name.as_deref(), Some("Director's Cut"));
+    assert_eq!(parsed.quality_label.as_deref(), Some("2160p"));
 }
 
 #[test]
@@ -107,6 +120,77 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
         .fetch_one(reopened.pool())
         .await?;
     assert_eq!(persisted_item_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scanner_aggregates_quality_sources_but_keeps_cuts_separate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    for (name, bytes) in [
+        ("Example.Movie.2024.1080p.mkv", b"1080".as_slice()),
+        ("Example.Movie.2024.2160p.mkv", b"2160".as_slice()),
+        (
+            "Example.Movie.2024.Directors.Cut.1080p.mkv",
+            b"directors".as_slice(),
+        ),
+    ] {
+        tokio::fs::write(root.join(name), bytes).await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let report = LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    assert_eq!(report.created_items, 2);
+    assert_eq!(report.created_sources, 3);
+
+    let items: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT mi.title, COUNT(ms.id)
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         GROUP BY mi.id
+         ORDER BY mi.title",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        items,
+        vec![
+            ("Example Movie".to_owned(), 2),
+            ("Example Movie (Director's Cut)".to_owned(), 1),
+        ]
+    );
+
+    let versions: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT ms.edition_name, ms.quality_label
+         FROM media_sources ms
+         ORDER BY ms.edition_name IS NOT NULL, ms.quality_label DESC",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        versions,
+        vec![
+            (None, Some("2160p".to_owned())),
+            (None, Some("1080p".to_owned())),
+            (Some("Director's Cut".to_owned()), Some("1080p".to_owned())),
+        ]
+    );
     Ok(())
 }
 

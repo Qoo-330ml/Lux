@@ -2255,13 +2255,16 @@ impl Database {
         sqlx::query(
             "INSERT INTO media_sources (
                 id, item_id, source_kind, filesystem_entry_id,
-                container, size, external_url, is_default, probe_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+                edition_name, quality_label, container, size,
+                external_url, is_default, probe_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
         )
         .bind(source.id)
         .bind(source.item_id)
         .bind(source.source_kind)
         .bind(source.filesystem_entry_id)
+        .bind(source.edition_name)
+        .bind(source.quality_label)
         .bind(source.container)
         .bind(source.size)
         .bind(source.external_url)
@@ -3312,6 +3315,8 @@ pub(crate) struct NewMediaSource<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) source_kind: &'a str,
     pub(crate) filesystem_entry_id: &'a str,
+    pub(crate) edition_name: Option<&'a str>,
+    pub(crate) quality_label: Option<&'a str>,
     pub(crate) container: &'a str,
     pub(crate) size: i64,
     pub(crate) external_url: Option<&'a str>,

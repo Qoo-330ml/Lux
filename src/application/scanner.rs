@@ -413,6 +413,8 @@ impl LibraryScanner {
                 item_id: &episode_id,
                 source_kind: if is_strm { "STRM_URL" } else { "LOCAL_FILE" },
                 filesystem_entry_id: &entry_id,
+                edition_name: None,
+                quality_label: None,
                 container: &container,
                 size,
                 external_url: external_url.as_deref(),
@@ -568,6 +570,8 @@ impl LibraryScanner {
                 item_id: &item_id,
                 source_kind: if is_strm { "STRM_URL" } else { "LOCAL_FILE" },
                 filesystem_entry_id: &entry_id,
+                edition_name: None,
+                quality_label: None,
                 container: &container,
                 size,
                 external_url: external_url.as_deref(),
@@ -800,6 +804,8 @@ impl LibraryScanner {
                 item_id: &item_id_text,
                 source_kind: if is_strm { "STRM_URL" } else { "LOCAL_FILE" },
                 filesystem_entry_id: &entry_id,
+                edition_name: parsed_name.edition_name.as_deref(),
+                quality_label: parsed_name.quality_label.as_deref(),
                 container: &container,
                 size,
                 external_url: external_url.as_deref(),
@@ -1229,6 +1235,8 @@ pub struct ParsedMovieFilename {
     pub title: String,
     pub sort_title: String,
     pub production_year: Option<i32>,
+    pub edition_name: Option<String>,
+    pub quality_label: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1323,18 +1331,79 @@ pub fn parse_movie_filename(filename: &str) -> Option<ParsedMovieFilename> {
                 .parse::<i32>()
                 .is_ok_and(|year| (1900..=2099).contains(&year))
     });
-    let (title_words, production_year) = match year_index {
-        Some(index) if index > 0 => (&words[..index], words[index].parse::<i32>().ok()),
-        _ => (&words[..], None),
+    let (title_words, suffix_words, production_year) = match year_index {
+        Some(index) if index > 0 => (
+            &words[..index],
+            &words[index + 1..],
+            words[index].parse::<i32>().ok(),
+        ),
+        _ => (&words[..], &[][..], None),
     };
     let title = title_words.join(" ");
     if title.is_empty() {
         return None;
     }
+    let edition_name = parse_edition_name(suffix_words);
+    let quality_label = parse_quality_label(suffix_words);
+    let display_title = edition_name
+        .as_ref()
+        .map(|edition| format!("{title} ({edition})"))
+        .unwrap_or(title);
     Some(ParsedMovieFilename {
-        sort_title: title.to_lowercase(),
-        title,
+        sort_title: display_title.to_lowercase(),
+        title: display_title,
         production_year,
+        edition_name,
+        quality_label,
+    })
+}
+
+fn parse_edition_name(words: &[&str]) -> Option<String> {
+    let lowered = words
+        .iter()
+        .map(|word| word.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if lowered
+        .windows(2)
+        .any(|window| matches!(window, [first, second] if (first == "director" || first == "directors" || first == "director's") && *second == "cut"))
+    {
+        return Some("Director's Cut".to_owned());
+    }
+    if lowered
+        .windows(2)
+        .any(|window| matches!(window, [first, second] if *first == "extended" && *second == "cut"))
+    {
+        return Some("Extended Cut".to_owned());
+    }
+    [
+        ("unrated", "Unrated"),
+        ("theatrical", "Theatrical"),
+        ("ultimate", "Ultimate"),
+        ("final", "Final"),
+        ("special", "Special"),
+        ("remastered", "Remastered"),
+    ]
+    .iter()
+    .find_map(|(token, label)| {
+        lowered
+            .iter()
+            .any(|word| word == token)
+            .then_some((*label).to_owned())
+    })
+}
+
+fn parse_quality_label(words: &[&str]) -> Option<String> {
+    words.iter().find_map(|word| {
+        let normalized = word.to_ascii_lowercase();
+        match normalized.as_str() {
+            "4k" | "uhd" | "2160p" => Some(if normalized == "4k" || normalized == "uhd" {
+                "4K".to_owned()
+            } else {
+                "2160p".to_owned()
+            }),
+            "1080p" | "720p" | "576p" | "480p" => Some(normalized),
+            _ => None,
+        }
     })
 }
 
