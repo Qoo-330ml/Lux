@@ -1,6 +1,9 @@
 pub mod lux;
 
-use std::path::PathBuf;
+use std::{
+    path::{Component, Path as FsPath, PathBuf},
+    time::UNIX_EPOCH,
+};
 
 use axum::{
     Json, Router,
@@ -20,6 +23,7 @@ use tower_http::{ServiceBuilderExt, request_id::MakeRequestUuid, trace::TraceLay
 
 use crate::{
     COMMIT, VERSION,
+    application::playback::{ByteRange, RangeError, parse_single_range},
     application::setup::{SetupError, SetupService},
     application::{
         access::{AccessPrincipal, MediaAccessService},
@@ -41,6 +45,7 @@ use crate::{
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
     storage::Database,
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -158,6 +163,10 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/items/{item_id}/subtitles/{stream_index}",
             get(lux_subtitle).head(lux_subtitle),
         )
+        .route(
+            "/api/v1/items/{item_id}/stream",
+            get(lux_stream).head(lux_stream),
+        )
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
@@ -213,6 +222,22 @@ fn emby_routes() -> Router<AppState> {
         .route(
             "/Items/{item_id}/Subtitles/{stream_index}/Stream",
             get(emby_subtitle_without_source).head(emby_subtitle_without_source),
+        )
+        .route(
+            "/Videos/{item_id}/stream",
+            get(emby_stream).head(emby_stream),
+        )
+        .route(
+            "/Videos/{item_id}/stream.{container}",
+            get(emby_stream_with_container).head(emby_stream_with_container),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/stream",
+            get(emby_stream_with_source).head(emby_stream_with_source),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/stream.{container}",
+            get(emby_stream_with_source_and_container).head(emby_stream_with_source_and_container),
         )
         .route("/Sessions/Logout", post(emby_logout))
 }
@@ -1506,6 +1531,36 @@ async fn lux_subtitle(
     .await
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LuxStreamQuery {
+    #[serde(alias = "MediaSourceId")]
+    source_id: Option<String>,
+}
+
+async fn lux_stream(
+    headers: HeaderMap,
+    method: Method,
+    Path(item_id): Path<String>,
+    Query(query): Query<LuxStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    serve_media_file(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &headers,
+        &method,
+        &item_id,
+        query.source_id.as_deref(),
+        None,
+    )
+    .await
+}
+
 async fn emby_image(
     headers: HeaderMap,
     method: Method,
@@ -1611,6 +1666,282 @@ async fn emby_subtitle_without_source(
         stream_index,
     )
     .await
+}
+
+#[derive(Deserialize, Default)]
+struct EmbyStreamQuery {
+    #[serde(rename = "api_key")]
+    api_key: Option<String>,
+    #[serde(alias = "mediaSourceId", alias = "MediaSourceId")]
+    media_source_id: Option<String>,
+}
+
+async fn emby_stream(
+    headers: HeaderMap,
+    method: Method,
+    Path(item_id): Path<String>,
+    Query(query): Query<EmbyStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    serve_media_file(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &headers,
+        &method,
+        &item_id,
+        query.media_source_id.as_deref(),
+        None,
+    )
+    .await
+}
+
+async fn emby_stream_with_container(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, container)): Path<(String, String)>,
+    Query(query): Query<EmbyStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    serve_media_file(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &headers,
+        &method,
+        &item_id,
+        query.media_source_id.as_deref(),
+        Some(&container),
+    )
+    .await
+}
+
+async fn emby_stream_with_source(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, media_source_id)): Path<(String, String)>,
+    Query(query): Query<EmbyStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    serve_media_file(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &headers,
+        &method,
+        &item_id,
+        Some(&media_source_id),
+        None,
+    )
+    .await
+}
+
+async fn emby_stream_with_source_and_container(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, media_source_id, container)): Path<(String, String, String)>,
+    Query(query): Query<EmbyStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    serve_media_file(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &headers,
+        &method,
+        &item_id,
+        Some(&media_source_id),
+        Some(&container),
+    )
+    .await
+}
+
+async fn serve_media_file(
+    state: &AppState,
+    principal: AccessPrincipal,
+    headers: &HeaderMap,
+    method: &Method,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    requested_container: Option<&str>,
+) -> Response {
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access.can_view_item(principal, item_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let source = match media_source_id {
+        Some(source_id) => {
+            database
+                .find_media_source_path_by_id(item_id, source_id)
+                .await
+        }
+        None => database.find_media_source_path(item_id).await,
+    };
+    let source = match source {
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let path = match canonical_local_media_path(&source.root_path, &source.relative_path).await {
+        Ok(path) => path,
+        Err(LocalPathError::Missing) => return StatusCode::NOT_FOUND.into_response(),
+        Err(LocalPathError::Forbidden) => return StatusCode::FORBIDDEN.into_response(),
+    };
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    if requested_container.is_some_and(|container| {
+        extension.as_deref()
+            != Some(
+                container
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase()
+                    .as_str(),
+            )
+    }) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let metadata = match fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let size = metadata.len();
+    let modified = metadata.modified().ok();
+    let etag = media_etag(size, modified);
+    let last_modified = modified.and_then(|value| {
+        value
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|_| httpdate::fmt_http_date(value))
+    });
+    let range = match parse_single_range(
+        headers
+            .get("range")
+            .map(|value| value.to_str().unwrap_or("")),
+        size,
+    ) {
+        Ok(range) => range,
+        Err(RangeError::Invalid | RangeError::Unsatisfiable) => {
+            let mut response = Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header("Accept-Ranges", "bytes")
+                .header("Content-Range", format!("bytes */{size}"))
+                .header("Content-Length", 0)
+                .header("ETag", &etag)
+                .header("Content-Type", media_content_type(extension.as_deref()));
+            if let Some(last_modified) = &last_modified {
+                response = response.header("Last-Modified", last_modified);
+            }
+            return response
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    let (status, start, length, content_range) = match range {
+        ByteRange::Full => (StatusCode::OK, 0, size, None),
+        ByteRange::Partial { start, end } => (
+            StatusCode::PARTIAL_CONTENT,
+            start,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{size}")),
+        ),
+    };
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        let Ok(mut file) = fs::File::open(&path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if file.seek(SeekFrom::Start(start)).await.is_err() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Body::from_stream(tokio_util::io::ReaderStream::new(file.take(length)))
+    };
+    let mut response = Response::builder()
+        .status(status)
+        .header("Accept-Ranges", "bytes")
+        .header("Content-Length", length)
+        .header("Content-Type", media_content_type(extension.as_deref()))
+        .header("ETag", &etag);
+    if let Some(content_range) = content_range {
+        response = response.header("Content-Range", content_range);
+    }
+    if let Some(last_modified) = &last_modified {
+        response = response.header("Last-Modified", last_modified);
+    }
+    response
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+enum LocalPathError {
+    Missing,
+    Forbidden,
+}
+
+async fn canonical_local_media_path(
+    root_path: &str,
+    relative_path: &str,
+) -> Result<PathBuf, LocalPathError> {
+    let relative = FsPath::new(relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(LocalPathError::Forbidden);
+    }
+    let root = fs::canonicalize(root_path)
+        .await
+        .map_err(|_| LocalPathError::Missing)?;
+    let path = fs::canonicalize(root.join(relative))
+        .await
+        .map_err(|_| LocalPathError::Missing)?;
+    if !path.starts_with(&root) || path == root {
+        return Err(LocalPathError::Forbidden);
+    }
+    Ok(path)
+}
+
+fn media_etag(size: u64, modified: Option<std::time::SystemTime>) -> String {
+    let modified = modified
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| format!("{}-{}", value.as_secs(), value.subsec_nanos()))
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!("\"{size:x}-{modified}\"")
+}
+
+fn media_content_type(extension: Option<&str>) -> &'static str {
+    match extension {
+        Some("mkv") => "video/x-matroska",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("avi") => "video/x-msvideo",
+        Some("ts" | "m2ts") => "video/mp2t",
+        Some("flv") => "video/x-flv",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn serve_subtitle(
