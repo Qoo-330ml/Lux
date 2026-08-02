@@ -1118,6 +1118,21 @@ impl Database {
             })
     }
 
+    pub(crate) async fn find_media_item_by_identity(
+        &self,
+        identity_key: &str,
+    ) -> Result<Option<StoredMediaItem>, StorageError> {
+        sqlx::query("SELECT id FROM media_items WHERE identity_key = ? AND removed_at IS NULL")
+            .bind(identity_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.map(stored_media_item))
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn find_media_item_metadata(
         &self,
         item_id: &str,
@@ -1729,6 +1744,40 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn insert_hierarchy_item(
+        &self,
+        item: NewHierarchyItem<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, parent_id, series_id,
+                season_number, episode_number, absolute_number,
+                title, sort_title, original_title, production_year,
+                identification_status, identity_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+        )
+        .bind(item.id)
+        .bind(item.library_id)
+        .bind(item.item_type)
+        .bind(item.parent_id)
+        .bind(item.series_id)
+        .bind(item.season_number)
+        .bind(item.episode_number)
+        .bind(item.absolute_number)
+        .bind(item.title)
+        .bind(item.sort_title)
+        .bind(item.original_title)
+        .bind(item.production_year)
+        .bind(item.identity_key)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn mark_media_probe_failed(
@@ -2366,6 +2415,22 @@ pub(crate) struct NewMediaItem<'a> {
     pub(crate) sort_title: &'a str,
     pub(crate) original_title: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+}
+
+pub(crate) struct NewHierarchyItem<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) item_type: &'a str,
+    pub(crate) parent_id: Option<&'a str>,
+    pub(crate) series_id: Option<&'a str>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
+    pub(crate) absolute_number: Option<i64>,
+    pub(crate) title: &'a str,
+    pub(crate) sort_title: &'a str,
+    pub(crate) original_title: Option<&'a str>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) identity_key: &'a str,
 }
 
 pub(crate) struct NewMediaSource<'a> {

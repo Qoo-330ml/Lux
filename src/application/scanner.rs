@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     storage::{
-        Database, NewFilesystemEntry, NewMediaItem, NewMediaSource, StorageError,
+        Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource, StorageError,
         StoredLibraryRoot, StoredScanJob,
     },
 };
@@ -88,6 +88,256 @@ impl LibraryScanner {
             .unwrap_or(usize::MAX);
         }
         Ok(report)
+    }
+
+    pub async fn scan_series_library(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<ScanReport, ScannerError> {
+        let library_id_text = library_id.to_string();
+        if self
+            .database
+            .find_library(&library_id_text)
+            .await?
+            .is_none()
+        {
+            return Err(ScannerError::LibraryNotFound);
+        }
+        let generation = Uuid::now_v7().to_string();
+        let roots = self.database.list_library_roots(&library_id_text).await?;
+        let mut report = ScanReport::default();
+        for root in roots {
+            let root_path = PathBuf::from(&root.canonical_path);
+            let root_is_available = fs::metadata(&root_path)
+                .await
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+            if !root_is_available {
+                self.database
+                    .update_library_root_availability(&root.id, false)
+                    .await?;
+                report.unavailable_roots += 1;
+                continue;
+            }
+            if !root.is_available {
+                self.database
+                    .update_library_root_availability(&root.id, true)
+                    .await?;
+            }
+            let files = collect_series_files(&root_path).await?;
+            for path in files {
+                report.merge(
+                    self.scan_episode_file(&library_id_text, &root, &root_path, &path, &generation)
+                        .await?,
+                );
+            }
+            report.marked_missing += usize::try_from(
+                self.database
+                    .mark_missing_filesystem_entries(&root.id, &generation)
+                    .await?,
+            )
+            .unwrap_or(usize::MAX);
+        }
+        Ok(report)
+    }
+
+    async fn scan_episode_file(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        generation: &str,
+    ) -> Result<ScanReport, ScannerError> {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(ScanReport::default());
+        };
+        let Some(parsed) = parse_episode_filename(file_name) else {
+            return Ok(ScanReport::default());
+        };
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let size = i64::try_from(metadata.len())
+            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        let (device, inode) = file_identity(&metadata);
+        let fingerprint =
+            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        if let Some(existing_entry) = self
+            .database
+            .find_filesystem_entry(&root.id, &relative_path)
+            .await?
+        {
+            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+                self.database
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .await?;
+                return Ok(ScanReport {
+                    discovered_files: 1,
+                    skipped_files: 1,
+                    ..ScanReport::default()
+                });
+            }
+            self.database
+                .update_filesystem_entry(
+                    &existing_entry.id,
+                    size,
+                    modified_at,
+                    &fingerprint,
+                    generation,
+                )
+                .await?;
+            self.database
+                .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
+                .await?;
+            return Ok(ScanReport {
+                discovered_files: 1,
+                changed_files: 1,
+                ..ScanReport::default()
+            });
+        }
+
+        let components = relative_path
+            .split(['/', '\\'])
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        let series_name = components.first().copied().unwrap_or("Series");
+        let series_title = clean_hierarchy_title(series_name);
+        let series_sort_title = series_title.to_lowercase();
+        let series_identity = format!("series:{}:{}", root.id, series_name);
+        let series_new_id = ItemId::new().to_string();
+        let (series_id, series_created) = self
+            .ensure_hierarchy_item(NewHierarchyItem {
+                id: &series_new_id,
+                library_id: library_id_text,
+                item_type: "SERIES",
+                parent_id: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+                absolute_number: None,
+                title: &series_title,
+                sort_title: &series_sort_title,
+                original_title: Some(&series_title),
+                production_year: None,
+                identity_key: &series_identity,
+            })
+            .await?;
+        let season_number = season_directory_number(&components).unwrap_or(parsed.season);
+        let season_title = if season_number == 0 {
+            "Specials".to_owned()
+        } else {
+            format!("Season {season_number:02}")
+        };
+        let season_identity = format!("{series_identity}:season:{season_number}");
+        let season_sort_title = season_title.to_lowercase();
+        let season_new_id = ItemId::new().to_string();
+        let (season_id, season_created) = self
+            .ensure_hierarchy_item(NewHierarchyItem {
+                id: &season_new_id,
+                library_id: library_id_text,
+                item_type: "SEASON",
+                parent_id: Some(&series_id),
+                series_id: Some(&series_id),
+                season_number: Some(i64::from(season_number)),
+                episode_number: None,
+                absolute_number: None,
+                title: &season_title,
+                sort_title: &season_sort_title,
+                original_title: Some(&season_title),
+                production_year: None,
+                identity_key: &season_identity,
+            })
+            .await?;
+        let episode_identity = format!("episode:{}:{}", root.id, relative_path);
+        let episode_title = parsed.title.clone();
+        let episode_sort_title = episode_title.to_lowercase();
+        let episode_new_id = ItemId::new().to_string();
+        let (episode_id, episode_created) = self
+            .ensure_hierarchy_item(NewHierarchyItem {
+                id: &episode_new_id,
+                library_id: library_id_text,
+                item_type: "EPISODE",
+                parent_id: Some(&season_id),
+                series_id: Some(&series_id),
+                season_number: Some(i64::from(season_number)),
+                episode_number: Some(i64::from(parsed.episode)),
+                absolute_number: parsed.absolute_number.map(i64::from),
+                title: &episode_title,
+                sort_title: &episode_sort_title,
+                original_title: Some(&episode_title),
+                production_year: None,
+                identity_key: &episode_identity,
+            })
+            .await?;
+        let entry_id = FilesystemEntryId::new().to_string();
+        self.database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &entry_id,
+                library_root_id: &root.id,
+                relative_path: &relative_path,
+                entry_kind: "FILE",
+                size,
+                modified_at,
+                fingerprint: &fingerprint,
+                last_seen_generation: generation,
+            })
+            .await?;
+        let source_id = SourceId::new().to_string();
+        let container = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        self.database
+            .insert_media_source(NewMediaSource {
+                id: &source_id,
+                item_id: &episode_id,
+                filesystem_entry_id: &entry_id,
+                container: &container,
+                size,
+                is_default: true,
+            })
+            .await?;
+        Ok(ScanReport {
+            discovered_files: 1,
+            created_items: usize::from(series_created)
+                + usize::from(season_created)
+                + usize::from(episode_created),
+            created_sources: 1,
+            ..ScanReport::default()
+        })
+    }
+
+    async fn ensure_hierarchy_item(
+        &self,
+        item: NewHierarchyItem<'_>,
+    ) -> Result<(String, bool), ScannerError> {
+        if let Some(existing) = self
+            .database
+            .find_media_item_by_identity(item.identity_key)
+            .await?
+        {
+            return Ok((existing.id, false));
+        }
+        let id = item.id.to_owned();
+        self.database.insert_hierarchy_item(item).await?;
+        Ok((id, true))
     }
 
     pub async fn scan_movie_directory(
@@ -631,6 +881,15 @@ pub struct ParsedMovieFilename {
     pub production_year: Option<i32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedEpisodeFilename {
+    pub title: String,
+    pub sort_title: String,
+    pub season: u32,
+    pub episode: u32,
+    pub absolute_number: Option<u32>,
+}
+
 pub fn parse_movie_filename(filename: &str) -> Option<ParsedMovieFilename> {
     let stem = Path::new(filename).file_stem()?.to_str()?;
     let normalized = stem
@@ -664,6 +923,101 @@ pub fn parse_movie_filename(filename: &str) -> Option<ParsedMovieFilename> {
         title,
         production_year,
     })
+}
+
+pub fn parse_episode_filename(filename: &str) -> Option<ParsedEpisodeFilename> {
+    let stem = Path::new(filename).file_stem()?.to_str()?;
+    let bytes = stem.as_bytes();
+    let mut marker = None;
+    for start in 0..bytes.len() {
+        if matches!(bytes[start], b's' | b'S') {
+            let (season_end, season) = ascii_number(bytes, start + 1);
+            if let Some(season) = season
+                && bytes
+                    .get(season_end)
+                    .is_some_and(|value| matches!(value, b'e' | b'E'))
+            {
+                let (episode_end, episode) = ascii_number(bytes, season_end + 1);
+                if let Some(episode) = episode {
+                    marker = Some((start, episode_end, season, episode));
+                    break;
+                }
+            }
+        }
+        if bytes[start].is_ascii_digit() {
+            let (season_end, season) = ascii_number(bytes, start);
+            if let Some(season) = season
+                && bytes
+                    .get(season_end)
+                    .is_some_and(|value| matches!(value, b'x' | b'X'))
+            {
+                let (episode_end, episode) = ascii_number(bytes, season_end + 1);
+                if let Some(episode) = episode {
+                    marker = Some((start, episode_end, season, episode));
+                    break;
+                }
+            }
+        }
+    }
+    let (start, end, season, episode) = marker?;
+    let title = clean_hierarchy_title(&format!("{} {}", &stem[..start], &stem[end..]));
+    let title = if title.is_empty() {
+        format!("Episode {episode:02}")
+    } else {
+        title
+    };
+    Some(ParsedEpisodeFilename {
+        sort_title: title.to_lowercase(),
+        title,
+        season,
+        episode,
+        absolute_number: None,
+    })
+}
+
+fn ascii_number(bytes: &[u8], start: usize) -> (usize, Option<u32>) {
+    let mut end = start;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    if end == start {
+        return (start, None);
+    }
+    let value = std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    (end, value)
+}
+
+fn clean_hierarchy_title(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '.' | '_' | '-' | '(' | ')' | '[' | ']' => ' ',
+            character => character,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn season_directory_number(components: &[&str]) -> Option<u32> {
+    components
+        .get(components.len().saturating_sub(2))
+        .and_then(|value| parse_season_directory_name(value))
+}
+
+fn parse_season_directory_name(value: &str) -> Option<u32> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "specials" {
+        return Some(0);
+    }
+    let digits = normalized
+        .strip_prefix("season")
+        .or_else(|| normalized.strip_prefix('s'))?
+        .trim();
+    digits.parse::<u32>().ok()
 }
 
 pub(crate) async fn collect_movie_files(root: &Path) -> Result<Vec<PathBuf>, ScannerError> {
@@ -719,6 +1073,40 @@ pub(crate) async fn collect_movie_files(root: &Path) -> Result<Vec<PathBuf>, Sca
                 {
                     files.push(child_path);
                 }
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+async fn collect_series_files(root: &Path) -> Result<Vec<PathBuf>, ScannerError> {
+    let mut directories = vec![root.to_owned()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: directory.clone(),
+                source,
+            })?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: directory.clone(),
+                source,
+            })?
+        {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_file() && is_supported_movie_file(&path) {
+                files.push(path);
+            } else if file_type.is_dir() {
+                directories.push(path);
             }
         }
     }
