@@ -1,0 +1,16 @@
+[package]
+name = "luxd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Lux personal media server"
+license = "MIT"
+
+[lib]
+name = "luxd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "luxd"
+path = "src/main.rs"
+
