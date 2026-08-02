@@ -186,6 +186,26 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         .await?;
     assert_eq!(disabled_scan.status(), reqwest::StatusCode::NOT_FOUND);
 
+    let deleted_library = client
+        .delete(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted_library.status(), reqwest::StatusCode::NO_CONTENT);
+    let after_delete = client
+        .get(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(after_delete.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        after_delete.json::<Value>().await?["libraries"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
     server.abort();
     Ok(())
 }
@@ -379,6 +399,24 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         .send()
         .await?;
     assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let deleted = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/libraries/{}",
+            library_ids[0]
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    let orphaned_tasks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_task_configs WHERE owner_type = 'LIBRARY' AND owner_id = ?",
+    )
+    .bind(&library_ids[0])
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(orphaned_tasks, 0);
 
     server.abort();
     Ok(())

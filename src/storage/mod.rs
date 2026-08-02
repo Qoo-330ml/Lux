@@ -614,6 +614,46 @@ impl Database {
         })
     }
 
+    pub(crate) async fn delete_library(&self, id: &str) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "DELETE FROM scheduled_task_configs
+             WHERE owner_type = 'LIBRARY' AND owner_id = ?",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let deleted = sqlx::query("DELETE FROM libraries WHERE id = ?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected()
+            == 1;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(deleted)
+    }
+
     pub(crate) async fn update_library_settings(
         &self,
         library_id: &str,

@@ -97,6 +97,11 @@ p { color: var(--muted); line-height: 1.6; }
 .check { display: inline-flex; align-items: center; gap: .45rem; color: var(--muted); font-size: .86rem; }
 .check input { accent-color: var(--accent); }
 .admin-library-grid { display: grid; gap: 1rem; }
+.job-detail { display: grid; gap: 1rem; padding: 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.job-detail dl { display: grid; gap: .55rem; margin: 0; }
+.job-detail dl div { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 1rem; }
+.job-detail dt { color: var(--muted); }
+.job-detail dd { margin: 0; overflow-wrap: anywhere; }
 .admin-library { display: grid; gap: 1rem; padding: 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .admin-library .admin-list li { background: #101c1e; }
 .compact-form { margin-top: .25rem; }

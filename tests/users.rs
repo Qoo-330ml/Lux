@@ -95,10 +95,18 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .send()
         .await?;
     assert_eq!(jobs.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        jobs.json::<Value>().await?["jobs"].as_array().map(Vec::len),
-        Some(1)
-    );
+    let jobs_body = jobs.json::<Value>().await?;
+    assert_eq!(jobs_body["jobs"].as_array().map(Vec::len), Some(1));
+    let job_id = jobs_body["jobs"][0]["id"]
+        .as_str()
+        .ok_or("missing job id")?;
+    let job_detail = client
+        .get(format!("{base_url}/api/v1/admin/jobs/{job_id}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(job_detail.status(), reqwest::StatusCode::OK);
+    assert_eq!(job_detail.json::<Value>().await?["job"]["id"], job_id);
     let access = client
         .patch(format!(
             "{base_url}/api/v1/admin/users/{created_id}/libraries/{library_id}"

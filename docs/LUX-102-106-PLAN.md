@@ -11,13 +11,18 @@
 - [x] 管理页展示 pending 候选字段差异，并支持“仅补缺/刷新未锁定”选择和写回。
 - [x] 管理页分页读取扫描任务，支持按状态过滤、取消和重试。
 - [x] 媒体库可停用/启用，停用后普通用户不可见且不能新建扫描；管理员可删除媒体库根路径配置（不删除媒体文件）。
+- [x] 管理员可删除媒体库配置和索引数据；服务端拒绝删除仍有扫描任务的媒体库，并在事务中清理库级计划任务配置。
+- [x] 任务列表支持查看单任务详情，包括状态、进度、游标、代次和结构化错误。
+- [x] `scripts/admin-smoke.mjs` 固化管理员登录、创建媒体库、添加/删除根路径、发起扫描、查看任务详情、停用和删除媒体库流程；多用户普通用户权限由 `scripts/browser-smoke.mjs` 覆盖。
 - [x] Chrome smoke 已验证初始化后的登录和管理入口权限边界；完整管理端 Playwright 流程仍待固化为可重复脚本。
 
 ## 后续切片
 
-- [ ] 媒体库删除和扫描任务详情。
 - [ ] 任务日志详情、结构化错误筛选和更长历史分页。
 - [ ] 图片管理和重新识别操作。
 - [ ] 管理控制台 Playwright 全流程和多用户权限回归。
 
-验证：`cargo test --locked --test libraries_api`（3 项）覆盖根路径删除、媒体库停用和停用后的扫描拒绝；`node --check web/src/app.mjs` 通过。
+验证：`cargo test --locked --test libraries_api --test users`（4 项）覆盖根路径删除、媒体库停用、停用后的扫描拒绝、媒体库删除/计划清理和任务详情；`node --check web/src/app.mjs` 通过。
+
+管理员脚本运行示例：
+`LUX_E2E_BASE_URL=http://127.0.0.1:18506 LUX_E2E_ADMIN_USERNAME=admin LUX_E2E_ADMIN_PASSWORD='…' LUX_E2E_MEDIA_ROOT='/media' NODE_PATH='<bundled-node-modules>' node scripts/admin-smoke.mjs`

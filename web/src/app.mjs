@@ -33,10 +33,12 @@ const api = {
   adminLibraries() { return this.request("/api/v1/admin/libraries"); },
   createLibrary(data) { return this.request("/api/v1/admin/libraries", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
   updateLibrary(id, data) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id), { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
+  deleteLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   addLibraryRoot(id, path) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/roots", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ path }) }); },
   deleteLibraryRoot(libraryId, rootId) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(libraryId) + "/roots/" + encodeURIComponent(rootId), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   scanLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/scan", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   adminJobs(status = "") { return this.request("/api/v1/admin/jobs?page=1&pageSize=50" + (status ? "&status=" + encodeURIComponent(status) : "")); },
+  adminJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id)); },
   cancelJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   retryJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/retry", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
@@ -141,7 +143,7 @@ async function loadRoute() {
     } else if (state.route === "admin") {
       const [ready, libraries, users, audit, pending, jobs] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit(), api.pendingMetadata(), api.adminJobs()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
-      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries) };
+      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), jobDetail: state.admin?.jobDetail || null };
       view.innerHTML = renderAdmin();
     }
     bind();
@@ -202,6 +204,7 @@ function renderChildrenPanel(item, result, showingEpisodes = false) {
 
 function renderAdmin() {
   const { ready = {}, libraries = [], users = [], audit: events = [], pending = [], jobs = [], access = {} } = state.admin || {};
+  const jobDetail = state.admin?.jobDetail || null;
   const userRows = users.map((user) => "<tr><td>" + escapeHtml(user.displayName || user.usernameNormalized) + "<small>" + escapeHtml(user.usernameNormalized) + "</small></td><td>" + (user.isDisabled ? "已禁用" : user.canManageServer ? "管理员" : "普通用户") + "</td><td><a class=\"button secondary\" href=\"#user-" + escapeHtml(user.id) + "\">编辑</a> " + (user.isDisabled ? "" : "<button class=\"button secondary\" data-disable-user=\"" + escapeHtml(user.id) + "\">禁用</button>") + "</td></tr>").join("");
   const userEditors = users.map((user) => renderUserEditor(user, libraries, new Set(access[user.id] || []))).join("");
   const libraryCards = libraries.map(renderAdminLibrary).join("");
@@ -209,7 +212,7 @@ function renderAdmin() {
   return "<section class=\"section\"><div class=\"admin-cards\"><div class=\"admin-card\"><span class=\"eyebrow\">Health</span><strong>" + escapeHtml(ready.status || "unknown") + "</strong><span>schema " + escapeHtml(ready.schemaVersion || "—") + "</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Libraries</span><strong>" + libraries.length + "</strong><span>已配置媒体库</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Users</span><strong>" + users.length + "</strong><span>账户</span></div></div></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>创建媒体库</h2><span>创建后再添加一个或多个根路径</span></div><form class=\"admin-form\" data-action=\"create-library\"><input name=\"name\" placeholder=\"媒体库名称\" aria-label=\"媒体库名称\" required><select name=\"kind\" aria-label=\"媒体库类型\"><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option><option value=\"MIXED\">混合</option></select><label class=\"check\"><input name=\"realtimeWatchEnabled\" type=\"checkbox\"> 实时监听</label><button class=\"button\" type=\"submit\">创建媒体库</button></form></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>媒体库与扫描</h2><span>计划字段留空可清除</span></div><div class=\"admin-library-grid\">" + (libraryCards || "<div class=\"empty\"><h3>还没有媒体库</h3><p>先创建一个媒体库，再添加根路径。</p></div>") + "</div></section>" +
-    "<section class=\"section\"><div class=\"section-heading\"><h2>任务</h2><span>失败任务可重试，运行中任务可取消</span></div><form class=\"filter-form\" data-action=\"job-filter\"><label>状态 <select name=\"status\"><option value=\"\">全部</option><option value=\"RUNNING\">运行中</option><option value=\"FAILED\">失败</option><option value=\"CANCELLED\">已取消</option><option value=\"COMPLETED\">已完成</option></select></label><button class=\"button secondary\" type=\"submit\">筛选任务</button></form>" + renderJobs(jobs, libraries) + "</section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>任务</h2><span>失败任务可重试，运行中任务可取消</span></div><form class=\"filter-form\" data-action=\"job-filter\"><label>状态 <select name=\"status\"><option value=\"\">全部</option><option value=\"RUNNING\">运行中</option><option value=\"FAILED\">失败</option><option value=\"CANCELLED\">已取消</option><option value=\"COMPLETED\">已完成</option></select></label><button class=\"button secondary\" type=\"submit\">筛选任务</button></form>" + renderJobs(jobs, libraries) + (jobDetail ? renderJobDetail(jobDetail) : "") + "</section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>密码为空表示不修改</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" required><input name=\"displayName\" placeholder=\"显示名称\" aria-label=\"显示名称\"><input name=\"password\" type=\"password\" placeholder=\"初始密码\" aria-label=\"初始密码\" required><label class=\"check\"><input name=\"isAdmin\" type=\"checkbox\"> 管理员</label><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div>" + userEditors + "</section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>待处理元数据</h2><span>候选写回前请检查差异</span></div><div class=\"candidate-list\">" + renderPendingCandidates(pending) + "</div></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>最近审计</h2><span>只展示最近 8 条</span></div><ul class=\"admin-list\">" + (auditRows || "<li><span>暂无管理操作</span></li>") + "</ul></section>";
@@ -219,11 +222,16 @@ function renderJobs(jobs, libraries) {
   if (!jobs.length) return "<div class=\"empty\"><h3>暂无任务</h3></div>";
   const libraryName = (id) => libraries.find((library) => library.id === id)?.name || id;
   const rows = jobs.map((job) => {
-    const action = ["FAILED", "CANCELLED"].includes(job.status) ? `<button class="button secondary" data-retry-job="${escapeHtml(job.id)}">重试</button>` : ["PENDING", "RUNNING"].includes(job.status) ? `<button class="button secondary" data-cancel-job="${escapeHtml(job.id)}">取消</button>` : "";
+    const action = `<button class="button secondary" data-job-detail="${escapeHtml(job.id)}">详情</button> ` + (["FAILED", "CANCELLED"].includes(job.status) ? `<button class="button secondary" data-retry-job="${escapeHtml(job.id)}">重试</button>` : ["PENDING", "RUNNING"].includes(job.status) ? `<button class="button secondary" data-cancel-job="${escapeHtml(job.id)}">取消</button>` : "");
     const progress = job.totalCount ? " · " + job.processedCount + "/" + job.totalCount : "";
     return "<tr><td>" + escapeHtml(libraryName(job.libraryId)) + "<small>" + escapeHtml(job.jobType) + "</small></td><td>" + escapeHtml(job.status) + escapeHtml(progress) + "</td><td>" + escapeHtml(job.error || "") + "</td><td>" + action + "</td></tr>";
   }).join("");
   return "<div class=\"table-wrap\"><table><thead><tr><th>媒体库/类型</th><th>状态</th><th>错误</th><th>操作</th></tr></thead><tbody>" + rows + "</tbody></table></div>";
+}
+
+function renderJobDetail(job) {
+  const progress = `${job.processedCount || 0}/${job.totalCount || 0}`;
+  return `<article class="job-detail"><div class="section-heading"><h3>任务详情</h3><button class="button secondary" type="button" data-close-job-detail>关闭</button></div><dl><div><dt>ID</dt><dd>${escapeHtml(job.id)}</dd></div><div><dt>状态</dt><dd>${escapeHtml(job.status)}</dd></div><div><dt>进度</dt><dd>${escapeHtml(progress)}</dd></div><div><dt>游标</dt><dd>${escapeHtml(job.cursor || "—")}</dd></div><div><dt>代次</dt><dd>${escapeHtml(job.generation || "—")}</dd></div><div><dt>错误</dt><dd>${escapeHtml(job.error || "—")}</dd></div></dl></article>`;
 }
 
 function renderPendingCandidates(candidates) {
@@ -238,7 +246,7 @@ function renderPendingCandidates(candidates) {
 
 function renderAdminLibrary(library) {
   const roots = (library.roots || []).map((root) => "<li><div><strong>" + escapeHtml(root.displayPath || root.canonicalPath) + "</strong><span>" + (root.isAvailable ? "可用" : "不可用") + (root.isWritable ? " · 可写" : " · 只读") + "</span></div><button class=\"button secondary\" type=\"button\" data-delete-root=\"" + escapeHtml(root.id) + "\" data-library-id=\"" + escapeHtml(library.id) + "\">删除配置</button></li>").join("");
-  return `<article class="admin-library"><div class="section-heading"><div><h3>${escapeHtml(library.name)}</h3><span>${escapeHtml(library.kind)} · ${library.isEnabled ? "已启用" : "已停用"} · ${library.realtimeWatchEnabled ? "实时监听" : "手动/计划扫描"}</span></div><button class="button secondary" data-scan-library="${escapeHtml(library.id)}"${library.isEnabled ? "" : " disabled"}>开始扫描</button></div><ul class="admin-list">${roots || "<li><span>尚未添加根路径</span></li>"}</ul><form class="admin-form compact-form" data-action="add-root" data-library-id="${escapeHtml(library.id)}"><input name="path" placeholder="/Volumes/Media/Movies" aria-label="根路径" required><button class="button secondary" type="submit">添加根路径</button></form><form class="schedule-form" data-action="update-library" data-library-id="${escapeHtml(library.id)}"><label class="check"><input name="isEnabled" type="checkbox"${library.isEnabled ? " checked" : ""}> 启用媒体库</label><label>增量 <input name="incrementalSchedule" value="${escapeHtml(library.incrementalSchedule || "")}" placeholder="interval:30s"></label><label>调和 <input name="reconciliationSchedule" value="${escapeHtml(library.reconciliationSchedule || "")}" placeholder="cron:0 3 * * *"></label><label>元数据 <input name="metadataSchedule" value="${escapeHtml(library.metadataSchedule || "")}" placeholder="interval:6h"></label><label>扫描并发 <input name="scanConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.scanConcurrency || "")}"></label><label>探测并发 <input name="probeConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.probeConcurrency || "")}"></label><label class="check"><input name="realtimeWatchEnabled" type="checkbox"${library.realtimeWatchEnabled ? " checked" : ""}> 实时监听</label><button class="button secondary" type="submit">保存计划</button></form></article>`;
+  return `<article class="admin-library"><div class="section-heading"><div><h3>${escapeHtml(library.name)}</h3><span>${escapeHtml(library.kind)} · ${library.isEnabled ? "已启用" : "已停用"} · ${library.realtimeWatchEnabled ? "实时监听" : "手动/计划扫描"}</span></div><div class="form-actions"><button class="button secondary" data-scan-library="${escapeHtml(library.id)}"${library.isEnabled ? "" : " disabled"}>开始扫描</button><button class="button secondary" data-delete-library="${escapeHtml(library.id)}">删除媒体库</button></div></div><ul class="admin-list">${roots || "<li><span>尚未添加根路径</span></li>"}</ul><form class="admin-form compact-form" data-action="add-root" data-library-id="${escapeHtml(library.id)}"><input name="path" placeholder="/Volumes/Media/Movies" aria-label="根路径" required><button class="button secondary" type="submit">添加根路径</button></form><form class="schedule-form" data-action="update-library" data-library-id="${escapeHtml(library.id)}"><label class="check"><input name="isEnabled" type="checkbox"${library.isEnabled ? " checked" : ""}> 启用媒体库</label><label>增量 <input name="incrementalSchedule" value="${escapeHtml(library.incrementalSchedule || "")}" placeholder="interval:30s"></label><label>调和 <input name="reconciliationSchedule" value="${escapeHtml(library.reconciliationSchedule || "")}" placeholder="cron:0 3 * * *"></label><label>元数据 <input name="metadataSchedule" value="${escapeHtml(library.metadataSchedule || "")}" placeholder="interval:6h"></label><label>扫描并发 <input name="scanConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.scanConcurrency || "")}"></label><label>探测并发 <input name="probeConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.probeConcurrency || "")}"></label><label class="check"><input name="realtimeWatchEnabled" type="checkbox"${library.realtimeWatchEnabled ? " checked" : ""}> 实时监听</label><button class="button secondary" type="submit">保存计划</button></form></article>`;
 }
 
 function renderUserEditor(user, libraries, granted) {
@@ -302,6 +310,11 @@ function bind() {
     try { await api.deleteLibraryRoot(element.dataset.libraryId, element.dataset.deleteRoot); state.error = ""; state.notice = "根路径配置已删除。"; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
+  document.querySelectorAll("[data-delete-library]").forEach((element) => element.addEventListener("click", async () => {
+    if (!window.confirm("删除媒体库配置和索引数据，但不会删除媒体文件。继续？")) return;
+    try { await api.deleteLibrary(element.dataset.deleteLibrary); state.error = ""; state.notice = "媒体库已删除。"; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
   document.querySelectorAll("[data-select-candidate]").forEach((element) => element.addEventListener("click", async () => {
     const [itemId, candidateId, mode] = element.dataset.selectCandidate.split("|");
     element.disabled = true;
@@ -315,6 +328,13 @@ function bind() {
   document.querySelectorAll("[data-retry-job]").forEach((element) => element.addEventListener("click", async () => {
     try { await api.retryJob(element.dataset.retryJob); state.notice = "重试任务已创建。"; state.error = ""; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-job-detail]").forEach((element) => element.addEventListener("click", async () => {
+    try { state.admin.jobDetail = (await api.adminJob(element.dataset.jobDetail)).job; state.error = ""; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-close-job-detail]").forEach((element) => element.addEventListener("click", () => {
+    state.admin.jobDetail = null; render();
   }));
   document.querySelectorAll("form[data-action='job-filter']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();

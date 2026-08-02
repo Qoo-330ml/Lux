@@ -150,7 +150,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/api/v1/admin/libraries/{library_id}",
-            patch(admin_update_library),
+            patch(admin_update_library).delete(admin_delete_library),
         )
         .route(
             "/api/v1/admin/users",
@@ -201,6 +201,7 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_cancel_scan),
         )
         .route("/api/v1/admin/jobs/{job_id}/retry", post(admin_retry_scan))
+        .route("/api/v1/admin/jobs/{job_id}", get(admin_get_job))
         .route("/api/v1/admin/jobs", get(admin_list_jobs))
         .route(
             "/api/v1/admin/settings",
@@ -4134,6 +4135,30 @@ async fn admin_list_jobs(
     }
 }
 
+async fn admin_get_job(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_scan_job(&job_id).await {
+        Ok(Some(job)) => Json(json!({ "job": scan_job_json_from_storage(&job) })).into_response(),
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "任务不存在",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn admin_retry_scan(
     headers: HeaderMap,
     Path(job_id): Path<String>,
@@ -5060,6 +5085,44 @@ async fn admin_delete_library_root(
     }
 }
 
+async fn admin_delete_library(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id,
+        Err(error) => {
+            return library_error(
+                &headers,
+                LibraryServiceError::InvalidLibraryId(error.to_string()),
+            );
+        }
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match libraries.delete_library(library_id).await {
+        Ok(()) => {
+            let target_id = library_id.to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "LIBRARY_DELETED",
+                Some("library"),
+                Some(&target_id),
+                "{}",
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => library_error(&headers, error),
+    }
+}
+
 async fn admin_add_library_root(
     headers: HeaderMap,
     Path(library_id): Path<String>,
@@ -5128,6 +5191,11 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
             "媒体库不存在",
+        ),
+        LibraryServiceError::LibraryBusy => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库仍有扫描任务运行",
         ),
         LibraryServiceError::RootNotFound => (
             StatusCode::NOT_FOUND,

@@ -198,6 +198,30 @@ impl LibraryService {
         }
         Ok(())
     }
+
+    pub async fn delete_library(&self, library_id: LibraryId) -> Result<(), LibraryServiceError> {
+        let library_id_text = library_id.to_string();
+        if self
+            .database
+            .find_library(&library_id_text)
+            .await?
+            .is_none()
+        {
+            return Err(LibraryServiceError::LibraryNotFound);
+        }
+        if self
+            .database
+            .find_active_scan_job(&library_id_text, "RECONCILE_LIBRARY")
+            .await?
+            .is_some()
+        {
+            return Err(LibraryServiceError::LibraryBusy);
+        }
+        if !self.database.delete_library(&library_id_text).await? {
+            return Err(LibraryServiceError::LibraryNotFound);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -247,6 +271,7 @@ pub enum LibraryServiceError {
     InvalidRootId(String),
     InvalidKind(String),
     LibraryNotFound,
+    LibraryBusy,
     RootNotFound,
     RootNotFoundAfterInsert,
     DuplicateRoot,
@@ -272,6 +297,7 @@ impl fmt::Display for LibraryServiceError {
             Self::InvalidRootId(error) => write!(formatter, "invalid library root ID: {error}"),
             Self::InvalidKind(error) => write!(formatter, "invalid library kind: {error}"),
             Self::LibraryNotFound => formatter.write_str("library not found"),
+            Self::LibraryBusy => formatter.write_str("library has an active scan"),
             Self::RootNotFound => formatter.write_str("library root not found"),
             Self::RootNotFoundAfterInsert => {
                 formatter.write_str("library root was inserted but could not be read back")
@@ -298,6 +324,7 @@ impl std::error::Error for LibraryServiceError {
             | Self::InvalidRootId(_)
             | Self::InvalidKind(_)
             | Self::LibraryNotFound
+            | Self::LibraryBusy
             | Self::RootNotFound
             | Self::RootNotFoundAfterInsert
             | Self::DuplicateRoot
