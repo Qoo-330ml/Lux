@@ -93,10 +93,17 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
     assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
     let second_logout = client
         .post(format!("http://{address}/Sessions/Logout"))
-        .header("X-Emby-Token", token)
+        .header("X-Emby-Token", &token)
         .send()
         .await?;
     assert_eq!(second_logout.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let after_logout = client
+        .get(format!("http://{address}/System/Info"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(after_logout.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     server.abort();
     Ok(())
