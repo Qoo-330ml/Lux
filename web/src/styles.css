@@ -98,6 +98,11 @@ p { color: var(--muted); line-height: 1.6; }
 .admin-user + .admin-user { margin-top: .6rem; }
 .admin-user summary { cursor: pointer; color: var(--ink); }
 .user-edit-form { padding-top: 1rem; }
+.candidate-list { display: grid; gap: .75rem; }
+.candidate-card { display: grid; gap: .85rem; padding: 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.diff-list { display: grid; gap: .4rem; margin: 0; padding: 0; list-style: none; }
+.diff-list li { display: flex; justify-content: space-between; gap: 1rem; padding: .55rem .7rem; border-radius: 7px; color: var(--muted); background: #101c1e; font-size: .84rem; }
+.diff-list strong { color: var(--ink); }
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
 table { width: 100%; border-collapse: collapse; background: var(--surface); }
 th, td { padding: .8rem; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }

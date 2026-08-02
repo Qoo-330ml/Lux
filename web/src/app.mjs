@@ -33,6 +33,8 @@ const api = {
   addLibraryRoot(id, path) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/roots", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ path }) }); },
   scanLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/scan", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
+  pendingMetadata() { return this.request("/api/v1/admin/metadata/pending?page=1&pageSize=50"); },
+  selectCandidate(itemId, candidateId, mode) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates/" + encodeURIComponent(candidateId) + "/select", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ mode }) }); },
   ready() { return fetch("/health/ready", { credentials: "same-origin" }).then((response) => response.json()); },
   progress(id, positionTicks, durationTicks) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/progress", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ positionTicks, durationTicks }) }); },
 };
@@ -118,9 +120,9 @@ async function loadRoute() {
       state.item = await api.item(state.itemId);
       view.innerHTML = renderDetail(state.item);
     } else if (state.route === "admin") {
-      const [ready, libraries, users, audit] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit()]);
+      const [ready, libraries, users, audit, pending] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit(), api.pendingMetadata()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
-      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], access: Object.fromEntries(accessEntries) };
+      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], access: Object.fromEntries(accessEntries) };
       view.innerHTML = renderAdmin();
     }
     bind();
@@ -163,7 +165,7 @@ function renderDetail(item) {
 }
 
 function renderAdmin() {
-  const { ready = {}, libraries = [], users = [], audit: events = [], access = {} } = state.admin || {};
+  const { ready = {}, libraries = [], users = [], audit: events = [], pending = [], access = {} } = state.admin || {};
   const userRows = users.map((user) => "<tr><td>" + escapeHtml(user.displayName || user.usernameNormalized) + "<small>" + escapeHtml(user.usernameNormalized) + "</small></td><td>" + (user.isDisabled ? "已禁用" : user.canManageServer ? "管理员" : "普通用户") + "</td><td><a class=\"button secondary\" href=\"#user-" + escapeHtml(user.id) + "\">编辑</a> " + (user.isDisabled ? "" : "<button class=\"button secondary\" data-disable-user=\"" + escapeHtml(user.id) + "\">禁用</button>") + "</td></tr>").join("");
   const userEditors = users.map((user) => renderUserEditor(user, libraries, new Set(access[user.id] || []))).join("");
   const libraryCards = libraries.map(renderAdminLibrary).join("");
@@ -172,7 +174,18 @@ function renderAdmin() {
     "<section class=\"section\"><div class=\"section-heading\"><h2>创建媒体库</h2><span>创建后再添加一个或多个根路径</span></div><form class=\"admin-form\" data-action=\"create-library\"><input name=\"name\" placeholder=\"媒体库名称\" aria-label=\"媒体库名称\" required><select name=\"kind\" aria-label=\"媒体库类型\"><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option><option value=\"MIXED\">混合</option></select><label class=\"check\"><input name=\"realtimeWatchEnabled\" type=\"checkbox\"> 实时监听</label><button class=\"button\" type=\"submit\">创建媒体库</button></form></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>媒体库与扫描</h2><span>计划字段留空可清除</span></div><div class=\"admin-library-grid\">" + (libraryCards || "<div class=\"empty\"><h3>还没有媒体库</h3><p>先创建一个媒体库，再添加根路径。</p></div>") + "</div></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>密码为空表示不修改</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" required><input name=\"displayName\" placeholder=\"显示名称\" aria-label=\"显示名称\"><input name=\"password\" type=\"password\" placeholder=\"初始密码\" aria-label=\"初始密码\" required><label class=\"check\"><input name=\"isAdmin\" type=\"checkbox\"> 管理员</label><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div>" + userEditors + "</section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>待处理元数据</h2><span>候选写回前请检查差异</span></div><div class=\"candidate-list\">" + renderPendingCandidates(pending) + "</div></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>最近审计</h2><span>只展示最近 8 条</span></div><ul class=\"admin-list\">" + (auditRows || "<li><span>暂无管理操作</span></li>") + "</ul></section>";
+}
+
+function renderPendingCandidates(candidates) {
+  if (!candidates.length) return "<div class=\"empty\"><h3>没有待处理候选</h3><p>扫描和识别产生的低置信候选会显示在这里。</p></div>";
+  return candidates.map((candidate) => {
+    const candidateData = candidate.candidate && typeof candidate.candidate === "object" ? candidate.candidate : {};
+    const candidateTitle = candidateData.title || candidateData.name || candidate.providerId || "候选元数据";
+    const diffs = (candidate.fieldDiffs || []).map((diff) => "<li><strong>" + escapeHtml(diff.field) + "</strong><span>" + escapeHtml(String(diff.current ?? "暂无")) + " → " + escapeHtml(String(diff.candidate ?? "暂无")) + "</span></li>").join("");
+    return "<article class=\"candidate-card\"><div class=\"section-heading\"><div><h3>" + escapeHtml(candidate.itemTitle || "未命名条目") + "</h3><span>" + escapeHtml(candidate.provider || "provider") + " · " + escapeHtml(candidateTitle) + "</span></div><span class=\"chip\">" + escapeHtml(candidate.status || "PENDING") + "</span></div><ul class=\"diff-list\">" + (diffs || "<li><span>没有可展示的字段差异</span></li>") + "</ul><div class=\"form-actions\"><button class=\"button secondary\" data-select-candidate=\"" + escapeHtml(candidate.itemId) + "|" + escapeHtml(candidate.id) + "|fillMissing\">仅补缺</button><button class=\"button\" data-select-candidate=\"" + escapeHtml(candidate.itemId) + "|" + escapeHtml(candidate.id) + "|refreshUnlocked\">刷新未锁定</button></div></article>";
+  }).join("");
 }
 
 function renderAdminLibrary(library) {
@@ -214,6 +227,12 @@ function bind() {
   document.querySelectorAll("[data-scan-library]").forEach((element) => element.addEventListener("click", async () => {
     try { await api.scanLibrary(element.dataset.scanLibrary); state.notice = "扫描任务已创建。"; state.error = ""; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-select-candidate]").forEach((element) => element.addEventListener("click", async () => {
+    const [itemId, candidateId, mode] = element.dataset.selectCandidate.split("|");
+    element.disabled = true;
+    try { await api.selectCandidate(itemId, candidateId, mode); state.notice = "元数据候选已写回。"; state.error = ""; render(); }
+    catch (error) { element.disabled = false; state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("[data-action='logout']").forEach((element) => element.addEventListener("click", async () => { try { await api.logout(); } finally { state.user = null; render(); } }));
   document.querySelectorAll("[data-action='retry']").forEach((element) => element.addEventListener("click", () => { state.error = ""; render(); }));
