@@ -196,6 +196,15 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
         .send()
         .await?;
     assert_eq!(grant.status(), reqwest::StatusCode::OK);
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_favorite)
+         VALUES (?, ?, 1)
+         ON CONFLICT(user_id, item_id) DO UPDATE SET is_favorite = 1",
+    )
+    .bind(viewer.id.to_string())
+    .bind(&first_item)
+    .execute(database.pool())
+    .await?;
     let viewer_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "viewer", "password": "viewer password" }))
@@ -214,6 +223,7 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     assert_eq!(collection_body["collection"]["itemType"], "BOX_SET");
     assert_eq!(collection_body["items"].as_array().map(Vec::len), Some(1));
     assert_eq!(collection_body["items"][0]["id"], first_item);
+    assert_eq!(collection_body["items"][0]["userData"]["isFavorite"], true);
 
     let viewer_emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))

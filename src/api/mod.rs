@@ -54,7 +54,7 @@ use crate::{
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
     network::RemoteAccessPolicy,
     security::LoginRateLimiter,
-    storage::{Database, NewPlaybackEvent},
+    storage::{Database, NewPlaybackEvent, StorageError},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
@@ -262,6 +262,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/items/{item_id}/playback", get(lux_get_playback))
         .route("/api/v1/items/{item_id}/progress", post(lux_post_progress))
         .route("/api/v1/items/{item_id}/favorite", put(lux_set_favorite))
+        .route("/api/v1/items/{item_id}/played", put(lux_set_played))
         .route(
             "/api/v1/items/{item_id}/download",
             get(lux_download).head(lux_download),
@@ -1514,6 +1515,9 @@ async fn lux_post_progress(
         Ok(user) => user,
         Err(response) => return response,
     };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
     if request.position_ticks < 0 || request.duration_ticks.is_some_and(|duration| duration < 0) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -1641,6 +1645,12 @@ struct LuxFavoriteRequest {
     favorite: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LuxPlayedRequest {
+    played: bool,
+}
+
 async fn lux_set_favorite(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -1651,6 +1661,9 @@ async fn lux_set_favorite(
         Ok(user) => user,
         Err(response) => return response,
     };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -1667,6 +1680,42 @@ async fn lux_set_favorite(
     };
     match database
         .set_user_item_favorite(&user.id.to_string(), &item_id, request.favorite)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn lux_set_played(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<LuxPlayedRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .set_user_item_played(&user.id.to_string(), &item_id, request.played)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -2539,6 +2588,70 @@ async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserR
     }
 }
 
+async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
+    let Some(auth) = state.auth.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response());
+    };
+    let Some(session_token) = request_cookie(headers, "lux_session") else {
+        return Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要登录",
+        )
+        .into_response());
+    };
+    let session = match auth.resolve(&session_token).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Err(api_error(
+                headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要登录",
+            )
+            .into_response());
+        }
+        Err(_) => {
+            return Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证暂时不可用",
+            )
+            .into_response());
+        }
+    };
+    let Some(csrf_token) = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::CsrfFailed,
+            "CSRF 校验失败",
+        )
+        .into_response());
+    };
+    if !auth.verify_csrf(&session, csrf_token) {
+        return Err(api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::CsrfFailed,
+            "CSRF 校验失败",
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct LuxSearchQuery {
@@ -2573,6 +2686,9 @@ async fn lux_search(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     match catalog
         .search_items(
             AccessPrincipal::new(user.id, user.is_admin),
@@ -2583,7 +2699,12 @@ async fn lux_search(
         )
         .await
     {
-        Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
+        Ok(page) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
             StatusCode::FORBIDDEN.into_response()
@@ -2597,6 +2718,9 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Err(response) => return response,
     };
     let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let Some(libraries) = state.libraries.as_ref() else {
@@ -2635,8 +2759,18 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
     }
+    let continue_watching_items = match lux_catalog_items_json_for_user(
+        database,
+        &user.id.to_string(),
+        &continue_watching.items,
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     Json(json!({
-        "continueWatching": continue_watching.items.iter().map(lux_catalog_item_json).collect::<Vec<_>>(),
+        "continueWatching": continue_watching_items,
         "continueWatchingTotal": continue_watching.total,
         "libraries": visible,
     }))
@@ -2809,6 +2943,9 @@ async fn lux_list_library_items(
         )
         .into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let base_page = catalog
         .list_library_items(principal, &library_id, 0, i64::MAX)
         .await;
@@ -2826,7 +2963,14 @@ async fn lux_list_library_items(
             match filter_emby_catalog_page(&state, principal, page, &filter_query, offset, limit)
                 .await
             {
-                Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
+                Ok(page) => {
+                    match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page)
+                        .await
+                    {
+                        Ok(body) => Json(body).into_response(),
+                        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    }
+                }
                 Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
         }
@@ -2873,8 +3017,21 @@ async fn lux_get_item(
         )
         .into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     match catalog.find_item(principal, &item_id).await {
-        Ok(Some(item)) => Json(lux_catalog_item_json(&item)).into_response(),
+        Ok(Some(item)) => match database
+            .find_user_item_state(&user.id.to_string(), &item.id)
+            .await
+        {
+            Ok(user_state) => Json(lux_catalog_item_json_with_user_state(
+                &item,
+                user_state.as_ref(),
+            ))
+            .into_response(),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
         Ok(None) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
@@ -2929,6 +3086,9 @@ async fn lux_get_children(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(parent) = (match catalog.find_item(principal, &item_id).await {
         Ok(parent) => parent,
@@ -2972,7 +3132,12 @@ async fn lux_get_children(
         }),
     };
     match result {
-        Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
+        Ok(page) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::NOT_FOUND.into_response()
         }
@@ -3005,6 +3170,9 @@ async fn lux_get_collection(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(collection) = (match catalog.find_item(principal, &collection_id).await {
         Ok(collection) => collection,
@@ -3015,18 +3183,34 @@ async fn lux_get_collection(
     if collection.item_type != "BOX_SET" {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let collection_state = match database
+        .find_user_item_state(&user.id.to_string(), &collection.id)
+        .await
+    {
+        Ok(state) => state,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     match catalog
         .list_collection_items(principal, &collection_id, offset, limit)
         .await
     {
-        Ok(page) => Json(json!({
-            "collection": lux_catalog_item_json(&collection),
-            "items": page.items.iter().map(lux_catalog_item_json).collect::<Vec<_>>(),
-            "total": page.total,
-            "page": page.offset / page.limit + 1,
-            "pageSize": page.limit,
-        }))
-        .into_response(),
+        Ok(page) => {
+            let items =
+                match lux_catalog_items_json_for_user(database, &user.id.to_string(), &page.items)
+                    .await
+                {
+                    Ok(items) => items,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
+            Json(json!({
+                "collection": lux_catalog_item_json_with_user_state(&collection, collection_state.as_ref()),
+                "items": items,
+                "total": page.total,
+                "page": page.offset / page.limit + 1,
+                "pageSize": page.limit,
+            }))
+            .into_response()
+        }
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::NOT_FOUND.into_response()
         }
@@ -3769,13 +3953,31 @@ fn page_params(page: Option<i64>, page_size: Option<i64>) -> Result<(i64, i64), 
     Ok((offset, page_size))
 }
 
-fn lux_catalog_page_json(page: &CatalogPage) -> Value {
-    json!({
-        "items": page.items.iter().map(lux_catalog_item_json).collect::<Vec<_>>(),
+async fn lux_catalog_items_json_for_user(
+    database: &Database,
+    user_id: &str,
+    items: &[CatalogItem],
+) -> Result<Vec<Value>, StorageError> {
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let state = database.find_user_item_state(user_id, &item.id).await?;
+        values.push(lux_catalog_item_json_with_user_state(item, state.as_ref()));
+    }
+    Ok(values)
+}
+
+async fn lux_catalog_page_json_for_user(
+    database: &Database,
+    user_id: &str,
+    page: &CatalogPage,
+) -> Result<Value, StorageError> {
+    let items = lux_catalog_items_json_for_user(database, user_id, &page.items).await?;
+    Ok(json!({
+        "items": items,
         "total": page.total,
         "page": page.offset / page.limit + 1,
         "pageSize": page.limit,
-    })
+    }))
 }
 
 fn lux_catalog_item_json(item: &CatalogItem) -> Value {
@@ -3794,6 +3996,26 @@ fn lux_catalog_item_json(item: &CatalogItem) -> Value {
             "fanart": item.fanart_image_tag,
         },
         "mediaSources": item.media_sources.iter().map(lux_catalog_source_json).collect::<Vec<_>>(),
+    })
+}
+
+fn lux_catalog_item_json_with_user_state(
+    item: &CatalogItem,
+    user_state: Option<&crate::storage::StoredUserItemState>,
+) -> Value {
+    let mut value = lux_catalog_item_json(item);
+    if let Value::Object(object) = &mut value {
+        object.insert("userData".to_owned(), lux_user_data_json(user_state));
+    }
+    value
+}
+
+fn lux_user_data_json(state: Option<&crate::storage::StoredUserItemState>) -> Value {
+    json!({
+        "positionTicks": state.map(|value| value.position_ticks).unwrap_or_default(),
+        "playCount": state.map(|value| value.play_count).unwrap_or_default(),
+        "isFavorite": state.map(|value| value.is_favorite).unwrap_or(false),
+        "isPlayed": state.map(|value| value.is_played).unwrap_or(false),
     })
 }
 

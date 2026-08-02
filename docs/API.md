@@ -76,6 +76,10 @@ Lux 电影查询要求有效 Web session：
 - `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回电影。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，结果执行媒体库 ACL。
 - `GET /api/v1/home`：返回当前用户继续观看摘要和可见媒体库入口。
+- `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看和收藏状态。
+- `POST /api/v1/items/{itemId}/progress`：写入播放进度，需要当前 Web session 和 CSRF。
+- `PUT /api/v1/items/{itemId}/favorite`：设置当前 Web 用户的收藏状态，需要当前 Web session 和 CSRF。
+- `PUT /api/v1/items/{itemId}/played`：设置当前 Web 用户的已看状态，请求体为 `{ "played": true }`，需要当前 Web session 和 CSRF。
 - `GET /api/v1/items/{itemId}`：返回电影详情、媒体源和已探测轨道。
 - `GET /api/v1/items/{itemId}/children?itemType=SEASON|EPISODE&seasonId=...`：Web 同源读取剧集季度/单集或合集成员，结果执行当前用户 ACL。
 - `GET /api/v1/collections/{collectionId}`：返回可访问 BOX_SET 及按媒体库 ACL 过滤后的成员。

@@ -178,7 +178,49 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .send()
         .await?;
     assert_eq!(web_episodes.status(), reqwest::StatusCode::OK);
-    assert_eq!(web_episodes.json::<Value>().await?["total"], 3);
+    let web_episodes_body = web_episodes.json::<Value>().await?;
+    assert_eq!(web_episodes_body["total"], 3);
+    assert_eq!(web_episodes_body["items"][0]["id"], episode_id);
+    assert_eq!(
+        web_episodes_body["items"][0]["userData"]["isFavorite"],
+        true
+    );
+    assert_eq!(web_episodes_body["items"][0]["userData"]["isPlayed"], false);
+    assert_eq!(web_episodes_body["items"][1]["userData"]["isPlayed"], true);
+
+    let csrf = request_cookie(&web_cookie, "lux_csrf");
+    let missing_csrf = client
+        .put(format!("{base_url}/api/v1/items/{episode_id}/played"))
+        .header(COOKIE, &web_cookie)
+        .json(&json!({ "played": true }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let missing_favorite_csrf = client
+        .put(format!("{base_url}/api/v1/items/{episode_id}/favorite"))
+        .header(COOKIE, &web_cookie)
+        .json(&json!({ "favorite": true }))
+        .send()
+        .await?;
+    assert_eq!(
+        missing_favorite_csrf.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let mark_played = client
+        .put(format!("{base_url}/api/v1/items/{episode_id}/played"))
+        .header(COOKIE, &web_cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "played": true }))
+        .send()
+        .await?;
+    assert_eq!(mark_played.status(), reqwest::StatusCode::NO_CONTENT);
+    let playback = client
+        .get(format!("{base_url}/api/v1/items/{episode_id}/playback"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(playback.status(), reqwest::StatusCode::OK);
+    assert_eq!(playback.json::<Value>().await?["isPlayed"], true);
 
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
@@ -223,6 +265,16 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
                 .strip_prefix(&format!("{name}="))
                 .and_then(|value| value.split(';').next())
                 .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+fn request_cookie(cookie: &str, name: &str) -> String {
+    cookie
+        .split("; ")
+        .find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            (key == name).then(|| value.to_owned())
         })
         .unwrap_or_default()
 }
