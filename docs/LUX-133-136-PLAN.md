@@ -17,4 +17,5 @@
 - [ ] amd64 构建产物和镜像签名/版本发布。
 - [ ] Tailscale/反代 HTTPS、Range 缓冲和 trusted proxy 实机验证。
 - [ ] 磁盘满、媒体挂载丢失、TMDb 故障和强制终止恢复演练。
+- [x] 已有根路径丢失、TMDb 故障、NFO/图片/ffprobe 故障和容器重启证据已汇总到 `docs/LUX-135-PLAN.md`。
 - [ ] 飞牛 NAS 7 天运行和正式发布候选验收。
