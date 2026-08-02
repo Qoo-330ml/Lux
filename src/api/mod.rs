@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, to_bytes},
     extract::{ConnectInfo, Path, Query, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode,
@@ -299,6 +299,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .nest("/emby", emby_routes())
         .with_state(state)
         .layer(middleware::from_fn(attach_peer_address))
+        .layer(middleware::from_fn(normalize_empty_api_service_unavailable))
         .layer(
             tower::ServiceBuilder::new()
                 .set_x_request_id(MakeRequestUuid)
@@ -337,6 +338,40 @@ pub fn app_with_state(state: AppState) -> Router {
                 )
                 .propagate_x_request_id(),
         )
+}
+
+async fn normalize_empty_api_service_unavailable(request: Request<Body>, next: Next) -> Response {
+    let is_lux_api = request.uri().path().starts_with("/api/v1/");
+    let request_headers = request.headers().clone();
+    let response = next.run(request).await;
+    if !is_lux_api || response.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    match to_bytes(body, 64 * 1024).await {
+        Ok(body) if !body.is_empty() => {
+            return Response::from_parts(parts, Body::from(body));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "failed to inspect service unavailable response body");
+        }
+    }
+
+    let mut error_headers = request_headers;
+    if let Some(request_id) = parts.headers.get("x-request-id") {
+        error_headers.insert("x-request-id", request_id.clone());
+    }
+    let mut normalized = api_error(
+        &error_headers,
+        StatusCode::SERVICE_UNAVAILABLE,
+        lux::ApiErrorCode::DatabaseUnavailable,
+        "数据库暂时不可用",
+    )
+    .into_response();
+    normalized.headers_mut().extend(parts.headers);
+    normalized
 }
 
 async fn attach_peer_address(mut request: Request<Body>, next: Next) -> Response {
