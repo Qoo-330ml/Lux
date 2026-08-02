@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod config;
+pub mod domain;
 pub mod observability;
 pub mod storage;
 

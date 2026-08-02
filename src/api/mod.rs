@@ -1,3 +1,5 @@
+pub mod lux;
+
 use axum::{Json, Router, routing::get};
 use serde_json::{Value, json};
 use tower_http::{ServiceBuilderExt, request_id::MakeRequestUuid, trace::TraceLayer};

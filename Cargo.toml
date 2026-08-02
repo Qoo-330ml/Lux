@@ -9,12 +9,14 @@ license = "MIT"
 [dependencies]
 axum = "0.8"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "sqlite", "migrate"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["request-id", "trace", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
