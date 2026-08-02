@@ -8,11 +8,12 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{
-        HeaderMap, HeaderValue, Method, StatusCode,
+        HeaderMap, HeaderValue, Method, Request, StatusCode,
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
     },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
 };
@@ -48,6 +49,7 @@ use crate::{
     },
     config::Config,
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
+    network::RemoteAccessPolicy,
     storage::{Database, NewPlaybackEvent},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -68,6 +70,7 @@ pub struct AppState {
     metadata_selection: Option<MetadataSelectionService>,
     scan_jobs: Option<ScanJobService>,
     collections: Option<CollectionService>,
+    remote_access: RemoteAccessPolicy,
 }
 
 impl AppState {
@@ -101,6 +104,7 @@ impl AppState {
             metadata_selection,
             scan_jobs: Some(ScanJobService::new(database.clone())),
             collections,
+            remote_access: RemoteAccessPolicy::from_env(),
         }
     }
 
@@ -109,6 +113,11 @@ impl AppState {
             return self;
         };
         self.collections = Some(CollectionService::new(database, tmdb));
+        self
+    }
+
+    pub fn with_remote_access_policy(mut self, policy: RemoteAccessPolicy) -> Self {
+        self.remote_access = policy;
         self
     }
 }
@@ -209,6 +218,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
+        .layer(middleware::from_fn(attach_peer_address))
         .layer(
             tower::ServiceBuilder::new()
                 .set_x_request_id(MakeRequestUuid)
@@ -226,8 +236,26 @@ pub fn app_with_state(state: AppState) -> Router {
         )
 }
 
+async fn attach_peer_address(mut request: Request<Body>, next: Next) -> Response {
+    request.headers_mut().remove("x-lux-peer-ip");
+    if let Some(ConnectInfo(address)) = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+    {
+        let value = address.ip().to_string();
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            request.headers_mut().insert("x-lux-peer-ip", value);
+        }
+    }
+    next.run(request).await
+}
+
 fn safe_trace_path(uri: &axum::http::Uri) -> &str {
     uri.path()
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn emby_routes() -> Router<AppState> {
@@ -326,7 +354,7 @@ async fn emby_system_info(
     let Some(auth) = state.emby_auth.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    if let Err(status) = require_emby_token(&headers, &query, auth).await {
+    if let Err(status) = require_emby_token(&headers, &query, auth, &state).await {
         return status.into_response();
     }
     Json(json!({
@@ -353,7 +381,7 @@ async fn emby_ping(
     let Some(auth) = state.emby_auth.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match require_emby_token(&headers, &query, auth).await {
+    match require_emby_token(&headers, &query, auth, &state).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(status) => status.into_response(),
     }
@@ -392,6 +420,15 @@ async fn emby_authenticate(
         .authenticate(&request.username, &request.password, &device)
         .await
     {
+        Ok(Some(result))
+            if state.remote_access.is_remote(
+                header_str(&headers, "x-lux-peer-ip"),
+                header_str(&headers, "x-forwarded-for"),
+            ) && !result.user.can_remote_access =>
+        {
+            let _ = auth.logout(&result.token).await;
+            StatusCode::FORBIDDEN.into_response()
+        }
         Ok(Some(result)) => Json(json!({
             "User": emby_user_json(&result.user),
             "SessionInfo": {
@@ -420,10 +457,17 @@ async fn require_emby_token(
     headers: &HeaderMap,
     query: &EmbyTokenQuery,
     auth: &EmbyAuthService,
+    state: &AppState,
 ) -> Result<(), StatusCode> {
-    resolve_emby_user_with_auth(headers, query, auth)
-        .await
-        .map(|_| ())
+    let user = resolve_emby_user_with_auth(headers, query, auth).await?;
+    if state.remote_access.is_remote(
+        header_str(headers, "x-lux-peer-ip"),
+        header_str(headers, "x-forwarded-for"),
+    ) && !user.can_remote_access
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
 }
 
 async fn resolve_emby_user_with_auth(
@@ -455,7 +499,15 @@ async fn require_emby_user(
     let query = EmbyTokenQuery {
         api_key: api_key.map(str::to_owned),
     };
-    resolve_emby_user_with_auth(headers, &query, auth).await
+    let user = resolve_emby_user_with_auth(headers, &query, auth).await?;
+    if state.remote_access.is_remote(
+        header_str(headers, "x-lux-peer-ip"),
+        header_str(headers, "x-forwarded-for"),
+    ) && !user.can_remote_access
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(user)
 }
 
 async fn emby_logout(
@@ -1855,6 +1907,20 @@ async fn auth_login(
             .into_response();
         }
     };
+    if state.remote_access.is_remote(
+        header_str(&headers, "x-lux-peer-ip"),
+        header_str(&headers, "x-forwarded-for"),
+    ) && !session.user.can_remote_access
+    {
+        let _ = auth.logout(&session.session_token).await;
+        return api_error(
+            &headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "当前账户不允许远程访问",
+        )
+        .into_response();
+    }
 
     let mut response_headers = HeaderMap::new();
     let Some(session_cookie) = build_cookie("lux_session", &session.session_token, true, None)
@@ -1887,7 +1953,7 @@ async fn auth_login(
 }
 
 async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    let Some(auth) = state.auth else {
+    let Some(auth) = state.auth.as_ref() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1906,7 +1972,22 @@ async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response 
         .into_response();
     };
     match auth.resolve(&session_token).await {
-        Ok(Some(session)) => Json(json!({ "user": user_json(&session.user) })).into_response(),
+        Ok(Some(session)) => {
+            if state.remote_access.is_remote(
+                header_str(&headers, "x-lux-peer-ip"),
+                header_str(&headers, "x-forwarded-for"),
+            ) && !session.user.can_remote_access
+            {
+                return api_error(
+                    &headers,
+                    StatusCode::FORBIDDEN,
+                    lux::ApiErrorCode::PermissionDenied,
+                    "当前账户不允许远程访问",
+                )
+                .into_response();
+            }
+            Json(json!({ "user": user_json(&session.user) })).into_response()
+        }
         Ok(None) => api_error(
             &headers,
             StatusCode::UNAUTHORIZED,
@@ -2045,7 +2126,22 @@ async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserR
         .into_response());
     };
     match auth.resolve(&session_token).await {
-        Ok(Some(session)) => Ok(session.user),
+        Ok(Some(session)) => {
+            if state.remote_access.is_remote(
+                header_str(headers, "x-lux-peer-ip"),
+                header_str(headers, "x-forwarded-for"),
+            ) && !session.user.can_remote_access
+            {
+                return Err(api_error(
+                    headers,
+                    StatusCode::FORBIDDEN,
+                    lux::ApiErrorCode::PermissionDenied,
+                    "当前账户不允许远程访问",
+                )
+                .into_response());
+            }
+            Ok(session.user)
+        }
         Ok(None) => Err(api_error(
             headers,
             StatusCode::UNAUTHORIZED,

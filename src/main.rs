@@ -8,6 +8,7 @@ use luxd::{
     observability,
     storage::Database,
 };
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -32,9 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     database.close().await;
     Ok(())
