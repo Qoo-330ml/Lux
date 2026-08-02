@@ -1,19 +1,24 @@
 use std::fmt;
 
-use crate::storage::{Database, StorageError, StoredCatalogRow};
+use crate::{
+    application::access::{AccessError, AccessPrincipal, MediaAccessService},
+    storage::{Database, StorageError, StoredCatalogRow},
+};
 
 #[derive(Clone)]
 pub struct CatalogService {
     database: Database,
+    access: MediaAccessService,
 }
 
 impl CatalogService {
-    pub fn new(database: Database) -> Self {
-        Self { database }
+    pub fn new(database: Database, access: MediaAccessService) -> Self {
+        Self { database, access }
     }
 
     pub async fn list_library_items(
         &self,
+        principal: AccessPrincipal,
         library_id: &str,
         offset: i64,
         limit: i64,
@@ -23,6 +28,9 @@ impl CatalogService {
         };
         if !library.is_enabled {
             return Err(CatalogError::LibraryNotFound);
+        }
+        if !self.access.can_view_library(principal, library_id).await? {
+            return Err(CatalogError::AccessDenied);
         }
         let total = self.database.count_catalog_items(Some(library_id)).await?;
         let rows = self
@@ -37,20 +45,56 @@ impl CatalogService {
         })
     }
 
-    pub async fn find_item(&self, item_id: &str) -> Result<Option<CatalogItem>, CatalogError> {
+    pub async fn find_item(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+    ) -> Result<Option<CatalogItem>, CatalogError> {
+        if !self.access.can_view_item(principal, item_id).await? {
+            return Ok(None);
+        }
         let rows = self.database.find_catalog_rows(item_id).await?;
         Ok(assemble_items(rows).into_iter().next())
     }
 
     pub async fn list_all_items(
         &self,
+        principal: AccessPrincipal,
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
-        let total = self.database.count_catalog_items(None).await?;
-        let rows = self.database.list_catalog_rows(None, offset, limit).await?;
+        if principal.is_admin {
+            let total = self.database.count_catalog_items(None).await?;
+            let rows = self.database.list_catalog_rows(None, offset, limit).await?;
+            return Ok(CatalogPage {
+                items: assemble_items(rows),
+                total,
+                offset,
+                limit,
+            });
+        }
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let mut items = Vec::new();
+        for library_id in library_ids {
+            let rows = self
+                .database
+                .list_catalog_rows(Some(&library_id), 0, i64::MAX)
+                .await?;
+            items.extend(assemble_items(rows));
+        }
+        items.sort_by(|left, right| {
+            left.sort_title
+                .cmp(&right.sort_title)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        let items = items
+            .into_iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(usize::try_from(limit).unwrap_or(0))
+            .collect();
         Ok(CatalogPage {
-            items: assemble_items(rows),
+            items,
             total,
             offset,
             limit,
@@ -181,6 +225,7 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
 #[derive(Debug)]
 pub enum CatalogError {
     LibraryNotFound,
+    AccessDenied,
     Storage(StorageError),
 }
 
@@ -188,6 +233,7 @@ impl fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LibraryNotFound => formatter.write_str("library not found"),
+            Self::AccessDenied => formatter.write_str("library access denied"),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -196,7 +242,7 @@ impl fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::LibraryNotFound => None,
+            Self::LibraryNotFound | Self::AccessDenied => None,
             Self::Storage(error) => Some(error),
         }
     }
@@ -205,5 +251,13 @@ impl std::error::Error for CatalogError {
 impl From<StorageError> for CatalogError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<AccessError> for CatalogError {
+    fn from(error: AccessError) -> Self {
+        match error {
+            AccessError::Storage(error) => Self::Storage(error),
+        }
     }
 }

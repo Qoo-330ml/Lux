@@ -6,26 +6,34 @@ use std::{
 
 use tokio::fs;
 
-use crate::storage::{Database, StorageError};
+use crate::{
+    application::access::{AccessError, AccessPrincipal, MediaAccessService},
+    storage::{Database, StorageError},
+};
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ImageService {
     database: Database,
+    access: MediaAccessService,
 }
 
 impl ImageService {
-    pub fn new(database: Database) -> Self {
-        Self { database }
+    pub fn new(database: Database, access: MediaAccessService) -> Self {
+        Self { database, access }
     }
 
     pub async fn resolve(
         &self,
+        principal: AccessPrincipal,
         item_id: &str,
         image_type: &str,
         image_index: i64,
     ) -> Result<Option<ResolvedImage>, ImageError> {
+        if !self.access.can_view_item(principal, item_id).await? {
+            return Ok(None);
+        }
         let candidates = self
             .database
             .list_item_image_candidates(item_id, image_type, image_index)
@@ -166,5 +174,13 @@ impl std::error::Error for ImageError {
 impl From<StorageError> for ImageError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<AccessError> for ImageError {
+    fn from(error: AccessError) -> Self {
+        match error {
+            AccessError::Storage(error) => Self::Storage(error),
+        }
     }
 }

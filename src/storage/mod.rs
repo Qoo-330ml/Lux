@@ -186,6 +186,18 @@ impl Database {
         })
     }
 
+    pub(crate) async fn user_exists(&self, user_id: &str) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)")
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value: i64| value != 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn list_users(&self) -> Result<Vec<StoredUser>, StorageError> {
         sqlx::query(
             "SELECT id, username_normalized, display_name, password_hash,
@@ -244,6 +256,101 @@ impl Database {
                 can_download: row.get::<i64, _>("can_download") != 0,
             })
         })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_user_library_access(
+        &self,
+        user_id: &str,
+        library_id: &str,
+        can_view: bool,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO user_library_access (user_id, library_id, can_view)
+             VALUES (?, ?, ?)
+             ON CONFLICT(user_id, library_id) DO UPDATE SET
+                 can_view = excluded.can_view, updated_at = unixepoch()",
+        )
+        .bind(user_id)
+        .bind(library_id)
+        .bind(can_view)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn has_user_library_access(
+        &self,
+        user_id: &str,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM user_library_access
+                WHERE user_id = ? AND library_id = ? AND can_view = 1
+            )",
+        )
+        .bind(user_id)
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_accessible_library_ids(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT ula.library_id
+             FROM user_library_access ula
+             JOIN libraries l ON l.id = ula.library_id
+             WHERE ula.user_id = ? AND ula.can_view = 1 AND l.is_enabled = 1
+             ORDER BY l.name, l.id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_enabled_library_ids(&self) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar("SELECT id FROM libraries WHERE is_enabled = 1 ORDER BY name, id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn find_item_library_id(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT mi.library_id
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.id = ? AND mi.removed_at IS NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -340,6 +447,18 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn library_exists(&self, library_id: &str) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM libraries WHERE id = ?)")
+            .bind(library_id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value: i64| value != 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn insert_library_root(

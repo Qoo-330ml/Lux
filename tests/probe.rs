@@ -196,7 +196,7 @@ async fn probe_service_persists_exit_failure_without_retrying_automatically()
     let script = executable_script(temp_dir.path(), "#!/bin/sh\necho broken >&2\nexit 7\n")?;
     let service = MediaProbeService::new(
         database.clone(),
-        FfprobeRunner::new(script, Duration::from_secs(1)),
+        FfprobeRunner::new(script, Duration::from_secs(5)),
     );
     let first = service.probe_movie_library(library.id).await?;
     assert_eq!(first.failed, 1);

@@ -11,7 +11,7 @@ use axum::{
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
     },
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -22,6 +22,7 @@ use crate::{
     COMMIT, VERSION,
     application::setup::{SetupError, SetupService},
     application::{
+        access::{AccessPrincipal, MediaAccessService},
         catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
         images::{ImageError, ImageService, normalize_image_type},
         libraries::{LibraryService, LibraryServiceError},
@@ -47,6 +48,7 @@ pub struct AppState {
     libraries: Option<LibraryService>,
     catalog: Option<CatalogService>,
     images: Option<ImageService>,
+    access: Option<MediaAccessService>,
 }
 
 impl AppState {
@@ -58,6 +60,7 @@ impl AppState {
         emby_auth: EmbyAuthService,
     ) -> Self {
         let server_id = database.server_id().to_owned();
+        let access = MediaAccessService::new(database.clone());
         Self {
             database: Some(database.clone()),
             config_dir: Some(config.config_dir),
@@ -66,8 +69,9 @@ impl AppState {
             auth: Some(auth),
             emby_auth: Some(emby_auth),
             libraries: Some(LibraryService::new(database.clone())),
-            catalog: Some(CatalogService::new(database.clone())),
-            images: Some(ImageService::new(database)),
+            catalog: Some(CatalogService::new(database.clone(), access.clone())),
+            images: Some(ImageService::new(database, access.clone())),
+            access: Some(access),
         }
     }
 }
@@ -93,6 +97,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries/{library_id}/roots",
             post(admin_add_library_root),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/libraries/{library_id}",
+            patch(admin_set_library_access),
         )
         .route("/api/v1/libraries", get(lux_list_libraries))
         .route(
@@ -361,20 +369,32 @@ async fn emby_user_views(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match libraries.list_libraries().await {
-        Ok(views) => Json(json!({
-            "Items": views
-                .iter()
-                .filter(|view| view.library.is_enabled)
-                .map(|view| emby_library_view_json(&view.library, &state.server_id))
-                .collect::<Vec<_>>(),
-            "TotalRecordCount": views.iter().filter(|view| view.library.is_enabled).count(),
-            "StartIndex": 0,
-        }))
-        .into_response(),
+        Ok(views) => {
+            let mut items = Vec::new();
+            for view in views {
+                let can_view = match access
+                    .can_view_library(principal, &view.library.id.to_string())
+                    .await
+                {
+                    Ok(can_view) => can_view,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
+                if view.library.is_enabled && can_view {
+                    items.push(emby_library_view_json(&view.library, &state.server_id));
+                }
+            }
+            let total = items.len();
+            Json(json!({ "Items": items, "TotalRecordCount": total, "StartIndex": 0 }))
+                .into_response()
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -413,7 +433,8 @@ async fn emby_user_items(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
-    emby_list_items(&headers, &state, &query).await
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    emby_list_items(&headers, &state, principal, &query).await
 }
 
 async fn emby_items(
@@ -430,12 +451,14 @@ async fn emby_items(
     {
         return status.into_response();
     }
-    emby_list_items(&headers, &state, &query).await
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    emby_list_items(&headers, &state, principal, &query).await
 }
 
 async fn emby_list_items(
     _headers: &HeaderMap,
     state: &AppState,
+    principal: AccessPrincipal,
     query: &EmbyItemsQuery,
 ) -> Response {
     if !query.include_item_types.as_deref().is_none_or(|types| {
@@ -463,14 +486,15 @@ async fn emby_list_items(
                 return StatusCode::BAD_REQUEST.into_response();
             };
             catalog
-                .list_library_items(&parent_id.to_string(), offset, limit)
+                .list_library_items(principal, &parent_id.to_string(), offset, limit)
                 .await
         }
-        None => catalog.list_all_items(offset, limit).await,
+        None => catalog.list_all_items(principal, offset, limit).await,
     };
     match page {
         Ok(page) => Json(emby_catalog_page_json(&page, &state.server_id)).into_response(),
         Err(CatalogError::LibraryNotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(CatalogError::AccessDenied) => StatusCode::FORBIDDEN.into_response(),
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -481,11 +505,12 @@ async fn emby_item(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let _user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
     };
-    emby_item_response(&state, &item_id).await
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    emby_item_response(&state, principal, &item_id).await
 }
 
 async fn emby_user_item(
@@ -501,18 +526,25 @@ async fn emby_user_item(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
-    emby_item_response(&state, &item_id).await
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    emby_item_response(&state, principal, &item_id).await
 }
 
-async fn emby_item_response(state: &AppState, item_id: &str) -> Response {
+async fn emby_item_response(
+    state: &AppState,
+    principal: AccessPrincipal,
+    item_id: &str,
+) -> Response {
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match catalog.find_item(item_id).await {
+    match catalog.find_item(principal, item_id).await {
         Ok(Some(item)) => Json(emby_catalog_item_json(&item, &state.server_id)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(CatalogError::LibraryNotFound) => unreachable!("item lookup has no library lookup"),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            unreachable!("inaccessible item is returned as not found")
+        }
     }
 }
 
@@ -1014,9 +1046,10 @@ async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserR
 }
 
 async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Err(response) = require_web_user(&headers, &state).await {
-        return response;
-    }
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
     let Some(libraries) = state.libraries.as_ref() else {
         return api_error(
             &headers,
@@ -1026,19 +1059,31 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
         )
         .into_response();
     };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     match libraries.list_libraries().await {
-        Ok(views) => Json(json!({
-            "libraries": views
-                .iter()
-                .filter(|view| view.library.is_enabled)
-                .map(|view| json!({
-                    "id": view.library.id.to_string(),
-                    "name": view.library.name,
-                    "kind": view.library.kind.as_str(),
-                }))
-                .collect::<Vec<_>>()
-        }))
-        .into_response(),
+        Ok(views) => {
+            let mut visible = Vec::new();
+            for view in views {
+                let can_view = match access
+                    .can_view_library(principal, &view.library.id.to_string())
+                    .await
+                {
+                    Ok(can_view) => can_view,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
+                if view.library.is_enabled && can_view {
+                    visible.push(json!({
+                        "id": view.library.id.to_string(),
+                        "name": view.library.name,
+                        "kind": view.library.kind.as_str(),
+                    }));
+                }
+            }
+            Json(json!({ "libraries": visible })).into_response()
+        }
         Err(error) => library_error(&headers, error),
     }
 }
@@ -1049,9 +1094,11 @@ async fn lux_list_library_items(
     Query(query): Query<LuxPageQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(response) = require_web_user(&headers, &state).await {
-        return response;
-    }
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
         Ok(id) => id.to_string(),
         Err(_) => {
@@ -1085,13 +1132,23 @@ async fn lux_list_library_items(
         )
         .into_response();
     };
-    match catalog.list_library_items(&library_id, offset, limit).await {
+    match catalog
+        .list_library_items(principal, &library_id, offset, limit)
+        .await
+    {
         Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
         Err(CatalogError::LibraryNotFound) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
             "媒体库不存在",
+        )
+        .into_response(),
+        Err(CatalogError::AccessDenied) => api_error(
+            &headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "没有媒体库访问权限",
         )
         .into_response(),
         Err(CatalogError::Storage(_)) => api_error(
@@ -1109,9 +1166,11 @@ async fn lux_get_item(
     Path(item_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(response) = require_web_user(&headers, &state).await {
-        return response;
-    }
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(catalog) = state.catalog.as_ref() else {
         return api_error(
             &headers,
@@ -1121,7 +1180,7 @@ async fn lux_get_item(
         )
         .into_response();
     };
-    match catalog.find_item(&item_id).await {
+    match catalog.find_item(principal, &item_id).await {
         Ok(Some(item)) => Json(lux_catalog_item_json(&item)).into_response(),
         Ok(None) => api_error(
             &headers,
@@ -1137,7 +1196,9 @@ async fn lux_get_item(
             "数据库暂时不可用",
         )
         .into_response(),
-        Err(CatalogError::LibraryNotFound) => unreachable!("item lookup has no library lookup"),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            unreachable!("inaccessible item is returned as not found")
+        }
     }
 }
 
@@ -1147,13 +1208,24 @@ async fn lux_image(
     Path((item_id, image_type)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(response) = require_web_user(&headers, &state).await {
-        return response;
-    }
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    serve_image(images, &headers, &method, &item_id, &image_type, 0).await
+    serve_image(
+        images,
+        principal,
+        &headers,
+        &method,
+        &item_id,
+        &image_type,
+        0,
+    )
+    .await
 }
 
 async fn lux_image_at_index(
@@ -1162,9 +1234,11 @@ async fn lux_image_at_index(
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(response) = require_web_user(&headers, &state).await {
-        return response;
-    }
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -1173,6 +1247,7 @@ async fn lux_image_at_index(
     };
     serve_image(
         images,
+        principal,
         &headers,
         &method,
         &item_id,
@@ -1189,13 +1264,24 @@ async fn emby_image(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(status) = require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        return status.into_response();
-    }
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    serve_image(images, &headers, &method, &item_id, &image_type, 0).await
+    serve_image(
+        images,
+        principal,
+        &headers,
+        &method,
+        &item_id,
+        &image_type,
+        0,
+    )
+    .await
 }
 
 async fn emby_image_at_index(
@@ -1205,9 +1291,11 @@ async fn emby_image_at_index(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(status) = require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        return status.into_response();
-    }
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -1216,6 +1304,7 @@ async fn emby_image_at_index(
     };
     serve_image(
         images,
+        principal,
         &headers,
         &method,
         &item_id,
@@ -1227,6 +1316,7 @@ async fn emby_image_at_index(
 
 async fn serve_image(
     images: &ImageService,
+    principal: AccessPrincipal,
     headers: &HeaderMap,
     method: &Method,
     item_id: &str,
@@ -1236,7 +1326,10 @@ async fn serve_image(
     let Some(image_type) = normalize_image_type(image_type) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let image = match images.resolve(item_id, image_type, image_index).await {
+    let image = match images
+        .resolve(principal, item_id, image_type, image_index)
+        .await
+    {
         Ok(Some(image)) => image,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
@@ -1346,6 +1439,116 @@ struct CreateLibraryRequest {
 #[derive(Deserialize)]
 struct AddLibraryRootRequest {
     path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetLibraryAccessRequest {
+    can_view: bool,
+}
+
+async fn admin_set_library_access(
+    headers: HeaderMap,
+    Path((user_id, library_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<SetLibraryAccessRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let user_id = match user_id.parse::<crate::domain::ids::UserId>() {
+        Ok(id) => id.to_string(),
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "用户 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id.to_string(),
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let Some(database) = state.database.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let user_exists = match database.user_exists(&user_id).await {
+        Ok(exists) => exists,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "数据库暂时不可用",
+            )
+            .into_response();
+        }
+    };
+    if !user_exists {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response();
+    }
+    let library_exists = match database.library_exists(&library_id).await {
+        Ok(exists) => exists,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "数据库暂时不可用",
+            )
+            .into_response();
+        }
+    };
+    if !library_exists {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在",
+        )
+        .into_response();
+    }
+    match database
+        .set_user_library_access(&user_id, &library_id, request.can_view)
+        .await
+    {
+        Ok(()) => Json(json!({
+            "userId": user_id,
+            "libraryId": library_id,
+            "canView": request.can_view,
+        }))
+        .into_response(),
+        Err(_) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+    }
 }
 
 async fn require_admin(
