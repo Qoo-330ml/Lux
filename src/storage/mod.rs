@@ -1146,6 +1146,123 @@ impl Database {
         })
     }
 
+    pub(crate) async fn count_pending_metadata_candidates(&self) -> Result<i64, StorageError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE status = 'PENDING'")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_pending_metadata_candidates(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredMetadataCandidate>, StorageError> {
+        sqlx::query(
+            "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                    mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                    mi.title AS item_title
+             FROM metadata_candidates mc
+             JOIN media_items mi ON mi.id = mc.item_id
+             WHERE mc.status = 'PENDING' AND mi.removed_at IS NULL
+             ORDER BY mc.created_at, mc.id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn count_pending_metadata_candidates_for_item(
+        &self,
+        item_id: &str,
+        search: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let count = if let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) {
+            let pattern = format!("%{search}%");
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM metadata_candidates
+                 WHERE item_id = ? AND status = 'PENDING'
+                   AND (provider_id LIKE ? OR candidate_json LIKE ?)",
+            )
+            .bind(item_id)
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_one(&self.pool)
+            .await
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM metadata_candidates
+                 WHERE item_id = ? AND status = 'PENDING'",
+            )
+            .bind(item_id)
+            .fetch_one(&self.pool)
+            .await
+        };
+        count.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_pending_metadata_candidates_for_item(
+        &self,
+        item_id: &str,
+        search: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredMetadataCandidate>, StorageError> {
+        let rows = if let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) {
+            let pattern = format!("%{search}%");
+            sqlx::query(
+                "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                        mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                        mi.title AS item_title
+                 FROM metadata_candidates mc
+                 JOIN media_items mi ON mi.id = mc.item_id
+                 WHERE mc.item_id = ? AND mc.status = 'PENDING' AND mi.removed_at IS NULL
+                   AND (mc.provider_id LIKE ? OR mc.candidate_json LIKE ?)
+                 ORDER BY mc.created_at, mc.id LIMIT ? OFFSET ?",
+            )
+            .bind(item_id)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                        mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                        mi.title AS item_title
+                 FROM metadata_candidates mc
+                 JOIN media_items mi ON mi.id = mc.item_id
+                 WHERE mc.item_id = ? AND mc.status = 'PENDING' AND mi.removed_at IS NULL
+                 ORDER BY mc.created_at, mc.id LIMIT ? OFFSET ?",
+            )
+            .bind(item_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn count_catalog_items(
         &self,
         library_id: Option<&str>,
@@ -1895,6 +2012,33 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) production_year: Option<i64>,
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredMetadataCandidate {
+    pub(crate) id: String,
+    pub(crate) item_id: String,
+    pub(crate) provider: String,
+    pub(crate) provider_id: String,
+    pub(crate) candidate_json: String,
+    pub(crate) score: f64,
+    pub(crate) status: String,
+    pub(crate) expires_at: Option<i64>,
+    pub(crate) item_title: String,
+}
+
+fn stored_metadata_candidate(row: sqlx::sqlite::SqliteRow) -> StoredMetadataCandidate {
+    StoredMetadataCandidate {
+        id: row.get("id"),
+        item_id: row.get("item_id"),
+        provider: row.get("provider"),
+        provider_id: row.get("provider_id"),
+        candidate_json: row.get("candidate_json"),
+        score: row.get("score"),
+        status: row.get("status"),
+        expires_at: row.get("expires_at"),
+        item_title: row.get("item_title"),
+    }
 }
 
 fn stored_media_item(row: sqlx::sqlite::SqliteRow) -> StoredMediaItem {

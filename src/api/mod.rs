@@ -23,6 +23,7 @@ use crate::{
     application::setup::{SetupError, SetupService},
     application::{
         access::{AccessPrincipal, MediaAccessService},
+        candidates::{MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService},
         catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
         images::{ImageError, ImageService, normalize_image_type},
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
@@ -50,6 +51,7 @@ pub struct AppState {
     catalog: Option<CatalogService>,
     images: Option<ImageService>,
     access: Option<MediaAccessService>,
+    metadata_candidates: Option<MetadataCandidateService>,
     scan_jobs: Option<ScanJobService>,
 }
 
@@ -74,6 +76,7 @@ impl AppState {
             catalog: Some(CatalogService::new(database.clone(), access.clone())),
             images: Some(ImageService::new(database.clone(), access.clone())),
             access: Some(access),
+            metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             scan_jobs: Some(ScanJobService::new(database.clone())),
         }
     }
@@ -100,6 +103,14 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries/{library_id}",
             patch(admin_update_library),
+        )
+        .route(
+            "/api/v1/admin/metadata/pending",
+            get(admin_list_pending_metadata),
+        )
+        .route(
+            "/api/v1/admin/items/{item_id}/identify/candidates",
+            get(admin_list_item_candidates),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/roots",
@@ -1383,8 +1394,16 @@ async fn serve_image(
 }
 
 fn lux_page_params(query: &LuxPageQuery) -> Result<(i64, i64), &'static str> {
-    let page = query.page.unwrap_or(1);
-    let page_size = query.page_size.unwrap_or(50);
+    page_params(query.page, query.page_size)
+}
+
+fn metadata_page_params(query: &MetadataCandidateQuery) -> Result<(i64, i64), &'static str> {
+    page_params(query.page, query.page_size)
+}
+
+fn page_params(page: Option<i64>, page_size: Option<i64>) -> Result<(i64, i64), &'static str> {
+    let page = page.unwrap_or(1);
+    let page_size = page_size.unwrap_or(50);
     if page < 1 || !(1..=100).contains(&page_size) {
         return Err("分页参数无效");
     }
@@ -1482,6 +1501,15 @@ where
 #[serde(rename_all = "camelCase")]
 struct SetLibraryAccessRequest {
     can_view: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MetadataCandidateQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    #[serde(alias = "q")]
+    search: Option<String>,
 }
 
 async fn admin_set_library_access(
@@ -1782,6 +1810,147 @@ async fn admin_list_libraries(headers: HeaderMap, State(state): State<AppState>)
         }))
         .into_response(),
         Err(error) => library_error(&headers, error),
+    }
+}
+
+async fn admin_list_pending_metadata(
+    headers: HeaderMap,
+    Query(query): Query<MetadataCandidateQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match metadata_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(candidates) = state.metadata_candidates.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match candidates.list_pending(offset, limit).await {
+        Ok(page) => Json(metadata_candidate_page_json(&page)).into_response(),
+        Err(error) => metadata_candidate_error(&headers, error),
+    }
+}
+
+async fn admin_list_item_candidates(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<MetadataCandidateQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let (offset, limit) = match metadata_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(candidates) = state.metadata_candidates.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match candidates
+        .list_for_item(&item_id, query.search.as_deref(), offset, limit)
+        .await
+    {
+        Ok(page) => Json(metadata_candidate_page_json(&page)).into_response(),
+        Err(error) => metadata_candidate_error(&headers, error),
+    }
+}
+
+fn metadata_candidate_page_json(page: &MetadataCandidatePage) -> Value {
+    json!({
+        "items": page.items.iter().map(|item| json!({
+            "id": item.id,
+            "itemId": item.item_id,
+            "itemTitle": item.item_title,
+            "provider": item.provider,
+            "providerId": item.provider_id,
+            "candidate": item.candidate,
+            "score": item.score,
+            "status": item.status,
+            "expiresAt": item.expires_at,
+            "fieldDiffs": item.field_diffs.iter().map(|diff| json!({
+                "field": diff.field,
+                "current": diff.current,
+                "candidate": diff.candidate,
+                "provenance": diff.provenance,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "total": page.total,
+        "page": page.offset / page.limit + 1,
+        "pageSize": page.limit,
+    })
+}
+
+fn metadata_candidate_error(headers: &HeaderMap, error: MetadataCandidateError) -> Response {
+    match error {
+        MetadataCandidateError::ItemNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
+        MetadataCandidateError::InvalidSearch => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "候选搜索条件无效",
+        )
+        .into_response(),
+        MetadataCandidateError::InvalidCandidateJson(_) => api_error(
+            headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            "候选数据损坏",
+        )
+        .into_response(),
+        MetadataCandidateError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
     }
 }
 
