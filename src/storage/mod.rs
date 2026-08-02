@@ -331,6 +331,68 @@ impl Database {
         self.find_user_by_id(user_id).await
     }
 
+    pub(crate) async fn insert_audit_event(
+        &self,
+        event: NewAuditEvent<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO audit_events (
+                id, actor_user_id, event_type, target_type, target_id, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(event.actor_user_id)
+        .bind(event.event_type)
+        .bind(event.target_type)
+        .bind(event.target_id)
+        .bind(event.metadata_json)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_audit_events(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredAuditEvent>, StorageError> {
+        sqlx::query(
+            "SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
+                    ae.event_type, ae.target_type, ae.target_id,
+                    ae.metadata_json, ae.created_at
+             FROM audit_events ae
+             LEFT JOIN users u ON u.id = ae.actor_user_id
+             ORDER BY ae.created_at DESC, ae.id DESC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredAuditEvent {
+                    id: row.get("id"),
+                    actor_user_id: row.get("actor_user_id"),
+                    actor_username: row.get("actor_username"),
+                    event_type: row.get("event_type"),
+                    target_type: row.get("target_type"),
+                    target_id: row.get("target_id"),
+                    metadata_json: row.get("metadata_json"),
+                    created_at: row.get("created_at"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_user_by_access_token(
         &self,
         token_hash: &[u8],
@@ -3293,6 +3355,26 @@ pub(crate) struct UpdateUser<'a> {
     pub(crate) can_manage_server: Option<bool>,
     pub(crate) can_remote_access: Option<bool>,
     pub(crate) can_download: Option<bool>,
+}
+
+pub(crate) struct NewAuditEvent<'a> {
+    pub(crate) actor_user_id: Option<&'a str>,
+    pub(crate) event_type: &'a str,
+    pub(crate) target_type: Option<&'a str>,
+    pub(crate) target_id: Option<&'a str>,
+    pub(crate) metadata_json: &'a str,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredAuditEvent {
+    pub(crate) id: String,
+    pub(crate) actor_user_id: Option<String>,
+    pub(crate) actor_username: Option<String>,
+    pub(crate) event_type: String,
+    pub(crate) target_type: Option<String>,
+    pub(crate) target_id: Option<String>,
+    pub(crate) metadata_json: String,
+    pub(crate) created_at: i64,
 }
 
 #[derive(Debug)]

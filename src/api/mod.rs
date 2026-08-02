@@ -191,6 +191,7 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
         )
+        .route("/api/v1/admin/audit", get(admin_list_audit))
         .route("/api/v1/libraries", get(lux_list_libraries))
         .route("/api/v1/search", get(lux_search))
         .route("/api/v1/home", get(lux_home))
@@ -3496,11 +3497,22 @@ async fn admin_update_settings(
         return StatusCode::BAD_REQUEST.into_response();
     }
     match database.set_resume_settings(percent, minimum_ticks).await {
-        Ok(()) => Json(json!({
-            "resumePlayedPercent": percent,
-            "resumeMinTicks": minimum_ticks,
-        }))
-        .into_response(),
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "SETTINGS_UPDATED",
+                Some("settings"),
+                None,
+                &format!(r#"{{"resumePlayedPercent":{percent},"resumeMinTicks":{minimum_ticks}}}"#),
+            )
+            .await;
+            Json(json!({
+                "resumePlayedPercent": percent,
+                "resumeMinTicks": minimum_ticks,
+            }))
+            .into_response()
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -3593,12 +3605,26 @@ async fn admin_set_library_access(
         .set_user_library_access(&user_id, &library_id, request.can_view)
         .await
     {
-        Ok(()) => Json(json!({
-            "userId": user_id,
-            "libraryId": library_id,
-            "canView": request.can_view,
-        }))
-        .into_response(),
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "LIBRARY_ACCESS_UPDATED",
+                Some("user_library_access"),
+                Some(&user_id),
+                &format!(
+                    r#"{{"libraryId":"{library_id}","canView":{}}}"#,
+                    request.can_view
+                ),
+            )
+            .await;
+            Json(json!({
+                "userId": user_id,
+                "libraryId": library_id,
+                "canView": request.can_view,
+            }))
+            .into_response()
+        }
         Err(_) => api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3662,6 +3688,16 @@ async fn admin_start_scan(
             }
         }
     });
+    let target_id = job.id.clone();
+    record_audit_event(
+        &state,
+        &headers,
+        "SCAN_STARTED",
+        Some("scan_job"),
+        Some(&target_id),
+        "{}",
+    )
+    .await;
     (
         StatusCode::ACCEPTED,
         Json(json!({ "job": scan_job_json(&job) })),
@@ -3687,15 +3723,26 @@ async fn admin_refresh_collection(
         .into_response();
     };
     match collections.refresh_for_item(&item_id).await {
-        Ok(report) => (
-            StatusCode::OK,
-            Json(json!({
-                "sourceItemId": report.source_item_id,
-                "collectionItemId": report.collection_item_id,
-                "memberCount": report.member_count,
-            })),
-        )
-            .into_response(),
+        Ok(report) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "COLLECTION_REFRESHED",
+                Some("item"),
+                Some(&item_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "sourceItemId": report.source_item_id,
+                    "collectionItemId": report.collection_item_id,
+                    "memberCount": report.member_count,
+                })),
+            )
+                .into_response()
+        }
         Err(CollectionError::MovieProviderIdMissing | CollectionError::NoCollection) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
@@ -3732,7 +3779,18 @@ async fn admin_cancel_scan(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match scan_jobs.cancel(&job_id).await {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "SCAN_CANCELLED",
+                Some("scan_job"),
+                Some(&job_id),
+                "{}",
+            )
+            .await;
+            StatusCode::ACCEPTED.into_response()
+        }
         Err(ScanJobError::JobNotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -3832,6 +3890,36 @@ async fn require_admin(
     Ok(())
 }
 
+async fn record_audit_event(
+    state: &AppState,
+    headers: &HeaderMap,
+    event_type: &str,
+    target_type: Option<&str>,
+    target_id: Option<&str>,
+    metadata_json: &str,
+) {
+    let (Some(auth), Some(database), Some(session_token)) = (
+        state.auth.as_ref(),
+        state.database.as_ref(),
+        request_cookie(headers, "lux_session"),
+    ) else {
+        return;
+    };
+    let Ok(Some(session)) = auth.resolve(&session_token).await else {
+        return;
+    };
+    let actor_user_id = session.user.id.to_string();
+    let _ = database
+        .insert_audit_event(crate::storage::NewAuditEvent {
+            actor_user_id: Some(&actor_user_id),
+            event_type,
+            target_type,
+            target_id,
+            metadata_json,
+        })
+        .await;
+}
+
 async fn admin_list_libraries(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -3877,6 +3965,50 @@ async fn admin_list_users(headers: HeaderMap, State(state): State<AppState>) -> 
     }
 }
 
+async fn admin_list_audit(
+    headers: HeaderMap,
+    Query(query): Query<MetadataCandidateQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match metadata_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.list_audit_events(offset, limit).await {
+        Ok(events) => Json(json!({
+            "events": events.iter().map(|event| json!({
+                "id": event.id,
+                "actorUserId": event.actor_user_id,
+                "actorUsername": event.actor_username,
+                "eventType": event.event_type,
+                "targetType": event.target_type,
+                "targetId": event.target_id,
+                "metadata": serde_json::from_str::<Value>(&event.metadata_json)
+                    .unwrap_or_else(|_| json!({})),
+                "createdAt": event.created_at,
+            })).collect::<Vec<_>>(),
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateUserRequest {
@@ -3912,11 +4044,23 @@ async fn admin_create_user(
         )
         .await
     {
-        Ok(user) => (
-            StatusCode::CREATED,
-            Json(json!({ "user": user_json(&user) })),
-        )
-            .into_response(),
+        Ok(user) => {
+            let target_id = user.id.to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_CREATED",
+                Some("user"),
+                Some(&target_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({ "user": user_json(&user) })),
+            )
+                .into_response()
+        }
         Err(error) => user_store_error(&headers, error),
     }
 }
@@ -3964,7 +4108,18 @@ async fn admin_update_user(
         )
         .await
     {
-        Ok(Some(user)) => Json(json!({ "user": user_json(&user) })).into_response(),
+        Ok(Some(user)) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_UPDATED",
+                Some("user"),
+                Some(&user_id),
+                "{}",
+            )
+            .await;
+            Json(json!({ "user": user_json(&user) })).into_response()
+        }
         Ok(None) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
@@ -4001,7 +4156,18 @@ async fn admin_disable_user(
         )
         .await
     {
-        Ok(Some(user)) => Json(json!({ "user": user_json(&user) })).into_response(),
+        Ok(Some(user)) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_DISABLED",
+                Some("user"),
+                Some(&user_id),
+                "{}",
+            )
+            .await;
+            Json(json!({ "user": user_json(&user) })).into_response()
+        }
         Ok(None) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
@@ -4172,14 +4338,25 @@ async fn admin_select_candidate(
         .select(&item_id, &candidate_id, request.mode)
         .await
     {
-        Ok(report) => Json(json!({
-            "itemId": report.item_id,
-            "candidateId": report.candidate_id,
-            "mode": report.mode.as_str(),
-            "status": report.status,
-            "imageTypes": report.image_types,
-        }))
-        .into_response(),
+        Ok(report) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "METADATA_SELECTED",
+                Some("item"),
+                Some(&report.item_id),
+                "{}",
+            )
+            .await;
+            Json(json!({
+                "itemId": report.item_id,
+                "candidateId": report.candidate_id,
+                "mode": report.mode.as_str(),
+                "status": report.status,
+                "imageTypes": report.image_types,
+            }))
+            .into_response()
+        }
         Err(error) => metadata_selection_error(&headers, error),
     }
 }
@@ -4317,14 +4494,26 @@ async fn admin_create_library(
         .create_library(&request.name, kind, request.realtime_watch_enabled)
         .await
     {
-        Ok(library) => (
-            StatusCode::CREATED,
-            Json(json!({
-                "library": library_json(&library, &[]),
-                "warnings": []
-            })),
-        )
-            .into_response(),
+        Ok(library) => {
+            let library_id = library.id.to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "LIBRARY_CREATED",
+                Some("library"),
+                Some(&library_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "library": library_json(&library, &[]),
+                    "warnings": []
+                })),
+            )
+                .into_response()
+        }
         Err(error) => library_error(&headers, error),
     }
 }
@@ -4365,13 +4554,25 @@ async fn admin_update_library(
         probe_concurrency: request.probe_concurrency,
     };
     match libraries.update_settings(library_id, settings).await {
-        Ok(view) => (
-            StatusCode::OK,
-            Json(json!({
-                "library": library_json(&view.library, &view.roots)
-            })),
-        )
-            .into_response(),
+        Ok(view) => {
+            let target_id = library_id.to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "LIBRARY_UPDATED",
+                Some("library"),
+                Some(&target_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "library": library_json(&view.library, &view.roots)
+                })),
+            )
+                .into_response()
+        }
         Err(error) => library_error(&headers, error),
     }
 }
@@ -4404,14 +4605,26 @@ async fn admin_add_library_root(
         .into_response();
     };
     match libraries.add_root(library_id, &request.path).await {
-        Ok(result) => (
-            StatusCode::CREATED,
-            Json(json!({
-                "root": root_json(&result.root),
-                "warnings": result.warnings.iter().map(|warning| warning.as_str()).collect::<Vec<_>>()
-            })),
-        )
-            .into_response(),
+        Ok(result) => {
+            let target_id = library_id.to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "LIBRARY_ROOT_ADDED",
+                Some("library"),
+                Some(&target_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "root": root_json(&result.root),
+                    "warnings": result.warnings.iter().map(|warning| warning.as_str()).collect::<Vec<_>>()
+                })),
+            )
+                .into_response()
+        }
         Err(error) => library_error(&headers, error),
     }
 }

@@ -145,6 +145,32 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .await?;
     assert_eq!(admin_demotion.status(), reqwest::StatusCode::CONFLICT);
 
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &manager_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let audit_events = audit.json::<Value>().await?["events"]
+        .as_array()
+        .cloned()
+        .ok_or("missing audit events")?;
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event["eventType"] == "USER_CREATED")
+    );
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event["eventType"] == "USER_UPDATED")
+    );
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event["eventType"] == "USER_DISABLED")
+    );
+
     server.abort();
     Ok(())
 }
