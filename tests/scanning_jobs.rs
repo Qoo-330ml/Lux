@@ -81,11 +81,32 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
             .fetch_one(database.pool())
             .await?;
     assert_eq!(root_cursor, None);
+    let event_codes: Vec<String> = sqlx::query_scalar(
+        "SELECT event_code FROM scan_job_events WHERE job_id = ? ORDER BY created_at, id",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert!(event_codes.iter().any(|code| code == "JOB_CREATED"));
+    assert!(event_codes.iter().any(|code| code == "JOB_STARTED"));
+    assert!(event_codes.iter().any(|code| code == "BATCH_COMPLETED"));
+    assert!(event_codes.iter().any(|code| code == "JOB_COMPLETED"));
 
     let cancel_job = restarted_jobs.create_movie_scan_job(library.id).await?;
     restarted_jobs.cancel(&cancel_job.id).await?;
     let cancelled = restarted_jobs.run_batch(&cancel_job.id, 1).await?;
     assert_eq!(cancelled.status, "CANCELLED");
     assert!(cancelled.completed);
+    let cancel_event: (String, String) = sqlx::query_as(
+        "SELECT level, event_code FROM scan_job_events
+         WHERE job_id = ? AND event_code = 'JOB_CANCELLED'",
+    )
+    .bind(&cancel_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        cancel_event,
+        ("INFO".to_owned(), "JOB_CANCELLED".to_owned())
+    );
     Ok(())
 }

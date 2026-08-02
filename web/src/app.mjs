@@ -42,6 +42,7 @@ const api = {
   scanLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/scan", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   adminJobs(status = "") { return this.request("/api/v1/admin/jobs?page=1&pageSize=50" + (status ? "&status=" + encodeURIComponent(status) : "")); },
   adminJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id)); },
+  adminJobEvents(id, filters = {}) { const params = new URLSearchParams({ page: String(filters.page || 1), pageSize: "100" }); if (filters.level) params.set("level", filters.level); if (filters.eventCode) params.set("eventCode", filters.eventCode); return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/events?" + params.toString()); },
   cancelJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   retryJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/retry", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
@@ -164,7 +165,7 @@ async function loadRoute() {
     } else if (state.route === "admin") {
       const [ready, libraries, users, audit, pending, jobs] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit(), api.pendingMetadata(), api.adminJobs()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
-      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), jobDetail: state.admin?.jobDetail || null };
+      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), jobDetail: state.admin?.jobDetail || null, jobEvents: state.admin?.jobEvents || [], jobEventsTotal: state.admin?.jobEventsTotal || 0, jobEventsPage: state.admin?.jobEventsPage || 1, jobEventFilters: state.admin?.jobEventFilters || {} };
       view.innerHTML = renderAdmin();
     } else if (state.route === "account") {
       const sessions = await api.sessions();
@@ -259,7 +260,7 @@ function renderAdmin() {
   return "<section class=\"section\"><div class=\"admin-cards\"><div class=\"admin-card\"><span class=\"eyebrow\">Health</span><strong>" + escapeHtml(ready.status || "unknown") + "</strong><span>schema " + escapeHtml(ready.schemaVersion || "—") + "</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Libraries</span><strong>" + libraries.length + "</strong><span>已配置媒体库</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Users</span><strong>" + users.length + "</strong><span>账户</span></div></div></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>创建媒体库</h2><span>创建后再添加一个或多个根路径</span></div><form class=\"admin-form\" data-action=\"create-library\"><input name=\"name\" placeholder=\"媒体库名称\" aria-label=\"媒体库名称\" required><select name=\"kind\" aria-label=\"媒体库类型\"><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option><option value=\"MIXED\">混合</option></select><label class=\"check\"><input name=\"realtimeWatchEnabled\" type=\"checkbox\"> 实时监听</label><button class=\"button\" type=\"submit\">创建媒体库</button></form></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>媒体库与扫描</h2><span>计划字段留空可清除</span></div><div class=\"admin-library-grid\">" + (libraryCards || "<div class=\"empty\"><h3>还没有媒体库</h3><p>先创建一个媒体库，再添加根路径。</p></div>") + "</div></section>" +
-    "<section class=\"section\"><div class=\"section-heading\"><h2>任务</h2><span>失败任务可重试，运行中任务可取消</span></div><form class=\"filter-form\" data-action=\"job-filter\"><label>状态 <select name=\"status\"><option value=\"\">全部</option><option value=\"RUNNING\">运行中</option><option value=\"FAILED\">失败</option><option value=\"CANCELLED\">已取消</option><option value=\"COMPLETED\">已完成</option></select></label><button class=\"button secondary\" type=\"submit\">筛选任务</button></form>" + renderJobs(jobs, libraries) + (jobDetail ? renderJobDetail(jobDetail) : "") + "</section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>任务</h2><span>失败任务可重试，运行中任务可取消</span></div><form class=\"filter-form\" data-action=\"job-filter\"><label>状态 <select name=\"status\"><option value=\"\">全部</option><option value=\"RUNNING\">运行中</option><option value=\"FAILED\">失败</option><option value=\"CANCELLED\">已取消</option><option value=\"COMPLETED\">已完成</option></select></label><button class=\"button secondary\" type=\"submit\">筛选任务</button></form>" + renderJobs(jobs, libraries) + (jobDetail ? renderJobDetail(jobDetail, state.admin?.jobEvents || [], state.admin?.jobEventsTotal || 0, state.admin?.jobEventsPage || 1) : "") + "</section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>密码为空表示不修改</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" required><input name=\"displayName\" placeholder=\"显示名称\" aria-label=\"显示名称\"><input name=\"password\" type=\"password\" placeholder=\"初始密码\" aria-label=\"初始密码\" required><label class=\"check\"><input name=\"isAdmin\" type=\"checkbox\"> 管理员</label><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div>" + userEditors + "</section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>待处理元数据</h2><span>候选写回前请检查差异</span></div><div class=\"candidate-list\">" + renderPendingCandidates(pending) + "</div></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>最近审计</h2><span>只展示最近 8 条</span></div><ul class=\"admin-list\">" + (auditRows || "<li><span>暂无管理操作</span></li>") + "</ul></section>";
@@ -276,9 +277,13 @@ function renderJobs(jobs, libraries) {
   return "<div class=\"table-wrap\"><table><thead><tr><th>媒体库/类型</th><th>状态</th><th>错误</th><th>操作</th></tr></thead><tbody>" + rows + "</tbody></table></div>";
 }
 
-function renderJobDetail(job) {
+function renderJobDetail(job, events = [], total = 0, page = 1) {
   const progress = `${job.processedCount || 0}/${job.totalCount || 0}`;
-  return `<article class="job-detail"><div class="section-heading"><h3>任务详情</h3><button class="button secondary" type="button" data-close-job-detail>关闭</button></div><dl><div><dt>ID</dt><dd>${escapeHtml(job.id)}</dd></div><div><dt>状态</dt><dd>${escapeHtml(job.status)}</dd></div><div><dt>进度</dt><dd>${escapeHtml(progress)}</dd></div><div><dt>游标</dt><dd>${escapeHtml(job.cursor || "—")}</dd></div><div><dt>代次</dt><dd>${escapeHtml(job.generation || "—")}</dd></div><div><dt>错误</dt><dd>${escapeHtml(job.error || "—")}</dd></div></dl></article>`;
+  const filters = state.admin?.jobEventFilters || {};
+  const eventRows = events.map((event) => `<tr><td>${escapeHtml(event.level)}</td><td>${escapeHtml(event.eventCode)}</td><td>${escapeHtml(event.message)}</td><td>${escapeHtml(event.createdAt || "")}</td></tr>`).join("");
+  const previous = page > 1 ? `<button class="button secondary" type="button" data-job-events-page="${page - 1}">上一页</button>` : "";
+  const next = page * 100 < total ? `<button class="button secondary" type="button" data-job-events-page="${page + 1}">下一页</button>` : "";
+  return `<article class="job-detail"><div class="section-heading"><h3>任务详情</h3><button class="button secondary" type="button" data-close-job-detail>关闭</button></div><dl><div><dt>ID</dt><dd>${escapeHtml(job.id)}</dd></div><div><dt>状态</dt><dd>${escapeHtml(job.status)}</dd></div><div><dt>进度</dt><dd>${escapeHtml(progress)}</dd></div><div><dt>游标</dt><dd>${escapeHtml(job.cursor || "—")}</dd></div><div><dt>代次</dt><dd>${escapeHtml(job.generation || "—")}</dd></div><div><dt>错误</dt><dd>${escapeHtml(job.error || "—")}</dd></div></dl><form class="filter-form" data-action="job-event-filter"><label>级别 <select name="level"><option value="">全部</option><option value="ERROR"${filters.level === "ERROR" ? " selected" : ""}>错误</option><option value="WARN"${filters.level === "WARN" ? " selected" : ""}>警告</option><option value="INFO"${filters.level === "INFO" ? " selected" : ""}>信息</option></select></label><label>事件代码 <input name="eventCode" value="${escapeHtml(filters.eventCode || "")}" placeholder="JOB_FAILED"></label><button class="button secondary" type="submit">筛选日志</button></form><div class="table-wrap"><table><thead><tr><th>级别</th><th>事件</th><th>消息</th><th>时间</th></tr></thead><tbody>${eventRows || "<tr><td colspan=\"4\">暂无日志</td></tr>"}</tbody></table></div><div class="form-actions"><span class="media-meta">共 ${escapeHtml(total)} 条，第 ${page} 页</span>${previous}${next}</div></article>`;
 }
 
 function renderPendingCandidates(candidates) {
@@ -393,11 +398,20 @@ function bind() {
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("[data-job-detail]").forEach((element) => element.addEventListener("click", async () => {
-    try { state.admin.jobDetail = (await api.adminJob(element.dataset.jobDetail)).job; state.error = ""; render(); }
+    try { const [job, events] = await Promise.all([api.adminJob(element.dataset.jobDetail), api.adminJobEvents(element.dataset.jobDetail)]); state.admin.jobDetail = job.job; state.admin.jobEvents = events.events || []; state.admin.jobEventsTotal = events.total || 0; state.admin.jobEventsPage = events.page || 1; state.admin.jobEventFilters = {}; state.error = ""; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("form[data-action='job-event-filter']").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { const filters = { level: form.level.value, eventCode: form.eventCode.value.trim(), page: 1 }; const result = await api.adminJobEvents(state.admin.jobDetail.id, filters); state.admin.jobEvents = result.events || []; state.admin.jobEventsTotal = result.total || 0; state.admin.jobEventsPage = result.page || 1; state.admin.jobEventFilters = filters; state.error = ""; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-job-events-page]").forEach((element) => element.addEventListener("click", async () => {
+    try { const result = await api.adminJobEvents(state.admin.jobDetail.id, { ...state.admin.jobEventFilters, page: Number(element.dataset.jobEventsPage) }); state.admin.jobEvents = result.events || []; state.admin.jobEventsTotal = result.total || 0; state.admin.jobEventsPage = result.page || 1; state.error = ""; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("[data-close-job-detail]").forEach((element) => element.addEventListener("click", () => {
-    state.admin.jobDetail = null; render();
+    state.admin.jobDetail = null; state.admin.jobEvents = []; state.admin.jobEventsTotal = 0; render();
   }));
   document.querySelectorAll("[data-revoke-session]").forEach((element) => element.addEventListener("click", async () => {
     if (!window.confirm("撤销这个浏览器会话？")) return;

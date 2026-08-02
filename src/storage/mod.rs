@@ -1280,6 +1280,153 @@ impl Database {
         })
     }
 
+    pub(crate) async fn append_scan_job_event(
+        &self,
+        event: NewScanJobEvent<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO scan_job_events
+             (id, job_id, level, event_code, message, details_json)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.id)
+        .bind(event.job_id)
+        .bind(event.level)
+        .bind(event.event_code)
+        .bind(event.message)
+        .bind(event.details_json)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn count_scan_job_events(
+        &self,
+        job_id: &str,
+        level: Option<&str>,
+        event_code: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let count = match (level, event_code) {
+            (Some(_), Some(_)) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM scan_job_events
+                     WHERE job_id = ? AND level = ? AND event_code = ?",
+                )
+                .bind(job_id)
+                .bind(level)
+                .bind(event_code)
+                .fetch_one(&self.pool)
+                .await
+            }
+            (Some(_), None) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM scan_job_events
+                     WHERE job_id = ? AND level = ?",
+                )
+                .bind(job_id)
+                .bind(level)
+                .fetch_one(&self.pool)
+                .await
+            }
+            (None, Some(_)) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM scan_job_events
+                     WHERE job_id = ? AND event_code = ?",
+                )
+                .bind(job_id)
+                .bind(event_code)
+                .fetch_one(&self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_events WHERE job_id = ?")
+                    .bind(job_id)
+                    .fetch_one(&self.pool)
+                    .await
+            }
+        };
+        count.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_job_events(
+        &self,
+        job_id: &str,
+        level: Option<&str>,
+        event_code: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredScanJobEvent>, StorageError> {
+        let rows = match (level, event_code) {
+            (Some(_), Some(_)) => {
+                sqlx::query(
+                    "SELECT id, job_id, level, event_code, message, details_json, created_at
+                     FROM scan_job_events
+                     WHERE job_id = ? AND level = ? AND event_code = ?
+                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                )
+                .bind(job_id)
+                .bind(level)
+                .bind(event_code)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (Some(_), None) => {
+                sqlx::query(
+                    "SELECT id, job_id, level, event_code, message, details_json, created_at
+                     FROM scan_job_events
+                     WHERE job_id = ? AND level = ?
+                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                )
+                .bind(job_id)
+                .bind(level)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (None, Some(_)) => {
+                sqlx::query(
+                    "SELECT id, job_id, level, event_code, message, details_json, created_at
+                     FROM scan_job_events
+                     WHERE job_id = ? AND event_code = ?
+                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                )
+                .bind(job_id)
+                .bind(event_code)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query(
+                    "SELECT id, job_id, level, event_code, message, details_json, created_at
+                     FROM scan_job_events WHERE job_id = ?
+                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                )
+                .bind(job_id)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+        };
+        rows.map(|rows| rows.into_iter().map(stored_scan_job_event).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn find_scan_job(
         &self,
         id: &str,
@@ -3676,6 +3823,26 @@ pub(crate) struct StoredScanJob {
     pub(crate) error: Option<String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredScanJobEvent {
+    pub(crate) id: String,
+    pub(crate) job_id: String,
+    pub(crate) level: String,
+    pub(crate) event_code: String,
+    pub(crate) message: String,
+    pub(crate) details_json: String,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) struct NewScanJobEvent<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) job_id: &'a str,
+    pub(crate) level: &'a str,
+    pub(crate) event_code: &'a str,
+    pub(crate) message: &'a str,
+    pub(crate) details_json: &'a str,
+}
+
 fn stored_scan_job(row: sqlx::sqlite::SqliteRow) -> StoredScanJob {
     StoredScanJob {
         id: row.get("id"),
@@ -3688,6 +3855,18 @@ fn stored_scan_job(row: sqlx::sqlite::SqliteRow) -> StoredScanJob {
         total_count: row.get("total_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
+    }
+}
+
+fn stored_scan_job_event(row: sqlx::sqlite::SqliteRow) -> StoredScanJobEvent {
+    StoredScanJobEvent {
+        id: row.get("id"),
+        job_id: row.get("job_id"),
+        level: row.get("level"),
+        event_code: row.get("event_code"),
+        message: row.get("message"),
+        details_json: row.get("details_json"),
+        created_at: row.get("created_at"),
     }
 }
 

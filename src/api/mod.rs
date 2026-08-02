@@ -224,6 +224,10 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/admin/jobs/{job_id}/retry", post(admin_retry_scan))
         .route("/api/v1/admin/jobs/{job_id}", get(admin_get_job))
+        .route(
+            "/api/v1/admin/jobs/{job_id}/events",
+            get(admin_list_job_events),
+        )
         .route("/api/v1/admin/jobs", get(admin_list_jobs))
         .route(
             "/api/v1/admin/settings",
@@ -4456,6 +4460,15 @@ struct AdminJobsQuery {
     status: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AdminJobEventsQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    level: Option<String>,
+    event_code: Option<String>,
+}
+
 async fn admin_list_jobs(
     headers: HeaderMap,
     Query(query): Query<AdminJobsQuery>,
@@ -4532,6 +4545,104 @@ async fn admin_get_job(
     }
 }
 
+async fn admin_list_job_events(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<AdminJobEventsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let level = query.level.as_deref().map(str::to_ascii_uppercase);
+    if level
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "INFO" | "WARN" | "ERROR"))
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "日志级别无效",
+        )
+        .into_response();
+    }
+    let event_code = query
+        .event_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_uppercase);
+    if event_code.as_deref().is_some_and(|value| {
+        value.chars().count() > 64
+            || value.chars().any(|character| {
+                !(character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_')
+            })
+    }) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "事件代码无效",
+        )
+        .into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_scan_job(&job_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "任务不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let total = match database
+        .count_scan_job_events(&job_id, level.as_deref(), event_code.as_deref())
+        .await
+    {
+        Ok(total) => total,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match database
+        .list_scan_job_events(
+            &job_id,
+            level.as_deref(),
+            event_code.as_deref(),
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(events) => Json(json!({
+            "events": events.iter().map(scan_job_event_json).collect::<Vec<_>>(),
+            "total": total,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn admin_retry_scan(
     headers: HeaderMap,
     Path(job_id): Path<String>,
@@ -4597,6 +4708,20 @@ fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) -> Value {
         "totalCount": job.total_count,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
+    })
+}
+
+fn scan_job_event_json(event: &crate::storage::StoredScanJobEvent) -> Value {
+    let details = serde_json::from_str::<Value>(&event.details_json)
+        .unwrap_or_else(|_| json!({ "invalid": true }));
+    json!({
+        "id": event.id,
+        "jobId": event.job_id,
+        "level": event.level,
+        "eventCode": event.event_code,
+        "message": event.message,
+        "details": details,
+        "createdAt": event.created_at,
     })
 }
 

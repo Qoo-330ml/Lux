@@ -14,8 +14,8 @@ use uuid::Uuid;
 use crate::{
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     storage::{
-        Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource, StorageError,
-        StoredLibraryRoot, StoredScanJob,
+        Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource,
+        NewScanJobEvent, StorageError, StoredLibraryRoot, StoredScanJob,
     },
 };
 
@@ -875,6 +875,8 @@ impl ScanJobService {
                 total_count,
             )
             .await?;
+        self.record_event(&id, "INFO", "JOB_CREATED", "任务已创建", "{}")
+            .await;
         self.get_job(&id).await
     }
 
@@ -896,13 +898,19 @@ impl ScanJobService {
                 completed: true,
             });
         }
-        if job.status == "PENDING" && !self.database.claim_scan_job(job_id).await? {
-            return Err(ScanJobError::AlreadyActive(job_id.to_owned()));
+        if job.status == "PENDING" {
+            if !self.database.claim_scan_job(job_id).await? {
+                return Err(ScanJobError::AlreadyActive(job_id.to_owned()));
+            }
+            self.record_event(job_id, "INFO", "JOB_STARTED", "任务开始执行", "{}")
+                .await;
         }
         if self.database.scan_job_cancel_requested(job_id).await? {
             self.database
                 .finish_scan_job(job_id, "CANCELLED", None)
                 .await?;
+            self.record_event(job_id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
+                .await;
             return Ok(ScanBatchReport {
                 status: "CANCELLED".to_owned(),
                 processed: 0,
@@ -968,6 +976,8 @@ impl ScanJobService {
             self.database
                 .finish_scan_job(job_id, "COMPLETED", None)
                 .await?;
+            self.record_event(job_id, "INFO", "JOB_COMPLETED", "任务已完成", "{}")
+                .await;
             return Ok(ScanBatchReport {
                 status: "COMPLETED".to_owned(),
                 processed: 0,
@@ -1040,9 +1050,12 @@ impl ScanJobService {
                 _ => Err(ScannerError::LibraryNotFound),
             };
             if let Err(error) = result {
+                let error_code = error.code();
                 self.database
                     .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
                     .await?;
+                self.record_event(job_id, "ERROR", error_code, "扫描任务失败", "{}")
+                    .await;
                 return Err(error.into());
             }
             last_cursor = Some(cursor.as_str());
@@ -1054,6 +1067,15 @@ impl ScanJobService {
         self.database
             .update_scan_job_progress(job_id, last_cursor, next_count)
             .await?;
+        let batch_details = format!(r#"{{"processed":{processed},"total":{next_count}}}"#);
+        self.record_event(
+            job_id,
+            "INFO",
+            "BATCH_COMPLETED",
+            "扫描批次完成",
+            &batch_details,
+        )
+        .await;
         if let Some((cursor, root_index, path)) = batch.last() {
             let root = &roots[*root_index];
             let relative = path
@@ -1070,6 +1092,8 @@ impl ScanJobService {
             self.database
                 .finish_scan_job(job_id, "CANCELLED", None)
                 .await?;
+            self.record_event(job_id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
+                .await;
             return Ok(ScanBatchReport {
                 status: "CANCELLED".to_owned(),
                 processed,
@@ -1107,6 +1131,28 @@ impl ScanJobService {
             .await?
             .map(scan_job)
             .ok_or(ScanJobError::JobNotFound)
+    }
+
+    async fn record_event(
+        &self,
+        job_id: &str,
+        level: &str,
+        event_code: &str,
+        message: &str,
+        details_json: &str,
+    ) {
+        let id = Uuid::now_v7().to_string();
+        let _ = self
+            .database
+            .append_scan_job_event(NewScanJobEvent {
+                id: &id,
+                job_id,
+                level,
+                event_code,
+                message,
+                details_json,
+            })
+            .await;
     }
 }
 
@@ -1645,6 +1691,21 @@ pub enum ScannerError {
         source: std::io::Error,
     },
     Storage(StorageError),
+}
+
+impl ScannerError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::LibraryNotFound => "LIBRARY_NOT_FOUND",
+            Self::InvalidRootId(_) => "INVALID_ROOT_ID",
+            Self::InvalidItemId(_) => "INVALID_ITEM_ID",
+            Self::InvalidRelativePath(_) => "INVALID_RELATIVE_PATH",
+            Self::NonUtf8Path => "NON_UTF8_PATH",
+            Self::FileSizeOverflow(_) => "FILE_SIZE_OVERFLOW",
+            Self::Io { .. } => "SCAN_IO",
+            Self::Storage(_) => "STORAGE_ERROR",
+        }
+    }
 }
 
 impl fmt::Display for ScannerError {

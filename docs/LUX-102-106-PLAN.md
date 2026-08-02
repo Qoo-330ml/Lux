@@ -19,8 +19,9 @@
 
 ## 后续切片
 
-- [ ] 任务日志详情、结构化错误筛选和更长历史分页。
-- [ ] 新候选搜索/批量重新识别任务。
+- [x] 任务日志详情、结构化错误筛选和更长历史分页；新增 `scan_job_events` 迁移、管理员分页 API 和控制台筛选。
+- [x] 新候选搜索；管理员可按标题/年份搜索 TMDb 并保存 pending 候选。
+- [ ] 批量重新识别任务；仍需独立任务模型和排队/重试策略。
 
 验证：`cargo test --locked --test libraries_api --test users --test images`（5 项）覆盖媒体库/任务管理和图片列举删除；`node --check web/src/app.mjs` 通过。
 
