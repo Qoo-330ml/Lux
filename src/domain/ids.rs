@@ -60,5 +60,6 @@ macro_rules! define_id {
 define_id!(UserId);
 define_id!(ItemId);
 define_id!(LibraryId);
+define_id!(LibraryRootId);
 define_id!(SourceId);
 define_id!(JobId);

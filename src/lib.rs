@@ -5,6 +5,7 @@ pub mod application;
 pub mod auth;
 pub mod config;
 pub mod domain;
+pub mod library;
 pub mod observability;
 pub mod storage;
 

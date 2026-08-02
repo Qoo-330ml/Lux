@@ -216,6 +216,181 @@ impl Database {
         })
     }
 
+    pub(crate) async fn insert_library(&self, library: NewLibrary<'_>) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO libraries (
+                id, name, kind, is_enabled, realtime_watch_enabled,
+                incremental_schedule, reconciliation_schedule, metadata_schedule,
+                scan_concurrency, probe_concurrency
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(library.id)
+        .bind(library.name)
+        .bind(library.kind)
+        .bind(library.realtime_watch_enabled)
+        .bind(library.incremental_schedule)
+        .bind(library.reconciliation_schedule)
+        .bind(library.metadata_schedule)
+        .bind(library.scan_concurrency)
+        .bind(library.probe_concurrency)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
+        sqlx::query(
+            "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
+                    incremental_schedule, reconciliation_schedule, metadata_schedule,
+                    scan_concurrency, probe_concurrency, last_scan_at
+             FROM libraries ORDER BY name, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredLibrary {
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    kind: row.get("kind"),
+                    is_enabled: row.get::<i64, _>("is_enabled") != 0,
+                    realtime_watch_enabled: row.get::<i64, _>("realtime_watch_enabled") != 0,
+                    incremental_schedule: row.get("incremental_schedule"),
+                    reconciliation_schedule: row.get("reconciliation_schedule"),
+                    metadata_schedule: row.get("metadata_schedule"),
+                    scan_concurrency: row.get("scan_concurrency"),
+                    probe_concurrency: row.get("probe_concurrency"),
+                    last_scan_at: row.get("last_scan_at"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_library(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredLibrary>, StorageError> {
+        sqlx::query(
+            "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
+                    incremental_schedule, reconciliation_schedule, metadata_schedule,
+                    scan_concurrency, probe_concurrency, last_scan_at
+             FROM libraries WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredLibrary {
+                id: row.get("id"),
+                name: row.get("name"),
+                kind: row.get("kind"),
+                is_enabled: row.get::<i64, _>("is_enabled") != 0,
+                realtime_watch_enabled: row.get::<i64, _>("realtime_watch_enabled") != 0,
+                incremental_schedule: row.get("incremental_schedule"),
+                reconciliation_schedule: row.get("reconciliation_schedule"),
+                metadata_schedule: row.get("metadata_schedule"),
+                scan_concurrency: row.get("scan_concurrency"),
+                probe_concurrency: row.get("probe_concurrency"),
+                last_scan_at: row.get("last_scan_at"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn insert_library_root(
+        &self,
+        root: NewLibraryRoot<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO library_roots (
+                id, library_id, canonical_path, display_path, is_available, is_writable
+            ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(root.id)
+        .bind(root.library_id)
+        .bind(root.canonical_path)
+        .bind(root.display_path)
+        .bind(root.is_available)
+        .bind(root.is_writable)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_library_roots(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredLibraryRoot>, StorageError> {
+        sqlx::query(
+            "SELECT id, library_id, canonical_path, display_path,
+                    is_available, is_writable, last_checked_at,
+                    unavailable_since, scan_cursor
+             FROM library_roots WHERE library_id = ?
+             ORDER BY canonical_path, id",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_library_root).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_all_library_roots(
+        &self,
+    ) -> Result<Vec<StoredLibraryRoot>, StorageError> {
+        sqlx::query(
+            "SELECT id, library_id, canonical_path, display_path,
+                    is_available, is_writable, last_checked_at,
+                    unavailable_since, scan_cursor
+             FROM library_roots ORDER BY canonical_path, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_library_root).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_library_root(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredLibraryRoot>, StorageError> {
+        sqlx::query(
+            "SELECT id, library_id, canonical_path, display_path,
+                    is_available, is_writable, last_checked_at,
+                    unavailable_since, scan_cursor
+             FROM library_roots WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_library_root))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn create_access_token(
         &self,
         token: NewAccessToken<'_>,
@@ -391,6 +566,48 @@ pub(crate) struct StoredUser {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredLibrary {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) is_enabled: bool,
+    pub(crate) realtime_watch_enabled: bool,
+    pub(crate) incremental_schedule: Option<String>,
+    pub(crate) reconciliation_schedule: Option<String>,
+    pub(crate) metadata_schedule: Option<String>,
+    pub(crate) scan_concurrency: i64,
+    pub(crate) probe_concurrency: i64,
+    pub(crate) last_scan_at: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredLibraryRoot {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) canonical_path: String,
+    pub(crate) display_path: String,
+    pub(crate) is_available: bool,
+    pub(crate) is_writable: bool,
+    pub(crate) last_checked_at: i64,
+    pub(crate) unavailable_since: Option<i64>,
+    pub(crate) scan_cursor: Option<String>,
+}
+
+fn stored_library_root(row: sqlx::sqlite::SqliteRow) -> StoredLibraryRoot {
+    StoredLibraryRoot {
+        id: row.get("id"),
+        library_id: row.get("library_id"),
+        canonical_path: row.get("canonical_path"),
+        display_path: row.get("display_path"),
+        is_available: row.get::<i64, _>("is_available") != 0,
+        is_writable: row.get::<i64, _>("is_writable") != 0,
+        last_checked_at: row.get("last_checked_at"),
+        unavailable_since: row.get("unavailable_since"),
+        scan_cursor: row.get("scan_cursor"),
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredWebSession {
     pub(crate) csrf_token_hash: Vec<u8>,
     pub(crate) user_id: String,
@@ -411,6 +628,27 @@ pub(crate) struct NewAccessToken<'a> {
     pub(crate) client_name: &'a str,
     pub(crate) device_name: &'a str,
     pub(crate) client_version: &'a str,
+}
+
+pub(crate) struct NewLibrary<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) realtime_watch_enabled: bool,
+    pub(crate) incremental_schedule: Option<&'a str>,
+    pub(crate) reconciliation_schedule: Option<&'a str>,
+    pub(crate) metadata_schedule: Option<&'a str>,
+    pub(crate) scan_concurrency: i64,
+    pub(crate) probe_concurrency: i64,
+}
+
+pub(crate) struct NewLibraryRoot<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) canonical_path: &'a str,
+    pub(crate) display_path: &'a str,
+    pub(crate) is_available: bool,
+    pub(crate) is_writable: bool,
 }
 
 async fn ensure_server_id(pool: &SqlitePool) -> Result<String, sqlx::Error> {
