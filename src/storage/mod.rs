@@ -391,6 +391,143 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_filesystem_entry(
+        &self,
+        library_root_id: &str,
+        relative_path: &str,
+    ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
+        sqlx::query(
+            "SELECT id
+             FROM filesystem_entries
+             WHERE library_root_id = ? AND relative_path = ?",
+        )
+        .bind(library_root_id)
+        .bind(relative_path)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_filesystem_entry))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn insert_filesystem_entry(
+        &self,
+        entry: NewFilesystemEntry<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                id, library_root_id, relative_path, entry_kind, size,
+                modified_at, last_seen_generation, is_missing
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+        )
+        .bind(entry.id)
+        .bind(entry.library_root_id)
+        .bind(entry.relative_path)
+        .bind(entry.entry_kind)
+        .bind(entry.size)
+        .bind(entry.modified_at)
+        .bind(entry.last_seen_generation)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_media_item(
+        &self,
+        library_id: &str,
+        sort_title: &str,
+        production_year: Option<i64>,
+    ) -> Result<Option<StoredMediaItem>, StorageError> {
+        let row = match production_year {
+            Some(year) => {
+                sqlx::query(
+                    "SELECT id
+                     FROM media_items
+                     WHERE library_id = ? AND sort_title = ? AND production_year = ?
+                       AND removed_at IS NULL",
+                )
+                .bind(library_id)
+                .bind(sort_title)
+                .bind(year)
+                .fetch_optional(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id
+                     FROM media_items
+                     WHERE library_id = ? AND sort_title = ? AND production_year IS NULL
+                       AND removed_at IS NULL",
+                )
+                .bind(library_id)
+                .bind(sort_title)
+                .fetch_optional(&self.pool)
+                .await
+            }
+        };
+        row.map(|row| row.map(stored_media_item))
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn insert_media_item(
+        &self,
+        item: NewMediaItem<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                original_title, production_year, identification_status
+            ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item.id)
+        .bind(item.library_id)
+        .bind(item.title)
+        .bind(item.sort_title)
+        .bind(item.original_title)
+        .bind(item.production_year)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn insert_media_source(
+        &self,
+        source: NewMediaSource<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO media_sources (
+                id, item_id, source_kind, filesystem_entry_id,
+                container, size, is_default, probe_status
+            ) VALUES (?, ?, 'LOCAL_FILE', ?, ?, ?, ?, 'PENDING')",
+        )
+        .bind(source.id)
+        .bind(source.item_id)
+        .bind(source.filesystem_entry_id)
+        .bind(source.container)
+        .bind(source.size)
+        .bind(source.is_default)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn create_access_token(
         &self,
         token: NewAccessToken<'_>,
@@ -608,6 +745,23 @@ fn stored_library_root(row: sqlx::sqlite::SqliteRow) -> StoredLibraryRoot {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredFilesystemEntry {}
+
+fn stored_filesystem_entry(row: sqlx::sqlite::SqliteRow) -> StoredFilesystemEntry {
+    let _id: String = row.get("id");
+    StoredFilesystemEntry {}
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredMediaItem {
+    pub(crate) id: String,
+}
+
+fn stored_media_item(row: sqlx::sqlite::SqliteRow) -> StoredMediaItem {
+    StoredMediaItem { id: row.get("id") }
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredWebSession {
     pub(crate) csrf_token_hash: Vec<u8>,
     pub(crate) user_id: String,
@@ -649,6 +803,34 @@ pub(crate) struct NewLibraryRoot<'a> {
     pub(crate) display_path: &'a str,
     pub(crate) is_available: bool,
     pub(crate) is_writable: bool,
+}
+
+pub(crate) struct NewFilesystemEntry<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) entry_kind: &'a str,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) last_seen_generation: &'a str,
+}
+
+pub(crate) struct NewMediaItem<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) sort_title: &'a str,
+    pub(crate) original_title: Option<&'a str>,
+    pub(crate) production_year: Option<i64>,
+}
+
+pub(crate) struct NewMediaSource<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) item_id: &'a str,
+    pub(crate) filesystem_entry_id: &'a str,
+    pub(crate) container: &'a str,
+    pub(crate) size: i64,
+    pub(crate) is_default: bool,
 }
 
 async fn ensure_server_id(pool: &SqlitePool) -> Result<String, sqlx::Error> {

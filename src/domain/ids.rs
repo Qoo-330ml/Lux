@@ -61,5 +61,6 @@ define_id!(UserId);
 define_id!(ItemId);
 define_id!(LibraryId);
 define_id!(LibraryRootId);
+define_id!(FilesystemEntryId);
 define_id!(SourceId);
 define_id!(JobId);
