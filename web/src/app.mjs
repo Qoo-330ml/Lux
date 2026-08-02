@@ -1,11 +1,11 @@
+import { requestOptions } from "./request-options.mjs";
+
 const app = document.querySelector("#app");
 const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, playback: null, children: null, error: "", notice: "", setupNotice: "" };
 
 const api = {
   async request(path, options = {}) {
-    const headers = { Accept: "application/json" };
-    if (options.body) headers["Content-Type"] = "application/json";
-    const response = await fetch(path, { credentials: "same-origin", headers, ...options });
+    const response = await fetch(path, requestOptions(options));
     if (response.status === 204) return null;
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body?.error?.message || "请求失败");
@@ -48,6 +48,10 @@ const api = {
 function readCookie(name) {
   const found = document.cookie.split("; ").find((part) => part.startsWith(name + "="));
   return found ? found.slice(name.length + 1) : "";
+}
+
+function field(form, name) {
+  return form.elements.namedItem(name);
 }
 
 function escapeHtml(value) {
@@ -312,44 +316,44 @@ function bind() {
   document.querySelectorAll("form[data-action='login']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const button = form.querySelector("button"); button.disabled = true;
-    try { const body = await api.login(form.username.value, form.password.value); state.user = body.user; state.error = ""; render(); }
+    try { const body = await api.login(field(form, "username").value, field(form, "password").value); state.user = body.user; state.error = ""; render(); }
     catch (error) { state.error = error.message; render(); }
   }));
   document.querySelectorAll("form[data-action='setup']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const button = form.querySelector("button"); button.disabled = true;
     try {
-      await api.setup(form.username.value, form.displayName.value, form.password.value);
+      await api.setup(field(form, "username").value, field(form, "displayName").value, field(form, "password").value);
       state.initialized = true; state.error = ""; state.setupNotice = "初始化完成，请使用刚创建的管理员登录。"; render();
     } catch (error) { state.error = error.message; render(); }
   }));
   document.querySelectorAll("form[data-action='create-user']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    try { await api.createUser({ username: form.username.value, displayName: form.displayName.value, password: form.password.value, isAdmin: form.isAdmin.checked }); state.route = "admin"; state.error = ""; state.notice = "用户已创建。"; render(); }
+    try { await api.createUser({ username: field(form, "username").value, displayName: field(form, "displayName").value, password: field(form, "password").value, isAdmin: field(form, "isAdmin").checked }); state.route = "admin"; state.error = ""; state.notice = "用户已创建。"; render(); }
     catch (error) { state.error = error.message; render(); }
   }));
   document.querySelectorAll("form[data-action='create-library']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    try { await api.createLibrary({ name: form.name.value, kind: form.kind.value, realtimeWatchEnabled: form.realtimeWatchEnabled.checked }); state.route = "admin"; state.error = ""; state.notice = "媒体库已创建。"; render(); }
+    try { await api.createLibrary({ name: field(form, "name").value, kind: field(form, "kind").value, realtimeWatchEnabled: field(form, "realtimeWatchEnabled").checked }); state.route = "admin"; state.error = ""; state.notice = "媒体库已创建。"; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='add-root']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    try { await api.addLibraryRoot(form.dataset.libraryId, form.path.value); state.route = "admin"; state.error = ""; state.notice = "根路径已添加。"; render(); }
+    try { await api.addLibraryRoot(form.dataset.libraryId, field(form, "path").value); state.route = "admin"; state.error = ""; state.notice = "根路径已添加。"; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='update-library']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const optionalNumber = (value) => value ? Number(value) : undefined;
     try {
-      await api.updateLibrary(form.dataset.libraryId, { realtimeWatchEnabled: form.realtimeWatchEnabled.checked, incrementalSchedule: form.incrementalSchedule.value || null, reconciliationSchedule: form.reconciliationSchedule.value || null, metadataSchedule: form.metadataSchedule.value || null, scanConcurrency: optionalNumber(form.scanConcurrency.value), probeConcurrency: optionalNumber(form.probeConcurrency.value) });
+      await api.updateLibrary(form.dataset.libraryId, { realtimeWatchEnabled: field(form, "realtimeWatchEnabled").checked, incrementalSchedule: field(form, "incrementalSchedule").value || null, reconciliationSchedule: field(form, "reconciliationSchedule").value || null, metadataSchedule: field(form, "metadataSchedule").value || null, scanConcurrency: optionalNumber(field(form, "scanConcurrency").value), probeConcurrency: optionalNumber(field(form, "probeConcurrency").value) });
       state.route = "admin"; state.error = ""; state.notice = "媒体库计划已保存。"; render();
     } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='update-user']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const payload = { displayName: form.displayName.value, isDisabled: form.isDisabled.checked, isAdmin: form.isAdmin.checked, canManageServer: form.canManageServer.checked, canRemoteAccess: form.canRemoteAccess.checked, canDownload: form.canDownload.checked };
-    if (form.password.value) payload.password = form.password.value;
+    const payload = { displayName: field(form, "displayName").value, isDisabled: field(form, "isDisabled").checked, isAdmin: field(form, "isAdmin").checked, canManageServer: field(form, "canManageServer").checked, canRemoteAccess: field(form, "canRemoteAccess").checked, canDownload: field(form, "canDownload").checked };
+    if (field(form, "password").value) payload.password = field(form, "password").value;
     try {
       await api.updateUser(form.dataset.userId, payload);
       const selectedLibraries = new Set(Array.from(form.querySelectorAll("input[name='libraryAccess']:checked"), (input) => input.value));
@@ -359,7 +363,7 @@ function bind() {
     } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='search']").forEach((form) => form.addEventListener("submit", (event) => {
-    event.preventDefault(); const query = form.q.value.trim(); if (!query) return;
+    event.preventDefault(); const query = field(form, "q").value.trim(); if (!query) return;
     state.query = query; state.route = "search"; state.error = ""; state.notice = ""; render();
   }));
 }
@@ -367,7 +371,7 @@ function bind() {
 async function boot() {
   try {
     state.initialized = (await api.setupStatus()).initialized;
-    if (state.initialized) state.user = (await api.me()).user;
+    if (state.initialized && readCookie("lux_csrf")) state.user = (await api.me()).user;
   } catch { state.user = null; }
   render();
 }

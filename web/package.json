@@ -4,8 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "test": "node --test",
-    "build": "node --check src/index.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "build": "node --check src/app.mjs && node --check src/request-options.mjs"
   }
 }
-

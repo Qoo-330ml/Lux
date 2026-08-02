@@ -15,7 +15,15 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     assert!(index.text().await?.contains("id=\"app\""));
     let script = client.get(format!("{base_url}/app.mjs")).send().await?;
     assert_eq!(script.status(), StatusCode::OK);
-    assert!(script.text().await?.contains("/api/v1/auth/login"));
+    let script_body = script.text().await?;
+    assert!(script_body.contains("/api/v1/auth/login"));
+    assert!(script_body.contains("request-options.mjs"));
+    let request_options = client
+        .get(format!("{base_url}/request-options.mjs"))
+        .send()
+        .await?;
+    assert_eq!(request_options.status(), StatusCode::OK);
+    assert!(request_options.text().await?.contains("Content-Type"));
     let styles = client.get(format!("{base_url}/styles.css")).send().await?;
     assert_eq!(styles.status(), StatusCode::OK);
     assert!(styles.text().await?.contains("--accent"));
