@@ -15,7 +15,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -183,6 +183,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries/{library_id}/roots",
             post(admin_add_library_root),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}/roots/{root_id}",
+            delete(admin_delete_library_root),
         )
         .route(
             "/api/v1/admin/users/{user_id}/libraries/{library_id}",
@@ -3675,6 +3679,7 @@ struct AddLibraryRootRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateLibraryRequest {
+    is_enabled: Option<bool>,
     realtime_watch_enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     incremental_schedule: Option<Option<String>>,
@@ -4960,6 +4965,7 @@ async fn admin_update_library(
         .into_response();
     };
     let settings = LibrarySettingsPatch {
+        is_enabled: request.is_enabled,
         realtime_watch_enabled: request.realtime_watch_enabled,
         incremental_schedule: request.incremental_schedule,
         reconciliation_schedule: request.reconciliation_schedule,
@@ -4986,6 +4992,53 @@ async fn admin_update_library(
                 })),
             )
                 .into_response()
+        }
+        Err(error) => library_error(&headers, error),
+    }
+}
+
+async fn admin_delete_library_root(
+    headers: HeaderMap,
+    Path((library_id, root_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id,
+        Err(error) => {
+            return library_error(
+                &headers,
+                LibraryServiceError::InvalidLibraryId(error.to_string()),
+            );
+        }
+    };
+    let root_id = match root_id.parse::<crate::domain::ids::LibraryRootId>() {
+        Ok(id) => id,
+        Err(error) => {
+            return library_error(
+                &headers,
+                LibraryServiceError::InvalidRootId(error.to_string()),
+            );
+        }
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match libraries.delete_root(library_id, root_id).await {
+        Ok(()) => {
+            let target_id = root_id.to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "LIBRARY_ROOT_DELETED",
+                Some("library_root"),
+                Some(&target_id),
+                "{}",
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => library_error(&headers, error),
     }
@@ -5059,6 +5112,11 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
             "媒体库不存在",
+        ),
+        LibraryServiceError::RootNotFound => (
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体根路径不存在",
         ),
         LibraryServiceError::DuplicateRoot => (
             StatusCode::CONFLICT,

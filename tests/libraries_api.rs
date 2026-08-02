@@ -136,6 +136,17 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
     assert_eq!(root_body["root"]["isAvailable"], true);
     assert_eq!(root_body["root"]["isWritable"], true);
     assert_eq!(root_body["warnings"], json!([]));
+    let root_id = root_body["root"]["id"].as_str().ok_or("missing root ID")?;
+
+    let deleted_root = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/libraries/{library_id}/roots/{root_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted_root.status(), reqwest::StatusCode::NO_CONTENT);
 
     let listed = client
         .get(format!("{base_url}/api/v1/admin/libraries"))
@@ -149,8 +160,31 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         listed_body["libraries"][0]["roots"]
             .as_array()
             .map(Vec::len),
-        Some(1)
+        Some(0)
     );
+
+    let disabled = client
+        .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "isEnabled": false }))
+        .send()
+        .await?;
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        disabled.json::<Value>().await?["library"]["isEnabled"],
+        false
+    );
+
+    let disabled_scan = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{library_id}/scan"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(disabled_scan.status(), reqwest::StatusCode::NOT_FOUND);
 
     server.abort();
     Ok(())

@@ -93,6 +93,7 @@ impl LibraryService {
             .update_library_settings(
                 &library_id.to_string(),
                 LibrarySettingsUpdate {
+                    is_enabled: settings.is_enabled,
                     realtime_watch_enabled: settings.realtime_watch_enabled,
                     incremental_schedule: incremental_schedule
                         .as_ref()
@@ -182,6 +183,21 @@ impl LibraryService {
             .and_then(stored_library_root)?;
         Ok(AddRootResult { root, warnings })
     }
+
+    pub async fn delete_root(
+        &self,
+        library_id: LibraryId,
+        root_id: LibraryRootId,
+    ) -> Result<(), LibraryServiceError> {
+        if !self
+            .database
+            .delete_library_root(&library_id.to_string(), &root_id.to_string())
+            .await?
+        {
+            return Err(LibraryServiceError::RootNotFound);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,6 +214,7 @@ pub struct AddRootResult {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LibrarySettingsPatch {
+    pub is_enabled: Option<bool>,
     pub realtime_watch_enabled: Option<bool>,
     pub incremental_schedule: Option<Option<String>>,
     pub reconciliation_schedule: Option<Option<String>>,
@@ -230,6 +247,7 @@ pub enum LibraryServiceError {
     InvalidRootId(String),
     InvalidKind(String),
     LibraryNotFound,
+    RootNotFound,
     RootNotFoundAfterInsert,
     DuplicateRoot,
     OverlappingRoot,
@@ -254,6 +272,7 @@ impl fmt::Display for LibraryServiceError {
             Self::InvalidRootId(error) => write!(formatter, "invalid library root ID: {error}"),
             Self::InvalidKind(error) => write!(formatter, "invalid library kind: {error}"),
             Self::LibraryNotFound => formatter.write_str("library not found"),
+            Self::RootNotFound => formatter.write_str("library root not found"),
             Self::RootNotFoundAfterInsert => {
                 formatter.write_str("library root was inserted but could not be read back")
             }
@@ -279,6 +298,7 @@ impl std::error::Error for LibraryServiceError {
             | Self::InvalidRootId(_)
             | Self::InvalidKind(_)
             | Self::LibraryNotFound
+            | Self::RootNotFound
             | Self::RootNotFoundAfterInsert
             | Self::DuplicateRoot
             | Self::OverlappingRoot => None,

@@ -640,6 +640,21 @@ impl Database {
             return Ok(false);
         }
 
+        if let Some(value) = settings.is_enabled {
+            sqlx::query(
+                "UPDATE libraries
+                 SET is_enabled = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         if let Some(value) = settings.realtime_watch_enabled {
             sqlx::query(
                 "UPDATE libraries
@@ -1162,6 +1177,23 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn delete_library_root(
+        &self,
+        library_id: &str,
+        root_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query("DELETE FROM library_roots WHERE id = ? AND library_id = ?")
+            .bind(root_id)
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_all_library_roots(
@@ -3754,6 +3786,7 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
 }
 
 pub(crate) struct LibrarySettingsUpdate<'a> {
+    pub(crate) is_enabled: Option<bool>,
     pub(crate) realtime_watch_enabled: Option<bool>,
     pub(crate) incremental_schedule: Option<Option<&'a str>>,
     pub(crate) reconciliation_schedule: Option<Option<&'a str>>,

@@ -34,6 +34,7 @@ const api = {
   createLibrary(data) { return this.request("/api/v1/admin/libraries", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
   updateLibrary(id, data) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id), { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
   addLibraryRoot(id, path) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/roots", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ path }) }); },
+  deleteLibraryRoot(libraryId, rootId) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(libraryId) + "/roots/" + encodeURIComponent(rootId), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   scanLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/scan", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   adminJobs(status = "") { return this.request("/api/v1/admin/jobs?page=1&pageSize=50" + (status ? "&status=" + encodeURIComponent(status) : "")); },
   cancelJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
@@ -236,8 +237,8 @@ function renderPendingCandidates(candidates) {
 }
 
 function renderAdminLibrary(library) {
-  const roots = (library.roots || []).map((root) => "<li><strong>" + escapeHtml(root.displayPath || root.canonicalPath) + "</strong><span>" + (root.isAvailable ? "可用" : "不可用") + (root.isWritable ? " · 可写" : " · 只读") + "</span></li>").join("");
-  return `<article class="admin-library"><div class="section-heading"><div><h3>${escapeHtml(library.name)}</h3><span>${escapeHtml(library.kind)} · ${library.realtimeWatchEnabled ? "实时监听" : "手动/计划扫描"}</span></div><button class="button secondary" data-scan-library="${escapeHtml(library.id)}">开始扫描</button></div><ul class="admin-list">${roots || "<li><span>尚未添加根路径</span></li>"}</ul><form class="admin-form compact-form" data-action="add-root" data-library-id="${escapeHtml(library.id)}"><input name="path" placeholder="/Volumes/Media/Movies" aria-label="根路径" required><button class="button secondary" type="submit">添加根路径</button></form><form class="schedule-form" data-action="update-library" data-library-id="${escapeHtml(library.id)}"><label>增量 <input name="incrementalSchedule" value="${escapeHtml(library.incrementalSchedule || "")}" placeholder="interval:30s"></label><label>调和 <input name="reconciliationSchedule" value="${escapeHtml(library.reconciliationSchedule || "")}" placeholder="cron:0 3 * * *"></label><label>元数据 <input name="metadataSchedule" value="${escapeHtml(library.metadataSchedule || "")}" placeholder="interval:6h"></label><label>扫描并发 <input name="scanConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.scanConcurrency || "")}"></label><label>探测并发 <input name="probeConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.probeConcurrency || "")}"></label><label class="check"><input name="realtimeWatchEnabled" type="checkbox"${library.realtimeWatchEnabled ? " checked" : ""}> 实时监听</label><button class="button secondary" type="submit">保存计划</button></form></article>`;
+  const roots = (library.roots || []).map((root) => "<li><div><strong>" + escapeHtml(root.displayPath || root.canonicalPath) + "</strong><span>" + (root.isAvailable ? "可用" : "不可用") + (root.isWritable ? " · 可写" : " · 只读") + "</span></div><button class=\"button secondary\" type=\"button\" data-delete-root=\"" + escapeHtml(root.id) + "\" data-library-id=\"" + escapeHtml(library.id) + "\">删除配置</button></li>").join("");
+  return `<article class="admin-library"><div class="section-heading"><div><h3>${escapeHtml(library.name)}</h3><span>${escapeHtml(library.kind)} · ${library.isEnabled ? "已启用" : "已停用"} · ${library.realtimeWatchEnabled ? "实时监听" : "手动/计划扫描"}</span></div><button class="button secondary" data-scan-library="${escapeHtml(library.id)}"${library.isEnabled ? "" : " disabled"}>开始扫描</button></div><ul class="admin-list">${roots || "<li><span>尚未添加根路径</span></li>"}</ul><form class="admin-form compact-form" data-action="add-root" data-library-id="${escapeHtml(library.id)}"><input name="path" placeholder="/Volumes/Media/Movies" aria-label="根路径" required><button class="button secondary" type="submit">添加根路径</button></form><form class="schedule-form" data-action="update-library" data-library-id="${escapeHtml(library.id)}"><label class="check"><input name="isEnabled" type="checkbox"${library.isEnabled ? " checked" : ""}> 启用媒体库</label><label>增量 <input name="incrementalSchedule" value="${escapeHtml(library.incrementalSchedule || "")}" placeholder="interval:30s"></label><label>调和 <input name="reconciliationSchedule" value="${escapeHtml(library.reconciliationSchedule || "")}" placeholder="cron:0 3 * * *"></label><label>元数据 <input name="metadataSchedule" value="${escapeHtml(library.metadataSchedule || "")}" placeholder="interval:6h"></label><label>扫描并发 <input name="scanConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.scanConcurrency || "")}"></label><label>探测并发 <input name="probeConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.probeConcurrency || "")}"></label><label class="check"><input name="realtimeWatchEnabled" type="checkbox"${library.realtimeWatchEnabled ? " checked" : ""}> 实时监听</label><button class="button secondary" type="submit">保存计划</button></form></article>`;
 }
 
 function renderUserEditor(user, libraries, granted) {
@@ -294,6 +295,11 @@ function bind() {
   }));
   document.querySelectorAll("[data-scan-library]").forEach((element) => element.addEventListener("click", async () => {
     try { await api.scanLibrary(element.dataset.scanLibrary); state.notice = "扫描任务已创建。"; state.error = ""; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-delete-root]").forEach((element) => element.addEventListener("click", async () => {
+    if (!window.confirm("只删除这条根路径配置，不会删除媒体文件。继续？")) return;
+    try { await api.deleteLibraryRoot(element.dataset.libraryId, element.dataset.deleteRoot); state.error = ""; state.notice = "根路径配置已删除。"; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("[data-select-candidate]").forEach((element) => element.addEventListener("click", async () => {
@@ -355,7 +361,7 @@ function bind() {
     event.preventDefault();
     const optionalNumber = (value) => value ? Number(value) : undefined;
     try {
-      await api.updateLibrary(form.dataset.libraryId, { realtimeWatchEnabled: field(form, "realtimeWatchEnabled").checked, incrementalSchedule: field(form, "incrementalSchedule").value || null, reconciliationSchedule: field(form, "reconciliationSchedule").value || null, metadataSchedule: field(form, "metadataSchedule").value || null, scanConcurrency: optionalNumber(field(form, "scanConcurrency").value), probeConcurrency: optionalNumber(field(form, "probeConcurrency").value) });
+      await api.updateLibrary(form.dataset.libraryId, { isEnabled: field(form, "isEnabled").checked, realtimeWatchEnabled: field(form, "realtimeWatchEnabled").checked, incrementalSchedule: field(form, "incrementalSchedule").value || null, reconciliationSchedule: field(form, "reconciliationSchedule").value || null, metadataSchedule: field(form, "metadataSchedule").value || null, scanConcurrency: optionalNumber(field(form, "scanConcurrency").value), probeConcurrency: optionalNumber(field(form, "probeConcurrency").value) });
       state.route = "admin"; state.error = ""; state.notice = "媒体库计划已保存。"; render();
     } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));

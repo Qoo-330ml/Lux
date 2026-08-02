@@ -837,12 +837,10 @@ impl ScanJobService {
         library_id: LibraryId,
     ) -> Result<ScanJob, ScanJobError> {
         let library_id_text = library_id.to_string();
-        if self
-            .database
-            .find_library(&library_id_text)
-            .await?
-            .is_none()
-        {
+        let Some(library) = self.database.find_library(&library_id_text).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if !library.is_enabled {
             return Err(ScanJobError::LibraryNotFound);
         }
         if let Some(active) = self
@@ -853,12 +851,7 @@ impl ScanJobService {
             return Err(ScanJobError::AlreadyActive(active.id));
         }
         let roots = self.database.list_library_roots(&library_id_text).await?;
-        let library_kind = self
-            .database
-            .find_library(&library_id_text)
-            .await?
-            .map(|library| library.kind)
-            .unwrap_or_else(|| "MOVIE".to_owned());
+        let library_kind = library.kind;
         let mut total_count = 0_i64;
         for root in roots {
             if root.is_available {
