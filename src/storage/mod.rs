@@ -1738,6 +1738,44 @@ impl Database {
         })
     }
 
+    pub(crate) async fn upsert_item_image(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        local_path: &std::path::Path,
+        file_size: i64,
+        content_tag: &str,
+        source: &str,
+    ) -> Result<String, StorageError> {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO item_images (
+                id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+            ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
+                id = excluded.id,
+                local_path = excluded.local_path,
+                file_size = excluded.file_size,
+                content_tag = excluded.content_tag,
+                source = excluded.source,
+                updated_at = unixepoch()",
+        )
+        .bind(&id)
+        .bind(item_id)
+        .bind(image_type)
+        .bind(local_path.to_string_lossy().as_ref())
+        .bind(file_size)
+        .bind(content_tag)
+        .bind(source)
+        .execute(&self.pool)
+        .await
+        .map(|_| id)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_item_image_candidates(
         &self,
         item_id: &str,
