@@ -57,7 +57,10 @@ use crate::{
     security::LoginRateLimiter,
     storage::{Database, NewPlaybackEvent, StorageError},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    process::Command,
+};
 
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -248,7 +251,9 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
         )
+        .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/audit", get(admin_list_audit))
+        .route("/api/v1/admin/logs", get(admin_list_logs))
         .route("/api/v1/libraries", get(lux_list_libraries))
         .route("/api/v1/search", get(lux_search))
         .route("/api/v1/home", get(lux_home))
@@ -5008,6 +5013,90 @@ async fn admin_list_audit(
         .into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+async fn admin_list_logs(
+    headers: HeaderMap,
+    Query(query): Query<MetadataCandidateQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_audit(headers, Query(query), State(state)).await
+}
+
+async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let schema_version = match database.schema_version().await {
+        Ok(version) => version,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let (config_available, config_writable) = match state.config_dir.as_deref() {
+        Some(path) => match fs::metadata(path).await {
+            Ok(metadata) => (true, !metadata.permissions().readonly()),
+            Err(_) => (false, false),
+        },
+        None => (false, false),
+    };
+    let ffprobe_available = Command::new("ffprobe")
+        .arg("-version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success());
+    let libraries = match state.libraries.as_ref() {
+        Some(libraries) => match libraries.list_libraries().await {
+            Ok(views) => views
+                .iter()
+                .map(|view| {
+                    json!({
+                        "id": view.library.id.to_string(),
+                        "name": view.library.name,
+                        "isEnabled": view.library.is_enabled,
+                        "rootCount": view.roots.len(),
+                        "availableRootCount": view.roots.iter().filter(|root| root.is_available).count(),
+                        "writableRootCount": view.roots.iter().filter(|root| root.is_writable).count(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+        None => Vec::new(),
+    };
+    let jobs = match database.list_scan_jobs(None, 0, 10_000).await {
+        Ok(jobs) => json!({
+            "scanRunning": jobs.iter().filter(|job| matches!(job.status.as_str(), "PENDING" | "RUNNING")).count(),
+            "scanFailed": jobs.iter().filter(|job| job.status == "FAILED").count(),
+        }),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let metadata_reidentify_running = match database.list_active_metadata_reidentify_job_ids().await
+    {
+        Ok(ids) => ids.len(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let status = if config_available && config_writable && ffprobe_available {
+        "ok"
+    } else {
+        "degraded"
+    };
+    Json(json!({
+        "status": status,
+        "schemaVersion": schema_version,
+        "database": { "status": "ok", "journalMode": "wal" },
+        "config": { "available": config_available, "writable": config_writable },
+        "ffprobe": { "available": ffprobe_available },
+        "tmdb": { "configured": state.tmdb.is_some() },
+        "jobs": {
+            "scanRunning": jobs["scanRunning"],
+            "scanFailed": jobs["scanFailed"],
+            "metadataReidentifyRunning": metadata_reidentify_running,
+        },
+        "libraries": libraries,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
