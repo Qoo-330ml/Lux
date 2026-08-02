@@ -27,6 +27,7 @@ const api = {
   adminLibraries() { return this.request("/api/v1/admin/libraries"); },
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
   ready() { return fetch("/health/ready", { credentials: "same-origin" }).then((response) => response.json()); },
+  progress(id, positionTicks, durationTicks) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/progress", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ positionTicks, durationTicks }) }); },
 };
 
 function readCookie(name) {
@@ -176,6 +177,14 @@ function bind() {
     document.querySelectorAll("[data-source]").forEach((button) => button.setAttribute("aria-pressed", String(button === element)));
     player.play().catch(() => {});
   }));
+  document.querySelectorAll("[data-player]").forEach((player) => {
+    let lastReport = 0;
+    player.addEventListener("timeupdate", () => {
+      if (!state.item || player.currentTime - lastReport < 10) return;
+      lastReport = player.currentTime;
+      api.progress(state.item.id, Math.round(player.currentTime * 10000000), Number.isFinite(player.duration) ? Math.round(player.duration * 10000000) : null).catch(() => {});
+    });
+  });
   document.querySelectorAll("[data-disable-user]").forEach((element) => element.addEventListener("click", async () => {
     if (!window.confirm("确认禁用这个用户？")) return;
     try { await api.disableUser(element.dataset.disableUser); state.error = ""; render(); } catch (error) { state.error = error.message; render(); }
