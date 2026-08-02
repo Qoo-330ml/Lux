@@ -17,16 +17,16 @@
 
 ### Slice 1：数据表和纯文件名解析
 
-- [ ] 新增 `0006_media_catalog.sql`：`filesystem_entries`、`media_items`、`media_sources`。
-- [ ] 增加文件/媒体 ID 新类型和本地电影文件名解析器。
-- [ ] 用单元测试覆盖 MKV/MP4、年份、质量后缀和无年份文件名。
+- [x] 新增 `0006_media_catalog.sql`：`filesystem_entries`、`media_items`、`media_sources`。
+- [x] 增加文件/媒体 ID 新类型和本地电影文件名解析器。
+- [x] 用单元测试覆盖 MKV/MP4、年份、质量后缀和无年份文件名。
 
 ### Slice 2：扫描与幂等持久化
 
-- [ ] 实现 `LibraryScanner::scan_movie_library`。
-- [ ] 只扫描根目录及一层子目录，保存文件大小、修改时间、相对路径和生成标识。
-- [ ] 创建/复用逻辑电影条目，保存媒体源，第二次扫描不重复。
-- [ ] 用临时目录和重启数据库集成测试验证结果持久化。
+- [x] 实现 `LibraryScanner::scan_movie_library`。
+- [x] 只扫描根目录及一层子目录，保存文件大小、修改时间、相对路径和生成标识。
+- [x] 创建/复用逻辑电影条目，保存媒体源，第二次扫描不重复。
+- [x] 用临时目录和重启数据库集成测试验证结果持久化。
 
 ## 验证门
 
@@ -34,6 +34,8 @@
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - ARM64 本机用一个 MKV/MP4 fixture 完成扫描并核对重启后的记录。
+
+以上验证已于 2026-08-02 在 `arm64` 本机通过。
 
 ## 明确不做
 
