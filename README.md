@@ -17,6 +17,8 @@ docker compose up --build
 
 首次启动后访问 `http://localhost:8097/` 完成初始化。媒体目录默认挂载为 `./media`，数据和迁移数据库持久化在 `lux-data` 卷中；生产环境应在反代 HTTPS 后使用，并谨慎配置 `LUX_TRUSTED_PROXY_CIDRS`。
 
+生产部署、HTTPS 反代、Tailscale 和升级说明见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
+
 ## 常用命令
 
 ```bash

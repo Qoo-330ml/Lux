@@ -14,6 +14,12 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 
+ARG LUX_VERSION=dev
+ARG LUX_REVISION=unknown
+LABEL org.opencontainers.image.title="Lux" \
+      org.opencontainers.image.version="$LUX_VERSION" \
+      org.opencontainers.image.revision="$LUX_REVISION"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
     && groupadd --system --gid 10001 lux \
