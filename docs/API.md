@@ -87,6 +87,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Items/{itemId}/Subtitles/{streamIndex}/Stream`：按条目读取默认媒体源的外挂字幕。
 - `GET|HEAD /Videos/{itemId}/stream`、`/Videos/{itemId}/stream.{container}`：读取默认本地媒体源。
 - `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定本地媒体源。
+- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流和 DirectPlay 能力；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。
 
 本地媒体流支持完整响应和单 `Range: bytes=...` 请求，返回 200、206 或 416，并包含 `Accept-Ranges`、`Content-Length`、`Content-Range`、`Content-Type`、`ETag` 和 `Last-Modified`。媒体文件通过数据库 source ID 解析，读取前执行媒体库 ACL 和根目录路径安全检查。
 

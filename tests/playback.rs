@@ -91,6 +91,34 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert!(full.headers().contains_key("last-modified"));
     assert_eq!(full.bytes().await?.as_ref(), b"0123456789");
 
+    let playback_info = client
+        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(playback_info.status(), reqwest::StatusCode::OK);
+    let playback_body = playback_info.json::<Value>().await?;
+    assert_eq!(playback_body["MediaSources"][0]["Id"], source_id);
+    assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
+    assert_eq!(
+        playback_body["MediaSources"][0]["SupportsDirectStream"],
+        false
+    );
+    assert_eq!(
+        playback_body["MediaSources"][0]["SupportsTranscoding"],
+        false
+    );
+    assert_eq!(
+        playback_body["MediaSources"][0]["DirectStreamUrl"],
+        format!("/Videos/{item_id}/{source_id}/stream.mkv")
+    );
+    let playback_post = client
+        .post(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(playback_post.status(), reqwest::StatusCode::OK);
+
     let source_route = client
         .get(format!(
             "{base_url}/Videos/{item_id}/{source_id}/stream.mkv"

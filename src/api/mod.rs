@@ -239,6 +239,10 @@ fn emby_routes() -> Router<AppState> {
             "/Videos/{item_id}/{media_source_id}/stream.{container}",
             get(emby_stream_with_source_and_container).head(emby_stream_with_source_and_container),
         )
+        .route(
+            "/Items/{item_id}/PlaybackInfo",
+            get(emby_playback_info).post(emby_playback_info),
+        )
         .route("/Sessions/Logout", post(emby_logout))
 }
 
@@ -778,6 +782,51 @@ async fn emby_item_response(
     }
 }
 
+async fn emby_playback_info(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<EmbyStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let item = match catalog.find_item(principal, &item_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let mut sources = item.media_sources.iter().collect::<Vec<_>>();
+    sources.sort_by(|left, right| {
+        right
+            .is_default
+            .cmp(&left.is_default)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if let Some(source_id) = query.media_source_id {
+        let Some(index) = sources.iter().position(|source| source.id == source_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let source = sources.remove(index);
+        sources.insert(0, source);
+    }
+    Json(json!({
+        "MediaSources": sources
+            .into_iter()
+            .map(|source| emby_media_source_json(&item.id, source))
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
 fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
@@ -841,7 +890,11 @@ fn emby_catalog_item_json_with_state(
         "Container": default_source.and_then(|source| source.container.clone()),
         "Size": default_source.and_then(|source| source.size),
         "Bitrate": default_source.and_then(|source| source.bitrate),
-        "MediaSources": item.media_sources.iter().map(emby_media_source_json).collect::<Vec<_>>(),
+        "MediaSources": item
+            .media_sources
+            .iter()
+            .map(|source| emby_media_source_json(&item.id, source))
+            .collect::<Vec<_>>(),
         "ImageTags": item
             .poster_image_tag
             .as_ref()
@@ -861,7 +914,18 @@ fn emby_catalog_item_json_with_state(
     })
 }
 
-fn emby_media_source_json(source: &crate::application::catalog::CatalogSource) -> Value {
+fn emby_media_source_json(
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+) -> Value {
+    let direct_stream_url = (source.source_kind == "LOCAL_FILE").then(|| {
+        let suffix = source
+            .container
+            .as_deref()
+            .map(|container| format!(".{container}"))
+            .unwrap_or_default();
+        format!("/Videos/{item_id}/{}/stream{suffix}", source.id)
+    });
     json!({
         "Id": source.id,
         "Container": source.container,
@@ -871,6 +935,10 @@ fn emby_media_source_json(source: &crate::application::catalog::CatalogSource) -
         "Protocol": "File",
         "Type": "Default",
         "IsRemote": false,
+        "SupportsDirectPlay": direct_stream_url.is_some(),
+        "SupportsDirectStream": false,
+        "SupportsTranscoding": false,
+        "DirectStreamUrl": direct_stream_url,
         "MediaStreams": source.streams.iter().map(|stream| json!({
             "Index": stream.index,
             "Type": emby_stream_type(&stream.stream_type),
