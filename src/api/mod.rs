@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
     http::{
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, Method, StatusCode,
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
     },
     response::{IntoResponse, Response},
@@ -22,6 +23,7 @@ use crate::{
     application::setup::{SetupError, SetupService},
     application::{
         catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
+        images::{ImageError, ImageService, normalize_image_type},
         libraries::{LibraryService, LibraryServiceError},
     },
     auth::users::{UserRecord, UserStoreError},
@@ -44,6 +46,7 @@ pub struct AppState {
     emby_auth: Option<EmbyAuthService>,
     libraries: Option<LibraryService>,
     catalog: Option<CatalogService>,
+    images: Option<ImageService>,
 }
 
 impl AppState {
@@ -63,7 +66,8 @@ impl AppState {
             auth: Some(auth),
             emby_auth: Some(emby_auth),
             libraries: Some(LibraryService::new(database.clone())),
-            catalog: Some(CatalogService::new(database)),
+            catalog: Some(CatalogService::new(database.clone())),
+            images: Some(ImageService::new(database)),
         }
     }
 }
@@ -96,6 +100,14 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_list_library_items),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route(
+            "/api/v1/items/{item_id}/images/{image_type}",
+            get(lux_image).head(lux_image),
+        )
+        .route(
+            "/api/v1/items/{item_id}/images/{image_type}/{image_index}",
+            get(lux_image_at_index).head(lux_image_at_index),
+        )
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
@@ -133,6 +145,14 @@ fn emby_routes() -> Router<AppState> {
         .route("/Users/{user_id}/Items/{item_id}", get(emby_user_item))
         .route("/Items", get(emby_items))
         .route("/Items/{item_id}", get(emby_item))
+        .route(
+            "/Items/{item_id}/Images/{image_type}",
+            get(emby_image).head(emby_image),
+        )
+        .route(
+            "/Items/{item_id}/Images/{image_type}/{image_index}",
+            get(emby_image_at_index).head(emby_image_at_index),
+        )
         .route("/Sessions/Logout", post(emby_logout))
 }
 
@@ -548,8 +568,16 @@ fn emby_catalog_item_json(item: &CatalogItem, server_id: &str) -> Value {
         "Size": default_source.and_then(|source| source.size),
         "Bitrate": default_source.and_then(|source| source.bitrate),
         "MediaSources": item.media_sources.iter().map(emby_media_source_json).collect::<Vec<_>>(),
-        "ImageTags": {},
-        "BackdropImageTags": [],
+        "ImageTags": item
+            .poster_image_tag
+            .as_ref()
+            .map(|tag| json!({"Primary": tag}))
+            .unwrap_or_else(|| json!({})),
+        "BackdropImageTags": item
+            .fanart_image_tag
+            .as_ref()
+            .map(|tag| json!([tag]))
+            .unwrap_or_else(|| json!([])),
         "UserData": {"PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false},
     })
 }
@@ -1113,6 +1141,139 @@ async fn lux_get_item(
     }
 }
 
+async fn lux_image(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, image_type)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_web_user(&headers, &state).await {
+        return response;
+    }
+    let Some(images) = state.images.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    serve_image(images, &headers, &method, &item_id, &image_type, 0).await
+}
+
+async fn lux_image_at_index(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_web_user(&headers, &state).await {
+        return response;
+    }
+    let Ok(image_index) = image_index.parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(images) = state.images.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    serve_image(
+        images,
+        &headers,
+        &method,
+        &item_id,
+        &image_type,
+        image_index,
+    )
+    .await
+}
+
+async fn emby_image(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, image_type)): Path<(String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(status) = require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        return status.into_response();
+    }
+    let Some(images) = state.images.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    serve_image(images, &headers, &method, &item_id, &image_type, 0).await
+}
+
+async fn emby_image_at_index(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(status) = require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        return status.into_response();
+    }
+    let Ok(image_index) = image_index.parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(images) = state.images.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    serve_image(
+        images,
+        &headers,
+        &method,
+        &item_id,
+        &image_type,
+        image_index,
+    )
+    .await
+}
+
+async fn serve_image(
+    images: &ImageService,
+    headers: &HeaderMap,
+    method: &Method,
+    item_id: &str,
+    image_type: &str,
+    image_index: i64,
+) -> Response {
+    let Some(image_type) = normalize_image_type(image_type) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let image = match images.resolve(item_id, image_type, image_index).await {
+        Ok(Some(image)) => image,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+        Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == image.etag))
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &image.etag)
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        let Ok(file) = tokio::fs::File::open(&image.path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        Body::from_stream(tokio_util::io::ReaderStream::new(file))
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", image.content_type)
+        .header("Content-Length", image.content_length)
+        .header("ETag", &image.etag)
+        .header("Cache-Control", "private, max-age=3600")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 fn lux_page_params(query: &LuxPageQuery) -> Result<(i64, i64), &'static str> {
     let page = query.page.unwrap_or(1);
     let page_size = query.page_size.unwrap_or(50);
@@ -1145,6 +1306,10 @@ fn lux_catalog_item_json(item: &CatalogItem) -> Value {
         "overview": item.overview,
         "productionYear": item.production_year,
         "runtimeTicks": item.runtime_ticks,
+        "imageTags": {
+            "poster": item.poster_image_tag,
+            "fanart": item.fanart_image_tag,
+        },
         "mediaSources": item.media_sources.iter().map(lux_catalog_source_json).collect::<Vec<_>>(),
     })
 }

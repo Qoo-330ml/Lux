@@ -602,6 +602,10 @@ impl Database {
                 "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
                         mi.production_year, mi.runtime_ticks,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                         ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                         ORDER BY image_index LIMIT 1) AS fanart_image_tag,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
@@ -628,6 +632,10 @@ impl Database {
                 "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
                         mi.production_year, mi.runtime_ticks,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                         ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                         ORDER BY image_index LIMIT 1) AS fanart_image_tag,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
@@ -658,6 +666,10 @@ impl Database {
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.runtime_ticks,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
@@ -700,6 +712,8 @@ impl Database {
                         overview: row.get("overview"),
                         production_year: row.get("production_year"),
                         runtime_ticks: row.get("runtime_ticks"),
+                        poster_image_tag: row.get("poster_image_tag"),
+                        fanart_image_tag: row.get("fanart_image_tag"),
                         source_id: row.get("source_id"),
                         source_kind: row.get("source_kind"),
                         container: row.get("container"),
@@ -957,6 +971,41 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_item_image_candidates(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+    ) -> Result<Vec<StoredItemImageCandidate>, StorageError> {
+        sqlx::query(
+            "SELECT ii.id, ii.local_path, lr.canonical_path AS root_path
+             FROM item_images ii
+             JOIN media_items mi ON mi.id = ii.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN library_roots lr ON lr.library_id = mi.library_id
+             WHERE ii.item_id = ? AND ii.image_type = ? AND ii.image_index = ?
+             ORDER BY lr.canonical_path",
+        )
+        .bind(item_id)
+        .bind(image_type)
+        .bind(image_index)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredItemImageCandidate {
+                    id: row.get("id"),
+                    local_path: row.get("local_path"),
+                    root_path: row.get("root_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn create_access_token(
         &self,
         token: NewAccessToken<'_>,
@@ -1208,6 +1257,8 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) overview: Option<String>,
     pub(crate) production_year: Option<i64>,
     pub(crate) runtime_ticks: Option<i64>,
+    pub(crate) poster_image_tag: Option<String>,
+    pub(crate) fanart_image_tag: Option<String>,
     pub(crate) source_id: Option<String>,
     pub(crate) source_kind: Option<String>,
     pub(crate) container: Option<String>,
@@ -1222,6 +1273,13 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) codec: Option<String>,
     pub(crate) language: Option<String>,
     pub(crate) stream_title: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredItemImageCandidate {
+    pub(crate) id: String,
+    pub(crate) local_path: String,
+    pub(crate) root_path: String,
 }
 
 enum CatalogBind<'a> {
