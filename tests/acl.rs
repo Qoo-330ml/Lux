@@ -57,7 +57,11 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
-        config, database, setup, web_auth, emby_auth,
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -125,6 +129,36 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .send()
         .await?;
     assert_eq!(denied_image.status(), reqwest::StatusCode::NOT_FOUND);
+    let denied_source: String =
+        sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+            .bind(&second_item)
+            .fetch_one(database.pool())
+            .await?;
+    let denied_search = client
+        .get(format!("{base_url}/api/v1/search?q=Denied"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(denied_search.status(), reqwest::StatusCode::OK);
+    let denied_search_body: Value = denied_search.json().await?;
+    assert!(
+        !denied_search_body["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["id"] == second_item))
+    );
+    for path in [
+        format!("{base_url}/api/v1/items/{second_item}/playback"),
+        format!("{base_url}/api/v1/items/{second_item}/stream"),
+        format!("{base_url}/api/v1/items/{second_item}/download"),
+        format!("{base_url}/api/v1/items/{second_item}/subtitles/0"),
+    ] {
+        let response = client
+            .get(path)
+            .header(COOKIE, &viewer_cookie)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
 
     let viewer_emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
@@ -139,6 +173,32 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .as_str()
         .ok_or("missing viewer token")?
         .to_owned();
+    let emby_search = client
+        .get(format!("{base_url}/Search/Hints?SearchTerm=Denied"))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(emby_search.status(), reqwest::StatusCode::OK);
+    let emby_search_body: Value = emby_search.json().await?;
+    assert_eq!(
+        emby_search_body["SearchHints"].as_array().map(Vec::len),
+        Some(0)
+    );
+    for path in [
+        format!("{base_url}/Items/{second_item}/Images/Primary"),
+        format!("{base_url}/Items/{second_item}/PlaybackInfo"),
+        format!("{base_url}/Items/{second_item}/Download"),
+        format!("{base_url}/Videos/{second_item}/stream"),
+        format!("{base_url}/Videos/{second_item}/{denied_source}/stream"),
+        format!("{base_url}/Items/{second_item}/Subtitles/0/Stream"),
+    ] {
+        let response = client
+            .get(path)
+            .header("X-Emby-Token", &viewer_token)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
     let emby_views = client
         .get(format!("{base_url}/Users/{}/Views", viewer.id))
         .header("X-Emby-Token", &viewer_token)

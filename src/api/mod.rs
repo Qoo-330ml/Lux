@@ -2593,6 +2593,17 @@ async fn lux_download(
         Ok(user) => user,
         Err(response) => return response,
     };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -2828,6 +2839,17 @@ async fn emby_download(
         Ok(user) => user,
         Err(status) => return status.into_response(),
     };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
