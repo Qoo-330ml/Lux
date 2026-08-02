@@ -318,6 +318,7 @@ pub fn app_with_state(state: AppState) -> Router {
                                 "requestId" = %request_id,
                                 "durationMs" = tracing::field::Empty,
                                 "statusCode" = tracing::field::Empty,
+                                "errorCode" = tracing::field::Empty,
                             )
                         })
                         .on_response(
@@ -6335,6 +6336,7 @@ fn api_error(
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("unknown");
+    tracing::Span::current().record("errorCode", code.as_str());
     let body = lux::ApiError::new(code, message, request_id);
     (
         status,

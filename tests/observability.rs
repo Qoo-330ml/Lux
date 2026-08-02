@@ -64,7 +64,8 @@ mod unix {
             return Err(error);
         }
 
-        let response = reqwest::Client::new().get(&health_url).send().await?;
+        let client = reqwest::Client::new();
+        let response = client.get(&health_url).send().await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let request_id = response
             .headers()
@@ -73,6 +74,18 @@ mod unix {
             .to_str()?
             .to_owned();
         assert!(!request_id.is_empty());
+
+        let unauthorized = client
+            .get(format!("http://{address}/api/v1/auth/me"))
+            .send()
+            .await?;
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let error_request_id = unauthorized
+            .headers()
+            .get("x-request-id")
+            .ok_or("missing error response request ID")?
+            .to_str()?
+            .to_owned();
 
         send_signal("TERM", pid).await?;
         let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
@@ -99,6 +112,18 @@ mod unix {
         assert_eq!(response_log["span"]["requestId"], request_id);
         assert!(response_log["span"]["durationMs"].is_number());
         assert_eq!(response_log["span"]["statusCode"], 200);
+
+        let error_log = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| {
+                value["fields"]["message"] == "finished processing request"
+                    && value["span"]["path"] == "/api/v1/auth/me"
+                    && value["span"]["requestId"] == error_request_id
+            })
+            .ok_or("missing structured error response log")?;
+        assert_eq!(error_log["span"]["errorCode"], "AUTHENTICATION_REQUIRED");
+        assert_eq!(error_log["span"]["statusCode"], 401);
         Ok(())
     }
 }
