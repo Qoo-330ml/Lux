@@ -1,0 +1,190 @@
+use luxd::{
+    api::{AppState, app_with_state},
+    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    auth::{emby::EmbyAuthService, sessions::WebAuthService},
+    config::Config,
+    library::LibraryKind,
+    storage::Database,
+};
+use reqwest::header::AUTHORIZATION;
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+
+#[tokio::test]
+async fn playback_events_are_idempotent_and_positions_never_regress()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Session.Movie.2024.mkv"), b"video").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await?;
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="SessionTest", Device="Mac", DeviceId="session-device", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing token")?
+        .to_owned();
+    let event_url = format!("{base_url}/Sessions/Playing");
+    let event = json!({
+        "ItemId": item_id,
+        "MediaSourceId": source_id,
+        "PlaySessionId": "session-1",
+        "PositionTicks": 100,
+        "RunTimeTicks": 1000,
+        "DeviceId": "session-device",
+        "Client": "SessionTest",
+        "DeviceName": "Mac",
+    });
+    let playing = client
+        .post(&event_url)
+        .header("X-Emby-Token", &token)
+        .json(&event)
+        .send()
+        .await?;
+    assert_eq!(playing.status(), reqwest::StatusCode::NO_CONTENT);
+    let duplicate = client
+        .post(&event_url)
+        .header("X-Emby-Token", &token)
+        .json(&event)
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let progress_url = format!("{base_url}/Sessions/Playing/Progress");
+    let high = client.clone();
+    let high_token = token.clone();
+    let high_item_id = event["ItemId"].clone();
+    let high_source_id = event["MediaSourceId"].clone();
+    let high_request = tokio::spawn(async move {
+        high.post(progress_url)
+            .header("X-Emby-Token", high_token)
+            .json(&json!({
+                "ItemId": high_item_id,
+                "MediaSourceId": high_source_id,
+                "PlaySessionId": "session-1",
+                "PositionTicks": 900,
+                "RunTimeTicks": 1000,
+            }))
+            .send()
+            .await
+    });
+    let low = client
+        .post(format!("{base_url}/Sessions/Playing/Progress"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": event["ItemId"],
+            "MediaSourceId": event["MediaSourceId"],
+            "PlaySessionId": "session-1",
+            "PositionTicks": 300,
+            "RunTimeTicks": 1000,
+        }))
+        .send();
+    let (high, low) = tokio::join!(high_request, low);
+    assert_eq!(high??.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(low?.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let sessions = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(sessions.status(), reqwest::StatusCode::OK);
+    let sessions_body = sessions.json::<Value>().await?;
+    assert_eq!(sessions_body.as_array().map(Vec::len), Some(1));
+    assert_eq!(sessions_body[0]["PlayState"]["PositionTicks"], 900);
+    assert_eq!(sessions_body[0]["DeviceId"], "session-device");
+
+    let stopped = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": event["ItemId"],
+            "MediaSourceId": event["MediaSourceId"],
+            "PlaySessionId": "session-1",
+            "PositionTicks": 900,
+        }))
+        .send()
+        .await?;
+    assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+    let stopped_again = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": event["ItemId"],
+            "PlaySessionId": "session-1",
+            "PositionTicks": 800,
+        }))
+        .send()
+        .await?;
+    assert_eq!(stopped_again.status(), reqwest::StatusCode::NO_CONTENT);
+    let sessions_after_stop = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(
+        sessions_after_stop
+            .json::<Value>()
+            .await?
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let position: i64 = sqlx::query_scalar(
+        "SELECT position_ticks FROM user_item_state
+         WHERE item_id = ? LIMIT 1",
+    )
+    .bind(event["ItemId"].as_str().ok_or("missing item id")?)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(position, 900);
+    server.abort();
+    Ok(())
+}

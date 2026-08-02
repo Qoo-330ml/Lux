@@ -43,7 +43,7 @@ use crate::{
     },
     config::Config,
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
-    storage::Database,
+    storage::{Database, NewPlaybackEvent},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
@@ -167,6 +167,8 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/items/{item_id}/stream",
             get(lux_stream).head(lux_stream),
         )
+        .route("/api/v1/items/{item_id}/playback", get(lux_get_playback))
+        .route("/api/v1/items/{item_id}/progress", post(lux_post_progress))
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
@@ -243,6 +245,10 @@ fn emby_routes() -> Router<AppState> {
             "/Items/{item_id}/PlaybackInfo",
             get(emby_playback_info).post(emby_playback_info),
         )
+        .route("/Sessions", get(emby_sessions))
+        .route("/Sessions/Playing", post(emby_playing))
+        .route("/Sessions/Playing/Progress", post(emby_playing_progress))
+        .route("/Sessions/Playing/Stopped", post(emby_playing_stopped))
         .route("/Sessions/Logout", post(emby_logout))
 }
 
@@ -825,6 +831,290 @@ async fn emby_playback_info(
             .collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct PlaybackEventRequest {
+    #[serde(rename = "ItemId", alias = "itemId")]
+    item_id: String,
+    #[serde(rename = "MediaSourceId", alias = "mediaSourceId")]
+    media_source_id: Option<String>,
+    #[serde(rename = "PlaySessionId", alias = "playSessionId")]
+    play_session_id: Option<String>,
+    #[serde(rename = "PositionTicks", alias = "positionTicks", default)]
+    position_ticks: i64,
+    #[serde(rename = "RunTimeTicks", alias = "runTimeTicks")]
+    duration_ticks: Option<i64>,
+    #[serde(rename = "IsPaused", alias = "isPaused", default)]
+    is_paused: bool,
+    #[serde(rename = "DeviceId", alias = "deviceId")]
+    device_id: Option<String>,
+    #[serde(rename = "Client", alias = "client")]
+    client: Option<String>,
+    #[serde(rename = "DeviceName", alias = "deviceName", alias = "Device")]
+    device_name: Option<String>,
+}
+
+async fn emby_playing(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<PlaybackEventRequest>,
+) -> Response {
+    handle_emby_playback_event(headers, query, state, request, "PLAYING").await
+}
+
+async fn emby_playing_progress(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<PlaybackEventRequest>,
+) -> Response {
+    let state_name = if request.is_paused {
+        "PAUSED"
+    } else {
+        "PLAYING"
+    };
+    handle_emby_playback_event(headers, query, state, request, state_name).await
+}
+
+async fn emby_playing_stopped(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<PlaybackEventRequest>,
+) -> Response {
+    handle_emby_playback_event(headers, query, state, request, "STOPPED").await
+}
+
+async fn handle_emby_playback_event(
+    headers: HeaderMap,
+    query: EmbyTokenQuery,
+    state: AppState,
+    request: PlaybackEventRequest,
+    state_name: &'static str,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if request.position_ticks < 0
+        || request.duration_ticks.is_some_and(|duration| duration < 0)
+        || request.item_id.is_empty()
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &request.item_id,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let media_source_id = request
+        .media_source_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    if let Some(media_source_id) = media_source_id {
+        match database
+            .media_source_belongs_to_item(media_source_id, &request.item_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+    let header_device = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(EmbyDeviceInfo::parse)
+        .unwrap_or_default();
+    let device_id = request
+        .device_id
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!header_device.device_id.is_empty()).then_some(header_device.device_id))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let client = request
+        .client
+        .as_deref()
+        .or_else(|| (!header_device.client.is_empty()).then_some(header_device.client.as_str()));
+    let device_name = request
+        .device_name
+        .as_deref()
+        .or_else(|| (!header_device.device.is_empty()).then_some(header_device.device.as_str()));
+    let play_session_id = request
+        .play_session_id
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{}:{device_id}", request.item_id));
+    let user_id = user.id.to_string();
+    match database
+        .record_playback_event(NewPlaybackEvent {
+            user_id: &user_id,
+            item_id: &request.item_id,
+            media_source_id,
+            play_session_id: &play_session_id,
+            device_id: &device_id,
+            client,
+            device_name,
+            state: state_name,
+            position_ticks: request.position_ticks,
+            duration_ticks: request.duration_ticks,
+            is_paused: request.is_paused || state_name == "PAUSED",
+        })
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_sessions(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let user_id = user.id.to_string();
+    let sessions = match database
+        .list_playback_sessions((!user.is_admin).then_some(user_id.as_str()))
+        .await
+    {
+        Ok(sessions) => sessions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(sessions.iter().map(emby_session_json).collect::<Vec<_>>()).into_response()
+}
+
+fn emby_session_json(session: &crate::storage::StoredPlaybackSession) -> Value {
+    json!({
+        "Id": session.id,
+        "UserId": session.user_id,
+        "ItemId": session.item_id,
+        "MediaSourceId": session.media_source_id,
+        "PlaySessionId": session.play_session_id,
+        "Client": session.client,
+        "DeviceId": session.device_id,
+        "DeviceName": session.device_name,
+        "PlayState": {
+            "PositionTicks": session.position_ticks,
+            "IsPaused": session.is_paused,
+            "CanSeek": true,
+            "PlayMethod": "DirectPlay",
+        },
+        "RunTimeTicks": session.duration_ticks,
+        "LastActivityDate": session.last_event_at,
+    })
+}
+
+async fn lux_get_playback(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let user_id = user.id.to_string();
+    match database.find_user_item_state(&user_id, &item_id).await {
+        Ok(state) => Json(json!({
+            "itemId": item_id,
+            "positionTicks": state.as_ref().map(|value| value.position_ticks).unwrap_or_default(),
+            "isPlayed": state.as_ref().map(|value| value.is_played).unwrap_or(false),
+            "isFavorite": state.as_ref().map(|value| value.is_favorite).unwrap_or(false),
+            "playCount": state.as_ref().map(|value| value.play_count).unwrap_or_default(),
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LuxProgressRequest {
+    position_ticks: i64,
+    duration_ticks: Option<i64>,
+}
+
+async fn lux_post_progress(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<LuxProgressRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if request.position_ticks < 0 || request.duration_ticks.is_some_and(|duration| duration < 0) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let user_id = user.id.to_string();
+    let play_session_id = format!("lux-web:{user_id}:{item_id}");
+    match database
+        .record_playback_event(NewPlaybackEvent {
+            user_id: &user_id,
+            item_id: &item_id,
+            media_source_id: None,
+            play_session_id: &play_session_id,
+            device_id: "lux-web",
+            client: Some("Lux"),
+            device_name: Some("Web"),
+            state: "PLAYING",
+            position_ticks: request.position_ticks,
+            duration_ticks: request.duration_ticks,
+            is_paused: false,
+        })
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {

@@ -669,6 +669,164 @@ impl Database {
         })
     }
 
+    pub(crate) async fn record_playback_event(
+        &self,
+        event: NewPlaybackEvent<'_>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                id, user_id, item_id, media_source_id, play_session_id,
+                device_id, client, device_name, state, position_ticks,
+                duration_ticks, is_paused
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, play_session_id) DO UPDATE SET
+                item_id = excluded.item_id,
+                media_source_id = excluded.media_source_id,
+                device_id = CASE
+                    WHEN excluded.device_id = 'unknown' THEN playback_sessions.device_id
+                    ELSE excluded.device_id END,
+                client = COALESCE(excluded.client, playback_sessions.client),
+                device_name = COALESCE(excluded.device_name, playback_sessions.device_name),
+                state = excluded.state,
+                position_ticks = MAX(playback_sessions.position_ticks, excluded.position_ticks),
+                duration_ticks = COALESCE(excluded.duration_ticks, playback_sessions.duration_ticks),
+                is_paused = excluded.is_paused,
+                last_event_at = unixepoch()",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(event.user_id)
+        .bind(event.item_id)
+        .bind(event.media_source_id)
+        .bind(event.play_session_id)
+        .bind(event.device_id)
+        .bind(event.client)
+        .bind(event.device_name)
+        .bind(event.state)
+        .bind(event.position_ticks)
+        .bind(event.duration_ticks)
+        .bind(event.is_paused)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        sqlx::query(
+            "INSERT INTO user_item_state (user_id, item_id, position_ticks, last_played_at)
+             VALUES (?, ?, ?, unixepoch())
+             ON CONFLICT(user_id, item_id) DO UPDATE SET
+                 position_ticks = MAX(user_item_state.position_ticks, excluded.position_ticks),
+                 last_played_at = CASE
+                     WHEN excluded.position_ticks > user_item_state.position_ticks
+                     THEN excluded.last_played_at ELSE user_item_state.last_played_at END,
+                 version = user_item_state.version + CASE
+                     WHEN excluded.position_ticks > user_item_state.position_ticks THEN 1 ELSE 0 END",
+        )
+        .bind(event.user_id)
+        .bind(event.item_id)
+        .bind(event.position_ticks)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_playback_sessions(
+        &self,
+        user_id: Option<&str>,
+    ) -> Result<Vec<StoredPlaybackSession>, StorageError> {
+        let (query, bind) = if user_id.is_some() {
+            (
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        device_id, client, device_name, state, position_ticks,
+                        duration_ticks, is_paused, started_at, last_event_at
+                 FROM playback_sessions
+                 WHERE user_id = ? AND state != 'STOPPED'
+                 ORDER BY last_event_at DESC, id",
+                user_id,
+            )
+        } else {
+            (
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        device_id, client, device_name, state, position_ticks,
+                        duration_ticks, is_paused, started_at, last_event_at
+                 FROM playback_sessions
+                 WHERE state != 'STOPPED'
+                 ORDER BY last_event_at DESC, id",
+                None,
+            )
+        };
+        let mut statement = sqlx::query(query);
+        if let Some(user_id) = bind {
+            statement = statement.bind(user_id);
+        }
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StoredPlaybackSession {
+                        id: row.get("id"),
+                        user_id: row.get("user_id"),
+                        item_id: row.get("item_id"),
+                        media_source_id: row.get("media_source_id"),
+                        play_session_id: row.get("play_session_id"),
+                        device_id: row.get("device_id"),
+                        client: row.get("client"),
+                        device_name: row.get("device_name"),
+                        state: row.get("state"),
+                        position_ticks: row.get("position_ticks"),
+                        duration_ticks: row.get("duration_ticks"),
+                        is_paused: row.get::<i64, _>("is_paused") != 0,
+                        started_at: row.get("started_at"),
+                        last_event_at: row.get("last_event_at"),
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn media_source_belongs_to_item(
+        &self,
+        source_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM media_sources WHERE id = ? AND item_id = ?
+            )",
+        )
+        .bind(source_id)
+        .bind(item_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn insert_library_root(
         &self,
         root: NewLibraryRoot<'_>,
@@ -2733,6 +2891,38 @@ pub(crate) struct StoredUserItemState {
     pub(crate) play_count: i64,
     pub(crate) last_played_at: Option<i64>,
     pub(crate) version: i64,
+}
+
+pub(crate) struct NewPlaybackEvent<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) item_id: &'a str,
+    pub(crate) media_source_id: Option<&'a str>,
+    pub(crate) play_session_id: &'a str,
+    pub(crate) device_id: &'a str,
+    pub(crate) client: Option<&'a str>,
+    pub(crate) device_name: Option<&'a str>,
+    pub(crate) state: &'a str,
+    pub(crate) position_ticks: i64,
+    pub(crate) duration_ticks: Option<i64>,
+    pub(crate) is_paused: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredPlaybackSession {
+    pub(crate) id: String,
+    pub(crate) user_id: String,
+    pub(crate) item_id: String,
+    pub(crate) media_source_id: Option<String>,
+    pub(crate) play_session_id: String,
+    pub(crate) device_id: String,
+    pub(crate) client: Option<String>,
+    pub(crate) device_name: Option<String>,
+    pub(crate) state: String,
+    pub(crate) position_ticks: i64,
+    pub(crate) duration_ticks: Option<i64>,
+    pub(crate) is_paused: bool,
+    pub(crate) started_at: i64,
+    pub(crate) last_event_at: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
