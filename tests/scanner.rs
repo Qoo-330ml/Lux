@@ -111,6 +111,56 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
 }
 
 #[tokio::test]
+async fn unavailable_root_does_not_mark_entries_missing_and_recovers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Safe Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    let movie_path = movie_dir.join("Safe.Movie.2020.mkv");
+    tokio::fs::write(&movie_path, b"fixture").await?;
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_movie_library(library.id).await?;
+    tokio::fs::remove_dir_all(&root).await?;
+
+    let unavailable = scanner.scan_movie_library(library.id).await?;
+    assert_eq!(unavailable.unavailable_roots, 1);
+    let state: (i64, i64) = sqlx::query_as(
+        "SELECT lr.is_available,
+                (SELECT is_missing FROM filesystem_entries LIMIT 1)
+         FROM library_roots lr WHERE lr.library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(state, (0, 0));
+
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(&movie_path, b"fixture").await?;
+    let recovered = scanner.scan_movie_library(library.id).await?;
+    assert_eq!(recovered.unavailable_roots, 0);
+    let available: i64 =
+        sqlx::query_scalar("SELECT is_available FROM library_roots WHERE library_id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(available, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

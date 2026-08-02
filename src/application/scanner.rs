@@ -46,11 +46,34 @@ impl LibraryScanner {
         let roots = self.database.list_library_roots(&library_id_text).await?;
         let mut report = ScanReport::default();
         for root in roots {
-            if !root.is_available {
+            let root_path = PathBuf::from(&root.canonical_path);
+            let root_is_available = fs::metadata(&root_path)
+                .await
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+            if !root_is_available {
+                self.database
+                    .update_library_root_availability(&root.id, false)
+                    .await?;
+                report.unavailable_roots += 1;
                 continue;
             }
-            let root_path = PathBuf::from(&root.canonical_path);
-            let files = collect_movie_files(&root_path).await?;
+            if !root.is_available {
+                self.database
+                    .update_library_root_availability(&root.id, true)
+                    .await?;
+            }
+            let files = match collect_movie_files(&root_path).await {
+                Ok(files) => files,
+                Err(ScannerError::Io { .. }) => {
+                    self.database
+                        .update_library_root_availability(&root.id, false)
+                        .await?;
+                    report.unavailable_roots += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             for path in files {
                 report.merge(
                     self.scan_movie_file(&library_id_text, &root, &root_path, &path, &generation)
@@ -497,6 +520,7 @@ pub struct ScanReport {
     pub created_sources: usize,
     pub changed_files: usize,
     pub marked_missing: usize,
+    pub unavailable_roots: usize,
     pub skipped_files: usize,
 }
 
@@ -507,6 +531,7 @@ impl ScanReport {
         self.created_sources += other.created_sources;
         self.changed_files += other.changed_files;
         self.marked_missing += other.marked_missing;
+        self.unavailable_roots += other.unavailable_roots;
         self.skipped_files += other.skipped_files;
     }
 }

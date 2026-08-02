@@ -734,6 +734,32 @@ impl Database {
         })
     }
 
+    pub(crate) async fn update_library_root_availability(
+        &self,
+        root_id: &str,
+        is_available: bool,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE library_roots
+             SET is_available = ?, last_checked_at = unixepoch(),
+                 unavailable_since = CASE
+                     WHEN ? = 1 THEN NULL
+                     ELSE COALESCE(unavailable_since, unixepoch())
+                 END
+             WHERE id = ?",
+        )
+        .bind(is_available)
+        .bind(is_available)
+        .bind(root_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_filesystem_entry(
         &self,
         library_root_id: &str,
