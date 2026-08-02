@@ -31,8 +31,11 @@ h3 { font-size: 1rem; }
 p { color: var(--muted); line-height: 1.6; }
 .field { display: grid; gap: .45rem; margin-top: 1rem; }
 .field label { color: var(--muted); font-size: .88rem; }
-.field input, .search-box { width: 100%; padding: .75rem .85rem; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: #101c1e; }
+.field input, .field select, .search-box { width: 100%; padding: .75rem .85rem; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: #101c1e; }
 .field input:focus, .search-box:focus, button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.setup-options { display: grid; gap: .25rem; margin: 1.2rem 0; padding: .85rem 1rem 1rem; border: 1px solid var(--line); border-radius: 1rem; }
+.setup-options legend { padding: 0 .45rem; color: var(--muted); font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; }
+.setup-options small { color: var(--muted); font-size: .78rem; line-height: 1.4; }
 .button { border: 1px solid var(--accent); border-radius: 8px; padding: .7rem 1rem; color: #17201f; background: var(--accent); font-weight: 700; }
 .button:hover { background: var(--accent-strong); }
 .button.secondary { color: var(--ink); background: transparent; border-color: var(--line); }

@@ -12,7 +12,7 @@ const api = {
     return body;
   },
   login(username, password) { return this.request("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }); },
-  setup(username, displayName, password) { return this.request("/api/v1/setup/complete", { method: "POST", body: JSON.stringify({ username, displayName, password }) }); },
+  setup(data) { return this.request("/api/v1/setup/complete", { method: "POST", body: JSON.stringify(data) }); },
   logout() { return this.request("/api/v1/auth/logout", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   setupStatus() { return this.request("/api/v1/setup/status"); },
   me() { return this.request("/api/v1/auth/me"); },
@@ -109,7 +109,7 @@ function renderAuth() {
 
 function renderSetup() {
   const error = state.error ? "<div class=\"notice error\" role=\"alert\">" + escapeHtml(state.error) + "</div>" : "";
-  app.innerHTML = "<div class=\"auth-layout\"><section class=\"auth-card\"><span class=\"eyebrow\">First run</span><h1 style=\"margin-top:.7rem\">开始使用 Lux</h1><p>创建第一个服务器管理员。媒体库和 TMDb 设置可以稍后在控制台完成。</p>" + error + "<form data-action=\"setup\"><div class=\"field\"><label for=\"setup-username\">管理员用户名</label><input id=\"setup-username\" name=\"username\" autocomplete=\"username\" required></div><div class=\"field\"><label for=\"setup-display-name\">显示名称</label><input id=\"setup-display-name\" name=\"displayName\" autocomplete=\"name\"></div><div class=\"field\"><label for=\"setup-password\">管理员密码</label><input id=\"setup-password\" name=\"password\" type=\"password\" autocomplete=\"new-password\" minlength=\"8\" required></div><div class=\"form-actions\"><button class=\"button\" type=\"submit\">完成初始化</button></div></form></section></div>";
+  app.innerHTML = "<div class=\"auth-layout\"><section class=\"auth-card\"><span class=\"eyebrow\">First run</span><h1 style=\"margin-top:.7rem\">开始使用 Lux</h1><p>先创建服务器管理员。TMDb 和首个媒体库都可以跳过，之后在管理控制台配置。</p>" + error + "<form data-action=\"setup\"><div class=\"field\"><label for=\"setup-username\">管理员用户名</label><input id=\"setup-username\" name=\"username\" autocomplete=\"username\" required></div><div class=\"field\"><label for=\"setup-display-name\">显示名称</label><input id=\"setup-display-name\" name=\"displayName\" autocomplete=\"name\"></div><div class=\"field\"><label for=\"setup-password\">管理员密码</label><input id=\"setup-password\" name=\"password\" type=\"password\" autocomplete=\"new-password\" minlength=\"8\" required></div><fieldset class=\"setup-options\"><legend>可选设置</legend><div class=\"field\"><label for=\"setup-tmdb-token\">TMDb Read Access Token</label><input id=\"setup-tmdb-token\" name=\"tmdbToken\" type=\"password\" autocomplete=\"off\" placeholder=\"可跳过\"><small>仅保存在服务端配置目录，不会返回给普通用户。</small></div><div class=\"field\"><label for=\"setup-library-name\">首个媒体库名称</label><input id=\"setup-library-name\" name=\"libraryName\" placeholder=\"可跳过\"></div><div class=\"field\"><label for=\"setup-library-kind\">媒体库类型</label><select id=\"setup-library-kind\" name=\"libraryKind\"><option value=\"MIXED\">混合</option><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option></select></div><div class=\"field\"><label for=\"setup-library-root\">媒体库根路径</label><input id=\"setup-library-root\" name=\"libraryRoot\" placeholder=\"可跳过，例如 /media\"><small>填写后服务端会检查目录是否存在且可读。</small></div></fieldset><div class=\"form-actions\"><button class=\"button\" type=\"submit\">完成初始化</button></div></form></section></div>";
   bind();
 }
 
@@ -323,7 +323,12 @@ function bind() {
     event.preventDefault();
     const button = form.querySelector("button"); button.disabled = true;
     try {
-      await api.setup(field(form, "username").value, field(form, "displayName").value, field(form, "password").value);
+      const data = { username: field(form, "username").value, displayName: field(form, "displayName").value, password: field(form, "password").value };
+      const tmdbToken = field(form, "tmdbToken").value.trim();
+      const libraryName = field(form, "libraryName").value.trim();
+      if (tmdbToken) data.tmdbToken = tmdbToken;
+      if (libraryName) data.firstLibrary = { name: libraryName, kind: field(form, "libraryKind").value, rootPath: field(form, "libraryRoot").value.trim() || undefined };
+      await api.setup(data);
       state.initialized = true; state.error = ""; state.setupNotice = "初始化完成，请使用刚创建的管理员登录。"; render();
     } catch (error) { state.error = error.message; render(); }
   }));

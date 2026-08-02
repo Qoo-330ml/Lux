@@ -92,6 +92,89 @@ async fn setup_can_create_one_admin_and_then_closes() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_can_store_tmdb_token_and_create_first_library()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let media_dir = temp_dir.path().join("Movies");
+    tokio::fs::create_dir(&media_dir).await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let (base_url, server) = test_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let complete = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Administrator",
+            "password": "correct horse battery staple",
+            "tmdbToken": "tmdb-secret-for-test",
+            "firstLibrary": {
+                "name": "Movies",
+                "kind": "MOVIE",
+                "rootPath": media_dir
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(complete.status(), reqwest::StatusCode::CREATED);
+    let body: serde_json::Value = complete.json().await?;
+    assert_eq!(body["initialized"], true);
+    assert_eq!(body["tmdbConfigured"], true);
+    assert_eq!(body["library"]["name"], "Movies");
+    assert!(body.get("tmdbToken").is_none());
+
+    let token_path = config_dir.join("tmdb_read_access_token");
+    assert_eq!(
+        tokio::fs::read_to_string(&token_path).await?,
+        "tmdb-secret-for-test\n"
+    );
+    assert_eq!(
+        tokio::fs::metadata(token_path).await?.permissions().mode() & 0o777,
+        0o600
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_can_skip_tmdb_and_first_library() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let (base_url, server) = test_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let complete = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Administrator",
+            "password": "correct horse battery staple"
+        }))
+        .send()
+        .await?;
+    assert_eq!(complete.status(), reqwest::StatusCode::CREATED);
+    let body: serde_json::Value = complete.json().await?;
+    assert_eq!(body["tmdbConfigured"], false);
+    assert!(body.get("library").is_none());
+    assert!(!config_dir.join("tmdb_read_access_token").exists());
+
+    server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn concurrent_setup_requests_only_allow_one_admin() -> Result<(), Box<dyn std::error::Error>>
 {

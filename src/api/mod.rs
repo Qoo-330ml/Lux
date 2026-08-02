@@ -40,6 +40,7 @@ use crate::{
         images::{ImageError, ImageService, ImageWriteService, normalize_image_type},
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         scanner::{ScanJobError, ScanJobService},
+        settings::{read_tmdb_token, write_tmdb_token},
         tmdb::TmdbClient,
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
@@ -88,7 +89,7 @@ impl AppState {
         let metadata_selection = ImageWriteService::new(database.clone())
             .ok()
             .map(|images| MetadataSelectionService::new(database.clone(), images));
-        let collections = TmdbClient::from_env()
+        let collections = TmdbClient::from_env_or_token(read_tmdb_token(&config.config_dir))
             .ok()
             .map(|tmdb| CollectionService::new(database.clone(), tmdb));
         Self {
@@ -1895,36 +1896,157 @@ struct SetupCompleteRequest {
     #[serde(default)]
     display_name: String,
     password: String,
+    #[serde(default)]
+    tmdb_token: Option<String>,
+    #[serde(default)]
+    first_library: Option<SetupFirstLibraryRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupFirstLibraryRequest {
+    name: String,
+    #[serde(default = "default_setup_library_kind")]
+    kind: String,
+    #[serde(default)]
+    realtime_watch_enabled: bool,
+    #[serde(default)]
+    root_path: Option<String>,
+}
+
+fn default_setup_library_kind() -> String {
+    "MIXED".to_owned()
 }
 
 async fn setup_complete(
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(request): Json<SetupCompleteRequest>,
-) -> (StatusCode, Json<Value>) {
+) -> Response {
     let Some(setup) = state.setup else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
             "服务尚未就绪",
-        );
+        )
+        .into_response();
+    };
+
+    let tmdb_token = request
+        .tmdb_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned);
+    if tmdb_token
+        .as_ref()
+        .is_some_and(|token| token.chars().count() > 4096)
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "TMDb token 无效",
+        )
+        .into_response();
+    }
+    let setup_kind = match request
+        .first_library
+        .as_ref()
+        .map(|library| library.kind.parse::<LibraryKind>())
+        .transpose()
+    {
+        Ok(kind) => kind,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库类型无效",
+            )
+            .into_response();
+        }
     };
 
     match setup
         .complete(&request.username, &request.display_name, &request.password)
         .await
     {
-        Ok(user) => (
-            StatusCode::CREATED,
-            Json(json!({ "initialized": true, "user": user_json(&user) })),
-        ),
+        Ok(user) => {
+            let mut library_json_value = None;
+            if let (Some(first_library), Some(kind), Some(libraries)) =
+                (request.first_library, setup_kind, state.libraries.as_ref())
+            {
+                let library = match libraries
+                    .create_library(
+                        &first_library.name,
+                        kind,
+                        first_library.realtime_watch_enabled,
+                    )
+                    .await
+                {
+                    Ok(library) => library,
+                    Err(error) => return library_error(&headers, error),
+                };
+                let mut roots = Vec::new();
+                let mut warnings = Vec::new();
+                if let Some(root_path) = first_library.root_path {
+                    match libraries.add_root(library.id, &root_path).await {
+                        Ok(result) => {
+                            roots.push(result.root);
+                            warnings = result
+                                .warnings
+                                .iter()
+                                .map(|warning| warning.as_str())
+                                .collect::<Vec<_>>();
+                        }
+                        Err(error) => return library_error(&headers, error),
+                    }
+                }
+                library_json_value = Some(json!({
+                    "library": library_json(&library, &roots),
+                    "warnings": warnings,
+                }));
+            }
+            if let Some(token) = tmdb_token.as_deref() {
+                if write_tmdb_token(
+                    state
+                        .config_dir
+                        .as_deref()
+                        .unwrap_or_else(|| FsPath::new("./config")),
+                    token,
+                )
+                .await
+                .is_err()
+                {
+                    return api_error(
+                        &headers,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        lux::ApiErrorCode::DatabaseUnavailable,
+                        "TMDb 配置保存失败",
+                    )
+                    .into_response();
+                }
+            }
+            let mut response = json!({
+                "initialized": true,
+                "user": user_json(&user),
+                "tmdbConfigured": tmdb_token.is_some(),
+            });
+            if let Some(library) = library_json_value {
+                response["library"] = library["library"].clone();
+                response["warnings"] = library["warnings"].clone();
+            }
+            (StatusCode::CREATED, Json(response)).into_response()
+        }
         Err(SetupError::AlreadyCompleted) => api_error(
             &headers,
             StatusCode::CONFLICT,
             lux::ApiErrorCode::SetupAlreadyCompleted,
             "初始化已完成",
-        ),
+        )
+        .into_response(),
         Err(SetupError::UserStore(
             UserStoreError::InvalidUsername | UserStoreError::Password(_),
         )) => api_error(
@@ -1932,13 +2054,15 @@ async fn setup_complete(
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "用户名或密码无效",
-        ),
+        )
+        .into_response(),
         Err(SetupError::UserStore(_)) => api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
             "初始化暂时不可用",
-        ),
+        )
+        .into_response(),
     }
 }
 

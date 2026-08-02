@@ -94,9 +94,17 @@ impl TmdbClient {
     }
 
     pub fn from_env() -> Result<Self, TmdbError> {
+        Self::from_env_or_token(None)
+    }
+
+    pub fn from_env_or_token(fallback_token: Option<String>) -> Result<Self, TmdbError> {
+        let read_access_token = env::var("LUX_TMDB_READ_ACCESS_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+            .or(fallback_token);
         let config = TmdbClientConfig {
             base_url: env::var("LUX_TMDB_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned()),
-            read_access_token: env::var("LUX_TMDB_READ_ACCESS_TOKEN").ok(),
+            read_access_token,
             ..TmdbClientConfig::default()
         };
         Self::new(config)

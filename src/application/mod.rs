@@ -10,6 +10,7 @@ pub mod nfo;
 pub mod playback;
 pub mod probe;
 pub mod scanner;
+pub mod settings;
 pub mod setup;
 pub mod tmdb;
 pub mod watch;
