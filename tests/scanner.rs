@@ -161,6 +161,64 @@ async fn unavailable_root_does_not_mark_entries_missing_and_recovers()
 }
 
 #[tokio::test]
+async fn scanner_can_process_one_directory_without_marking_other_entries_missing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let first_directory = root.join("First");
+    let second_directory = root.join("Second");
+    tokio::fs::create_dir_all(&first_directory).await?;
+    tokio::fs::create_dir_all(&second_directory).await?;
+    tokio::fs::write(first_directory.join("First.Movie.2020.mkv"), b"first").await?;
+    tokio::fs::write(second_directory.join("Second.Movie.2021.mkv"), b"second").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_movie_library(library.id).await?;
+
+    tokio::fs::write(first_directory.join("Added.Movie.2022.mkv"), b"added").await?;
+    let incremental = scanner
+        .scan_movie_directory(library.id, &first_directory)
+        .await?;
+    assert_eq!(incremental.discovered_files, 2);
+    assert_eq!(incremental.created_items, 1);
+    assert_eq!(incremental.created_sources, 1);
+    assert_eq!(incremental.skipped_files, 1);
+    assert_eq!(incremental.marked_missing, 0);
+
+    let second_missing: i64 = sqlx::query_scalar(
+        "SELECT is_missing FROM filesystem_entries
+         WHERE relative_path LIKE 'Second/%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(second_missing, 0);
+
+    let outside = temp_dir.path().join("Outside");
+    tokio::fs::create_dir(&outside).await?;
+    let outside_error = scanner
+        .scan_movie_directory(library.id, &outside)
+        .await
+        .expect_err("directory outside the library root");
+    assert!(matches!(
+        outside_error,
+        luxd::application::scanner::ScannerError::InvalidRelativePath(_)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

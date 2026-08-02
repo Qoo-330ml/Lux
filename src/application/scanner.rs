@@ -90,6 +90,64 @@ impl LibraryScanner {
         Ok(report)
     }
 
+    pub async fn scan_movie_directory(
+        &self,
+        library_id: LibraryId,
+        directory: &Path,
+    ) -> Result<ScanReport, ScannerError> {
+        let library_id_text = library_id.to_string();
+        if self
+            .database
+            .find_library(&library_id_text)
+            .await?
+            .is_none()
+        {
+            return Err(ScannerError::LibraryNotFound);
+        }
+
+        let canonical_directory =
+            fs::canonicalize(directory)
+                .await
+                .map_err(|source| ScannerError::Io {
+                    path: directory.to_owned(),
+                    source,
+                })?;
+        let roots = self.database.list_library_roots(&library_id_text).await?;
+        let root = roots
+            .into_iter()
+            .filter(|root| canonical_directory.starts_with(&root.canonical_path))
+            .max_by_key(|root| root.canonical_path.len())
+            .ok_or_else(|| {
+                ScannerError::InvalidRelativePath(format!(
+                    "directory is outside library roots: {}",
+                    canonical_directory.display()
+                ))
+            })?;
+        if !root.is_available {
+            return Ok(ScanReport {
+                unavailable_roots: 1,
+                ..ScanReport::default()
+            });
+        }
+
+        let generation = Uuid::now_v7().to_string();
+        let files = collect_movie_files(&canonical_directory).await?;
+        let mut report = ScanReport::default();
+        for path in files {
+            report.merge(
+                self.scan_movie_file(
+                    &library_id_text,
+                    &root,
+                    Path::new(&root.canonical_path),
+                    &path,
+                    &generation,
+                )
+                .await?,
+            );
+        }
+        Ok(report)
+    }
+
     pub(crate) async fn scan_movie_file(
         &self,
         library_id_text: &str,
