@@ -8,6 +8,7 @@ const username = process.env.LUX_E2E_USERNAME || "viewer";
 const password = process.env.LUX_E2E_PASSWORD;
 const libraryName = process.env.LUX_E2E_LIBRARY || "";
 const itemId = process.env.LUX_E2E_ITEM || "";
+const unsupportedItemId = process.env.LUX_E2E_UNSUPPORTED_ITEM || "";
 if (!password) throw new Error("LUX_E2E_PASSWORD is required");
 
 const browser = await chromium.launch({
@@ -74,10 +75,20 @@ const accessibilityIssues = await page.evaluate(() => {
 await page.locator("[data-route='account']").first().click();
 await page.getByRole("heading", { name: "账户与会话", exact: true }).waitFor();
 const accountVisible = await page.getByRole("heading", { name: "账户与会话", exact: true }).isVisible();
+let unsupportedCodecErrorVisible = false;
+if (unsupportedItemId) {
+  await page.locator("[data-route='home']").first().click();
+  await page.locator("[data-library]").first().click();
+  await page.locator(`[data-item="${unsupportedItemId}"]`).click();
+  await page.locator("[data-player]").waitFor({ state: "visible" });
+  await page.waitForFunction(() => document.querySelector("[data-player-status]")?.textContent.includes("浏览器无法播放"));
+  unsupportedCodecErrorVisible = true;
+}
 
 const result = {
   ordinaryUserNoAdmin,
   accountVisible,
+  unsupportedCodecErrorVisible,
   playerMetadataReady,
   streamResponses,
   favoriteStatus,
@@ -90,4 +101,4 @@ const result = {
 };
 console.log(JSON.stringify(result, null, 2));
 await browser.close();
-if (!ordinaryUserNoAdmin || !accountVisible || !playerMetadataReady || streamResponses.every((response) => response.status !== 206) || ![200, 204].includes(favoriteStatus) || viewportChecks.some((check) => !check.noHorizontalOverflow) || accessibilityIssues.length || consoleErrors.length || pageErrors.length || result.failedRequests.length) process.exitCode = 1;
+if (!ordinaryUserNoAdmin || !accountVisible || (unsupportedItemId && !unsupportedCodecErrorVisible) || !playerMetadataReady || streamResponses.every((response) => response.status !== 206) || ![200, 204].includes(favoriteStatus) || viewportChecks.some((check) => !check.noHorizontalOverflow) || accessibilityIssues.length || consoleErrors.length || pageErrors.length || result.failedRequests.length) process.exitCode = 1;

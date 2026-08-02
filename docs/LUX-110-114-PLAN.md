@@ -15,7 +15,7 @@
 
 - [ ] 剧集季度/单集、合集详情和更完整的 UserData 操作。
 - [x] 不支持浏览器编码时显示明确错误提示。
-- [ ] 可播放/不可播放编码 fixture 的自动化验证。
+- [x] `scripts/browser-smoke.mjs` 支持可播放 MP4 和随机不可播放 `.mp4` fixture；ARM64 Chrome smoke 已验证 `video.error` 明确提示。
 - [x] `scripts/browser-smoke.mjs` 固化登录、普通用户无管理入口、直放 metadata、收藏写回、390/768/1440 viewport 横向溢出和基础语义可访问性扫描。
 
 脚本运行示例：
