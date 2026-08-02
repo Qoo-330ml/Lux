@@ -179,6 +179,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/items/{item_id}/playback", get(lux_get_playback))
         .route("/api/v1/items/{item_id}/progress", post(lux_post_progress))
         .route("/api/v1/items/{item_id}/favorite", put(lux_set_favorite))
+        .route(
+            "/api/v1/items/{item_id}/download",
+            get(lux_download).head(lux_download),
+        )
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
@@ -256,6 +260,10 @@ fn emby_routes() -> Router<AppState> {
         .route(
             "/Items/{item_id}/PlaybackInfo",
             get(emby_playback_info).post(emby_playback_info),
+        )
+        .route(
+            "/Items/{item_id}/Download",
+            get(emby_download).head(emby_download),
         )
         .route("/Sessions", get(emby_sessions))
         .route("/Sessions/Playing", post(emby_playing))
@@ -2455,6 +2463,34 @@ async fn lux_stream(
     .await
 }
 
+async fn lux_download(
+    headers: HeaderMap,
+    method: Method,
+    Path(item_id): Path<String>,
+    Query(query): Query<LuxStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if !user.can_download {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut response = serve_media_file(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &headers,
+        &method,
+        &item_id,
+        query.source_id.as_deref(),
+        None,
+    )
+    .await;
+    add_download_header(&mut response);
+    response
+}
+
 async fn emby_image(
     headers: HeaderMap,
     method: Method,
@@ -2660,6 +2696,43 @@ async fn emby_stream_with_source_and_container(
         Some(&container),
     )
     .await
+}
+
+async fn emby_download(
+    headers: HeaderMap,
+    method: Method,
+    Path(item_id): Path<String>,
+    Query(query): Query<EmbyStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_download {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut response = serve_media_file(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &headers,
+        &method,
+        &item_id,
+        query.media_source_id.as_deref(),
+        None,
+    )
+    .await;
+    add_download_header(&mut response);
+    response
+}
+
+fn add_download_header(response: &mut Response) {
+    if response.status().is_success() {
+        response.headers_mut().insert(
+            "Content-Disposition",
+            HeaderValue::from_static("attachment"),
+        );
+    }
 }
 
 async fn serve_media_file(
