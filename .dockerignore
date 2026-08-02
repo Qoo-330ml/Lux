@@ -1,0 +1,14 @@
+.git
+.github
+.codex
+target
+web/node_modules
+media
+config
+*.db
+*.sqlite
+*.sqlite3
+docs
+tests
+tools
+Lux-开发规格与分步实施计划.md
