@@ -52,6 +52,23 @@ Emby access token 与 Web session 完全分离。access token 是高熵随机值
 
 上述接口是 LUX-021/LUX-022 的基础能力。媒体库、Emby 兼容、用户管理和进度接口按开发规格后续任务逐项增加；未实现端点不应被客户端兼容性声明引用。
 
+## 电影查询（LUX-034）
+
+Lux 电影查询要求有效 Web session：
+
+- `GET /api/v1/libraries`：返回已启用媒体库的基本信息，不暴露服务器路径。
+- `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回电影。
+- `GET /api/v1/items/{itemId}`：返回电影详情、媒体源和已探测轨道。
+
+Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
+
+- `GET /Users/{userId}/Views`：返回电影媒体库视图。
+- `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`StartIndex`、`Limit` 和 `IncludeItemTypes=Movie`，默认从 0 开始、每页 50 条，单页上限 100。
+- `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影详情 DTO。
+- `GET /Users/{userId}/Items/Resume`：当前返回空的继续观看列表。
+
+媒体 DTO 只返回客户端所需的标题、年份、简介、时长、容器、大小、码率和轨道信息，不返回服务器内部文件路径。图片内容端点属于 LUX-035。
+
 ## Emby 连接探针（LUX-023）
 
 以下端点同时接受根路径和 `/emby` 前缀：

@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod libraries;
 pub mod metadata;
 pub mod probe;

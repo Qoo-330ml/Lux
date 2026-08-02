@@ -19,8 +19,11 @@ use tower_http::{ServiceBuilderExt, request_id::MakeRequestUuid, trace::TraceLay
 
 use crate::{
     COMMIT, VERSION,
-    application::libraries::{LibraryService, LibraryServiceError},
     application::setup::{SetupError, SetupService},
+    application::{
+        catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
+        libraries::{LibraryService, LibraryServiceError},
+    },
     auth::users::{UserRecord, UserStoreError},
     auth::{
         emby::{EmbyAuthService, EmbyDeviceInfo},
@@ -40,6 +43,7 @@ pub struct AppState {
     auth: Option<WebAuthService>,
     emby_auth: Option<EmbyAuthService>,
     libraries: Option<LibraryService>,
+    catalog: Option<CatalogService>,
 }
 
 impl AppState {
@@ -59,6 +63,7 @@ impl AppState {
             auth: Some(auth),
             emby_auth: Some(emby_auth),
             libraries: Some(LibraryService::new(database.clone())),
+            catalog: Some(CatalogService::new(database)),
         }
     }
 }
@@ -85,6 +90,12 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/libraries/{library_id}/roots",
             post(admin_add_library_root),
         )
+        .route("/api/v1/libraries", get(lux_list_libraries))
+        .route(
+            "/api/v1/libraries/{library_id}/items",
+            get(lux_list_library_items),
+        )
+        .route("/api/v1/items/{item_id}", get(lux_get_item))
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
@@ -116,6 +127,12 @@ fn emby_routes() -> Router<AppState> {
         .route("/System/Ping", get(emby_ping).post(emby_ping))
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
+        .route("/Users/{user_id}/Views", get(emby_user_views))
+        .route("/Users/{user_id}/Items/Resume", get(emby_user_resume))
+        .route("/Users/{user_id}/Items", get(emby_user_items))
+        .route("/Users/{user_id}/Items/{item_id}", get(emby_user_item))
+        .route("/Items", get(emby_items))
+        .route("/Items/{item_id}", get(emby_item))
         .route("/Sessions/Logout", post(emby_logout))
 }
 
@@ -236,17 +253,41 @@ async fn require_emby_token(
     query: &EmbyTokenQuery,
     auth: &EmbyAuthService,
 ) -> Result<(), StatusCode> {
+    resolve_emby_user_with_auth(headers, query, auth)
+        .await
+        .map(|_| ())
+}
+
+async fn resolve_emby_user_with_auth(
+    headers: &HeaderMap,
+    query: &EmbyTokenQuery,
+    auth: &EmbyAuthService,
+) -> Result<UserRecord, StatusCode> {
     let token = headers
         .get("X-Emby-Token")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    match auth.verify_token(&token).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(StatusCode::UNAUTHORIZED),
+    match auth.resolve_token(&token).await {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => Err(StatusCode::UNAUTHORIZED),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+async fn require_emby_user(
+    headers: &HeaderMap,
+    state: &AppState,
+    api_key: Option<&str>,
+) -> Result<UserRecord, StatusCode> {
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let query = EmbyTokenQuery {
+        api_key: api_key.map(str::to_owned),
+    };
+    resolve_emby_user_with_auth(headers, &query, auth).await
 }
 
 async fn emby_logout(
@@ -268,6 +309,299 @@ async fn emby_logout(
     match auth.logout(&token).await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct EmbyItemsQuery {
+    #[serde(rename = "api_key", default)]
+    api_key: Option<String>,
+    #[serde(rename = "UserId", default)]
+    user_id: Option<String>,
+    #[serde(rename = "ParentId", default)]
+    parent_id: Option<String>,
+    #[serde(rename = "IncludeItemTypes", default)]
+    include_item_types: Option<String>,
+    #[serde(rename = "StartIndex", default)]
+    start_index: Option<i64>,
+    #[serde(rename = "Limit", default)]
+    limit: Option<i64>,
+}
+
+async fn emby_user_views(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match libraries.list_libraries().await {
+        Ok(views) => Json(json!({
+            "Items": views
+                .iter()
+                .filter(|view| view.library.is_enabled)
+                .map(|view| emby_library_view_json(&view.library, &state.server_id))
+                .collect::<Vec<_>>(),
+            "TotalRecordCount": views.iter().filter(|view| view.library.is_enabled).count(),
+            "StartIndex": 0,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_user_resume(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    Json(json!({
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": 0,
+    }))
+    .into_response()
+}
+
+async fn emby_user_items(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    emby_list_items(&headers, &state, &query).await
+}
+
+async fn emby_items(
+    headers: HeaderMap,
+    Query(query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Some(user_id) = query.user_id.as_deref()
+        && let Err(status) = ensure_emby_user_scope(&user, user_id)
+    {
+        return status.into_response();
+    }
+    emby_list_items(&headers, &state, &query).await
+}
+
+async fn emby_list_items(
+    _headers: &HeaderMap,
+    state: &AppState,
+    query: &EmbyItemsQuery,
+) -> Response {
+    if !query.include_item_types.as_deref().is_none_or(|types| {
+        types
+            .split(',')
+            .any(|item_type| item_type.eq_ignore_ascii_case("Movie"))
+    }) {
+        return Json(json!({
+            "Items": [],
+            "TotalRecordCount": 0,
+            "StartIndex": 0,
+        }))
+        .into_response();
+    }
+    let (offset, limit) = match emby_page_params(query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let page = match query.parent_id.as_deref() {
+        Some(parent_id) => {
+            let Ok(parent_id) = parent_id.parse::<crate::domain::ids::LibraryId>() else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            catalog
+                .list_library_items(&parent_id.to_string(), offset, limit)
+                .await
+        }
+        None => catalog.list_all_items(offset, limit).await,
+    };
+    match page {
+        Ok(page) => Json(emby_catalog_page_json(&page, &state.server_id)).into_response(),
+        Err(CatalogError::LibraryNotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_item(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let _user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    emby_item_response(&state, &item_id).await
+}
+
+async fn emby_user_item(
+    headers: HeaderMap,
+    Path((user_id, item_id)): Path<(String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    emby_item_response(&state, &item_id).await
+}
+
+async fn emby_item_response(state: &AppState, item_id: &str) -> Response {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog.find_item(item_id).await {
+        Ok(Some(item)) => Json(emby_catalog_item_json(&item, &state.server_id)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound) => unreachable!("item lookup has no library lookup"),
+    }
+}
+
+fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
+    let offset = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50);
+    if offset < 0 || !(1..=100).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((offset, limit))
+}
+
+fn ensure_emby_user_scope(user: &UserRecord, requested_id: &str) -> Result<(), StatusCode> {
+    let requested_id = requested_id
+        .parse::<crate::domain::ids::UserId>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if user.is_admin || user.id == requested_id {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+fn emby_catalog_page_json(page: &CatalogPage, server_id: &str) -> Value {
+    json!({
+        "Items": page.items.iter().map(|item| emby_catalog_item_json(item, server_id)).collect::<Vec<_>>(),
+        "TotalRecordCount": page.total,
+        "StartIndex": page.offset,
+    })
+}
+
+fn emby_catalog_item_json(item: &CatalogItem, server_id: &str) -> Value {
+    let default_source = item
+        .media_sources
+        .iter()
+        .find(|source| source.is_default)
+        .or_else(|| item.media_sources.first());
+    let runtime_ticks = item
+        .runtime_ticks
+        .or_else(|| default_source.and_then(|source| source.duration_ticks));
+    json!({
+        "Name": item.title,
+        "OriginalTitle": item.original_title,
+        "Id": item.id,
+        "ServerId": server_id,
+        "Type": emby_item_type(&item.item_type),
+        "MediaType": "Video",
+        "IsFolder": false,
+        "ProductionYear": item.production_year,
+        "Overview": item.overview,
+        "RunTimeTicks": runtime_ticks,
+        "Container": default_source.and_then(|source| source.container.clone()),
+        "Size": default_source.and_then(|source| source.size),
+        "Bitrate": default_source.and_then(|source| source.bitrate),
+        "MediaSources": item.media_sources.iter().map(emby_media_source_json).collect::<Vec<_>>(),
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "UserData": {"PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false},
+    })
+}
+
+fn emby_media_source_json(source: &crate::application::catalog::CatalogSource) -> Value {
+    json!({
+        "Id": source.id,
+        "Container": source.container,
+        "Size": source.size,
+        "Bitrate": source.bitrate,
+        "RunTimeTicks": source.duration_ticks,
+        "Protocol": "File",
+        "Type": "Default",
+        "IsRemote": false,
+        "MediaStreams": source.streams.iter().map(|stream| json!({
+            "Index": stream.index,
+            "Type": emby_stream_type(&stream.stream_type),
+            "Codec": stream.codec,
+            "Language": stream.language,
+            "DisplayTitle": stream.title,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn emby_library_view_json(library: &LibraryRecord, server_id: &str) -> Value {
+    json!({
+        "Name": library.name,
+        "Id": library.id,
+        "ServerId": server_id,
+        "Type": "CollectionFolder",
+        "IsFolder": true,
+        "CollectionType": "movies",
+        "ImageTags": {},
+    })
+}
+
+fn emby_item_type(item_type: &str) -> &'static str {
+    match item_type {
+        "MOVIE" => "Movie",
+        "SERIES" => "Series",
+        "SEASON" => "Season",
+        "EPISODE" => "Episode",
+        _ => "Folder",
+    }
+}
+
+fn emby_stream_type(stream_type: &str) -> &'static str {
+    match stream_type {
+        "VIDEO" => "Video",
+        "AUDIO" => "Audio",
+        "SUBTITLE" => "Subtitle",
+        _ => "Unknown",
     }
 }
 
@@ -603,6 +937,236 @@ async fn auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Respo
         response_headers.append(SET_COOKIE, cookie);
     }
     (StatusCode::NO_CONTENT, response_headers).into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct LuxPageQuery {
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(rename = "pageSize", default)]
+    page_size: Option<i64>,
+}
+
+async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserRecord, Response> {
+    let Some(auth) = state.auth.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response());
+    };
+    let Some(session_token) = request_cookie(headers, "lux_session") else {
+        return Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要登录",
+        )
+        .into_response());
+    };
+    match auth.resolve(&session_token).await {
+        Ok(Some(session)) => Ok(session.user),
+        Ok(None) => Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要登录",
+        )
+        .into_response()),
+        Err(_) => Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "认证暂时不可用",
+        )
+        .into_response()),
+    }
+}
+
+async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_web_user(&headers, &state).await {
+        return response;
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match libraries.list_libraries().await {
+        Ok(views) => Json(json!({
+            "libraries": views
+                .iter()
+                .filter(|view| view.library.is_enabled)
+                .map(|view| json!({
+                    "id": view.library.id.to_string(),
+                    "name": view.library.name,
+                    "kind": view.library.kind.as_str(),
+                }))
+                .collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => library_error(&headers, error),
+    }
+}
+
+async fn lux_list_library_items(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_web_user(&headers, &state).await {
+        return response;
+    }
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id.to_string(),
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match catalog.list_library_items(&library_id, offset, limit).await {
+        Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
+        Err(CatalogError::LibraryNotFound) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在",
+        )
+        .into_response(),
+        Err(CatalogError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+async fn lux_get_item(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_web_user(&headers, &state).await {
+        return response;
+    }
+    let Some(catalog) = state.catalog.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match catalog.find_item(&item_id).await {
+        Ok(Some(item)) => Json(lux_catalog_item_json(&item)).into_response(),
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
+        Err(CatalogError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+        Err(CatalogError::LibraryNotFound) => unreachable!("item lookup has no library lookup"),
+    }
+}
+
+fn lux_page_params(query: &LuxPageQuery) -> Result<(i64, i64), &'static str> {
+    let page = query.page.unwrap_or(1);
+    let page_size = query.page_size.unwrap_or(50);
+    if page < 1 || !(1..=100).contains(&page_size) {
+        return Err("分页参数无效");
+    }
+    let offset = (page - 1)
+        .checked_mul(page_size)
+        .ok_or("分页参数超出范围")?;
+    Ok((offset, page_size))
+}
+
+fn lux_catalog_page_json(page: &CatalogPage) -> Value {
+    json!({
+        "items": page.items.iter().map(lux_catalog_item_json).collect::<Vec<_>>(),
+        "total": page.total,
+        "page": page.offset / page.limit + 1,
+        "pageSize": page.limit,
+    })
+}
+
+fn lux_catalog_item_json(item: &CatalogItem) -> Value {
+    json!({
+        "id": item.id,
+        "libraryId": item.library_id,
+        "itemType": item.item_type,
+        "title": item.title,
+        "sortTitle": item.sort_title,
+        "originalTitle": item.original_title,
+        "overview": item.overview,
+        "productionYear": item.production_year,
+        "runtimeTicks": item.runtime_ticks,
+        "mediaSources": item.media_sources.iter().map(lux_catalog_source_json).collect::<Vec<_>>(),
+    })
+}
+
+fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) -> Value {
+    json!({
+        "id": source.id,
+        "sourceKind": source.source_kind,
+        "container": source.container,
+        "size": source.size,
+        "bitrate": source.bitrate,
+        "durationTicks": source.duration_ticks,
+        "isDefault": source.is_default,
+        "probeStatus": source.probe_status,
+        "streams": source.streams.iter().map(|stream| json!({
+            "index": stream.index,
+            "type": stream.stream_type,
+            "codec": stream.codec,
+            "language": stream.language,
+            "title": stream.title,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Deserialize)]

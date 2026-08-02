@@ -134,7 +134,7 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
     )?;
     let service = MediaProbeService::new(
         database.clone(),
-        FfprobeRunner::new(script, Duration::from_secs(1)),
+        FfprobeRunner::new(script, Duration::from_secs(5)),
     );
 
     let first = service.probe_movie_library(library.id).await?;

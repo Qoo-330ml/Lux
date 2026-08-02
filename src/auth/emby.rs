@@ -74,6 +74,20 @@ impl EmbyAuthService {
             .has_valid_access_token(&hash_token(token))
             .await?)
     }
+
+    pub async fn resolve_token(&self, token: &str) -> Result<Option<UserRecord>, EmbyAuthError> {
+        let Some(stored) = self
+            .database
+            .find_user_by_access_token(&hash_token(token))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if stored.is_disabled {
+            return Ok(None);
+        }
+        user_record(stored).map(Some)
+    }
 }
 
 fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, EmbyAuthError> {
