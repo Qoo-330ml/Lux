@@ -166,6 +166,48 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
         .await?;
     assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
 
+    sqlx::query("UPDATE item_images SET local_path = ? WHERE id = ?")
+        .bind(
+            movie_dir
+                .join("poster.jpg")
+                .to_str()
+                .ok_or("non-utf8 path")?,
+        )
+        .bind(&image_id)
+        .execute(database.pool())
+        .await?;
+    let admin_images = client
+        .get(format!("{base_url}/api/v1/admin/items/{item_id}/images"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(admin_images.status(), reqwest::StatusCode::OK);
+    let admin_images_body = admin_images.json::<Value>().await?;
+    assert_eq!(
+        admin_images_body["images"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(admin_images_body["images"][0]["imageType"], "POSTER");
+    let deleted = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/items/{item_id}/images/{image_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header(
+            "x-csrf-token",
+            cookie_value(web_login.headers(), "lux_csrf"),
+        )
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(!movie_dir.join("poster.jpg").exists());
+    let after_delete = client
+        .get(format!("{base_url}/api/v1/items/{item_id}/images/poster"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(after_delete.status(), reqwest::StatusCode::NOT_FOUND);
+
     server.abort();
     assert_eq!(admin.display_name, "Admin");
     Ok(())

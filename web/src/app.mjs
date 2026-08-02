@@ -1,7 +1,7 @@
 import { requestOptions } from "./request-options.mjs";
 
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, playback: null, children: null, error: "", notice: "", setupNotice: "" };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, itemImages: [], playback: null, children: null, error: "", notice: "", setupNotice: "" };
 
 const api = {
   async request(path, options = {}) {
@@ -44,6 +44,8 @@ const api = {
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
   pendingMetadata() { return this.request("/api/v1/admin/metadata/pending?page=1&pageSize=50"); },
   selectCandidate(itemId, candidateId, mode) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates/" + encodeURIComponent(candidateId) + "/select", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ mode }) }); },
+  adminImages(itemId) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/images"); },
+  deleteAdminImage(itemId, imageId) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/images/" + encodeURIComponent(imageId), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   ready() { return fetch("/health/ready", { credentials: "same-origin" }).then((response) => response.json()); },
   progress(id, positionTicks, durationTicks) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/progress", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ positionTicks, durationTicks }) }); },
 };
@@ -137,9 +139,10 @@ async function loadRoute() {
       view.innerHTML = renderGrid(result.items || [], "搜索“" + escapeHtml(state.query) + "”");
     } else if (state.route === "item") {
       state.item = await api.item(state.itemId);
+      state.itemImages = state.user?.canManageServer ? ((await api.adminImages(state.itemId)).images || []) : [];
       state.playback = await api.playback(state.itemId);
       state.children = ["SERIES", "BOX_SET"].includes(state.item.itemType) ? await api.children(state.itemId) : null;
-      view.innerHTML = renderDetail(state.item, state.playback, state.children);
+      view.innerHTML = renderDetail(state.item, state.playback, state.children, state.itemImages);
     } else if (state.route === "admin") {
       const [ready, libraries, users, audit, pending, jobs] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit(), api.pendingMetadata(), api.adminJobs()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
@@ -183,7 +186,7 @@ function renderGrid(items, heading = "") {
 function mediaCard(item) {
   return "<button class=\"media-card\" data-item=\"" + escapeHtml(item.id) + "\">" + poster(item) + "<span class=\"media-card-body\"><strong>" + escapeHtml(item.title || item.name) + "</strong><span class=\"media-meta\">" + escapeHtml(item.productionYear || item.itemType || "") + "</span></span></button>";
 }
-function renderDetail(item, playback = {}, children = null) {
+function renderDetail(item, playback = {}, children = null, images = []) {
   const sources = item.mediaSources || [];
   const chips = sources.map((source) => "<span class=\"chip\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "source") + "</span>").join("");
   const buttons = sources.map((source, index) => "<button class=\"button secondary\" data-source=\"" + escapeHtml(source.id) + "\" aria-pressed=\"" + (index === 0) + "\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "版本 " + (index + 1)) + "</button>").join("");
@@ -191,7 +194,16 @@ function renderDetail(item, playback = {}, children = null) {
   const favoriteLabel = playback.isFavorite ? "取消收藏" : "收藏";
   const userData = "<div class=\"chips\"><span class=\"chip\">" + (playback.isPlayed ? "已看" : "未看") + "</span>" + (playback.isFavorite ? "<span class=\"chip\">已收藏</span>" : "") + (playback.positionTicks ? "<span class=\"chip\">已播放 " + Math.round(playback.positionTicks / 10000000) + " 秒</span>" : "") + "</div>";
   const childrenPanel = children ? `<section class="children-panel" id="children-panel">${renderChildrenPanel(item, children)}</section>` : "";
-  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail"><div>${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2 style="margin-top:.6rem">${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button>${childrenPanel}${player}</div></article>`;
+  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail"><div>${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2 style="margin-top:.6rem">${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button>${childrenPanel}${renderAdminImages(item, images)}${player}</div></article>`;
+}
+
+function renderAdminImages(item, images) {
+  if (!state.user?.canManageServer) return "";
+  const rows = images.map((image) => {
+    const type = image.imageType === "FANART" ? "fanart" : "poster";
+    return `<li><img src="/api/v1/items/${encodeURIComponent(item.id)}/images/${type}" alt="${escapeHtml(type)}"><div><strong>${escapeHtml(image.imageType)} #${image.imageIndex}</strong><span>${escapeHtml(image.source || "LOCAL")} · ${escapeHtml(String(image.fileSize || 0))} bytes</span></div><button class="button secondary" type="button" data-delete-image="${escapeHtml(image.id)}">删除图片</button></li>`;
+  }).join("");
+  return `<section class="admin-images"><div class="section-heading"><h3>图片管理</h3><span>删除会移除索引和媒体目录中的文件</span></div><ul class="admin-list">${rows || "<li><span>暂无图片索引</span></li>"}</ul></section>`;
 }
 
 function renderChildrenPanel(item, result, showingEpisodes = false) {
@@ -313,6 +325,11 @@ function bind() {
   document.querySelectorAll("[data-delete-library]").forEach((element) => element.addEventListener("click", async () => {
     if (!window.confirm("删除媒体库配置和索引数据，但不会删除媒体文件。继续？")) return;
     try { await api.deleteLibrary(element.dataset.deleteLibrary); state.error = ""; state.notice = "媒体库已删除。"; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-delete-image]").forEach((element) => element.addEventListener("click", async () => {
+    if (!window.confirm("删除这张图片及其索引？")) return;
+    try { await api.deleteAdminImage(state.item.id, element.dataset.deleteImage); state.error = ""; state.notice = "图片已删除。"; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("[data-select-candidate]").forEach((element) => element.addEventListener("click", async () => {

@@ -80,6 +80,63 @@ impl ImageWriteService {
             .map(Some)
     }
 
+    pub(crate) async fn list_item_images(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<crate::storage::StoredItemImage>, ImageWriteError> {
+        Ok(self.database.list_item_images(item_id).await?)
+    }
+
+    pub(crate) async fn delete_item_image(
+        &self,
+        item_id: &str,
+        image_id: &str,
+    ) -> Result<(), ImageWriteError> {
+        let image = self
+            .database
+            .find_item_image(item_id, image_id)
+            .await?
+            .ok_or(ImageWriteError::ItemNotFound)?;
+        let Some(root_path) = image.root_path.as_deref() else {
+            return Err(ImageWriteError::PathOutsideRoot(PathBuf::from(
+                &image.local_path,
+            )));
+        };
+        let canonical_root =
+            fs::canonicalize(root_path)
+                .await
+                .map_err(|source| ImageWriteError::Io {
+                    path: PathBuf::from(root_path),
+                    source,
+                })?;
+        let path = PathBuf::from(&image.local_path);
+        if let Ok(metadata) = fs::symlink_metadata(&path).await {
+            if metadata.file_type().is_symlink() {
+                return Err(ImageWriteError::SymlinkTarget(path));
+            }
+            let canonical_path =
+                fs::canonicalize(&path)
+                    .await
+                    .map_err(|source| ImageWriteError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+            if !canonical_path.starts_with(&canonical_root) || canonical_path == canonical_root {
+                return Err(ImageWriteError::PathOutsideRoot(canonical_path));
+            }
+            fs::remove_file(&canonical_path)
+                .await
+                .map_err(|source| ImageWriteError::Io {
+                    path: canonical_path,
+                    source,
+                })?;
+        }
+        if !self.database.delete_item_image(item_id, image_id).await? {
+            return Err(ImageWriteError::ItemNotFound);
+        }
+        Ok(())
+    }
+
     async fn local_image_exists(
         &self,
         item_id: &str,

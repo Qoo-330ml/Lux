@@ -3268,6 +3268,74 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_item_images(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<StoredItemImage>, StorageError> {
+        sqlx::query(
+            "SELECT ii.id, ii.item_id, ii.image_type, ii.image_index,
+                    ii.local_path, ii.file_size, ii.content_tag, ii.source,
+                    MIN(lr.canonical_path) AS root_path
+             FROM item_images ii
+             JOIN media_items mi ON mi.id = ii.item_id
+             LEFT JOIN library_roots lr ON lr.library_id = mi.library_id
+             WHERE ii.item_id = ?
+             GROUP BY ii.id
+             ORDER BY ii.image_type, ii.image_index, ii.id",
+        )
+        .bind(item_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_item_image).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_item_image(
+        &self,
+        item_id: &str,
+        image_id: &str,
+    ) -> Result<Option<StoredItemImage>, StorageError> {
+        sqlx::query(
+            "SELECT ii.id, ii.item_id, ii.image_type, ii.image_index,
+                    ii.local_path, ii.file_size, ii.content_tag, ii.source,
+                    MIN(lr.canonical_path) AS root_path
+             FROM item_images ii
+             JOIN media_items mi ON mi.id = ii.item_id
+             LEFT JOIN library_roots lr ON lr.library_id = mi.library_id
+             WHERE ii.item_id = ? AND ii.id = ?
+             GROUP BY ii.id",
+        )
+        .bind(item_id)
+        .bind(image_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_item_image))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn delete_item_image(
+        &self,
+        item_id: &str,
+        image_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query("DELETE FROM item_images WHERE item_id = ? AND id = ?")
+            .bind(item_id)
+            .bind(image_id)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn create_access_token(
         &self,
         token: NewAccessToken<'_>,
@@ -3734,6 +3802,33 @@ pub(crate) struct StoredItemImageCandidate {
     pub(crate) id: String,
     pub(crate) local_path: String,
     pub(crate) root_path: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredItemImage {
+    pub(crate) id: String,
+    pub(crate) item_id: String,
+    pub(crate) image_type: String,
+    pub(crate) image_index: i64,
+    pub(crate) local_path: String,
+    pub(crate) file_size: Option<i64>,
+    pub(crate) content_tag: Option<String>,
+    pub(crate) source: String,
+    pub(crate) root_path: Option<String>,
+}
+
+fn stored_item_image(row: sqlx::sqlite::SqliteRow) -> StoredItemImage {
+    StoredItemImage {
+        id: row.get("id"),
+        item_id: row.get("item_id"),
+        image_type: row.get("image_type"),
+        image_index: row.get("image_index"),
+        local_path: row.get("local_path"),
+        file_size: row.get("file_size"),
+        content_tag: row.get("content_tag"),
+        source: row.get("source"),
+        root_path: row.get("root_path"),
+    }
 }
 
 enum CatalogBind<'a> {

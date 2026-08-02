@@ -102,6 +102,8 @@ p { color: var(--muted); line-height: 1.6; }
 .job-detail dl div { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 1rem; }
 .job-detail dt { color: var(--muted); }
 .job-detail dd { margin: 0; overflow-wrap: anywhere; }
+.admin-images { display: grid; gap: .8rem; margin-top: 1.2rem; }
+.admin-images .admin-list img { width: 42px; height: 56px; object-fit: cover; border-radius: 6px; background: #203033; }
 .admin-library { display: grid; gap: 1rem; padding: 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .admin-library .admin-list li { background: #101c1e; }
 .compact-form { margin-top: .25rem; }
