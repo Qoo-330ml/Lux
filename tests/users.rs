@@ -68,6 +68,43 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .ok_or("missing user id")?
         .to_owned();
 
+    let library = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "Movies", "kind": "MOVIE" }))
+        .send()
+        .await?;
+    assert_eq!(library.status(), reqwest::StatusCode::CREATED);
+    let library_id = library.json::<Value>().await?["library"]["id"]
+        .as_str()
+        .ok_or("missing library id")?
+        .to_owned();
+    let access = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries/{library_id}"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "canView": true }))
+        .send()
+        .await?;
+    assert_eq!(access.status(), reqwest::StatusCode::OK);
+    let access_list = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(access_list.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        access_list.json::<Value>().await?["libraryIds"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
     let regular = client
         .post(format!("{base_url}/api/v1/admin/users"))
         .header(COOKIE, &cookie)

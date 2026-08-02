@@ -159,6 +159,10 @@ pub fn app_with_state(state: AppState) -> Router {
             patch(admin_update_user).delete(admin_disable_user),
         )
         .route(
+            "/api/v1/admin/users/{user_id}/libraries",
+            get(admin_list_user_library_access),
+        )
+        .route(
             "/api/v1/admin/metadata/pending",
             get(admin_list_pending_metadata),
         )
@@ -3995,6 +3999,35 @@ async fn admin_list_users(headers: HeaderMap, State(state): State<AppState>) -> 
         }))
         .into_response(),
         Err(error) => user_store_error(&headers, error),
+    }
+}
+
+async fn admin_list_user_library_access(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .list_accessible_library_ids(&user_id.to_string())
+        .await
+    {
+        Ok(library_ids) => Json(json!({ "libraryIds": library_ids })).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 

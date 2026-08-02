@@ -1,5 +1,5 @@
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", item: null, error: "", setupNotice: "" };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", item: null, error: "", notice: "", setupNotice: "" };
 
 const api = {
   async request(path, options = {}) {
@@ -24,7 +24,14 @@ const api = {
   adminUsers() { return this.request("/api/v1/admin/users"); },
   createUser(data) { return this.request("/api/v1/admin/users", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
   disableUser(id) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
+  updateUser(id, data) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id), { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
+  userLibraryAccess(id) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id) + "/libraries"); },
+  setLibraryAccess(userId, libraryId, canView) { return this.request("/api/v1/admin/users/" + encodeURIComponent(userId) + "/libraries/" + encodeURIComponent(libraryId), { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ canView }) }); },
   adminLibraries() { return this.request("/api/v1/admin/libraries"); },
+  createLibrary(data) { return this.request("/api/v1/admin/libraries", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
+  updateLibrary(id, data) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id), { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
+  addLibraryRoot(id, path) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/roots", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ path }) }); },
+  scanLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/scan", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
   ready() { return fetch("/health/ready", { credentials: "same-origin" }).then((response) => response.json()); },
   progress(id, positionTicks, durationTicks) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/progress", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ positionTicks, durationTicks }) }); },
@@ -63,7 +70,8 @@ function render() {
   if (state.initialized === false) return renderSetup();
   if (!state.user) return renderAuth();
   const error = state.error ? "<div class=\"notice error\" role=\"alert\">" + escapeHtml(state.error) + "</div>" : "";
-  app.innerHTML = "<div class=\"shell\"><aside class=\"sidebar\">" + brand() + nav() + account() + "</aside><div><nav class=\"mobile-nav\"><strong>Lux</strong><button class=\"button secondary\" data-action=\"logout\">退出</button></nav><main class=\"content\"><header class=\"topbar\"><div><span class=\"eyebrow\">Personal media</span><h1>" + titleForRoute() + "</h1></div><form class=\"search-form\" data-action=\"search\"><input class=\"search-box\" name=\"q\" type=\"search\" placeholder=\"搜索电影、剧集或别名\" aria-label=\"搜索\"></form></header>" + error + "<section id=\"view\">" + loading() + "</section></main></div></div>";
+  const notice = state.notice ? "<div class=\"notice\" role=\"status\">" + escapeHtml(state.notice) + "</div>" : "";
+  app.innerHTML = "<div class=\"shell\"><aside class=\"sidebar\">" + brand() + nav() + account() + "</aside><div><nav class=\"mobile-nav\"><strong>Lux</strong><button class=\"button secondary\" data-action=\"logout\">退出</button></nav><main class=\"content\"><header class=\"topbar\"><div><span class=\"eyebrow\">Personal media</span><h1>" + titleForRoute() + "</h1></div><form class=\"search-form\" data-action=\"search\"><input class=\"search-box\" name=\"q\" type=\"search\" placeholder=\"搜索电影、剧集或别名\" aria-label=\"搜索\"></form></header>" + error + notice + "<section id=\"view\">" + loading() + "</section></main></div></div>";
   bind();
   loadRoute();
 }
@@ -110,7 +118,9 @@ async function loadRoute() {
       state.item = await api.item(state.itemId);
       view.innerHTML = renderDetail(state.item);
     } else if (state.route === "admin") {
-      state.admin = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit()]);
+      const [ready, libraries, users, audit] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit()]);
+      const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
+      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], access: Object.fromEntries(accessEntries) };
       view.innerHTML = renderAdmin();
     }
     bind();
@@ -153,14 +163,26 @@ function renderDetail(item) {
 }
 
 function renderAdmin() {
-  const ready = state.admin[0] || {};
-  const libraries = state.admin[1]?.libraries || [];
-  const users = state.admin[2]?.users || [];
-  const events = state.admin[3]?.events || [];
-  const userRows = users.map((user) => "<tr><td>" + escapeHtml(user.displayName) + "<small>" + escapeHtml(user.usernameNormalized) + "</small></td><td>" + (user.isDisabled ? "已禁用" : user.canManageServer ? "管理员" : "普通用户") + "</td><td>" + (user.isDisabled ? "" : "<button class=\"button secondary\" data-disable-user=\"" + escapeHtml(user.id) + "\">禁用</button>") + "</td></tr>").join("");
-  const libraryRows = libraries.map((library) => "<li><strong>" + escapeHtml(library.name) + "</strong><span>" + escapeHtml(library.kind) + " · " + (library.isEnabled ? "启用" : "停用") + "</span></li>").join("");
+  const { ready = {}, libraries = [], users = [], audit: events = [], access = {} } = state.admin || {};
+  const userRows = users.map((user) => "<tr><td>" + escapeHtml(user.displayName || user.usernameNormalized) + "<small>" + escapeHtml(user.usernameNormalized) + "</small></td><td>" + (user.isDisabled ? "已禁用" : user.canManageServer ? "管理员" : "普通用户") + "</td><td><a class=\"button secondary\" href=\"#user-" + escapeHtml(user.id) + "\">编辑</a> " + (user.isDisabled ? "" : "<button class=\"button secondary\" data-disable-user=\"" + escapeHtml(user.id) + "\">禁用</button>") + "</td></tr>").join("");
+  const userEditors = users.map((user) => renderUserEditor(user, libraries, new Set(access[user.id] || []))).join("");
+  const libraryCards = libraries.map(renderAdminLibrary).join("");
   const auditRows = events.slice(0, 8).map((event) => "<li><strong>" + escapeHtml(event.eventType) + "</strong><span>" + escapeHtml(event.actorUsername || "system") + " · " + escapeHtml(event.targetId || "") + "</span></li>").join("");
-  return "<section class=\"section\"><div class=\"admin-cards\"><div class=\"admin-card\"><span class=\"eyebrow\">Health</span><strong>" + escapeHtml(ready.status || "unknown") + "</strong><span>schema " + escapeHtml(ready.schemaVersion || "—") + "</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Libraries</span><strong>" + libraries.length + "</strong><span>已配置媒体库</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Users</span><strong>" + users.length + "</strong><span>账户</span></div></div></section><section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>禁用不会删除历史状态</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" required><input name=\"password\" type=\"password\" placeholder=\"临时密码\" aria-label=\"临时密码\" required><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div></section><section class=\"section admin-columns\"><div><div class=\"section-heading\"><h2>媒体库</h2></div><ul class=\"admin-list\">" + libraryRows + "</ul></div><div><div class=\"section-heading\"><h2>最近审计</h2></div><ul class=\"admin-list\">" + auditRows + "</ul></div></section>";
+  return "<section class=\"section\"><div class=\"admin-cards\"><div class=\"admin-card\"><span class=\"eyebrow\">Health</span><strong>" + escapeHtml(ready.status || "unknown") + "</strong><span>schema " + escapeHtml(ready.schemaVersion || "—") + "</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Libraries</span><strong>" + libraries.length + "</strong><span>已配置媒体库</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Users</span><strong>" + users.length + "</strong><span>账户</span></div></div></section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>创建媒体库</h2><span>创建后再添加一个或多个根路径</span></div><form class=\"admin-form\" data-action=\"create-library\"><input name=\"name\" placeholder=\"媒体库名称\" aria-label=\"媒体库名称\" required><select name=\"kind\" aria-label=\"媒体库类型\"><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option><option value=\"MIXED\">混合</option></select><label class=\"check\"><input name=\"realtimeWatchEnabled\" type=\"checkbox\"> 实时监听</label><button class=\"button\" type=\"submit\">创建媒体库</button></form></section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>媒体库与扫描</h2><span>计划字段留空可清除</span></div><div class=\"admin-library-grid\">" + (libraryCards || "<div class=\"empty\"><h3>还没有媒体库</h3><p>先创建一个媒体库，再添加根路径。</p></div>") + "</div></section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>密码为空表示不修改</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" required><input name=\"displayName\" placeholder=\"显示名称\" aria-label=\"显示名称\"><input name=\"password\" type=\"password\" placeholder=\"初始密码\" aria-label=\"初始密码\" required><label class=\"check\"><input name=\"isAdmin\" type=\"checkbox\"> 管理员</label><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div>" + userEditors + "</section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>最近审计</h2><span>只展示最近 8 条</span></div><ul class=\"admin-list\">" + (auditRows || "<li><span>暂无管理操作</span></li>") + "</ul></section>";
+}
+
+function renderAdminLibrary(library) {
+  const roots = (library.roots || []).map((root) => "<li><strong>" + escapeHtml(root.displayPath || root.canonicalPath) + "</strong><span>" + (root.isAvailable ? "可用" : "不可用") + (root.isWritable ? " · 可写" : " · 只读") + "</span></li>").join("");
+  return `<article class="admin-library"><div class="section-heading"><div><h3>${escapeHtml(library.name)}</h3><span>${escapeHtml(library.kind)} · ${library.realtimeWatchEnabled ? "实时监听" : "手动/计划扫描"}</span></div><button class="button secondary" data-scan-library="${escapeHtml(library.id)}">开始扫描</button></div><ul class="admin-list">${roots || "<li><span>尚未添加根路径</span></li>"}</ul><form class="admin-form compact-form" data-action="add-root" data-library-id="${escapeHtml(library.id)}"><input name="path" placeholder="/Volumes/Media/Movies" aria-label="根路径" required><button class="button secondary" type="submit">添加根路径</button></form><form class="schedule-form" data-action="update-library" data-library-id="${escapeHtml(library.id)}"><label>增量 <input name="incrementalSchedule" value="${escapeHtml(library.incrementalSchedule || "")}" placeholder="interval:30s"></label><label>调和 <input name="reconciliationSchedule" value="${escapeHtml(library.reconciliationSchedule || "")}" placeholder="cron:0 3 * * *"></label><label>元数据 <input name="metadataSchedule" value="${escapeHtml(library.metadataSchedule || "")}" placeholder="interval:6h"></label><label>扫描并发 <input name="scanConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.scanConcurrency || "")}"></label><label>探测并发 <input name="probeConcurrency" type="number" min="1" max="64" value="${escapeHtml(library.probeConcurrency || "")}"></label><label class="check"><input name="realtimeWatchEnabled" type="checkbox"${library.realtimeWatchEnabled ? " checked" : ""}> 实时监听</label><button class="button secondary" type="submit">保存计划</button></form></article>`;
+}
+
+function renderUserEditor(user, libraries, granted) {
+  const libraryChecks = libraries.map((library) => `<label class="check"><input type="checkbox" name="libraryAccess" value="${escapeHtml(library.id)}"${granted.has(library.id) ? " checked" : ""}> ${escapeHtml(library.name)}</label>`).join("");
+  return `<details class="admin-user" id="user-${escapeHtml(user.id)}"><summary>编辑 ${escapeHtml(user.displayName || user.usernameNormalized)}</summary><form class="user-edit-form" data-action="update-user" data-user-id="${escapeHtml(user.id)}"><div class="admin-form"><input name="displayName" value="${escapeHtml(user.displayName || "")}" placeholder="显示名称" aria-label="显示名称"><input name="password" type="password" placeholder="新密码（可选）" aria-label="新密码"></div><div class="permission-grid"><label class="check"><input name="isAdmin" type="checkbox"${user.isAdmin ? " checked" : ""}> 管理员</label><label class="check"><input name="canManageServer" type="checkbox"${user.canManageServer ? " checked" : ""}> 管理服务器</label><label class="check"><input name="canRemoteAccess" type="checkbox"${user.canRemoteAccess ? " checked" : ""}> 允许远程</label><label class="check"><input name="canDownload" type="checkbox"${user.canDownload ? " checked" : ""}> 允许下载</label><label class="check"><input name="isDisabled" type="checkbox"${user.isDisabled ? " checked" : ""}> 已禁用</label></div><div class="permission-grid"><strong>媒体库访问</strong>${libraryChecks || "<span class=\"media-meta\">暂无媒体库</span>"}</div><button class="button" type="submit">保存用户权限</button></form></details>`;
 }
 
 function bind() {
@@ -189,6 +211,10 @@ function bind() {
     if (!window.confirm("确认禁用这个用户？")) return;
     try { await api.disableUser(element.dataset.disableUser); state.error = ""; render(); } catch (error) { state.error = error.message; render(); }
   }));
+  document.querySelectorAll("[data-scan-library]").forEach((element) => element.addEventListener("click", async () => {
+    try { await api.scanLibrary(element.dataset.scanLibrary); state.notice = "扫描任务已创建。"; state.error = ""; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
   document.querySelectorAll("[data-action='logout']").forEach((element) => element.addEventListener("click", async () => { try { await api.logout(); } finally { state.user = null; render(); } }));
   document.querySelectorAll("[data-action='retry']").forEach((element) => element.addEventListener("click", () => { state.error = ""; render(); }));
   document.querySelectorAll("form[data-action='login']").forEach((form) => form.addEventListener("submit", async (event) => {
@@ -207,12 +233,42 @@ function bind() {
   }));
   document.querySelectorAll("form[data-action='create-user']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    try { await api.createUser({ username: form.username.value, password: form.password.value }); state.route = "admin"; state.error = ""; render(); }
+    try { await api.createUser({ username: form.username.value, displayName: form.displayName.value, password: form.password.value, isAdmin: form.isAdmin.checked }); state.route = "admin"; state.error = ""; state.notice = "用户已创建。"; render(); }
     catch (error) { state.error = error.message; render(); }
+  }));
+  document.querySelectorAll("form[data-action='create-library']").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await api.createLibrary({ name: form.name.value, kind: form.kind.value, realtimeWatchEnabled: form.realtimeWatchEnabled.checked }); state.route = "admin"; state.error = ""; state.notice = "媒体库已创建。"; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("form[data-action='add-root']").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await api.addLibraryRoot(form.dataset.libraryId, form.path.value); state.route = "admin"; state.error = ""; state.notice = "根路径已添加。"; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("form[data-action='update-library']").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const optionalNumber = (value) => value ? Number(value) : undefined;
+    try {
+      await api.updateLibrary(form.dataset.libraryId, { realtimeWatchEnabled: form.realtimeWatchEnabled.checked, incrementalSchedule: form.incrementalSchedule.value || null, reconciliationSchedule: form.reconciliationSchedule.value || null, metadataSchedule: form.metadataSchedule.value || null, scanConcurrency: optionalNumber(form.scanConcurrency.value), probeConcurrency: optionalNumber(form.probeConcurrency.value) });
+      state.route = "admin"; state.error = ""; state.notice = "媒体库计划已保存。"; render();
+    } catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("form[data-action='update-user']").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload = { displayName: form.displayName.value, isDisabled: form.isDisabled.checked, isAdmin: form.isAdmin.checked, canManageServer: form.canManageServer.checked, canRemoteAccess: form.canRemoteAccess.checked, canDownload: form.canDownload.checked };
+    if (form.password.value) payload.password = form.password.value;
+    try {
+      await api.updateUser(form.dataset.userId, payload);
+      const selectedLibraries = new Set(Array.from(form.querySelectorAll("input[name='libraryAccess']:checked"), (input) => input.value));
+      const libraries = state.admin?.libraries || [];
+      await Promise.all(libraries.map((library) => api.setLibraryAccess(form.dataset.userId, library.id, selectedLibraries.has(library.id))));
+      state.route = "admin"; state.error = ""; state.notice = "用户权限已保存。"; render();
+    } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='search']").forEach((form) => form.addEventListener("submit", (event) => {
     event.preventDefault(); const query = form.q.value.trim(); if (!query) return;
-    state.query = query; state.route = "search"; state.error = ""; render();
+    state.query = query; state.route = "search"; state.error = ""; state.notice = ""; render();
   }));
 }
 

@@ -82,7 +82,22 @@ p { color: var(--muted); line-height: 1.6; }
 .admin-card strong { font-size: 1.5rem; }
 .admin-card span:last-child, .admin-list span, td small { color: var(--muted); font-size: .82rem; }
 .admin-form { display: flex; flex-wrap: wrap; gap: .6rem; }
-.admin-form input { min-width: 160px; flex: 1; padding: .65rem .75rem; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: #101c1e; }
+.admin-form input, .admin-form select { min-width: 160px; flex: 1; padding: .65rem .75rem; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: #101c1e; }
+.admin-form select { flex: 0 1 150px; }
+.check { display: inline-flex; align-items: center; gap: .45rem; color: var(--muted); font-size: .86rem; }
+.check input { accent-color: var(--accent); }
+.admin-library-grid { display: grid; gap: 1rem; }
+.admin-library { display: grid; gap: 1rem; padding: 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.admin-library .admin-list li { background: #101c1e; }
+.compact-form { margin-top: .25rem; }
+.schedule-form { display: flex; flex-wrap: wrap; align-items: end; gap: .6rem; padding-top: .25rem; border-top: 1px solid var(--line); }
+.schedule-form label { display: grid; gap: .35rem; min-width: 150px; color: var(--muted); font-size: .78rem; }
+.schedule-form input { width: 100%; padding: .55rem .65rem; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: #101c1e; }
+.permission-grid { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem 1rem; margin: 1rem 0; }
+.admin-user { padding: .75rem 1rem; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.admin-user + .admin-user { margin-top: .6rem; }
+.admin-user summary { cursor: pointer; color: var(--ink); }
+.user-edit-form { padding-top: 1rem; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
 table { width: 100%; border-collapse: collapse; background: var(--surface); }
 th, td { padding: .8rem; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
