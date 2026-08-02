@@ -1,0 +1,213 @@
+use std::{env, path::PathBuf, time::Instant};
+
+use luxd::{
+    api::{AppState, app_with_state},
+    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    auth::{emby::EmbyAuthService, sessions::WebAuthService},
+    config::Config,
+    library::LibraryKind,
+    storage::Database,
+};
+use reqwest::header::{COOKIE, SET_COOKIE};
+use serde_json::json;
+use tokio::net::TcpListener;
+
+const FOREGROUND_REQUESTS: usize = 50;
+const INCREMENTAL_FILES: usize = 100;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with scripts/run-performance.sh for the LUX-045 ARM64 gate"]
+async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let media_root = PathBuf::from(env::var("LUX_PERF_MEDIA_ROOT")?);
+    let file_count: usize = env::var("LUX_PERF_FILE_COUNT")?.parse()?;
+    assert!(file_count >= 60_000, "LUX-045 requires at least 60k files");
+    assert!(media_root.join(".lux-fixture.json").is_file());
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Admin", "performance-only password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Performance Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 fixture path")?,
+        )
+        .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(FOREGROUND_REQUESTS)
+        .build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "admin",
+            "password": "performance-only password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookies = format!(
+        "lux_session={}",
+        cookie_value(login.headers(), "lux_session")
+    );
+
+    let scanner = LibraryScanner::new(database.clone());
+    let first_started = Instant::now();
+    let first = scanner.scan_movie_library(library.id).await?;
+    let first_ms = first_started.elapsed().as_millis();
+    assert_eq!(first.discovered_files, file_count);
+    assert_eq!(first.created_items, file_count);
+    assert_eq!(first.created_sources, file_count);
+
+    let unchanged_started = Instant::now();
+    let scanner_for_unchanged = scanner.clone();
+    let unchanged_handle = tokio::spawn(async move {
+        scanner_for_unchanged
+            .scan_movie_library(library.id)
+            .await
+            .map(|report| (report, unchanged_started.elapsed().as_millis()))
+    });
+    tokio::task::yield_now().await;
+    let scan_running_before_api = !unchanged_handle.is_finished();
+    let foreground_ms = measure_foreground_requests(&client, &base_url, &cookies).await?;
+    let (unchanged, unchanged_ms) = unchanged_handle.await??;
+    assert_eq!(unchanged.discovered_files, file_count);
+    assert_eq!(unchanged.created_items, 0);
+    assert_eq!(unchanged.created_sources, 0);
+    assert_eq!(unchanged.skipped_files, file_count);
+
+    let incremental_directory = media_root.join("bucket-0000");
+    for index in 60_000..60_000 + INCREMENTAL_FILES {
+        let year = 2000 + index % 100;
+        tokio::fs::write(
+            incremental_directory.join(format!("Fixture.Movie.{index:06}.{year}.mkv")),
+            b"LUX PERF INCREMENTAL FIXTURE\n",
+        )
+        .await?;
+    }
+    let incremental_started = Instant::now();
+    let incremental = scanner
+        .scan_movie_directory(library.id, &incremental_directory)
+        .await?;
+    let incremental_ms = incremental_started.elapsed().as_millis();
+    assert_eq!(incremental.discovered_files, 100 + INCREMENTAL_FILES);
+    assert_eq!(incremental.created_items, INCREMENTAL_FILES);
+    assert_eq!(incremental.created_sources, INCREMENTAL_FILES);
+    assert_eq!(incremental.skipped_files, 100);
+    assert_eq!(incremental.marked_missing, 0);
+
+    let non_pending_probe_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE probe_status <> 'PENDING'")
+            .fetch_one(database.pool())
+            .await?;
+    let metadata_fingerprint_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE metadata_fingerprint IS NOT NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(non_pending_probe_count, 0);
+    assert_eq!(metadata_fingerprint_count, 0);
+
+    println!(
+        "LUX-045 RESULT {}",
+        serde_json::to_string(&json!({
+            "commit": luxd::COMMIT,
+            "architecture": std::env::consts::ARCH,
+            "fileCount": file_count,
+            "firstScanMs": first_ms,
+            "unchangedRescanMs": unchanged_ms,
+            "incrementalDirectoryFiles": 100 + INCREMENTAL_FILES,
+            "incrementalScanMs": incremental_ms,
+            "foregroundRequestCount": FOREGROUND_REQUESTS,
+            "foregroundDuringScan": scan_running_before_api,
+            "foregroundP50Ms": percentile(&foreground_ms, 50),
+            "foregroundP95Ms": percentile(&foreground_ms, 95),
+            "foregroundErrors": 0,
+            "nonPendingProbeCount": non_pending_probe_count,
+            "metadataFingerprintCount": metadata_fingerprint_count,
+            "targetForegroundP95Ms": 1000,
+        }))?
+    );
+
+    server.abort();
+    Ok(())
+}
+
+async fn measure_foreground_requests(
+    client: &reqwest::Client,
+    base_url: &str,
+    cookies: &str,
+) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    let mut requests = Vec::with_capacity(FOREGROUND_REQUESTS);
+    for _ in 0..FOREGROUND_REQUESTS {
+        let client = client.clone();
+        let url = format!("{base_url}/api/v1/admin/libraries");
+        let cookies = cookies.to_owned();
+        requests.push(tokio::spawn(async move {
+            let started = Instant::now();
+            let response = client
+                .get(url)
+                .header(COOKIE, cookies)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let status = response.status();
+            let _ = response.bytes().await.map_err(|error| error.to_string())?;
+            if status != reqwest::StatusCode::OK {
+                return Err(format!("foreground request returned {status}"));
+            }
+            Ok::<u128, String>(started.elapsed().as_millis())
+        }));
+    }
+    let mut durations = Vec::with_capacity(FOREGROUND_REQUESTS);
+    for request in requests {
+        let result = request
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        durations.push(result.map_err(std::io::Error::other)?);
+    }
+    Ok(durations)
+}
+
+fn percentile(values: &[u128], percentile: usize) -> u128 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() * percentile).saturating_add(99) / 100).saturating_sub(1);
+    sorted[index.min(sorted.len().saturating_sub(1))]
+}
+
+fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            let (pair, _) = value.split_once(';')?;
+            let (cookie_name, cookie_value) = pair.split_once('=')?;
+            (cookie_name == name).then(|| cookie_value.to_owned())
+        })
+        .expect("expected cookie")
+}
