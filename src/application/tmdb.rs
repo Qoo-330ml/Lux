@@ -312,7 +312,7 @@ fn retry_after(response: &reqwest::Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct TmdbMovieSearchResponse {
     pub page: i32,
     pub total_pages: i32,
@@ -320,7 +320,7 @@ pub struct TmdbMovieSearchResponse {
     pub results: Vec<TmdbMovieSummary>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct TmdbMovieSummary {
     pub id: i64,
     pub title: Option<String>,
@@ -330,7 +330,7 @@ pub struct TmdbMovieSummary {
     pub original_language: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct TmdbMovieDetails {
     pub id: i64,
     pub title: Option<String>,

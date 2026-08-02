@@ -1,5 +1,6 @@
 pub mod access;
 pub mod catalog;
+pub mod identification;
 pub mod images;
 pub mod libraries;
 pub mod metadata;
