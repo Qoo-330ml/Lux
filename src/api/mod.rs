@@ -462,6 +462,16 @@ struct EmbyItemsQuery {
     start_index: Option<i64>,
     #[serde(rename = "Limit", default)]
     limit: Option<i64>,
+    #[serde(rename = "IsPlayed", default)]
+    is_played: Option<bool>,
+    #[serde(rename = "IsFavorite", default)]
+    is_favorite: Option<bool>,
+    #[serde(rename = "Years", default)]
+    years: Option<String>,
+    #[serde(rename = "SortBy", default)]
+    sort_by: Option<String>,
+    #[serde(rename = "SortOrder", default)]
+    sort_order: Option<String>,
 }
 
 async fn emby_user_views(
@@ -772,18 +782,6 @@ async fn emby_list_items(
     principal: AccessPrincipal,
     query: &EmbyItemsQuery,
 ) -> Response {
-    if !query.include_item_types.as_deref().is_none_or(|types| {
-        types
-            .split(',')
-            .any(|item_type| item_type.eq_ignore_ascii_case("Movie"))
-    }) {
-        return Json(json!({
-            "Items": [],
-            "TotalRecordCount": 0,
-            "StartIndex": 0,
-        }))
-        .into_response();
-    }
     let (offset, limit) = match emby_page_params(query) {
         Ok(params) => params,
         Err(status) => return status.into_response(),
@@ -797,17 +795,121 @@ async fn emby_list_items(
                 return StatusCode::BAD_REQUEST.into_response();
             };
             catalog
-                .list_library_items(principal, &parent_id.to_string(), offset, limit)
+                .list_library_items(principal, &parent_id.to_string(), 0, i64::MAX)
                 .await
         }
-        None => catalog.list_all_items(principal, offset, limit).await,
+        None => catalog.list_all_items(principal, 0, i64::MAX).await,
     };
     match page {
-        Ok(page) => Json(emby_catalog_page_json(&page, &state.server_id)).into_response(),
+        Ok(page) => {
+            match filter_emby_catalog_page(state, principal, page, query, offset, limit).await {
+                Ok(page) => {
+                    emby_catalog_page_for_user(state, &principal.user_id.to_string(), &page).await
+                }
+                Err(status) => status.into_response(),
+            }
+        }
         Err(CatalogError::LibraryNotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(CatalogError::AccessDenied) => StatusCode::FORBIDDEN.into_response(),
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+async fn filter_emby_catalog_page(
+    state: &AppState,
+    principal: AccessPrincipal,
+    page: CatalogPage,
+    query: &EmbyItemsQuery,
+    offset: i64,
+    limit: i64,
+) -> Result<CatalogPage, StatusCode> {
+    let Some(database) = state.database.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let allowed_types = query.include_item_types.as_deref().map(|types| {
+        types
+            .split(',')
+            .map(|value| value.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+    let years = query.years.as_deref().map(|years| {
+        years
+            .split(',')
+            .filter_map(|year| year.trim().parse::<i64>().ok())
+            .collect::<Vec<_>>()
+    });
+    let mut items = Vec::new();
+    for item in page.items {
+        let item_type = emby_item_type(&item.item_type).to_ascii_lowercase();
+        if allowed_types
+            .as_ref()
+            .is_some_and(|types| !types.iter().any(|value| value == &item_type))
+        {
+            continue;
+        }
+        if years.as_ref().is_some_and(|years| {
+            !years.is_empty() && !years.contains(&item.production_year.unwrap_or_default())
+        }) {
+            continue;
+        }
+        let item_state = database
+            .find_user_item_state(&principal.user_id.to_string(), &item.id)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if query.is_played.is_some_and(|value| {
+            item_state
+                .as_ref()
+                .map(|state| state.is_played)
+                .unwrap_or(false)
+                != value
+        }) {
+            continue;
+        }
+        if query.is_favorite.is_some_and(|value| {
+            item_state
+                .as_ref()
+                .map(|state| state.is_favorite)
+                .unwrap_or(false)
+                != value
+        }) {
+            continue;
+        }
+        items.push(item);
+    }
+    let descending = query
+        .sort_order
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("Descending"));
+    items.sort_by(|left, right| {
+        let ordering = if query
+            .sort_by
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("DateCreated"))
+        {
+            left.id.cmp(&right.id)
+        } else {
+            left.sort_title
+                .cmp(&right.sort_title)
+                .then_with(|| left.id.cmp(&right.id))
+        };
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    let items = items
+        .into_iter()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .take(usize::try_from(limit).unwrap_or(0))
+        .collect();
+    Ok(CatalogPage {
+        items,
+        total,
+        offset,
+        limit,
+    })
 }
 
 async fn emby_item(
@@ -1343,18 +1445,6 @@ fn ensure_emby_user_scope(user: &UserRecord, requested_id: &str) -> Result<(), S
     }
 }
 
-fn emby_catalog_page_json(page: &CatalogPage, server_id: &str) -> Value {
-    json!({
-        "Items": page.items.iter().map(|item| emby_catalog_item_json(item, server_id)).collect::<Vec<_>>(),
-        "TotalRecordCount": page.total,
-        "StartIndex": page.offset,
-    })
-}
-
-fn emby_catalog_item_json(item: &CatalogItem, server_id: &str) -> Value {
-    emby_catalog_item_json_with_state(item, server_id, None)
-}
-
 fn emby_catalog_item_json_with_state(
     item: &CatalogItem,
     server_id: &str,
@@ -1822,6 +1912,18 @@ struct LuxPageQuery {
     page: Option<i64>,
     #[serde(rename = "pageSize", default)]
     page_size: Option<i64>,
+    #[serde(rename = "itemType", default)]
+    item_type: Option<String>,
+    #[serde(default)]
+    year: Option<i64>,
+    #[serde(default)]
+    is_played: Option<bool>,
+    #[serde(default)]
+    is_favorite: Option<bool>,
+    #[serde(default)]
+    sort_by: Option<String>,
+    #[serde(default)]
+    sort_order: Option<String>,
 }
 
 async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserRecord, Response> {
@@ -2080,11 +2182,27 @@ async fn lux_list_library_items(
         )
         .into_response();
     };
-    match catalog
-        .list_library_items(principal, &library_id, offset, limit)
-        .await
-    {
-        Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
+    let base_page = catalog
+        .list_library_items(principal, &library_id, 0, i64::MAX)
+        .await;
+    let filter_query = EmbyItemsQuery {
+        include_item_types: query.item_type.clone(),
+        years: query.year.map(|year| year.to_string()),
+        is_played: query.is_played,
+        is_favorite: query.is_favorite,
+        sort_by: query.sort_by.clone(),
+        sort_order: query.sort_order.clone(),
+        ..EmbyItemsQuery::default()
+    };
+    match base_page {
+        Ok(page) => {
+            match filter_emby_catalog_page(&state, principal, page, &filter_query, offset, limit)
+                .await
+            {
+                Ok(page) => Json(lux_catalog_page_json(&page)).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
         Err(CatalogError::LibraryNotFound) => api_error(
             &headers,
             StatusCode::NOT_FOUND,

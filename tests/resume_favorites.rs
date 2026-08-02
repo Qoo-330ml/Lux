@@ -163,6 +163,19 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(detail["UserData"]["Played"], true);
     assert_eq!(detail["UserData"]["PlayCount"], 1);
     assert_eq!(detail["UserData"]["IsFavorite"], true);
+    let filtered = client
+        .get(format!("{base_url}/Users/{admin_id}/Items"))
+        .query(&[
+            ("api_key", token.as_str()),
+            ("ParentId", library.id.to_string().as_str()),
+            ("IncludeItemTypes", "Movie"),
+            ("IsPlayed", "true"),
+            ("IsFavorite", "true"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(filtered.status(), reqwest::StatusCode::OK);
+    assert_eq!(filtered.json::<Value>().await?["TotalRecordCount"], 1);
 
     let unplayed = client
         .delete(format!(
