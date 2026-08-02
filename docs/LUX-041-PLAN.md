@@ -28,6 +28,8 @@
 
 验证结果：以上检查均通过；本机 `arm64` / `aarch64-apple-darwin` 已验证分批 progress/cursor、重启恢复、活动任务去重和取消。
 
+补充故障演练（2026-08-03）：`./scripts/restart-recovery-smoke.sh` 在本机生成 5,000 个临时媒体文件，观察到首批提交 `processedBeforeKill=100` 后对服务进程发送 `SIGKILL`；复用同一 SQLite 数据目录重启，任务最终 `COMPLETED`，`processedAfterRestart=5000`、`totalAfterRestart=5000`。
+
 ## 明确不做
 
 - 不实现实时文件监听、防抖和事件合并（LUX-042）。
