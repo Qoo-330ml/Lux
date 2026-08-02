@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
@@ -19,6 +19,7 @@ use tower_http::{ServiceBuilderExt, request_id::MakeRequestUuid, trace::TraceLay
 
 use crate::{
     COMMIT, VERSION,
+    application::libraries::{LibraryService, LibraryServiceError},
     application::setup::{SetupError, SetupService},
     auth::users::{UserRecord, UserStoreError},
     auth::{
@@ -26,6 +27,7 @@ use crate::{
         sessions::WebAuthService,
     },
     config::Config,
+    library::{LibraryKind, LibraryRecord, LibraryRootRecord},
     storage::Database,
 };
 
@@ -37,6 +39,7 @@ pub struct AppState {
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
     emby_auth: Option<EmbyAuthService>,
+    libraries: Option<LibraryService>,
 }
 
 impl AppState {
@@ -49,12 +52,13 @@ impl AppState {
     ) -> Self {
         let server_id = database.server_id().to_owned();
         Self {
-            database: Some(database),
+            database: Some(database.clone()),
             config_dir: Some(config.config_dir),
             server_id,
             setup: Some(setup),
             auth: Some(auth),
             emby_auth: Some(emby_auth),
+            libraries: Some(LibraryService::new(database.clone())),
         }
     }
 }
@@ -73,6 +77,14 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/me", get(auth_me))
+        .route(
+            "/api/v1/admin/libraries",
+            get(admin_list_libraries).post(admin_create_library),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}/roots",
+            post(admin_add_library_root),
+        )
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
@@ -591,6 +603,288 @@ async fn auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Respo
         response_headers.append(SET_COOKIE, cookie);
     }
     (StatusCode::NO_CONTENT, response_headers).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateLibraryRequest {
+    name: String,
+    kind: String,
+    #[serde(default)]
+    realtime_watch_enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct AddLibraryRootRequest {
+    path: String,
+}
+
+async fn require_admin(
+    headers: &HeaderMap,
+    state: &AppState,
+    require_csrf: bool,
+) -> Result<(), Response> {
+    let Some(auth) = state.auth.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response());
+    };
+    let Some(session_token) = request_cookie(headers, "lux_session") else {
+        return Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要登录",
+        )
+        .into_response());
+    };
+    let session = match auth.resolve(&session_token).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Err(api_error(
+                headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要登录",
+            )
+            .into_response());
+        }
+        Err(_) => {
+            return Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证暂时不可用",
+            )
+            .into_response());
+        }
+    };
+    if !session.user.can_manage_server {
+        return Err(api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "没有服务器管理权限",
+        )
+        .into_response());
+    }
+    if require_csrf {
+        let Some(csrf_token) = headers
+            .get("x-csrf-token")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Err(api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::CsrfFailed,
+                "CSRF 校验失败",
+            )
+            .into_response());
+        };
+        if !auth.verify_csrf(&session, csrf_token) {
+            return Err(api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::CsrfFailed,
+                "CSRF 校验失败",
+            )
+            .into_response());
+        }
+    }
+    Ok(())
+}
+
+async fn admin_list_libraries(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match libraries.list_libraries().await {
+        Ok(views) => Json(json!({
+            "libraries": views
+                .iter()
+                .map(|view| library_json(&view.library, &view.roots))
+                .collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => library_error(&headers, error),
+    }
+}
+
+async fn admin_create_library(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<CreateLibraryRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let kind = match request.kind.parse::<LibraryKind>() {
+        Ok(kind) => kind,
+        Err(_error) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库类型无效",
+            )
+            .into_response();
+        }
+    };
+    match libraries
+        .create_library(&request.name, kind, request.realtime_watch_enabled)
+        .await
+    {
+        Ok(library) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "library": library_json(&library, &[]),
+                "warnings": []
+            })),
+        )
+            .into_response(),
+        Err(error) => library_error(&headers, error),
+    }
+}
+
+async fn admin_add_library_root(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<AddLibraryRootRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id,
+        Err(error) => {
+            return library_error(
+                &headers,
+                LibraryServiceError::InvalidLibraryId(error.to_string()),
+            );
+        }
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match libraries.add_root(library_id, &request.path).await {
+        Ok(result) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "root": root_json(&result.root),
+                "warnings": result.warnings.iter().map(|warning| warning.as_str()).collect::<Vec<_>>()
+            })),
+        )
+            .into_response(),
+        Err(error) => library_error(&headers, error),
+    }
+}
+
+fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
+    let (status, code, message) = match error {
+        LibraryServiceError::InvalidName
+        | LibraryServiceError::InvalidLibraryId(_)
+        | LibraryServiceError::InvalidRootId(_)
+        | LibraryServiceError::InvalidKind(_) => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库请求无效",
+        ),
+        LibraryServiceError::LibraryNotFound => (
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在",
+        ),
+        LibraryServiceError::DuplicateRoot => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::LibraryRootDuplicate,
+            "根路径已存在",
+        ),
+        LibraryServiceError::OverlappingRoot => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            lux::ApiErrorCode::LibraryRootOverlap,
+            "根路径与同一媒体库的其他路径重叠",
+        ),
+        LibraryServiceError::Path(error) => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::LibraryPathUnavailable,
+            if error.is_unavailable() {
+                "媒体目录不可用"
+            } else {
+                "媒体目录无效"
+            },
+        ),
+        LibraryServiceError::RootNotFoundAfterInsert => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            "媒体根路径保存失败",
+        ),
+        LibraryServiceError::Storage(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        ),
+    };
+    api_error(headers, status, code, message).into_response()
+}
+
+fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
+    json!({
+        "id": library.id.to_string(),
+        "name": library.name,
+        "kind": library.kind.as_str(),
+        "isEnabled": library.is_enabled,
+        "realtimeWatchEnabled": library.realtime_watch_enabled,
+        "incrementalSchedule": library.incremental_schedule,
+        "reconciliationSchedule": library.reconciliation_schedule,
+        "metadataSchedule": library.metadata_schedule,
+        "scanConcurrency": library.scan_concurrency,
+        "probeConcurrency": library.probe_concurrency,
+        "lastScanAt": library.last_scan_at,
+        "roots": roots.iter().map(root_json).collect::<Vec<_>>(),
+    })
+}
+
+fn root_json(root: &LibraryRootRecord) -> Value {
+    json!({
+        "id": root.id.to_string(),
+        "libraryId": root.library_id.to_string(),
+        "canonicalPath": root.canonical_path,
+        "displayPath": root.display_path,
+        "isAvailable": root.is_available,
+        "isWritable": root.is_writable,
+        "lastCheckedAt": root.last_checked_at,
+        "unavailableSince": root.unavailable_since,
+        "scanCursor": root.scan_cursor,
+    })
 }
 
 fn user_json(user: &UserRecord) -> Value {

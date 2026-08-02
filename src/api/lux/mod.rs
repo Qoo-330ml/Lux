@@ -8,8 +8,12 @@ pub enum ApiErrorCode {
     DatabaseUnavailable,
     Internal,
     InvalidRequest,
+    LibraryPathUnavailable,
     LibraryPathNotWritable,
+    LibraryRootDuplicate,
+    LibraryRootOverlap,
     NotFound,
+    PermissionDenied,
     InvalidCredentials,
     SetupAlreadyCompleted,
 }
