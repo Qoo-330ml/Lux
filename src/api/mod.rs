@@ -2,7 +2,7 @@ pub mod lux;
 
 use std::{
     path::{Component, Path as FsPath, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use axum::{
@@ -302,16 +302,38 @@ pub fn app_with_state(state: AppState) -> Router {
         .layer(
             tower::ServiceBuilder::new()
                 .set_x_request_id(MakeRequestUuid)
-                .layer(TraceLayer::new_for_http().make_span_with(
-                    |request: &axum::http::Request<_>| {
-                        tracing::info_span!(
-                            "request",
-                            method = %request.method(),
-                            path = %safe_trace_path(request.uri()),
-                            version = ?request.version(),
-                        )
-                    },
-                ))
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(|request: &axum::http::Request<_>| {
+                            let request_id = request
+                                .headers()
+                                .get("x-request-id")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("unknown");
+                            tracing::info_span!(
+                                "request",
+                                method = %request.method(),
+                                path = %safe_trace_path(request.uri()),
+                                version = ?request.version(),
+                                "requestId" = %request_id,
+                                "durationMs" = tracing::field::Empty,
+                                "statusCode" = tracing::field::Empty,
+                            )
+                        })
+                        .on_response(
+                            |response: &Response, latency: Duration, span: &tracing::Span| {
+                                let duration_ms =
+                                    u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+                                span.record("durationMs", duration_ms);
+                                span.record("statusCode", response.status().as_u16());
+                                tracing::debug!(
+                                    latency = ?latency,
+                                    status = %response.status(),
+                                    "finished processing request"
+                                );
+                            },
+                        ),
+                )
                 .propagate_x_request_id(),
         )
 }
