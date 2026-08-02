@@ -8,6 +8,7 @@ pub mod domain;
 pub mod library;
 pub mod network;
 pub mod observability;
+pub mod security;
 pub mod storage;
 
 /// Package version exposed by the service.

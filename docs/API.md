@@ -23,6 +23,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 - `POST /api/v1/auth/login`：校验用户名和密码，成功后设置 `lux_session` 与 `lux_csrf` cookie。
 - 远程请求还需命中 `LUX_TRUSTED_PROXY_CIDRS` 规则（若经反代）并满足用户 `can_remote_access`。
+- 登录失败按来源和用户名限流；失败响应不区分用户不存在、密码错误或暂时封锁。
 - `GET /api/v1/auth/me`：读取当前 Web session，返回用户和权限。
 - `POST /api/v1/auth/logout`：需要有效 `lux_session` 和 `X-CSRF-Token`，成功返回 204 并撤销 session。
 
@@ -74,6 +75,7 @@ Lux 电影查询要求有效 Web session：
 - `GET /api/v1/home`：返回当前用户继续观看摘要和可见媒体库入口。
 - `GET /api/v1/items/{itemId}`：返回电影详情、媒体源和已探测轨道。
 - `GET /api/v1/collections/{collectionId}`：返回可访问 BOX_SET 及按媒体库 ACL 过滤后的成员。
+- `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；删除为禁用语义，最后一个服务器管理账户受保护。
 - `GET|HEAD /api/v1/items/{itemId}/images/{type}`、`/{type}/{index}`：读取本地 poster/fanart，支持 ETag 和 `If-None-Match`。
 
 Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：

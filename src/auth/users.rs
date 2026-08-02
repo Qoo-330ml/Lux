@@ -1,7 +1,7 @@
 use crate::{
     auth::password::{PasswordError, PasswordService},
     domain::ids::UserId,
-    storage::{Database, StorageError},
+    storage::{Database, StorageError, UpdateUser},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +66,48 @@ impl UserStore {
 
     pub async fn has_users(&self) -> Result<bool, UserStoreError> {
         Ok(self.database.has_users().await?)
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<UserRecord>, UserStoreError> {
+        self.database
+            .list_users()
+            .await?
+            .into_iter()
+            .map(user_record)
+            .collect()
+    }
+
+    pub async fn update_user(
+        &self,
+        user_id: &str,
+        update: UserUpdate<'_>,
+    ) -> Result<Option<UserRecord>, UserStoreError> {
+        let password_hash = update
+            .password
+            .filter(|password| !password.is_empty())
+            .map(|password| self.passwords.hash_password(password))
+            .transpose()?;
+        let updated = match self
+            .database
+            .update_user(
+                user_id,
+                UpdateUser {
+                    display_name: update.display_name,
+                    password_hash: password_hash.as_deref(),
+                    is_disabled: update.is_disabled,
+                    is_admin: update.is_admin,
+                    can_manage_server: update.can_manage_server,
+                    can_remote_access: update.can_remote_access,
+                    can_download: update.can_download,
+                },
+            )
+            .await
+        {
+            Ok(updated) => updated,
+            Err(StorageError::LastManager) => return Err(UserStoreError::LastManager),
+            Err(error) => return Err(UserStoreError::Storage(error)),
+        };
+        updated.map(user_record).transpose()
     }
 
     pub async fn create_initial_admin(
@@ -164,6 +206,7 @@ pub enum UserStoreError {
     SetupAlreadyCompleted,
     Password(PasswordError),
     Storage(StorageError),
+    LastManager,
 }
 
 impl From<PasswordError> for UserStoreError {
@@ -188,6 +231,9 @@ impl std::fmt::Display for UserStoreError {
             }
             Self::Password(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
+            Self::LastManager => {
+                formatter.write_str("at least one active server manager is required")
+            }
         }
     }
 }
@@ -197,7 +243,38 @@ impl std::error::Error for UserStoreError {
         match self {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
-            Self::InvalidUsername | Self::InvalidUserId(_) | Self::SetupAlreadyCompleted => None,
+            Self::InvalidUsername
+            | Self::InvalidUserId(_)
+            | Self::SetupAlreadyCompleted
+            | Self::LastManager => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UserUpdate<'a> {
+    pub display_name: Option<&'a str>,
+    pub password: Option<&'a str>,
+    pub is_disabled: Option<bool>,
+    pub is_admin: Option<bool>,
+    pub can_manage_server: Option<bool>,
+    pub can_remote_access: Option<bool>,
+    pub can_download: Option<bool>,
+}
+
+fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, UserStoreError> {
+    let id = stored
+        .id
+        .parse()
+        .map_err(|error: uuid::Error| UserStoreError::InvalidUserId(error.to_string()))?;
+    Ok(UserRecord {
+        id,
+        username_normalized: stored.username_normalized,
+        display_name: stored.display_name,
+        is_disabled: stored.is_disabled,
+        is_admin: stored.is_admin,
+        can_manage_server: stored.can_manage_server,
+        can_remote_access: stored.can_remote_access,
+        can_download: stored.can_download,
+    })
 }

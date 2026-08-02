@@ -42,7 +42,7 @@ use crate::{
         scanner::{ScanJobError, ScanJobService},
         tmdb::TmdbClient,
     },
-    auth::users::{UserRecord, UserStoreError},
+    auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
@@ -50,6 +50,7 @@ use crate::{
     config::Config,
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
     network::RemoteAccessPolicy,
+    security::LoginRateLimiter,
     storage::{Database, NewPlaybackEvent},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -71,6 +72,7 @@ pub struct AppState {
     scan_jobs: Option<ScanJobService>,
     collections: Option<CollectionService>,
     remote_access: RemoteAccessPolicy,
+    login_rate_limiter: LoginRateLimiter,
 }
 
 impl AppState {
@@ -105,6 +107,7 @@ impl AppState {
             scan_jobs: Some(ScanJobService::new(database.clone())),
             collections,
             remote_access: RemoteAccessPolicy::from_env(),
+            login_rate_limiter: LoginRateLimiter::default(),
         }
     }
 
@@ -143,6 +146,14 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries/{library_id}",
             patch(admin_update_library),
+        )
+        .route(
+            "/api/v1/admin/users",
+            get(admin_list_users).post(admin_create_user),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}",
+            patch(admin_update_user).delete(admin_disable_user),
         )
         .route(
             "/api/v1/admin/metadata/pending",
@@ -256,6 +267,14 @@ fn safe_trace_path(uri: &axum::http::Uri) -> &str {
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn login_attempt_key(headers: &HeaderMap, username: &str) -> String {
+    format!(
+        "{}:{}",
+        header_str(headers, "x-lux-peer-ip").unwrap_or("local"),
+        username.trim().to_ascii_lowercase()
+    )
 }
 
 fn emby_routes() -> Router<AppState> {
@@ -408,9 +427,13 @@ async fn emby_authenticate(
     State(state): State<AppState>,
     Json(request): Json<EmbyAuthenticateRequest>,
 ) -> Response {
-    let Some(auth) = state.emby_auth else {
+    let Some(auth) = state.emby_auth.clone() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let login_key = login_attempt_key(&headers, &request.username);
+    if !state.login_rate_limiter.is_allowed(&login_key).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let device = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -420,29 +443,34 @@ async fn emby_authenticate(
         .authenticate(&request.username, &request.password, &device)
         .await
     {
-        Ok(Some(result))
+        Ok(Some(result)) => {
             if state.remote_access.is_remote(
                 header_str(&headers, "x-lux-peer-ip"),
                 header_str(&headers, "x-forwarded-for"),
-            ) && !result.user.can_remote_access =>
-        {
-            let _ = auth.logout(&result.token).await;
-            StatusCode::FORBIDDEN.into_response()
+            ) && !result.user.can_remote_access
+            {
+                let _ = auth.logout(&result.token).await;
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            state.login_rate_limiter.record_success(&login_key).await;
+            Json(json!({
+                "User": emby_user_json(&result.user),
+                "SessionInfo": {
+                    "Client": result.device.client,
+                    "DeviceId": result.device.device_id,
+                    "DeviceName": result.device.device,
+                    "ApplicationVersion": result.device.version,
+                    "UserId": result.user.id.to_string()
+                },
+                "AccessToken": result.token,
+                "ServerId": state.server_id
+            }))
+            .into_response()
         }
-        Ok(Some(result)) => Json(json!({
-            "User": emby_user_json(&result.user),
-            "SessionInfo": {
-                "Client": result.device.client,
-                "DeviceId": result.device.device_id,
-                "DeviceName": result.device.device,
-                "ApplicationVersion": result.device.version,
-                "UserId": result.user.id.to_string()
-            },
-            "AccessToken": result.token,
-            "ServerId": state.server_id
-        }))
-        .into_response(),
-        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
+        Ok(None) => {
+            state.login_rate_limiter.record_failure(&login_key).await;
+            StatusCode::UNAUTHORIZED.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -1876,7 +1904,7 @@ async fn auth_login(
     State(state): State<AppState>,
     Json(request): Json<AuthLoginRequest>,
 ) -> Response {
-    let Some(auth) = state.auth else {
+    let Some(auth) = state.auth.clone() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1886,9 +1914,23 @@ async fn auth_login(
         .into_response();
     };
 
+    let login_key = login_attempt_key(&headers, &request.username);
+    if !state.login_rate_limiter.is_allowed(&login_key).await {
+        return api_error(
+            &headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::InvalidCredentials,
+            "用户名或密码错误",
+        )
+        .into_response();
+    }
     let session = match auth.login(&request.username, &request.password).await {
-        Ok(Some(session)) => session,
+        Ok(Some(session)) => {
+            state.login_rate_limiter.record_success(&login_key).await;
+            session
+        }
         Ok(None) => {
+            state.login_rate_limiter.record_failure(&login_key).await;
             return api_error(
                 &headers,
                 StatusCode::UNAUTHORIZED,
@@ -3815,6 +3857,202 @@ async fn admin_list_libraries(headers: HeaderMap, State(state): State<AppState>)
     }
 }
 
+async fn admin_list_users(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users.list_users().await {
+        Ok(users) => Json(json!({
+            "users": users.iter().map(user_json).collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateUserRequest {
+    username: String,
+    #[serde(default)]
+    display_name: String,
+    password: String,
+    #[serde(default)]
+    is_admin: bool,
+}
+
+async fn admin_create_user(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<CreateUserRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users
+        .create_user(
+            &request.username,
+            &request.display_name,
+            &request.password,
+            request.is_admin,
+        )
+        .await
+    {
+        Ok(user) => (
+            StatusCode::CREATED,
+            Json(json!({ "user": user_json(&user) })),
+        )
+            .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UpdateUserRequest {
+    display_name: Option<String>,
+    password: Option<String>,
+    is_disabled: Option<bool>,
+    is_admin: Option<bool>,
+    can_manage_server: Option<bool>,
+    can_remote_access: Option<bool>,
+    can_download: Option<bool>,
+}
+
+async fn admin_update_user(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateUserRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users
+        .update_user(
+            &user_id,
+            UserUpdate {
+                display_name: request.display_name.as_deref(),
+                password: request.password.as_deref(),
+                is_disabled: request.is_disabled,
+                is_admin: request.is_admin,
+                can_manage_server: request.can_manage_server,
+                can_remote_access: request.can_remote_access,
+                can_download: request.can_download,
+            },
+        )
+        .await
+    {
+        Ok(Some(user)) => Json(json!({ "user": user_json(&user) })).into_response(),
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
+async fn admin_disable_user(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users
+        .update_user(
+            &user_id,
+            UserUpdate {
+                is_disabled: Some(true),
+                ..UserUpdate::default()
+            },
+        )
+        .await
+    {
+        Ok(Some(user)) => Json(json!({ "user": user_json(&user) })).into_response(),
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
+fn user_store_error(headers: &HeaderMap, error: UserStoreError) -> Response {
+    match error {
+        UserStoreError::InvalidUsername | UserStoreError::Password(_) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户请求无效",
+        )
+        .into_response(),
+        UserStoreError::LastManager => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PermissionDenied,
+            "至少需要一个启用的服务器管理账户",
+        )
+        .into_response(),
+        UserStoreError::InvalidUserId(_) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response(),
+        UserStoreError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "用户数据暂时不可用",
+        )
+        .into_response(),
+        UserStoreError::SetupAlreadyCompleted => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "初始化已完成",
+        )
+        .into_response(),
+    }
+}
+
 async fn admin_list_pending_metadata(
     headers: HeaderMap,
     Query(query): Query<MetadataCandidateQuery>,
@@ -4264,6 +4502,7 @@ fn user_json(user: &UserRecord) -> Value {
         "id": user.id.to_string(),
         "usernameNormalized": user.username_normalized,
         "displayName": user.display_name,
+        "isDisabled": user.is_disabled,
         "isAdmin": user.is_admin,
         "canManageServer": user.can_manage_server,
         "canRemoteAccess": user.can_remote_access,

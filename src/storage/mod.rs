@@ -228,6 +228,109 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_user_by_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<StoredUser>, StorageError> {
+        sqlx::query(
+            "SELECT id, username_normalized, display_name, password_hash,
+                    is_disabled, is_admin, can_manage_server,
+                    can_remote_access, can_download
+             FROM users WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_user))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_user(
+        &self,
+        user_id: &str,
+        update: UpdateUser<'_>,
+    ) -> Result<Option<StoredUser>, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(current) = sqlx::query(
+            "SELECT is_disabled, can_manage_server
+             FROM users WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        else {
+            return Ok(None);
+        };
+        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
+        let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
+        let next_disabled = update.is_disabled.unwrap_or(current_disabled);
+        let next_can_manage = update.can_manage_server.unwrap_or(current_can_manage);
+        if current_can_manage && (!next_can_manage || next_disabled) {
+            let remaining: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM users
+                 WHERE can_manage_server = 1 AND is_disabled = 0 AND id != ?",
+            )
+            .bind(user_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            if remaining == 0 {
+                return Err(StorageError::LastManager);
+            }
+        }
+        sqlx::query(
+            "UPDATE users
+             SET display_name = COALESCE(?, display_name),
+                 password_hash = COALESCE(?, password_hash),
+                 is_disabled = COALESCE(?, is_disabled),
+                 is_admin = COALESCE(?, is_admin),
+                 can_manage_server = COALESCE(?, can_manage_server),
+                 can_remote_access = COALESCE(?, can_remote_access),
+                 can_download = COALESCE(?, can_download),
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(update.display_name)
+        .bind(update.password_hash)
+        .bind(update.is_disabled)
+        .bind(update.is_admin)
+        .bind(update.can_manage_server)
+        .bind(update.can_remote_access)
+        .bind(update.can_download)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.find_user_by_id(user_id).await
+    }
+
     pub(crate) async fn find_user_by_access_token(
         &self,
         token_hash: &[u8],
@@ -3168,6 +3271,30 @@ pub(crate) struct StoredUser {
     pub(crate) can_download: bool,
 }
 
+fn stored_user(row: sqlx::sqlite::SqliteRow) -> StoredUser {
+    StoredUser {
+        id: row.get("id"),
+        username_normalized: row.get("username_normalized"),
+        display_name: row.get("display_name"),
+        password_hash: row.get("password_hash"),
+        is_disabled: row.get::<i64, _>("is_disabled") != 0,
+        is_admin: row.get::<i64, _>("is_admin") != 0,
+        can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
+        can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
+        can_download: row.get::<i64, _>("can_download") != 0,
+    }
+}
+
+pub(crate) struct UpdateUser<'a> {
+    pub(crate) display_name: Option<&'a str>,
+    pub(crate) password_hash: Option<&'a str>,
+    pub(crate) is_disabled: Option<bool>,
+    pub(crate) is_admin: Option<bool>,
+    pub(crate) can_manage_server: Option<bool>,
+    pub(crate) can_remote_access: Option<bool>,
+    pub(crate) can_download: Option<bool>,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredLibrary {
     pub(crate) id: String,
@@ -3631,6 +3758,7 @@ pub enum StorageError {
         path: PathBuf,
         source: MigrateError,
     },
+    LastManager,
 }
 
 impl std::fmt::Display for StorageError {
@@ -3649,6 +3777,9 @@ impl std::fmt::Display for StorageError {
                     path.display()
                 )
             }
+            Self::LastManager => {
+                formatter.write_str("at least one active server manager is required")
+            }
         }
     }
 }
@@ -3659,6 +3790,7 @@ impl std::error::Error for StorageError {
             Self::Io { source, .. } => Some(source),
             Self::Sqlx { source, .. } => Some(source),
             Self::Migration { source, .. } => Some(source),
+            Self::LastManager => None,
         }
     }
 }
