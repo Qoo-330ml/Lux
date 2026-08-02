@@ -6,6 +6,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions},
 };
 use tokio::fs;
+use uuid::Uuid;
 
 use crate::config::Config;
 
@@ -15,6 +16,7 @@ static MIGRATOR: Migrator = sqlx::migrate!();
 pub struct Database {
     pool: SqlitePool,
     path: PathBuf,
+    server_id: String,
 }
 
 impl Database {
@@ -46,12 +48,26 @@ impl Database {
             pool.close().await;
             return Err(StorageError::Migration { path, source });
         }
+        let server_id = ensure_server_id(&pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: path.clone(),
+                source,
+            })?;
 
-        Ok(Self { pool, path })
+        Ok(Self {
+            pool,
+            path,
+            server_id,
+        })
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub fn server_id(&self) -> &str {
+        &self.server_id
     }
 
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
@@ -293,6 +309,28 @@ pub(crate) struct StoredWebSession {
     pub(crate) can_manage_server: bool,
     pub(crate) can_remote_access: bool,
     pub(crate) can_download: bool,
+}
+
+async fn ensure_server_id(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let existing =
+        sqlx::query_scalar::<_, String>("SELECT value FROM lux_meta WHERE key = 'server_id'")
+            .fetch_optional(&mut *transaction)
+            .await?;
+    if let Some(server_id) = existing {
+        transaction.commit().await?;
+        return Ok(server_id);
+    }
+
+    let generated = Uuid::now_v7().to_string();
+    sqlx::query("INSERT OR IGNORE INTO lux_meta (key, value) VALUES ('server_id', ?)")
+        .bind(generated)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    sqlx::query_scalar("SELECT value FROM lux_meta WHERE key = 'server_id'")
+        .fetch_one(pool)
+        .await
 }
 
 #[derive(Debug)]

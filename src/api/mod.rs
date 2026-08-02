@@ -30,6 +30,7 @@ use crate::{
 pub struct AppState {
     database: Option<Database>,
     config_dir: Option<PathBuf>,
+    server_id: String,
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
 }
@@ -41,9 +42,11 @@ impl AppState {
         setup: SetupService,
         auth: WebAuthService,
     ) -> Self {
+        let server_id = database.server_id().to_owned();
         Self {
             database: Some(database),
             config_dir: Some(config.config_dir),
+            server_id,
             setup: Some(setup),
             auth: Some(auth),
         }
@@ -64,6 +67,8 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/me", get(auth_me))
+        .merge(emby_routes())
+        .nest("/emby", emby_routes())
         .with_state(state)
         .layer(
             tower::ServiceBuilder::new()
@@ -71,6 +76,47 @@ pub fn app_with_state(state: AppState) -> Router {
                 .layer(TraceLayer::new_for_http())
                 .propagate_x_request_id(),
         )
+}
+
+fn emby_routes() -> Router<AppState> {
+    Router::new()
+        .route("/System/Info/Public", get(emby_public_system_info))
+        .route("/System/Info", get(emby_system_info))
+        .route("/System/Ping", get(emby_ping).post(emby_ping))
+}
+
+async fn emby_public_system_info(State(state): State<AppState>) -> Json<Value> {
+    let startup_wizard_completed = match state.setup.as_ref() {
+        Some(setup) => setup.status().await.unwrap_or(false),
+        None => false,
+    };
+    Json(json!({
+        "LocalAddress": "",
+        "ServerName": "Lux",
+        "Version": VERSION,
+        "Id": state.server_id,
+        "StartupWizardCompleted": startup_wizard_completed
+    }))
+}
+
+async fn emby_system_info(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "LocalAddress": "",
+        "ServerName": "Lux",
+        "Version": VERSION,
+        "Id": state.server_id,
+        "OperatingSystem": std::env::consts::OS,
+        "OperatingSystemDisplayName": std::env::consts::OS,
+        "SupportsLibraryMonitor": false,
+        "SupportsHttps": false,
+        "HasPendingRestart": false,
+        "IsShuttingDown": false,
+        "HttpServerPortNumber": 8097
+    }))
+}
+
+async fn emby_ping() -> StatusCode {
+    StatusCode::OK
 }
 
 async fn live() -> Json<Value> {

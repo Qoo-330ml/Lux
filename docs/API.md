@@ -32,3 +32,13 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 ## 当前边界
 
 上述接口是 LUX-021/LUX-022 的基础能力。媒体库、Emby 兼容、用户管理和进度接口按开发规格后续任务逐项增加；未实现端点不应被客户端兼容性声明引用。
+
+## Emby 连接探针（LUX-023）
+
+以下端点同时接受根路径和 `/emby` 前缀：
+
+- `GET /System/Info/Public`
+- `GET /System/Info`
+- `GET|POST /System/Ping`
+
+响应只返回 Lux 名称、版本、持久 ServerId 和必要能力字段，不返回配置目录、数据库路径或其他内部路径。LUX-023 的自动化测试是本地协议 shape 测试；VidHub、SenPlayer 和 Infuse 的真实连接证据要到 LUX-025 记录。
