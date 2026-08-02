@@ -7,6 +7,7 @@ use luxd::{
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 async fn test_server(
@@ -118,5 +119,34 @@ async fn login_me_logout_and_csrf_are_session_backed() -> Result<(), Box<dyn std
     assert_eq!(me_after_logout.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_web_sessions_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let auth = WebAuthService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+
+    let session = auth
+        .login("admin", "correct password")
+        .await?
+        .ok_or("expected session")?;
+    let session_hash = Sha256::digest(session.session_token.as_bytes()).to_vec();
+    sqlx::query(
+        "UPDATE web_sessions SET expires_at = unixepoch() - 1
+         WHERE session_token_hash = ?",
+    )
+    .bind(session_hash)
+    .execute(database.pool())
+    .await?;
+
+    assert!(auth.resolve(&session.session_token).await?.is_none());
     Ok(())
 }
