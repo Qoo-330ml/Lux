@@ -47,6 +47,9 @@ const api = {
   retryJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/retry", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
   pendingMetadata() { return this.request("/api/v1/admin/metadata/pending?page=1&pageSize=50"); },
+  startBatchReidentify(itemIds) { return this.request("/api/v1/admin/metadata/reidentify", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ itemIds }) }); },
+  metadataReidentifyJob(id) { return this.request("/api/v1/admin/metadata/reidentify/" + encodeURIComponent(id)); },
+  retryMetadataReidentify(id) { return this.request("/api/v1/admin/metadata/reidentify/" + encodeURIComponent(id), { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   adminCandidates(itemId) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates?page=1&pageSize=50"); },
   searchCandidates(itemId, query, year) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ query, year: year || undefined }) }); },
   selectCandidate(itemId, candidateId, mode) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates/" + encodeURIComponent(candidateId) + "/select", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ mode }) }); },
@@ -165,7 +168,7 @@ async function loadRoute() {
     } else if (state.route === "admin") {
       const [ready, libraries, users, audit, pending, jobs] = await Promise.all([api.ready(), api.adminLibraries(), api.adminUsers(), api.audit(), api.pendingMetadata(), api.adminJobs()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
-      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), jobDetail: state.admin?.jobDetail || null, jobEvents: state.admin?.jobEvents || [], jobEventsTotal: state.admin?.jobEventsTotal || 0, jobEventsPage: state.admin?.jobEventsPage || 1, jobEventFilters: state.admin?.jobEventFilters || {} };
+      state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), reidentifyJobs: state.admin?.reidentifyJobs || [], jobDetail: state.admin?.jobDetail || null, jobEvents: state.admin?.jobEvents || [], jobEventsTotal: state.admin?.jobEventsTotal || 0, jobEventsPage: state.admin?.jobEventsPage || 1, jobEventFilters: state.admin?.jobEventFilters || {} };
       view.innerHTML = renderAdmin();
     } else if (state.route === "account") {
       const sessions = await api.sessions();
@@ -252,6 +255,7 @@ function renderChildrenPanel(item, result, showingEpisodes = false) {
 
 function renderAdmin() {
   const { ready = {}, libraries = [], users = [], audit: events = [], pending = [], jobs = [], access = {} } = state.admin || {};
+  const reidentifyJobs = state.admin?.reidentifyJobs || [];
   const jobDetail = state.admin?.jobDetail || null;
   const userRows = users.map((user) => "<tr><td>" + escapeHtml(user.displayName || user.usernameNormalized) + "<small>" + escapeHtml(user.usernameNormalized) + "</small></td><td>" + (user.isDisabled ? "已禁用" : user.canManageServer ? "管理员" : "普通用户") + "</td><td><a class=\"button secondary\" href=\"#user-" + escapeHtml(user.id) + "\">编辑</a> " + (user.isDisabled ? "" : "<button class=\"button secondary\" data-disable-user=\"" + escapeHtml(user.id) + "\">禁用</button>") + "</td></tr>").join("");
   const userEditors = users.map((user) => renderUserEditor(user, libraries, new Set(access[user.id] || []))).join("");
@@ -262,7 +266,8 @@ function renderAdmin() {
     "<section class=\"section\"><div class=\"section-heading\"><h2>媒体库与扫描</h2><span>计划字段留空可清除</span></div><div class=\"admin-library-grid\">" + (libraryCards || "<div class=\"empty\"><h3>还没有媒体库</h3><p>先创建一个媒体库，再添加根路径。</p></div>") + "</div></section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>任务</h2><span>失败任务可重试，运行中任务可取消</span></div><form class=\"filter-form\" data-action=\"job-filter\"><label>状态 <select name=\"status\"><option value=\"\">全部</option><option value=\"RUNNING\">运行中</option><option value=\"FAILED\">失败</option><option value=\"CANCELLED\">已取消</option><option value=\"COMPLETED\">已完成</option></select></label><button class=\"button secondary\" type=\"submit\">筛选任务</button></form>" + renderJobs(jobs, libraries) + (jobDetail ? renderJobDetail(jobDetail, state.admin?.jobEvents || [], state.admin?.jobEventsTotal || 0, state.admin?.jobEventsPage || 1) : "") + "</section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>密码为空表示不修改</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" required><input name=\"displayName\" placeholder=\"显示名称\" aria-label=\"显示名称\"><input name=\"password\" type=\"password\" placeholder=\"初始密码\" aria-label=\"初始密码\" required><label class=\"check\"><input name=\"isAdmin\" type=\"checkbox\"> 管理员</label><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div>" + userEditors + "</section>" +
-    "<section class=\"section\"><div class=\"section-heading\"><h2>待处理元数据</h2><span>候选写回前请检查差异</span></div><div class=\"candidate-list\">" + renderPendingCandidates(pending) + "</div></section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><div><h2>待处理元数据</h2><span>候选写回前请检查差异</span></div><button class=\"button secondary\" type=\"button\" data-action=\"batch-reidentify\">批量重新识别已选条目</button></div><div class=\"candidate-list\">" + renderPendingCandidates(pending) + "</div></section>" +
+    renderMetadataReidentifyJobs(reidentifyJobs) +
     "<section class=\"section\"><div class=\"section-heading\"><h2>最近审计</h2><span>只展示最近 8 条</span></div><ul class=\"admin-list\">" + (auditRows || "<li><span>暂无管理操作</span></li>") + "</ul></section>";
 }
 
@@ -288,12 +293,24 @@ function renderJobDetail(job, events = [], total = 0, page = 1) {
 
 function renderPendingCandidates(candidates) {
   if (!candidates.length) return "<div class=\"empty\"><h3>没有待处理候选</h3><p>扫描和识别产生的低置信候选会显示在这里。</p></div>";
+  const itemIds = new Set();
   return candidates.map((candidate) => {
     const candidateData = candidate.candidate && typeof candidate.candidate === "object" ? candidate.candidate : {};
     const candidateTitle = candidateData.title || candidateData.name || candidate.providerId || "候选元数据";
     const diffs = (candidate.fieldDiffs || []).map((diff) => "<li><strong>" + escapeHtml(diff.field) + "</strong><span>" + escapeHtml(String(diff.current ?? "暂无")) + " → " + escapeHtml(String(diff.candidate ?? "暂无")) + "</span></li>").join("");
-    return "<article class=\"candidate-card\"><div class=\"section-heading\"><div><h3>" + escapeHtml(candidate.itemTitle || "未命名条目") + "</h3><span>" + escapeHtml(candidate.provider || "provider") + " · " + escapeHtml(candidateTitle) + "</span></div><span class=\"chip\">" + escapeHtml(candidate.status || "PENDING") + "</span></div><ul class=\"diff-list\">" + (diffs || "<li><span>没有可展示的字段差异</span></li>") + "</ul><div class=\"form-actions\"><button class=\"button secondary\" data-select-candidate=\"" + escapeHtml(candidate.itemId) + "|" + escapeHtml(candidate.id) + "|fillMissing\">仅补缺</button><button class=\"button\" data-select-candidate=\"" + escapeHtml(candidate.itemId) + "|" + escapeHtml(candidate.id) + "|refreshUnlocked\">刷新未锁定</button></div></article>";
+    const batchToggle = itemIds.has(candidate.itemId) ? "" : "<label class=\"check\"><input type=\"checkbox\" data-batch-item=\"" + escapeHtml(candidate.itemId) + "\"> 批量重新识别</label>";
+    itemIds.add(candidate.itemId);
+    return "<article class=\"candidate-card\"><div class=\"section-heading\"><div><h3>" + escapeHtml(candidate.itemTitle || "未命名条目") + "</h3><span>" + escapeHtml(candidate.provider || "provider") + " · " + escapeHtml(candidateTitle) + "</span></div><div class=\"form-actions\">" + batchToggle + "<span class=\"chip\">" + escapeHtml(candidate.status || "PENDING") + "</span></div></div><ul class=\"diff-list\">" + (diffs || "<li><span>没有可展示的字段差异</span></li>") + "</ul><div class=\"form-actions\"><button class=\"button secondary\" data-select-candidate=\"" + escapeHtml(candidate.itemId) + "|" + escapeHtml(candidate.id) + "|fillMissing\">仅补缺</button><button class=\"button\" data-select-candidate=\"" + escapeHtml(candidate.itemId) + "|" + escapeHtml(candidate.id) + "|refreshUnlocked\">刷新未锁定</button></div></article>";
   }).join("");
+}
+
+function renderMetadataReidentifyJobs(jobs) {
+  if (!jobs.length) return "";
+  const rows = jobs.map((job) => {
+    const retry = job.status === "FAILED" ? "<button class=\"button secondary\" type=\"button\" data-retry-reidentify=\"" + escapeHtml(job.id) + "\">重试</button>" : "";
+    return "<tr><td><code>" + escapeHtml(job.id) + "</code></td><td>" + escapeHtml(job.status) + "</td><td>" + escapeHtml(String(job.processedCount || 0)) + "/" + escapeHtml(String(job.totalCount || 0)) + "</td><td>" + escapeHtml(job.error || "") + "</td><td><button class=\"button secondary\" type=\"button\" data-refresh-reidentify=\"" + escapeHtml(job.id) + "\">刷新</button> " + retry + "</td></tr>";
+  }).join("");
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>批量重新识别任务</h2><span>本次会话创建的任务</span></div><div class=\"table-wrap\"><table><thead><tr><th>ID</th><th>状态</th><th>进度</th><th>错误</th><th>操作</th></tr></thead><tbody>" + rows + "</tbody></table></div></section>";
 }
 
 function renderAdminLibrary(library) {
@@ -375,6 +392,32 @@ function bind() {
     if (!window.confirm("删除这张图片及其索引？")) return;
     try { await api.deleteAdminImage(state.item.id, element.dataset.deleteImage); state.error = ""; state.notice = "图片已删除。"; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-action='batch-reidentify']").forEach((element) => element.addEventListener("click", async () => {
+    const itemIds = [...new Set(Array.from(document.querySelectorAll("[data-batch-item]:checked"), (input) => input.dataset.batchItem))];
+    if (!itemIds.length) { state.error = "请先选择至少一个媒体条目。"; state.notice = ""; render(); return; }
+    element.disabled = true;
+    try {
+      const result = await api.startBatchReidentify(itemIds);
+      state.admin.reidentifyJobs = [result.job, ...(state.admin.reidentifyJobs || []).filter((job) => job.id !== result.job?.id)];
+      state.error = "";
+      state.notice = "批量重新识别任务已创建：" + (result.job?.id || "");
+      render();
+    } catch (error) { element.disabled = false; state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-refresh-reidentify]").forEach((element) => element.addEventListener("click", async () => {
+    try {
+      const result = await api.metadataReidentifyJob(element.dataset.refreshReidentify);
+      state.admin.reidentifyJobs = (state.admin.reidentifyJobs || []).map((job) => job.id === result.job.id ? result.job : job);
+      state.error = ""; state.notice = "批量任务状态已刷新。"; render();
+    } catch (error) { state.error = error.message; state.notice = ""; render(); }
+  }));
+  document.querySelectorAll("[data-retry-reidentify]").forEach((element) => element.addEventListener("click", async () => {
+    try {
+      const result = await api.retryMetadataReidentify(element.dataset.retryReidentify);
+      state.admin.reidentifyJobs = (state.admin.reidentifyJobs || []).map((job) => job.id === result.job.id ? result.job : job);
+      state.error = ""; state.notice = "批量任务已重新排队。"; render();
+    } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='search-candidates']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();

@@ -9,6 +9,7 @@ pub mod metadata;
 pub mod nfo;
 pub mod playback;
 pub mod probe;
+pub mod reidentify;
 pub mod scanner;
 pub mod settings;
 pub mod setup;

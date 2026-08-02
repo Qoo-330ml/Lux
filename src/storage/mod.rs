@@ -1427,6 +1427,286 @@ impl Database {
             })
     }
 
+    pub(crate) async fn create_metadata_reidentify_job(
+        &self,
+        job_id: &str,
+        item_ids: &[String],
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_jobs (id, status, total_count)
+             VALUES (?, 'QUEUED', ?)",
+        )
+        .bind(job_id)
+        .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        for item_id in item_ids {
+            sqlx::query(
+                "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+                 VALUES (?, ?, 'PENDING')",
+            )
+            .bind(job_id)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn find_metadata_reidentify_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<StoredMetadataReidentifyJob>, StorageError> {
+        sqlx::query(
+            "SELECT id, status, processed_count, total_count, error,
+                    created_at, updated_at, started_at, finished_at
+             FROM metadata_reidentify_jobs WHERE id = ?",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_metadata_reidentify_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_metadata_reidentify_job(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE metadata_reidentify_jobs
+             SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'QUEUED'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn next_metadata_reidentify_item(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT item_id FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND status = 'PENDING'
+             ORDER BY item_id LIMIT 1",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_metadata_reidentify_item(
+        &self,
+        job_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE metadata_reidentify_job_items
+             SET status = 'RUNNING', updated_at = unixepoch()
+             WHERE job_id = ? AND item_id = ? AND status = 'PENDING'",
+        )
+        .bind(job_id)
+        .bind(item_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_metadata_reidentify_item(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        status: &str,
+        candidate_count: i64,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "UPDATE metadata_reidentify_job_items
+             SET status = ?, candidate_count = ?, error = ?, updated_at = unixepoch()
+             WHERE job_id = ? AND item_id = ? AND status = 'RUNNING'",
+        )
+        .bind(status)
+        .bind(candidate_count)
+        .bind(error)
+        .bind(job_id)
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        sqlx::query(
+            "UPDATE metadata_reidentify_jobs
+             SET processed_count = processed_count + 1, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn finish_metadata_reidentify_job(
+        &self,
+        job_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE metadata_reidentify_jobs
+             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND status IN ('QUEUED', 'RUNNING')",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn retry_metadata_reidentify_job(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let result = sqlx::query(
+            "UPDATE metadata_reidentify_jobs
+             SET status = 'QUEUED',
+                 processed_count = (
+                     SELECT COUNT(*) FROM metadata_reidentify_job_items
+                     WHERE job_id = ? AND status = 'COMPLETED'
+                 ),
+                 error = NULL, started_at = NULL, finished_at = NULL,
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'FAILED'",
+        )
+        .bind(job_id)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if result.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE metadata_reidentify_job_items
+                 SET status = 'PENDING', candidate_count = 0, error = NULL,
+                     updated_at = unixepoch()
+                 WHERE job_id = ? AND status = 'FAILED'",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn list_metadata_reidentify_items(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<StoredMetadataReidentifyItem>, StorageError> {
+        sqlx::query(
+            "SELECT job_id, item_id, status, candidate_count, error, updated_at
+             FROM metadata_reidentify_job_items WHERE job_id = ? ORDER BY item_id",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(stored_metadata_reidentify_item)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_scan_job(
         &self,
         id: &str,
@@ -3955,6 +4235,54 @@ pub(crate) struct NewMetadataCandidate<'a> {
     pub(crate) candidate_json: &'a str,
     pub(crate) score: f64,
     pub(crate) expires_at: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredMetadataReidentifyJob {
+    pub(crate) id: String,
+    pub(crate) status: String,
+    pub(crate) processed_count: i64,
+    pub(crate) total_count: i64,
+    pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredMetadataReidentifyItem {
+    pub(crate) job_id: String,
+    pub(crate) item_id: String,
+    pub(crate) status: String,
+    pub(crate) candidate_count: i64,
+    pub(crate) error: Option<String>,
+    pub(crate) updated_at: i64,
+}
+
+fn stored_metadata_reidentify_job(row: sqlx::sqlite::SqliteRow) -> StoredMetadataReidentifyJob {
+    StoredMetadataReidentifyJob {
+        id: row.get("id"),
+        status: row.get("status"),
+        processed_count: row.get("processed_count"),
+        total_count: row.get("total_count"),
+        error: row.get("error"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
+    }
+}
+
+fn stored_metadata_reidentify_item(row: sqlx::sqlite::SqliteRow) -> StoredMetadataReidentifyItem {
+    StoredMetadataReidentifyItem {
+        job_id: row.get("job_id"),
+        item_id: row.get("item_id"),
+        status: row.get("status"),
+        candidate_count: row.get("candidate_count"),
+        error: row.get("error"),
+        updated_at: row.get("updated_at"),
+    }
 }
 
 fn stored_metadata_candidate(row: sqlx::sqlite::SqliteRow) -> StoredMetadataCandidate {

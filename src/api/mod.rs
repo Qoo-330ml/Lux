@@ -41,6 +41,7 @@ use crate::{
             ImageError, ImageService, ImageWriteError, ImageWriteService, normalize_image_type,
         },
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
+        reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
         settings::{read_tmdb_token, write_tmdb_token},
         tmdb::{TmdbClient, TmdbError},
@@ -73,6 +74,7 @@ pub struct AppState {
     access: Option<MediaAccessService>,
     metadata_candidates: Option<MetadataCandidateService>,
     metadata_selection: Option<MetadataSelectionService>,
+    metadata_reidentify: Option<MetadataReidentifyService>,
     scan_jobs: Option<ScanJobService>,
     tmdb: Option<TmdbClient>,
     collections: Option<CollectionService>,
@@ -98,6 +100,9 @@ impl AppState {
         let collections = tmdb
             .clone()
             .map(|tmdb| CollectionService::new(database.clone(), tmdb));
+        let metadata_reidentify = tmdb
+            .clone()
+            .map(|tmdb| MetadataReidentifyService::new(database.clone(), tmdb));
         Self {
             database: Some(database.clone()),
             config_dir: Some(config.config_dir),
@@ -112,6 +117,7 @@ impl AppState {
             access: Some(access),
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
+            metadata_reidentify,
             scan_jobs: Some(ScanJobService::new(database.clone())),
             tmdb,
             collections,
@@ -125,7 +131,8 @@ impl AppState {
             return self;
         };
         self.tmdb = Some(tmdb.clone());
-        self.collections = Some(CollectionService::new(database, tmdb));
+        self.collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
+        self.metadata_reidentify = Some(MetadataReidentifyService::new(database, tmdb));
         self
     }
 
@@ -181,6 +188,14 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/metadata/pending",
             get(admin_list_pending_metadata),
+        )
+        .route(
+            "/api/v1/admin/metadata/reidentify",
+            post(admin_start_metadata_reidentify),
+        )
+        .route(
+            "/api/v1/admin/metadata/reidentify/{job_id}",
+            get(admin_get_metadata_reidentify).post(admin_retry_metadata_reidentify),
         )
         .route(
             "/api/v1/admin/items/{item_id}/identify/candidates",
@@ -4108,6 +4123,13 @@ struct MetadataCandidateSearchRequest {
     year: Option<i32>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetadataReidentifyRequest {
+    #[serde(default)]
+    item_ids: Vec<String>,
+}
+
 async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -5212,6 +5234,126 @@ async fn admin_list_pending_metadata(
     }
 }
 
+async fn admin_start_metadata_reidentify(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<MetadataReidentifyRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if request
+        .item_ids
+        .iter()
+        .any(|item_id| item_id.parse::<crate::domain::ids::ItemId>().is_err())
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "TMDb 重新识别服务尚未配置",
+        )
+        .into_response();
+    };
+    let job = match reidentify.create_job(request.item_ids).await {
+        Ok(job) => job,
+        Err(error) => return metadata_reidentify_error(&headers, error),
+    };
+    let worker = reidentify.clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        worker.run(&job_id).await;
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "METADATA_REIDENTIFY_STARTED",
+        Some("metadata_reidentify_job"),
+        Some(&job.id),
+        "{}",
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": metadata_reidentify_job_json(&job) })),
+    )
+        .into_response()
+}
+
+async fn admin_get_metadata_reidentify(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "TMDb 重新识别服务尚未配置",
+        )
+        .into_response();
+    };
+    match reidentify.get_job(&job_id).await {
+        Ok(job) => Json(json!({ "job": metadata_reidentify_job_json(&job) })).into_response(),
+        Err(error) => metadata_reidentify_error(&headers, error),
+    }
+}
+
+async fn admin_retry_metadata_reidentify(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "TMDb 重新识别服务尚未配置",
+        )
+        .into_response();
+    };
+    let job = match reidentify.retry_job(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return metadata_reidentify_error(&headers, error),
+    };
+    let worker = reidentify.clone();
+    let worker_job_id = job.id.clone();
+    tokio::spawn(async move {
+        worker.run(&worker_job_id).await;
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "METADATA_REIDENTIFY_RETRIED",
+        Some("metadata_reidentify_job"),
+        Some(&job.id),
+        "{}",
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": metadata_reidentify_job_json(&job) })),
+    )
+        .into_response()
+}
+
 async fn admin_list_item_candidates(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -5565,6 +5707,81 @@ fn metadata_candidate_page_json(page: &MetadataCandidatePage) -> Value {
         "page": page.offset / page.limit + 1,
         "pageSize": page.limit,
     })
+}
+
+fn metadata_reidentify_job_json(
+    job: &crate::application::reidentify::MetadataReidentifyJob,
+) -> Value {
+    json!({
+        "id": job.id,
+        "status": job.status,
+        "processedCount": job.processed_count,
+        "totalCount": job.total_count,
+        "error": job.error,
+        "createdAt": job.created_at,
+        "updatedAt": job.updated_at,
+        "startedAt": job.started_at,
+        "finishedAt": job.finished_at,
+        "items": job.items.iter().map(|item| json!({
+            "jobId": item.job_id,
+            "itemId": item.item_id,
+            "status": item.status,
+            "candidateCount": item.candidate_count,
+            "error": item.error,
+            "updatedAt": item.updated_at,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError) -> Response {
+    match error {
+        MetadataReidentifyError::InvalidItemCount
+        | MetadataReidentifyError::InvalidSearch
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidSearch)
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::Tmdb(
+            TmdbError::InvalidRequest(_),
+        )) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "批量重新识别请求无效",
+        )
+        .into_response(),
+        MetadataReidentifyError::ItemNotFound(_)
+        | MetadataReidentifyError::JobNotFound
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::ItemNotFound) => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目或重新识别任务不存在",
+        )
+        .into_response(),
+        MetadataReidentifyError::JobNotRetryable => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "该批量重新识别任务当前不可重试",
+        )
+        .into_response(),
+        MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => {
+            api_error(
+                headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                lux::ApiErrorCode::Internal,
+                "候选数据损坏",
+            )
+            .into_response()
+        }
+        MetadataReidentifyError::Candidate(MetadataCandidateError::Tmdb(_))
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::Storage(_))
+        | MetadataReidentifyError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "批量重新识别暂时不可用",
+        )
+        .into_response(),
+    }
 }
 
 fn metadata_candidate_error(headers: &HeaderMap, error: MetadataCandidateError) -> Response {

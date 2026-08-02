@@ -21,9 +21,9 @@
 
 - [x] 任务日志详情、结构化错误筛选和更长历史分页；新增 `scan_job_events` 迁移、管理员分页 API 和控制台筛选。
 - [x] 新候选搜索；管理员可按标题/年份搜索 TMDb 并保存 pending 候选。
-- [ ] 批量重新识别任务；仍需独立任务模型和排队/重试策略。
+- [x] 批量重新识别任务；新增持久化任务/条目模型、管理员创建/状态查询/失败重试 API、队列 worker、条目级稳定错误代码和管理页批量选择及最近任务状态入口。
 
-验证：`cargo test --locked --test libraries_api --test users --test images`（5 项）覆盖媒体库/任务管理和图片列举删除；`node --check web/src/app.mjs` 通过。
+验证：`cargo test --locked --test reidentify --test libraries_api --test users --test images` 覆盖批量任务、媒体库/任务管理和图片列举删除；`node --check web/src/app.mjs` 通过。
 
 管理员脚本运行示例：
 `LUX_E2E_BASE_URL=http://127.0.0.1:18506 LUX_E2E_ADMIN_USERNAME=admin LUX_E2E_ADMIN_PASSWORD='…' LUX_E2E_MEDIA_ROOT='/media' NODE_PATH='<bundled-node-modules>' node scripts/admin-smoke.mjs`

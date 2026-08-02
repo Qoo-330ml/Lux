@@ -1052,6 +1052,8 @@ locked local value
 7. 确认。
 8. 写回 NFO/图片并重新索引该条目。
 
+批量重新识别使用持久化任务队列：管理员一次提交 1-100 个条目，服务端去重后以 `QUEUED` 创建任务并在后台逐条处理；每条记录 `PENDING/RUNNING/COMPLETED/FAILED`、候选数量和稳定错误代码，任务通过 `GET /api/v1/admin/metadata/reidentify/{jobId}` 查询。批量任务只负责重新搜索并生成 pending 候选，不自动选择或覆盖本地元数据；失败任务可通过 `POST /api/v1/admin/metadata/reidentify/{jobId}` 重新排队失败条目。
+
 ---
 
 ## 14. 播放与文件传输
@@ -1275,6 +1277,9 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - GET /api/v1/admin/items/{id}/identify/candidates
 - POST /api/v1/admin/items/{id}/identify/candidates
 - POST /api/v1/admin/items/{id}/identify/candidates/{candidateId}/select
+- POST /api/v1/admin/metadata/reidentify
+- GET /api/v1/admin/metadata/reidentify/{jobId}
+- POST /api/v1/admin/metadata/reidentify/{jobId}
 - PATCH /api/v1/admin/items/{id}/metadata
 - POST /api/v1/admin/items/{id}/metadata/refresh
 - GET/PATCH /api/v1/admin/settings

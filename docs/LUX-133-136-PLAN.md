@@ -15,7 +15,8 @@
 
 ## 未完成的发布门
 
-- [ ] amd64 构建产物和镜像签名/版本发布。
+- [x] 本机 ARM64 Docker builder 交叉构建 `linux/amd64` 镜像 `lux:amd64-local`；镜像架构、非 root `uid=10001` 和 `ffprobe` 已验证。
+- [ ] 镜像签名/版本发布。
 - [ ] Tailscale/反代 HTTPS、Range 缓冲和 trusted proxy 实机验证。
 - [ ] 磁盘满、媒体挂载丢失、TMDb 故障和强制终止恢复演练。
 - [x] 已有根路径丢失、TMDb 故障、NFO/图片/ffprobe 故障和容器重启证据已汇总到 `docs/LUX-135-PLAN.md`。
