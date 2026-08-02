@@ -45,6 +45,119 @@ impl CatalogService {
         })
     }
 
+    pub async fn list_children(
+        &self,
+        principal: AccessPrincipal,
+        parent_id: &str,
+        item_type: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        if !self.access.can_view_item(principal, parent_id).await? {
+            return Err(CatalogError::AccessDenied);
+        }
+        let total = self
+            .database
+            .count_catalog_children(parent_id, item_type)
+            .await?;
+        let rows = self
+            .database
+            .list_catalog_children(parent_id, item_type, offset, limit)
+            .await?;
+        Ok(CatalogPage {
+            items: assemble_items(rows),
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn list_series_episodes(
+        &self,
+        principal: AccessPrincipal,
+        series_id: &str,
+        season_id: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        if !self.access.can_view_item(principal, series_id).await? {
+            return Err(CatalogError::AccessDenied);
+        }
+        let season_ids = if let Some(season_id) = season_id {
+            let season = self
+                .database
+                .find_catalog_rows(season_id)
+                .await
+                .map(assemble_items)?
+                .into_iter()
+                .next()
+                .filter(|item| {
+                    item.item_type == "SEASON" && item.parent_id.as_deref() == Some(series_id)
+                });
+            let Some(_) = season else {
+                return Err(CatalogError::LibraryNotFound);
+            };
+            vec![season_id.to_owned()]
+        } else {
+            let rows = self
+                .database
+                .list_catalog_children(series_id, "SEASON", 0, i64::MAX)
+                .await?;
+            rows.into_iter().map(|row| row.item_id).collect::<Vec<_>>()
+        };
+        let mut items = Vec::new();
+        for season_id in season_ids {
+            let rows = self
+                .database
+                .list_catalog_children(&season_id, "EPISODE", 0, i64::MAX)
+                .await?;
+            items.extend(assemble_items(rows));
+        }
+        items.sort_by(|left, right| {
+            left.season_number
+                .cmp(&right.season_number)
+                .then_with(|| left.episode_number.cmp(&right.episode_number))
+                .then_with(|| left.sort_title.cmp(&right.sort_title))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        let items = items
+            .into_iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(usize::try_from(limit).unwrap_or(0))
+            .collect();
+        Ok(CatalogPage {
+            items,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn list_next_up(
+        &self,
+        principal: AccessPrincipal,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let total = self
+            .database
+            .count_next_up_items(user_id, &library_ids)
+            .await?;
+        let rows = self
+            .database
+            .list_next_up_items(user_id, &library_ids, offset, limit)
+            .await?;
+        Ok(CatalogPage {
+            items: assemble_items(rows),
+            total,
+            offset,
+            limit,
+        })
+    }
+
     pub async fn find_item(
         &self,
         principal: AccessPrincipal,
@@ -115,6 +228,10 @@ pub struct CatalogItem {
     pub id: String,
     pub library_id: String,
     pub item_type: String,
+    pub parent_id: Option<String>,
+    pub series_id: Option<String>,
+    pub season_number: Option<i64>,
+    pub episode_number: Option<i64>,
     pub title: String,
     pub sort_title: String,
     pub original_title: Option<String>,
@@ -161,6 +278,10 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     id: row.item_id.clone(),
                     library_id: row.library_id.clone(),
                     item_type: row.item_type.clone(),
+                    parent_id: row.parent_id.clone(),
+                    series_id: row.series_id.clone(),
+                    season_number: row.season_number,
+                    episode_number: row.episode_number,
                     title: row.title.clone(),
                     sort_title: row.sort_title.clone(),
                     original_title: row.original_title.clone(),

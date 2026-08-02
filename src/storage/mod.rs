@@ -639,6 +639,36 @@ impl Database {
             })
     }
 
+    pub(crate) async fn find_user_item_state(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<Option<StoredUserItemState>, StorageError> {
+        sqlx::query(
+            "SELECT position_ticks, is_played, is_favorite, play_count,
+                    last_played_at, version
+             FROM user_item_state WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredUserItemState {
+                position_ticks: row.get("position_ticks"),
+                is_played: row.get::<i64, _>("is_played") != 0,
+                is_favorite: row.get::<i64, _>("is_favorite") != 0,
+                play_count: row.get("play_count"),
+                last_played_at: row.get("last_played_at"),
+                version: row.get("version"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn insert_library_root(
         &self,
         root: NewLibraryRoot<'_>,
@@ -1415,6 +1445,142 @@ impl Database {
         })
     }
 
+    pub(crate) async fn count_catalog_children(
+        &self,
+        parent_id: &str,
+        item_type: &str,
+    ) -> Result<i64, StorageError> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.parent_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL",
+        )
+        .bind(parent_id)
+        .bind(item_type)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_catalog_children(
+        &self,
+        parent_id: &str,
+        item_type: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        self.fetch_catalog_rows(
+            "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    mi.title, mi.sort_title, mi.original_title, mi.overview,
+                    mi.production_year, mi.runtime_ticks,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size,
+                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                    mt.codec, mt.language, mt.title AS stream_title
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             WHERE mi.parent_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL
+             ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id,
+                      ms.id, mt.stream_index
+             LIMIT ? OFFSET ?",
+            &[
+                CatalogBind::Text(parent_id),
+                CatalogBind::Text(item_type),
+                CatalogBind::Integer(limit),
+                CatalogBind::Integer(offset),
+            ],
+        )
+        .await
+    }
+
+    pub(crate) async fn count_next_up_items(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+    ) -> Result<i64, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT COUNT(*) FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+             WHERE mi.item_type = 'EPISODE' AND mi.removed_at IS NULL
+               AND us.is_played = 0 AND us.position_ticks > 0
+               AND mi.library_id IN ({placeholders})"
+        );
+        let mut statement = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(query)).bind(user_id);
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_next_up_items(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    mi.title, mi.sort_title, mi.original_title, mi.overview,
+                    mi.production_year, mi.runtime_ticks,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size,
+                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                    mt.codec, mt.language, mt.title AS stream_title
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             WHERE mi.item_type = 'EPISODE' AND mi.removed_at IS NULL
+               AND us.is_played = 0 AND us.position_ticks > 0
+               AND mi.library_id IN ({placeholders})
+             ORDER BY us.last_played_at DESC, mi.series_id, mi.season_number,
+                      mi.episode_number, mi.id
+             LIMIT ? OFFSET ?"
+        );
+        let mut binds = Vec::with_capacity(library_ids.len() + 3);
+        binds.push(CatalogBind::Text(user_id));
+        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
+        binds.push(CatalogBind::Integer(limit));
+        binds.push(CatalogBind::Integer(offset));
+        self.fetch_catalog_rows(&query, &binds).await
+    }
+
     pub(crate) async fn list_catalog_rows(
         &self,
         library_id: Option<&str>,
@@ -1424,6 +1590,7 @@ impl Database {
         let (query, binds) = match library_id {
             Some(library_id) => (
                 "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                        mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
                         mi.production_year, mi.runtime_ticks,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
@@ -1435,7 +1602,9 @@ impl Database {
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title
                  FROM (
-                     SELECT mi.id, mi.library_id, mi.item_type, mi.title, mi.sort_title,
+                     SELECT mi.id, mi.library_id, mi.item_type,
+                            mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                            mi.title, mi.sort_title,
                             mi.original_title, mi.overview, mi.production_year, mi.runtime_ticks
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -1454,6 +1623,7 @@ impl Database {
             ),
             None => (
                 "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                        mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
                         mi.production_year, mi.runtime_ticks,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
@@ -1465,7 +1635,9 @@ impl Database {
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title
                  FROM (
-                     SELECT mi.id, mi.library_id, mi.item_type, mi.title, mi.sort_title,
+                     SELECT mi.id, mi.library_id, mi.item_type,
+                            mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                            mi.title, mi.sort_title,
                             mi.original_title, mi.overview, mi.production_year, mi.runtime_ticks
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -1488,6 +1660,7 @@ impl Database {
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
         self.fetch_catalog_rows(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.runtime_ticks,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
@@ -1511,10 +1684,10 @@ impl Database {
 
     async fn fetch_catalog_rows(
         &self,
-        query: &'static str,
+        query: &str,
         binds: &[CatalogBind<'_>],
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
-        let mut statement = sqlx::query(query);
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
         for bind in binds {
             statement = match bind {
                 CatalogBind::Text(value) => statement.bind(*value),
@@ -1530,6 +1703,10 @@ impl Database {
                         item_id: row.get("item_id"),
                         library_id: row.get("library_id"),
                         item_type: row.get("item_type"),
+                        parent_id: row.get("parent_id"),
+                        series_id: row.get("series_id"),
+                        season_number: row.get("season_number"),
+                        episode_number: row.get("episode_number"),
                         title: row.get("title"),
                         sort_title: row.get("sort_title"),
                         original_title: row.get("original_title"),
@@ -2371,6 +2548,10 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) item_id: String,
     pub(crate) library_id: String,
     pub(crate) item_type: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) series_id: Option<String>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
     pub(crate) title: String,
     pub(crate) sort_title: String,
     pub(crate) original_title: Option<String>,
@@ -2393,6 +2574,16 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) codec: Option<String>,
     pub(crate) language: Option<String>,
     pub(crate) stream_title: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredUserItemState {
+    pub(crate) position_ticks: i64,
+    pub(crate) is_played: bool,
+    pub(crate) is_favorite: bool,
+    pub(crate) play_count: i64,
+    pub(crate) last_played_at: Option<i64>,
+    pub(crate) version: i64,
 }
 
 #[derive(Debug)]

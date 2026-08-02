@@ -1,0 +1,180 @@
+use luxd::{
+    api::{AppState, app_with_state},
+    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
+    config::Config,
+    library::LibraryKind,
+    storage::Database,
+};
+use reqwest::header::AUTHORIZATION;
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+
+#[tokio::test]
+async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let viewer = UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season_dir = root.join("Example Show/Season 01");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    for episode in 1..=3 {
+        tokio::fs::write(
+            season_dir.join(format!("Example.Show.S01E0{episode}.mkv")),
+            b"episode",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let series_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SERIES'")
+            .fetch_one(database.pool())
+            .await?;
+    let season_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SEASON'")
+            .fetch_one(database.pool())
+            .await?;
+    let episode_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'EPISODE' AND episode_number = 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let played_episode_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'EPISODE' AND episode_number = 2",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state
+         (user_id, item_id, position_ticks, is_played, is_favorite, play_count, last_played_at)
+         VALUES (?, ?, 12345, 0, 1, 2, 200)",
+    )
+    .bind(admin.id.to_string())
+    .bind(&episode_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state
+         (user_id, item_id, position_ticks, is_played, is_favorite, play_count, last_played_at)
+         VALUES (?, ?, 999, 1, 0, 4, 100)",
+    )
+    .bind(admin.id.to_string())
+    .bind(&played_episode_id)
+    .execute(database.pool())
+    .await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="SeriesTest", Device="Mac", DeviceId="series-admin", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing token")?
+        .to_owned();
+    let headers = [("X-Emby-Token", token.as_str())];
+
+    let seasons = client
+        .get(format!("{base_url}/Shows/{series_id}/Seasons?Limit=10"))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(seasons.status(), reqwest::StatusCode::OK);
+    let seasons_body: Value = seasons.json().await?;
+    assert_eq!(seasons_body["TotalRecordCount"], 1);
+    assert_eq!(seasons_body["Items"][0]["Type"], "Season");
+    assert_eq!(seasons_body["Items"][0]["IsFolder"], true);
+    assert_eq!(seasons_body["Items"][0]["ParentId"], series_id);
+
+    let episodes = client
+        .get(format!(
+            "{base_url}/Shows/{series_id}/Episodes?StartIndex=1&Limit=1"
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(episodes.status(), reqwest::StatusCode::OK);
+    let episodes_body: Value = episodes.json().await?;
+    assert_eq!(episodes_body["TotalRecordCount"], 3);
+    assert_eq!(episodes_body["Items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(episodes_body["Items"][0]["Index"], 2);
+    assert_eq!(episodes_body["Items"][0]["ParentIndexNumber"], 1);
+    assert_eq!(episodes_body["Items"][0]["ParentId"], season_id);
+    assert_eq!(episodes_body["Items"][0]["UserData"]["Played"], true);
+    assert_eq!(episodes_body["Items"][0]["UserData"]["PlayCount"], 4);
+
+    let next_up = client
+        .get(format!("{base_url}/Users/{}/Items/NextUp", admin.id))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(next_up.status(), reqwest::StatusCode::OK);
+    let next_up_body: Value = next_up.json().await?;
+    assert_eq!(next_up_body["TotalRecordCount"], 1);
+    assert_eq!(next_up_body["Items"][0]["Id"], episode_id);
+    assert_eq!(
+        next_up_body["Items"][0]["UserData"]["PlaybackPositionTicks"],
+        12345
+    );
+    assert_eq!(next_up_body["Items"][0]["UserData"]["IsFavorite"], true);
+
+    let viewer_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="SeriesTest", Device="Mac", DeviceId="series-viewer", Version="1""#,
+        )
+        .json(&json!({ "Username": "viewer", "Pw": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_token = viewer_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer token")?
+        .to_owned();
+    let denied = client
+        .get(format!("{base_url}/Shows/{series_id}/Seasons"))
+        .header("X-Emby-Token", viewer_token)
+        .send()
+        .await?;
+    assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    assert_ne!(admin.id, viewer.id);
+    Ok(())
+}

@@ -76,6 +76,9 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET /Users/{userId}/Views`：返回电影媒体库视图。
 - `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`StartIndex`、`Limit` 和 `IncludeItemTypes=Movie`，默认从 0 开始、每页 50 条，单页上限 100。
 - `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影详情 DTO。
+- `GET /Shows/{seriesId}/Seasons`：按用户媒体库权限返回季度。
+- `GET /Shows/{seriesId}/Episodes?SeasonId={seasonId}&StartIndex=0&Limit=50`：返回剧集，可省略 `SeasonId` 获取整部剧集，支持分页。
+- `GET /Users/{userId}/Items/NextUp`：按该用户的播放状态返回未看完单集。
 - `GET|HEAD /Items/{itemId}/Images/{Type}`、`/{Type}/{Index}`：读取与 Lux API 相同的本地图片记录，支持 `X-Emby-Token` 或 `api_key`。
 - `GET /Users/{userId}/Items/Resume`：当前返回空的继续观看列表。
 

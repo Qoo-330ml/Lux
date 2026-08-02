@@ -187,8 +187,11 @@ fn emby_routes() -> Router<AppState> {
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Resume", get(emby_user_resume))
+        .route("/Users/{user_id}/Items/NextUp", get(emby_user_next_up))
         .route("/Users/{user_id}/Items", get(emby_user_items))
         .route("/Users/{user_id}/Items/{item_id}", get(emby_user_item))
+        .route("/Shows/{series_id}/Seasons", get(emby_show_seasons))
+        .route("/Shows/{series_id}/Episodes", get(emby_show_episodes))
         .route("/Items", get(emby_items))
         .route("/Items/{item_id}", get(emby_item))
         .route(
@@ -388,6 +391,8 @@ struct EmbyItemsQuery {
     parent_id: Option<String>,
     #[serde(rename = "IncludeItemTypes", default)]
     include_item_types: Option<String>,
+    #[serde(rename = "SeasonId", default)]
+    season_id: Option<String>,
     #[serde(rename = "StartIndex", default)]
     start_index: Option<i64>,
     #[serde(rename = "Limit", default)]
@@ -454,6 +459,141 @@ async fn emby_user_resume(
         "Items": [],
         "TotalRecordCount": 0,
         "StartIndex": 0,
+    }))
+    .into_response()
+}
+
+async fn emby_user_next_up(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    let (offset, limit) = match emby_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog
+        .list_next_up(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &user_id,
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => emby_catalog_page_for_user(&state, &user_id, &page).await,
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_show_seasons(
+    headers: HeaderMap,
+    Path(series_id): Path<String>,
+    Query(query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let (offset, limit) = match emby_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog
+        .list_children(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &series_id,
+            "SEASON",
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => emby_catalog_page_for_user(&state, &user.id.to_string(), &page).await,
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_show_episodes(
+    headers: HeaderMap,
+    Path(series_id): Path<String>,
+    Query(query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let (offset, limit) = match emby_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog
+        .list_series_episodes(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &series_id,
+            query.season_id.as_deref(),
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => emby_catalog_page_for_user(&state, &user.id.to_string(), &page).await,
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_catalog_page_for_user(
+    state: &AppState,
+    user_id: &str,
+    page: &CatalogPage,
+) -> Response {
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in &page.items {
+        let user_state = match database.find_user_item_state(user_id, &item.id).await {
+            Ok(state) => state,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        items.push(emby_catalog_item_json_with_state(
+            item,
+            &state.server_id,
+            user_state.as_ref(),
+        ));
+    }
+    Json(json!({
+        "Items": items,
+        "TotalRecordCount": page.total,
+        "StartIndex": page.offset,
     }))
     .into_response()
 }
@@ -577,7 +717,22 @@ async fn emby_item_response(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match catalog.find_item(principal, item_id).await {
-        Ok(Some(item)) => Json(emby_catalog_item_json(&item, &state.server_id)).into_response(),
+        Ok(Some(item)) => {
+            let Some(database) = state.database.as_ref() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let user_id = principal.user_id.to_string();
+            let user_state = match database.find_user_item_state(&user_id, item_id).await {
+                Ok(state) => state,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            Json(emby_catalog_item_json_with_state(
+                &item,
+                &state.server_id,
+                user_state.as_ref(),
+            ))
+            .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
@@ -615,6 +770,14 @@ fn emby_catalog_page_json(page: &CatalogPage, server_id: &str) -> Value {
 }
 
 fn emby_catalog_item_json(item: &CatalogItem, server_id: &str) -> Value {
+    emby_catalog_item_json_with_state(item, server_id, None)
+}
+
+fn emby_catalog_item_json_with_state(
+    item: &CatalogItem,
+    server_id: &str,
+    user_state: Option<&crate::storage::StoredUserItemState>,
+) -> Value {
     let default_source = item
         .media_sources
         .iter()
@@ -630,7 +793,11 @@ fn emby_catalog_item_json(item: &CatalogItem, server_id: &str) -> Value {
         "ServerId": server_id,
         "Type": emby_item_type(&item.item_type),
         "MediaType": "Video",
-        "IsFolder": false,
+        "IsFolder": matches!(item.item_type.as_str(), "SERIES" | "SEASON"),
+        "ParentId": item.parent_id,
+        "SeriesId": item.series_id,
+        "ParentIndexNumber": item.season_number,
+        "Index": item.episode_number,
         "ProductionYear": item.production_year,
         "Overview": item.overview,
         "RunTimeTicks": runtime_ticks,
@@ -648,7 +815,12 @@ fn emby_catalog_item_json(item: &CatalogItem, server_id: &str) -> Value {
             .as_ref()
             .map(|tag| json!([tag]))
             .unwrap_or_else(|| json!([])),
-        "UserData": {"PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false},
+        "UserData": {
+            "PlaybackPositionTicks": user_state.map(|state| state.position_ticks).unwrap_or_default(),
+            "PlayCount": user_state.map(|state| state.play_count).unwrap_or_default(),
+            "IsFavorite": user_state.map(|state| state.is_favorite).unwrap_or(false),
+            "Played": user_state.map(|state| state.is_played).unwrap_or(false),
+        },
     })
 }
 
