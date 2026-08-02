@@ -79,9 +79,22 @@ pub fn app_with_state(state: AppState) -> Router {
         .layer(
             tower::ServiceBuilder::new()
                 .set_x_request_id(MakeRequestUuid)
-                .layer(TraceLayer::new_for_http())
+                .layer(TraceLayer::new_for_http().make_span_with(
+                    |request: &axum::http::Request<_>| {
+                        tracing::info_span!(
+                            "request",
+                            method = %request.method(),
+                            path = %safe_trace_path(request.uri()),
+                            version = ?request.version(),
+                        )
+                    },
+                ))
                 .propagate_x_request_id(),
         )
+}
+
+fn safe_trace_path(uri: &axum::http::Uri) -> &str {
+    uri.path()
 }
 
 fn emby_routes() -> Router<AppState> {
@@ -641,4 +654,17 @@ fn build_cookie(
         cookie.push_str(&format!("; Max-Age={max_age}"));
     }
     HeaderValue::from_str(&cookie).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_trace_path;
+    use axum::http::Uri;
+
+    #[test]
+    fn trace_path_excludes_query_credentials() {
+        let uri: Uri = "/System/Info?api_key=do-not-log".parse().unwrap();
+
+        assert_eq!(safe_trace_path(&uri), "/System/Info");
+    }
 }
