@@ -64,6 +64,45 @@ impl UserStore {
         })
     }
 
+    pub async fn has_users(&self) -> Result<bool, UserStoreError> {
+        Ok(self.database.has_users().await?)
+    }
+
+    pub async fn create_initial_admin(
+        &self,
+        username: &str,
+        display_name: &str,
+        password: &str,
+    ) -> Result<UserRecord, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        let display_name = normalized_display_name(display_name, &username_normalized);
+        let password_hash = self.passwords.hash_password(password)?;
+        let id = UserId::new();
+        let inserted = self
+            .database
+            .insert_initial_user(
+                &id.to_string(),
+                &username_normalized,
+                &display_name,
+                &password_hash,
+            )
+            .await?;
+        if !inserted {
+            return Err(UserStoreError::SetupAlreadyCompleted);
+        }
+
+        Ok(UserRecord {
+            id,
+            username_normalized,
+            display_name,
+            is_disabled: false,
+            is_admin: true,
+            can_manage_server: true,
+            can_remote_access: false,
+            can_download: false,
+        })
+    }
+
     pub async fn authenticate(
         &self,
         username: &str,
@@ -122,6 +161,7 @@ fn normalized_display_name(display_name: &str, username_normalized: &str) -> Str
 pub enum UserStoreError {
     InvalidUsername,
     InvalidUserId(String),
+    SetupAlreadyCompleted,
     Password(PasswordError),
     Storage(StorageError),
 }
@@ -143,6 +183,9 @@ impl std::fmt::Display for UserStoreError {
         match self {
             Self::InvalidUsername => formatter.write_str("username must be 1-128 characters"),
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
+            Self::SetupAlreadyCompleted => {
+                formatter.write_str("initial setup has already completed")
+            }
             Self::Password(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
@@ -154,7 +197,7 @@ impl std::error::Error for UserStoreError {
         match self {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
-            Self::InvalidUsername | Self::InvalidUserId(_) => None,
+            Self::InvalidUsername | Self::InvalidUserId(_) | Self::SetupAlreadyCompleted => None,
         }
     }
 }

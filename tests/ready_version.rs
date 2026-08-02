@@ -1,5 +1,6 @@
 use luxd::{
     api::{AppState, app, app_with_state},
+    application::setup::SetupService,
     config::Config,
     storage::Database,
 };
@@ -28,7 +29,8 @@ async fn ready_and_version_report_migrated_state_without_paths()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    let app = app_with_state(AppState::ready(config.clone(), database.clone()));
+    let setup = SetupService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(config.clone(), database.clone(), setup));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });

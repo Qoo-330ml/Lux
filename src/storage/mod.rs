@@ -54,6 +54,61 @@ impl Database {
         &self.pool
     }
 
+    pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users LIMIT 1)")
+            .fetch_one(&self.pool)
+            .await
+            .map(|value: i64| value != 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn insert_initial_user(
+        &self,
+        id: &str,
+        username_normalized: &str,
+        display_name: &str,
+        password_hash: &str,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let inserted = sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash,
+                is_admin, can_manage_server
+            )
+            SELECT ?, ?, ?, ?, 1, 1
+            WHERE NOT EXISTS (SELECT 1 FROM users)",
+        )
+        .bind(id)
+        .bind(username_normalized)
+        .bind(display_name)
+        .bind(password_hash)
+        .execute(&mut *transaction)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(inserted)
+    }
+
     pub(crate) async fn insert_user(
         &self,
         id: &str,
