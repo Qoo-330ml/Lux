@@ -918,23 +918,26 @@ fn emby_media_source_json(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
 ) -> Value {
-    let direct_stream_url = (source.source_kind == "LOCAL_FILE").then(|| {
+    let direct_stream_url = if source.source_kind == "LOCAL_FILE" {
         let suffix = source
             .container
             .as_deref()
             .map(|container| format!(".{container}"))
             .unwrap_or_default();
-        format!("/Videos/{item_id}/{}/stream{suffix}", source.id)
-    });
+        Some(format!("/Videos/{item_id}/{}/stream{suffix}", source.id))
+    } else {
+        source.external_url.clone()
+    };
+    let is_remote = source.source_kind == "STRM_URL";
     json!({
         "Id": source.id,
         "Container": source.container,
         "Size": source.size,
         "Bitrate": source.bitrate,
         "RunTimeTicks": source.duration_ticks,
-        "Protocol": "File",
+        "Protocol": if is_remote { "Http" } else { "File" },
         "Type": "Default",
-        "IsRemote": false,
+        "IsRemote": is_remote,
         "SupportsDirectPlay": direct_stream_url.is_some(),
         "SupportsDirectStream": false,
         "SupportsTranscoding": false,
@@ -2204,6 +2207,7 @@ fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) 
         "size": source.size,
         "bitrate": source.bitrate,
         "durationTicks": source.duration_ticks,
+        "externalUrl": source.external_url,
         "isDefault": source.is_default,
         "probeStatus": source.probe_status,
         "streams": source.streams.iter().map(|stream| json!({

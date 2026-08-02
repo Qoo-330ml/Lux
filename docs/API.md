@@ -89,6 +89,8 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定本地媒体源。
 - `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流和 DirectPlay 能力；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。
 
+`.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 和原始 `DirectStreamUrl` 返回；服务端不请求、不验证、不代理该 URL。具有媒体库访问权限的客户端会直接获得该地址，因此 URL 中的令牌也会按产品设计暴露给客户端。
+
 本地媒体流支持完整响应和单 `Range: bytes=...` 请求，返回 200、206 或 416，并包含 `Accept-Ranges`、`Content-Length`、`Content-Range`、`Content-Type`、`ETag` 和 `Last-Modified`。媒体文件通过数据库 source ID 解析，读取前执行媒体库 ACL 和根目录路径安全检查。
 
 字幕索引来自 ffprobe 内嵌轨和媒体文件同目录的同名外挂文件，支持 srt、ass、ssa、vtt、sub、sup；外挂字幕的语言、标题、forced 和 default 标记来自文件名，媒体流 DTO 会返回 `IsExternal`、`IsDefault` 和 `IsForced`。内嵌字幕不通过本阶段的读取端点抽取。

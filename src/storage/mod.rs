@@ -1139,6 +1139,27 @@ impl Database {
         })
     }
 
+    pub(crate) async fn update_media_source_external_url(
+        &self,
+        filesystem_entry_id: &str,
+        external_url: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE media_sources
+             SET external_url = ?, updated_at = unixepoch()
+             WHERE filesystem_entry_id = ?",
+        )
+        .bind(external_url)
+        .bind(filesystem_entry_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn insert_filesystem_entry(
         &self,
         entry: NewFilesystemEntry<'_>,
@@ -1539,7 +1560,7 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                    ms.id AS source_id, ms.source_kind, ms.container, ms.size,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
@@ -1618,7 +1639,7 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                    ms.id AS source_id, ms.source_kind, ms.container, ms.size,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
@@ -1661,7 +1682,7 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                          ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                        ms.id AS source_id, ms.source_kind, ms.container, ms.size,
+                        ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
@@ -1697,7 +1718,7 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                          ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                        ms.id AS source_id, ms.source_kind, ms.container, ms.size,
+                        ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
@@ -1737,7 +1758,7 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                    ms.id AS source_id, ms.source_kind, ms.container, ms.size,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
@@ -1792,6 +1813,7 @@ impl Database {
                         source_kind: row.get("source_kind"),
                         container: row.get("container"),
                         size: row.get("size"),
+                        external_url: row.get("external_url"),
                         bitrate: row.get("bitrate"),
                         duration_ticks: row.get("duration_ticks"),
                         is_default: row
@@ -1854,14 +1876,16 @@ impl Database {
         sqlx::query(
             "INSERT INTO media_sources (
                 id, item_id, source_kind, filesystem_entry_id,
-                container, size, is_default, probe_status
-            ) VALUES (?, ?, 'LOCAL_FILE', ?, ?, ?, ?, 'PENDING')",
+                container, size, external_url, is_default, probe_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
         )
         .bind(source.id)
         .bind(source.item_id)
+        .bind(source.source_kind)
         .bind(source.filesystem_entry_id)
         .bind(source.container)
         .bind(source.size)
+        .bind(source.external_url)
         .bind(source.is_default)
         .execute(&self.pool)
         .await
@@ -2685,6 +2709,7 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) source_kind: Option<String>,
     pub(crate) container: Option<String>,
     pub(crate) size: Option<i64>,
+    pub(crate) external_url: Option<String>,
     pub(crate) bitrate: Option<i64>,
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) is_default: Option<bool>,
@@ -2874,9 +2899,11 @@ pub(crate) struct NewHierarchyItem<'a> {
 pub(crate) struct NewMediaSource<'a> {
     pub(crate) id: &'a str,
     pub(crate) item_id: &'a str,
+    pub(crate) source_kind: &'a str,
     pub(crate) filesystem_entry_id: &'a str,
     pub(crate) container: &'a str,
     pub(crate) size: i64,
+    pub(crate) external_url: Option<&'a str>,
     pub(crate) is_default: bool,
 }
 
