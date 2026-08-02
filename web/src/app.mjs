@@ -16,6 +16,8 @@ const api = {
   logout() { return this.request("/api/v1/auth/logout", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   setupStatus() { return this.request("/api/v1/setup/status"); },
   me() { return this.request("/api/v1/auth/me"); },
+  sessions() { return this.request("/api/v1/auth/sessions"); },
+  revokeSession(id) { return this.request("/api/v1/auth/sessions/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   home() { return this.request("/api/v1/home"); },
   libraries() { return this.request("/api/v1/libraries"); },
   libraryItems(id, filters = {}) { const params = new URLSearchParams({ page: "1", pageSize: "60" }); Object.entries(filters).forEach(([key, value]) => { if (value !== "" && value !== null && value !== undefined) params.set(key, String(value)); }); return this.request("/api/v1/libraries/" + encodeURIComponent(id) + "/items?" + params.toString()); },
@@ -81,6 +83,7 @@ function titleForRoute() {
   if (state.route === "search") return "搜索";
   if (state.route === "item") return state.item?.title || "详情";
   if (state.route === "admin") return "管理控制台";
+  if (state.route === "account") return "账户与会话";
   return "你的片单";
 }
 
@@ -99,10 +102,10 @@ function nav() {
   const homeCurrent = state.route === "home" ? "page" : "false";
   const libraryCurrent = state.route === "libraries" ? "page" : "false";
   const admin = state.user.canManageServer ? "<button data-route=\"admin\" aria-current=\"" + (state.route === "admin" ? "page" : "false") + "\">管理</button>" : "";
-  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\">首页</button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\">媒体库</button>" + admin + "</nav>";
+  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\">首页</button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\">媒体库</button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\">账户</button>" + admin + "</nav>";
 }
 function account() {
-  return "<div class=\"sidebar-footer\"><small>" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</small><button class=\"button secondary\" data-action=\"logout\" style=\"margin-top:.7rem;width:100%\">退出登录</button></div>";
+  return "<div class=\"sidebar-footer\"><small>" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</small><button class=\"button secondary\" data-route=\"account\" style=\"margin-top:.7rem;width:100%\">账户与会话</button><button class=\"button secondary\" data-action=\"logout\" style=\"margin-top:.7rem;width:100%\">退出登录</button></div>";
 }
 
 function renderAuth() {
@@ -110,6 +113,11 @@ function renderAuth() {
   const notice = state.setupNotice ? "<div class=\"notice\" role=\"status\">" + escapeHtml(state.setupNotice) + "</div>" : "";
   app.innerHTML = "<div class=\"auth-layout\"><section class=\"auth-card\"><span class=\"eyebrow\">Personal media</span><h1 style=\"margin-top:.7rem\">Lux</h1><p>把你的媒体库安静地放在自己的设备上。</p>" + notice + error + "<form data-action=\"login\"><div class=\"field\"><label for=\"username\">用户名</label><input id=\"username\" name=\"username\" autocomplete=\"username\" required></div><div class=\"field\"><label for=\"password\">密码</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required></div><div class=\"form-actions\"><button class=\"button\" type=\"submit\">登录</button></div></form></section></div>";
   bind();
+}
+
+function renderAccount(sessions) {
+  const rows = sessions.map((session) => `<tr><td>${session.isCurrent ? "当前浏览器" : "其他会话"}</td><td>${escapeHtml(new Date((session.updatedAt || session.createdAt) * 1000).toLocaleString())}</td><td>${session.isCurrent ? "当前使用中" : `<button class="button secondary" type="button" data-revoke-session="${escapeHtml(session.id)}">撤销</button>`}</td></tr>`).join("");
+  return `<section class="section"><div class="section-heading"><h2>账户与会话</h2><span>${escapeHtml(state.user.displayName || state.user.usernameNormalized)}</span></div><p>当前密码和权限由管理员管理。你可以撤销其他浏览器上的 Lux Web 会话。</p><div class="table-wrap"><table><thead><tr><th>设备</th><th>最近活动</th><th>状态</th></tr></thead><tbody>${rows || "<tr><td colspan=\"3\">暂无会话</td></tr>"}</tbody></table></div></section>`;
 }
 
 function renderSetup() {
@@ -148,6 +156,9 @@ async function loadRoute() {
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
       state.admin = { ready, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), jobDetail: state.admin?.jobDetail || null };
       view.innerHTML = renderAdmin();
+    } else if (state.route === "account") {
+      const sessions = await api.sessions();
+      view.innerHTML = renderAccount(sessions.sessions || []);
     }
     bind();
   } catch (error) {
@@ -352,6 +363,11 @@ function bind() {
   }));
   document.querySelectorAll("[data-close-job-detail]").forEach((element) => element.addEventListener("click", () => {
     state.admin.jobDetail = null; render();
+  }));
+  document.querySelectorAll("[data-revoke-session]").forEach((element) => element.addEventListener("click", async () => {
+    if (!window.confirm("撤销这个浏览器会话？")) return;
+    try { await api.revokeSession(element.dataset.revokeSession); state.error = ""; state.notice = "会话已撤销。"; render(); }
+    catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='job-filter']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();

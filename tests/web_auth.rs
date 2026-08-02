@@ -77,6 +77,50 @@ async fn login_me_logout_and_csrf_are_session_backed() -> Result<(), Box<dyn std
     assert!(session_set_cookie.contains("SameSite=Lax"));
     let cookie_header = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
 
+    let second_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(second_login.status(), reqwest::StatusCode::OK);
+    let sessions = client
+        .get(format!("{base_url}/api/v1/auth/sessions"))
+        .header(COOKIE, &cookie_header)
+        .send()
+        .await?;
+    assert_eq!(sessions.status(), reqwest::StatusCode::OK);
+    let sessions_body = sessions.json::<serde_json::Value>().await?;
+    assert_eq!(sessions_body["sessions"].as_array().map(Vec::len), Some(2));
+    let other_session_id = sessions_body["sessions"]
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["isCurrent"] == false)
+        })
+        .and_then(|session| session["id"].as_str())
+        .ok_or("missing other session")?;
+    let revoke_other = client
+        .delete(format!(
+            "{base_url}/api/v1/auth/sessions/{other_session_id}"
+        ))
+        .header(COOKIE, &cookie_header)
+        .header("x-csrf-token", &csrf_cookie)
+        .send()
+        .await?;
+    assert_eq!(revoke_other.status(), reqwest::StatusCode::NO_CONTENT);
+    let remaining = client
+        .get(format!("{base_url}/api/v1/auth/sessions"))
+        .header(COOKIE, &cookie_header)
+        .send()
+        .await?;
+    assert_eq!(
+        remaining.json::<serde_json::Value>().await?["sessions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
     let me = client
         .get(format!("{base_url}/api/v1/auth/me"))
         .header(COOKIE, &cookie_header)

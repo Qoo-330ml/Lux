@@ -3481,6 +3481,61 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_web_session_summaries(
+        &self,
+        user_id: &str,
+        current_session_token_hash: &[u8],
+    ) -> Result<Vec<StoredWebSessionSummary>, StorageError> {
+        sqlx::query(
+            "SELECT id, created_at, updated_at, expires_at, last_seen_at,
+                    session_token_hash = ? AS is_current
+             FROM web_sessions
+             WHERE user_id = ? AND revoked_at IS NULL AND expires_at > unixepoch()
+             ORDER BY updated_at DESC, id DESC",
+        )
+        .bind(current_session_token_hash)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredWebSessionSummary {
+                    id: row.get("id"),
+                    created_at: row.get("created_at"),
+                    updated_at: row.get("updated_at"),
+                    expires_at: row.get("expires_at"),
+                    last_seen_at: row.get("last_seen_at"),
+                    is_current: row.get::<i64, _>("is_current") != 0,
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn revoke_web_session_by_id(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE web_sessions
+             SET revoked_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub async fn schema_version(&self) -> Result<i64, StorageError> {
         sqlx::query("SELECT COALESCE(MAX(version), 0) AS version FROM _sqlx_migrations")
             .fetch_one(&self.pool)
@@ -3872,6 +3927,16 @@ pub(crate) struct StoredWebSession {
     pub(crate) can_manage_server: bool,
     pub(crate) can_remote_access: bool,
     pub(crate) can_download: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredWebSessionSummary {
+    pub(crate) id: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) expires_at: i64,
+    pub(crate) last_seen_at: Option<i64>,
+    pub(crate) is_current: bool,
 }
 
 pub(crate) struct NewAccessToken<'a> {

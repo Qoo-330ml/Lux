@@ -96,6 +96,38 @@ impl WebAuthService {
         Ok(())
     }
 
+    pub async fn list_sessions(
+        &self,
+        user_id: &UserId,
+        current_session_token: &str,
+    ) -> Result<Vec<WebSessionSummary>, WebAuthError> {
+        Ok(self
+            .database
+            .list_web_session_summaries(&user_id.to_string(), &hash_token(current_session_token))
+            .await?
+            .into_iter()
+            .map(|session| WebSessionSummary {
+                id: session.id,
+                created_at: session.created_at,
+                updated_at: session.updated_at,
+                expires_at: session.expires_at,
+                last_seen_at: session.last_seen_at,
+                is_current: session.is_current,
+            })
+            .collect())
+    }
+
+    pub async fn revoke_session(
+        &self,
+        user_id: &UserId,
+        session_id: &str,
+    ) -> Result<bool, WebAuthError> {
+        Ok(self
+            .database
+            .revoke_web_session_by_id(&user_id.to_string(), session_id)
+            .await?)
+    }
+
     pub fn verify_csrf(&self, session: &AuthenticatedSession, csrf_token: &str) -> bool {
         hash_token(csrf_token)
             .as_slice()
@@ -109,6 +141,16 @@ pub struct LoginSession {
     pub session_token: String,
     pub csrf_token: String,
     pub user: UserRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct WebSessionSummary {
+    pub id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: i64,
+    pub last_seen_at: Option<i64>,
+    pub is_current: bool,
 }
 
 #[derive(Clone, Debug)]

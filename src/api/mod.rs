@@ -149,6 +149,11 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/me", get(auth_me))
+        .route("/api/v1/auth/sessions", get(auth_sessions))
+        .route(
+            "/api/v1/auth/sessions/{session_id}",
+            delete(auth_revoke_session),
+        )
         .route(
             "/api/v1/admin/libraries",
             get(admin_list_libraries).post(admin_create_library),
@@ -2251,6 +2256,128 @@ async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response 
             "认证暂时不可用",
         )
         .into_response(),
+    }
+}
+
+async fn auth_sessions(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(session_token) = request_cookie(&headers, "lux_session") else {
+        return api_error(
+            &headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要登录",
+        )
+        .into_response();
+    };
+    let session = match auth.resolve(&session_token).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要登录",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match auth.list_sessions(&session.user.id, &session_token).await {
+        Ok(sessions) => Json(json!({
+            "sessions": sessions.iter().map(|session| json!({
+                "id": session.id,
+                "createdAt": session.created_at,
+                "updatedAt": session.updated_at,
+                "expiresAt": session.expires_at,
+                "lastSeenAt": session.last_seen_at,
+                "isCurrent": session.is_current,
+            })).collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn auth_revoke_session(
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(session_token) = request_cookie(&headers, "lux_session") else {
+        return api_error(
+            &headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要登录",
+        )
+        .into_response();
+    };
+    let session = match auth.resolve(&session_token).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要登录",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(csrf_token) = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return api_error(
+            &headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::CsrfFailed,
+            "CSRF 校验失败",
+        )
+        .into_response();
+    };
+    if !auth.verify_csrf(&session, csrf_token) {
+        return api_error(
+            &headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::CsrfFailed,
+            "CSRF 校验失败",
+        )
+        .into_response();
+    }
+    let sessions = match auth.list_sessions(&session.user.id, &session_token).await {
+        Ok(sessions) => sessions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if sessions
+        .iter()
+        .any(|entry| entry.id == session_id && entry.is_current)
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "不能撤销当前会话，请使用退出登录",
+        )
+        .into_response();
+    }
+    match auth.revoke_session(&session.user.id, &session_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "会话不存在",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 

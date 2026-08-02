@@ -71,8 +71,13 @@ const accessibilityIssues = await page.evaluate(() => {
   return issues;
 });
 
+await page.locator("[data-route='account']").first().click();
+await page.getByRole("heading", { name: "账户与会话", exact: true }).waitFor();
+const accountVisible = await page.getByRole("heading", { name: "账户与会话", exact: true }).isVisible();
+
 const result = {
   ordinaryUserNoAdmin,
+  accountVisible,
   playerMetadataReady,
   streamResponses,
   favoriteStatus,
@@ -85,4 +90,4 @@ const result = {
 };
 console.log(JSON.stringify(result, null, 2));
 await browser.close();
-if (!ordinaryUserNoAdmin || !playerMetadataReady || streamResponses.every((response) => response.status !== 206) || ![200, 204].includes(favoriteStatus) || viewportChecks.some((check) => !check.noHorizontalOverflow) || accessibilityIssues.length || consoleErrors.length || pageErrors.length || result.failedRequests.length) process.exitCode = 1;
+if (!ordinaryUserNoAdmin || !accountVisible || !playerMetadataReady || streamResponses.every((response) => response.status !== 206) || ![200, 204].includes(favoriteStatus) || viewportChecks.some((check) => !check.noHorizontalOverflow) || accessibilityIssues.length || consoleErrors.length || pageErrors.length || result.failedRequests.length) process.exitCode = 1;
