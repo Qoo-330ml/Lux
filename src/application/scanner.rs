@@ -1095,6 +1095,19 @@ impl ScanJobService {
         Ok(())
     }
 
+    pub async fn retry(&self, job_id: &str) -> Result<ScanJob, ScanJobError> {
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
+        if !matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
+            return Err(ScanJobError::AlreadyActive(job.id));
+        }
+        let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        self.create_movie_scan_job(library_id).await
+    }
+
     async fn get_job(&self, id: &str) -> Result<ScanJob, ScanJobError> {
         self.database
             .find_scan_job(id)

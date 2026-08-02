@@ -1227,6 +1227,43 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_scan_jobs(
+        &self,
+        status: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredScanJob>, StorageError> {
+        let rows = if let Some(status) = status {
+            sqlx::query(
+                "SELECT id, library_id, job_type, status, generation, cursor,
+                        processed_count, total_count, cancel_requested, error
+                 FROM scan_jobs WHERE status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, library_id, job_type, status, generation, cursor,
+                        processed_count, total_count, cancel_requested, error
+                 FROM scan_jobs
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map(|rows| rows.into_iter().map(stored_scan_job).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn find_active_scan_job(
         &self,
         library_id: &str,

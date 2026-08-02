@@ -194,6 +194,8 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/jobs/{job_id}/cancel",
             post(admin_cancel_scan),
         )
+        .route("/api/v1/admin/jobs/{job_id}/retry", post(admin_retry_scan))
+        .route("/api/v1/admin/jobs", get(admin_list_jobs))
         .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
@@ -3831,6 +3833,134 @@ async fn admin_cancel_scan(
         Err(ScanJobError::JobNotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AdminJobsQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    status: Option<String>,
+}
+
+async fn admin_list_jobs(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let status = query.status.as_deref().map(str::to_ascii_uppercase);
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED"
+        )
+    }) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务状态无效",
+        )
+        .into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .list_scan_jobs(status.as_deref(), offset, limit)
+        .await
+    {
+        Ok(jobs) => Json(json!({
+            "jobs": jobs.iter().map(scan_job_json_from_storage).collect::<Vec<_>>(),
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_retry_scan(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let job = match scan_jobs.retry(&job_id).await {
+        Ok(job) => job,
+        Err(ScanJobError::JobNotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(ScanJobError::AlreadyActive(_)) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                "任务仍在运行或不可重试",
+            )
+            .into_response();
+        }
+        Err(ScanJobError::LibraryNotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let worker = scan_jobs.clone();
+    let new_job_id = job.id.clone();
+    tokio::spawn(async move {
+        loop {
+            match worker.run_batch(&new_job_id, 100).await {
+                Ok(report) if report.completed => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "SCAN_RETRIED",
+        Some("scan_job"),
+        Some(&job_id),
+        &format!(r#"{{"newJobId":"{}"}}"#, job.id),
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": scan_job_json(&job) })),
+    )
+        .into_response()
+}
+
+fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) -> Value {
+    json!({
+        "id": job.id,
+        "libraryId": job.library_id,
+        "jobType": job.job_type,
+        "status": job.status,
+        "generation": job.generation,
+        "cursor": job.cursor,
+        "processedCount": job.processed_count,
+        "totalCount": job.total_count,
+        "cancelRequested": job.cancel_requested,
+        "error": job.error,
+    })
 }
 
 fn scan_job_json(job: &crate::application::scanner::ScanJob) -> Value {

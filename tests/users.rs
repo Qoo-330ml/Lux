@@ -80,6 +80,25 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .as_str()
         .ok_or("missing library id")?
         .to_owned();
+    let scan = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{library_id}/scan"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(scan.status(), reqwest::StatusCode::ACCEPTED);
+    let jobs = client
+        .get(format!("{base_url}/api/v1/admin/jobs"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(jobs.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        jobs.json::<Value>().await?["jobs"].as_array().map(Vec::len),
+        Some(1)
+    );
     let access = client
         .patch(format!(
             "{base_url}/api/v1/admin/users/{created_id}/libraries/{library_id}"
