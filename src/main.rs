@@ -1,6 +1,6 @@
 //! Lux server binary entry point.
 
-use luxd::{app, config::Config, observability};
+use luxd::{app, config::Config, observability, storage::Database};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -8,6 +8,9 @@ use tracing::{error, info};
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
     observability::init();
+    let database = Database::connect(&config).await?;
+    let schema_version = database.schema_version().await?;
+    info!(schema_version, "database migrations applied");
 
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
@@ -16,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    database.close().await;
     Ok(())
 }
 
