@@ -56,6 +56,13 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     assert!(persisted.2.is_some());
 
     let restarted_jobs = ScanJobService::new(database.clone());
+    assert!(
+        restarted_jobs
+            .active_job_ids()
+            .await?
+            .iter()
+            .any(|id| id == &job.id)
+    );
     let second_batch = restarted_jobs.run_batch(&job.id, 1).await?;
     assert_eq!(second_batch.status, "RUNNING");
     assert_eq!(second_batch.processed, 1);
@@ -71,6 +78,13 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
             .fetch_one(database.pool())
             .await?;
     assert_eq!(final_status, ("COMPLETED".to_owned(), 3, None));
+    assert!(
+        !restarted_jobs
+            .active_job_ids()
+            .await?
+            .iter()
+            .any(|id| id == &job.id)
+    );
     let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
         .fetch_one(database.pool())
         .await?;

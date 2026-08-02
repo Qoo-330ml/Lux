@@ -60,8 +60,11 @@ impl MetadataReidentifyService {
         let Ok(Some(job)) = self.database.find_metadata_reidentify_job(job_id).await else {
             return;
         };
-        if matches!(job.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED")
-            || !self
+        if matches!(job.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") {
+            return;
+        }
+        if job.status == "QUEUED"
+            && !self
                 .database
                 .claim_metadata_reidentify_job(job_id)
                 .await
@@ -161,6 +164,12 @@ impl MetadataReidentifyService {
             return Err(MetadataReidentifyError::JobNotRetryable);
         }
         self.get_job(job_id).await
+    }
+
+    pub async fn active_job_ids(&self) -> Result<Vec<String>, StorageError> {
+        self.database
+            .list_active_metadata_reidentify_job_ids()
+            .await
     }
 }
 

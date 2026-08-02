@@ -1809,6 +1809,22 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_active_metadata_reidentify_job_ids(
+        &self,
+    ) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT id FROM metadata_reidentify_jobs
+             WHERE status IN ('QUEUED', 'RUNNING')
+             ORDER BY created_at, id LIMIT 10000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_active_scan_job(
         &self,
         library_id: &str,

@@ -1107,6 +1107,22 @@ impl ScanJobService {
         })
     }
 
+    pub async fn active_job_ids(&self) -> Result<Vec<String>, ScanJobError> {
+        let mut ids = Vec::new();
+        for status in ["PENDING", "RUNNING"] {
+            ids.extend(
+                self.database
+                    .list_scan_jobs(Some(status), 0, 10_000)
+                    .await?
+                    .into_iter()
+                    .map(|job| job.id),
+            );
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     pub async fn cancel(&self, job_id: &str) -> Result<(), ScanJobError> {
         self.database.request_scan_job_cancel(job_id).await?;
         Ok(())
