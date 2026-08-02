@@ -131,6 +131,9 @@ pub fn app() -> Router {
 
 pub fn app_with_state(state: AppState) -> Router {
     Router::new()
+        .route("/", get(web_index))
+        .route("/app.mjs", get(web_app))
+        .route("/styles.css", get(web_styles))
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/api/v1/version", get(version))
@@ -264,6 +267,36 @@ async fn attach_peer_address(mut request: Request<Body>, next: Next) -> Response
 
 fn safe_trace_path(uri: &axum::http::Uri) -> &str {
     uri.path()
+}
+
+async fn web_index() -> Response {
+    static_response(
+        "text/html; charset=utf-8",
+        include_str!("../../web/src/index.html"),
+    )
+}
+
+async fn web_app() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../../web/src/app.mjs"),
+    )
+}
+
+async fn web_styles() -> Response {
+    static_response(
+        "text/css; charset=utf-8",
+        include_str!("../../web/src/styles.css"),
+    )
+}
+
+fn static_response(content_type: &'static str, body: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", content_type)
+        .header("Cache-Control", "no-cache")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
