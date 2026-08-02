@@ -237,6 +237,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_start_scan),
         )
         .route(
+            "/api/v1/admin/libraries/{library_id}/reconcile",
+            post(admin_start_scan),
+        )
+        .route(
             "/api/v1/admin/jobs/{job_id}/cancel",
             post(admin_cancel_scan),
         )

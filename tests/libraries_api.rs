@@ -186,6 +186,16 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         .await?;
     assert_eq!(disabled_scan.status(), reqwest::StatusCode::NOT_FOUND);
 
+    let disabled_reconcile = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{library_id}/reconcile"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(disabled_reconcile.status(), reqwest::StatusCode::NOT_FOUND);
+
     let deleted_library = client
         .delete(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
         .header(COOKIE, &cookies)
