@@ -16,15 +16,15 @@
 
 ### Slice 1：NFO parser 和图片 migration
 
-- [ ] 引入小型 XML parser 依赖并新增 `0007_item_images.sql`。
-- [ ] 实现受限 NFO parser，覆盖正常、部分、空和损坏 XML。
-- [ ] 实现安全的 poster/fanart 文件发现。
+- [x] 引入小型 XML parser 依赖并新增 `0007_item_images.sql`。
+- [x] 实现受限 NFO parser，覆盖正常、部分、空和损坏 XML。
+- [x] 实现安全的 poster/fanart 文件发现。
 
 ### Slice 2：本地 metadata enrichment
 
-- [ ] 根据已持久化 media source 找到媒体文件和同目录元数据。
-- [ ] 更新 media item 元数据，保存 item_images。
-- [ ] 重复运行幂等；损坏 NFO 生成失败报告但保留条目。
+- [x] 根据已持久化 media source 找到媒体文件和同目录元数据。
+- [x] 更新 media item 元数据，保存 item_images。
+- [x] 重复运行幂等；损坏 NFO 生成失败报告但保留条目。
 
 ## 验证门
 
@@ -32,6 +32,8 @@
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - ARM64 本机用正常/损坏 NFO 和 poster/fanart fixture 验证持久化。
+
+验证结果：以上检查均通过；本机 `arm64` / `aarch64-apple-darwin` 已验证正常、部分、空和损坏 NFO，以及图片元数据持久化和重复运行幂等。
 
 ## 明确不做
 

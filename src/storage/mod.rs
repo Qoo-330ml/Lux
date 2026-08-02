@@ -528,6 +528,95 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_media_sources_for_library(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        sqlx::query(
+            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
+             ORDER BY ms.item_id, fe.relative_path",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaSourcePath {
+                    item_id: row.get("item_id"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_media_item_metadata(
+        &self,
+        item_id: &str,
+        title: Option<&str>,
+        original_title: Option<&str>,
+        overview: Option<&str>,
+        production_year: Option<i64>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE media_items
+             SET title = COALESCE(?, title),
+                 original_title = COALESCE(?, original_title),
+                 overview = COALESCE(?, overview),
+                 production_year = COALESCE(?, production_year),
+                 metadata_provenance_json = '{\"source\":\"LOCAL_NFO\"}'
+             WHERE id = ?",
+        )
+        .bind(title)
+        .bind(original_title)
+        .bind(overview)
+        .bind(production_year)
+        .bind(item_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn insert_item_image(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        local_path: &std::path::Path,
+        file_size: i64,
+    ) -> Result<bool, StorageError> {
+        let id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT OR IGNORE INTO item_images (
+                id, item_id, image_type, image_index, local_path, file_size, source
+            ) VALUES (?, ?, ?, 0, ?, ?, 'LOCAL')",
+        )
+        .bind(id)
+        .bind(item_id)
+        .bind(image_type)
+        .bind(local_path.to_string_lossy().as_ref())
+        .bind(file_size)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn create_access_token(
         &self,
         token: NewAccessToken<'_>,
@@ -759,6 +848,13 @@ pub(crate) struct StoredMediaItem {
 
 fn stored_media_item(row: sqlx::sqlite::SqliteRow) -> StoredMediaItem {
     StoredMediaItem { id: row.get("id") }
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredMediaSourcePath {
+    pub(crate) item_id: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
 }
 
 #[derive(Debug)]
