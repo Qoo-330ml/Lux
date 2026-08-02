@@ -8,7 +8,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -49,7 +49,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .fetch_one(database.pool())
         .await?;
     let high_media_path = root.join("Range.Movie.2024.2160p.mkv");
-    tokio::fs::write(&high_media_path, b"high-quality").await?;
+    tokio::fs::write(&high_media_path, vec![b'X'; 8 * 1024 * 1024]).await?;
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
@@ -145,6 +145,44 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     let selected_body = selected_playback.json::<Value>().await?;
     assert_eq!(selected_body["MediaSources"][0]["Id"], high_source_id);
     assert_eq!(selected_body["MediaSources"][0]["Quality"], "2160p");
+
+    let range_request = |start: u64, end: u64| {
+        let client = client.clone();
+        let url = format!("{base_url}/Videos/{item_id}/{high_source_id}/stream.mkv");
+        let token = token.clone();
+        async move {
+            let mut response = client
+                .get(url)
+                .header("X-Emby-Token", token)
+                .header(RANGE, format!("bytes={start}-{end}"))
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                response.headers()[CONTENT_LENGTH],
+                (end - start + 1).to_string()
+            );
+            assert_eq!(
+                response.headers()[CONTENT_RANGE],
+                format!("bytes {start}-{end}/8388608")
+            );
+            let mut received = 0_u64;
+            while let Some(chunk) = response.chunk().await? {
+                received = received.saturating_add(u64::try_from(chunk.len()).unwrap_or(0));
+            }
+            Ok::<u64, reqwest::Error>(received)
+        }
+    };
+    let (range_one, range_two, range_three, range_four) = tokio::join!(
+        range_request(0, 1_048_575),
+        range_request(2_097_152, 3_145_727),
+        range_request(4_194_304, 5_242_879),
+        range_request(6_291_456, 7_340_031),
+    );
+    for result in [range_one, range_two, range_three, range_four] {
+        assert_eq!(result?, 1_048_576);
+    }
+
     let playback_post = client
         .post(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
         .query(&[("api_key", token.as_str())])
