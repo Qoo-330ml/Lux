@@ -186,11 +186,21 @@ impl NfoWriteService {
         item_id: &str,
         patch: &NfoMetadata,
     ) -> Result<NfoWriteReport, NfoWriteError> {
-        let source = self
+        let kind = self
             .database
-            .find_media_source_path(item_id)
+            .find_media_item_kind(item_id)
             .await?
             .ok_or(NfoWriteError::ItemNotFound)?;
+        let source = match kind.item_type.as_str() {
+            "MOVIE" | "EPISODE" => self.database.find_media_source_path(item_id).await?,
+            "SERIES" | "SEASON" => {
+                self.database
+                    .find_first_episode_source_path(item_id)
+                    .await?
+            }
+            _ => None,
+        }
+        .ok_or(NfoWriteError::ItemNotFound)?;
         let root = fs::canonicalize(&source.root_path)
             .await
             .map_err(|error| io_error(Path::new(&source.root_path), error))?;
@@ -210,9 +220,25 @@ impl NfoWriteService {
         if !directory.starts_with(&root) {
             return Err(NfoWriteError::PathOutsideRoot(directory));
         }
-        let target = find_nfo_path(&media_path)
-            .await
-            .unwrap_or_else(|| directory.join("movie.nfo"));
+        let target = match kind.item_type.as_str() {
+            "MOVIE" => find_nfo_path(&media_path)
+                .await
+                .unwrap_or_else(|| directory.join("movie.nfo")),
+            "EPISODE" => find_episode_nfo_target(&media_path, &directory).await,
+            "SERIES" => {
+                let series_dir = series_directory(&root, &source.relative_path)
+                    .ok_or_else(|| NfoWriteError::PathOutsideRoot(directory.clone()))?;
+                let series_dir = fs::canonicalize(&series_dir)
+                    .await
+                    .map_err(|error| io_error(&series_dir, error))?;
+                if !series_dir.starts_with(&root) {
+                    return Err(NfoWriteError::PathOutsideRoot(series_dir));
+                }
+                series_dir.join("tvshow.nfo")
+            }
+            "SEASON" => find_season_nfo_target(&directory, kind.season_number).await,
+            _ => return Err(NfoWriteError::ItemNotFound),
+        };
         let target_parent = target.parent().unwrap_or_else(|| Path::new("."));
         let target_parent = fs::canonicalize(target_parent)
             .await
@@ -377,6 +403,46 @@ fn patch_value(patch: &NfoMetadata, field: MetadataField) -> Option<String> {
         MetadataField::ProductionYear => patch.production_year.map(|year| year.to_string()),
     }
     .filter(|value| !value.trim().is_empty())
+}
+
+async fn find_episode_nfo_target(media_path: &Path, directory: &Path) -> PathBuf {
+    let same_name = media_path.with_extension("nfo");
+    if fs::try_exists(&same_name).await.unwrap_or(false) {
+        return same_name;
+    }
+    let episode_nfo = directory.join("episode.nfo");
+    if fs::try_exists(&episode_nfo).await.unwrap_or(false) {
+        return episode_nfo;
+    }
+    same_name
+}
+
+async fn find_season_nfo_target(directory: &Path, season_number: Option<i64>) -> PathBuf {
+    let number = season_number.unwrap_or_default();
+    let generic = directory.join("season.nfo");
+    if fs::try_exists(&generic).await.unwrap_or(false) {
+        return generic;
+    }
+    let names = if number == 0 {
+        vec!["specials.nfo".to_owned(), "season00.nfo".to_owned()]
+    } else {
+        vec![
+            format!("season{number:02}.nfo"),
+            format!("season{number}.nfo"),
+        ]
+    };
+    for name in &names {
+        let path = directory.join(name);
+        if fs::try_exists(&path).await.unwrap_or(false) {
+            return path;
+        }
+    }
+    directory.join(&names[0])
+}
+
+fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {
+    let first = Path::new(relative_path).components().next()?.as_os_str();
+    Some(root.join(first))
 }
 
 fn field_for_tag(tag: &[u8]) -> Option<MetadataField> {

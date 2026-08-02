@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     io::Cursor,
     path::{Path, PathBuf},
@@ -656,6 +656,175 @@ impl MetadataEnricher {
         }
         Ok(report)
     }
+
+    pub async fn enrich_series_library(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<MetadataReport, MetadataError> {
+        let sources = self
+            .database
+            .list_series_metadata_sources(&library_id.to_string())
+            .await?;
+        let mut report = MetadataReport::default();
+        let mut series_seen = HashSet::new();
+        let mut seasons_seen = HashSet::new();
+        let mut episodes_seen = HashSet::new();
+        for source in sources {
+            let root = PathBuf::from(&source.root_path);
+            let media_path = root.join(&source.relative_path);
+            let Some(series_dir) = series_directory(&root, &source.relative_path) else {
+                continue;
+            };
+            let series_paths = read_directory_paths(&series_dir).await?;
+            if series_seen.insert(source.series_id.clone()) {
+                if let Some(nfo_path) = find_tvshow_nfo(&series_dir).await {
+                    report.merge(self.enrich_nfo_item(&source.series_id, &nfo_path).await?);
+                }
+                report.images_found += self
+                    .index_images(&source.series_id, find_series_images(&series_paths, None))
+                    .await?;
+            }
+
+            let season_number = source.season_number.unwrap_or_default();
+            let season_key = format!("{}:{season_number}", source.season_id);
+            let season_dir = media_path.parent().unwrap_or(&series_dir);
+            if seasons_seen.insert(season_key) {
+                if let Some(nfo_path) =
+                    find_season_nfo(&series_dir, season_dir, season_number).await
+                {
+                    report.merge(self.enrich_nfo_item(&source.season_id, &nfo_path).await?);
+                }
+                let mut season_paths = series_paths.clone();
+                if season_dir != series_dir {
+                    let mut directory_paths = read_directory_paths(season_dir).await?;
+                    season_paths = series_paths
+                        .iter()
+                        .filter(|path| is_prefixed_season_image(path, season_number))
+                        .cloned()
+                        .collect();
+                    season_paths.append(&mut directory_paths);
+                }
+                report.images_found += self
+                    .index_images(
+                        &source.season_id,
+                        find_series_images(&season_paths, Some(season_number)),
+                    )
+                    .await?;
+            }
+
+            if episodes_seen.insert(source.episode_id.clone()) {
+                if let Some(nfo_path) = find_episode_nfo(&media_path).await {
+                    report.merge(self.enrich_nfo_item(&source.episode_id, &nfo_path).await?);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn enrich_nfo_item(
+        &self,
+        item_id: &str,
+        nfo_path: &Path,
+    ) -> Result<MetadataReport, MetadataError> {
+        let mut report = MetadataReport::default();
+        let fingerprint = nfo_fingerprint(nfo_path).await.ok();
+        if let Some(fingerprint) = fingerprint.as_deref()
+            && self
+                .database
+                .media_item_metadata_fingerprint(item_id)
+                .await?
+                .as_deref()
+                == Some(fingerprint)
+        {
+            report.nfo_skipped = 1;
+            return Ok(report);
+        }
+        let bytes = match fs::read(nfo_path).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                report.nfo_failed = 1;
+                return Ok(report);
+            }
+        };
+        let metadata = match parse_nfo(&bytes) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                if let Some(fingerprint) = fingerprint.as_deref() {
+                    self.database
+                        .mark_media_item_metadata_checked(item_id, fingerprint)
+                        .await?;
+                }
+                report.nfo_failed = 1;
+                return Ok(report);
+            }
+        };
+        if let Some(fingerprint) = fingerprint.as_deref()
+            && let Some(current) = self.database.find_media_item_metadata(item_id).await?
+        {
+            let mut state = MetadataState::from_persisted(
+                NfoMetadata {
+                    title: Some(current.title.clone()),
+                    original_title: current.original_title.clone(),
+                    overview: current.overview.clone(),
+                    production_year: current
+                        .production_year
+                        .and_then(|year| i32::try_from(year).ok()),
+                },
+                current.provenance_json.as_deref(),
+                current.locked_fields_json.as_deref(),
+            );
+            state.apply_automatic(&MetadataCandidate {
+                source: MetadataSource::LocalNfo,
+                metadata,
+            });
+            let provenance_json = state.provenance_json();
+            let locked_fields_json = state.locked_fields_json();
+            self.database
+                .update_media_item_metadata(MediaMetadataUpdate {
+                    item_id,
+                    title: state.metadata.title.as_deref().unwrap_or(&current.title),
+                    original_title: state.metadata.original_title.as_deref(),
+                    overview: state.metadata.overview.as_deref(),
+                    production_year: state.metadata.production_year.map(i64::from),
+                    metadata_fingerprint: fingerprint,
+                    provenance_json: &provenance_json,
+                    locked_fields_json: &locked_fields_json,
+                })
+                .await?;
+        }
+        report.nfo_loaded = 1;
+        Ok(report)
+    }
+
+    async fn index_images(
+        &self,
+        item_id: &str,
+        images: Vec<LocalImage>,
+    ) -> Result<usize, MetadataError> {
+        let mut inserted_count = 0;
+        for image in images {
+            let file_size = fs::metadata(&image.path)
+                .await
+                .map_err(|source| MetadataError::Io {
+                    path: image.path.clone(),
+                    source,
+                })?
+                .len();
+            let file_size =
+                i64::try_from(file_size).map_err(|_| MetadataError::FileSizeOutOfRange {
+                    path: image.path.clone(),
+                    size: file_size,
+                })?;
+            if self
+                .database
+                .insert_item_image(item_id, image.image_type.as_str(), &image.path, file_size)
+                .await?
+            {
+                inserted_count += 1;
+            }
+        }
+        Ok(inserted_count)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -664,6 +833,15 @@ pub struct MetadataReport {
     pub nfo_failed: usize,
     pub nfo_skipped: usize,
     pub images_found: usize,
+}
+
+impl MetadataReport {
+    fn merge(&mut self, other: Self) {
+        self.nfo_loaded += other.nfo_loaded;
+        self.nfo_failed += other.nfo_failed;
+        self.nfo_skipped += other.nfo_skipped;
+        self.images_found += other.images_found;
+    }
 }
 
 pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
@@ -693,6 +871,153 @@ pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
     }
     let same_name = media_path.with_extension("nfo");
     fs::try_exists(&same_name).await.ok()?.then_some(same_name)
+}
+
+async fn read_directory_paths(directory: &Path) -> Result<Vec<PathBuf>, MetadataError> {
+    let mut entries = fs::read_dir(directory)
+        .await
+        .map_err(|source| MetadataError::Io {
+            path: directory.to_owned(),
+            source,
+        })?;
+    let mut paths = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| MetadataError::Io {
+            path: directory.to_owned(),
+            source,
+        })?
+    {
+        paths.push(entry.path());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {
+    let first = Path::new(relative_path).components().next()?.as_os_str();
+    Some(root.join(first))
+}
+
+async fn find_tvshow_nfo(series_dir: &Path) -> Option<PathBuf> {
+    let path = series_dir.join("tvshow.nfo");
+    fs::try_exists(&path).await.ok()?.then_some(path)
+}
+
+async fn find_season_nfo(
+    series_dir: &Path,
+    season_dir: &Path,
+    season_number: i64,
+) -> Option<PathBuf> {
+    let names = if season_number == 0 {
+        vec!["season00.nfo".to_owned(), "specials.nfo".to_owned()]
+    } else {
+        vec![
+            format!("season{season_number:02}.nfo"),
+            format!("season{season_number}.nfo"),
+        ]
+    };
+    let mut candidates = Vec::new();
+    for name in names {
+        candidates.push(season_dir.join(&name));
+        candidates.push(series_dir.join(&name));
+    }
+    candidates.push(season_dir.join("season.nfo"));
+    for candidate in candidates {
+        if fs::try_exists(&candidate).await.ok()? {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+async fn find_episode_nfo(media_path: &Path) -> Option<PathBuf> {
+    let same_name = media_path.with_extension("nfo");
+    if fs::try_exists(&same_name).await.ok()? {
+        return Some(same_name);
+    }
+    let episode_nfo = media_path.parent()?.join("episode.nfo");
+    fs::try_exists(&episode_nfo)
+        .await
+        .ok()?
+        .then_some(episode_nfo)
+}
+
+fn find_series_images(paths: &[PathBuf], season_number: Option<i64>) -> Vec<LocalImage> {
+    let mut images = Vec::new();
+    for path in paths {
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "webp"
+        ) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let stem = stem.to_ascii_lowercase();
+        let image_type = match season_number {
+            None => match stem.as_str() {
+                "poster" => ImageType::Poster,
+                "fanart" | "backdrop" => ImageType::Fanart,
+                _ => continue,
+            },
+            Some(number) => {
+                let prefix = format!("season{number}");
+                let padded_prefix = format!("season{number:02}");
+                let is_poster = stem == "poster"
+                    || stem == format!("{prefix}-poster")
+                    || stem == format!("{padded_prefix}-poster");
+                let is_fanart = stem == "fanart"
+                    || stem == "backdrop"
+                    || stem == format!("{prefix}-fanart")
+                    || stem == format!("{padded_prefix}-fanart")
+                    || stem == format!("{prefix}-backdrop")
+                    || stem == format!("{padded_prefix}-backdrop");
+                if is_poster {
+                    ImageType::Poster
+                } else if is_fanart {
+                    ImageType::Fanart
+                } else {
+                    continue;
+                }
+            }
+        };
+        if images
+            .iter()
+            .any(|image: &LocalImage| image.image_type == image_type)
+        {
+            continue;
+        }
+        images.push(LocalImage {
+            image_type,
+            path: path.clone(),
+        });
+    }
+    images
+}
+
+fn is_prefixed_season_image(path: &Path, season_number: i64) -> bool {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let stem = stem.to_ascii_lowercase();
+    let prefix = format!("season{season_number}");
+    let padded_prefix = format!("season{season_number:02}");
+    [
+        format!("{prefix}-poster"),
+        format!("{prefix}-fanart"),
+        format!("{prefix}-backdrop"),
+        format!("{padded_prefix}-poster"),
+        format!("{padded_prefix}-fanart"),
+        format!("{padded_prefix}-backdrop"),
+    ]
+    .into_iter()
+    .any(|candidate| stem == candidate)
 }
 
 #[derive(Debug)]

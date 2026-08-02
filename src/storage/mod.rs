@@ -1679,6 +1679,60 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_media_item_kind(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredMediaItemKind>, StorageError> {
+        sqlx::query("SELECT item_type, season_number FROM media_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| {
+                row.map(|row| StoredMediaItemKind {
+                    item_type: row.get("item_type"),
+                    season_number: row.get("season_number"),
+                })
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn find_first_episode_source_path(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+        sqlx::query(
+            "SELECT ms.id AS source_id, episode.id AS item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_items episode
+             JOIN media_sources ms ON ms.item_id = episode.id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE episode.item_type = 'EPISODE'
+               AND (episode.series_id = ? OR episode.parent_id = ?)
+             ORDER BY episode.id, fe.relative_path LIMIT 1",
+        )
+        .bind(item_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredMediaSourcePath {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                probe_status: row.get("probe_status"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn save_media_probe(
         &self,
         update: MediaProbeUpdate<'_>,
@@ -1744,6 +1798,48 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn list_series_metadata_sources(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
+        sqlx::query(
+            "SELECT series.id AS series_id, season.id AS season_id,
+                    episode.id AS episode_id, season.season_number,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_items episode
+             JOIN media_items season ON season.id = episode.parent_id
+             JOIN media_items series ON series.id = episode.series_id
+             JOIN media_sources ms ON ms.item_id = episode.id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE episode.item_type = 'EPISODE'
+               AND season.item_type = 'SEASON'
+               AND series.item_type = 'SERIES'
+               AND episode.library_id = ?
+               AND episode.removed_at IS NULL
+             ORDER BY series.id, season.season_number, episode.id, fe.relative_path",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredSeriesMetadataSource {
+                    series_id: row.get("series_id"),
+                    season_id: row.get("season_id"),
+                    episode_id: row.get("episode_id"),
+                    season_number: row.get("season_number"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn insert_hierarchy_item(
@@ -2316,6 +2412,22 @@ pub(crate) struct StoredMediaSourcePath {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
     pub(crate) probe_status: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredMediaItemKind {
+    pub(crate) item_type: String,
+    pub(crate) season_number: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredSeriesMetadataSource {
+    pub(crate) series_id: String,
+    pub(crate) season_id: String,
+    pub(crate) episode_id: String,
+    pub(crate) season_number: Option<i64>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
 }
