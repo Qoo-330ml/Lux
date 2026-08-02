@@ -9,7 +9,7 @@
 | Infuse | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 待 LUX-025 |
 | VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 未实现（Views/Resume 返回 404） | 未测试 | 未测试 | 未测试 | 真实 UI 添加/登录成功；见下方请求序列 |
 | SenPlayer | 6.0.6 | macOS arm64 | 通过 | 未通过（响应解析） | 未测试 | 未测试 | 未测试 | 未测试 | 服务器已保存；认证 HTTP 200 后客户端报“未能读取数据，数据已丢失” |
-| Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选通过 | MP4 直放通过 | 浏览器端进度/收藏未完整回归 | 多版本代码已实现、浏览器未覆盖 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390px 无横向溢出、控制台无错误；完整 Playwright 套件仍未固化 |
+| Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
 
 ## 记录格式
 
@@ -21,7 +21,7 @@
 - LUX-023：已完成根路径/`/emby` 前缀的 System/Ping 本地协议 shape 测试，并完成 VidHub/SenPlayer 真实登录前置探针。
 - LUX-024：已完成 Users/Public、AuthenticateByName、Sessions/Logout 的本地协议 shape 和 token 脱敏测试；VidHub 真实登录通过，SenPlayer 认证响应解析失败。
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
-- Web 的“已实现”仅表示代码路径和服务端静态集成已完成；在真实浏览器中完成登录、筛选和播放前，不宣称浏览器端到端兼容。
+- Web 的“已实现”仅表示代码路径和服务端静态集成已完成；当前 Chrome smoke 覆盖登录、筛选、播放、收藏、账户会话和管理流程，不等同于所有浏览器/编码格式兼容。
 
 ## LUX-025 本机探针进度（2026-08-02）
 
