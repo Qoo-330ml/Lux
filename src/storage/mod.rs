@@ -852,6 +852,64 @@ impl Database {
             })
     }
 
+    pub(crate) async fn find_external_subtitle(
+        &self,
+        item_id: &str,
+        media_source_id: Option<&str>,
+        stream_index: i64,
+    ) -> Result<Option<StoredExternalSubtitle>, StorageError> {
+        let row = if let Some(media_source_id) = media_source_id {
+            sqlx::query(
+                "SELECT ms.id AS media_source_id, ms.item_id, mt.external_path,
+                        mt.language, mt.title, lr.canonical_path AS root_path
+                 FROM media_streams mt
+                 JOIN media_sources ms ON ms.id = mt.media_source_id
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE ms.id = ? AND mi.id = ? AND mt.stream_index = ?
+                   AND mt.stream_type = 'SUBTITLE' AND mt.external_path IS NOT NULL
+                 LIMIT 1",
+            )
+            .bind(media_source_id)
+            .bind(item_id)
+            .bind(stream_index)
+            .fetch_optional(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT ms.id AS media_source_id, ms.item_id, mt.external_path,
+                        mt.language, mt.title, lr.canonical_path AS root_path
+                 FROM media_streams mt
+                 JOIN media_sources ms ON ms.id = mt.media_source_id
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE mi.id = ? AND mt.stream_index = ?
+                   AND mt.stream_type = 'SUBTITLE' AND mt.external_path IS NOT NULL
+                 ORDER BY ms.is_default DESC, ms.id LIMIT 1",
+            )
+            .bind(item_id)
+            .bind(stream_index)
+            .fetch_optional(&self.pool)
+            .await
+        };
+        row.map(|row| {
+            row.map(|row| StoredExternalSubtitle {
+                media_source_id: row.get("media_source_id"),
+                item_id: row.get("item_id"),
+                external_path: row.get("external_path"),
+                language: row.get("language"),
+                title: row.get("title"),
+                root_path: row.get("root_path"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn request_scan_job_cancel(&self, id: &str) -> Result<(), StorageError> {
         sqlx::query(
             "UPDATE scan_jobs SET cancel_requested = 1, updated_at = unixepoch()
@@ -1484,7 +1542,10 @@ impl Database {
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                    mt.codec, mt.language, mt.title AS stream_title
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              LEFT JOIN media_sources ms ON ms.item_id = mi.id
@@ -1560,7 +1621,10 @@ impl Database {
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                    mt.codec, mt.language, mt.title AS stream_title
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
@@ -1600,7 +1664,10 @@ impl Database {
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                        mt.codec, mt.language, mt.title AS stream_title
+                        mt.codec, mt.language, mt.title AS stream_title,
+                        mt.is_external AS stream_is_external,
+                        mt.is_default AS stream_is_default,
+                        mt.is_forced AS stream_is_forced
                  FROM (
                      SELECT mi.id, mi.library_id, mi.item_type,
                             mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -1633,7 +1700,10 @@ impl Database {
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                        mt.codec, mt.language, mt.title AS stream_title
+                        mt.codec, mt.language, mt.title AS stream_title,
+                        mt.is_external AS stream_is_external,
+                        mt.is_default AS stream_is_default,
+                        mt.is_forced AS stream_is_forced
                  FROM (
                      SELECT mi.id, mi.library_id, mi.item_type,
                             mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -1670,7 +1740,10 @@ impl Database {
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                    mt.codec, mt.language, mt.title AS stream_title
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              LEFT JOIN media_sources ms ON ms.item_id = mi.id
@@ -1731,6 +1804,15 @@ impl Database {
                         codec: row.get("codec"),
                         language: row.get("language"),
                         stream_title: row.get("stream_title"),
+                        stream_is_external: row
+                            .get::<Option<i64>, _>("stream_is_external")
+                            .map(|value| value != 0),
+                        stream_is_default: row
+                            .get::<Option<i64>, _>("stream_is_default")
+                            .map(|value| value != 0),
+                        stream_is_forced: row
+                            .get::<Option<i64>, _>("stream_is_forced")
+                            .map(|value| value != 0),
                     })
                     .collect()
             })
@@ -1951,8 +2033,8 @@ impl Database {
             sqlx::query(
                 "INSERT INTO media_streams (
                     id, media_source_id, stream_index, stream_type,
-                    codec, language, title
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    codec, language, title, external_path, is_external, is_default, is_forced
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(update.source_id)
@@ -1961,6 +2043,10 @@ impl Database {
             .bind(stream.codec)
             .bind(stream.language)
             .bind(stream.title)
+            .bind(stream.external_path)
+            .bind(stream.is_external)
+            .bind(stream.is_default)
+            .bind(stream.is_forced)
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -2575,6 +2661,9 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) codec: Option<String>,
     pub(crate) language: Option<String>,
     pub(crate) stream_title: Option<String>,
+    pub(crate) stream_is_external: Option<bool>,
+    pub(crate) stream_is_default: Option<bool>,
+    pub(crate) stream_is_forced: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2585,6 +2674,16 @@ pub(crate) struct StoredUserItemState {
     pub(crate) play_count: i64,
     pub(crate) last_played_at: Option<i64>,
     pub(crate) version: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredExternalSubtitle {
+    pub(crate) media_source_id: String,
+    pub(crate) item_id: String,
+    pub(crate) external_path: String,
+    pub(crate) language: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) root_path: String,
 }
 
 #[derive(Debug)]
@@ -2761,6 +2860,10 @@ pub(crate) struct MediaStreamUpdate<'a> {
     pub(crate) codec: Option<&'a str>,
     pub(crate) language: Option<&'a str>,
     pub(crate) title: Option<&'a str>,
+    pub(crate) external_path: Option<&'a str>,
+    pub(crate) is_external: bool,
+    pub(crate) is_default: bool,
+    pub(crate) is_forced: bool,
 }
 
 async fn ensure_server_id(pool: &SqlitePool) -> Result<String, sqlx::Error> {

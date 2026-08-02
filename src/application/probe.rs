@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde_json::Value;
-use tokio::{process::Command, time::timeout};
+use tokio::{fs, process::Command, time::timeout};
 
 use crate::{
     domain::{ids::LibraryId, time::duration_to_ticks},
@@ -329,8 +329,36 @@ impl MediaProbeService {
                             codec: stream.codec.as_deref(),
                             language: stream.language.as_deref(),
                             title: stream.title.as_deref(),
+                            external_path: None,
+                            is_external: false,
+                            is_default: false,
+                            is_forced: false,
                         })
                         .collect::<Vec<_>>();
+                    let external_subtitles =
+                        discover_external_subtitles(&path, &source.root_path).await;
+                    let next_stream_index = result
+                        .streams
+                        .iter()
+                        .map(|stream| stream.stream_index)
+                        .max()
+                        .unwrap_or(-1)
+                        .saturating_add(1);
+                    let mut streams = streams;
+                    for (offset, subtitle) in external_subtitles.iter().enumerate() {
+                        streams.push(MediaStreamUpdate {
+                            stream_index: next_stream_index
+                                .saturating_add(i64::try_from(offset).unwrap_or(i64::MAX)),
+                            stream_type: "SUBTITLE",
+                            codec: subtitle.codec.as_deref(),
+                            language: subtitle.language.as_deref(),
+                            title: subtitle.title.as_deref(),
+                            external_path: Some(subtitle.relative_path.as_str()),
+                            is_external: true,
+                            is_default: subtitle.is_default,
+                            is_forced: subtitle.is_forced,
+                        });
+                    }
                     self.database
                         .save_media_probe(MediaProbeUpdate {
                             source_id: &source.source_id,
@@ -375,6 +403,101 @@ fn safe_media_path(root_path: &str, relative_path: &str) -> Result<PathBuf, Prob
         });
     }
     Ok(PathBuf::from(root_path).join(relative))
+}
+
+#[derive(Clone, Debug)]
+struct ExternalSubtitle {
+    relative_path: String,
+    codec: Option<String>,
+    language: Option<String>,
+    title: Option<String>,
+    is_default: bool,
+    is_forced: bool,
+}
+
+async fn discover_external_subtitles(media_path: &Path, root_path: &str) -> Vec<ExternalSubtitle> {
+    let Some(directory) = media_path.parent() else {
+        return Vec::new();
+    };
+    let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+    let Ok(mut entries) = fs::read_dir(directory).await else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let supported = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "srt" | "ass" | "ssa" | "vtt" | "sub" | "sup"
+                )
+            });
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if supported && (stem == media_stem || stem.starts_with(&format!("{media_stem}."))) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let stem = path.file_stem()?.to_str()?;
+            let suffix = stem.strip_prefix(media_stem).unwrap_or_default();
+            let tokens = suffix
+                .trim_start_matches('.')
+                .split(['.', '_', '-'])
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            let language = tokens.iter().find_map(|token| subtitle_language(token));
+            let is_forced = tokens
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case("forced"));
+            let is_default = tokens
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case("default"));
+            let codec = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase());
+            let relative_path = path.strip_prefix(root_path).ok()?.to_str()?.to_owned();
+            Some(ExternalSubtitle {
+                relative_path,
+                codec,
+                language,
+                title: (!tokens.is_empty()).then(|| tokens.join(" ")),
+                is_default,
+                is_forced,
+            })
+        })
+        .collect()
+}
+
+fn subtitle_language(value: &str) -> Option<String> {
+    match value.to_ascii_lowercase().as_str() {
+        "en" | "eng" => Some("eng".to_owned()),
+        "zh" | "chi" | "cmn" | "chs" | "zh-cn" | "zh-hans" => Some("zho".to_owned()),
+        "cht" | "zh-tw" | "zh-hant" => Some("zho".to_owned()),
+        "ja" | "jpn" => Some("jpn".to_owned()),
+        "ko" | "kor" => Some("kor".to_owned()),
+        "fr" | "fra" | "fre" => Some("fra".to_owned()),
+        "de" | "deu" | "ger" => Some("deu".to_owned()),
+        "es" | "spa" => Some("spa".to_owned()),
+        "it" | "ita" => Some("ita".to_owned()),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

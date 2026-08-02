@@ -263,6 +263,9 @@ pub struct CatalogStream {
     pub codec: Option<String>,
     pub language: Option<String>,
     pub title: Option<String>,
+    pub is_external: bool,
+    pub is_default: bool,
+    pub is_forced: bool,
 }
 
 fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
@@ -337,6 +340,9 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
             codec: row.codec,
             language: row.language,
             title: row.stream_title,
+            is_external: row.stream_is_external.unwrap_or(false),
+            is_default: row.stream_is_default.unwrap_or(false),
+            is_forced: row.stream_is_forced.unwrap_or(false),
         });
         let _ = stream_id;
     }

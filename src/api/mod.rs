@@ -154,6 +154,10 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/items/{item_id}/images/{image_type}/{image_index}",
             get(lux_image_at_index).head(lux_image_at_index),
         )
+        .route(
+            "/api/v1/items/{item_id}/subtitles/{stream_index}",
+            get(lux_subtitle).head(lux_subtitle),
+        )
         .merge(emby_routes())
         .nest("/emby", emby_routes())
         .with_state(state)
@@ -201,6 +205,14 @@ fn emby_routes() -> Router<AppState> {
         .route(
             "/Items/{item_id}/Images/{image_type}/{image_index}",
             get(emby_image_at_index).head(emby_image_at_index),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/Stream",
+            get(emby_subtitle_with_source).head(emby_subtitle_with_source),
+        )
+        .route(
+            "/Items/{item_id}/Subtitles/{stream_index}/Stream",
+            get(emby_subtitle_without_source).head(emby_subtitle_without_source),
         )
         .route("/Sessions/Logout", post(emby_logout))
 }
@@ -840,6 +852,9 @@ fn emby_media_source_json(source: &crate::application::catalog::CatalogSource) -
             "Codec": stream.codec,
             "Language": stream.language,
             "DisplayTitle": stream.title,
+            "IsExternal": stream.is_external,
+            "IsDefault": stream.is_default,
+            "IsForced": stream.is_forced,
         })).collect::<Vec<_>>(),
     })
 }
@@ -1467,6 +1482,30 @@ async fn lux_image_at_index(
     .await
 }
 
+async fn lux_subtitle(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, stream_index)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Ok(stream_index) = stream_index.parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    serve_subtitle(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &method,
+        &item_id,
+        None,
+        stream_index,
+    )
+    .await
+}
+
 async fn emby_image(
     headers: HeaderMap,
     method: Method,
@@ -1522,6 +1561,139 @@ async fn emby_image_at_index(
         image_index,
     )
     .await
+}
+
+async fn emby_subtitle_with_source(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, media_source_id, stream_index)): Path<(String, String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Ok(stream_index) = stream_index.parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    serve_subtitle(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &method,
+        &item_id,
+        Some(&media_source_id),
+        stream_index,
+    )
+    .await
+}
+
+async fn emby_subtitle_without_source(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, stream_index)): Path<(String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Ok(stream_index) = stream_index.parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    serve_subtitle(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &method,
+        &item_id,
+        None,
+        stream_index,
+    )
+    .await
+}
+
+async fn serve_subtitle(
+    state: &AppState,
+    principal: AccessPrincipal,
+    method: &Method,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    stream_index: i64,
+) -> Response {
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access.can_view_item(principal, item_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let subtitle = match database
+        .find_external_subtitle(item_id, media_source_id, stream_index)
+        .await
+    {
+        Ok(Some(subtitle)) => subtitle,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let relative = std::path::Path::new(&subtitle.external_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let root = match tokio::fs::canonicalize(&subtitle.root_path).await {
+        Ok(root) => root,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let path = root.join(relative);
+    let path = match tokio::fs::canonicalize(&path).await {
+        Ok(path) => path,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if !path.starts_with(&root) || path == root {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if metadata.len() > 10 * 1024 * 1024 {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    let content_type = match extension.as_deref() {
+        Some("vtt") => "text/vtt; charset=utf-8",
+        Some("srt" | "ass" | "ssa" | "sub") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        let Ok(file) = tokio::fs::File::open(&path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        Body::from_stream(tokio_util::io::ReaderStream::new(file))
+    };
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", content_type)
+        .header("Content-Length", metadata.len());
+    if let Some(language) = subtitle.language {
+        builder = builder.header("Content-Language", language);
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn serve_image(
@@ -1641,6 +1813,9 @@ fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) 
             "codec": stream.codec,
             "language": stream.language,
             "title": stream.title,
+            "isExternal": stream.is_external,
+            "isDefault": stream.is_default,
+            "isForced": stream.is_forced,
         })).collect::<Vec<_>>(),
     })
 }
