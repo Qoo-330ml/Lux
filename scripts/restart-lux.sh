@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LUX_HTTP_ADDR="${LUX_HTTP_ADDR:-127.0.0.1:8097}"
+LUX_HTTP_ADDR="${LUX_HTTP_ADDR:-0.0.0.0:8097}"
 LUX_CONFIG_DIR="${LUX_CONFIG_DIR:-./config}"
 RUST_LOG="${RUST_LOG:-luxd=info,tower_http=info}"
 PORT="${LUX_HTTP_ADDR##*:}"
