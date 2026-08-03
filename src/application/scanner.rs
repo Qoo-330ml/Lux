@@ -854,15 +854,38 @@ impl ScanJobService {
         let library_kind = library.kind;
         let mut total_count = 0_i64;
         for root in roots {
-            if root.is_available {
-                let files = if library_kind == "MOVIE" {
-                    collect_movie_files(Path::new(&root.canonical_path)).await?
-                } else {
-                    collect_series_files(Path::new(&root.canonical_path)).await?
-                };
-                total_count =
-                    total_count.saturating_add(i64::try_from(files.len()).unwrap_or(i64::MAX));
+            let root_path = Path::new(&root.canonical_path);
+            let root_is_available = fs::metadata(root_path)
+                .await
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+            if !root_is_available {
+                self.database
+                    .update_library_root_availability(&root.id, false)
+                    .await?;
+                continue;
             }
+            if !root.is_available {
+                self.database
+                    .update_library_root_availability(&root.id, true)
+                    .await?;
+            }
+            let files = match if library_kind == "MOVIE" {
+                collect_movie_files(root_path).await
+            } else {
+                collect_series_files(root_path).await
+            } {
+                Ok(files) => files,
+                Err(ScannerError::Io { .. }) => {
+                    self.database
+                        .update_library_root_availability(&root.id, false)
+                        .await?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            total_count =
+                total_count.saturating_add(i64::try_from(files.len()).unwrap_or(i64::MAX));
         }
         let id = Uuid::now_v7().to_string();
         let generation = Uuid::now_v7().to_string();

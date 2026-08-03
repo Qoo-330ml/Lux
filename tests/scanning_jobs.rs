@@ -124,3 +124,80 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scan_job_marks_inaccessible_root_unavailable_and_recovers_after_restore()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Recovery.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    assert_eq!(initial.total_count, 1);
+    finish_scan(&jobs, &initial.id).await?;
+
+    let mut permissions = tokio::fs::metadata(&root).await?.permissions();
+    permissions.set_mode(0o000);
+    tokio::fs::set_permissions(&root, permissions).await?;
+
+    let unavailable = jobs.create_movie_scan_job(library.id).await?;
+    assert_eq!(unavailable.total_count, 0);
+    finish_scan(&jobs, &unavailable.id).await?;
+    let root_available: i64 =
+        sqlx::query_scalar("SELECT is_available FROM library_roots WHERE library_id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(root_available, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_items")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+
+    let mut permissions = tokio::fs::metadata(&root).await?.permissions();
+    permissions.set_mode(0o755);
+    tokio::fs::set_permissions(&root, permissions).await?;
+
+    let recovered = jobs.create_movie_scan_job(library.id).await?;
+    assert_eq!(recovered.total_count, 1);
+    finish_scan(&jobs, &recovered.id).await?;
+    let recovered_available: i64 =
+        sqlx::query_scalar("SELECT is_available FROM library_roots WHERE library_id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(recovered_available, 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn finish_scan(
+    jobs: &ScanJobService,
+    job_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..10 {
+        if jobs.run_batch(job_id, 100).await?.completed {
+            return Ok(());
+        }
+    }
+    Err("scan did not complete within the test batch limit".into())
+}
