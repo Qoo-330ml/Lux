@@ -73,8 +73,8 @@ function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
 }
 
-function imageUrl(item) {
-  return item?.imageTags?.poster ? "/api/v1/items/" + encodeURIComponent(item.id) + "/images/poster" : "";
+function imageUrl(item, imageType = "poster") {
+  return item?.imageTags?.[imageType] ? "/api/v1/items/" + encodeURIComponent(item.id) + "/images/" + imageType : "";
 }
 
 function poster(item, className = "poster") {
@@ -228,6 +228,8 @@ function mediaCard(item) {
 }
 function renderDetail(item, playback = {}, children = null, images = [], candidates = []) {
   const sources = item.mediaSources || [];
+  const backdropUrl = imageUrl(item, "fanart") || imageUrl(item);
+  const backdrop = backdropUrl ? `<img class="detail-backdrop" src="${backdropUrl}" alt="">` : "<div class=\"detail-backdrop\"></div>";
   const chips = sources.map((source) => "<span class=\"chip\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "source") + "</span>").join("");
   const buttons = sources.map((source, index) => "<button class=\"button secondary\" data-source=\"" + escapeHtml(source.id) + "\" aria-pressed=\"" + (index === 0) + "\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "版本 " + (index + 1)) + "</button>").join("");
   const player = sources.length ? "<div class=\"source-list\" aria-label=\"媒体版本\">" + buttons + "</div><p class=\"player-status\" data-player-status role=\"status\"></p><video class=\"player\" controls preload=\"metadata\" data-player aria-label=\"播放 " + escapeHtml(item.title || item.name) + "\" src=\"/api/v1/items/" + encodeURIComponent(item.id) + "/stream?sourceId=" + encodeURIComponent(sources[0].id) + "\"></video>" : "";
@@ -235,7 +237,7 @@ function renderDetail(item, playback = {}, children = null, images = [], candida
   const playedLabel = playback.isPlayed ? "标记未看" : "标记已看";
   const userData = "<div class=\"chips\"><span class=\"chip\">" + (playback.isPlayed ? "已看" : "未看") + "</span>" + (playback.isFavorite ? "<span class=\"chip\">已收藏</span>" : "") + (playback.positionTicks ? "<span class=\"chip\">已播放 " + Math.round(playback.positionTicks / 10000000) + " 秒</span>" : "") + "</div>";
   const childrenPanel = children ? `<section class="children-panel" id="children-panel">${renderChildrenPanel(item, children)}</section>` : "";
-  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail"><div>${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2 style="margin-top:.6rem">${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><div class="form-actions"><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button><button class="button secondary" data-action="toggle-played" aria-pressed="${Boolean(playback.isPlayed)}">${playedLabel}</button></div>${childrenPanel}${renderAdminImages(item, images)}${renderAdminCandidates(item, candidates)}${player}</div></article>`;
+  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail">${backdrop}<div class="detail-art">${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2 style="margin-top:.6rem">${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><div class="form-actions"><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button><button class="button secondary" data-action="toggle-played" aria-pressed="${Boolean(playback.isPlayed)}">${playedLabel}</button></div>${childrenPanel}${renderAdminImages(item, images)}${renderAdminCandidates(item, candidates)}${player}</div></article>`;
 }
 
 function renderAdminImages(item, images) {
