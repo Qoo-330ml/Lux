@@ -12,7 +12,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
-    application::probe::MediaProbeService,
+    application::{metadata::MetadataEnricher, probe::MediaProbeService},
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     storage::{
         Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource,
@@ -1144,9 +1144,60 @@ impl ScanJobService {
             }
             if report.status == "COMPLETED" {
                 self.run_probe_after_scan(job_id, probe).await?;
+                self.run_metadata_after_scan(job_id).await?;
             }
             return Ok(());
         }
+    }
+
+    async fn run_metadata_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
+        let Some(library) = self.database.find_library(&job.library_id).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if library.kind != "MOVIE" {
+            return Ok(());
+        }
+        let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
+            tracing::warn!(job_id, library_id = %job.library_id, "local metadata enrichment skipped for invalid library ID");
+            return Ok(());
+        };
+        let result = MetadataEnricher::new(self.database.clone())
+            .enrich_movie_library(library_id)
+            .await;
+        match result {
+            Ok(report) => {
+                let details = format!(
+                    r#"{{"nfoLoaded":{},"nfoFailed":{},"nfoSkipped":{},"imagesFound":{}}}"#,
+                    report.nfo_loaded, report.nfo_failed, report.nfo_skipped, report.images_found,
+                );
+                self.record_event(
+                    job_id,
+                    "INFO",
+                    "METADATA_COMPLETED",
+                    "本地元数据处理完成",
+                    &details,
+                )
+                .await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    job_id,
+                    "scan completed but local metadata enrichment failed"
+                );
+                self.record_event(
+                    job_id,
+                    "ERROR",
+                    "METADATA_FAILED",
+                    "本地元数据处理失败",
+                    "{}",
+                )
+                .await;
+            }
+        }
+        Ok(())
     }
 
     async fn run_probe_after_scan(
