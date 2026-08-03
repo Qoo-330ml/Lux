@@ -204,6 +204,11 @@ td small { display: block; margin-top: .25rem; }
 .detail-copy { padding: .25rem 0 .25rem 1rem; }
 .detail-copy h2 { font-size: clamp(2rem, 5vw, 3.6rem); letter-spacing: -.04em; }
 .detail-copy > p { max-width: 65ch; }
+.library-header { display: flex; align-items: end; justify-content: space-between; gap: 1rem; }
+.library-header > span { color: var(--muted); font-size: .85rem; }
+.library-header h2 { margin-top: .35rem; font-size: clamp(1.8rem, 4vw, 2.6rem); }
+.library-toolbar { margin-top: .8rem; padding: .25rem; border: 1px solid var(--line); border-radius: .9rem; background: rgba(23, 36, 38, .72); }
+.library-toolbar .filter-form { border: 0; background: transparent; }
 @media (max-width: 760px) {
   .shell { display: block; }
   .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 30; width: min(86vw, 300px); transform: translateX(-105%); transition: transform .2s ease; box-shadow: var(--shadow); }
