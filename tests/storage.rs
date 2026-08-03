@@ -40,6 +40,28 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 }
 
 #[tokio::test]
+async fn sqlite_write_probe_succeeds_without_changing_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+
+    database.probe_write().await?;
+    assert_eq!(database.schema_version().await?, 23);
+    let probe_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(probe_rows, 0);
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_only_config_dir_returns_a_clear_database_error()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

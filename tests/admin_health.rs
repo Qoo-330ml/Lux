@@ -93,6 +93,7 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
     );
     assert_eq!(body["schemaVersion"], 23);
     assert_eq!(body["database"]["status"], "ok");
+    assert_eq!(body["database"]["writable"], true);
     assert_eq!(body["config"]["available"], true);
     assert_eq!(body["config"]["writable"], true);
     assert!(body["ffprobe"]["available"].is_boolean());
@@ -102,6 +103,32 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
     let body_text = body.to_string();
     let config_path = temp_dir.path().to_string_lossy().into_owned();
     assert!(!body_text.contains(&config_path));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let config_dir = temp_dir.path().join("config");
+        let mut permissions = std::fs::metadata(&config_dir)?.permissions();
+        permissions.set_mode(0o500);
+        std::fs::set_permissions(&config_dir, permissions)?;
+
+        let degraded = client
+            .get(format!("{base_url}/api/v1/admin/health"))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        assert_eq!(degraded.status(), reqwest::StatusCode::OK);
+        let degraded_body: Value = degraded.json().await?;
+        assert_eq!(degraded_body["status"], "degraded");
+        assert_eq!(degraded_body["database"]["status"], "ok");
+        assert_eq!(degraded_body["database"]["writable"], true);
+        assert_eq!(degraded_body["config"]["writable"], false);
+
+        let mut permissions = std::fs::metadata(&config_dir)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&config_dir, permissions)?;
+    }
 
     let logs = client
         .get(format!("{base_url}/api/v1/admin/logs?pageSize=10"))

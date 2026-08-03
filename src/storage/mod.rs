@@ -4061,6 +4061,45 @@ impl Database {
             })
     }
 
+    /// Verifies that SQLite can begin and roll back a real write transaction.
+    ///
+    /// The probe uses a reserved metadata key and always rolls the transaction
+    /// back, so it does not change the persistent schema or application data.
+    pub async fn probe_write(&self) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO lux_meta (key, value)
+             VALUES ('__lux_write_probe__', 'ok')",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        sqlx::query("DELETE FROM lux_meta WHERE key = '__lux_write_probe__'")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .rollback()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub async fn close(self) {
         self.pool.close().await;
     }
@@ -4748,5 +4787,35 @@ impl std::error::Error for StorageError {
             Self::Migration { source, .. } => Some(source),
             Self::LastManager => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn write_probe_reports_a_query_only_sqlite_connection() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(":memory:"))
+            .await
+            .expect("in-memory SQLite connection");
+        sqlx::query("CREATE TABLE lux_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create probe table");
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(&pool)
+            .await
+            .expect("enable query-only mode");
+
+        let database = Database {
+            pool,
+            path: PathBuf::from("query-only-test.db"),
+            server_id: "test".to_owned(),
+        };
+        assert!(database.probe_write().await.is_err());
+        database.close().await;
     }
 }

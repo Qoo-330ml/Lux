@@ -53,6 +53,7 @@ async fn ready_and_version_report_migrated_state_without_paths()
     let ready_body: serde_json::Value = ready.json().await?;
     assert_eq!(ready_body["status"], "ready");
     assert_eq!(ready_body["schemaVersion"], 23);
+    assert_eq!(ready_body["databaseWritable"], true);
 
     let version = client
         .get(format!("http://{address}/api/v1/version"))

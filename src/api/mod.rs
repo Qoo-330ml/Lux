@@ -2015,16 +2015,34 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
         );
     }
 
-    match database.schema_version().await {
-        Ok(schema_version) => (
-            StatusCode::OK,
-            Json(json!({ "status": "ready", "schemaVersion": schema_version })),
-        ),
-        Err(_) => (
+    let schema_version = match database.schema_version().await {
+        Ok(schema_version) => schema_version,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
+            );
+        }
+    };
+    if database.probe_write().await.is_err() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
-        ),
+            Json(json!({
+                "status": "not_ready",
+                "reason": "database_write_unavailable",
+                "schemaVersion": schema_version,
+                "databaseWritable": false,
+            })),
+        );
     }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ready",
+            "schemaVersion": schema_version,
+            "databaseWritable": true,
+        })),
+    )
 }
 
 async fn version(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
@@ -5085,6 +5103,20 @@ async fn admin_list_logs(
     admin_list_audit(headers, Query(query), State(state)).await
 }
 
+async fn probe_directory_writable(path: &FsPath) -> bool {
+    let probe_path = path.join(format!(".lux-health-probe-{}", uuid::Uuid::now_v7()));
+    let created = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+        .await;
+    let Ok(file) = created else {
+        return false;
+    };
+    drop(file);
+    fs::remove_file(probe_path).await.is_ok()
+}
+
 async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -5096,12 +5128,17 @@ async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Resp
         Ok(version) => version,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let (config_available, config_writable) = match state.config_dir.as_deref() {
-        Some(path) => match fs::metadata(path).await {
-            Ok(metadata) => (true, !metadata.permissions().readonly()),
-            Err(_) => (false, false),
-        },
-        None => (false, false),
+    let database_writable = database.probe_write().await.is_ok();
+    let config_available = match state.config_dir.as_deref() {
+        Some(path) => fs::metadata(path)
+            .await
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false),
+        None => false,
+    };
+    let config_writable = match state.config_dir.as_deref() {
+        Some(path) if config_available => probe_directory_writable(path).await,
+        _ => false,
     };
     let ffprobe_available = Command::new("ffprobe")
         .arg("-version")
@@ -5139,7 +5176,7 @@ async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Resp
         Ok(ids) => ids.len(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let status = if config_available && config_writable && ffprobe_available {
+    let status = if database_writable && config_available && config_writable && ffprobe_available {
         "ok"
     } else {
         "degraded"
@@ -5147,7 +5184,11 @@ async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Resp
     Json(json!({
         "status": status,
         "schemaVersion": schema_version,
-        "database": { "status": "ok", "journalMode": "wal" },
+        "database": {
+            "status": if database_writable { "ok" } else { "degraded" },
+            "journalMode": "wal",
+            "writable": database_writable,
+        },
         "config": { "available": config_available, "writable": config_writable },
         "ffprobe": { "available": ffprobe_available },
         "tmdb": { "configured": state.tmdb.is_some() },

@@ -47,7 +47,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
 - `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）和 `resumeMinTicks`（非负）。写操作需要管理员 Web session 和 CSRF。
-- `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL、配置可用性、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。
+- `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、配置目录实际写入能力、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，支持 `page`、`pageSize`、`level` 和 `eventCode` 筛选。
 
 ## 元数据候选管理（LUX-053）
@@ -72,6 +72,8 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 Emby access token 与 Web session 完全分离。access token 是高熵随机值，只在认证响应中返回；数据库只保存 SHA-256 哈希以及设备元数据。认证失败响应不区分“用户不存在”和“密码错误”。
 
 ## 当前边界
+
+`GET /health/ready` 在数据库可读但事务写入探针失败时返回 503 和 `reason=database_write_unavailable`；`/api/v1` 的写入接口统一返回 `DATABASE_UNAVAILABLE` 错误契约并包含 requestId。
 
 上述接口是 LUX-021/LUX-022 的基础能力。媒体库、Emby 兼容、用户管理和进度接口按开发规格后续任务逐项增加；未实现端点不应被客户端兼容性声明引用。
 
