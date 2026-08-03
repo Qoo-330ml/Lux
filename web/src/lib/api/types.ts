@@ -71,6 +71,86 @@ export type PlaybackState = {
   durationTicks?: number;
 };
 
+export type AdminRoot = {
+  id: string;
+  libraryId: string;
+  canonicalPath: string;
+  displayPath: string;
+  isAvailable: boolean;
+  isWritable: boolean;
+  lastCheckedAt?: string | null;
+  unavailableSince?: string | null;
+  scanCursor?: string | null;
+};
+
+export type AdminLibrary = Library & {
+  isEnabled: boolean;
+  realtimeWatchEnabled: boolean;
+  incrementalSchedule?: string | null;
+  reconciliationSchedule?: string | null;
+  metadataSchedule?: string | null;
+  scanConcurrency?: number;
+  probeConcurrency?: number;
+  lastScanAt?: string | null;
+  roots: AdminRoot[];
+};
+
+export type AdminUser = LuxUser & {
+  isDisabled: boolean;
+  isAdmin: boolean;
+};
+
+export type AdminHealth = {
+  status: "ok" | "degraded" | string;
+  schemaVersion: number;
+  database: { status: string; journalMode: string; writable: boolean };
+  config: { available: boolean; writable: boolean };
+  ffprobe: { available: boolean };
+  tmdb: { configured: boolean };
+  jobs: {
+    scanRunning: number;
+    scanFailed: number;
+    metadataReidentifyRunning: number;
+  };
+  libraries: Array<{
+    id: string;
+    name: string;
+    isEnabled: boolean;
+    rootCount: number;
+    availableRootCount: number;
+    writableRootCount: number;
+  }>;
+};
+
+export type AdminJob = {
+  id: string;
+  libraryId: string;
+  jobType: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  generation?: number;
+  cursor?: string | null;
+  processedCount?: number;
+  totalCount?: number | null;
+  cancelRequested?: boolean;
+  error?: string | null;
+};
+
+export type AdminAuditEvent = {
+  id: string;
+  actorUserId?: string | null;
+  actorUsername?: string | null;
+  eventType: string;
+  targetType?: string | null;
+  targetId?: string | null;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type AdminSettings = {
+  resumePlayedPercent: number;
+  resumeMinTicks: number;
+};
+
 export type ApiErrorBody = {
   error?: {
     code?: string;

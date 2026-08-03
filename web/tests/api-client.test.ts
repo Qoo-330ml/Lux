@@ -43,4 +43,32 @@ describe("LuxApiClient", () => {
       requestId: "request-1",
     } satisfies Partial<ApiError>);
   });
+
+  it("exposes admin health and settings through the Lux API contract", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/admin/health") {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/admin/settings");
+      expect(init?.method).toBe("PATCH");
+      expect(JSON.parse(String(init?.body))).toEqual({ resumePlayedPercent: 85 });
+      expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      return new Response(JSON.stringify({ resumePlayedPercent: 85, resumeMinTicks: 120 }), {
+        status: 200,
+      });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.adminHealth()).resolves.toEqual({ status: "ok" });
+    await expect(client.updateAdminSettings({ resumePlayedPercent: 85 })).resolves.toEqual({
+      resumePlayedPercent: 85,
+      resumeMinTicks: 120,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });

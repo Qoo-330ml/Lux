@@ -1,4 +1,11 @@
 import type {
+  AdminAuditEvent,
+  AdminHealth,
+  AdminJob,
+  AdminLibrary,
+  AdminRoot,
+  AdminSettings,
+  AdminUser,
   ApiErrorBody,
   HomeResponse,
   Library,
@@ -137,6 +144,133 @@ export class LuxApiClient {
     return this.request<PlaybackState>(
       `/api/v1/items/${encodeURIComponent(itemId)}/playback`,
     );
+  }
+
+  adminHealth() {
+    return this.request<AdminHealth>("/api/v1/admin/health");
+  }
+
+  adminLibraries() {
+    return this.request<{ libraries?: AdminLibrary[] }>("/api/v1/admin/libraries");
+  }
+
+  createAdminLibrary(input: { name: string; kind: string; realtimeWatchEnabled: boolean }) {
+    return this.request<{ library: AdminLibrary }>("/api/v1/admin/libraries", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  updateAdminLibrary(libraryId: string, input: Record<string, unknown>) {
+    return this.request<{ library: AdminLibrary }>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}`,
+      { method: "PATCH", body: JSON.stringify(input) },
+    );
+  }
+
+  deleteAdminLibrary(libraryId: string) {
+    return this.request<void>(`/api/v1/admin/libraries/${encodeURIComponent(libraryId)}`, {
+      method: "DELETE",
+    });
+  }
+
+  addAdminLibraryRoot(libraryId: string, path: string) {
+    return this.request<{ root: AdminRoot; warnings?: string[] }>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/roots`,
+      { method: "POST", body: JSON.stringify({ path }) },
+    );
+  }
+
+  deleteAdminLibraryRoot(libraryId: string, rootId: string) {
+    return this.request<void>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/roots/${encodeURIComponent(rootId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  startAdminScan(libraryId: string) {
+    return this.request<{ job: AdminJob }>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/scan`,
+      { method: "POST" },
+    );
+  }
+
+  adminUsers() {
+    return this.request<{ users?: AdminUser[] }>("/api/v1/admin/users");
+  }
+
+  createAdminUser(input: {
+    username: string;
+    displayName: string;
+    password: string;
+    isAdmin: boolean;
+  }) {
+    return this.request<{ user: AdminUser }>("/api/v1/admin/users", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  updateAdminUser(userId: string, input: Record<string, unknown>) {
+    return this.request<{ user: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+      { method: "PATCH", body: JSON.stringify(input) },
+    );
+  }
+
+  disableAdminUser(userId: string) {
+    return this.request<{ user: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  adminUserLibraryAccess(userId: string) {
+    return this.request<{ libraryIds?: string[] }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/libraries`,
+    );
+  }
+
+  setAdminUserLibraryAccess(userId: string, libraryId: string, canView: boolean) {
+    return this.request<{ canView: boolean }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/libraries/${encodeURIComponent(libraryId)}`,
+      { method: "PATCH", body: JSON.stringify({ canView }) },
+    );
+  }
+
+  adminJobs(status?: string) {
+    const params = new URLSearchParams({ page: "1", pageSize: "50" });
+    if (status) params.set("status", status);
+    return this.request<{ jobs?: AdminJob[] }>(`/api/v1/admin/jobs?${params}`);
+  }
+
+  cancelAdminJob(jobId: string) {
+    return this.request<void>(`/api/v1/admin/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    });
+  }
+
+  retryAdminJob(jobId: string) {
+    return this.request<{ job: AdminJob }>(`/api/v1/admin/jobs/${encodeURIComponent(jobId)}/retry`, {
+      method: "POST",
+    });
+  }
+
+  adminLogs() {
+    return this.request<{ events?: AdminAuditEvent[] }>(
+      "/api/v1/admin/logs?page=1&pageSize=50",
+    );
+  }
+
+  adminSettings() {
+    return this.request<AdminSettings>("/api/v1/admin/settings");
+  }
+
+  updateAdminSettings(input: Partial<AdminSettings>) {
+    return this.request<AdminSettings>("/api/v1/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
   }
 }
 
