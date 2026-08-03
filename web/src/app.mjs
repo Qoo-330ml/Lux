@@ -1,7 +1,7 @@
 import { requestOptions } from "./request-options.mjs";
 
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, libraryPage: 1, searchPage: 1, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "", drawerOpen: false };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, libraryPage: 1, searchPage: 1, favoritesPage: 1, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "", drawerOpen: false };
 
 const api = {
   async request(path, options = {}) {
@@ -19,6 +19,7 @@ const api = {
   sessions() { return this.request("/api/v1/auth/sessions"); },
   revokeSession(id) { return this.request("/api/v1/auth/sessions/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   home() { return this.request("/api/v1/home"); },
+  favorites(page = 1) { return this.request("/api/v1/favorites?page=" + encodeURIComponent(page) + "&pageSize=24"); },
   libraries() { return this.request("/api/v1/libraries"); },
   libraryItems(id, filters = {}) { const params = new URLSearchParams({ page: String(filters.page || 1), pageSize: String(filters.pageSize || 24) }); Object.entries(filters).forEach(([key, value]) => { if (!["page", "pageSize"].includes(key) && value !== "" && value !== null && value !== undefined) params.set(key, String(value)); }); return this.request("/api/v1/libraries/" + encodeURIComponent(id) + "/items?" + params.toString()); },
   item(id) { return this.request("/api/v1/items/" + encodeURIComponent(id)); },
@@ -87,6 +88,7 @@ function poster(item, className = "poster") {
 function loading() { return "<div class=\"loading\" aria-busy=\"true\">正在整理你的媒体…</div>"; }
 function titleForRoute() {
   if (state.route === "libraries") return "媒体库";
+  if (state.route === "favorites") return "收藏";
   if (state.route === "library") return state.libraries.find((library) => library.id === state.libraryId)?.name || "媒体库内容";
   if (state.route === "search") return "搜索";
   if (state.route === "item") return state.item?.title || "详情";
@@ -110,10 +112,11 @@ function brand() { return "<div class=\"brand\"><button class=\"brand-home\" typ
 function nav() {
   const homeCurrent = state.route === "home" ? "page" : "false";
   const libraryCurrent = state.route === "libraries" ? "page" : "false";
+  const favoritesCurrent = state.route === "favorites" ? "page" : "false";
   const admin = state.user.canManageServer ? "<button data-route=\"admin\" aria-current=\"" + (state.route === "admin" ? "page" : "false") + "\"><span class=\"nav-glyph\">⚙</span><span>管理</span></button>" : "";
   const libraries = state.home?.libraries || state.libraries;
   const libraryLinks = libraries.length ? "<div class=\"nav-group\"><span class=\"nav-group-label\">媒体库</span>" + libraries.map((library) => "<button class=\"nav-library\" data-library=\"" + escapeHtml(library.id) + "\" aria-current=\"" + (state.route === "library" && state.libraryId === library.id ? "page" : "false") + "\"><span class=\"nav-glyph\">" + (library.kind === "SERIES" ? "▤" : "▣") + "</span><span>" + escapeHtml(library.name) + "</span></button>").join("") + "</div>" : "";
-  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\"><span class=\"nav-glyph\">⌂</span><span>首页</span></button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\"><span class=\"nav-glyph\">▦</span><span>媒体库</span></button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\"><span class=\"nav-glyph\">◉</span><span>账户</span></button>" + admin + libraryLinks + "</nav>";
+  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\"><span class=\"nav-glyph\">⌂</span><span>首页</span></button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\"><span class=\"nav-glyph\">▦</span><span>媒体库</span></button><button data-route=\"favorites\" aria-current=\"" + favoritesCurrent + "\"><span class=\"nav-glyph\">♥</span><span>收藏</span></button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\"><span class=\"nav-glyph\">◉</span><span>账户</span></button>" + admin + libraryLinks + "</nav>";
 }
 function account() {
   return "<div class=\"sidebar-footer\"><span class=\"sidebar-label\">当前账户</span><strong>" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</strong><button class=\"button secondary sidebar-action\" data-route=\"account\">账户与会话</button><button class=\"button secondary sidebar-action\" data-action=\"logout\">退出登录</button></div>";
@@ -148,6 +151,9 @@ async function loadRoute() {
     } else if (state.route === "libraries") {
       state.libraries = state.libraries.length ? state.libraries : (await api.libraries()).libraries || [];
       view.innerHTML = renderLibraries();
+    } else if (state.route === "favorites") {
+      const result = await api.favorites(state.favoritesPage);
+      view.innerHTML = renderFavorites(result);
     } else if (state.route === "library") {
       state.libraries = state.libraries.length ? state.libraries : (await api.libraries()).libraries || [];
       const result = await api.libraryItems(state.libraryId, { ...state.libraryFilters, page: state.libraryPage });
@@ -207,6 +213,9 @@ function libraryCard(library) {
 function renderLibraries() {
   const content = state.libraries.length ? state.libraries.map(libraryCard).join("") : "<div class=\"empty\"><h2>没有媒体库</h2><p>当前账户没有可见媒体库。</p></div>";
   return "<section class=\"section\"><div class=\"library-grid\">" + content + "</div></section>";
+}
+function renderFavorites(result) {
+  return "<section class=\"section\"><div class=\"library-header\"><div><span class=\"eyebrow\">Personal</span><h2>收藏</h2></div><span>" + (result.total || 0) + " 项</span></div>" + renderGrid(result.items || []) + renderPagination(result, "favorites-page", "收藏翻页") + "</section>";
 }
 function renderLibraryItems(result, library) {
   const filters = state.libraryFilters || {};
@@ -376,6 +385,7 @@ function bind() {
   document.querySelectorAll("[data-action='clear-library-filter']").forEach((element) => element.addEventListener("click", () => { state.libraryFilters = {}; state.libraryPage = 1; state.route = "library"; state.error = ""; state.notice = ""; render(); }));
   document.querySelectorAll("[data-library-page]").forEach((element) => element.addEventListener("click", () => { state.libraryPage = Number(element.dataset.libraryPage); state.error = ""; render(); }));
   document.querySelectorAll("[data-search-page]").forEach((element) => element.addEventListener("click", () => { state.searchPage = Number(element.dataset.searchPage); state.error = ""; render(); }));
+  document.querySelectorAll("[data-favorites-page]").forEach((element) => element.addEventListener("click", () => { state.favoritesPage = Number(element.dataset.favoritesPage); state.error = ""; render(); }));
   document.querySelectorAll("[data-action='toggle-favorite']").forEach((element) => element.addEventListener("click", async () => {
     try { await api.favorite(state.item.id, !state.playback?.isFavorite); state.notice = state.playback?.isFavorite ? "已取消收藏。" : "已加入收藏。"; state.error = ""; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }

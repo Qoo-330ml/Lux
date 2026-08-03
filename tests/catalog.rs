@@ -229,6 +229,16 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(favorite_page_body["total"], 1);
     assert_eq!(favorite_page_body["items"][0]["title"], "Beta Movie");
 
+    let favorites = client
+        .get(format!("{base_url}/api/v1/favorites?pageSize=1"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(favorites.status(), reqwest::StatusCode::OK);
+    let favorites_body: Value = favorites.json().await?;
+    assert_eq!(favorites_body["total"], 1);
+    assert_eq!(favorites_body["items"][0]["title"], "Beta Movie");
+
     let home = client
         .get(format!("{base_url}/api/v1/home"))
         .header(COOKIE, &cookies)

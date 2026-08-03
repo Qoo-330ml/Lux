@@ -265,6 +265,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/admin/audit", get(admin_list_audit))
         .route("/api/v1/admin/logs", get(admin_list_logs))
         .route("/api/v1/libraries", get(lux_list_libraries))
+        .route("/api/v1/favorites", get(lux_list_favorites))
         .route("/api/v1/search", get(lux_search))
         .route("/api/v1/home", get(lux_home))
         .route(
@@ -3006,6 +3007,61 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
             Json(json!({ "libraries": visible })).into_response()
         }
         Err(error) => library_error(&headers, error),
+    }
+}
+
+async fn lux_list_favorites(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let filter = CatalogFilter {
+        is_favorite: Some(true),
+        sort_by: CatalogSort::DateCreated,
+        descending: true,
+        ..CatalogFilter::default()
+    };
+    match catalog
+        .list_all_items_filtered(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &filter,
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
     }
 }
 
