@@ -58,7 +58,7 @@ use crate::{
     storage::{Database, NewPlaybackEvent, StorageError},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     process::Command,
 };
 
@@ -5105,16 +5105,19 @@ async fn admin_list_logs(
 
 async fn probe_directory_writable(path: &FsPath) -> bool {
     let probe_path = path.join(format!(".lux-health-probe-{}", uuid::Uuid::now_v7()));
-    let created = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe_path)
-        .await;
-    let Ok(file) = created else {
-        return false;
-    };
-    drop(file);
-    fs::remove_file(probe_path).await.is_ok()
+    let payload = [0_u8; 4096];
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+            .await?;
+        file.write_all(&payload).await?;
+        file.sync_all().await
+    }
+    .await;
+    let _ = fs::remove_file(probe_path).await;
+    result.is_ok()
 }
 
 async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Response {

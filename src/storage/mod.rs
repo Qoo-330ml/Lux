@@ -4061,10 +4061,11 @@ impl Database {
             })
     }
 
-    /// Verifies that SQLite can begin and roll back a real write transaction.
+    /// Verifies that SQLite can commit a real write transaction.
     ///
-    /// The probe uses a reserved metadata key and always rolls the transaction
-    /// back, so it does not change the persistent schema or application data.
+    /// The probe only changes a reserved metadata key and never touches
+    /// application data or the schema. Committing is intentional: a rollback
+    /// can succeed even when the filesystem cannot persist a durable write.
     pub async fn probe_write(&self) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -4076,23 +4077,17 @@ impl Database {
             })?;
         sqlx::query(
             "INSERT OR REPLACE INTO lux_meta (key, value)
-             VALUES ('__lux_write_probe__', 'ok')",
+             VALUES ('__lux_write_probe__', ?)",
         )
+        .bind(format!("lux-write-probe-{}", Uuid::now_v7()))
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        sqlx::query("DELETE FROM lux_meta WHERE key = '__lux_write_probe__'")
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         transaction
-            .rollback()
+            .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),

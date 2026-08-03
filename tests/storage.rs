@@ -40,7 +40,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 }
 
 #[tokio::test]
-async fn sqlite_write_probe_succeeds_without_changing_schema()
+async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -55,7 +55,7 @@ async fn sqlite_write_probe_succeeds_without_changing_schema()
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(probe_rows, 0);
+    assert_eq!(probe_rows, 1);
 
     database.close().await;
     Ok(())
