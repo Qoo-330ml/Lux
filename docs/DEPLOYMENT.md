@@ -116,3 +116,11 @@ LUX_IMAGE=lux:arm64-local ./scripts/proxy-smoke.sh
 ```
 
 该脚本验证可信代理转发公网地址时的远程访问控制，以及 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges` 和 `ETag` 的保留；自签名证书和本机 Docker 网络不替代真实 Tailscale/HTTPS 实机验证。
+
+扫描完成后可以用 ARM64 容器端到端验证媒体探测和 Emby 播放信息：
+
+```bash
+LUX_IMAGE=lux:arm64-local ./scripts/probe-smoke.sh
+```
+
+该脚本生成有效 MP4，验证扫描自动运行 `ffprobe`、媒体源进入 `READY`，并确认 `PlaybackInfo` 返回运行时长、媒体流和 `PROBE_COMPLETED` 事件；它不替代真实 NAS 媒体库验收。

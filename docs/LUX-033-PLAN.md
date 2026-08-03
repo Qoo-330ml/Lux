@@ -2,7 +2,7 @@
 
 ## 范围
 
-在 LUX-031 已持久化的本地媒体源上运行受控的 `ffprobe`，保存容器、时长、码率和视频/音频/字幕轨道。探测不进入 HTTP 请求路径；本阶段提供可复用的应用服务和持久化能力，后续任务再接入后台任务调度。
+在 LUX-031 已持久化的本地媒体源上运行受控的 `ffprobe`，保存容器、时长、码率和视频/音频/字幕轨道。探测不进入 HTTP 请求路径；扫描 worker 在一次扫描完成后调用应用服务，随后通过媒体源和 Emby `PlaybackInfo` 提供结果。
 
 ## 规则
 
@@ -27,6 +27,13 @@
 - [x] 保存容器、时长、码率和视频/音频/字幕轨。
 - [x] 成功、失败、超时和重复运行均有测试覆盖。
 
+### Slice 3：扫描完成后的后台接入
+
+- [x] 扫描 worker 完成库扫描后探测仍为 `PENDING` 的本地媒体源。
+- [x] API 发起的扫描、重试扫描和启动恢复扫描均复用同一探测路径。
+- [x] 探测结果写入媒体源并由 Emby `PlaybackInfo` 返回运行时长和媒体流；失败按文件隔离，不把整次扫描标记为失败。
+- [x] 记录 `PROBE_COMPLETED`/`PROBE_FAILED` 扫描事件，并提供 ARM64 容器端到端冒烟脚本。
+
 ## 验证门
 
 - `cargo test --locked --all-targets`
@@ -34,10 +41,10 @@
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - ARM64 本机验证新增/变化文件会探测，第二次不重复，失败状态可持久化。
 
-验证结果：以上检查均通过；本机 `arm64` / `aarch64-apple-darwin` 已用受控 ffprobe fixture 验证新增、变化、成功、退出失败、超时和重复跳过。
+验证结果：以上检查均通过；本机 `arm64` / `aarch64-apple-darwin` 已用受控 ffprobe fixture 验证新增、变化、成功、退出失败、超时和重复跳过。`LUX_IMAGE=lux:arm64-local ./scripts/probe-smoke.sh` 另验证真实 ARM64 容器扫描有效 MP4 后 `probeStatus=READY`、`durationTicks=10000000`、Emby `PlaybackInfo.RunTimeTicks=10000000`、2 条 `MediaStreams` 和 `PROBE_COMPLETED` 事件。
 
 ## 明确不做
 
 - 不在 HTTP 请求路径中启动 ffprobe。
 - 不保存原始 ffprobe JSON 或未限制的 stderr/stdout。
-- 不在本阶段实现后台任务队列、章节、字幕文件扫描或 Emby MediaStreams DTO。
+- 不在本阶段实现章节扫描或字幕文件扫描；外部字幕探测和 Emby MediaStreams 映射仅覆盖当前媒体源能力。

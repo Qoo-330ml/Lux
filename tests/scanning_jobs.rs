@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use luxd::{
     application::{
         libraries::LibraryService,
+        probe::{FfprobeRunner, MediaProbeService},
         scanner::{ScanJobError, ScanJobService},
     },
     config::Config,
@@ -122,6 +125,68 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
         cancel_event,
         ("INFO".to_owned(), "JOB_CANCELLED".to_owned())
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_scan_runs_pending_ffprobe_before_worker_returns()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Probe Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Probe.Movie.2024.mp4"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        r#"#!/bin/sh
+printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}]}'
+"#,
+    )?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, Some(probe)).await?;
+
+    let source: (String, i64, i64, String) = sqlx::query_as(
+        "SELECT container, duration_ticks, bitrate, probe_status FROM media_sources",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        source,
+        ("mp4".to_owned(), 300_000_000, 128_000, "READY".to_owned())
+    );
+    let event_codes: Vec<String> = sqlx::query_scalar(
+        "SELECT event_code FROM scan_job_events WHERE job_id = ? ORDER BY created_at, id",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert!(event_codes.iter().any(|code| code == "PROBE_COMPLETED"));
     Ok(())
 }
 

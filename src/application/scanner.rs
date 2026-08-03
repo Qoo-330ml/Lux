@@ -12,6 +12,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
+    application::probe::MediaProbeService,
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     storage::{
         Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource,
@@ -1128,6 +1129,57 @@ impl ScanJobService {
             processed,
             completed: false,
         })
+    }
+
+    pub async fn run_to_completion(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        probe: Option<MediaProbeService>,
+    ) -> Result<(), ScanJobError> {
+        loop {
+            let report = self.run_batch(job_id, batch_size).await?;
+            if !report.completed {
+                continue;
+            }
+            if report.status == "COMPLETED" {
+                self.run_probe_after_scan(job_id, probe).await?;
+            }
+            return Ok(());
+        }
+    }
+
+    async fn run_probe_after_scan(
+        &self,
+        job_id: &str,
+        probe: Option<MediaProbeService>,
+    ) -> Result<(), ScanJobError> {
+        let Some(probe) = probe else {
+            return Ok(());
+        };
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
+        let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
+            tracing::warn!(job_id, library_id = %job.library_id, "scan probe skipped for invalid library ID");
+            return Ok(());
+        };
+        match probe.probe_movie_library(library_id).await {
+            Ok(report) => {
+                let details = format!(
+                    r#"{{"attempted":{},"ready":{},"failed":{},"timedOut":{},"skipped":{}}}"#,
+                    report.attempted, report.ready, report.failed, report.timed_out, report.skipped,
+                );
+                self.record_event(job_id, "INFO", "PROBE_COMPLETED", "媒体探测完成", &details)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(job_id, %error, "scan completed but media probe failed");
+                self.record_event(job_id, "ERROR", "PROBE_FAILED", "媒体探测任务失败", "{}")
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     pub async fn active_job_ids(&self) -> Result<Vec<String>, ScanJobError> {

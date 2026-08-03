@@ -25,6 +25,7 @@ use tower_http::{ServiceBuilderExt, request_id::MakeRequestUuid, trace::TraceLay
 use crate::{
     COMMIT, VERSION,
     application::playback::{ByteRange, RangeError, parse_single_range},
+    application::probe::{FfprobeRunner, MediaProbeService},
     application::setup::{SetupError, SetupService},
     application::{
         access::{AccessPrincipal, MediaAccessService},
@@ -78,6 +79,7 @@ pub struct AppState {
     metadata_candidates: Option<MetadataCandidateService>,
     metadata_selection: Option<MetadataSelectionService>,
     metadata_reidentify: Option<MetadataReidentifyService>,
+    probe: Option<MediaProbeService>,
     scan_jobs: Option<ScanJobService>,
     tmdb: Option<TmdbClient>,
     collections: Option<CollectionService>,
@@ -121,6 +123,10 @@ impl AppState {
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
             metadata_reidentify,
+            probe: Some(MediaProbeService::new(
+                database.clone(),
+                FfprobeRunner::default(),
+            )),
             scan_jobs: Some(ScanJobService::new(database.clone())),
             tmdb,
             collections,
@@ -4463,14 +4469,9 @@ async fn admin_start_scan(
     };
     let worker = scan_jobs.clone();
     let job_id = job.id.clone();
+    let probe = state.probe.clone();
     tokio::spawn(async move {
-        loop {
-            match worker.run_batch(&job_id, 100).await {
-                Ok(report) if report.completed => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
+        let _ = worker.run_to_completion(&job_id, 100, probe).await;
     });
     let target_id = job.id.clone();
     record_audit_event(
@@ -4799,14 +4800,9 @@ async fn admin_retry_scan(
     };
     let worker = scan_jobs.clone();
     let new_job_id = job.id.clone();
+    let probe = state.probe.clone();
     tokio::spawn(async move {
-        loop {
-            match worker.run_batch(&new_job_id, 100).await {
-                Ok(report) if report.completed => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
+        let _ = worker.run_to_completion(&new_job_id, 100, probe).await;
     });
     record_audit_event(
         &state,

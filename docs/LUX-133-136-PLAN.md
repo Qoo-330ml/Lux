@@ -16,6 +16,7 @@
 - [x] 当前 ARM64 镜像受控磁盘满/恢复演练：`scripts/disk-write-fault-smoke.sh` 在 64 MiB tmpfs 上验证 100% 满盘诊断、结构化写错误和释放空间后的恢复；镜像 revision `83b5977`。
 - [x] 当前 ARM64 镜像受控媒体挂载不可访问/恢复演练：`scripts/mount-loss-smoke.sh` 验证 root 不可用时的扫描隔离、已有条目保留以及恢复后的重新探测；镜像 revision `83b5977`。
 - [x] 当前 ARM64 本机 Nginx HTTPS 反代补充烟测：`scripts/proxy-smoke.sh` 验证自签名 TLS、可信代理公网地址访问控制和 Range 响应头保留；真实 Tailscale/HTTPS 实机验证仍保持待办。
+- [x] 当前 ARM64 容器扫描后 ffprobe/PlaybackInfo 烟测：`scripts/probe-smoke.sh` 验证有效 MP4 扫描后自动进入 `READY`，返回 `RunTimeTicks` 和 2 条媒体流，并记录 `PROBE_COMPLETED`；真实 NAS 长期运行仍保持待办。
 
 ## 未完成的发布门
 
