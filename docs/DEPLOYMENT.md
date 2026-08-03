@@ -90,3 +90,13 @@ docker compose ps
 ```
 
 随后用真实客户端执行登录、媒体库列表、详情和一次 Range 播放。真实代理、NAS 7 天运行和发布签名仍需在目标环境单独记录，不能用本机 ARM64 结果替代。
+
+## 本机故障注入
+
+可以在本机 ARM64 Docker 环境用受限 tmpfs 演练 SQLite 写失败和恢复；脚本会创建临时管理员、填满 `/data`，验证 ready/管理员健康/新媒体库写入错误，再删除填充文件验证恢复：
+
+```bash
+LUX_IMAGE=lux:arm64-local ./scripts/disk-write-fault-smoke.sh
+```
+
+该脚本只证明容器内 ENOSPC 的诊断和恢复契约，不替代飞牛 NAS 真实持久卷故障演练。

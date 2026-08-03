@@ -15,7 +15,8 @@
 
 ## 尚未完成的故障注入
 
-- [ ] 受控磁盘满场景和真实持久卷恢复报告；SQLite 写失败的在线诊断契约已完成，但尚未在 Docker/NAS 上注入磁盘耗尽。
+- [x] 本机 ARM64 受控磁盘满：`scripts/disk-write-fault-smoke.sh` 在 64 MiB tmpfs 填满到 100% 后验证 `/health/ready` 为 503、管理员健康降级、新媒体库写入返回 `DATABASE_UNAVAILABLE`；删除填充文件后 ready、健康和新媒体库写入恢复，最新镜像 revision `fc190e6` 已通过。
+- [ ] 真实 NAS 持久卷磁盘满、媒体挂载丢失和恢复报告。
 - [ ] 真实 Tailscale/HTTPS 反代下的 trusted proxy、Range、超时和缓冲验证。
 - [ ] 高风险问题复核、接受记录和发布候选签名。
 
