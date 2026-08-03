@@ -93,6 +93,7 @@ Lux 的核心价值不是功能数量，而是：
 - 单个媒体库可包含多个本地路径。
 - 同一媒体库可同时包含真实媒体文件和 .strm 文件。
 - 每个媒体库独立配置文件实时监听、增量扫描、全量校验和元数据任务。
+- 每个媒体库可选择一个已安装的元数据刮削器；未选择时仅使用本地 NFO 和图片。
 - 不在用户请求路径中扫描目录、读取 NFO、调用 ffprobe 或访问 TMDb。
 
 ### 3.2 媒体来源
@@ -258,6 +259,14 @@ Lux 的核心价值不是功能数量，而是：
 
 首版不提供内置备份与恢复。配置和数据库通过 Docker 持久化卷由 NAS 自己备份。
 
+### 3.14 内置插件与刮削器
+
+- Lux 提供安全的内置元数据插件注册表；插件以服务端已编译实现提供能力，不加载任意第三方动态库、脚本或远程代码。
+- 首个内置插件为 TMDb。管理员从插件库安装/启用后，创建或编辑媒体库时可以选择 `TMDB` 作为刮削器。
+- 只有已安装、已启用且配置完整的插件才能被媒体库选择；TMDb token 仍只保存在配置目录，不返回 API 或写入日志。
+- 媒体库的 `scraperId` 为空表示只使用本地元数据；插件安装状态与媒体库选择均持久化，服务重启后保持不变。
+- 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
+
 ---
 
 ## 4. 明确不在首版范围
@@ -265,7 +274,7 @@ Lux 的核心价值不是功能数量，而是：
 - 音频转码、视频转码、HLS 转码、容器转换。
 - 在线字幕搜索、字幕下载、OCR 或字幕格式转换。
 - 直播电视、DVR、DLNA、Chromecast 控制。
-- Emby 插件体系。
+- 任意外部插件代码加载、动态 native/WASM 运行时和远程插件执行。
 - Emby Connect、Quick Connect 或官方云账户。
 - 公网穿透、自动端口映射和自动证书申请。
 - 音乐库、照片库、有声书库和游戏库。
@@ -1616,6 +1625,7 @@ services:
 | LUX-110 至 114 | web/src/features/、web/src/routes/、web/tests/；按单一用户流程切片 |
 | LUX-120 至 123 | src/api/emby/、tests/fixtures/emby-contract/、tests/api/、docs/COMPATIBILITY.md |
 | LUX-130 至 136 | migrations/、tests/performance/、Dockerfile、compose.yaml、docs/ |
+| LUX-140 | src/application/plugins.rs、src/storage/、src/api/、migrations/、web/src/features/admin/、tests/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2684,6 +2694,34 @@ services:
 - 可选 .strm 代理。
 - 内嵌字幕按需无转换抽取。
 - Web 浏览器兼容转码，需要全新规格和 ADR。
+
+#### LUX-140：内置元数据插件与媒体库刮削器选择
+
+范围：增加只允许服务端内置实现的插件注册表。管理员可以查看插件目录并安装/启用内置 TMDb 插件；媒体库创建和编辑接口返回并持久化 `scraperId`，Web 管理页面提供可用刮削器选择。
+
+验收：
+
+- [ ] 空数据库迁移后，插件目录分页返回 TMDb，且未安装时不能被媒体库选择。
+- [ ] 管理员安装 TMDb 后，插件状态显示为已安装；已配置 token 时 TMDb 可作为媒体库刮削器，未配置时显示不可用原因。
+- [ ] 创建和编辑媒体库可以选择或清空 `scraperId`，重启服务后选择保持；无效、未安装或未配置插件选择被拒绝。
+- [ ] 非管理员不能查看或修改插件安装状态，也不能修改媒体库刮削器配置。
+- [ ] Web 管理员可以完成安装 TMDb、创建媒体库并选择 TMDb、编辑已有媒体库并保存选择。
+
+验证：
+
+- `cargo test --locked --test plugins`
+- `cargo test --locked --test libraries_api`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-051、LUX-103。
+
+明确不做：
+
+- 不实现任意外部插件包下载、签名验证、动态加载或沙箱运行。
+- 不在本任务增加新的 TMDb API 能力；继续复用现有 `TmdbClient` 边界。
 
 ---
 
