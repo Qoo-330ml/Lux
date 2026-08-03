@@ -71,6 +71,10 @@ if ((${#lux_pids[@]} > 0)); then
     done
 fi
 
+log "building Web frontend"
+pnpm --dir web install --frozen-lockfile
+pnpm --dir web build
+
 log "compiling and starting Lux on ${LUX_HTTP_ADDR}"
 exec env \
     RUST_LOG="$RUST_LOG" \
