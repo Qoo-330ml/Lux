@@ -47,6 +47,9 @@ const api = {
   cancelJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   retryJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/retry", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
+  adminSettings() { return this.request("/api/v1/admin/settings"); },
+  updateSettings(data) { return this.request("/api/v1/admin/settings", { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
+  logs() { return this.request("/api/v1/admin/logs?page=1&pageSize=50"); },
   pendingMetadata() { return this.request("/api/v1/admin/metadata/pending?page=1&pageSize=50"); },
   startBatchReidentify(itemIds) { return this.request("/api/v1/admin/metadata/reidentify", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ itemIds }) }); },
   metadataReidentifyJob(id) { return this.request("/api/v1/admin/metadata/reidentify/" + encodeURIComponent(id)); },
@@ -176,9 +179,9 @@ async function loadRoute() {
       state.children = ["SERIES", "BOX_SET"].includes(state.item.itemType) ? await api.children(state.itemId) : null;
       view.innerHTML = renderDetail(state.item, state.playback, state.children, state.itemImages, state.itemCandidates);
     } else if (state.route === "admin") {
-      const [health, libraries, users, audit, pending, jobs] = await Promise.all([api.adminHealth(), api.adminLibraries(), api.adminUsers(), api.audit(), api.pendingMetadata(), api.adminJobs()]);
+      const [health, libraries, users, audit, logs, settings, pending, jobs] = await Promise.all([api.adminHealth(), api.adminLibraries(), api.adminUsers(), api.audit(), api.logs(), api.adminSettings(), api.pendingMetadata(), api.adminJobs()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
-      state.admin = { health, ready: health, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), reidentifyJobs: state.admin?.reidentifyJobs || [], jobDetail: state.admin?.jobDetail || null, jobEvents: state.admin?.jobEvents || [], jobEventsTotal: state.admin?.jobEventsTotal || 0, jobEventsPage: state.admin?.jobEventsPage || 1, jobEventFilters: state.admin?.jobEventFilters || {} };
+      state.admin = { health, ready: health, settings, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], logs: logs.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), reidentifyJobs: state.admin?.reidentifyJobs || [], jobDetail: state.admin?.jobDetail || null, jobEvents: state.admin?.jobEvents || [], jobEventsTotal: state.admin?.jobEventsTotal || 0, jobEventsPage: state.admin?.jobEventsPage || 1, jobEventFilters: state.admin?.jobEventFilters || {} };
       view.innerHTML = renderAdmin();
     } else if (state.route === "account") {
       const sessions = await api.sessions();
@@ -287,8 +290,17 @@ function renderChildrenPanel(item, result, showingEpisodes = false) {
   return `<div class="section-heading"><h3>季度</h3><span>${result.total || items.length} 个季度</span></div><div class="library-grid">${seasons || "<div class=\"empty\"><span>暂无季度</span></div>"}</div>`;
 }
 
+function renderAdminSettings(settings = {}) {
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>服务端设置</h2><span>继续观看阈值</span></div><form class=\"admin-form\" data-action=\"update-settings\"><label>标记已看比例 <input name=\"resumePlayedPercent\" type=\"number\" min=\"1\" max=\"100\" value=\"" + escapeHtml(settings.resumePlayedPercent ?? 90) + "\" required></label><label>最短进度 ticks <input name=\"resumeMinTicks\" type=\"number\" min=\"0\" value=\"" + escapeHtml(settings.resumeMinTicks ?? 1200000000) + "\" required></label><button class=\"button\" type=\"submit\">保存设置</button></form><p>1 秒等于 10,000,000 ticks；设置会影响继续观看和已看判断。</p></section>";
+}
+
+function renderAdminLogs(logs) {
+  const rows = logs.slice(0, 12).map((event) => "<li><strong>" + escapeHtml(event.eventType || event.eventCode || "EVENT") + "</strong><span>" + escapeHtml(event.actorUsername || "system") + " · " + escapeHtml(event.createdAt || "") + "</span></li>").join("");
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>日志与审计</h2><span>最近 12 条脱敏事件</span></div><ul class=\"admin-list\">" + (rows || "<li><span>暂无日志</span></li>") + "</ul></section>";
+}
+
 function renderAdmin() {
-  const { ready = {}, libraries = [], users = [], audit: events = [], pending = [], jobs = [], access = {} } = state.admin || {};
+  const { ready = {}, settings = {}, libraries = [], users = [], audit: events = [], logs = [], pending = [], jobs = [], access = {} } = state.admin || {};
   const health = state.admin?.health || ready;
   const reidentifyJobs = state.admin?.reidentifyJobs || [];
   const jobDetail = state.admin?.jobDetail || null;
@@ -307,7 +319,9 @@ function renderAdmin() {
     "<section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>密码为空表示不修改</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" autocomplete=\"username\" required><input name=\"displayName\" placeholder=\"显示名称\" aria-label=\"显示名称\" autocomplete=\"name\"><input name=\"password\" type=\"password\" placeholder=\"初始密码\" aria-label=\"初始密码\" autocomplete=\"new-password\" required><label class=\"check\"><input name=\"isAdmin\" type=\"checkbox\"> 管理员</label><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div>" + userEditors + "</section>" +
     "<section class=\"section\"><div class=\"section-heading\"><div><h2>待处理元数据</h2><span>候选写回前请检查差异</span></div><button class=\"button secondary\" type=\"button\" data-action=\"batch-reidentify\">批量重新识别已选条目</button></div><div class=\"candidate-list\">" + renderPendingCandidates(pending) + "</div></section>" +
     renderMetadataReidentifyJobs(reidentifyJobs) +
-    "<section class=\"section\"><div class=\"section-heading\"><h2>最近审计</h2><span>只展示最近 8 条</span></div><ul class=\"admin-list\">" + (auditRows || "<li><span>暂无管理操作</span></li>") + "</ul></section>";
+    renderAdminSettings(settings) +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>最近审计</h2><span>只展示最近 8 条</span></div><ul class=\"admin-list\">" + (auditRows || "<li><span>暂无管理操作</span></li>") + "</ul></section>" +
+    renderAdminLogs(logs);
 }
 
 function renderJobs(jobs, libraries) {
@@ -535,6 +549,13 @@ function bind() {
     event.preventDefault();
     try { await api.createUser({ username: field(form, "username").value, displayName: field(form, "displayName").value, password: field(form, "password").value, isAdmin: field(form, "isAdmin").checked }); state.route = "admin"; state.error = ""; state.notice = "用户已创建。"; render(); }
     catch (error) { state.error = error.message; render(); }
+  }));
+  document.querySelectorAll("form[data-action='update-settings']").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      state.admin.settings = await api.updateSettings({ resumePlayedPercent: Number(field(form, "resumePlayedPercent").value), resumeMinTicks: Number(field(form, "resumeMinTicks").value) });
+      state.route = "admin"; state.error = ""; state.notice = "服务端设置已保存。"; render();
+    } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='create-library']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
