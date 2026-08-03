@@ -20,7 +20,7 @@
 
 ## 未完成的发布门
 
-- [x] 本机 ARM64 Docker builder 交叉构建 `linux/amd64` 镜像 `lux:amd64-local`；镜像架构、非 root `uid=10001` 和 `ffprobe` 已验证。
+- [x] 本机 ARM64 Docker builder 交叉构建当前源码 `linux/amd64` 镜像 `lux:amd64-local`；revision `fc677a5` 的镜像架构、非 root `uid=10001`、`ffprobe` 和 `/health/live` 已验证。
 - [ ] 镜像签名/版本发布。
 - [ ] Tailscale/反代 HTTPS、Range 缓冲和 trusted proxy 实机验证。
 - [ ] 真实 NAS 磁盘满、媒体挂载丢失和长期运行恢复演练；TMDb 故障与强制终止已有本机证据。
