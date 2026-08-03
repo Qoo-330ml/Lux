@@ -44,6 +44,33 @@ describe("LuxApiClient", () => {
     } satisfies Partial<ApiError>);
   });
 
+  it("filters library browse requests by the requested root item type", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().libraryItems("series-library", 1, "SERIES");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/libraries/series-library/items?page=1&pageSize=24&itemType=SERIES",
+    );
+  });
+
+  it("requests the children for a series or a selected season", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().children("series-1", {
+      itemType: "EPISODE",
+      seasonId: "season-1",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/items/series-1/children?page=1&pageSize=60&itemType=EPISODE&seasonId=season-1",
+    );
+  });
+
   it("exposes admin health and settings through the Lux API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
@@ -78,10 +105,16 @@ describe("LuxApiClient", () => {
       if (path === "/api/v1/admin/plugins?page=1&pageSize=50") {
         return new Response(JSON.stringify({ plugins: [{ id: "tmdb", installed: false }] }), { status: 200 });
       }
-      expect(path).toBe("/api/v1/admin/plugins/tmdb/install");
-      expect(init?.method).toBe("POST");
+      if (path === "/api/v1/admin/plugins/tmdb/install") {
+        expect(init?.method).toBe("POST");
+        expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+        return new Response(JSON.stringify({ plugin: { id: "tmdb", installed: true } }), { status: 201 });
+      }
+      expect(path).toBe("/api/v1/admin/plugins/tmdb/config");
+      expect(init?.method).toBe("PUT");
+      expect(JSON.parse(String(init?.body))).toEqual({ apiKey: "custom-key" });
       expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
-      return new Response(JSON.stringify({ plugin: { id: "tmdb", installed: true } }), { status: 201 });
+      return new Response(JSON.stringify({ plugin: { id: "tmdb", installed: true, configSource: "CUSTOM" } }), { status: 200 });
     });
     Object.defineProperty(globalThis, "document", {
       configurable: true,
@@ -91,7 +124,8 @@ describe("LuxApiClient", () => {
     const client = new LuxApiClient();
     await expect(client.adminPlugins()).resolves.toEqual({ plugins: [{ id: "tmdb", installed: false }] });
     await expect(client.installAdminPlugin("tmdb")).resolves.toEqual({ plugin: { id: "tmdb", installed: true } });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(client.updateAdminPluginConfig("tmdb", "custom-key")).resolves.toEqual({ plugin: { id: "tmdb", installed: true, configSource: "CUSTOM" } });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("unwraps the authenticated user from the login envelope", async () => {

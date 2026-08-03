@@ -6,7 +6,7 @@ use luxd::{
         probe::{FfprobeRunner, MediaProbeService},
         reidentify::MetadataReidentifyService,
         scanner::ScanJobService,
-        settings::read_tmdb_token,
+        settings::{read_tmdb_api_key, read_tmdb_token},
         setup::SetupService,
         tmdb::TmdbClient,
     },
@@ -37,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )),
     )
     .await;
-    if let Ok(tmdb) = TmdbClient::from_env_or_token(read_tmdb_token(&config.config_dir)) {
+    if let Ok(tmdb) = TmdbClient::from_env_or_config(
+        read_tmdb_api_key(&config.config_dir),
+        read_tmdb_token(&config.config_dir),
+    ) {
         resume_metadata_reidentify_jobs(MetadataReidentifyService::new(database.clone(), tmdb))
             .await;
     }

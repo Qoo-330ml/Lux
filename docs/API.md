@@ -17,7 +17,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/setup/status`：返回 `initialized`。
 - `POST /api/v1/setup/complete`：仅在没有用户时创建首个管理员；成功返回 201，重复或并发失败返回 `SETUP_ALREADY_COMPLETED`。
 
-请求体至少包含 `username` 和 `password`，可选 `displayName`。密码只以 Argon2id PHC 哈希形式写入数据库。
+请求体至少包含 `username` 和 `password`，可选 `displayName` 和首个媒体库信息。初始化接口不接收 TMDb 配置；TMDb API Key 在插件详情页配置。密码只以 Argon2id PHC 哈希形式写入数据库。
 
 ## Web 会话
 
@@ -52,13 +52,14 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 ## 内置插件与刮削器（LUX-140）
 
-以下接口要求 `canManageServer`；POST 还要求 `X-CSRF-Token`：
+以下接口要求 `canManageServer`；写操作还要求 `X-CSRF-Token`：
 
-- `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回已编译的插件目录及 `installed`、`configured`、`available` 状态。首版目录包含 `tmdb`。
+- `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回已编译的插件目录及 `installed`、`configured`、`available`、`configurable`、`configFields`、`configSource` 状态。`configFields` 只包含非敏感 schema，不包含当前值。首版目录包含 `tmdb`。
 - `POST /api/v1/admin/plugins/{pluginId}/install`：安装/启用内置插件，首次安装返回 201，重复请求返回 200。未知插件返回 404。
-- 未安装、未配置或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
+- `PUT /api/v1/admin/plugins/{pluginId}/config`：替换插件配置。TMDb 请求体为 `{ "apiKey": "..." }`；空字符串清除自定义 Key 并恢复内置 fallback。成功返回不含明文凭据的插件状态。
+- 未安装、无可用凭据或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
-插件不会从网络下载或加载任意代码。TMDb Read Access Token 只存在配置目录，不出现在插件 API、媒体库 API 或日志中。
+插件不会从网络下载或加载任意代码。TMDb API Key 和 Read Access Token 只存在配置目录或内置实现，不出现在插件 API、媒体库 API 或日志中。
 
 ## 元数据候选管理（LUX-053）
 

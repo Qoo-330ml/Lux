@@ -71,11 +71,6 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
     tokio::fs::create_dir_all(&config_dir).await?;
-    tokio::fs::write(
-        config_dir.join("tmdb_read_access_token"),
-        "test-only-configured-value\n",
-    )
-    .await?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir,
@@ -107,6 +102,13 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(catalog_body["plugins"][0]["id"], "tmdb");
     assert_eq!(catalog_body["plugins"][0]["installed"], false);
     assert_eq!(catalog_body["plugins"][0]["configured"], true);
+    assert_eq!(catalog_body["plugins"][0]["configurable"], true);
+    assert_eq!(catalog_body["plugins"][0]["configSource"], "BUILT_IN");
+    assert_eq!(
+        catalog_body["plugins"][0]["configFields"][0]["key"],
+        "apiKey"
+    );
+    assert!(catalog_body["plugins"][0].get("apiKey").is_none());
 
     let installed = client
         .post(format!("{base_url}/api/v1/admin/plugins/tmdb/install"))
@@ -156,7 +158,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
 }
 
 #[tokio::test]
-async fn unconfigured_tmdb_cannot_be_selected_even_after_install()
+async fn admin_can_configure_tmdb_key_and_reset_to_the_embedded_default()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -175,6 +177,37 @@ async fn unconfigured_tmdb_cannot_be_selected_even_after_install()
         .await?;
     assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
 
+    let custom_key = "custom-api-key-for-test";
+    let configured = client
+        .put(format!("{base_url}/api/v1/admin/plugins/tmdb/config"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "apiKey": custom_key }))
+        .send()
+        .await?;
+    assert_eq!(configured.status(), reqwest::StatusCode::OK);
+    let configured_body: Value = configured.json().await?;
+    assert_eq!(configured_body["plugin"]["configSource"], "CUSTOM");
+    assert!(!configured_body.to_string().contains(custom_key));
+    assert_eq!(
+        tokio::fs::read_to_string(temp_dir.path().join("config/tmdb_api_key")).await?,
+        format!("{custom_key}\n")
+    );
+
+    let reset = client
+        .put(format!("{base_url}/api/v1/admin/plugins/tmdb/config"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "apiKey": "" }))
+        .send()
+        .await?;
+    assert_eq!(reset.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        reset.json::<Value>().await?["plugin"]["configSource"],
+        "BUILT_IN"
+    );
+    assert!(!temp_dir.path().join("config/tmdb_api_key").exists());
+
     let created = client
         .post(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookies)
@@ -186,10 +219,10 @@ async fn unconfigured_tmdb_cannot_be_selected_even_after_install()
         }))
         .send()
         .await?;
-    assert_eq!(created.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
     assert_eq!(
-        created.json::<Value>().await?["error"]["code"],
-        "PLUGIN_UNAVAILABLE"
+        created.json::<Value>().await?["library"]["scraperId"],
+        "tmdb"
     );
 
     server.abort();

@@ -22,6 +22,7 @@ struct StubState {
     statuses: Arc<Mutex<Vec<StatusCode>>>,
     attempts: Arc<AtomicUsize>,
     auth_seen: Arc<AtomicBool>,
+    api_key_seen: Arc<AtomicBool>,
     delay: Option<Duration>,
     invalid_schema: bool,
     localized: bool,
@@ -41,6 +42,7 @@ async fn start_stub(
         statuses: Arc::new(Mutex::new(statuses)),
         attempts: Arc::new(AtomicUsize::new(0)),
         auth_seen: Arc::new(AtomicBool::new(false)),
+        api_key_seen: Arc::new(AtomicBool::new(false)),
         delay,
         invalid_schema,
         localized,
@@ -64,6 +66,13 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
         == Some("Bearer stub-token")
     {
         state.auth_seen.store(true, Ordering::Relaxed);
+    }
+    if request
+        .uri()
+        .query()
+        .is_some_and(|query| query.contains("api_key=custom-api-key"))
+    {
+        state.api_key_seen.store(true, Ordering::Relaxed);
     }
     state.attempts.fetch_add(1, Ordering::Relaxed);
     if let Some(delay) = state.delay {
@@ -150,6 +159,7 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
 fn client_config(base_url: String, timeout: Duration, max_retries: u32) -> TmdbClientConfig {
     TmdbClientConfig {
         base_url,
+        api_key: None,
         read_access_token: Some("stub-token".to_owned()),
         timeout,
         max_retries,
@@ -170,11 +180,35 @@ fn tmdb_client_requires_a_token_and_valid_http_base_url() {
     assert!(matches!(
         TmdbClient::new(TmdbClientConfig {
             base_url: "file:///tmp/tmdb".to_owned(),
+            api_key: None,
             read_access_token: Some("stub-token".to_owned()),
             ..TmdbClientConfig::default()
         }),
         Err(TmdbError::InvalidBaseUrl(_))
     ));
+}
+
+#[tokio::test]
+async fn tmdb_client_sends_v3_api_key_as_a_query_parameter()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (base_url, state, server) = start_stub(vec![StatusCode::OK], None, false, false).await;
+    let client = TmdbClient::new(TmdbClientConfig {
+        base_url,
+        api_key: Some("custom-api-key".to_owned()),
+        read_access_token: None,
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+
+    client.search_movies("stub", None, "en-US").await?;
+
+    assert!(state.api_key_seen.load(Ordering::Relaxed));
+    server.abort();
+    Ok(())
 }
 
 #[tokio::test]

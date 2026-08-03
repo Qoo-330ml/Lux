@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, Download, PackageOpen, RefreshCw } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Download, PackageOpen, RefreshCw, Save, Settings2 } from "lucide-react";
+import { useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminPlugin } from "../../lib/api/types";
@@ -34,14 +35,50 @@ export function AdminPluginsPage() {
 }
 
 function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; installing: boolean; onInstall: () => void }) {
-  const status = plugin.available ? "可用于媒体库" : plugin.installed ? "需要配置 TMDb Token" : "尚未安装";
+  const queryClient = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const configField = plugin.configFields.find((field) => field.key === "apiKey");
+  const save = useMutation({
+    mutationFn: () => api.updateAdminPluginConfig(plugin.id, apiKey),
+    onSuccess: () => {
+      setApiKey("");
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
+    },
+  });
+  const status = plugin.available ? availabilityLabel(plugin.configSource) : plugin.installed ? "暂不可用" : "尚未安装";
+  const canOpen = plugin.configurable && plugin.configFields.length > 0;
+
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
-      <div className="lux-admin-plugin-icon" aria-hidden="true"><PackageOpen size={22} /></div>
-      <div className="lux-admin-plugin-content"><span className="lux-eyebrow">{plugin.id.toUpperCase()}</span><h2>{plugin.name}</h2><p>{plugin.description}</p><div className={plugin.available ? "lux-admin-plugin-status is-ok" : "lux-admin-plugin-status is-warn"}>{plugin.available ? <CheckCircle2 size={15} /> : <AlertTriangle size={15} />}<span>{status}</span></div>{!plugin.configured ? <small>请先在初始化配置或环境变量中设置 TMDb Read Access Token。</small> : null}</div>
+      <button
+        className="lux-admin-plugin-card-toggle"
+        type="button"
+        disabled={!canOpen}
+        aria-expanded={canOpen ? open : undefined}
+        onClick={() => canOpen && setOpen((value) => !value)}
+      >
+        <div className="lux-admin-plugin-icon" aria-hidden="true"><PackageOpen size={22} /></div>
+        <div className="lux-admin-plugin-content"><span className="lux-eyebrow">{plugin.id.toUpperCase()}</span><h2>{plugin.name}</h2><p>{plugin.description}</p><div className={plugin.available ? "lux-admin-plugin-status is-ok" : "lux-admin-plugin-status is-warn"}>{plugin.available ? <CheckCircle2 size={15} /> : <AlertTriangle size={15} />}<span>{status}</span></div>{canOpen ? <small><Settings2 size={13} /> 点击配置插件</small> : null}</div>
+      </button>
       <button className="lux-button lux-button-primary" type="button" disabled={plugin.installed || installing} onClick={onInstall}>{plugin.installed ? <CheckCircle2 size={16} /> : <Download size={16} />}{installing ? "安装中…" : plugin.installed ? "已安装" : "安装插件"}</button>
+      {open && configField ? <form className="lux-admin-plugin-config" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
+        <label>{configField.label}<input type={configField.type} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="留空可恢复内置 Key" autoComplete="new-password" /></label>
+        <p>{configField.description} 当前：{availabilityLabel(plugin.configSource)}。</p>
+        <button className="lux-button lux-button-secondary" type="submit" disabled={save.isPending}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</button>
+        {save.error ? <span className="lux-error-copy" role="alert">{save.error.message}</span> : null}
+      </form> : null}
     </article>
   );
+}
+
+function availabilityLabel(source: AdminPlugin["configSource"]) {
+  if (source === "CUSTOM") return "使用自定义 Key";
+  if (source === "ENVIRONMENT") return "使用环境变量 Key";
+  if (source === "READ_ACCESS_TOKEN") return "使用 Read Access Token";
+  if (source === "BUILT_IN") return "使用内置 Key";
+  return "未配置凭据";
 }
 
 function AdminPluginsState({ label, error = false }: { label: string; error?: boolean }) {

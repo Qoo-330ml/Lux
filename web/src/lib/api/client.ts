@@ -93,7 +93,6 @@ export class LuxApiClient {
     username: string;
     displayName?: string;
     password: string;
-    tmdbToken?: string;
     libraryName?: string;
     libraryKind?: string;
     libraryRoot?: string;
@@ -127,8 +126,9 @@ export class LuxApiClient {
     return this.request<{ libraries?: Library[] }>("/api/v1/libraries");
   }
 
-  libraryItems(libraryId: string, page = 1) {
+  libraryItems(libraryId: string, page = 1, itemTypes?: string) {
     const params = new URLSearchParams({ page: String(page), pageSize: "24" });
+    if (itemTypes) params.set("itemType", itemTypes);
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
     );
@@ -141,6 +141,15 @@ export class LuxApiClient {
 
   item(itemId: string) {
     return this.request<MediaItem>(`/api/v1/items/${encodeURIComponent(itemId)}`);
+  }
+
+  children(itemId: string, options: { itemType?: string; seasonId?: string } = {}) {
+    const params = new URLSearchParams({ page: "1", pageSize: "60" });
+    if (options.itemType) params.set("itemType", options.itemType);
+    if (options.seasonId) params.set("seasonId", options.seasonId);
+    return this.request<PageResponse<MediaItem>>(
+      `/api/v1/items/${encodeURIComponent(itemId)}/children?${params}`,
+    );
   }
 
   playback(itemId: string) {
@@ -167,6 +176,13 @@ export class LuxApiClient {
     return this.request<{ plugin: AdminPlugin }>(
       `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/install`,
       { method: "POST" },
+    );
+  }
+
+  updateAdminPluginConfig(pluginId: string, apiKey: string) {
+    return this.request<{ plugin: AdminPlugin }>(
+      `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/config`,
+      { method: "PUT", body: JSON.stringify({ apiKey }) },
     );
   }
 

@@ -8,7 +8,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 export function SetupPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [values, setValues] = useState({ username: "", displayName: "", password: "", tmdbToken: "", libraryName: "", libraryRoot: "" });
+  const [values, setValues] = useState({ username: "", displayName: "", password: "", libraryName: "", libraryRoot: "" });
   const setup = useMutation({
     mutationFn: () => api.setup({ ...values, libraryKind: "MIXED" }),
     onSuccess: () => {
@@ -34,7 +34,7 @@ export function SetupPage() {
           <label>管理员用户名<input value={values.username} onChange={(event) => setValues({ ...values, username: event.target.value })} required /></label>
           <label>显示名称<input value={values.displayName} onChange={(event) => setValues({ ...values, displayName: event.target.value })} /></label>
           <label>管理员密码<input value={values.password} onChange={(event) => setValues({ ...values, password: event.target.value })} type="password" minLength={8} required /></label>
-          <details><summary>可选：创建首个媒体库</summary><div className="lux-setup-optional"><label>媒体库名称<input value={values.libraryName} onChange={(event) => setValues({ ...values, libraryName: event.target.value })} /></label><label>媒体库路径<input value={values.libraryRoot} onChange={(event) => setValues({ ...values, libraryRoot: event.target.value })} placeholder="例如 /media/movies" /></label><label>TMDb Token<input value={values.tmdbToken} onChange={(event) => setValues({ ...values, tmdbToken: event.target.value })} type="password" /></label></div></details>
+          <details><summary>可选：创建首个媒体库</summary><div className="lux-setup-optional"><label>媒体库名称<input value={values.libraryName} onChange={(event) => setValues({ ...values, libraryName: event.target.value })} /></label><label>媒体库路径<input value={values.libraryRoot} onChange={(event) => setValues({ ...values, libraryRoot: event.target.value })} placeholder="例如 /media/movies" /></label></div></details>
           <button className="lux-button lux-button-primary" type="submit" disabled={setup.isPending}>{setup.isPending ? "正在初始化…" : "完成初始化"}</button>
         </form>
         {setup.error ? <p className="lux-error-copy" role="alert">{setup.error.message}</p> : null}

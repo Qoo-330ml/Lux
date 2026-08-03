@@ -6,14 +6,19 @@ use std::{
 
 use reqwest::{Client, Url};
 use serde::Deserialize;
-use tokio::{sync::Mutex, time::sleep};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::sleep,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.themoviedb.org/";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const EMBEDDED_TMDB_API_KEY: &str = "f6bd687ffa63cd282b6ff2c6877f2669";
 
 #[derive(Clone)]
 pub struct TmdbClientConfig {
     pub base_url: String,
+    pub api_key: Option<String>,
     pub read_access_token: Option<String>,
     pub timeout: Duration,
     pub max_retries: u32,
@@ -27,6 +32,7 @@ impl Default for TmdbClientConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_owned(),
+            api_key: None,
             read_access_token: None,
             timeout: Duration::from_secs(10),
             max_retries: 3,
@@ -42,7 +48,8 @@ impl Default for TmdbClientConfig {
 pub struct TmdbClient {
     http: Client,
     base_url: Url,
-    read_access_token: String,
+    credential: Arc<RwLock<TmdbCredential>>,
+    fallback_credential: TmdbCredential,
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
@@ -53,13 +60,15 @@ pub struct TmdbClient {
 
 impl TmdbClient {
     pub fn new(config: TmdbClientConfig) -> Result<Self, TmdbError> {
-        let token = config
-            .read_access_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .ok_or(TmdbError::MissingToken)?
-            .to_owned();
+        Self::new_with_fallback(config, None)
+    }
+
+    fn new_with_fallback(
+        config: TmdbClientConfig,
+        fallback_credential: Option<TmdbCredential>,
+    ) -> Result<Self, TmdbError> {
+        let credential = credential_from_config(&config).or(fallback_credential);
+        let credential = credential.ok_or(TmdbError::MissingToken)?;
         let base_url_text = if config.base_url.ends_with('/') {
             config.base_url.clone()
         } else {
@@ -83,7 +92,8 @@ impl TmdbClient {
         Ok(Self {
             http,
             base_url,
-            read_access_token: token,
+            credential: Arc::new(RwLock::new(credential.clone())),
+            fallback_credential: credential,
             max_retries: config.max_retries,
             initial_backoff: config.initial_backoff,
             max_backoff: config.max_backoff,
@@ -104,10 +114,53 @@ impl TmdbClient {
             .or(fallback_token);
         let config = TmdbClientConfig {
             base_url: env::var("LUX_TMDB_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned()),
+            api_key: None,
             read_access_token,
             ..TmdbClientConfig::default()
         };
         Self::new(config)
+    }
+
+    pub fn from_env_or_config(
+        configured_api_key: Option<String>,
+        configured_token: Option<String>,
+    ) -> Result<Self, TmdbError> {
+        let environment_api_key = env::var("LUX_TMDB_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let environment_token = env::var("LUX_TMDB_READ_ACCESS_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let fallback_credential = environment_api_key
+            .clone()
+            .map(TmdbCredential::ApiKey)
+            .or_else(|| {
+                environment_token
+                    .clone()
+                    .map(TmdbCredential::ReadAccessToken)
+            })
+            .or_else(|| {
+                configured_token
+                    .clone()
+                    .map(TmdbCredential::ReadAccessToken)
+            })
+            .unwrap_or_else(|| TmdbCredential::ApiKey(EMBEDDED_TMDB_API_KEY.to_owned()));
+        let config = TmdbClientConfig {
+            base_url: env::var("LUX_TMDB_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned()),
+            api_key: configured_api_key.or(environment_api_key),
+            read_access_token: environment_token.or(configured_token),
+            ..TmdbClientConfig::default()
+        };
+        Self::new_with_fallback(config, Some(fallback_credential))
+    }
+
+    pub async fn set_api_key(&self, api_key: Option<&str>) {
+        let credential = api_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| TmdbCredential::ApiKey(value.to_owned()))
+            .unwrap_or_else(|| self.fallback_credential.clone());
+        *self.credential.write().await = credential;
     }
 
     pub async fn search_movies(
@@ -238,12 +291,14 @@ impl TmdbClient {
         let mut retry_count = 0;
         loop {
             self.wait_for_rate_limit().await;
-            let response = self
-                .http
-                .get(url.clone())
-                .bearer_auth(&self.read_access_token)
-                .send()
-                .await;
+            let credential = self.credential.read().await.clone();
+            let request = self.http.get(url.clone());
+            let response = match credential {
+                TmdbCredential::ApiKey(api_key) => {
+                    request.query(&[("api_key", api_key.as_str())]).send().await
+                }
+                TmdbCredential::ReadAccessToken(token) => request.bearer_auth(token).send().await,
+            };
             let response = match response {
                 Ok(response) => response,
                 Err(error) if error.is_timeout() => {
@@ -322,6 +377,29 @@ impl TmdbClient {
         let delay = backoff.max(retry_after.unwrap_or_default()) + jitter;
         sleep(delay).await;
     }
+}
+
+#[derive(Clone)]
+enum TmdbCredential {
+    ApiKey(String),
+    ReadAccessToken(String),
+}
+
+fn credential_from_config(config: &TmdbClientConfig) -> Option<TmdbCredential> {
+    config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| TmdbCredential::ApiKey(value.to_owned()))
+        .or_else(|| {
+            config
+                .read_access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| TmdbCredential::ReadAccessToken(value.to_owned()))
+        })
 }
 
 fn classify_transport_error(error: reqwest::Error) -> TmdbError {

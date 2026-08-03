@@ -92,12 +92,9 @@ async fn setup_can_create_one_admin_and_then_closes() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn setup_can_store_tmdb_token_and_create_first_library()
+async fn setup_does_not_store_tmdb_configuration_and_can_create_first_library()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
     let media_dir = temp_dir.path().join("Movies");
@@ -115,7 +112,6 @@ async fn setup_can_store_tmdb_token_and_create_first_library()
             "username": "Admin",
             "displayName": "Administrator",
             "password": "correct horse battery staple",
-            "tmdbToken": "tmdb-secret-for-test",
             "firstLibrary": {
                 "name": "Movies",
                 "kind": "MOVIE",
@@ -127,19 +123,9 @@ async fn setup_can_store_tmdb_token_and_create_first_library()
     assert_eq!(complete.status(), reqwest::StatusCode::CREATED);
     let body: serde_json::Value = complete.json().await?;
     assert_eq!(body["initialized"], true);
-    assert_eq!(body["tmdbConfigured"], true);
+    assert!(body.get("tmdbConfigured").is_none());
     assert_eq!(body["library"]["name"], "Movies");
-    assert!(body.get("tmdbToken").is_none());
-
-    let token_path = config_dir.join("tmdb_read_access_token");
-    assert_eq!(
-        tokio::fs::read_to_string(&token_path).await?,
-        "tmdb-secret-for-test\n"
-    );
-    assert_eq!(
-        tokio::fs::metadata(token_path).await?.permissions().mode() & 0o777,
-        0o600
-    );
+    assert!(!config_dir.join("tmdb_read_access_token").exists());
 
     server.abort();
     Ok(())
@@ -167,7 +153,7 @@ async fn setup_can_skip_tmdb_and_first_library() -> Result<(), Box<dyn std::erro
         .await?;
     assert_eq!(complete.status(), reqwest::StatusCode::CREATED);
     let body: serde_json::Value = complete.json().await?;
-    assert_eq!(body["tmdbConfigured"], false);
+    assert!(body.get("tmdbConfigured").is_none());
     assert!(body.get("library").is_none());
     assert!(!config_dir.join("tmdb_read_access_token").exists());
 

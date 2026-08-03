@@ -34,7 +34,7 @@
 
 ## Security and reliability rules
 
-- Never commit passwords, tokens, cookies, real `.strm` URLs, or user data.
+- Never commit passwords, user tokens, cookies, real `.strm` URLs, or user data. The project owner has explicitly approved the fixed third-party TMDb fallback key embedded in the built-in TMDb implementation; it must never be returned by an API or written to logs.
 - Never log credentials, access tokens, cookies, full query strings, or complete external URLs.
 - Validate every external input, canonicalize media paths, and enforce the configured library root.
 - Do not trust forwarded headers unless the request source is in the configured trusted proxy range.
