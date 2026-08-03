@@ -1,7 +1,8 @@
 import { requestOptions } from "./request-options.mjs";
+import { ADMIN_NAV_ITEMS, adminRoute, adminSectionForRoute, isAdminRoute } from "./admin-navigation.mjs";
 
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, libraryPage: 1, searchPage: 1, favoritesPage: 1, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "", drawerOpen: false };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", adminNavExpanded: false, libraryId: "", libraryFilters: {}, libraryPage: 1, searchPage: 1, favoritesPage: 1, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "", drawerOpen: false };
 
 const api = {
   async request(path, options = {}) {
@@ -100,7 +101,7 @@ function titleForRoute() {
   if (state.route === "library") return state.libraries.find((library) => library.id === state.libraryId)?.name || "媒体库内容";
   if (state.route === "search") return "搜索";
   if (state.route === "item") return state.item?.title || "详情";
-  if (state.route === "admin") return "管理控制台";
+  if (isAdminRoute(state.route)) return ADMIN_NAV_ITEMS.find((item) => item.id === adminSectionForRoute(state.route))?.label || "管理控制台";
   if (state.route === "account") return "账户与会话";
   return "首页";
 }
@@ -121,7 +122,9 @@ function nav() {
   const homeCurrent = state.route === "home" ? "page" : "false";
   const libraryCurrent = state.route === "libraries" ? "page" : "false";
   const favoritesCurrent = state.route === "favorites" ? "page" : "false";
-  const admin = state.user.canManageServer ? "<button data-route=\"admin\" aria-current=\"" + (state.route === "admin" ? "page" : "false") + "\"><span class=\"nav-glyph\">⚙</span><span>管理</span></button>" : "";
+  const adminExpanded = state.adminNavExpanded && isAdminRoute(state.route);
+  const adminCurrent = isAdminRoute(state.route) ? "page" : "false";
+  const admin = state.user.canManageServer ? "<div class=\"nav-admin-group\"><button class=\"nav-admin-toggle\" data-action=\"toggle-admin-nav\" aria-expanded=\"" + adminExpanded + "\" aria-controls=\"admin-navigation\" aria-current=\"" + adminCurrent + "\"><span class=\"nav-glyph\">⚙</span><span>管理</span><span class=\"nav-chevron\" aria-hidden=\"true\">" + (adminExpanded ? "⌃" : "⌄") + "</span></button>" + (adminExpanded ? "<div class=\"nav-submenu\" id=\"admin-navigation\" role=\"group\" aria-label=\"管理设置\">" + ADMIN_NAV_ITEMS.map((item) => "<button class=\"nav-subitem\" data-route=\"" + adminRoute(item.id) + "\" aria-current=\"" + (adminSectionForRoute(state.route) === item.id ? "page" : "false") + "\"><span class=\"nav-glyph\">" + item.glyph + "</span><span>" + item.label + "</span></button>").join("") + "</div>" : "") + "</div>" : "";
   const libraries = state.home?.libraries || state.libraries;
   const libraryLinks = libraries.length ? "<div class=\"nav-group\"><span class=\"nav-group-label\">媒体库</span>" + libraries.map((library) => "<button class=\"nav-library\" data-library=\"" + escapeHtml(library.id) + "\" aria-current=\"" + (state.route === "library" && state.libraryId === library.id ? "page" : "false") + "\"><span class=\"nav-glyph\">" + (library.kind === "SERIES" ? "▤" : "▣") + "</span><span>" + escapeHtml(library.name) + "</span></button>").join("") + "</div>" : "";
   return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\"><span class=\"nav-glyph\">⌂</span><span>首页</span></button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\"><span class=\"nav-glyph\">▦</span><span>媒体库</span></button><button data-route=\"favorites\" aria-current=\"" + favoritesCurrent + "\"><span class=\"nav-glyph\">♥</span><span>收藏</span></button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\"><span class=\"nav-glyph\">◉</span><span>账户</span></button>" + admin + libraryLinks + "</nav>";
@@ -183,7 +186,7 @@ async function loadRoute() {
       state.playback = await api.playback(state.itemId);
       state.children = ["SERIES", "BOX_SET"].includes(state.item.itemType) ? await api.children(state.itemId) : null;
       view.innerHTML = renderDetail(state.item, state.playback, state.children, state.itemImages, state.itemCandidates);
-    } else if (state.route === "admin") {
+    } else if (isAdminRoute(state.route)) {
       const [health, libraries, users, audit, logs, settings, pending, jobs] = await Promise.all([api.adminHealth(), api.adminLibraries(), api.adminUsers(), api.audit(), api.logs(), api.adminSettings(), api.pendingMetadata(), api.adminJobs()]);
       const accessEntries = await Promise.all((users.users || []).map(async (user) => [user.id, (await api.userLibraryAccess(user.id)).libraryIds || []]));
       state.admin = { health, ready: health, settings, libraries: libraries.libraries || [], users: users.users || [], audit: audit.events || [], logs: logs.events || [], pending: pending.items || [], jobs: jobs.jobs || [], access: Object.fromEntries(accessEntries), reidentifyJobs: state.admin?.reidentifyJobs || [], jobDetail: state.admin?.jobDetail || null, jobEvents: state.admin?.jobEvents || [], jobEventsTotal: state.admin?.jobEventsTotal || 0, jobEventsPage: state.admin?.jobEventsPage || 1, jobEventFilters: state.admin?.jobEventFilters || {} };
@@ -315,28 +318,48 @@ function renderAdminLogs(logs) {
 }
 
 function renderAdmin() {
-  const { ready = {}, settings = {}, libraries = [], users = [], audit: events = [], logs = [], pending = [], jobs = [], access = {} } = state.admin || {};
-  const health = state.admin?.health || ready;
-  const reidentifyJobs = state.admin?.reidentifyJobs || [];
-  const jobDetail = state.admin?.jobDetail || null;
-  const userRows = users.map((user) => "<tr><td>" + escapeHtml(user.displayName || user.usernameNormalized) + "<small>" + escapeHtml(user.usernameNormalized) + "</small></td><td>" + (user.isDisabled ? "已禁用" : user.canManageServer ? "管理员" : "普通用户") + "</td><td><a class=\"button secondary\" href=\"#user-" + escapeHtml(user.id) + "\">编辑</a> " + (user.isDisabled ? "" : "<button class=\"button secondary\" data-disable-user=\"" + escapeHtml(user.id) + "\">禁用</button>") + "</td></tr>").join("");
-  const userEditors = users.map((user) => renderUserEditor(user, libraries, new Set(access[user.id] || []))).join("");
-  const libraryCards = libraries.map(renderAdminLibrary).join("");
-  const auditRows = events.slice(0, 8).map((event) => "<li><strong>" + escapeHtml(event.eventType) + "</strong><span>" + escapeHtml(event.actorUsername || "system") + " · " + escapeHtml(event.targetId || "") + "</span></li>").join("");
+  const admin = state.admin || {};
+  const section = adminSectionForRoute(state.route);
+  if (section === "libraries") return renderAdminLibraries(admin);
+  if (section === "users") return renderAdminUsers(admin);
+  if (section === "jobs") return renderAdminJobs(admin);
+  if (section === "metadata") return renderAdminMetadata(admin);
+  if (section === "settings") return renderAdminSettings(admin.settings);
+  return renderAdminDashboard(admin);
+}
+
+function renderAdminDashboard({ ready = {}, health: reportedHealth, libraries = [], users = [] }) {
+  const health = reportedHealth || ready;
   const rootCount = (health.libraries || []).reduce((total, library) => total + Number(library.rootCount || 0), 0);
   const availableRootCount = (health.libraries || []).reduce((total, library) => total + Number(library.availableRootCount || 0), 0);
   const writableRootCount = (health.libraries || []).reduce((total, library) => total + Number(library.writableRootCount || 0), 0);
   const healthDetails = "<section class=\"section\"><div class=\"section-heading\"><h2>运行状态</h2><span>管理员诊断信息</span></div><div class=\"admin-list\"><div><strong>ffprobe</strong><span>" + (health.ffprobe?.available ? "可用" : "不可用") + "</span></div><div><strong>TMDb</strong><span>" + (health.tmdb?.configured ? "已配置" : "未配置") + "</span></div><div><strong>配置目录</strong><span>" + (health.config?.writable ? "可写" : "不可写或不可用") + "</span></div><div><strong>媒体根路径</strong><span>" + availableRootCount + "/" + rootCount + " 可用 · " + writableRootCount + " 可写</span></div><div><strong>活动扫描</strong><span>" + Number(health.jobs?.scanRunning || 0) + " 个 · 失败 " + Number(health.jobs?.scanFailed || 0) + " 个</span></div></div></section>";
-  return "<section class=\"section\"><div class=\"admin-cards\"><div class=\"admin-card\"><span class=\"eyebrow\">Health</span><strong>" + escapeHtml(health.status || "unknown") + "</strong><span>schema " + escapeHtml(health.schemaVersion || "—") + "</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Libraries</span><strong>" + libraries.length + "</strong><span>已配置媒体库</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Users</span><strong>" + users.length + "</strong><span>账户</span></div></div></section>" + healthDetails +
-    "<section class=\"section\"><div class=\"section-heading\"><h2>创建媒体库</h2><span>创建后再添加一个或多个根路径</span></div><form class=\"admin-form\" data-action=\"create-library\"><input name=\"name\" placeholder=\"媒体库名称\" aria-label=\"媒体库名称\" required><select name=\"kind\" aria-label=\"媒体库类型\"><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option><option value=\"MIXED\">混合</option></select><label class=\"check\"><input name=\"realtimeWatchEnabled\" type=\"checkbox\"> 实时监听</label><button class=\"button\" type=\"submit\">创建媒体库</button></form></section>" +
-    "<section class=\"section\"><div class=\"section-heading\"><h2>媒体库与扫描</h2><span>计划字段留空可清除</span></div><div class=\"admin-library-grid\">" + (libraryCards || "<div class=\"empty\"><h3>还没有媒体库</h3><p>先创建一个媒体库，再添加根路径。</p></div>") + "</div></section>" +
-    "<section class=\"section\"><div class=\"section-heading\"><h2>任务</h2><span>失败任务可重试，运行中任务可取消</span></div><form class=\"filter-form\" data-action=\"job-filter\"><label>状态 <select name=\"status\"><option value=\"\">全部</option><option value=\"RUNNING\">运行中</option><option value=\"FAILED\">失败</option><option value=\"CANCELLED\">已取消</option><option value=\"COMPLETED\">已完成</option></select></label><button class=\"button secondary\" type=\"submit\">筛选任务</button></form>" + renderJobs(jobs, libraries) + (jobDetail ? renderJobDetail(jobDetail, state.admin?.jobEvents || [], state.admin?.jobEventsTotal || 0, state.admin?.jobEventsPage || 1) : "") + "</section>" +
-    "<section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>密码为空表示不修改</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" autocomplete=\"username\" required><input name=\"displayName\" placeholder=\"显示名称\" aria-label=\"显示名称\" autocomplete=\"name\"><input name=\"password\" type=\"password\" placeholder=\"初始密码\" aria-label=\"初始密码\" autocomplete=\"new-password\" required><label class=\"check\"><input name=\"isAdmin\" type=\"checkbox\"> 管理员</label><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div>" + userEditors + "</section>" +
-    "<section class=\"section\"><div class=\"section-heading\"><div><h2>待处理元数据</h2><span>候选写回前请检查差异</span></div><button class=\"button secondary\" type=\"button\" data-action=\"batch-reidentify\">批量重新识别已选条目</button></div><div class=\"candidate-list\">" + renderPendingCandidates(pending) + "</div></section>" +
-    renderMetadataReidentifyJobs(reidentifyJobs) +
-    renderAdminSettings(settings) +
+  return "<section class=\"section\"><div class=\"admin-cards\"><div class=\"admin-card\"><span class=\"eyebrow\">Health</span><strong>" + escapeHtml(health.status || "unknown") + "</strong><span>schema " + escapeHtml(health.schemaVersion || "—") + "</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Libraries</span><strong>" + libraries.length + "</strong><span>已配置媒体库</span></div><div class=\"admin-card\"><span class=\"eyebrow\">Users</span><strong>" + users.length + "</strong><span>账户</span></div></div></section>" + healthDetails;
+}
+
+function renderAdminLibraries({ libraries = [] }) {
+  const libraryCards = libraries.map(renderAdminLibrary).join("");
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>创建媒体库</h2><span>创建后再添加一个或多个根路径</span></div><form class=\"admin-form\" data-action=\"create-library\"><input name=\"name\" placeholder=\"媒体库名称\" aria-label=\"媒体库名称\" required><select name=\"kind\" aria-label=\"媒体库类型\"><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option><option value=\"MIXED\">混合</option></select><label class=\"check\"><input name=\"realtimeWatchEnabled\" type=\"checkbox\"> 实时监听</label><button class=\"button\" type=\"submit\">创建媒体库</button></form></section>" +
+    "<section class=\"section\"><div class=\"section-heading\"><h2>媒体库与扫描</h2><span>计划字段留空可清除</span></div><div class=\"admin-library-grid\">" + (libraryCards || "<div class=\"empty\"><h3>还没有媒体库</h3><p>先创建一个媒体库，再添加根路径。</p></div>") + "</div></section>";
+}
+
+function renderAdminUsers({ libraries = [], users = [], access = {} }) {
+  const userRows = users.map((user) => "<tr><td>" + escapeHtml(user.displayName || user.usernameNormalized) + "<small>" + escapeHtml(user.usernameNormalized) + "</small></td><td>" + (user.isDisabled ? "已禁用" : user.canManageServer ? "管理员" : "普通用户") + "</td><td><a class=\"button secondary\" href=\"#user-" + escapeHtml(user.id) + "\">编辑</a> " + (user.isDisabled ? "" : "<button class=\"button secondary\" data-disable-user=\"" + escapeHtml(user.id) + "\">禁用</button>") + "</td></tr>").join("");
+  const userEditors = users.map((user) => renderUserEditor(user, libraries, new Set(access[user.id] || []))).join("");
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>用户与权限</h2><span>密码为空表示不修改</span></div><form class=\"admin-form\" data-action=\"create-user\"><input name=\"username\" placeholder=\"用户名\" aria-label=\"用户名\" autocomplete=\"username\" required><input name=\"displayName\" placeholder=\"显示名称\" aria-label=\"显示名称\" autocomplete=\"name\"><input name=\"password\" type=\"password\" placeholder=\"初始密码\" aria-label=\"初始密码\" autocomplete=\"new-password\" required><label class=\"check\"><input name=\"isAdmin\" type=\"checkbox\"> 管理员</label><button class=\"button\" type=\"submit\">创建用户</button></form><div class=\"table-wrap\"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody>" + userRows + "</tbody></table></div>" + userEditors + "</section>";
+}
+
+function renderAdminJobs({ jobs = [], libraries = [], audit: events = [], logs = [] }) {
+  const jobDetail = state.admin?.jobDetail || null;
+  const auditRows = events.slice(0, 8).map((event) => "<li><strong>" + escapeHtml(event.eventType) + "</strong><span>" + escapeHtml(event.actorUsername || "system") + " · " + escapeHtml(event.targetId || "") + "</span></li>").join("");
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>任务</h2><span>失败任务可重试，运行中任务可取消</span></div><form class=\"filter-form\" data-action=\"job-filter\"><label>状态 <select name=\"status\"><option value=\"\">全部</option><option value=\"RUNNING\">运行中</option><option value=\"FAILED\">失败</option><option value=\"CANCELLED\">已取消</option><option value=\"COMPLETED\">已完成</option></select></label><button class=\"button secondary\" type=\"submit\">筛选任务</button></form>" + renderJobs(jobs, libraries) + (jobDetail ? renderJobDetail(jobDetail, state.admin?.jobEvents || [], state.admin?.jobEventsTotal || 0, state.admin?.jobEventsPage || 1) : "") + "</section>" +
     "<section class=\"section\"><div class=\"section-heading\"><h2>最近审计</h2><span>只展示最近 8 条</span></div><ul class=\"admin-list\">" + (auditRows || "<li><span>暂无管理操作</span></li>") + "</ul></section>" +
     renderAdminLogs(logs);
+}
+
+function renderAdminMetadata({ pending = [], reidentifyJobs = [] }) {
+  const jobs = state.admin?.reidentifyJobs || reidentifyJobs;
+  return "<section class=\"section\"><div class=\"section-heading\"><div><h2>待处理元数据</h2><span>候选写回前请检查差异</span></div><button class=\"button secondary\" type=\"button\" data-action=\"batch-reidentify\">批量重新识别已选条目</button></div><div class=\"candidate-list\">" + renderPendingCandidates(pending) + "</div></section>" + renderMetadataReidentifyJobs(jobs) + "<section class=\"section\"><div class=\"section-heading\"><h2>图片管理</h2><span>在媒体详情页查看并删除条目图片</span></div><p>打开任意媒体详情后，可在图片管理区域检查并删除图片索引。</p></section>";
 }
 
 function renderJobs(jobs, libraries) {
@@ -394,7 +417,18 @@ function renderUserEditor(user, libraries, granted) {
 function bind() {
   document.querySelectorAll("[data-action='toggle-drawer']").forEach((element) => element.addEventListener("click", () => { state.drawerOpen = true; render(); }));
   document.querySelectorAll("[data-action='close-drawer']").forEach((element) => element.addEventListener("click", () => { state.drawerOpen = false; render(); }));
-  document.querySelectorAll("[data-route]").forEach((element) => element.addEventListener("click", (event) => { event.preventDefault(); state.route = element.dataset.route; state.drawerOpen = false; state.error = ""; render(); }));
+  document.querySelectorAll("[data-action='toggle-admin-nav']").forEach((element) => element.addEventListener("click", () => {
+    if (isAdminRoute(state.route)) {
+      state.adminNavExpanded = !state.adminNavExpanded;
+    } else {
+      state.route = "admin";
+      state.adminNavExpanded = true;
+      state.error = "";
+      state.notice = "";
+    }
+    render();
+  }));
+  document.querySelectorAll("[data-route]").forEach((element) => element.addEventListener("click", (event) => { event.preventDefault(); state.route = element.dataset.route; state.adminNavExpanded = isAdminRoute(state.route); state.drawerOpen = false; state.error = ""; render(); }));
   document.querySelectorAll("[data-library]").forEach((element) => element.addEventListener("click", async () => {
     state.libraryId = element.dataset.library; state.libraryFilters = {}; state.libraryPage = 1; state.route = "library"; state.error = ""; state.notice = ""; render();
   }));
@@ -562,24 +596,24 @@ function bind() {
   }));
   document.querySelectorAll("form[data-action='create-user']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    try { await api.createUser({ username: field(form, "username").value, displayName: field(form, "displayName").value, password: field(form, "password").value, isAdmin: field(form, "isAdmin").checked }); state.route = "admin"; state.error = ""; state.notice = "用户已创建。"; render(); }
+    try { await api.createUser({ username: field(form, "username").value, displayName: field(form, "displayName").value, password: field(form, "password").value, isAdmin: field(form, "isAdmin").checked }); state.route = "admin-users"; state.adminNavExpanded = true; state.error = ""; state.notice = "用户已创建。"; render(); }
     catch (error) { state.error = error.message; render(); }
   }));
   document.querySelectorAll("form[data-action='update-settings']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
     try {
       state.admin.settings = await api.updateSettings({ resumePlayedPercent: Number(field(form, "resumePlayedPercent").value), resumeMinTicks: Number(field(form, "resumeMinTicks").value) });
-      state.route = "admin"; state.error = ""; state.notice = "服务端设置已保存。"; render();
+      state.route = "admin-settings"; state.adminNavExpanded = true; state.error = ""; state.notice = "服务端设置已保存。"; render();
     } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='create-library']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    try { await api.createLibrary({ name: field(form, "name").value, kind: field(form, "kind").value, realtimeWatchEnabled: field(form, "realtimeWatchEnabled").checked }); state.route = "admin"; state.error = ""; state.notice = "媒体库已创建。"; render(); }
+    try { await api.createLibrary({ name: field(form, "name").value, kind: field(form, "kind").value, realtimeWatchEnabled: field(form, "realtimeWatchEnabled").checked }); state.route = "admin-libraries"; state.adminNavExpanded = true; state.error = ""; state.notice = "媒体库已创建。"; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='add-root']").forEach((form) => form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    try { await api.addLibraryRoot(form.dataset.libraryId, field(form, "path").value); state.route = "admin"; state.error = ""; state.notice = "根路径已添加。"; render(); }
+    try { await api.addLibraryRoot(form.dataset.libraryId, field(form, "path").value); state.route = "admin-libraries"; state.adminNavExpanded = true; state.error = ""; state.notice = "根路径已添加。"; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='update-library']").forEach((form) => form.addEventListener("submit", async (event) => {
@@ -587,7 +621,7 @@ function bind() {
     const optionalNumber = (value) => value ? Number(value) : undefined;
     try {
       await api.updateLibrary(form.dataset.libraryId, { isEnabled: field(form, "isEnabled").checked, realtimeWatchEnabled: field(form, "realtimeWatchEnabled").checked, incrementalSchedule: field(form, "incrementalSchedule").value || null, reconciliationSchedule: field(form, "reconciliationSchedule").value || null, metadataSchedule: field(form, "metadataSchedule").value || null, scanConcurrency: optionalNumber(field(form, "scanConcurrency").value), probeConcurrency: optionalNumber(field(form, "probeConcurrency").value) });
-      state.route = "admin"; state.error = ""; state.notice = "媒体库计划已保存。"; render();
+      state.route = "admin-libraries"; state.adminNavExpanded = true; state.error = ""; state.notice = "媒体库计划已保存。"; render();
     } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='update-user']").forEach((form) => form.addEventListener("submit", async (event) => {
@@ -599,7 +633,7 @@ function bind() {
       const selectedLibraries = new Set(Array.from(form.querySelectorAll("input[name='libraryAccess']:checked"), (input) => input.value));
       const libraries = state.admin?.libraries || [];
       await Promise.all(libraries.map((library) => api.setLibraryAccess(form.dataset.userId, library.id, selectedLibraries.has(library.id))));
-      state.route = "admin"; state.error = ""; state.notice = "用户权限已保存。"; render();
+      state.route = "admin-users"; state.adminNavExpanded = true; state.error = ""; state.notice = "用户权限已保存。"; render();
     } catch (error) { state.error = error.message; state.notice = ""; render(); }
   }));
   document.querySelectorAll("form[data-action='search']").forEach((form) => form.addEventListener("submit", (event) => {

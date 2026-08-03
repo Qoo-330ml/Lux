@@ -180,6 +180,12 @@ td small { display: block; margin-top: .25rem; }
 .nav button:hover .nav-glyph, .nav button[aria-current="page"] .nav-glyph { color: var(--accent); }
 .nav-group { display: grid; gap: .25rem; margin-top: .85rem; padding-top: .85rem; border-top: 1px solid var(--line); }
 .nav-group-label { padding: 0 .85rem .25rem; color: var(--muted); font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; }
+.nav-admin-group { display: grid; gap: .25rem; }
+.nav-admin-toggle { justify-content: flex-start; }
+.nav-admin-toggle .nav-chevron { margin-left: auto; color: var(--muted); font-size: .9rem; }
+.nav-submenu { display: grid; gap: .2rem; margin: .1rem 0 .2rem .65rem; padding: .2rem 0 .2rem 1.15rem; border-left: 1px solid var(--line); }
+.nav-subitem { padding: .6rem .75rem !important; font-size: .86rem; }
+.nav-subitem[aria-current="page"] { color: var(--ink); background: var(--surface-strong); }
 .nav-library { display: flex; align-items: center; gap: .75rem; width: 100%; padding: .6rem .85rem; border: 0; border-radius: .65rem; color: var(--muted); text-align: left; background: transparent; }
 .nav-library:hover, .nav-library[aria-current="page"] { color: var(--ink); background: var(--surface-strong); }
 .sidebar-footer { display: grid; gap: .5rem; margin-top: auto; padding: 1rem .45rem .25rem; }
