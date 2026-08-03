@@ -123,7 +123,6 @@ function nav() {
   const libraryCurrent = state.route === "libraries" ? "page" : "false";
   const favoritesCurrent = state.route === "favorites" ? "page" : "false";
   const adminExpanded = state.adminNavExpanded && isAdminRoute(state.route);
-  const adminCurrent = isAdminRoute(state.route) ? "page" : "false";
   const admin = state.user.canManageServer ? renderAdminNavigation({ expanded: adminExpanded, route: state.route }) : "";
   const libraries = state.home?.libraries || state.libraries;
   const libraryLinks = libraries.length ? "<div class=\"nav-group\"><span class=\"nav-group-label\">媒体库</span>" + libraries.map((library) => "<button class=\"nav-library\" data-library=\"" + escapeHtml(library.id) + "\" aria-current=\"" + (state.route === "library" && state.libraryId === library.id ? "page" : "false") + "\"><span class=\"nav-glyph\">" + (library.kind === "SERIES" ? "▤" : "▣") + "</span><span>" + escapeHtml(library.name) + "</span></button>").join("") + "</div>" : "";
