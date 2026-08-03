@@ -680,6 +680,36 @@ impl Database {
             return Ok(false);
         }
 
+        if let Some(value) = settings.name {
+            sqlx::query(
+                "UPDATE libraries
+                 SET name = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        if let Some(value) = settings.kind {
+            sqlx::query(
+                "UPDATE libraries
+                 SET kind = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         if let Some(value) = settings.is_enabled {
             sqlx::query(
                 "UPDATE libraries
@@ -4842,6 +4872,8 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
 }
 
 pub(crate) struct LibrarySettingsUpdate<'a> {
+    pub(crate) name: Option<&'a str>,
+    pub(crate) kind: Option<&'a str>,
     pub(crate) is_enabled: Option<bool>,
     pub(crate) realtime_watch_enabled: Option<bool>,
     pub(crate) incremental_schedule: Option<Option<&'a str>>,

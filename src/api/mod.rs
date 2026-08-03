@@ -4219,6 +4219,8 @@ struct AddLibraryRootRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateLibraryRequest {
+    name: Option<String>,
+    kind: Option<String>,
     is_enabled: Option<bool>,
     realtime_watch_enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
@@ -6153,7 +6155,24 @@ async fn admin_update_library(
         )
         .into_response();
     };
+    let kind = match request.kind.as_deref() {
+        Some(value) => match value.parse::<LibraryKind>() {
+            Ok(kind) => Some(kind),
+            Err(_error) => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "媒体库类型无效",
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
     let settings = LibrarySettingsPatch {
+        name: request.name,
+        kind,
         is_enabled: request.is_enabled,
         realtime_watch_enabled: request.realtime_watch_enabled,
         incremental_schedule: request.incremental_schedule,

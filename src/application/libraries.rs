@@ -93,6 +93,8 @@ impl LibraryService {
             .update_library_settings(
                 &library_id.to_string(),
                 LibrarySettingsUpdate {
+                    name: name.as_deref(),
+                    kind,
                     is_enabled: settings.is_enabled,
                     realtime_watch_enabled: settings.realtime_watch_enabled,
                     incremental_schedule: incremental_schedule
@@ -238,6 +240,8 @@ pub struct AddRootResult {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LibrarySettingsPatch {
+    pub name: Option<String>,
+    pub kind: Option<LibraryKind>,
     pub is_enabled: Option<bool>,
     pub realtime_watch_enabled: Option<bool>,
     pub incremental_schedule: Option<Option<String>>,
@@ -419,4 +423,12 @@ fn stored_library_root(
         unavailable_since: stored.unavailable_since,
         scan_cursor: stored.scan_cursor,
     })
+}
+
+fn normalize_library_name(value: &str) -> Result<String, LibraryServiceError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 128 {
+        return Err(LibraryServiceError::InvalidName);
+    }
+    Ok(value.to_owned())
 }

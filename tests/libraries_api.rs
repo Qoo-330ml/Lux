@@ -138,6 +138,18 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
     assert_eq!(root_body["warnings"], json!([]));
     let root_id = root_body["root"]["id"].as_str().ok_or("missing root ID")?;
 
+    let edited = client
+        .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "Shows", "kind": "SERIES" }))
+        .send()
+        .await?;
+    assert_eq!(edited.status(), reqwest::StatusCode::OK);
+    let edited_library = edited.json::<Value>().await?["library"].clone();
+    assert_eq!(edited_library["name"], "Shows");
+    assert_eq!(edited_library["kind"], "SERIES");
+
     let deleted_root = client
         .delete(format!(
             "{base_url}/api/v1/admin/libraries/{library_id}/roots/{root_id}"
