@@ -13,6 +13,8 @@ import { LibrariesPage } from "../features/library/LibrariesPage";
 import { SearchPage } from "../features/search/SearchPage";
 import { MediaDetailPage } from "../features/detail/MediaDetailPage";
 import { PlayerPage } from "../features/player/PlayerPage";
+import { AdminDashboardPage } from "../features/admin/AdminDashboardPage";
+import { AdminLayout } from "../features/admin/AdminLayout";
 
 export function App() {
   const setup = useQuery({
@@ -62,6 +64,9 @@ function AuthenticatedRoutes({ user }: { user: LuxUser }) {
         <Route path="watch/:itemId" element={<PlayerPage />} />
         <Route path="search" element={<SearchPage />} />
         <Route path="account" element={<AccountPage user={user} />} />
+        <Route path="admin" element={user.canManageServer ? <AdminLayout /> : <Navigate to="/" replace />}>
+          <Route index element={<AdminDashboardPage />} />
+        </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

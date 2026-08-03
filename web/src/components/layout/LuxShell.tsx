@@ -49,6 +49,7 @@ export function LuxShell({ user }: LuxShellProps) {
             <NavLink className={navClass} to="/search">
               搜索
             </NavLink>
+            {user.canManageServer ? <NavLink className={navClass} to="/admin">管理</NavLink> : null}
           </nav>
         </div>
 
@@ -116,9 +117,7 @@ export function LuxShell({ user }: LuxShellProps) {
               搜索
             </NavLink>
             {user.canManageServer ? (
-              <span className="lux-mobile-admin">
-                <Settings2 size={15} /> 管理员权限已启用
-              </span>
+              <NavLink className={navClass} to="/admin" onClick={() => setMobileOpen(false)}><Settings2 size={15} /> 管理控制台</NavLink>
             ) : null}
           </motion.nav>
         ) : null}
