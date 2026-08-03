@@ -1,6 +1,6 @@
 # Lux
 
-Lux 是面向 NAS 的个人媒体服务端，核心服务使用 Rust，Web 客户端当前使用同源浏览器原生 ES module，后续再按规格演进构建链。
+Lux 是面向 NAS 的个人媒体服务端，核心服务使用 Rust，Web 客户端使用同源 Vite + React + TypeScript 静态资源。
 当前仓库处于工程骨架阶段，产品与实现边界以 [`docs/LUX-DEVELOPMENT.md`](docs/LUX-DEVELOPMENT.md) 为准。
 
 ## 开发环境

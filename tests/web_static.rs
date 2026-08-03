@@ -13,8 +13,18 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     let index = client.get(format!("{base_url}/")).send().await?;
     assert_eq!(index.status(), StatusCode::OK);
     let index_body = index.text().await?;
-    assert!(index_body.contains("id=\"app\""));
-    assert!(index_body.contains("href=\"/logo.svg\""));
+    let vite_assets = index_body.contains("id=\"root\"");
+    assert!(vite_assets || index_body.contains("id=\"app\""));
+    let client_route = client
+        .get(format!("{base_url}/libraries/example"))
+        .send()
+        .await?;
+    assert_eq!(client_route.status(), StatusCode::OK);
+    assert!(client_route.text().await?.contains(if vite_assets {
+        "id=\"root\""
+    } else {
+        "id=\"app\""
+    }));
     let logo = client.get(format!("{base_url}/logo.svg")).send().await?;
     assert_eq!(logo.status(), StatusCode::OK);
     assert_eq!(
@@ -24,29 +34,43 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
         Some("image/svg+xml")
     );
     assert!(logo.text().await?.contains("<svg"));
-    let script = client.get(format!("{base_url}/app.mjs")).send().await?;
-    assert_eq!(script.status(), StatusCode::OK);
-    let script_body = script.text().await?;
-    assert!(script_body.contains("/api/v1/auth/login"));
-    assert!(script_body.contains("request-options.mjs"));
-    let admin_navigation = client
-        .get(format!("{base_url}/admin-navigation.mjs"))
-        .send()
-        .await?;
-    assert_eq!(admin_navigation.status(), StatusCode::OK);
-    assert!(admin_navigation.text().await?.contains("ADMIN_NAV_ITEMS"));
-    assert!(script_body.contains("/logo.svg"));
-    let request_options = client
-        .get(format!("{base_url}/request-options.mjs"))
-        .send()
-        .await?;
-    assert_eq!(request_options.status(), StatusCode::OK);
-    assert!(request_options.text().await?.contains("Content-Type"));
-    let styles = client.get(format!("{base_url}/styles.css")).send().await?;
-    assert_eq!(styles.status(), StatusCode::OK);
-    let styles_body = styles.text().await?;
-    assert!(styles_body.contains("--accent"));
-    assert!(styles_body.contains(".brand-logo"));
+    if vite_assets {
+        let script = client
+            .get(format!("{base_url}/assets/lux.js"))
+            .send()
+            .await?;
+        assert_eq!(script.status(), StatusCode::OK);
+        assert!(script.text().await?.contains("/api/v1/auth/login"));
+        let styles = client
+            .get(format!("{base_url}/assets/index.css"))
+            .send()
+            .await?;
+        assert_eq!(styles.status(), StatusCode::OK);
+        assert!(styles.text().await?.contains("--lux-bg"));
+    } else {
+        let script = client.get(format!("{base_url}/app.mjs")).send().await?;
+        assert_eq!(script.status(), StatusCode::OK);
+        let script_body = script.text().await?;
+        assert!(script_body.contains("/api/v1/auth/login"));
+        assert!(script_body.contains("request-options.mjs"));
+        let admin_navigation = client
+            .get(format!("{base_url}/admin-navigation.mjs"))
+            .send()
+            .await?;
+        assert_eq!(admin_navigation.status(), StatusCode::OK);
+        assert!(admin_navigation.text().await?.contains("ADMIN_NAV_ITEMS"));
+        let request_options = client
+            .get(format!("{base_url}/request-options.mjs"))
+            .send()
+            .await?;
+        assert_eq!(request_options.status(), StatusCode::OK);
+        assert!(request_options.text().await?.contains("Content-Type"));
+        let styles = client.get(format!("{base_url}/styles.css")).send().await?;
+        assert_eq!(styles.status(), StatusCode::OK);
+        let styles_body = styles.text().await?;
+        assert!(styles_body.contains("--accent"));
+        assert!(styles_body.contains(".brand-logo"));
+    }
 
     server.abort();
     let _ = app_with_state(AppState::default());

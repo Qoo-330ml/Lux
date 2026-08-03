@@ -1,3 +1,13 @@
+FROM node:22-bookworm-slim AS web-builder
+
+WORKDIR /src/web
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN corepack enable \
+    && corepack prepare pnpm@11.9.0 --activate \
+    && pnpm install --frozen-lockfile
+COPY web ./
+RUN pnpm build
+
 FROM rust:1.85-bookworm AS builder
 
 WORKDIR /src
@@ -9,6 +19,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src ./src
 COPY migrations ./migrations
 COPY web ./web
+COPY --from=web-builder /src/web/dist ./web/dist
 
 RUN cargo build --release --locked
 
@@ -29,9 +40,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
+COPY --from=web-builder /src/web/dist /usr/local/share/lux/web
 
 ENV LUX_HTTP_ADDR=0.0.0.0:8097 \
     LUX_CONFIG_DIR=/data/config \
+    LUX_WEB_DIR=/usr/local/share/lux/web \
     RUST_LOG=luxd=info,tower_http=info \
     TZ=UTC
 

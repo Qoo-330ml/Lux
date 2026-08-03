@@ -20,7 +20,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
-use tower_http::{ServiceBuilderExt, request_id::MakeRequestUuid, trace::TraceLayer};
+use tower_http::{
+    ServiceBuilderExt,
+    request_id::MakeRequestUuid,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 
 use crate::{
     COMMIT, VERSION,
@@ -156,12 +161,8 @@ pub fn app() -> Router {
 }
 
 pub fn app_with_state(state: AppState) -> Router {
+    let web_root = web_root();
     Router::new()
-        .route("/", get(web_index))
-        .route("/app.mjs", get(web_app))
-        .route("/request-options.mjs", get(web_request_options))
-        .route("/admin-navigation.mjs", get(web_admin_navigation))
-        .route("/styles.css", get(web_styles))
         .route("/logo.svg", get(web_logo))
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
@@ -306,6 +307,11 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .merge(emby_routes())
         .nest("/emby", emby_routes())
+        .fallback_service(
+            ServeDir::new(web_root.clone())
+                .append_index_html_on_directories(true)
+                .fallback(ServeFile::new(web_root.join("index.html"))),
+        )
         .with_state(state)
         .layer(middleware::from_fn(attach_peer_address))
         .layer(middleware::from_fn(normalize_empty_api_service_unavailable))
@@ -401,39 +407,17 @@ fn safe_trace_path(uri: &axum::http::Uri) -> &str {
     uri.path()
 }
 
-async fn web_index() -> Response {
-    static_response(
-        "text/html; charset=utf-8",
-        include_str!("../../web/src/index.html"),
-    )
-}
+fn web_root() -> PathBuf {
+    if let Some(directory) = std::env::var_os("LUX_WEB_DIR") {
+        return PathBuf::from(directory);
+    }
 
-async fn web_app() -> Response {
-    static_response(
-        "text/javascript; charset=utf-8",
-        include_str!("../../web/src/app.mjs"),
-    )
-}
-
-async fn web_request_options() -> Response {
-    static_response(
-        "text/javascript; charset=utf-8",
-        include_str!("../../web/src/request-options.mjs"),
-    )
-}
-
-async fn web_admin_navigation() -> Response {
-    static_response(
-        "text/javascript; charset=utf-8",
-        include_str!("../../web/src/admin-navigation.mjs"),
-    )
-}
-
-async fn web_styles() -> Response {
-    static_response(
-        "text/css; charset=utf-8",
-        include_str!("../../web/src/styles.css"),
-    )
+    let dist = FsPath::new("web/dist");
+    if dist.join("index.html").is_file() {
+        dist.to_path_buf()
+    } else {
+        FsPath::new("web/src").to_path_buf()
+    }
 }
 
 async fn web_logo() -> Response {
