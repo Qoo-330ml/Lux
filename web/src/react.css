@@ -260,6 +260,34 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-schedule-field { margin-top: 13px; }
 .lux-admin-schedule-field > div { display: flex; gap: 7px; }
 .lux-admin-schedule-field input { flex: 1; }
+.lux-admin-user-create-form { display: grid; grid-template-columns: repeat(3, minmax(140px, 1fr)) auto auto; align-items: end; gap: 13px; }
+.lux-admin-user-list { display: grid; gap: 8px; }
+.lux-admin-user-row { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; align-items: center; gap: 16px; padding: 14px; border: 1px solid var(--lux-line-soft); border-radius: 11px; background: rgba(255,255,255,.025); }
+.lux-admin-user-row.is-disabled { opacity: .64; }
+.lux-admin-user-summary { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.lux-admin-user-summary strong, .lux-admin-user-summary small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-user-summary strong { color: #fff; font-size: .86rem; }
+.lux-admin-user-summary small { margin-top: 4px; color: var(--lux-subtle); font-size: .72rem; }
+.lux-admin-user-avatar { display: grid; place-items: center; flex: 0 0 auto; width: 38px; height: 38px; border-radius: 11px; color: #fff; background: linear-gradient(145deg, #515158, #242429); }
+.lux-admin-user-badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.lux-user-badge { padding: 5px 8px; border: 1px solid var(--lux-line-soft); border-radius: 999px; color: var(--lux-subtle); font-size: .67rem; white-space: nowrap; }
+.lux-user-badge.is-ok { border-color: rgba(96,194,132,.25); color: #9bdcb3; background: rgba(96,194,132,.09); }
+.lux-user-badge.is-warn { border-color: rgba(226,163,75,.25); color: #f3c788; background: rgba(226,163,75,.09); }
+.lux-admin-user-actions { display: flex; align-items: center; gap: 7px; }
+.lux-admin-user-detail { grid-column: 1 / -1; display: grid; gap: 17px; padding: 17px 0 2px; border-top: 1px solid var(--lux-line-soft); }
+.lux-admin-permission-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.lux-admin-permission-toggle { display: flex; align-items: center; gap: 8px; min-height: 39px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); font-size: .75rem; cursor: pointer; }
+.lux-admin-permission-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+.lux-admin-permission-toggle > span { display: grid; place-items: center; width: 17px; height: 17px; border: 1px solid var(--lux-line); border-radius: 5px; color: #111; background: transparent; }
+.lux-admin-permission-toggle:has(input:checked) { border-color: rgba(210,71,191,.38); color: #fff; background: rgba(210,71,191,.08); }
+.lux-admin-permission-toggle:has(input:checked) > span { border-color: var(--lux-accent); background: var(--lux-accent); }
+.lux-admin-access-block { padding: 15px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: rgba(0,0,0,.12); }
+.lux-admin-library-access { display: flex; flex-wrap: wrap; gap: 9px; }
+.lux-admin-library-access label { display: flex; align-items: center; gap: 7px; color: var(--lux-muted); font-size: .75rem; }
+.lux-admin-library-access input { accent-color: var(--lux-accent); }
+.lux-admin-password-row { display: flex; align-items: flex-end; gap: 10px; max-width: 620px; }
+.lux-admin-password-row label { display: grid; flex: 1; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
+.lux-admin-password-row input { min-height: 42px; padding: 0 12px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
 
 @media (max-width: 900px) {
   .lux-header { padding: 18px 20px; }
@@ -324,10 +352,15 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-stat strong { font-size: .9rem; }
   .lux-admin-panel { padding: 17px; }
   .lux-admin-create-form, .lux-admin-library-body { grid-template-columns: 1fr; }
+  .lux-admin-user-create-form { grid-template-columns: 1fr; }
   .lux-admin-library-heading { flex-direction: column; }
   .lux-admin-card-actions { width: 100%; }
   .lux-admin-card-actions .lux-button { flex: 1; }
   .lux-admin-root-form { flex-direction: column; }
+  .lux-admin-user-row { grid-template-columns: 1fr; gap: 11px; }
+  .lux-admin-user-actions { justify-content: flex-end; }
+  .lux-admin-permission-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lux-admin-password-row { align-items: stretch; flex-direction: column; }
 }
 
 @media (prefers-reduced-motion: reduce) {
