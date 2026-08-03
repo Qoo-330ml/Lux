@@ -124,6 +124,37 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
 }
 
 #[tokio::test]
+async fn scanner_recurses_through_nested_movie_directories()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Animation").join("Example Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2024.mkv"), b"fixture").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let report = LibraryScanner::new(database)
+        .scan_movie_library(library.id)
+        .await?;
+    assert_eq!(report.discovered_files, 1);
+    assert_eq!(report.created_items, 1);
+    assert_eq!(report.created_sources, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn scanner_aggregates_quality_sources_but_keeps_cuts_separate()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

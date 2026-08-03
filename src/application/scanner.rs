@@ -1646,58 +1646,32 @@ fn parse_season_directory_name(value: &str) -> Option<u32> {
 }
 
 pub(crate) async fn collect_movie_files(root: &Path) -> Result<Vec<PathBuf>, ScannerError> {
+    let mut directories = vec![root.to_owned()];
     let mut files = Vec::new();
-    let mut entries = fs::read_dir(root)
-        .await
-        .map_err(|source| ScannerError::Io {
-            path: root.to_owned(),
-            source,
-        })?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|source| ScannerError::Io {
-            path: root.to_owned(),
-            source,
-        })?
-    {
-        let entry_path = entry.path();
-        let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
-            path: entry_path.clone(),
-            source,
-        })?;
-        if file_type.is_file() && is_supported_movie_file(&entry_path) {
-            files.push(entry_path);
-        } else if file_type.is_dir() {
-            let mut children =
-                fs::read_dir(&entry_path)
-                    .await
-                    .map_err(|source| ScannerError::Io {
-                        path: entry_path.clone(),
-                        source,
-                    })?;
-            while let Some(child) =
-                children
-                    .next_entry()
-                    .await
-                    .map_err(|source| ScannerError::Io {
-                        path: entry_path.clone(),
-                        source,
-                    })?
-            {
-                let child_path = child.path();
-                if child
-                    .file_type()
-                    .await
-                    .map_err(|source| ScannerError::Io {
-                        path: child_path.clone(),
-                        source,
-                    })?
-                    .is_file()
-                    && is_supported_movie_file(&child_path)
-                {
-                    files.push(child_path);
-                }
+    while let Some(directory) = directories.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: directory.clone(),
+                source,
+            })?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: directory.clone(),
+                source,
+            })?
+        {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_file() && is_supported_movie_file(&path) {
+                files.push(path);
+            } else if file_type.is_dir() {
+                directories.push(path);
             }
         }
     }
