@@ -13,6 +13,7 @@
 - [x] 本机 ARM64 强制终止恢复：`scripts/restart-recovery-smoke.sh` 在首批游标提交后发送 `SIGKILL`，复用同一 SQLite 数据目录重启后 5,000/5,000 条扫描任务完成；最新源码 revision `70474bc` 于 2026-08-03 重跑通过。
 - [x] SQLite 写能力诊断：`Database::probe_write` 提交专用保留标记以验证持久写入，配置目录探针写入并同步固定字节；`/health/ready` 报告 `database_write_unavailable`，管理员健康接口报告 `database.status=degraded`、`database.writable=false`；查询只读连接、目录只读和正常路径均有测试。
 - [x] 本机 ARM64 受控媒体挂载不可访问恢复：`scripts/mount-loss-smoke.sh` 通过临时媒体目录权限撤销模拟挂载不可读，验证扫描将 root 标记为不可用、保留既有条目，并在权限恢复后重新探测并恢复；源码 revision `83b5977` 于 2026-08-03 通过。
+- [x] 本机 ARM64 HTTPS 反代补充烟测：`scripts/proxy-smoke.sh` 验证可信代理下远程访问限制和 Range/ETag 透传；自签名证书与 Docker 网络不作为真实 Tailscale/HTTPS 发布门替代。
 
 ## 尚未完成的故障注入
 

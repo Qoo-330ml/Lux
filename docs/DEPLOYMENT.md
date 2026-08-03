@@ -108,3 +108,11 @@ LUX_IMAGE=lux:arm64-local ./scripts/mount-loss-smoke.sh
 ```
 
 该脚本通过临时目录权限撤销模拟不可访问状态，证明扫描会隔离不可用 root、保留已有条目并在恢复后重新发现 root；它不替代真实 NAS 卸载、网络中断或持久卷恢复演练。
+
+本机还可以用临时自签名证书和 Nginx 反代演练 HTTPS、trusted proxy 和 Range 响应头：
+
+```bash
+LUX_IMAGE=lux:arm64-local ./scripts/proxy-smoke.sh
+```
+
+该脚本验证可信代理转发公网地址时的远程访问控制，以及 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges` 和 `ETag` 的保留；自签名证书和本机 Docker 网络不替代真实 Tailscale/HTTPS 实机验证。
