@@ -61,6 +61,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-hero-meta span + span::before { margin-right: 10px; color: rgba(255,255,255,.35); content: "·"; }
 .lux-hero-copy p { max-width: 690px; margin: 0; color: rgba(255,255,255,.68); font-size: 1.02rem; line-height: 1.65; }
 .lux-hero-actions { display: flex; flex-wrap: wrap; gap: 13px; margin-top: 25px; }
+.lux-hero-carousel-controls { display: flex; align-items: center; gap: 13px; margin-top: 25px; }
+.lux-hero-carousel-arrow { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--lux-line); border-radius: 50%; color: #fff; background: rgba(0,0,0,.28); backdrop-filter: blur(12px); transition: background .2s ease, border-color .2s ease, transform .2s var(--lux-ease); }
+.lux-hero-carousel-arrow:hover { border-color: rgba(255,255,255,.42); background: rgba(255,255,255,.12); transform: translateY(-1px); }
+.lux-hero-dots { display: flex; align-items: center; gap: 7px; }
+.lux-hero-dot { width: 7px; height: 7px; padding: 0; border: 0; border-radius: 50%; background: rgba(255,255,255,.38); transition: width .22s var(--lux-ease), background .2s ease; }
+.lux-hero-dot:hover { background: rgba(255,255,255,.78); }
+.lux-hero-dot.is-active { width: 23px; border-radius: 999px; background: #fff; }
 .lux-button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 48px; padding: 0 22px; border: 1px solid transparent; border-radius: 999px; color: #111; font-size: .9rem; font-weight: 650; transition: transform .2s var(--lux-ease), border-color .2s ease, background .2s ease, box-shadow .2s ease; }
 .lux-button:hover { transform: translateY(-2px); }
 .lux-button-primary { background: #f2f2f3; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
@@ -370,6 +377,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-hero-copy { width: calc(100% - 32px); margin: 0 16px 58px; }
   .lux-hero h1 { font-size: clamp(2.8rem, 14vw, 4.4rem); }
   .lux-hero-copy p { font-size: .91rem; }
+  .lux-hero-carousel-controls { margin-top: 20px; }
   .lux-home-content { width: calc(100% - 32px); padding-bottom: 52px; }
   .lux-section { margin-top: 38px; }
   .lux-page { width: calc(100% - 32px); padding-top: 112px; }
