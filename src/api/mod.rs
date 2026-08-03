@@ -161,6 +161,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/app.mjs", get(web_app))
         .route("/request-options.mjs", get(web_request_options))
         .route("/styles.css", get(web_styles))
+        .route("/logo.svg", get(web_logo))
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/api/v1/version", get(version))
@@ -425,6 +426,10 @@ async fn web_styles() -> Response {
         "text/css; charset=utf-8",
         include_str!("../../web/src/styles.css"),
     )
+}
+
+async fn web_logo() -> Response {
+    static_response("image/svg+xml", include_str!("../../logo.svg"))
 }
 
 fn static_response(content_type: &'static str, body: &'static str) -> Response {

@@ -406,7 +406,11 @@ pub fn normalize_search_query(value: &str) -> Option<String> {
     if tokens.is_empty() {
         return None;
     }
-    Some(tokens.join(" OR "))
+    // A multi-word search should narrow results to items containing every
+    // token. The LIKE fallback already treats the full input as a phrase;
+    // keeping FTS on the same AND semantics prevents broad matches such as
+    // "Reference Movie 40" from returning every title containing "Movie".
+    Some(tokens.join(" AND "))
 }
 
 pub fn normalize_search_like_query(value: &str) -> Option<String> {

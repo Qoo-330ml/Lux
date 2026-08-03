@@ -32,6 +32,7 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     tokio::fs::create_dir_all(&root).await?;
     tokio::fs::write(root.join("银河护卫队.2024.mkv"), b"one").await?;
     tokio::fs::write(root.join("Hidden.Movie.2025.mkv"), b"two").await?;
+    tokio::fs::write(root.join("Movie.2026.mkv"), b"three").await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
         .await?;
@@ -40,6 +41,10 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
         .await?;
     let chinese_id: String =
         sqlx::query_scalar("SELECT id FROM media_items WHERE title = '银河护卫队'")
+            .fetch_one(database.pool())
+            .await?;
+    let hidden_movie_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Hidden Movie'")
             .fetch_one(database.pool())
             .await?;
     sqlx::query(
@@ -111,6 +116,16 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     let lux_body = lux.json::<Value>().await?;
     assert_eq!(lux_body["total"], 1);
     assert_eq!(lux_body["items"][0]["id"], chinese_id);
+
+    let multi_word = client
+        .get(format!("{base_url}/api/v1/search?q=Hidden%20Movie"))
+        .header("Cookie", format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(multi_word.status(), reqwest::StatusCode::OK);
+    let multi_word_body = multi_word.json::<Value>().await?;
+    assert_eq!(multi_word_body["total"], 1);
+    assert_eq!(multi_word_body["items"][0]["id"], hidden_movie_id);
 
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))

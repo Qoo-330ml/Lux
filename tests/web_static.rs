@@ -12,12 +12,24 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
 
     let index = client.get(format!("{base_url}/")).send().await?;
     assert_eq!(index.status(), StatusCode::OK);
-    assert!(index.text().await?.contains("id=\"app\""));
+    let index_body = index.text().await?;
+    assert!(index_body.contains("id=\"app\""));
+    assert!(index_body.contains("href=\"/logo.svg\""));
+    let logo = client.get(format!("{base_url}/logo.svg")).send().await?;
+    assert_eq!(logo.status(), StatusCode::OK);
+    assert_eq!(
+        logo.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/svg+xml")
+    );
+    assert!(logo.text().await?.contains("<svg"));
     let script = client.get(format!("{base_url}/app.mjs")).send().await?;
     assert_eq!(script.status(), StatusCode::OK);
     let script_body = script.text().await?;
     assert!(script_body.contains("/api/v1/auth/login"));
     assert!(script_body.contains("request-options.mjs"));
+    assert!(script_body.contains("/logo.svg"));
     let request_options = client
         .get(format!("{base_url}/request-options.mjs"))
         .send()
@@ -26,7 +38,9 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     assert!(request_options.text().await?.contains("Content-Type"));
     let styles = client.get(format!("{base_url}/styles.css")).send().await?;
     assert_eq!(styles.status(), StatusCode::OK);
-    assert!(styles.text().await?.contains("--accent"));
+    let styles_body = styles.text().await?;
+    assert!(styles_body.contains("--accent"));
+    assert!(styles_body.contains(".brand-logo"));
 
     server.abort();
     let _ = app_with_state(AppState::default());
