@@ -81,9 +81,6 @@ export function LuxShell({ user }: LuxShellProps) {
                 .slice(0, 1)
                 .toUpperCase()}
             </span>
-            <span className="lux-user-label">
-              {user.displayName || user.usernameNormalized}
-            </span>
           </button>
           <button
             className="lux-icon-button lux-menu-button"
