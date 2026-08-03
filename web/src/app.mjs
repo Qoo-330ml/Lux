@@ -92,7 +92,7 @@ function titleForRoute() {
   if (state.route === "item") return state.item?.title || "详情";
   if (state.route === "admin") return "管理控制台";
   if (state.route === "account") return "账户与会话";
-  return "你的片单";
+  return "首页";
 }
 
 function render() {
@@ -187,14 +187,16 @@ async function loadRoute() {
 function renderHome() {
   const continueWatching = state.home?.continueWatching || [];
   const libraries = state.home?.libraries || state.libraries;
+  const recentlyAdded = state.home?.recentlyAdded || [];
   const featured = continueWatching[0];
   const backdrop = featured && imageUrl(featured) ? `<img class="home-hero-backdrop" src="${imageUrl(featured)}" alt="">` : "<div class=\"home-hero-backdrop\"></div>";
   const hero = featured
     ? `<article class="home-hero">${backdrop}<div class="home-hero-content"><span class="eyebrow">继续观看</span><h2>${escapeHtml(featured.title || featured.name)}</h2><p>${escapeHtml(featured.overview || "从上次停下的位置继续播放。")}</p><div class="hero-actions"><button class="button" type="button" data-item="${escapeHtml(featured.id)}">继续播放</button><span class="hero-meta">${escapeHtml([featured.productionYear || "", featured.itemType || ""].filter(Boolean).join(" · "))}</span></div></div></article>`
     : "<article class=\"home-hero home-hero-empty\"><div class=\"home-hero-content\"><span class=\"eyebrow\">Lux</span><h2>你的私人媒体空间</h2><p>从媒体库开始，继续观看和管理属于你的内容。</p><div class=\"hero-actions\"><button class=\"button\" type=\"button\" data-route=\"libraries\">浏览媒体库</button></div></div></article>";
   const progress = continueWatching.length ? "<section class=\"section home-section\"><div class=\"section-heading\"><h2>继续观看</h2><span>" + continueWatching.length + " 个进行中</span></div>" + renderRail(continueWatching) + "</section>" : "";
+  const recent = recentlyAdded.length ? "<section class=\"section home-section\"><div class=\"section-heading\"><h2>最近添加</h2><span>" + recentlyAdded.length + " 项</span></div>" + renderRail(recentlyAdded) + "</section>" : "";
   const cards = libraries.length ? libraries.map(libraryCard).join("") : "<div class=\"empty\"><h3>还没有可见媒体库</h3><p>请联系管理员授予媒体库访问权限。</p></div>";
-  return hero + progress + "<section class=\"section home-section\"><div class=\"section-heading\"><h2>媒体库</h2><span>只显示你有权限访问的库</span></div><div class=\"library-rail\">" + cards + "</div></section>";
+  return hero + progress + recent + "<section class=\"section home-section\"><div class=\"section-heading\"><h2>媒体库</h2><span>只显示你有权限访问的库</span></div><div class=\"library-rail\">" + cards + "</div></section>";
 }
 
 function libraryCard(library) {

@@ -2861,6 +2861,10 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Ok(page) => page,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let recently_added = match catalog.list_recently_added(principal, 0, 12).await {
+        Ok(page) => page,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let views = match libraries.list_libraries().await {
         Ok(views) => views,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2896,9 +2900,21 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Ok(items) => items,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let recently_added_items = match lux_catalog_items_json_for_user(
+        database,
+        &user.id.to_string(),
+        &recently_added.items,
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     Json(json!({
         "continueWatching": continue_watching_items,
         "continueWatchingTotal": continue_watching.total,
+        "recentlyAdded": recently_added_items,
+        "recentlyAddedTotal": recently_added.total,
         "libraries": visible,
     }))
     .into_response()

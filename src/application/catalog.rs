@@ -196,6 +196,31 @@ impl CatalogService {
         })
     }
 
+    pub async fn list_recently_added(
+        &self,
+        principal: AccessPrincipal,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let (item_ids, total) = self
+            .database
+            .list_recent_catalog_item_ids(&library_ids, offset, limit)
+            .await?;
+        let mut items = Vec::with_capacity(item_ids.len());
+        for item_id in item_ids {
+            if let Some(item) = self.find_item(principal, &item_id).await? {
+                items.push(item);
+            }
+        }
+        Ok(CatalogPage {
+            items,
+            total,
+            offset,
+            limit,
+        })
+    }
+
     pub async fn find_item(
         &self,
         principal: AccessPrincipal,

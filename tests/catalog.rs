@@ -158,6 +158,16 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(lux_page_body["pageSize"], 1);
     assert_eq!(lux_page_body["items"][0]["title"], "Alpha Movie");
 
+    let home = client
+        .get(format!("{base_url}/api/v1/home"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(home.status(), reqwest::StatusCode::OK);
+    let home_body: Value = home.json().await?;
+    assert_eq!(home_body["recentlyAddedTotal"], 2);
+    assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
+
     let lux_detail = client
         .get(format!("{base_url}/api/v1/items/{item_id}"))
         .header(COOKIE, &cookies)
