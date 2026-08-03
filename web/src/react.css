@@ -225,6 +225,41 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-page-state { display: grid; place-items: center; align-content: center; min-height: 65vh; color: var(--lux-muted); text-align: center; }
 .lux-admin-page-state h1 { margin: 12px 0 8px; color: #fff; }
 .lux-admin-page-state p { max-width: 48ch; line-height: 1.6; }
+.lux-admin-create-panel { margin-bottom: 18px; }
+.lux-admin-create-form { display: grid; grid-template-columns: minmax(180px, 1.3fr) minmax(130px, .75fr) auto auto; align-items: end; gap: 13px; }
+.lux-admin-form label, .lux-admin-schedule-field { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
+.lux-admin-form input, .lux-admin-form select, .lux-admin-schedule-field input, .lux-admin-root-form input { min-width: 0; min-height: 42px; padding: 0 12px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
+.lux-admin-form input:focus, .lux-admin-form select:focus, .lux-admin-schedule-field input:focus, .lux-admin-root-form input:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.lux-admin-form select { appearance: auto; }
+.lux-admin-toggle { display: flex !important; grid-template-columns: none; align-items: center; gap: 9px !important; min-height: 42px; white-space: nowrap; }
+.lux-admin-toggle input { width: 16px; min-height: 16px; accent-color: var(--lux-accent); }
+.lux-admin-empty { display: grid; place-items: center; align-content: center; min-height: 240px; padding: 28px; border: 1px dashed var(--lux-line); border-radius: 15px; color: var(--lux-muted); text-align: center; }
+.lux-admin-empty h2 { margin: 12px 0 6px; color: #fff; font-size: 1.15rem; }
+.lux-admin-empty p { margin: 0; font-size: .84rem; }
+.lux-admin-library-list { display: grid; gap: 16px; }
+.lux-admin-library-card { overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 15px; background: rgba(17,17,21,.68); }
+.lux-admin-library-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 21px 22px; border-bottom: 1px solid var(--lux-line-soft); }
+.lux-admin-library-heading h2 { margin: 8px 0 5px; color: #fff; font-size: 1.3rem; letter-spacing: -.03em; }
+.lux-admin-library-heading p { margin: 0; color: var(--lux-subtle); font-size: .75rem; }
+.lux-admin-card-actions { display: flex; align-items: center; gap: 8px; }
+.lux-danger-icon { color: #ee9eaa; }
+.lux-icon-button-small { min-width: 32px; width: 32px; height: 32px; border-radius: 8px; box-shadow: none; }
+.lux-admin-library-body { display: grid; grid-template-columns: 1.1fr .9fr; gap: 16px; padding: 16px; }
+.lux-admin-subpanel { min-width: 0; padding: 17px; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: rgba(255,255,255,.025); }
+.lux-admin-subpanel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; color: #fff; font-size: .86rem; }
+.lux-admin-subpanel-heading span { color: var(--lux-subtle); font-size: .72rem; font-weight: 400; }
+.lux-admin-root-list { display: grid; gap: 4px; }
+.lux-admin-root-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto 32px; align-items: center; gap: 8px; min-height: 43px; border-bottom: 1px solid var(--lux-line-soft); color: var(--lux-muted); font-size: .77rem; }
+.lux-admin-root-row > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-root-state { font-size: .68rem; }
+.lux-root-state.is-ok { color: #9bdcb3; }
+.lux-root-state.is-warn { color: #f3c788; }
+.lux-admin-root-form { display: flex; gap: 8px; margin-top: 14px; }
+.lux-admin-root-form input { flex: 1; }
+.lux-admin-muted { color: var(--lux-subtle); font-size: .78rem; }
+.lux-admin-schedule-field { margin-top: 13px; }
+.lux-admin-schedule-field > div { display: flex; gap: 7px; }
+.lux-admin-schedule-field input { flex: 1; }
 
 @media (max-width: 900px) {
   .lux-header { padding: 18px 20px; }
@@ -288,6 +323,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-stat-icon { width: 34px; height: 34px; }
   .lux-admin-stat strong { font-size: .9rem; }
   .lux-admin-panel { padding: 17px; }
+  .lux-admin-create-form, .lux-admin-library-body { grid-template-columns: 1fr; }
+  .lux-admin-library-heading { flex-direction: column; }
+  .lux-admin-card-actions { width: 100%; }
+  .lux-admin-card-actions .lux-button { flex: 1; }
+  .lux-admin-root-form { flex-direction: column; }
 }
 
 @media (prefers-reduced-motion: reduce) {
