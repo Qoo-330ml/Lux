@@ -20,3 +20,12 @@ export function adminSectionForRoute(route) {
 export function isAdminRoute(route) {
   return route === "admin" || ADMIN_NAV_ITEMS.some((item) => adminRoute(item.id) === route);
 }
+
+export function renderAdminNavigation({ expanded = false, route = "home" } = {}) {
+  const isExpanded = Boolean(expanded && isAdminRoute(route));
+  const currentSection = adminSectionForRoute(route);
+  const submenu = isExpanded
+    ? `<div class="nav-submenu" id="admin-navigation" role="group" aria-label="管理设置">${ADMIN_NAV_ITEMS.map((item) => `<button class="nav-subitem" data-route="${adminRoute(item.id)}" aria-current="${currentSection === item.id ? "page" : "false"}"><span class="nav-glyph">${item.glyph}</span><span>${item.label}</span></button>`).join("")}</div>`
+    : "";
+  return `<div class="nav-admin-group"><button class="nav-admin-toggle" data-action="toggle-admin-nav" aria-expanded="${isExpanded}" aria-controls="admin-navigation" aria-current="${isAdminRoute(route) ? "page" : "false"}"><span class="nav-glyph">⚙</span><span>管理</span><span class="nav-chevron" aria-hidden="true">${isExpanded ? "⌃" : "⌄"}</span></button>${submenu}</div>`;
+}

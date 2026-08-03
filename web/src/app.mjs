@@ -1,5 +1,5 @@
 import { requestOptions } from "./request-options.mjs";
-import { ADMIN_NAV_ITEMS, adminRoute, adminSectionForRoute, isAdminRoute } from "./admin-navigation.mjs";
+import { ADMIN_NAV_ITEMS, adminSectionForRoute, isAdminRoute, renderAdminNavigation } from "./admin-navigation.mjs";
 
 const app = document.querySelector("#app");
 const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", adminNavExpanded: false, libraryId: "", libraryFilters: {}, libraryPage: 1, searchPage: 1, favoritesPage: 1, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "", drawerOpen: false };
@@ -124,7 +124,7 @@ function nav() {
   const favoritesCurrent = state.route === "favorites" ? "page" : "false";
   const adminExpanded = state.adminNavExpanded && isAdminRoute(state.route);
   const adminCurrent = isAdminRoute(state.route) ? "page" : "false";
-  const admin = state.user.canManageServer ? "<div class=\"nav-admin-group\"><button class=\"nav-admin-toggle\" data-action=\"toggle-admin-nav\" aria-expanded=\"" + adminExpanded + "\" aria-controls=\"admin-navigation\" aria-current=\"" + adminCurrent + "\"><span class=\"nav-glyph\">⚙</span><span>管理</span><span class=\"nav-chevron\" aria-hidden=\"true\">" + (adminExpanded ? "⌃" : "⌄") + "</span></button>" + (adminExpanded ? "<div class=\"nav-submenu\" id=\"admin-navigation\" role=\"group\" aria-label=\"管理设置\">" + ADMIN_NAV_ITEMS.map((item) => "<button class=\"nav-subitem\" data-route=\"" + adminRoute(item.id) + "\" aria-current=\"" + (adminSectionForRoute(state.route) === item.id ? "page" : "false") + "\"><span class=\"nav-glyph\">" + item.glyph + "</span><span>" + item.label + "</span></button>").join("") + "</div>" : "") + "</div>" : "";
+  const admin = state.user.canManageServer ? renderAdminNavigation({ expanded: adminExpanded, route: state.route }) : "";
   const libraries = state.home?.libraries || state.libraries;
   const libraryLinks = libraries.length ? "<div class=\"nav-group\"><span class=\"nav-group-label\">媒体库</span>" + libraries.map((library) => "<button class=\"nav-library\" data-library=\"" + escapeHtml(library.id) + "\" aria-current=\"" + (state.route === "library" && state.libraryId === library.id ? "page" : "false") + "\"><span class=\"nav-glyph\">" + (library.kind === "SERIES" ? "▤" : "▣") + "</span><span>" + escapeHtml(library.name) + "</span></button>").join("") + "</div>" : "";
   return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\"><span class=\"nav-glyph\">⌂</span><span>首页</span></button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\"><span class=\"nav-glyph\">▦</span><span>媒体库</span></button><button data-route=\"favorites\" aria-current=\"" + favoritesCurrent + "\"><span class=\"nav-glyph\">♥</span><span>收藏</span></button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\"><span class=\"nav-glyph\">◉</span><span>账户</span></button>" + admin + libraryLinks + "</nav>";

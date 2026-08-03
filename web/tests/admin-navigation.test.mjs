@@ -5,6 +5,7 @@ import {
   adminRoute,
   adminSectionForRoute,
   isAdminRoute,
+  renderAdminNavigation,
 } from "../src/admin-navigation.mjs";
 
 test("management navigation exposes the six documented sections", () => {
@@ -32,4 +33,23 @@ test("only management routes keep the management navigation expanded", () => {
   assert.equal(isAdminRoute("admin-jobs"), true);
   assert.equal(isAdminRoute("home"), false);
   assert.equal(isAdminRoute("account"), false);
+});
+
+test("expanded management navigation renders every child and marks the active child", () => {
+  const html = renderAdminNavigation({ expanded: true, route: "admin-settings" });
+
+  assert.match(html, /data-action="toggle-admin-nav"[^>]+aria-expanded="true"/);
+  for (const item of ADMIN_NAV_ITEMS) {
+    assert.match(html, new RegExp(`data-route="${adminRoute(item.id)}"`));
+  }
+  assert.match(html, /data-route="admin-settings" aria-current="page"/);
+  assert.match(html, /aria-label="管理设置"/);
+});
+
+test("collapsed management navigation hides its child settings", () => {
+  const html = renderAdminNavigation({ expanded: false, route: "home" });
+
+  assert.match(html, /aria-expanded="false"/);
+  assert.doesNotMatch(html, /id="admin-navigation"/);
+  assert.doesNotMatch(html, /data-route="admin-settings"/);
 });
