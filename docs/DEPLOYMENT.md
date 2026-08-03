@@ -100,3 +100,11 @@ LUX_IMAGE=lux:arm64-local ./scripts/disk-write-fault-smoke.sh
 ```
 
 该脚本只证明容器内 ENOSPC 的诊断和恢复契约，不替代飞牛 NAS 真实持久卷故障演练。
+
+也可以演练媒体目录暂时不可访问以及恢复后的重新探测：
+
+```bash
+LUX_IMAGE=lux:arm64-local ./scripts/mount-loss-smoke.sh
+```
+
+该脚本通过临时目录权限撤销模拟不可访问状态，证明扫描会隔离不可用 root、保留已有条目并在恢复后重新发现 root；它不替代真实 NAS 卸载、网络中断或持久卷恢复演练。

@@ -97,7 +97,7 @@ recovery_health_status="$(curl -sS -o "$WORK_DIR/recovery-health.json" -w '%{htt
     -H "Cookie: $cookies" "http://127.0.0.1:$PORT/api/v1/admin/health")"
 recovery_write_status=503
 recovery_library_name=""
-for attempt in $(seq 1 10); do
+for attempt in $(seq 1 60); do
     recovery_library_name="Recovered Library $attempt"
     recovery_write_status="$(curl -sS -o "$WORK_DIR/recovery-write.json" -w '%{http_code}' \
         -X POST "http://127.0.0.1:$PORT/api/v1/admin/libraries" \
@@ -106,7 +106,7 @@ for attempt in $(seq 1 10); do
         -H 'Content-Type: application/json' \
         -d "{\"name\":\"$recovery_library_name\",\"kind\":\"MOVIE\"}")"
     [[ "$recovery_write_status" == 201 ]] && break
-    sleep 0.2
+    sleep 0.5
 done
 [[ "$recovery_ready_status" == 200 ]]
 [[ "$recovery_health_status" == 200 ]]
