@@ -14,6 +14,24 @@ log() {
     printf '[lux] %s\n' "$*"
 }
 
+if command -v pnpm >/dev/null 2>&1; then
+    PNPM_COMMAND=(pnpm)
+elif command -v corepack >/dev/null 2>&1; then
+    PNPM_COMMAND=(corepack pnpm)
+else
+    printf '[lux] pnpm is unavailable; install pnpm or enable Node Corepack before restarting\n' >&2
+    exit 1
+fi
+
+if command -v cargo >/dev/null 2>&1; then
+    CARGO_COMMAND=(cargo)
+elif [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+    CARGO_COMMAND=("$HOME/.cargo/bin/cargo")
+else
+    printf '[lux] cargo is unavailable; install Rust before restarting\n' >&2
+    exit 1
+fi
+
 if ! command -v lsof >/dev/null 2>&1; then
     printf '[lux] lsof is required to find the process listening on %s\n' "$PORT" >&2
     exit 1
@@ -72,12 +90,12 @@ if ((${#lux_pids[@]} > 0)); then
 fi
 
 log "building Web frontend"
-pnpm --dir web install --frozen-lockfile
-pnpm --dir web build
+"${PNPM_COMMAND[@]}" --dir web install --frozen-lockfile
+"${PNPM_COMMAND[@]}" --dir web build
 
 log "compiling and starting Lux on ${LUX_HTTP_ADDR}"
 exec env \
     RUST_LOG="$RUST_LOG" \
     LUX_HTTP_ADDR="$LUX_HTTP_ADDR" \
     LUX_CONFIG_DIR="$LUX_CONFIG_DIR" \
-    cargo run --locked --bin luxd
+    "${CARGO_COMMAND[@]}" run --locked --bin luxd
