@@ -34,8 +34,8 @@ use crate::{
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
         },
         catalog::{
-            CatalogError, CatalogItem, CatalogPage, CatalogService, normalize_search_like_query,
-            normalize_search_query,
+            CatalogError, CatalogFilter, CatalogItem, CatalogPage, CatalogService, CatalogSort,
+            normalize_search_like_query, normalize_search_query,
         },
         collections::{CollectionError, CollectionService},
         images::{
@@ -758,6 +758,72 @@ struct EmbyItemsQuery {
     sort_order: Option<String>,
 }
 
+fn catalog_filter_from_values(
+    item_types: Option<&str>,
+    years: Option<&str>,
+    is_played: Option<bool>,
+    is_favorite: Option<bool>,
+    sort_by: Option<&str>,
+    sort_order: Option<&str>,
+) -> CatalogFilter {
+    let item_types = item_types
+        .map(|values| {
+            let raw_values = values
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            let normalized = raw_values
+                .iter()
+                .filter_map(|value| match value.to_ascii_lowercase().as_str() {
+                    "movie" => Some("MOVIE".to_owned()),
+                    "series" | "show" => Some("SERIES".to_owned()),
+                    "season" => Some("SEASON".to_owned()),
+                    "episode" => Some("EPISODE".to_owned()),
+                    "boxset" | "box_set" => Some("BOX_SET".to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if raw_values.is_empty() || !normalized.is_empty() {
+                normalized
+            } else {
+                vec!["__NO_MATCH__".to_owned()]
+            }
+        })
+        .unwrap_or_default();
+    let years = years
+        .map(|values| {
+            values
+                .split(',')
+                .filter_map(|value| value.trim().parse::<i64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    CatalogFilter {
+        item_types,
+        years,
+        is_played,
+        is_favorite,
+        sort_by: if sort_by.is_some_and(|value| value.eq_ignore_ascii_case("DateCreated")) {
+            CatalogSort::DateCreated
+        } else {
+            CatalogSort::Name
+        },
+        descending: sort_order.is_some_and(|value| value.eq_ignore_ascii_case("Descending")),
+    }
+}
+
+fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
+    catalog_filter_from_values(
+        query.include_item_types.as_deref(),
+        query.years.as_deref(),
+        query.is_played,
+        query.is_favorite,
+        query.sort_by.as_deref(),
+        query.sort_order.as_deref(),
+    )
+}
+
 async fn emby_user_views(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -1142,133 +1208,34 @@ async fn emby_list_items(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let filter = catalog_filter_from_emby(query);
     let page = match query.parent_id.as_deref() {
         Some(parent_id) => {
             let Ok(parent_id) = parent_id.parse::<crate::domain::ids::LibraryId>() else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
             catalog
-                .list_library_items(principal, &parent_id.to_string(), 0, i64::MAX)
+                .list_library_items_filtered(
+                    principal,
+                    &parent_id.to_string(),
+                    &filter,
+                    offset,
+                    limit,
+                )
                 .await
         }
-        None => catalog.list_all_items(principal, 0, i64::MAX).await,
+        None => {
+            catalog
+                .list_all_items_filtered(principal, &filter, offset, limit)
+                .await
+        }
     };
     match page {
-        Ok(page) => {
-            match filter_emby_catalog_page(state, principal, page, query, offset, limit).await {
-                Ok(page) => {
-                    emby_catalog_page_for_user(state, &principal.user_id.to_string(), &page).await
-                }
-                Err(status) => status.into_response(),
-            }
-        }
+        Ok(page) => emby_catalog_page_for_user(state, &principal.user_id.to_string(), &page).await,
         Err(CatalogError::LibraryNotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(CatalogError::AccessDenied) => StatusCode::FORBIDDEN.into_response(),
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-}
-
-async fn filter_emby_catalog_page(
-    state: &AppState,
-    principal: AccessPrincipal,
-    page: CatalogPage,
-    query: &EmbyItemsQuery,
-    offset: i64,
-    limit: i64,
-) -> Result<CatalogPage, StatusCode> {
-    let Some(database) = state.database.as_ref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    let allowed_types = query.include_item_types.as_deref().map(|types| {
-        types
-            .split(',')
-            .map(|value| value.trim().to_ascii_lowercase())
-            .collect::<Vec<_>>()
-    });
-    let years = query.years.as_deref().map(|years| {
-        years
-            .split(',')
-            .filter_map(|year| year.trim().parse::<i64>().ok())
-            .collect::<Vec<_>>()
-    });
-    let item_ids = page
-        .items
-        .iter()
-        .map(|item| item.id.clone())
-        .collect::<Vec<_>>();
-    let user_states = database
-        .list_user_item_states(&principal.user_id.to_string(), &item_ids)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let mut items = Vec::new();
-    for item in page.items {
-        let item_type = emby_item_type(&item.item_type).to_ascii_lowercase();
-        if allowed_types
-            .as_ref()
-            .is_some_and(|types| !types.iter().any(|value| value == &item_type))
-        {
-            continue;
-        }
-        if years.as_ref().is_some_and(|years| {
-            !years.is_empty() && !years.contains(&item.production_year.unwrap_or_default())
-        }) {
-            continue;
-        }
-        let item_state = user_states.get(&item.id);
-        if query.is_played.is_some_and(|value| {
-            item_state
-                .as_ref()
-                .map(|state| state.is_played)
-                .unwrap_or(false)
-                != value
-        }) {
-            continue;
-        }
-        if query.is_favorite.is_some_and(|value| {
-            item_state
-                .as_ref()
-                .map(|state| state.is_favorite)
-                .unwrap_or(false)
-                != value
-        }) {
-            continue;
-        }
-        items.push(item);
-    }
-    let descending = query
-        .sort_order
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("Descending"));
-    items.sort_by(|left, right| {
-        let ordering = if query
-            .sort_by
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("DateCreated"))
-        {
-            left.id.cmp(&right.id)
-        } else {
-            left.sort_title
-                .cmp(&right.sort_title)
-                .then_with(|| left.id.cmp(&right.id))
-        };
-        if descending {
-            ordering.reverse()
-        } else {
-            ordering
-        }
-    });
-    let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
-    let items = items
-        .into_iter()
-        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-        .take(usize::try_from(limit).unwrap_or(0))
-        .collect();
-    Ok(CatalogPage {
-        items,
-        total,
-        offset,
-        limit,
-    })
 }
 
 async fn emby_item(
@@ -3089,31 +3056,21 @@ async fn lux_list_library_items(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let base_page = catalog
-        .list_library_items(principal, &library_id, 0, i64::MAX)
-        .await;
-    let filter_query = EmbyItemsQuery {
-        include_item_types: query.item_type.clone(),
-        years: query.year.map(|year| year.to_string()),
-        is_played: query.is_played,
-        is_favorite: query.is_favorite,
-        sort_by: query.sort_by.clone(),
-        sort_order: query.sort_order.clone(),
-        ..EmbyItemsQuery::default()
-    };
-    match base_page {
+    let filter = catalog_filter_from_values(
+        query.item_type.as_deref(),
+        query.year.map(|year| year.to_string()).as_deref(),
+        query.is_played,
+        query.is_favorite,
+        query.sort_by.as_deref(),
+        query.sort_order.as_deref(),
+    );
+    match catalog
+        .list_library_items_filtered(principal, &library_id, &filter, offset, limit)
+        .await
+    {
         Ok(page) => {
-            match filter_emby_catalog_page(&state, principal, page, &filter_query, offset, limit)
-                .await
-            {
-                Ok(page) => {
-                    match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page)
-                        .await
-                    {
-                        Ok(body) => Json(body).into_response(),
-                        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                    }
-                }
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
                 Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
         }

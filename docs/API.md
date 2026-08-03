@@ -82,9 +82,9 @@ Emby access token 与 Web session 完全分离。access token 是高熵随机值
 Lux 电影查询要求有效 Web session：
 
 - `GET /api/v1/libraries`：返回已启用媒体库的基本信息，不暴露服务器路径。
-- `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回电影。
+- `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回条目；支持 `itemType`、`year`、`isPlayed`、`isFavorite`、`sortBy=DateCreated` 和 `sortOrder=Ascending|Descending`，筛选和分页在 SQLite 查询中完成。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，结果执行媒体库 ACL。
-- `GET /api/v1/home`：返回当前用户继续观看摘要和可见媒体库入口。
+- `GET /api/v1/home`：返回当前用户继续观看、最近添加（按 `media_items.added_at` 倒序）和可见媒体库入口；最近添加与继续观看都执行媒体库 ACL。
 - `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看和收藏状态。
 - `POST /api/v1/items/{itemId}/progress`：写入播放进度，需要当前 Web session 和 CSRF。
 - `PUT /api/v1/items/{itemId}/favorite`：设置当前 Web 用户的收藏状态，需要当前 Web session 和 CSRF。

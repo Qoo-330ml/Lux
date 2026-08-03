@@ -2,8 +2,25 @@ use std::fmt;
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
-    storage::{Database, StorageError, StoredCatalogRow},
+    storage::{CatalogFilterQuery, Database, StorageError, StoredCatalogRow},
 };
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CatalogFilter {
+    pub item_types: Vec<String>,
+    pub years: Vec<i64>,
+    pub is_played: Option<bool>,
+    pub is_favorite: Option<bool>,
+    pub sort_by: CatalogSort,
+    pub descending: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CatalogSort {
+    #[default]
+    Name,
+    DateCreated,
+}
 
 #[derive(Clone)]
 pub struct CatalogService {
@@ -37,6 +54,76 @@ impl CatalogService {
             .database
             .list_catalog_rows(Some(library_id), offset, limit)
             .await?;
+        Ok(CatalogPage {
+            items: assemble_items(rows),
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn list_library_items_filtered(
+        &self,
+        principal: AccessPrincipal,
+        library_id: &str,
+        filter: &CatalogFilter,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        let Some(library) = self.database.find_library(library_id).await? else {
+            return Err(CatalogError::LibraryNotFound);
+        };
+        if !library.is_enabled {
+            return Err(CatalogError::LibraryNotFound);
+        }
+        if !self.access.can_view_library(principal, library_id).await? {
+            return Err(CatalogError::AccessDenied);
+        }
+        let library_ids = vec![library_id.to_owned()];
+        let user_id = principal.user_id.to_string();
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types: &filter.item_types,
+            years: &filter.years,
+            is_played: filter.is_played,
+            is_favorite: filter.is_favorite,
+            sort_by_date_created: matches!(filter.sort_by, CatalogSort::DateCreated),
+            descending: filter.descending,
+            offset,
+            limit,
+        };
+        let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
+        Ok(CatalogPage {
+            items: assemble_items(rows),
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn list_all_items_filtered(
+        &self,
+        principal: AccessPrincipal,
+        filter: &CatalogFilter,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let user_id = principal.user_id.to_string();
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types: &filter.item_types,
+            years: &filter.years,
+            is_played: filter.is_played,
+            is_favorite: filter.is_favorite,
+            sort_by_date_created: matches!(filter.sort_by, CatalogSort::DateCreated),
+            descending: filter.descending,
+            offset,
+            limit,
+        };
+        let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
         Ok(CatalogPage {
             items: assemble_items(rows),
             total,

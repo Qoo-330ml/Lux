@@ -51,7 +51,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .fetch_one(database.pool())
             .await?;
     sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
-        .bind(100_i64)
+        .bind(300_i64)
         .bind(&item_id)
         .execute(database.pool())
         .await?;
@@ -60,6 +60,15 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .bind(&beta_item_id)
         .execute(database.pool())
         .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_favorite)
+         VALUES (?, ?, 1)
+         ON CONFLICT(user_id, item_id) DO UPDATE SET is_favorite = 1",
+    )
+    .bind(admin.id.to_string())
+    .bind(&beta_item_id)
+    .execute(database.pool())
+    .await?;
 
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -195,6 +204,31 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(lux_page_body["pageSize"], 1);
     assert_eq!(lux_page_body["items"][0]["title"], "Alpha Movie");
 
+    let recent_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=DateCreated&sort_order=Descending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(recent_page.status(), reqwest::StatusCode::OK);
+    let recent_page_body: Value = recent_page.json().await?;
+    assert_eq!(recent_page_body["items"][0]["title"], "Alpha Movie");
+
+    let favorite_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&is_favorite=true",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(favorite_page.status(), reqwest::StatusCode::OK);
+    let favorite_page_body: Value = favorite_page.json().await?;
+    assert_eq!(favorite_page_body["total"], 1);
+    assert_eq!(favorite_page_body["items"][0]["title"], "Beta Movie");
+
     let home = client
         .get(format!("{base_url}/api/v1/home"))
         .header(COOKIE, &cookies)
@@ -204,8 +238,8 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let home_body: Value = home.json().await?;
     assert_eq!(home_body["recentlyAddedTotal"], 2);
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
-    assert_eq!(home_body["recentlyAdded"][0]["title"], "Beta Movie");
-    assert_eq!(home_body["recentlyAdded"][1]["title"], "Alpha Movie");
+    assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
+    assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");
 
     let lux_detail = client
         .get(format!("{base_url}/api/v1/items/{item_id}"))

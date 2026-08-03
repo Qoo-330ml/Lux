@@ -3109,6 +3109,89 @@ impl Database {
         self.fetch_catalog_rows(&query, &binds).await
     }
 
+    pub(crate) async fn list_filtered_catalog_rows(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        if filter.library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (where_clause, filter_binds) = catalog_filter_where_clause(
+            filter.library_ids,
+            filter.user_id,
+            filter.item_types,
+            filter.years,
+            filter.is_played,
+            filter.is_favorite,
+        );
+        let count_query = format!(
+            "SELECT COUNT(*) FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             {where_clause}"
+        );
+        let mut count_statement = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_query));
+        for bind in &filter_binds {
+            count_statement = match bind {
+                CatalogBind::Text(value) => count_statement.bind(*value),
+                CatalogBind::Integer(value) => count_statement.bind(*value),
+            };
+        }
+        let total = count_statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let item_order = if filter.sort_by_date_created {
+            if filter.descending {
+                "mi.added_at DESC, mi.sort_title ASC, mi.id ASC"
+            } else {
+                "mi.added_at ASC, mi.sort_title ASC, mi.id ASC"
+            }
+        } else if filter.descending {
+            "mi.sort_title DESC, mi.id DESC"
+        } else {
+            "mi.sort_title ASC, mi.id ASC"
+        };
+        let query = format!(
+            "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    mi.title, mi.sort_title, mi.original_title, mi.overview,
+                    mi.production_year, mi.runtime_ticks,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
+                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
+             FROM (
+                 SELECT mi.id
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 {where_clause}
+                 ORDER BY {item_order}
+                 LIMIT ? OFFSET ?
+             ) selected
+             JOIN media_items mi ON mi.id = selected.id
+             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             ORDER BY {item_order}, ms.id, mt.stream_index"
+        );
+        let mut list_binds = filter_binds;
+        list_binds.push(CatalogBind::Integer(filter.limit));
+        list_binds.push(CatalogBind::Integer(filter.offset));
+        let rows = self.fetch_catalog_rows(&query, &list_binds).await?;
+        Ok((rows, total))
+    }
+
     pub(crate) async fn list_catalog_rows(
         &self,
         library_id: Option<&str>,
@@ -4577,9 +4660,91 @@ fn stored_item_image(row: sqlx::sqlite::SqliteRow) -> StoredItemImage {
     }
 }
 
+fn catalog_filter_where_clause<'a>(
+    library_ids: &'a [String],
+    user_id: &'a str,
+    item_types: &'a [String],
+    years: &'a [i64],
+    is_played: Option<bool>,
+    is_favorite: Option<bool>,
+) -> (String, Vec<CatalogBind<'a>>) {
+    let mut where_clause = format!(
+        "WHERE mi.removed_at IS NULL
+         AND mi.library_id IN ({})",
+        std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut binds = library_ids
+        .iter()
+        .map(|library_id| CatalogBind::Text(library_id.as_str()))
+        .collect::<Vec<_>>();
+    if !item_types.is_empty() {
+        where_clause.push_str(&format!(
+            " AND mi.item_type IN ({})",
+            std::iter::repeat_n("?", item_types.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        binds.extend(
+            item_types
+                .iter()
+                .map(|item_type| CatalogBind::Text(item_type.as_str())),
+        );
+    }
+    if !years.is_empty() {
+        where_clause.push_str(&format!(
+            " AND mi.production_year IN ({})",
+            std::iter::repeat_n("?", years.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        binds.extend(years.iter().copied().map(CatalogBind::Integer));
+    }
+    if let Some(is_played) = is_played {
+        where_clause.push_str(
+            " AND COALESCE(
+                (SELECT state_filter.is_played
+                 FROM user_item_state state_filter
+                 WHERE state_filter.user_id = ? AND state_filter.item_id = mi.id),
+                0
+            ) = ?",
+        );
+        binds.push(CatalogBind::Text(user_id));
+        binds.push(CatalogBind::Integer(i64::from(is_played)));
+    }
+    if let Some(is_favorite) = is_favorite {
+        where_clause.push_str(
+            " AND COALESCE(
+                (SELECT state_filter.is_favorite
+                 FROM user_item_state state_filter
+                 WHERE state_filter.user_id = ? AND state_filter.item_id = mi.id),
+                0
+            ) = ?",
+        );
+        binds.push(CatalogBind::Text(user_id));
+        binds.push(CatalogBind::Integer(i64::from(is_favorite)));
+    }
+    (where_clause, binds)
+}
+
+#[derive(Clone, Copy)]
 enum CatalogBind<'a> {
     Text(&'a str),
     Integer(i64),
+}
+
+pub(crate) struct CatalogFilterQuery<'a> {
+    pub(crate) library_ids: &'a [String],
+    pub(crate) user_id: &'a str,
+    pub(crate) item_types: &'a [String],
+    pub(crate) years: &'a [i64],
+    pub(crate) is_played: Option<bool>,
+    pub(crate) is_favorite: Option<bool>,
+    pub(crate) sort_by_date_created: bool,
+    pub(crate) descending: bool,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
 }
 
 #[derive(Debug)]
