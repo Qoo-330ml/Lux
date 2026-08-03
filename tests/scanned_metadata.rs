@@ -14,7 +14,11 @@ async fn completed_movie_scan_indexes_local_nfo_and_images()
     let media_root = temp_dir.path().join("Movies");
     let movie_dir = media_root.join("Example Movie (2020)");
     tokio::fs::create_dir_all(&movie_dir).await?;
-    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+    tokio::fs::write(
+        movie_dir.join("Example.Movie.2020.strm"),
+        "https://example.invalid/media/example",
+    )
+    .await?;
     tokio::fs::write(
         movie_dir.join("Example.Movie.2020.nfo"),
         "<movie><title>Title From NFO</title><plot>Overview from NFO</plot></movie>",

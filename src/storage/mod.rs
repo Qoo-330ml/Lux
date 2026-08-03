@@ -3441,7 +3441,7 @@ impl Database {
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
-             WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
+             WHERE mi.library_id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
              ORDER BY ms.item_id, fe.relative_path",
         )
         .bind(library_id)
