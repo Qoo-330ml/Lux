@@ -71,4 +71,28 @@ describe("LuxApiClient", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it("unwraps the authenticated user from the login envelope", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ user: { id: "admin-1", canManageServer: true }, csrfToken: "csrf" }), {
+        status: 200,
+      }),
+    );
+
+    await expect(new LuxApiClient().login("admin", "password")).resolves.toEqual({
+      id: "admin-1",
+      canManageServer: true,
+    });
+  });
+
+  it("unwraps the authenticated user when restoring a session", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ user: { id: "admin-1", canManageServer: true } }), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().me()).resolves.toEqual({
+      id: "admin-1",
+      canManageServer: true,
+    });
+  });
 });

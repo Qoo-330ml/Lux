@@ -104,10 +104,10 @@ export class LuxApiClient {
   }
 
   login(username: string, password: string) {
-    return this.request<LuxUser>("/api/v1/auth/login", {
+    return this.request<{ user: LuxUser; csrfToken?: string }>("/api/v1/auth/login", {
       method: "POST",
       body: JSON.stringify({ username, password }),
-    });
+    }).then((response) => response.user);
   }
 
   logout() {
@@ -115,7 +115,7 @@ export class LuxApiClient {
   }
 
   me() {
-    return this.request<LuxUser>("/api/v1/auth/me");
+    return this.request<{ user: LuxUser }>("/api/v1/auth/me").then((response) => response.user);
   }
 
   home() {
