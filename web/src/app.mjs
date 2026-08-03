@@ -1,7 +1,7 @@
 import { requestOptions } from "./request-options.mjs";
 
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "" };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "", drawerOpen: false };
 
 const api = {
   async request(path, options = {}) {
@@ -100,20 +100,21 @@ function render() {
   if (!state.user) return renderAuth();
   const error = state.error ? "<div class=\"notice error\" role=\"alert\">" + escapeHtml(state.error) + "</div>" : "";
   const notice = state.notice ? "<div class=\"notice\" role=\"status\">" + escapeHtml(state.notice) + "</div>" : "";
-  app.innerHTML = "<div class=\"shell\"><aside class=\"sidebar\">" + brand() + nav() + account() + "</aside><div><nav class=\"mobile-nav\"><strong>Lux</strong><button class=\"button secondary\" data-action=\"logout\">退出</button></nav><main class=\"content\"><header class=\"topbar\"><div><span class=\"eyebrow\">Personal media</span><h1>" + titleForRoute() + "</h1></div><form class=\"search-form\" data-action=\"search\"><input class=\"search-box\" name=\"q\" type=\"search\" placeholder=\"搜索电影、剧集或别名\" aria-label=\"搜索\"></form></header>" + error + notice + "<section id=\"view\">" + loading() + "</section></main></div></div>";
+  const drawerClass = state.drawerOpen ? " drawer-is-open" : "";
+  app.innerHTML = "<div class=\"shell" + drawerClass + "\"><aside class=\"sidebar\">" + brand() + nav() + account() + "</aside><button class=\"drawer-scrim\" type=\"button\" data-action=\"close-drawer\" aria-label=\"关闭导航\"></button><div class=\"app-frame\"><header class=\"app-toolbar\"><button class=\"toolbar-menu\" type=\"button\" data-action=\"toggle-drawer\" aria-label=\"打开导航\">☰</button><button class=\"toolbar-brand\" type=\"button\" data-route=\"home\"><span class=\"brand-mark\">L</span><span>Lux</span></button><div class=\"toolbar-title\"><span class=\"eyebrow\">Personal media</span><h1>" + titleForRoute() + "</h1></div><form class=\"search-form\" data-action=\"search\"><input class=\"search-box\" name=\"q\" type=\"search\" placeholder=\"搜索电影、剧集或别名\" aria-label=\"搜索\"></form><button class=\"toolbar-user\" type=\"button\" data-route=\"account\" aria-label=\"打开账户\"><span class=\"user-avatar\">" + escapeHtml((state.user.displayName || state.user.usernameNormalized || "L").slice(0, 1).toUpperCase()) + "</span><span class=\"toolbar-user-name\">" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</span></button></header><main id=\"main-content\" class=\"content\">" + error + notice + "<section id=\"view\">" + loading() + "</section></main></div></div>";
   bind();
   loadRoute();
 }
 
-function brand() { return "<div class=\"brand\"><strong>Lux</strong><span>quietly yours</span></div>"; }
+function brand() { return "<div class=\"brand\"><button class=\"brand-home\" type=\"button\" data-route=\"home\"><span class=\"brand-mark\">L</span><span><strong>Lux</strong><small>quietly yours</small></span></button><button class=\"drawer-close\" type=\"button\" data-action=\"close-drawer\" aria-label=\"关闭导航\">×</button></div>"; }
 function nav() {
   const homeCurrent = state.route === "home" ? "page" : "false";
   const libraryCurrent = state.route === "libraries" ? "page" : "false";
-  const admin = state.user.canManageServer ? "<button data-route=\"admin\" aria-current=\"" + (state.route === "admin" ? "page" : "false") + "\">管理</button>" : "";
-  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\">首页</button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\">媒体库</button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\">账户</button>" + admin + "</nav>";
+  const admin = state.user.canManageServer ? "<button data-route=\"admin\" aria-current=\"" + (state.route === "admin" ? "page" : "false") + "\"><span class=\"nav-glyph\">⚙</span><span>管理</span></button>" : "";
+  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\"><span class=\"nav-glyph\">⌂</span><span>首页</span></button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\"><span class=\"nav-glyph\">▦</span><span>媒体库</span></button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\"><span class=\"nav-glyph\">◉</span><span>账户</span></button>" + admin + "</nav>";
 }
 function account() {
-  return "<div class=\"sidebar-footer\"><small>" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</small><button class=\"button secondary\" data-route=\"account\" style=\"margin-top:.7rem;width:100%\">账户与会话</button><button class=\"button secondary\" data-action=\"logout\" style=\"margin-top:.7rem;width:100%\">退出登录</button></div>";
+  return "<div class=\"sidebar-footer\"><span class=\"sidebar-label\">当前账户</span><strong>" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</strong><button class=\"button secondary sidebar-action\" data-route=\"account\">账户与会话</button><button class=\"button secondary sidebar-action\" data-action=\"logout\">退出登录</button></div>";
 }
 
 function renderAuth() {
@@ -186,9 +187,14 @@ async function loadRoute() {
 function renderHome() {
   const continueWatching = state.home?.continueWatching || [];
   const libraries = state.home?.libraries || state.libraries;
-  const progress = continueWatching.length ? "<section class=\"section\"><div class=\"section-heading\"><h2>继续观看</h2><span>" + continueWatching.length + " 个进行中</span></div>" + renderGrid(continueWatching) + "</section>" : "";
+  const featured = continueWatching[0];
+  const backdrop = featured && imageUrl(featured) ? `<img class="home-hero-backdrop" src="${imageUrl(featured)}" alt="">` : "<div class=\"home-hero-backdrop\"></div>";
+  const hero = featured
+    ? `<article class="home-hero">${backdrop}<div class="home-hero-content"><span class="eyebrow">继续观看</span><h2>${escapeHtml(featured.title || featured.name)}</h2><p>${escapeHtml(featured.overview || "从上次停下的位置继续播放。")}</p><div class="hero-actions"><button class="button" type="button" data-item="${escapeHtml(featured.id)}">继续播放</button><span class="hero-meta">${escapeHtml([featured.productionYear || "", featured.itemType || ""].filter(Boolean).join(" · "))}</span></div></div></article>`
+    : "<article class=\"home-hero home-hero-empty\"><div class=\"home-hero-content\"><span class=\"eyebrow\">Lux</span><h2>你的私人媒体空间</h2><p>从媒体库开始，继续观看和管理属于你的内容。</p><div class=\"hero-actions\"><button class=\"button\" type=\"button\" data-route=\"libraries\">浏览媒体库</button></div></div></article>";
+  const progress = continueWatching.length ? "<section class=\"section home-section\"><div class=\"section-heading\"><h2>继续观看</h2><span>" + continueWatching.length + " 个进行中</span></div>" + renderRail(continueWatching) + "</section>" : "";
   const cards = libraries.length ? libraries.map(libraryCard).join("") : "<div class=\"empty\"><h3>还没有可见媒体库</h3><p>请联系管理员授予媒体库访问权限。</p></div>";
-  return progress + "<section class=\"section\"><div class=\"section-heading\"><h2>媒体库</h2><span>只显示你有权限访问的库</span></div><div class=\"library-grid\">" + cards + "</div></section>";
+  return hero + progress + "<section class=\"section home-section\"><div class=\"section-heading\"><h2>媒体库</h2><span>只显示你有权限访问的库</span></div><div class=\"library-rail\">" + cards + "</div></section>";
 }
 
 function libraryCard(library) {
@@ -208,6 +214,10 @@ function renderGrid(items, heading = "") {
   const title = heading ? "<div class=\"section-heading\" style=\"grid-column:1/-1\"><h2>" + heading + "</h2><span>" + items.length + " 项</span></div>" : "";
   const content = items.length ? items.map(mediaCard).join("") : "<div class=\"empty\" style=\"grid-column:1/-1\"><h3>没有找到内容</h3><p>试试其他关键词或筛选条件。</p></div>";
   return "<div class=\"media-grid\">" + title + content + "</div>";
+}
+function renderRail(items) {
+  const content = items.length ? items.map(mediaCard).join("") : "<div class=\"empty\"><h3>没有找到内容</h3><p>试试其他关键词或筛选条件。</p></div>";
+  return "<div class=\"media-rail\">" + content + "</div>";
 }
 function mediaCard(item) {
   const userData = item.userData || {};
@@ -330,7 +340,9 @@ function renderUserEditor(user, libraries, granted) {
 }
 
 function bind() {
-  document.querySelectorAll("[data-route]").forEach((element) => element.addEventListener("click", (event) => { event.preventDefault(); state.route = element.dataset.route; state.error = ""; render(); }));
+  document.querySelectorAll("[data-action='toggle-drawer']").forEach((element) => element.addEventListener("click", () => { state.drawerOpen = true; render(); }));
+  document.querySelectorAll("[data-action='close-drawer']").forEach((element) => element.addEventListener("click", () => { state.drawerOpen = false; render(); }));
+  document.querySelectorAll("[data-route]").forEach((element) => element.addEventListener("click", (event) => { event.preventDefault(); state.route = element.dataset.route; state.drawerOpen = false; state.error = ""; render(); }));
   document.querySelectorAll("[data-library]").forEach((element) => element.addEventListener("click", async () => {
     state.libraryId = element.dataset.library; state.libraryFilters = {}; state.route = "library"; state.error = ""; state.notice = ""; render();
   }));

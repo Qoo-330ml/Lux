@@ -1,4 +1,6 @@
 /target/
+/output/playwright/
+/.playwright-cli/
 /web/node_modules/
 /web/dist/
 /.env
@@ -8,4 +10,3 @@
 *.db-shm
 *.db-wal
 .DS_Store
-
