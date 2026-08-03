@@ -248,18 +248,28 @@ function mediaCard(item) {
   const status = [userData.isPlayed ? "已看" : "", userData.isFavorite ? "已收藏" : ""].filter(Boolean).join(" · ");
   return "<button class=\"media-card\" data-item=\"" + escapeHtml(item.id) + "\">" + poster(item) + "<span class=\"media-card-body\"><strong>" + escapeHtml(item.title || item.name) + "</strong><span class=\"media-meta\">" + escapeHtml([item.productionYear || item.itemType || "", status].filter(Boolean).join(" · ")) + "</span></span></button>";
 }
+function formatRuntime(ticks) {
+  const minutes = Math.round(Number(ticks || 0) / 10000000 / 60);
+  if (!minutes) return "";
+  const hours = Math.floor(minutes / 60);
+  return hours ? hours + " 小时 " + (minutes % 60) + " 分钟" : minutes + " 分钟";
+}
 function renderDetail(item, playback = {}, children = null, images = [], candidates = []) {
   const sources = item.mediaSources || [];
   const backdropUrl = imageUrl(item, "fanart") || imageUrl(item);
   const backdrop = backdropUrl ? `<img class="detail-backdrop" src="${backdropUrl}" alt="">` : "<div class=\"detail-backdrop\"></div>";
   const chips = sources.map((source) => "<span class=\"chip\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "source") + "</span>").join("");
+  const runtimeTicks = item.runtimeTicks || sources.find((source) => source.isDefault)?.durationTicks || sources[0]?.durationTicks;
+  const subtitleCount = sources.reduce((count, source) => count + (source.streams || []).filter((stream) => stream.type === "SUBTITLE").length, 0);
+  const audioCount = sources.reduce((count, source) => count + (source.streams || []).filter((stream) => stream.type === "AUDIO").length, 0);
+  const detailFacts = [[formatRuntime(runtimeTicks), "时长"], [sources.length ? sources.length + " 个版本" : "", "媒体版本"], [subtitleCount ? subtitleCount + " 条" : "暂无", "字幕轨道"], [audioCount ? audioCount + " 条" : "暂无", "音频轨道"]].filter(([value]) => value).map(([value, label]) => `<div><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join("");
   const buttons = sources.map((source, index) => "<button class=\"button secondary\" data-source=\"" + escapeHtml(source.id) + "\" aria-pressed=\"" + (index === 0) + "\">" + escapeHtml(source.qualityLabel || source.editionName || source.container || "版本 " + (index + 1)) + "</button>").join("");
   const player = sources.length ? "<div class=\"source-list\" aria-label=\"媒体版本\">" + buttons + "</div><p class=\"player-status\" data-player-status role=\"status\"></p><video class=\"player\" controls preload=\"metadata\" data-player aria-label=\"播放 " + escapeHtml(item.title || item.name) + "\" src=\"/api/v1/items/" + encodeURIComponent(item.id) + "/stream?sourceId=" + encodeURIComponent(sources[0].id) + "\"></video>" : "";
   const favoriteLabel = playback.isFavorite ? "取消收藏" : "收藏";
   const playedLabel = playback.isPlayed ? "标记未看" : "标记已看";
   const userData = "<div class=\"chips\"><span class=\"chip\">" + (playback.isPlayed ? "已看" : "未看") + "</span>" + (playback.isFavorite ? "<span class=\"chip\">已收藏</span>" : "") + (playback.positionTicks ? "<span class=\"chip\">已播放 " + Math.round(playback.positionTicks / 10000000) + " 秒</span>" : "") + "</div>";
   const childrenPanel = children ? `<section class="children-panel" id="children-panel">${renderChildrenPanel(item, children)}</section>` : "";
-  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail">${backdrop}<div class="detail-art">${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2 style="margin-top:.6rem">${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><div class="form-actions"><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button><button class="button secondary" data-action="toggle-played" aria-pressed="${Boolean(playback.isPlayed)}">${playedLabel}</button></div>${childrenPanel}${renderAdminImages(item, images)}${renderAdminCandidates(item, candidates)}${player}</div></article>`;
+  return `<a class="back-link" href="#home" data-route="home">← 返回</a><article class="detail">${backdrop}<div class="detail-art">${poster(item, "detail-poster")}</div><div class="detail-copy"><span class="eyebrow">${escapeHtml(item.itemType || item.type || "media")}</span><h2>${escapeHtml(item.title || item.name)}</h2><div class="chips">${item.productionYear ? `<span class="chip">${item.productionYear}</span>` : ""}${chips}</div><div class="detail-facts">${detailFacts}</div>${userData}<p>${escapeHtml(item.overview || "暂无简介。")}</p><div class="form-actions"><button class="button secondary" data-action="toggle-favorite" aria-pressed="${Boolean(playback.isFavorite)}">${favoriteLabel}</button><button class="button secondary" data-action="toggle-played" aria-pressed="${Boolean(playback.isPlayed)}">${playedLabel}</button></div>${childrenPanel}${renderAdminImages(item, images)}${renderAdminCandidates(item, candidates)}${player}</div></article>`;
 }
 
 function renderAdminImages(item, images) {

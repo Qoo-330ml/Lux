@@ -208,6 +208,10 @@ td small { display: block; margin-top: .25rem; }
 .detail-copy { padding: .25rem 0 .25rem 1rem; }
 .detail-copy h2 { font-size: clamp(2rem, 5vw, 3.6rem); letter-spacing: -.04em; }
 .detail-copy > p { max-width: 65ch; }
+.detail-facts { display: flex; flex-wrap: wrap; gap: .8rem 1.2rem; margin: 1rem 0; }
+.detail-facts div { display: grid; gap: .15rem; min-width: 76px; }
+.detail-facts strong { font-size: .95rem; }
+.detail-facts span { color: var(--muted); font-size: .72rem; }
 .library-header { display: flex; align-items: end; justify-content: space-between; gap: 1rem; }
 .library-header > span { color: var(--muted); font-size: .85rem; }
 .library-header h2 { margin-top: .35rem; font-size: clamp(1.8rem, 4vw, 2.6rem); }
