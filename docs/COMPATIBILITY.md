@@ -7,7 +7,7 @@
 | 客户端 | 版本 | 平台/设备 | 添加服务器 | 登录 | 浏览/详情 | 播放 | 进度/收藏 | 字幕/多版本 | 证据/备注 |
 |---|---|---|---|---|---|---|---|---|---|
 | Infuse | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 待 LUX-025 |
-| VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 服务端路径已实现，真实客户端流程未复测 | 未测试 | 未测试 | 未测试 | 真实 UI 添加/登录成功；服务端 `Views/Resume` 有 ACL/续播测试 |
+| VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目详情通过 | 通过 | 部分通过 | 未测试 | 2026-08-03 本机 ARM64 独立实例真实 UI 流程通过；有效 MP4 播放、收藏/已观看状态通过，实际播放位置未观察到 |
 | SenPlayer | 6.0.6 | macOS arm64 | 通过 | 已添加，客户端读取失败 | 未测试 | 未测试 | 未测试 | 未测试 | 认证 HTTP 200 后客户端报“未能读取数据，数据已丢失”；项目所有者接受该边界 |
 | Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
 
@@ -33,6 +33,21 @@
 
 本次 VidHub 探针使用临时本机 ARM 服务 `127.0.0.1:18099`，未记录密码、token、Cookie、用户 ID 或真实媒体数据。
 
+## VidHub 最新 ARM64 实测（2026-08-03）
+
+VidHub 2.1.8（macOS arm64）连接本机独立 ARM64 实例 `http://127.0.0.1:18612`，服务端镜像为 `lux:arm64-local`（revision `83b5977`），使用临时媒体库和有效 MP4 夹具。真实 UI 流程如下：
+
+| 流程 | 结果 | 证据 |
+|---|---|---|
+| 添加服务器并登录 | 通过 | VidHub 显示 `Lux ARM64 Full Smoke Emby - http://127.0.0.1:18612` 并进入库首页 |
+| 媒体库浏览 | 通过 | 显示 `VidHub Smoke Movies` 和 `VidHub Valid 2024` |
+| 条目详情 | 通过 | 详情页显示标题、年份和播放入口 |
+| 本地 MP4 直放 | 通过 | VidHub 播放器进入 `VidHub Valid` 播放页面；初始 10 字节伪 MKV 的失败提示属于无效测试夹具，换成有效 MP4 后播放成功 |
+| 收藏/已观看 | 通过 | UI 开关操作后，Lux API 返回 `isFavorite=true`、`isPlayed=true`、`playCount=1` |
+| 播放位置上报 | 未观察 | 30 秒 MP4 播放并退出后，服务端 `positionTicks` 仍为 0；不把服务端接口测试当作真实客户端进度证据 |
+
+本次测试没有记录密码、token、Cookie 或真实媒体数据。字幕、多版本和 Infuse 仍未完成真实客户端实测。
+
 VidHub 2.1.8 登录后请求序列（动态用户 ID 已脱敏；这是服务端实现 `Views/Resume` 前的历史探针）：
 
 | 方法 | 路径 | 状态 | 结果 |
@@ -40,7 +55,7 @@ VidHub 2.1.8 登录后请求序列（动态用户 ID 已脱敏；这是服务端
 | GET | `/emby/Users/:userId/Views` | 404 | 未实现的媒体库视图路径 |
 | GET | `/emby/Users/:userId/Items/Resume` | 404 | 未实现的继续观看路径 |
 
-这组 404 只代表当时运行的服务端版本，不代表当前源码状态。当前源码已提供这两条路径；`tests/acl.rs` 覆盖 `Views`，`tests/resume_favorites.rs` 覆盖 `Items/Resume`。VidHub 真实客户端浏览/播放仍需在目标客户端上复测，不能由服务端测试替代。
+这组 404 只代表当时运行的服务端版本，不代表当前源码状态。当前源码已提供这两条路径；`tests/acl.rs` 覆盖 `Views`，`tests/resume_favorites.rs` 覆盖 `Items/Resume`。上述最新 ARM64 实测已补充真实客户端浏览、详情、播放和用户状态证据。
 
 SenPlayer 6.0.6 的实际结果：服务器已添加，但客户端重复请求 `POST /emby/Users/AuthenticateByName`，服务端均返回 `200`；客户端随后显示“未能读取数据，数据已丢失”，没有继续请求 `System/Info`。项目所有者已接受暂不为该客户端补齐未实现的后续媒体接口，作为已知阻塞记录。
 
