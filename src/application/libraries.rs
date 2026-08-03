@@ -33,16 +33,29 @@ impl LibraryService {
         kind: LibraryKind,
         realtime_watch_enabled: bool,
     ) -> Result<LibraryRecord, LibraryServiceError> {
+        self.create_library_with_scraper(name, kind, realtime_watch_enabled, None)
+            .await
+    }
+
+    pub async fn create_library_with_scraper(
+        &self,
+        name: &str,
+        kind: LibraryKind,
+        realtime_watch_enabled: bool,
+        scraper_id: Option<&str>,
+    ) -> Result<LibraryRecord, LibraryServiceError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 128 {
             return Err(LibraryServiceError::InvalidName);
         }
+        let scraper_id = normalize_scraper_id(scraper_id)?;
         let id = LibraryId::new();
         self.database
             .insert_library(NewLibrary {
                 id: &id.to_string(),
                 name,
                 kind: kind.as_str(),
+                scraper_id: scraper_id.as_deref(),
                 realtime_watch_enabled,
                 incremental_schedule: None,
                 reconciliation_schedule: None,
@@ -87,6 +100,7 @@ impl LibraryService {
         let incremental_schedule = normalize_schedule(settings.incremental_schedule)?;
         let reconciliation_schedule = normalize_schedule(settings.reconciliation_schedule)?;
         let metadata_schedule = normalize_schedule(settings.metadata_schedule)?;
+        let scraper_id = normalize_scraper_patch(settings.scraper_id)?;
 
         let updated = self
             .database
@@ -104,6 +118,7 @@ impl LibraryService {
                         .as_ref()
                         .map(|value| value.as_deref()),
                     metadata_schedule: metadata_schedule.as_ref().map(|value| value.as_deref()),
+                    scraper_id: scraper_id.as_ref().map(|value| value.as_deref()),
                     scan_concurrency: settings.scan_concurrency,
                     probe_concurrency: settings.probe_concurrency,
                 },
@@ -247,6 +262,7 @@ pub struct LibrarySettingsPatch {
     pub incremental_schedule: Option<Option<String>>,
     pub reconciliation_schedule: Option<Option<String>>,
     pub metadata_schedule: Option<Option<String>>,
+    pub scraper_id: Option<Option<String>>,
     pub scan_concurrency: Option<i64>,
     pub probe_concurrency: Option<i64>,
 }
@@ -274,6 +290,7 @@ pub enum LibraryServiceError {
     InvalidLibraryId(String),
     InvalidRootId(String),
     InvalidKind(String),
+    InvalidScraperId,
     LibraryNotFound,
     LibraryBusy,
     RootNotFound,
@@ -300,6 +317,7 @@ impl fmt::Display for LibraryServiceError {
             Self::InvalidLibraryId(error) => write!(formatter, "invalid library ID: {error}"),
             Self::InvalidRootId(error) => write!(formatter, "invalid library root ID: {error}"),
             Self::InvalidKind(error) => write!(formatter, "invalid library kind: {error}"),
+            Self::InvalidScraperId => formatter.write_str("invalid library scraper ID"),
             Self::LibraryNotFound => formatter.write_str("library not found"),
             Self::LibraryBusy => formatter.write_str("library has an active scan"),
             Self::RootNotFound => formatter.write_str("library root not found"),
@@ -327,6 +345,7 @@ impl std::error::Error for LibraryServiceError {
             | Self::InvalidLibraryId(_)
             | Self::InvalidRootId(_)
             | Self::InvalidKind(_)
+            | Self::InvalidScraperId
             | Self::LibraryNotFound
             | Self::LibraryBusy
             | Self::RootNotFound
@@ -342,6 +361,36 @@ fn validate_concurrency(value: Option<i64>) -> Result<(), LibraryServiceError> {
         return Err(LibraryServiceError::InvalidConcurrency);
     }
     Ok(())
+}
+
+fn normalize_scraper_id(value: Option<&str>) -> Result<Option<String>, LibraryServiceError> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.chars().count() > 64
+                || !value.chars().all(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || "-_.".contains(character)
+                })
+            {
+                Err(LibraryServiceError::InvalidScraperId)
+            } else {
+                Ok(value.to_owned())
+            }
+        })
+        .transpose()
+}
+
+fn normalize_scraper_patch(
+    value: Option<Option<String>>,
+) -> Result<Option<Option<String>>, LibraryServiceError> {
+    match value {
+        None => Ok(None),
+        Some(None) => Ok(Some(None)),
+        Some(Some(value)) => normalize_scraper_id(Some(&value)).map(Some),
+    }
 }
 
 fn normalize_schedule(

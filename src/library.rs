@@ -22,6 +22,7 @@ pub struct LibraryRecord {
     pub id: LibraryId,
     pub name: String,
     pub kind: LibraryKind,
+    pub scraper_id: Option<String>,
     pub is_enabled: bool,
     pub realtime_watch_enabled: bool,
     pub incremental_schedule: Option<String>,

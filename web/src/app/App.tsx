@@ -16,6 +16,7 @@ import { PlayerPage } from "../features/player/PlayerPage";
 import { AdminDashboardPage } from "../features/admin/AdminDashboardPage";
 import { AdminLayout } from "../features/admin/AdminLayout";
 import { AdminLibrariesPage } from "../features/admin/AdminLibrariesPage";
+import { AdminPluginsPage } from "../features/admin/AdminPluginsPage";
 import { AdminUsersPage } from "../features/admin/AdminUsersPage";
 import { AdminOperationsPage } from "../features/admin/AdminOperationsPage";
 import { AdminSettingsPage } from "../features/admin/AdminSettingsPage";
@@ -72,6 +73,7 @@ function AuthenticatedRoutes({ user }: { user: LuxUser }) {
         <Route path="admin" element={user.canManageServer ? <AdminLayout /> : <Navigate to="/" replace />}>
           <Route index element={<AdminDashboardPage />} />
           <Route path="libraries" element={<AdminLibrariesPage />} />
+          <Route path="plugins" element={<AdminPluginsPage />} />
           <Route path="users" element={<AdminUsersPage />} />
           <Route path="jobs" element={<AdminOperationsPage />} />
           <Route path="settings" element={<AdminSettingsPage />} />

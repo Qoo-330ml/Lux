@@ -8,6 +8,7 @@ pub mod libraries;
 pub mod metadata;
 pub mod nfo;
 pub mod playback;
+pub mod plugins;
 pub mod probe;
 pub mod reidentify;
 pub mod scanner;

@@ -8,6 +8,7 @@ import type {
   AdminSettings,
   AdminUser,
   AdminMetadataCandidate,
+  AdminPlugin,
   ApiErrorBody,
   HomeResponse,
   Library,
@@ -156,7 +157,20 @@ export class LuxApiClient {
     return this.request<{ libraries?: AdminLibrary[] }>("/api/v1/admin/libraries");
   }
 
-  createAdminLibrary(input: { name: string; kind: string; realtimeWatchEnabled: boolean }) {
+  adminPlugins() {
+    return this.request<{ plugins?: AdminPlugin[]; total?: number; page?: number; pageSize?: number }>(
+      "/api/v1/admin/plugins?page=1&pageSize=50",
+    );
+  }
+
+  installAdminPlugin(pluginId: string) {
+    return this.request<{ plugin: AdminPlugin }>(
+      `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/install`,
+      { method: "POST" },
+    );
+  }
+
+  createAdminLibrary(input: { name: string; kind: string; realtimeWatchEnabled: boolean; scraperId?: string | null }) {
     return this.request<{ library: AdminLibrary }>("/api/v1/admin/libraries", {
       method: "POST",
       body: JSON.stringify(input),

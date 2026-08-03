@@ -1,9 +1,10 @@
-import { Activity, ChevronLeft, Database, FileClock, Image, Settings2, ShieldCheck, Users } from "lucide-react";
+import { Activity, ChevronLeft, Database, FileClock, Image, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
 import { Link, NavLink, Outlet } from "react-router-dom";
 
 const adminNav = [
   { to: "/admin", label: "仪表盘", icon: Activity, end: true },
   { to: "/admin/libraries", label: "媒体库", icon: Database },
+  { to: "/admin/plugins", label: "插件库", icon: PackageOpen },
   { to: "/admin/users", label: "用户与权限", icon: Users },
   { to: "/admin/jobs", label: "任务与日志", icon: FileClock },
   { to: "/admin/metadata", label: "元数据纠错", icon: Image },

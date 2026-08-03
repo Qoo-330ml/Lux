@@ -14,6 +14,7 @@ pub enum ApiErrorCode {
     LibraryRootOverlap,
     NotFound,
     PermissionDenied,
+    PluginUnavailable,
     InvalidCredentials,
     SetupAlreadyCompleted,
 }
@@ -32,6 +33,7 @@ impl ApiErrorCode {
             Self::LibraryRootOverlap => "LIBRARY_ROOT_OVERLAP",
             Self::NotFound => "NOT_FOUND",
             Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::PluginUnavailable => "PLUGIN_UNAVAILABLE",
             Self::InvalidCredentials => "INVALID_CREDENTIALS",
             Self::SetupAlreadyCompleted => "SETUP_ALREADY_COMPLETED",
         }

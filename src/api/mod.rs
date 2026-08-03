@@ -47,6 +47,7 @@ use crate::{
             ImageError, ImageService, ImageWriteError, ImageWriteService, normalize_image_type,
         },
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
+        plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
         settings::{read_tmdb_token, write_tmdb_token},
@@ -86,6 +87,7 @@ pub struct AppState {
     metadata_reidentify: Option<MetadataReidentifyService>,
     probe: Option<MediaProbeService>,
     scan_jobs: Option<ScanJobService>,
+    plugins: Option<PluginService>,
     tmdb: Option<TmdbClient>,
     collections: Option<CollectionService>,
     remote_access: RemoteAccessPolicy,
@@ -101,12 +103,13 @@ impl AppState {
         emby_auth: EmbyAuthService,
     ) -> Self {
         let server_id = database.server_id().to_owned();
+        let config_dir = config.config_dir.clone();
         let access = MediaAccessService::new(database.clone());
         let image_writes = ImageWriteService::new(database.clone()).ok();
         let metadata_selection = image_writes
             .clone()
             .map(|images| MetadataSelectionService::new(database.clone(), images));
-        let tmdb = TmdbClient::from_env_or_token(read_tmdb_token(&config.config_dir)).ok();
+        let tmdb = TmdbClient::from_env_or_token(read_tmdb_token(&config_dir)).ok();
         let collections = tmdb
             .clone()
             .map(|tmdb| CollectionService::new(database.clone(), tmdb));
@@ -115,7 +118,7 @@ impl AppState {
             .map(|tmdb| MetadataReidentifyService::new(database.clone(), tmdb));
         Self {
             database: Some(database.clone()),
-            config_dir: Some(config.config_dir),
+            config_dir: Some(config_dir.clone()),
             server_id,
             setup: Some(setup),
             auth: Some(auth),
@@ -133,6 +136,7 @@ impl AppState {
                 FfprobeRunner::default(),
             )),
             scan_jobs: Some(ScanJobService::new(database.clone())),
+            plugins: Some(PluginService::new(database.clone(), config_dir)),
             tmdb,
             collections,
             remote_access: RemoteAccessPolicy::from_env(),
@@ -184,6 +188,11 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries/{library_id}",
             patch(admin_update_library).delete(admin_delete_library),
+        )
+        .route("/api/v1/admin/plugins", get(admin_list_plugins))
+        .route(
+            "/api/v1/admin/plugins/{plugin_id}/install",
+            post(admin_install_plugin),
         )
         .route(
             "/api/v1/admin/users",
@@ -4209,6 +4218,7 @@ struct CreateLibraryRequest {
     kind: String,
     #[serde(default)]
     realtime_watch_enabled: bool,
+    scraper_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4229,6 +4239,8 @@ struct UpdateLibraryRequest {
     reconciliation_schedule: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     metadata_schedule: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    scraper_id: Option<Option<String>>,
     scan_concurrency: Option<i64>,
     probe_concurrency: Option<i64>,
 }
@@ -6071,6 +6083,104 @@ fn metadata_candidate_error(headers: &HeaderMap, error: MetadataCandidateError) 
     }
 }
 
+async fn admin_list_plugins(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(plugins) = state.plugins.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match plugins.list(offset, limit, state.tmdb.is_some()).await {
+        Ok(page) => Json(plugin_page_json(&page)).into_response(),
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
+async fn admin_install_plugin(
+    headers: HeaderMap,
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match plugins.install(&plugin_id, state.tmdb.is_some()).await {
+        Ok(result) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PLUGIN_INSTALLED",
+                Some("plugin"),
+                Some(&plugin_id),
+                "{}",
+            )
+            .await;
+            let status = if result.was_installed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            (
+                status,
+                Json(json!({ "plugin": plugin_json(&result.plugin) })),
+            )
+                .into_response()
+        }
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
+async fn validate_scraper_selection(
+    headers: &HeaderMap,
+    state: &AppState,
+    scraper_id: Option<&str>,
+) -> Result<(), Response> {
+    let Some(plugins) = state.plugins.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response());
+    };
+    plugins
+        .validate_selection(scraper_id, state.tmdb.is_some())
+        .await
+        .map_err(|error| plugin_error(headers, error).into_response())
+}
+
 async fn admin_create_library(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -6088,6 +6198,11 @@ async fn admin_create_library(
         )
         .into_response();
     };
+    if let Err(response) =
+        validate_scraper_selection(&headers, &state, request.scraper_id.as_deref()).await
+    {
+        return response;
+    }
     let kind = match request.kind.parse::<LibraryKind>() {
         Ok(kind) => kind,
         Err(_error) => {
@@ -6101,7 +6216,12 @@ async fn admin_create_library(
         }
     };
     match libraries
-        .create_library(&request.name, kind, request.realtime_watch_enabled)
+        .create_library_with_scraper(
+            &request.name,
+            kind,
+            request.realtime_watch_enabled,
+            request.scraper_id.as_deref(),
+        )
         .await
     {
         Ok(library) => {
@@ -6349,7 +6469,8 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
         | LibraryServiceError::InvalidConcurrency
         | LibraryServiceError::InvalidLibraryId(_)
         | LibraryServiceError::InvalidRootId(_)
-        | LibraryServiceError::InvalidKind(_) => (
+        | LibraryServiceError::InvalidKind(_)
+        | LibraryServiceError::InvalidScraperId => (
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "媒体库请求无效",
@@ -6402,11 +6523,60 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
     api_error(headers, status, code, message).into_response()
 }
 
+fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
+    match error {
+        PluginServiceError::UnknownPlugin(_) => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "插件不存在",
+        )
+        .into_response(),
+        PluginServiceError::Unavailable(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            "插件尚未安装或配置完成",
+        )
+        .into_response(),
+        PluginServiceError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+fn plugin_page_json(page: &PluginPage) -> Value {
+    json!({
+        "plugins": page.plugins.iter().map(plugin_json).collect::<Vec<_>>(),
+        "total": page.total,
+        "page": page.offset / page.limit + 1,
+        "pageSize": page.limit,
+    })
+}
+
+fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
+    json!({
+        "id": plugin.id,
+        "name": plugin.name,
+        "description": plugin.description,
+        "installed": plugin.installed,
+        "enabled": plugin.enabled,
+        "configured": plugin.configured,
+        "available": plugin.available,
+        "unavailableReason": plugin.unavailable_reason,
+    })
+}
+
 fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
     json!({
         "id": library.id.to_string(),
         "name": library.name,
         "kind": library.kind.as_str(),
+        "scraperId": library.scraper_id,
         "isEnabled": library.is_enabled,
         "realtimeWatchEnabled": library.realtime_watch_enabled,
         "incrementalSchedule": library.incremental_schedule,

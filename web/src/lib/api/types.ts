@@ -84,6 +84,7 @@ export type AdminRoot = {
 };
 
 export type AdminLibrary = Library & {
+  scraperId?: string | null;
   isEnabled: boolean;
   realtimeWatchEnabled: boolean;
   incrementalSchedule?: string | null;
@@ -93,6 +94,17 @@ export type AdminLibrary = Library & {
   probeConcurrency?: number;
   lastScanAt?: string | null;
   roots: AdminRoot[];
+};
+
+export type AdminPlugin = {
+  id: string;
+  name: string;
+  description: string;
+  installed: boolean;
+  enabled: boolean;
+  configured: boolean;
+  available: boolean;
+  unavailableReason?: string | null;
 };
 
 export type AdminUser = LuxUser & {

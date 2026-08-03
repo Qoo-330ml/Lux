@@ -36,8 +36,8 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 以下接口要求有效 Web session；写操作还要求 `X-CSRF-Token`，并检查当前用户的 `canManageServer` 权限：
 
 - `GET /api/v1/admin/libraries`：列出媒体库及其根路径。
-- `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`。
-- `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时监听开关、增量/调和/元数据计划和扫描/探测并发。字段均可省略；计划使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。例如 `{ "realtimeWatchEnabled": true, "incrementalSchedule": "interval:30s", "scanConcurrency": 4 }`。修改无需重启，下一次任务读取最新配置。
+- `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false, "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；`scraperId` 可省略或为 `null`，表示只使用本地元数据。
+- `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时监听开关、增量/调和/元数据计划、扫描/探测并发和 `scraperId`。字段均可省略；计划和 `scraperId` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。例如 `{ "scraperId": "tmdb", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
@@ -49,6 +49,16 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）和 `resumeMinTicks`（非负）。写操作需要管理员 Web session 和 CSRF。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、配置目录实际写入能力、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，支持 `page`、`pageSize`、`level` 和 `eventCode` 筛选。
+
+## 内置插件与刮削器（LUX-140）
+
+以下接口要求 `canManageServer`；POST 还要求 `X-CSRF-Token`：
+
+- `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回已编译的插件目录及 `installed`、`configured`、`available` 状态。首版目录包含 `tmdb`。
+- `POST /api/v1/admin/plugins/{pluginId}/install`：安装/启用内置插件，首次安装返回 201，重复请求返回 200。未知插件返回 404。
+- 未安装、未配置或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
+
+插件不会从网络下载或加载任意代码。TMDb Read Access Token 只存在配置目录，不出现在插件 API、媒体库 API 或日志中。
 
 ## 元数据候选管理（LUX-053）
 

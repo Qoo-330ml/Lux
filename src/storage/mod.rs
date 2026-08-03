@@ -527,8 +527,8 @@ impl Database {
             "INSERT INTO libraries (
                 id, name, kind, is_enabled, realtime_watch_enabled,
                 incremental_schedule, reconciliation_schedule, metadata_schedule,
-                scan_concurrency, probe_concurrency
-            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                scan_concurrency, probe_concurrency, scraper_id
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(library.id)
         .bind(library.name)
@@ -539,6 +539,7 @@ impl Database {
         .bind(library.metadata_schedule)
         .bind(library.scan_concurrency)
         .bind(library.probe_concurrency)
+        .bind(library.scraper_id)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -552,7 +553,7 @@ impl Database {
         sqlx::query(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
-                    scan_concurrency, probe_concurrency, last_scan_at
+                    scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
              FROM libraries ORDER BY name, id",
         )
         .fetch_all(&self.pool)
@@ -571,6 +572,7 @@ impl Database {
                     scan_concurrency: row.get("scan_concurrency"),
                     probe_concurrency: row.get("probe_concurrency"),
                     last_scan_at: row.get("last_scan_at"),
+                    scraper_id: row.get("scraper_id"),
                 })
                 .collect()
         })
@@ -587,7 +589,7 @@ impl Database {
         sqlx::query(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
-                    scan_concurrency, probe_concurrency, last_scan_at
+                    scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
              FROM libraries WHERE id = ?",
         )
         .bind(id)
@@ -606,6 +608,7 @@ impl Database {
                 scan_concurrency: row.get("scan_concurrency"),
                 probe_concurrency: row.get("probe_concurrency"),
                 last_scan_at: row.get("last_scan_at"),
+                scraper_id: row.get("scraper_id"),
             })
         })
         .map_err(|source| StorageError::Sqlx {
@@ -785,6 +788,21 @@ impl Database {
                 source,
             })?;
         }
+        if let Some(value) = settings.scraper_id {
+            sqlx::query(
+                "UPDATE libraries
+                 SET scraper_id = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         if let Some(value) = settings.scan_concurrency {
             sqlx::query(
                 "UPDATE libraries
@@ -913,6 +931,41 @@ impl Database {
                 version: row.get("version"),
             })
         })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn is_plugin_installed(&self, plugin_id: &str) -> Result<bool, StorageError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM installed_plugins
+                WHERE plugin_id = ? AND is_enabled = 1
+            )",
+        )
+        .bind(plugin_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn install_plugin(&self, plugin_id: &str) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO installed_plugins (plugin_id, is_enabled)
+             VALUES (?, 1)
+             ON CONFLICT(plugin_id) DO UPDATE SET
+                is_enabled = 1,
+                updated_at = unixepoch()",
+        )
+        .bind(plugin_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -4336,6 +4389,7 @@ pub(crate) struct StoredLibrary {
     pub(crate) scan_concurrency: i64,
     pub(crate) probe_concurrency: i64,
     pub(crate) last_scan_at: Option<i64>,
+    pub(crate) scraper_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -4845,6 +4899,7 @@ pub(crate) struct NewLibrary<'a> {
     pub(crate) metadata_schedule: Option<&'a str>,
     pub(crate) scan_concurrency: i64,
     pub(crate) probe_concurrency: i64,
+    pub(crate) scraper_id: Option<&'a str>,
 }
 
 pub(crate) struct MediaMetadataUpdate<'a> {
@@ -4881,6 +4936,7 @@ pub(crate) struct LibrarySettingsUpdate<'a> {
     pub(crate) metadata_schedule: Option<Option<&'a str>>,
     pub(crate) scan_concurrency: Option<i64>,
     pub(crate) probe_concurrency: Option<i64>,
+    pub(crate) scraper_id: Option<Option<&'a str>>,
 }
 
 pub(crate) struct NewLibraryRoot<'a> {
