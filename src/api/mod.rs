@@ -160,6 +160,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/", get(web_index))
         .route("/app.mjs", get(web_app))
         .route("/request-options.mjs", get(web_request_options))
+        .route("/admin-navigation.mjs", get(web_admin_navigation))
         .route("/styles.css", get(web_styles))
         .route("/logo.svg", get(web_logo))
         .route("/health/live", get(live))
@@ -418,6 +419,13 @@ async fn web_request_options() -> Response {
     static_response(
         "text/javascript; charset=utf-8",
         include_str!("../../web/src/request-options.mjs"),
+    )
+}
+
+async fn web_admin_navigation() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../../web/src/admin-navigation.mjs"),
     )
 }
 

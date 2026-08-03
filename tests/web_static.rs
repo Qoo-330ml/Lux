@@ -29,6 +29,12 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     let script_body = script.text().await?;
     assert!(script_body.contains("/api/v1/auth/login"));
     assert!(script_body.contains("request-options.mjs"));
+    let admin_navigation = client
+        .get(format!("{base_url}/admin-navigation.mjs"))
+        .send()
+        .await?;
+    assert_eq!(admin_navigation.status(), StatusCode::OK);
+    assert!(admin_navigation.text().await?.contains("ADMIN_NAV_ITEMS"));
     assert!(script_body.contains("/logo.svg"));
     let request_options = client
         .get(format!("{base_url}/request-options.mjs"))
