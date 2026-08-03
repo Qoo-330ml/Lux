@@ -1,7 +1,7 @@
 import { requestOptions } from "./request-options.mjs";
 
 const app = document.querySelector("#app");
-const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "", drawerOpen: false };
+const state = { user: null, initialized: true, libraries: [], home: null, admin: null, route: "home", libraryId: "", libraryFilters: {}, libraryPage: 1, searchPage: 1, item: null, itemImages: [], itemCandidates: [], playback: null, children: null, error: "", notice: "", setupNotice: "", drawerOpen: false };
 
 const api = {
   async request(path, options = {}) {
@@ -20,13 +20,13 @@ const api = {
   revokeSession(id) { return this.request("/api/v1/auth/sessions/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
   home() { return this.request("/api/v1/home"); },
   libraries() { return this.request("/api/v1/libraries"); },
-  libraryItems(id, filters = {}) { const params = new URLSearchParams({ page: "1", pageSize: "60" }); Object.entries(filters).forEach(([key, value]) => { if (value !== "" && value !== null && value !== undefined) params.set(key, String(value)); }); return this.request("/api/v1/libraries/" + encodeURIComponent(id) + "/items?" + params.toString()); },
+  libraryItems(id, filters = {}) { const params = new URLSearchParams({ page: String(filters.page || 1), pageSize: String(filters.pageSize || 24) }); Object.entries(filters).forEach(([key, value]) => { if (!["page", "pageSize"].includes(key) && value !== "" && value !== null && value !== undefined) params.set(key, String(value)); }); return this.request("/api/v1/libraries/" + encodeURIComponent(id) + "/items?" + params.toString()); },
   item(id) { return this.request("/api/v1/items/" + encodeURIComponent(id)); },
   children(id, filters = {}) { const params = new URLSearchParams({ page: "1", pageSize: "60" }); Object.entries(filters).forEach(([key, value]) => { if (value !== "" && value !== null && value !== undefined) params.set(key, String(value)); }); return this.request("/api/v1/items/" + encodeURIComponent(id) + "/children?" + params.toString()); },
   playback(id) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/playback"); },
   favorite(id, favorite) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/favorite", { method: "PUT", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ favorite }) }); },
   played(id, played) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/played", { method: "PUT", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ played }) }); },
-  search(query) { return this.request("/api/v1/search?q=" + encodeURIComponent(query) + "&page=1&pageSize=60"); },
+  search(query, page = 1) { return this.request("/api/v1/search?q=" + encodeURIComponent(query) + "&page=" + encodeURIComponent(page) + "&pageSize=24"); },
   adminUsers() { return this.request("/api/v1/admin/users"); },
   createUser(data) { return this.request("/api/v1/admin/users", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
   disableUser(id) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
@@ -111,7 +111,9 @@ function nav() {
   const homeCurrent = state.route === "home" ? "page" : "false";
   const libraryCurrent = state.route === "libraries" ? "page" : "false";
   const admin = state.user.canManageServer ? "<button data-route=\"admin\" aria-current=\"" + (state.route === "admin" ? "page" : "false") + "\"><span class=\"nav-glyph\">⚙</span><span>管理</span></button>" : "";
-  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\"><span class=\"nav-glyph\">⌂</span><span>首页</span></button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\"><span class=\"nav-glyph\">▦</span><span>媒体库</span></button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\"><span class=\"nav-glyph\">◉</span><span>账户</span></button>" + admin + "</nav>";
+  const libraries = state.home?.libraries || state.libraries;
+  const libraryLinks = libraries.length ? "<div class=\"nav-group\"><span class=\"nav-group-label\">媒体库</span>" + libraries.map((library) => "<button class=\"nav-library\" data-library=\"" + escapeHtml(library.id) + "\" aria-current=\"" + (state.route === "library" && state.libraryId === library.id ? "page" : "false") + "\"><span class=\"nav-glyph\">" + (library.kind === "SERIES" ? "▤" : "▣") + "</span><span>" + escapeHtml(library.name) + "</span></button>").join("") + "</div>" : "";
+  return "<nav class=\"nav\" aria-label=\"主导航\"><button data-route=\"home\" aria-current=\"" + homeCurrent + "\"><span class=\"nav-glyph\">⌂</span><span>首页</span></button><button data-route=\"libraries\" aria-current=\"" + libraryCurrent + "\"><span class=\"nav-glyph\">▦</span><span>媒体库</span></button><button data-route=\"account\" aria-current=\"" + (state.route === "account" ? "page" : "false") + "\"><span class=\"nav-glyph\">◉</span><span>账户</span></button>" + admin + libraryLinks + "</nav>";
 }
 function account() {
   return "<div class=\"sidebar-footer\"><span class=\"sidebar-label\">当前账户</span><strong>" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</strong><button class=\"button secondary sidebar-action\" data-route=\"account\">账户与会话</button><button class=\"button secondary sidebar-action\" data-action=\"logout\">退出登录</button></div>";
@@ -148,12 +150,12 @@ async function loadRoute() {
       view.innerHTML = renderLibraries();
     } else if (state.route === "library") {
       state.libraries = state.libraries.length ? state.libraries : (await api.libraries()).libraries || [];
-      const result = await api.libraryItems(state.libraryId, state.libraryFilters);
+      const result = await api.libraryItems(state.libraryId, { ...state.libraryFilters, page: state.libraryPage });
       const library = state.libraries.find((entry) => entry.id === state.libraryId);
       view.innerHTML = renderLibraryItems(result, library);
     } else if (state.route === "search") {
-      const result = await api.search(state.query);
-      view.innerHTML = renderGrid(result.items || [], "搜索“" + escapeHtml(state.query) + "”");
+      const result = await api.search(state.query, state.searchPage);
+      view.innerHTML = "<section class=\"section\">" + renderGrid(result.items || [], "搜索“" + escapeHtml(state.query) + "”") + renderPagination(result, "search-page", "搜索结果翻页") + "</section>";
     } else if (state.route === "item") {
       state.item = await api.item(state.itemId);
       if (state.user?.canManageServer) {
@@ -210,7 +212,7 @@ function renderLibraryItems(result, library) {
   const filters = state.libraryFilters || {};
   const selected = (name, value) => filters[name] === value ? " selected" : "";
   const form = `<form class="filter-form" data-action="library-filter"><label>类型 <select name="item_type"><option value="">全部</option><option value="movie"${selected("item_type", "movie")}>电影</option><option value="series"${selected("item_type", "series")}>剧集</option><option value="episode"${selected("item_type", "episode")}>单集</option></select></label><label>年份 <input name="year" type="number" min="1800" max="2200" value="${escapeHtml(filters.year || "")}" placeholder="2024"></label><label>观看 <select name="is_played"><option value="">全部</option><option value="true"${selected("is_played", "true")}>已看</option><option value="false"${selected("is_played", "false")}>未看</option></select></label><label>收藏 <select name="is_favorite"><option value="">全部</option><option value="true"${selected("is_favorite", "true")}>已收藏</option><option value="false"${selected("is_favorite", "false")}>未收藏</option></select></label><label>排序 <select name="sort_by"><option value="">名称</option><option value="DateCreated"${selected("sort_by", "DateCreated")}>最近添加</option></select></label><label>顺序 <select name="sort_order"><option value="Ascending"${selected("sort_order", "Ascending")}>正序</option><option value="Descending"${selected("sort_order", "Descending")}>倒序</option></select></label><button class="button" type="submit">应用筛选</button><button class="button secondary" type="button" data-action="clear-library-filter">清除</button></form>`;
-  return "<section class=\"section\"><div class=\"library-header\"><div><span class=\"eyebrow\">Library</span><h2>" + escapeHtml(library?.name || "媒体库") + "</h2></div><span>" + (result.total || 0) + " 项</span></div><div class=\"library-toolbar\">" + form + "</div>" + renderGrid(result.items || []) + "</section>";
+  return "<section class=\"section\"><div class=\"library-header\"><div><span class=\"eyebrow\">Library</span><h2>" + escapeHtml(library?.name || "媒体库") + "</h2></div><span>" + (result.total || 0) + " 项</span></div><div class=\"library-toolbar\">" + form + "</div>" + renderGrid(result.items || []) + renderPagination(result, "library-page", "媒体库翻页") + "</section>";
 }
 function renderGrid(items, heading = "") {
   const title = heading ? "<div class=\"section-heading\" style=\"grid-column:1/-1\"><h2>" + heading + "</h2><span>" + items.length + " 项</span></div>" : "";
@@ -220,6 +222,14 @@ function renderGrid(items, heading = "") {
 function renderRail(items) {
   const content = items.length ? items.map(mediaCard).join("") : "<div class=\"empty\"><h3>没有找到内容</h3><p>试试其他关键词或筛选条件。</p></div>";
   return "<div class=\"media-rail\">" + content + "</div>";
+}
+function renderPagination(result, action, label) {
+  const page = Number(result.page || 1);
+  const pageSize = Number(result.pageSize || 24);
+  const total = Number(result.total || 0);
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  if (pageCount <= 1) return "";
+  return `<nav class="pagination" aria-label="${escapeHtml(label)}"><button class="button secondary" type="button" data-${action}="${page - 1}"${page <= 1 ? " disabled" : ""}>上一页</button><span>第 ${page} / ${pageCount} 页</span><button class="button secondary" type="button" data-${action}="${page + 1}"${page >= pageCount ? " disabled" : ""}>下一页</button></nav>`;
 }
 function mediaCard(item) {
   const userData = item.userData || {};
@@ -348,7 +358,7 @@ function bind() {
   document.querySelectorAll("[data-action='close-drawer']").forEach((element) => element.addEventListener("click", () => { state.drawerOpen = false; render(); }));
   document.querySelectorAll("[data-route]").forEach((element) => element.addEventListener("click", (event) => { event.preventDefault(); state.route = element.dataset.route; state.drawerOpen = false; state.error = ""; render(); }));
   document.querySelectorAll("[data-library]").forEach((element) => element.addEventListener("click", async () => {
-    state.libraryId = element.dataset.library; state.libraryFilters = {}; state.route = "library"; state.error = ""; state.notice = ""; render();
+    state.libraryId = element.dataset.library; state.libraryFilters = {}; state.libraryPage = 1; state.route = "library"; state.error = ""; state.notice = ""; render();
   }));
   document.querySelectorAll("[data-item]").forEach((element) => element.addEventListener("click", () => { state.itemId = element.dataset.item; state.route = "item"; state.error = ""; render(); }));
   document.querySelectorAll("[data-source]").forEach((element) => element.addEventListener("click", () => {
@@ -361,9 +371,11 @@ function bind() {
   document.querySelectorAll("form[data-action='library-filter']").forEach((form) => form.addEventListener("submit", (event) => {
     event.preventDefault();
     state.libraryFilters = Object.fromEntries(["item_type", "year", "is_played", "is_favorite", "sort_by", "sort_order"].map((name) => [name, form[name].value]).filter(([, value]) => value));
-    state.route = "library"; state.error = ""; state.notice = ""; render();
+    state.libraryPage = 1; state.route = "library"; state.error = ""; state.notice = ""; render();
   }));
-  document.querySelectorAll("[data-action='clear-library-filter']").forEach((element) => element.addEventListener("click", () => { state.libraryFilters = {}; state.route = "library"; state.error = ""; state.notice = ""; render(); }));
+  document.querySelectorAll("[data-action='clear-library-filter']").forEach((element) => element.addEventListener("click", () => { state.libraryFilters = {}; state.libraryPage = 1; state.route = "library"; state.error = ""; state.notice = ""; render(); }));
+  document.querySelectorAll("[data-library-page]").forEach((element) => element.addEventListener("click", () => { state.libraryPage = Number(element.dataset.libraryPage); state.error = ""; render(); }));
+  document.querySelectorAll("[data-search-page]").forEach((element) => element.addEventListener("click", () => { state.searchPage = Number(element.dataset.searchPage); state.error = ""; render(); }));
   document.querySelectorAll("[data-action='toggle-favorite']").forEach((element) => element.addEventListener("click", async () => {
     try { await api.favorite(state.item.id, !state.playback?.isFavorite); state.notice = state.playback?.isFavorite ? "已取消收藏。" : "已加入收藏。"; state.error = ""; render(); }
     catch (error) { state.error = error.message; state.notice = ""; render(); }
@@ -546,7 +558,7 @@ function bind() {
   }));
   document.querySelectorAll("form[data-action='search']").forEach((form) => form.addEventListener("submit", (event) => {
     event.preventDefault(); const query = field(form, "q").value.trim(); if (!query) return;
-    state.query = query; state.route = "search"; state.error = ""; state.notice = ""; render();
+    state.query = query; state.searchPage = 1; state.route = "search"; state.error = ""; state.notice = ""; render();
   }));
 }
 
