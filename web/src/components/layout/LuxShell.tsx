@@ -20,19 +20,22 @@ export function LuxShell({ user }: LuxShellProps) {
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
   const isDetail = location.pathname.startsWith("/libraries/");
+  const showBackButton = location.pathname !== "/";
 
   return (
     <div className="lux-app">
       <header className="lux-header">
         <div className="lux-header-left">
-          <button
-            className="lux-icon-button lux-back-button"
-            type="button"
-            aria-label="返回"
-            onClick={() => navigate(-1)}
-          >
-            <ChevronLeft size={22} strokeWidth={1.8} />
-          </button>
+          {showBackButton ? (
+            <button
+              className="lux-icon-button lux-back-button"
+              type="button"
+              aria-label="返回"
+              onClick={() => navigate(-1)}
+            >
+              <ChevronLeft size={22} strokeWidth={1.8} />
+            </button>
+          ) : null}
           <NavLink className="lux-brand" to="/" aria-label="Lux 首页">
             <span className="lux-brand-mark" aria-hidden="true">
               <Sparkles size={19} strokeWidth={1.6} />
