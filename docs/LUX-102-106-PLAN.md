@@ -26,5 +26,11 @@
 
 验证：`cargo test --locked --test reidentify --test libraries_api --test users --test images` 覆盖批量任务、媒体库/任务管理和图片列举删除；`node --check web/src/app.mjs` 通过。
 
+## 管理控制台导航调整
+
+- 管理员点击“管理”后，侧边栏展开管理子导航并进入仪表盘。
+- 管理子导航分为：仪表盘、媒体库与计划、用户与权限、任务与日志、元数据与图片、服务端设置。
+- 点击子项只展示对应管理分区；管理权限仍由 `canManageServer` 服务端校验，普通用户不显示管理入口。
+
 管理员脚本运行示例：
 `LUX_E2E_BASE_URL=http://127.0.0.1:18506 LUX_E2E_ADMIN_USERNAME=admin LUX_E2E_ADMIN_PASSWORD='…' LUX_E2E_MEDIA_ROOT='/media' NODE_PATH='<bundled-node-modules>' node scripts/admin-smoke.mjs`
