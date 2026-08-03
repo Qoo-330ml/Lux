@@ -46,6 +46,20 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'alpha movie'")
             .fetch_one(database.pool())
             .await?;
+    let beta_item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'beta movie'")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
+        .bind(100_i64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
+        .bind(200_i64)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
 
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -134,6 +148,29 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .await?;
     assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
 
+    let viewer_web_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "viewer", "password": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(viewer_web_login.headers(), "lux_session"),
+        cookie_value(viewer_web_login.headers(), "lux_csrf")
+    );
+    let viewer_home = client
+        .get(format!("{base_url}/api/v1/home"))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(viewer_home.status(), reqwest::StatusCode::OK);
+    let viewer_home_body: Value = viewer_home.json().await?;
+    assert_eq!(viewer_home_body["recentlyAddedTotal"], 0);
+    assert_eq!(
+        viewer_home_body["libraries"].as_array().map(Vec::len),
+        Some(0)
+    );
+
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))
@@ -167,6 +204,8 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let home_body: Value = home.json().await?;
     assert_eq!(home_body["recentlyAddedTotal"], 2);
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
+    assert_eq!(home_body["recentlyAdded"][0]["title"], "Beta Movie");
+    assert_eq!(home_body["recentlyAdded"][1]["title"], "Alpha Movie");
 
     let lux_detail = client
         .get(format!("{base_url}/api/v1/items/{item_id}"))
