@@ -100,6 +100,12 @@ impl LibraryService {
         let incremental_schedule = normalize_schedule(settings.incremental_schedule)?;
         let reconciliation_schedule = normalize_schedule(settings.reconciliation_schedule)?;
         let metadata_schedule = normalize_schedule(settings.metadata_schedule)?;
+        let name = settings
+            .name
+            .as_deref()
+            .map(normalize_library_name)
+            .transpose()?;
+        let kind = settings.kind.map(LibraryKind::as_str);
         let scraper_id = normalize_scraper_patch(settings.scraper_id)?;
 
         let updated = self
@@ -439,6 +445,10 @@ fn stored_library(stored: StoredLibrary) -> Result<LibraryRecord, LibraryService
         id,
         name: stored.name,
         kind,
+        cover_image_path: stored.cover_image_path,
+        cover_image_content_type: stored.cover_image_content_type,
+        cover_image_size: stored.cover_image_size,
+        cover_image_tag: stored.cover_image_tag,
         is_enabled: stored.is_enabled,
         realtime_watch_enabled: stored.realtime_watch_enabled,
         incremental_schedule: stored.incremental_schedule,

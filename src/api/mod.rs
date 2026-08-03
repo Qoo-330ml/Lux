@@ -7,8 +7,8 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::{Body, to_bytes},
-    extract::{ConnectInfo, Path, Query, State},
+    body::{Body, Bytes, to_bytes},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode,
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
@@ -47,6 +47,7 @@ use crate::{
             ImageError, ImageService, ImageWriteError, ImageWriteService, normalize_image_type,
         },
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
+        library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
@@ -81,6 +82,7 @@ pub struct AppState {
     catalog: Option<CatalogService>,
     images: Option<ImageService>,
     image_writes: Option<ImageWriteService>,
+    library_covers: Option<LibraryCoverService>,
     access: Option<MediaAccessService>,
     metadata_candidates: Option<MetadataCandidateService>,
     metadata_selection: Option<MetadataSelectionService>,
@@ -106,6 +108,10 @@ impl AppState {
         let config_dir = config.config_dir.clone();
         let access = MediaAccessService::new(database.clone());
         let image_writes = ImageWriteService::new(database.clone()).ok();
+        let library_covers = Some(LibraryCoverService::new(
+            database.clone(),
+            config.config_dir.join("library-covers"),
+        ));
         let metadata_selection = image_writes
             .clone()
             .map(|images| MetadataSelectionService::new(database.clone(), images));
@@ -127,6 +133,7 @@ impl AppState {
             catalog: Some(CatalogService::new(database.clone(), access.clone())),
             images: Some(ImageService::new(database.clone(), access.clone())),
             image_writes,
+            library_covers,
             access: Some(access),
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
@@ -188,6 +195,11 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries/{library_id}",
             patch(admin_update_library).delete(admin_delete_library),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}/cover",
+            put(admin_update_library_cover)
+                .layer(DefaultBodyLimit::max(MAX_LIBRARY_COVER_BYTES as usize)),
         )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
         .route(
@@ -277,6 +289,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/admin/audit", get(admin_list_audit))
         .route("/api/v1/admin/logs", get(admin_list_logs))
         .route("/api/v1/libraries", get(lux_list_libraries))
+        .route(
+            "/api/v1/libraries/{library_id}/cover",
+            get(lux_library_cover).head(lux_library_cover),
+        )
         .route("/api/v1/favorites", get(lux_list_favorites))
         .route("/api/v1/search", get(lux_search))
         .route("/api/v1/home", get(lux_home))
@@ -2859,6 +2875,7 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
                 "id": view.library.id,
                 "name": view.library.name,
                 "kind": view.library.kind.as_str(),
+                "coverImageUrl": library_cover_url(&view.library),
             })),
             Ok(false) => {}
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -3007,6 +3024,7 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
                         "id": view.library.id.to_string(),
                         "name": view.library.name,
                         "kind": view.library.kind.as_str(),
+                        "coverImageUrl": library_cover_url(&view.library),
                     }));
                 }
             }
@@ -3014,6 +3032,82 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
         }
         Err(error) => library_error(&headers, error),
     }
+}
+
+async fn lux_library_cover(
+    headers: HeaderMap,
+    method: Method,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    match access
+        .can_view_library(principal, &library_id.to_string())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(covers) = state.library_covers.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let cover = match covers.resolve(library_id).await {
+        Ok(Some(cover)) => cover,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(LibraryCoverError::LibraryNotFound | LibraryCoverError::InvalidPath) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(LibraryCoverError::Storage(_)) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(LibraryCoverError::Io { .. } | LibraryCoverError::ImageWrite(_)) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(
+            LibraryCoverError::UnsupportedContentType(_)
+            | LibraryCoverError::InvalidContent { .. }
+            | LibraryCoverError::TooLarge { .. },
+        ) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == cover.etag))
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &cover.etag)
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        let Ok(file) = tokio::fs::File::open(&cover.path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        Body::from_stream(tokio_util::io::ReaderStream::new(file))
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", &cover.content_type)
+        .header("Content-Length", cover.content_length)
+        .header("ETag", &cover.etag)
+        .header("Cache-Control", "private, max-age=3600")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn lux_list_favorites(
@@ -6325,6 +6419,60 @@ async fn admin_update_library(
     }
 }
 
+async fn admin_update_library_cover(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id,
+        Err(error) => {
+            return library_error(
+                &headers,
+                LibraryServiceError::InvalidLibraryId(error.to_string()),
+            );
+        }
+    };
+    let Some(covers) = state.library_covers.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    match covers.store(library_id, content_type, &body).await {
+        Ok(cover) => {
+            let target_id = library_id.to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "LIBRARY_COVER_UPDATED",
+                Some("library"),
+                Some(&target_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "library": {
+                        "id": target_id,
+                        "coverImageUrl": format!("/api/v1/libraries/{target_id}/cover"),
+                        "contentType": cover.content_type,
+                        "contentLength": cover.content_length,
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => library_cover_error(&headers, error),
+    }
+}
+
 async fn admin_delete_library_root(
     headers: HeaderMap,
     Path((library_id, root_id)): Path<(String, String)>,
@@ -6462,6 +6610,50 @@ async fn admin_add_library_root(
     }
 }
 
+fn library_cover_error(headers: &HeaderMap, error: LibraryCoverError) -> Response {
+    match error {
+        LibraryCoverError::UnsupportedContentType(_) | LibraryCoverError::InvalidContent { .. } => {
+            api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "封面图格式无效，仅支持 JPEG、PNG 或 WebP",
+            )
+            .into_response()
+        }
+        LibraryCoverError::TooLarge { .. } => api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            "封面图不能超过 5 MiB",
+        )
+        .into_response(),
+        LibraryCoverError::LibraryNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在",
+        )
+        .into_response(),
+        LibraryCoverError::InvalidPath => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "媒体库封面路径无效",
+        )
+        .into_response(),
+        LibraryCoverError::Io { .. }
+        | LibraryCoverError::ImageWrite(_)
+        | LibraryCoverError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "媒体库封面保存失败",
+        )
+        .into_response(),
+    }
+}
+
 fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
     let (status, code, message) = match error {
         LibraryServiceError::InvalidName
@@ -6577,6 +6769,7 @@ fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
         "name": library.name,
         "kind": library.kind.as_str(),
         "scraperId": library.scraper_id,
+        "coverImageUrl": library_cover_url(library),
         "isEnabled": library.is_enabled,
         "realtimeWatchEnabled": library.realtime_watch_enabled,
         "incrementalSchedule": library.incremental_schedule,
@@ -6587,6 +6780,13 @@ fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
         "lastScanAt": library.last_scan_at,
         "roots": roots.iter().map(root_json).collect::<Vec<_>>(),
     })
+}
+
+fn library_cover_url(library: &LibraryRecord) -> Option<String> {
+    library
+        .cover_image_path
+        .as_ref()
+        .map(|_| format!("/api/v1/libraries/{}/cover", library.id))
 }
 
 fn root_json(root: &LibraryRootRecord) -> Value {

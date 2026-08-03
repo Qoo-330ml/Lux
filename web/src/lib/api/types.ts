@@ -15,6 +15,7 @@ export type Library = {
   id: string;
   name: string;
   kind: "MOVIE" | "SERIES" | "MIXED" | string;
+  coverImageUrl?: string | null;
   itemCount?: number;
 };
 

@@ -11,6 +11,14 @@ use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
 async fn start_server(
     config: Config,
 ) -> Result<
@@ -150,6 +158,44 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
     assert_eq!(edited_library["name"], "Shows");
     assert_eq!(edited_library["kind"], "SERIES");
 
+    let cover = client
+        .put(format!(
+            "{base_url}/api/v1/admin/libraries/{library_id}/cover"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .header("content-type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(cover.status(), reqwest::StatusCode::OK);
+    let cover_body = cover.json::<Value>().await?;
+    assert!(cover_body["library"]["coverImageUrl"].is_string());
+
+    let public_cover = client
+        .get(format!("{base_url}/api/v1/libraries/{library_id}/cover"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(public_cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        public_cover.headers().get("content-type").unwrap(),
+        "image/png"
+    );
+    assert_eq!(public_cover.bytes().await?.as_ref(), PNG_1X1);
+
+    let invalid_cover = client
+        .put(format!(
+            "{base_url}/api/v1/admin/libraries/{library_id}/cover"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .header("content-type", "image/png")
+        .body("not an image")
+        .send()
+        .await?;
+    assert_eq!(invalid_cover.status(), reqwest::StatusCode::BAD_REQUEST);
+
     let deleted_root = client
         .delete(format!(
             "{base_url}/api/v1/admin/libraries/{library_id}/roots/{root_id}"
@@ -229,6 +275,73 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
     );
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_cover_survives_server_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config.clone()).await?;
+    let client = reqwest::Client::new();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "Movies", "kind": "MOVIE" }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let library_id = created.json::<Value>().await?["library"]["id"]
+        .as_str()
+        .ok_or("missing library ID")?
+        .to_owned();
+
+    let uploaded = client
+        .put(format!(
+            "{base_url}/api/v1/admin/libraries/{library_id}/cover"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .header("content-type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(uploaded.status(), reqwest::StatusCode::OK);
+
+    server.abort();
+    let _ = server.await;
+    database.close().await;
+
+    let (base_url, server, database) = start_server(config).await?;
+    let (cookies, _) = login(&client, &base_url, "admin", "correct password").await?;
+    let cover = client
+        .get(format!("{base_url}/api/v1/libraries/{library_id}/cover"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(cover.headers()["content-type"], "image/png");
+    assert_eq!(cover.bytes().await?.as_ref(), PNG_1X1);
+
+    server.abort();
+    let _ = server.await;
+    database.close().await;
     Ok(())
 }
 

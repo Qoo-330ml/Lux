@@ -13,6 +13,14 @@ use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
 #[tokio::test]
 async fn library_acl_is_consistent_for_lists_details_and_images()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -88,6 +96,19 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .await?;
     assert_eq!(grant_first.status(), reqwest::StatusCode::OK);
 
+    let upload_cover = client
+        .put(format!(
+            "{base_url}/api/v1/admin/libraries/{}/cover",
+            first.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .header("content-type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(upload_cover.status(), reqwest::StatusCode::OK);
+
     let viewer_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "viewer", "password": "viewer password" }))
@@ -102,6 +123,21 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
     let visible_body: Value = visible_libraries.json().await?;
     assert_eq!(visible_body["libraries"].as_array().map(Vec::len), Some(1));
     assert_eq!(visible_body["libraries"][0]["id"], first.id.to_string());
+
+    let allowed_cover = client
+        .get(format!("{base_url}/api/v1/libraries/{}/cover", first.id))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(allowed_cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(allowed_cover.headers()["content-type"], "image/png");
+    assert_eq!(allowed_cover.bytes().await?.as_ref(), PNG_1X1);
+    let denied_cover = client
+        .get(format!("{base_url}/api/v1/libraries/{}/cover", second.id))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(denied_cover.status(), reqwest::StatusCode::NOT_FOUND);
 
     let allowed_items = client
         .get(format!("{base_url}/api/v1/libraries/{}/items", first.id))

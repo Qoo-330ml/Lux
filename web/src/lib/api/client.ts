@@ -184,6 +184,17 @@ export class LuxApiClient {
     );
   }
 
+  updateAdminLibraryCover(libraryId: string, file: Blob) {
+    return this.request<{ library: AdminLibrary }>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/cover`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+      },
+    );
+  }
+
   deleteAdminLibrary(libraryId: string) {
     return this.request<void>(`/api/v1/admin/libraries/${encodeURIComponent(libraryId)}`, {
       method: "DELETE",

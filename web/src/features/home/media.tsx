@@ -56,7 +56,7 @@ export function LibraryCard({ library }: { library: Library }) {
   const label = library.kind === "SERIES" ? "电视剧" : library.kind === "MOVIE" ? "电影" : "媒体库";
   return (
     <Link className="lux-library-card" to={`/libraries/${library.id}`}>
-      <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>
+      {library.coverImageUrl ? <img className="lux-library-cover" src={library.coverImageUrl} alt="" loading="lazy" /> : <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>}
       <span><small>{label}</small><strong>{library.name}</strong></span>
     </Link>
   );

@@ -5,6 +5,7 @@ pub mod collections;
 pub mod identification;
 pub mod images;
 pub mod libraries;
+pub mod library_covers;
 pub mod metadata;
 pub mod nfo;
 pub mod playback;

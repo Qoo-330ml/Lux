@@ -84,6 +84,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-rail::-webkit-scrollbar, .lux-media-rail::-webkit-scrollbar { display: none; }
 .lux-library-card { display: flex; flex: 0 0 235px; align-items: center; gap: 15px; min-height: 92px; padding: 16px; border: 1px solid var(--lux-line-soft); border-radius: 15px; background: linear-gradient(135deg, rgba(35,35,40,.84), rgba(15,15,18,.78)); box-shadow: 0 12px 26px rgba(0,0,0,.16); transition: border-color .2s ease, transform .2s var(--lux-ease), background .2s ease; }
 .lux-library-card:hover { border-color: rgba(255,255,255,.28); background: rgba(45,45,50,.86); transform: translateY(-3px); }
+.lux-library-cover { flex: 0 0 auto; width: 50px; height: 60px; overflow: hidden; border-radius: 9px; object-fit: cover; background: #1b1b20; }
 .lux-library-icon { display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid rgba(255,255,255,.16); border-radius: 12px; color: #fff; background: rgba(255,255,255,.08); font-size: 1.25rem; }
 .lux-library-card small { display: block; margin-bottom: 4px; color: var(--lux-subtle); font-size: .68rem; letter-spacing: .11em; text-transform: uppercase; }
 .lux-library-card strong { display: block; overflow: hidden; color: #fff; font-size: .93rem; text-overflow: ellipsis; white-space: nowrap; }
@@ -246,6 +247,15 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-empty h2 { margin: 12px 0 6px; color: #fff; font-size: 1.15rem; }
 .lux-admin-empty p { margin: 0; font-size: .84rem; }
 .lux-admin-library-list { display: grid; gap: 16px; }
+.lux-admin-library-edit { display: grid; gap: 18px; padding: 18px 22px; border-bottom: 1px solid var(--lux-line-soft); background: rgba(255,255,255,.025); }
+.lux-admin-library-details-form { grid-template-columns: minmax(180px, 1fr) minmax(160px, .7fr) auto; align-items: end; margin: 0; }
+.lux-admin-edit-actions { display: flex; align-items: center; gap: 8px; }
+.lux-admin-cover-editor { display: flex; align-items: center; gap: 14px; }
+.lux-admin-cover-preview { display: grid; place-items: center; flex: 0 0 auto; width: 72px; height: 72px; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 10px; color: var(--lux-subtle); background: rgba(0,0,0,.2); }
+.lux-admin-cover-preview img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.lux-admin-cover-editor strong { color: #fff; font-size: .86rem; }
+.lux-admin-cover-editor p { margin: 4px 0 9px; color: var(--lux-subtle); font-size: .75rem; }
+.lux-visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; clip-path: inset(50%); }
 .lux-admin-plugin-grid { display: grid; gap: 16px; }
 .lux-admin-plugin-card { display: grid; grid-template-columns: 48px minmax(0, 1fr) auto; align-items: start; gap: 16px; }
 .lux-admin-plugin-icon { display: grid; place-items: center; width: 48px; height: 48px; border: 1px solid var(--lux-line-soft); border-radius: 12px; color: #fff; background: rgba(255,255,255,.07); }
@@ -418,6 +428,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-stat strong { font-size: .9rem; }
   .lux-admin-panel { padding: 17px; }
   .lux-admin-create-form, .lux-admin-library-body { grid-template-columns: 1fr; }
+  .lux-admin-library-details-form { grid-template-columns: 1fr; }
+  .lux-admin-edit-actions { flex-wrap: wrap; }
+  .lux-admin-cover-editor { align-items: flex-start; }
   .lux-admin-plugin-card { grid-template-columns: 40px minmax(0, 1fr); }
   .lux-admin-plugin-card > .lux-button { grid-column: 1 / -1; }
   .lux-admin-user-create-form { grid-template-columns: 1fr; }

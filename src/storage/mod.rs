@@ -554,6 +554,7 @@ impl Database {
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
+                    cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag
              FROM libraries ORDER BY name, id",
         )
         .fetch_all(&self.pool)
@@ -573,6 +574,10 @@ impl Database {
                     probe_concurrency: row.get("probe_concurrency"),
                     last_scan_at: row.get("last_scan_at"),
                     scraper_id: row.get("scraper_id"),
+                    cover_image_path: row.get("cover_image_path"),
+                    cover_image_content_type: row.get("cover_image_content_type"),
+                    cover_image_size: row.get("cover_image_size"),
+                    cover_image_tag: row.get("cover_image_tag"),
                 })
                 .collect()
         })
@@ -590,6 +595,7 @@ impl Database {
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
+                    cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag
              FROM libraries WHERE id = ?",
         )
         .bind(id)
@@ -609,6 +615,10 @@ impl Database {
                 probe_concurrency: row.get("probe_concurrency"),
                 last_scan_at: row.get("last_scan_at"),
                 scraper_id: row.get("scraper_id"),
+                cover_image_path: row.get("cover_image_path"),
+                cover_image_content_type: row.get("cover_image_content_type"),
+                cover_image_size: row.get("cover_image_size"),
+                cover_image_tag: row.get("cover_image_tag"),
             })
         })
         .map_err(|source| StorageError::Sqlx {
@@ -905,6 +915,37 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn update_library_cover(
+        &self,
+        library_id: &str,
+        path: &str,
+        content_type: &str,
+        size: i64,
+        tag: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE libraries
+             SET cover_image_path = ?,
+                 cover_image_content_type = ?,
+                 cover_image_size = ?,
+                 cover_image_tag = ?,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(path)
+        .bind(content_type)
+        .bind(size)
+        .bind(tag)
+        .bind(library_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn find_user_item_state(
@@ -4390,6 +4431,10 @@ pub(crate) struct StoredLibrary {
     pub(crate) probe_concurrency: i64,
     pub(crate) last_scan_at: Option<i64>,
     pub(crate) scraper_id: Option<String>,
+    pub(crate) cover_image_path: Option<String>,
+    pub(crate) cover_image_content_type: Option<String>,
+    pub(crate) cover_image_size: Option<i64>,
+    pub(crate) cover_image_tag: Option<String>,
 }
 
 #[derive(Debug)]
