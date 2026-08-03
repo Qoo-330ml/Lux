@@ -1,11 +1,13 @@
 import type {
   AdminAuditEvent,
   AdminHealth,
+  AdminImage,
   AdminJob,
   AdminLibrary,
   AdminRoot,
   AdminSettings,
   AdminUser,
+  AdminMetadataCandidate,
   ApiErrorBody,
   HomeResponse,
   Library,
@@ -271,6 +273,32 @@ export class LuxApiClient {
       method: "PATCH",
       body: JSON.stringify(input),
     });
+  }
+
+  adminPendingMetadata() {
+    return this.request<{ items?: AdminMetadataCandidate[]; total?: number }>(
+      "/api/v1/admin/metadata/pending?page=1&pageSize=50",
+    );
+  }
+
+  selectAdminMetadata(itemId: string, candidateId: string, mode: "fillMissing" | "refreshUnlocked") {
+    return this.request<{ itemId: string; candidateId: string; status: string }>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/identify/candidates/${encodeURIComponent(candidateId)}/select`,
+      { method: "POST", body: JSON.stringify({ mode }) },
+    );
+  }
+
+  adminItemImages(itemId: string) {
+    return this.request<{ images?: AdminImage[] }>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/images`,
+    );
+  }
+
+  deleteAdminItemImage(itemId: string, imageId: string) {
+    return this.request<void>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/images/${encodeURIComponent(imageId)}`,
+      { method: "DELETE" },
+    );
   }
 }
 

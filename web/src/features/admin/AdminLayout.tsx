@@ -1,4 +1,4 @@
-import { Activity, ChevronLeft, Database, FileClock, Settings2, ShieldCheck, Users } from "lucide-react";
+import { Activity, ChevronLeft, Database, FileClock, Image, Settings2, ShieldCheck, Users } from "lucide-react";
 import { Link, NavLink, Outlet } from "react-router-dom";
 
 const adminNav = [
@@ -6,6 +6,7 @@ const adminNav = [
   { to: "/admin/libraries", label: "媒体库", icon: Database },
   { to: "/admin/users", label: "用户与权限", icon: Users },
   { to: "/admin/jobs", label: "任务与日志", icon: FileClock },
+  { to: "/admin/metadata", label: "元数据纠错", icon: Image },
   { to: "/admin/settings", label: "服务器设置", icon: Settings2 },
 ];
 

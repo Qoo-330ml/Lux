@@ -146,6 +146,29 @@ export type AdminAuditEvent = {
   createdAt: string;
 };
 
+export type AdminMetadataCandidate = {
+  id: string;
+  itemId: string;
+  itemTitle: string;
+  provider: string;
+  providerId: string;
+  candidate: Record<string, unknown>;
+  score: number;
+  status: string;
+  expiresAt?: string | null;
+  fieldDiffs: Array<{ field: string; current?: unknown; candidate?: unknown; provenance?: unknown }>;
+};
+
+export type AdminImage = {
+  id: string;
+  itemId: string;
+  imageType: string;
+  imageIndex: number;
+  fileSize?: number | null;
+  contentTag?: string | null;
+  source?: string | null;
+};
+
 export type AdminSettings = {
   resumePlayedPercent: number;
   resumeMinTicks: number;

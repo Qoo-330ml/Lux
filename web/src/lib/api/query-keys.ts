@@ -13,4 +13,6 @@ export const queryKeys = {
   adminJobs: (status?: string) => ["admin", "jobs", status ?? "all"] as const,
   adminLogs: ["admin", "logs"] as const,
   adminSettings: ["admin", "settings"] as const,
+  adminPendingMetadata: ["admin", "metadata", "pending"] as const,
+  adminItemImages: (itemId: string) => ["admin", "item-images", itemId] as const,
 };

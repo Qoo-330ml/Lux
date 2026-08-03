@@ -320,6 +320,20 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-settings-saved { display: flex; align-items: center; gap: 7px; margin: 17px 0 0; color: #9bdcb3; font-size: .78rem; }
 .lux-admin-settings-note { max-width: 760px; margin-top: 16px; }
 .lux-admin-settings-note p { margin: 0; color: var(--lux-muted); font-size: .8rem; line-height: 1.7; }
+.lux-admin-metadata-list { display: grid; gap: 10px; }
+.lux-admin-metadata-card { padding: 17px; border: 1px solid var(--lux-line-soft); border-radius: 11px; background: rgba(255,255,255,.025); }
+.lux-admin-metadata-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; }
+.lux-admin-metadata-heading h3 { margin: 7px 0 4px; color: #fff; font-size: .94rem; }
+.lux-admin-metadata-heading p { margin: 0; color: var(--lux-muted); font-size: .77rem; }
+.lux-admin-diff-list { display: grid; gap: 5px; margin-top: 15px; padding: 11px; border-left: 2px solid rgba(210,71,191,.55); background: rgba(210,71,191,.05); }
+.lux-admin-diff-list div { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 10px; font-size: .73rem; }
+.lux-admin-diff-list span { color: var(--lux-subtle); }
+.lux-admin-diff-list small { overflow: hidden; color: var(--lux-muted); text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-metadata-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
+.lux-admin-metadata-actions .lux-button { min-height: 39px; padding: 0 13px; font-size: .75rem; }
+.lux-admin-image-list { display: grid; gap: 5px; margin-top: 13px; padding-top: 13px; border-top: 1px solid var(--lux-line-soft); }
+.lux-admin-image-list > div { display: grid; grid-template-columns: 1fr auto 32px; align-items: center; gap: 8px; min-height: 36px; color: var(--lux-muted); font-size: .75rem; }
+.lux-admin-image-list small { color: var(--lux-subtle); }
 
 @media (max-width: 900px) {
   .lux-header { padding: 18px 20px; }
@@ -393,6 +407,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-user-actions { justify-content: flex-end; }
   .lux-admin-permission-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lux-admin-password-row { align-items: stretch; flex-direction: column; }
+  .lux-admin-metadata-heading { flex-direction: column; }
+  .lux-admin-metadata-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .lux-admin-metadata-actions .lux-button:last-child { grid-column: 1 / -1; }
+  .lux-admin-diff-list div { grid-template-columns: 80px minmax(0, 1fr); }
   .lux-admin-job-row, .lux-admin-log-row { grid-template-columns: 30px minmax(0, 1fr); }
   .lux-admin-job-actions, .lux-admin-log-row time { grid-column: 2; }
 }

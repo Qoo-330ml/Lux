@@ -19,6 +19,7 @@ import { AdminLibrariesPage } from "../features/admin/AdminLibrariesPage";
 import { AdminUsersPage } from "../features/admin/AdminUsersPage";
 import { AdminOperationsPage } from "../features/admin/AdminOperationsPage";
 import { AdminSettingsPage } from "../features/admin/AdminSettingsPage";
+import { AdminMetadataPage } from "../features/admin/AdminMetadataPage";
 
 export function App() {
   const setup = useQuery({
@@ -74,6 +75,7 @@ function AuthenticatedRoutes({ user }: { user: LuxUser }) {
           <Route path="users" element={<AdminUsersPage />} />
           <Route path="jobs" element={<AdminOperationsPage />} />
           <Route path="settings" element={<AdminSettingsPage />} />
+          <Route path="metadata" element={<AdminMetadataPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
