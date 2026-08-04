@@ -308,6 +308,21 @@ impl CatalogService {
         })
     }
 
+    pub async fn list_recommended(
+        &self,
+        principal: AccessPrincipal,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<CatalogItem>, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let rows = self
+            .database
+            .list_recommended_catalog_rows(user_id, &library_ids, offset, limit)
+            .await?;
+        Ok(assemble_items(rows))
+    }
+
     pub async fn find_item(
         &self,
         principal: AccessPrincipal,
@@ -479,7 +494,6 @@ pub struct CatalogStream {
     pub is_external: bool,
     pub is_default: bool,
     pub is_forced: bool,
-    pub details: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
@@ -560,11 +574,6 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
             is_external: row.stream_is_external.unwrap_or(false),
             is_default: row.stream_is_default.unwrap_or(false),
             is_forced: row.stream_is_forced.unwrap_or(false),
-            details: row
-                .stream_details_json
-                .as_deref()
-                .and_then(|value| serde_json::from_str(value).ok())
-                .unwrap_or_default(),
         });
         let _ = stream_id;
     }

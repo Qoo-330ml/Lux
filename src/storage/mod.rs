@@ -3089,6 +3089,79 @@ impl Database {
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
 
+    pub(crate) async fn list_recommended_catalog_rows(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "WITH ranked AS (
+                 SELECT mi.id,
+                        (
+                            CASE WHEN COALESCE(us.is_favorite, 0) = 1 THEN 100 ELSE 0 END
+                            + CASE WHEN us.item_id IS NULL THEN 35 ELSE 0 END
+                            + CASE WHEN COALESCE(us.position_ticks, 0) > 0
+                                      AND COALESCE(us.is_played, 0) = 0 THEN 55 ELSE 0 END
+                            + CASE WHEN us.item_id IS NOT NULL
+                                      AND COALESCE(us.is_played, 0) = 0 THEN 20 ELSE 0 END
+                            + CASE WHEN COALESCE(us.is_played, 0) = 1 THEN -35 ELSE 0 END
+                            + MIN(30, MAX(0, 30 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
+                            + CASE WHEN us.last_played_at IS NULL THEN 0 ELSE
+                                MIN(30, MAX(0, 30 - CAST((unixepoch() - us.last_played_at) / 86400 AS INTEGER)))
+                              END
+                        ) AS recommendation_score,
+                        mi.added_at,
+                        mi.sort_title
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN user_item_state us
+                   ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type IN ('MOVIE', 'SERIES')
+                   AND mi.library_id IN ({placeholders})
+                 ORDER BY recommendation_score DESC, mi.added_at DESC,
+                          mi.sort_title, mi.id
+                 LIMIT ? OFFSET ?
+             )
+             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    mi.title, mi.sort_title, mi.original_title, mi.overview,
+                    mi.production_year, mi.runtime_ticks,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
+                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
+             FROM ranked
+             JOIN media_items mi ON mi.id = ranked.id
+             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             ORDER BY ranked.recommendation_score DESC, mi.added_at DESC,
+                      mi.sort_title, mi.id, ms.id, mt.stream_index"
+        );
+        let mut binds = Vec::with_capacity(library_ids.len() + 3);
+        binds.push(CatalogBind::Text(user_id));
+        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
+        binds.push(CatalogBind::Integer(limit));
+        binds.push(CatalogBind::Integer(offset));
+        self.fetch_catalog_rows(&query, &binds).await
+    }
+
     pub(crate) async fn count_catalog_children(
         &self,
         parent_id: &str,
@@ -3130,7 +3203,6 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
-                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3211,7 +3283,6 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
-                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3295,7 +3366,6 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
-                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3340,7 +3410,6 @@ impl Database {
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
-                        mt.details_json AS stream_details_json,
                         mt.is_external AS stream_is_external,
                         mt.is_default AS stream_is_default,
                         mt.is_forced AS stream_is_forced
@@ -3378,7 +3447,6 @@ impl Database {
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
-                        mt.details_json AS stream_details_json,
                         mt.is_external AS stream_is_external,
                         mt.is_default AS stream_is_default,
                         mt.is_forced AS stream_is_forced
@@ -3420,7 +3488,6 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
-                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3487,7 +3554,6 @@ impl Database {
                         codec: row.get("codec"),
                         language: row.get("language"),
                         stream_title: row.get("stream_title"),
-                        stream_details_json: row.get("stream_details_json"),
                         stream_is_external: row
                             .get::<Option<i64>, _>("stream_is_external")
                             .map(|value| value != 0),
@@ -4709,7 +4775,6 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) codec: Option<String>,
     pub(crate) language: Option<String>,
     pub(crate) stream_title: Option<String>,
-    pub(crate) stream_details_json: Option<String>,
     pub(crate) stream_is_external: Option<bool>,
     pub(crate) stream_is_default: Option<bool>,
     pub(crate) stream_is_forced: Option<bool>,

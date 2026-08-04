@@ -54,6 +54,7 @@ export type MediaItem = {
 
 export type HomeResponse = {
   libraries?: Library[];
+  recommended?: MediaItem[];
   continueWatching?: MediaItem[];
   recentlyAdded?: MediaItem[];
 };
@@ -106,6 +107,18 @@ export type AdminPlugin = {
   configured: boolean;
   available: boolean;
   unavailableReason?: string | null;
+  configurable: boolean;
+  configFields: AdminPluginConfigField[];
+  configSource: "BUILT_IN" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
+};
+
+export type AdminPluginConfigField = {
+  key: string;
+  label: string;
+  type: "password" | "text" | string;
+  required: boolean;
+  sensitive: boolean;
+  description: string;
 };
 
 export type AdminUser = LuxUser & {

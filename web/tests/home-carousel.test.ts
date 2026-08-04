@@ -4,6 +4,19 @@ import { heroSlides } from "../src/features/home/carousel";
 const item = (id: string, itemType = "MOVIE") => ({ id, title: id, itemType });
 
 describe("heroSlides", () => {
+  it("uses server-ranked recommendations before legacy home shelves", () => {
+    expect(heroSlides({
+      recommended: [item("recommended-1"), item("shared")],
+      continueWatching: [item("continue-1"), item("shared")],
+      recentlyAdded: [item("recent-1")],
+    }).map((media) => media.id)).toEqual([
+      "recommended-1",
+      "shared",
+      "continue-1",
+      "recent-1",
+    ]);
+  });
+
   it("keeps continue-watching first and appends unique recently added items", () => {
     expect(heroSlides({
       continueWatching: [item("continue-1"), item("shared")],

@@ -51,7 +51,7 @@ use crate::{
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
-        settings::{read_tmdb_token, write_tmdb_token},
+        settings::{read_tmdb_api_key, read_tmdb_token},
         tmdb::{TmdbClient, TmdbError},
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
@@ -115,7 +115,11 @@ impl AppState {
         let metadata_selection = image_writes
             .clone()
             .map(|images| MetadataSelectionService::new(database.clone(), images));
-        let tmdb = TmdbClient::from_env_or_token(read_tmdb_token(&config_dir)).ok();
+        let tmdb = TmdbClient::from_env_or_config(
+            read_tmdb_api_key(&config_dir),
+            read_tmdb_token(&config_dir),
+        )
+        .ok();
         let collections = tmdb
             .clone()
             .map(|tmdb| CollectionService::new(database.clone(), tmdb));
@@ -205,6 +209,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/plugins/{plugin_id}/install",
             post(admin_install_plugin),
+        )
+        .route(
+            "/api/v1/admin/plugins/{plugin_id}/config",
+            put(admin_update_plugin_config),
         )
         .route(
             "/api/v1/admin/users",
@@ -1923,7 +1931,6 @@ fn emby_media_source_json(
         "Size": source.size,
         "Bitrate": source.bitrate,
         "RunTimeTicks": source.duration_ticks,
-        "Path": source.external_url,
         "IsDefault": source.is_default,
         "Protocol": if is_remote { "Http" } else { "File" },
         "Type": "Default",
@@ -1932,31 +1939,17 @@ fn emby_media_source_json(
         "SupportsDirectStream": false,
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
-        "MediaStreams": source
-            .streams
-            .iter()
-            .map(emby_media_stream_json)
-            .collect::<Vec<_>>(),
+        "MediaStreams": source.streams.iter().map(|stream| json!({
+            "Index": stream.index,
+            "Type": emby_stream_type(&stream.stream_type),
+            "Codec": stream.codec,
+            "Language": stream.language,
+            "DisplayTitle": stream.title,
+            "IsExternal": stream.is_external,
+            "IsDefault": stream.is_default,
+            "IsForced": stream.is_forced,
+        })).collect::<Vec<_>>(),
     })
-}
-
-fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
-    let mut value = json!({
-        "Index": stream.index,
-        "Type": emby_stream_type(&stream.stream_type),
-        "Codec": stream.codec,
-        "Language": stream.language,
-        "DisplayTitle": stream.title,
-        "IsExternal": stream.is_external,
-        "IsDefault": stream.is_default,
-        "IsForced": stream.is_forced,
-    });
-    if let Value::Object(object) = &mut value {
-        for (key, detail) in &stream.details {
-            object.entry(key.clone()).or_insert_with(|| detail.clone());
-        }
-    }
-    value
 }
 
 fn emby_library_view_json(library: &LibraryRecord, server_id: &str) -> Value {
@@ -2105,8 +2098,6 @@ struct SetupCompleteRequest {
     display_name: String,
     password: String,
     #[serde(default)]
-    tmdb_token: Option<String>,
-    #[serde(default)]
     first_library: Option<SetupFirstLibraryRequest>,
 }
 
@@ -2141,24 +2132,6 @@ async fn setup_complete(
         .into_response();
     };
 
-    let tmdb_token = request
-        .tmdb_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned);
-    if tmdb_token
-        .as_ref()
-        .is_some_and(|token| token.chars().count() > 4096)
-    {
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "TMDb token 无效",
-        )
-        .into_response();
-    }
     let setup_kind = match request
         .first_library
         .as_ref()
@@ -2233,30 +2206,9 @@ async fn setup_complete(
                     "warnings": warnings,
                 }));
             }
-            if let Some(token) = tmdb_token.as_deref() {
-                if write_tmdb_token(
-                    state
-                        .config_dir
-                        .as_deref()
-                        .unwrap_or_else(|| FsPath::new("./config")),
-                    token,
-                )
-                .await
-                .is_err()
-                {
-                    return api_error(
-                        &headers,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        lux::ApiErrorCode::DatabaseUnavailable,
-                        "TMDb 配置保存失败",
-                    )
-                    .into_response();
-                }
-            }
             let mut response = json!({
                 "initialized": true,
                 "user": user_json(&user),
-                "tmdbConfigured": tmdb_token.is_some(),
             });
             if let Some(library) = library_json_value {
                 response["library"] = library["library"].clone();
@@ -2870,6 +2822,13 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Ok(page) => page,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let recommended = match catalog
+        .list_recommended(principal, &user.id.to_string(), 0, 12)
+        .await
+    {
+        Ok(items) => items,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let views = match libraries.list_libraries().await {
         Ok(views) => views,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2916,11 +2875,17 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Ok(items) => items,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let recommended_items =
+        match lux_catalog_items_json_for_user(database, &user.id.to_string(), &recommended).await {
+            Ok(items) => items,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     Json(json!({
         "continueWatching": continue_watching_items,
         "continueWatchingTotal": continue_watching.total,
         "recentlyAdded": recently_added_items,
         "recentlyAddedTotal": recently_added.total,
+        "recommended": recommended_items,
         "libraries": visible,
     }))
     .into_response()
@@ -6221,7 +6186,7 @@ async fn admin_list_plugins(
         )
         .into_response();
     };
-    match plugins.list(offset, limit, state.tmdb.is_some()).await {
+    match plugins.list(offset, limit).await {
         Ok(page) => Json(plugin_page_json(&page)).into_response(),
         Err(error) => plugin_error(&headers, error),
     }
@@ -6244,7 +6209,7 @@ async fn admin_install_plugin(
         )
         .into_response();
     };
-    match plugins.install(&plugin_id, state.tmdb.is_some()).await {
+    match plugins.install(&plugin_id).await {
         Ok(result) => {
             record_audit_event(
                 &state,
@@ -6270,6 +6235,59 @@ async fn admin_install_plugin(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginConfigRequest {
+    api_key: String,
+}
+
+async fn admin_update_plugin_config(
+    headers: HeaderMap,
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PluginConfigRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let api_key = request.api_key.trim();
+    let result = plugins.update_config(&plugin_id, api_key).await;
+    match result {
+        Ok(plugin) => {
+            if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID {
+                if let Some(tmdb) = state.tmdb.as_ref() {
+                    tmdb.set_api_key((!api_key.is_empty()).then_some(api_key))
+                        .await;
+                }
+            }
+            record_audit_event(
+                &state,
+                &headers,
+                "PLUGIN_CONFIG_UPDATED",
+                Some("plugin"),
+                Some(&plugin_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({ "plugin": plugin_json(&plugin) })),
+            )
+                .into_response()
+        }
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
 async fn validate_scraper_selection(
     headers: &HeaderMap,
     state: &AppState,
@@ -6285,7 +6303,7 @@ async fn validate_scraper_selection(
         .into_response());
     };
     plugins
-        .validate_selection(scraper_id, state.tmdb.is_some())
+        .validate_selection(scraper_id)
         .await
         .map_err(|error| plugin_error(headers, error).into_response())
 }
@@ -6746,6 +6764,20 @@ fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
             "插件尚未安装或配置完成",
         )
         .into_response(),
+        PluginServiceError::InvalidConfig => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "插件配置无效",
+        )
+        .into_response(),
+        PluginServiceError::ConfigIo(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "插件配置保存失败",
+        )
+        .into_response(),
         PluginServiceError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6775,6 +6807,16 @@ fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
         "configured": plugin.configured,
         "available": plugin.available,
         "unavailableReason": plugin.unavailable_reason,
+        "configurable": plugin.configurable,
+        "configFields": plugin.config_fields.iter().map(|field| json!({
+            "key": field.key,
+            "label": field.label,
+            "type": field.input_type,
+            "required": field.required,
+            "sensitive": field.sensitive,
+            "description": field.description,
+        })).collect::<Vec<_>>(),
+        "configSource": plugin.config_source,
     })
 }
 

@@ -250,6 +250,8 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
     assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
     assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");
+    assert_eq!(home_body["recommended"].as_array().map(Vec::len), Some(2));
+    assert_eq!(home_body["recommended"][0]["title"], "Beta Movie");
 
     let lux_detail = client
         .get(format!("{base_url}/api/v1/items/{item_id}"))

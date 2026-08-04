@@ -105,7 +105,11 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
         }))
         .into_response();
     }
-    if request.uri().path().contains("/3/movie/7") {
+    if request.uri().path().contains("/3/movie/7")
+        && !request.uri().path().contains("/external_ids")
+        && !request.uri().path().contains("/videos")
+        && !request.uri().path().contains("/images")
+    {
         return axum::Json(json!({
             "id": 7,
             "title": "Stub title",
@@ -117,6 +121,154 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
                 "id": 10,
                 "name": "Stub Collection"
             }
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/search/tv") {
+        return axum::Json(json!({
+            "page": 1,
+            "total_pages": 1,
+            "total_results": 1,
+            "results": [{
+                "id": 8,
+                "name": "Stub Series",
+                "original_name": "Original Series",
+                "overview": "Series overview",
+                "first_air_date": "2021-01-02",
+                "original_language": "en",
+                "poster_path": "/series-poster.jpg",
+                "backdrop_path": "/series-backdrop.jpg"
+            }]
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/search/person") {
+        return axum::Json(json!({
+            "page": 1,
+            "total_pages": 1,
+            "total_results": 1,
+            "results": [{
+                "id": 9,
+                "name": "Stub Person",
+                "known_for_department": "Acting",
+                "profile_path": "/profile.jpg"
+            }]
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/search/collection") {
+        return axum::Json(json!({
+            "page": 1,
+            "total_pages": 1,
+            "total_results": 1,
+            "results": [{
+                "id": 10,
+                "name": "Stub Collection",
+                "overview": "Collection overview",
+                "poster_path": "/poster.jpg",
+                "backdrop_path": "/backdrop.jpg"
+            }]
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/tv/8/season/1/episode/2") {
+        return axum::Json(json!({
+            "id": 802,
+            "name": "Stub Episode",
+            "overview": "Episode overview",
+            "air_date": "2021-01-03",
+            "episode_number": 2,
+            "season_number": 1,
+            "still_path": "/still.jpg",
+            "runtime": 45
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/tv/8/season/1") {
+        return axum::Json(json!({
+            "id": 801,
+            "name": "Season 1",
+            "overview": "Season overview",
+            "air_date": "2021-01-02",
+            "season_number": 1,
+            "poster_path": "/season-poster.jpg",
+            "episodes": [{
+                "id": 802,
+                "name": "Stub Episode",
+                "overview": "Episode overview",
+                "air_date": "2021-01-03",
+                "episode_number": 2,
+                "season_number": 1,
+                "still_path": "/still.jpg",
+                "runtime": 45
+            }]
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/tv/8") {
+        return axum::Json(json!({
+            "id": 8,
+            "name": "Stub Series",
+            "original_name": "Original Series",
+            "overview": "Series overview",
+            "first_air_date": "2021-01-02",
+            "last_air_date": "2021-02-03",
+            "original_language": "en",
+            "number_of_seasons": 1,
+            "number_of_episodes": 2,
+            "poster_path": "/series-poster.jpg",
+            "backdrop_path": "/series-backdrop.jpg",
+            "seasons": []
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/person/9/external_ids") {
+        return axum::Json(json!({
+            "imdb_id": "nm0000009",
+            "tvdb_id": 9009,
+            "wikidata_id": "Q9"
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/person/9") {
+        return axum::Json(json!({
+            "id": 9,
+            "name": "Stub Person",
+            "biography": "Biography",
+            "birthday": "1970-01-01",
+            "known_for_department": "Acting",
+            "place_of_birth": "Test City",
+            "profile_path": "/profile.jpg"
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/movie/7/videos") {
+        return axum::Json(json!({
+            "results": [{
+                "id": "video-1",
+                "key": "abc123",
+                "name": "Official Trailer",
+                "site": "YouTube",
+                "type": "Trailer",
+                "official": true,
+                "published_at": "2020-01-01T00:00:00.000Z"
+            }]
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/movie/7/images") {
+        return axum::Json(json!({
+            "posters": [{"file_path": "/poster.jpg", "iso_639_1": "zh", "width": 100, "height": 150}],
+            "backdrops": [{"file_path": "/backdrop.jpg", "iso_639_1": null, "width": 1920, "height": 1080}],
+            "profiles": []
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/movie/7/external_ids") {
+        return axum::Json(json!({
+            "imdb_id": "tt0000007",
+            "tvdb_id": 7007,
+            "wikidata_id": "Q7"
         }))
         .into_response();
     }
@@ -319,6 +471,37 @@ async fn tmdb_client_reads_collection_details() -> Result<(), Box<dyn std::error
     let collection = client.collection_details(10, "zh-CN").await?;
     assert_eq!(collection.id, 10);
     assert_eq!(collection.parts[0].id, 7);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn tmdb_client_reads_tv_people_images_external_ids_and_videos()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (base_url, _, server) = start_stub(vec![StatusCode::OK; 12], None, false, false).await;
+    let client = TmdbClient::new(client_config(base_url, Duration::from_secs(1), 0))?;
+
+    let series_search = client.search_tv("stub", Some(2021), "zh-CN").await?;
+    assert_eq!(series_search.results[0].id, 8);
+    let person_search = client.search_people("stub", "zh-CN").await?;
+    assert_eq!(person_search.results[0].id, 9);
+    let collection_search = client.search_collections("stub", "zh-CN").await?;
+    assert_eq!(collection_search.results[0].id, 10);
+    let series = client.series_details(8, "zh-CN").await?;
+    assert_eq!(series.number_of_episodes, Some(2));
+    let season = client.season_details(8, 1, "zh-CN").await?;
+    assert_eq!(season.episodes[0].episode_number, Some(2));
+    let episode = client.episode_details(8, 1, 2, "zh-CN").await?;
+    assert_eq!(episode.id, 802);
+    let person = client.person_details(9, "zh-CN").await?;
+    assert_eq!(person.name.as_deref(), Some("Stub Person"));
+    let external_ids = client.movie_external_ids(7).await?;
+    assert_eq!(external_ids.imdb_id.as_deref(), Some("tt0000007"));
+    let images = client.movie_images(7, "zh-CN").await?;
+    assert_eq!(images.posters[0].file_path.as_deref(), Some("/poster.jpg"));
+    let videos = client.movie_videos(7, "zh-CN").await?;
+    assert_eq!(videos.results[0].key.as_deref(), Some("abc123"));
+
     server.abort();
     Ok(())
 }

@@ -248,6 +248,266 @@ impl TmdbClient {
         Ok(details)
     }
 
+    pub async fn search_tv(
+        &self,
+        query: &str,
+        first_air_date_year: Option<i32>,
+        language: &str,
+    ) -> Result<TmdbTvSearchResponse, TmdbError> {
+        let query = query.trim();
+        let language = language.trim();
+        if query.is_empty() || language.is_empty() {
+            return Err(TmdbError::InvalidRequest(
+                "TV query and language are required".to_owned(),
+            ));
+        }
+        let mut params = vec![
+            ("query", query.to_owned()),
+            ("include_adult", "false".to_owned()),
+            ("language", language.to_owned()),
+            ("page", "1".to_owned()),
+        ];
+        if let Some(year) = first_air_date_year {
+            if !(1800..=2200).contains(&year) {
+                return Err(TmdbError::InvalidRequest(
+                    "first air date year is out of range".to_owned(),
+                ));
+            }
+            params.push(("first_air_date_year", year.to_string()));
+        }
+        let response: TmdbTvSearchResponse = self.request_json("3/search/tv", &params).await?;
+        validate_tv_search_response(&response)?;
+        Ok(response)
+    }
+
+    pub async fn search_people(
+        &self,
+        query: &str,
+        language: &str,
+    ) -> Result<TmdbPersonSearchResponse, TmdbError> {
+        let query = query.trim();
+        let language = language.trim();
+        if query.is_empty() || language.is_empty() {
+            return Err(TmdbError::InvalidRequest(
+                "person query and language are required".to_owned(),
+            ));
+        }
+        let params = [
+            ("query", query.to_owned()),
+            ("include_adult", "false".to_owned()),
+            ("language", language.to_owned()),
+            ("page", "1".to_owned()),
+        ];
+        let response: TmdbPersonSearchResponse =
+            self.request_json("3/search/person", &params).await?;
+        validate_person_search_response(&response)?;
+        Ok(response)
+    }
+
+    pub async fn search_collections(
+        &self,
+        query: &str,
+        language: &str,
+    ) -> Result<TmdbCollectionSearchResponse, TmdbError> {
+        let query = query.trim();
+        let language = language.trim();
+        if query.is_empty() || language.is_empty() {
+            return Err(TmdbError::InvalidRequest(
+                "collection query and language are required".to_owned(),
+            ));
+        }
+        let params = [
+            ("query", query.to_owned()),
+            ("language", language.to_owned()),
+            ("page", "1".to_owned()),
+        ];
+        let response: TmdbCollectionSearchResponse =
+            self.request_json("3/search/collection", &params).await?;
+        validate_collection_search_response(&response)?;
+        Ok(response)
+    }
+
+    pub async fn series_details(
+        &self,
+        series_id: i64,
+        language: &str,
+    ) -> Result<TmdbSeriesDetails, TmdbError> {
+        validate_id_language(series_id, language, "series")?;
+        let endpoint = format!("3/tv/{series_id}");
+        let params = [("language", language.trim().to_owned())];
+        let details: TmdbSeriesDetails = self.request_json(&endpoint, &params).await?;
+        validate_id(details.id, "series details")?;
+        Ok(details)
+    }
+
+    pub async fn season_details(
+        &self,
+        series_id: i64,
+        season_number: i32,
+        language: &str,
+    ) -> Result<TmdbSeasonDetails, TmdbError> {
+        validate_id_language(series_id, language, "series")?;
+        if !(-1..=1000).contains(&season_number) {
+            return Err(TmdbError::InvalidRequest(
+                "season number is out of range".to_owned(),
+            ));
+        }
+        let endpoint = format!("3/tv/{series_id}/season/{season_number}");
+        let params = [("language", language.trim().to_owned())];
+        let details: TmdbSeasonDetails = self.request_json(&endpoint, &params).await?;
+        validate_id(details.id, "season details")?;
+        if details.episodes.iter().any(|episode| episode.id <= 0) {
+            return Err(TmdbError::InvalidResponse(
+                "season episode ID is invalid".to_owned(),
+            ));
+        }
+        Ok(details)
+    }
+
+    pub async fn episode_details(
+        &self,
+        series_id: i64,
+        season_number: i32,
+        episode_number: i32,
+        language: &str,
+    ) -> Result<TmdbEpisodeDetails, TmdbError> {
+        validate_id_language(series_id, language, "series")?;
+        if !(-1..=1000).contains(&season_number) || !(0..=10000).contains(&episode_number) {
+            return Err(TmdbError::InvalidRequest(
+                "episode number is out of range".to_owned(),
+            ));
+        }
+        let endpoint = format!("3/tv/{series_id}/season/{season_number}/episode/{episode_number}");
+        let params = [("language", language.trim().to_owned())];
+        let details: TmdbEpisodeDetails = self.request_json(&endpoint, &params).await?;
+        validate_id(details.id, "episode details")?;
+        Ok(details)
+    }
+
+    pub async fn person_details(
+        &self,
+        person_id: i64,
+        language: &str,
+    ) -> Result<TmdbPersonDetails, TmdbError> {
+        validate_id_language(person_id, language, "person")?;
+        let endpoint = format!("3/person/{person_id}");
+        let params = [("language", language.trim().to_owned())];
+        let details: TmdbPersonDetails = self.request_json(&endpoint, &params).await?;
+        validate_id(details.id, "person details")?;
+        Ok(details)
+    }
+
+    pub async fn movie_external_ids(&self, movie_id: i64) -> Result<TmdbExternalIds, TmdbError> {
+        self.external_ids("movie", movie_id).await
+    }
+
+    pub async fn tv_external_ids(&self, series_id: i64) -> Result<TmdbExternalIds, TmdbError> {
+        self.external_ids("tv", series_id).await
+    }
+
+    pub async fn person_external_ids(&self, person_id: i64) -> Result<TmdbExternalIds, TmdbError> {
+        self.external_ids("person", person_id).await
+    }
+
+    async fn external_ids(
+        &self,
+        item_type: &str,
+        item_id: i64,
+    ) -> Result<TmdbExternalIds, TmdbError> {
+        validate_id(item_id, item_type)?;
+        let endpoint = format!("3/{item_type}/{item_id}/external_ids");
+        let ids: TmdbExternalIds = self
+            .request_json(&endpoint, &[] as &[(String, String)])
+            .await?;
+        Ok(ids)
+    }
+
+    pub async fn movie_images(
+        &self,
+        movie_id: i64,
+        language: &str,
+    ) -> Result<TmdbImagesResponse, TmdbError> {
+        self.images("movie", movie_id, language).await
+    }
+
+    pub async fn tv_images(
+        &self,
+        series_id: i64,
+        language: &str,
+    ) -> Result<TmdbImagesResponse, TmdbError> {
+        self.images("tv", series_id, language).await
+    }
+
+    pub async fn season_images(
+        &self,
+        season_id: i64,
+        language: &str,
+    ) -> Result<TmdbImagesResponse, TmdbError> {
+        self.images("tv/season", season_id, language).await
+    }
+
+    pub async fn episode_images(
+        &self,
+        episode_id: i64,
+        language: &str,
+    ) -> Result<TmdbImagesResponse, TmdbError> {
+        self.images("tv/episode", episode_id, language).await
+    }
+
+    pub async fn person_images(
+        &self,
+        person_id: i64,
+        language: &str,
+    ) -> Result<TmdbImagesResponse, TmdbError> {
+        self.images("person", person_id, language).await
+    }
+
+    async fn images(
+        &self,
+        item_type: &str,
+        item_id: i64,
+        language: &str,
+    ) -> Result<TmdbImagesResponse, TmdbError> {
+        validate_id_language(item_id, language, item_type)?;
+        let endpoint = format!("3/{item_type}/{item_id}/images");
+        let params = [
+            ("language", language.trim().to_owned()),
+            (
+                "include_image_language",
+                format!("{},en,null", language.trim()),
+            ),
+        ];
+        self.request_json(&endpoint, &params).await
+    }
+
+    pub async fn movie_videos(
+        &self,
+        movie_id: i64,
+        language: &str,
+    ) -> Result<TmdbVideosResponse, TmdbError> {
+        self.videos("movie", movie_id, language).await
+    }
+
+    pub async fn tv_videos(
+        &self,
+        series_id: i64,
+        language: &str,
+    ) -> Result<TmdbVideosResponse, TmdbError> {
+        self.videos("tv", series_id, language).await
+    }
+
+    async fn videos(
+        &self,
+        item_type: &str,
+        item_id: i64,
+        language: &str,
+    ) -> Result<TmdbVideosResponse, TmdbError> {
+        validate_id_language(item_id, language, item_type)?;
+        let endpoint = format!("3/{item_type}/{item_id}/videos");
+        let params = [("language", language.trim().to_owned())];
+        self.request_json(&endpoint, &params).await
+    }
+
     pub async fn collection_details(
         &self,
         collection_id: i64,
@@ -473,6 +733,183 @@ pub struct TmdbMovieDetails {
     pub belongs_to_collection: Option<TmdbCollectionReference>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbTvSearchResponse {
+    pub page: i32,
+    pub total_pages: i32,
+    pub total_results: i32,
+    pub results: Vec<TmdbTvSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbTvSummary {
+    pub id: i64,
+    pub name: Option<String>,
+    pub original_name: Option<String>,
+    pub overview: Option<String>,
+    pub first_air_date: Option<String>,
+    pub original_language: Option<String>,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbPersonSearchResponse {
+    pub page: i32,
+    pub total_pages: i32,
+    pub total_results: i32,
+    pub results: Vec<TmdbPersonSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbPersonSummary {
+    pub id: i64,
+    pub name: Option<String>,
+    pub known_for_department: Option<String>,
+    pub profile_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbCollectionSearchResponse {
+    pub page: i32,
+    pub total_pages: i32,
+    pub total_results: i32,
+    pub results: Vec<TmdbCollectionSearchResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbCollectionSearchResult {
+    pub id: i64,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbSeriesDetails {
+    pub id: i64,
+    pub name: Option<String>,
+    pub original_name: Option<String>,
+    pub overview: Option<String>,
+    pub first_air_date: Option<String>,
+    pub last_air_date: Option<String>,
+    pub original_language: Option<String>,
+    pub number_of_seasons: Option<i32>,
+    pub number_of_episodes: Option<i32>,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    #[serde(default)]
+    pub seasons: Vec<TmdbSeasonSummary>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbSeasonSummary {
+    pub id: i64,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub air_date: Option<String>,
+    pub season_number: Option<i32>,
+    pub episode_count: Option<i32>,
+    pub poster_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbSeasonDetails {
+    pub id: i64,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub air_date: Option<String>,
+    pub season_number: Option<i32>,
+    pub poster_path: Option<String>,
+    #[serde(default)]
+    pub episodes: Vec<TmdbEpisodeSummary>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbEpisodeSummary {
+    pub id: i64,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub air_date: Option<String>,
+    pub episode_number: Option<i32>,
+    pub season_number: Option<i32>,
+    pub still_path: Option<String>,
+    pub runtime: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbEpisodeDetails {
+    pub id: i64,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub air_date: Option<String>,
+    pub episode_number: Option<i32>,
+    pub season_number: Option<i32>,
+    pub still_path: Option<String>,
+    pub runtime: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbPersonDetails {
+    pub id: i64,
+    pub name: Option<String>,
+    pub biography: Option<String>,
+    pub birthday: Option<String>,
+    pub deathday: Option<String>,
+    pub known_for_department: Option<String>,
+    pub place_of_birth: Option<String>,
+    pub profile_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbExternalIds {
+    pub imdb_id: Option<String>,
+    pub tvdb_id: Option<i64>,
+    pub wikidata_id: Option<String>,
+    pub facebook_id: Option<String>,
+    pub instagram_id: Option<String>,
+    pub twitter_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct TmdbImagesResponse {
+    #[serde(default)]
+    pub posters: Vec<TmdbImageReference>,
+    #[serde(default)]
+    pub backdrops: Vec<TmdbImageReference>,
+    #[serde(default)]
+    pub profiles: Vec<TmdbImageReference>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct TmdbImageReference {
+    pub file_path: Option<String>,
+    pub iso_639_1: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub vote_average: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbVideosResponse {
+    #[serde(default)]
+    pub results: Vec<TmdbVideoReference>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbVideoReference {
+    pub id: Option<String>,
+    pub key: Option<String>,
+    pub name: Option<String>,
+    pub site: Option<String>,
+    #[serde(rename = "type")]
+    pub video_type: Option<String>,
+    pub official: Option<bool>,
+    pub published_at: Option<String>,
+    pub iso_639_1: Option<String>,
+}
+
 fn validate_search_response(response: &TmdbMovieSearchResponse) -> Result<(), TmdbError> {
     if response.page < 1 || response.total_pages < 0 || response.total_results < 0 {
         return Err(TmdbError::InvalidResponse(
@@ -483,6 +920,66 @@ fn validate_search_response(response: &TmdbMovieSearchResponse) -> Result<(), Tm
         return Err(TmdbError::InvalidResponse(
             "TMDb movie result ID is invalid".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_tv_search_response(response: &TmdbTvSearchResponse) -> Result<(), TmdbError> {
+    validate_pagination(response.page, response.total_pages, response.total_results)?;
+    if response.results.iter().any(|result| result.id <= 0) {
+        return Err(TmdbError::InvalidResponse(
+            "TMDb TV result ID is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_person_search_response(response: &TmdbPersonSearchResponse) -> Result<(), TmdbError> {
+    validate_pagination(response.page, response.total_pages, response.total_results)?;
+    if response.results.iter().any(|result| result.id <= 0) {
+        return Err(TmdbError::InvalidResponse(
+            "TMDb person result ID is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_collection_search_response(
+    response: &TmdbCollectionSearchResponse,
+) -> Result<(), TmdbError> {
+    validate_pagination(response.page, response.total_pages, response.total_results)?;
+    if response.results.iter().any(|result| result.id <= 0) {
+        return Err(TmdbError::InvalidResponse(
+            "TMDb collection result ID is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pagination(page: i32, total_pages: i32, total_results: i32) -> Result<(), TmdbError> {
+    if page < 1 || total_pages < 0 || total_results < 0 {
+        return Err(TmdbError::InvalidResponse(
+            "TMDb search pagination is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_id_language(id: i64, language: &str, item_type: &str) -> Result<(), TmdbError> {
+    validate_id(id, item_type)?;
+    if language.trim().is_empty() {
+        return Err(TmdbError::InvalidRequest(format!(
+            "{item_type} ID and language are required"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_id(id: i64, item_type: &str) -> Result<(), TmdbError> {
+    if id <= 0 {
+        return Err(TmdbError::InvalidResponse(format!(
+            "{item_type} ID is invalid"
+        )));
     }
     Ok(())
 }

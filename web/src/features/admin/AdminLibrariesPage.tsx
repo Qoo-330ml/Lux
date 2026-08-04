@@ -112,7 +112,7 @@ function LibraryAdminCard({ library, plugins }: { library: AdminLibrary; plugins
 }
 
 function ScraperSelect({ value, plugins, onChange }: { value: string; plugins: AdminPlugin[]; onChange: (value: string) => void }) {
-  return <label className="lux-admin-scraper-field">刮削器<select value={value} onChange={(event) => onChange(event.target.value)}><option value="">仅使用本地元数据</option>{plugins.map((plugin) => <option key={plugin.id} value={plugin.id} disabled={!plugin.available}>{plugin.name}{plugin.available ? "" : plugin.installed ? "（请先配置）" : "（请先安装）"}</option>)}</select></label>;
+  return <label className="lux-admin-scraper-field">刮削器<select value={value} onChange={(event) => onChange(event.target.value)}><option value="">仅使用本地元数据</option>{plugins.map((plugin) => <option key={plugin.id} value={plugin.id} disabled={!plugin.available}>{plugin.name}{plugin.available ? "" : plugin.installed ? "（暂不可用）" : "（请先安装）"}</option>)}</select></label>;
 }
 
 function ScheduleField({ label, value, onSave }: { label: string; value?: string | null; onSave: (value: string) => void }) {
