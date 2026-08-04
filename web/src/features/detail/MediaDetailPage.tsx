@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Heart, Play, Radio, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource } from "../../lib/api/types";
@@ -13,9 +13,11 @@ import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
 import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
 import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
+import { MediaDeleteDialog } from "../media/MediaDeleteDialog";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
   const itemImages = useQuery({ queryKey: queryKeys.itemImages(itemId), queryFn: () => api.itemImages(itemId), enabled: Boolean(itemId) });
@@ -25,6 +27,7 @@ export function MediaDetailPage() {
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const isSeries = item.data?.itemType === "SERIES";
   const seasons = useQuery({
     queryKey: queryKeys.children(itemId, "SEASON"),
@@ -120,7 +123,7 @@ export function MediaDetailPage() {
               >
                 <Check size={20} strokeWidth={2.4} />
               </span>
-              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
               <span className="lux-detail-source"><Radio size={16} /> {source ? source.container || "DIRECT PLAY" : "暂无可播放版本"}</span>
             </div>
             {actionError ? <p className="lux-editor-error lux-detail-action-error" role="alert">{actionError}</p> : null}
@@ -152,6 +155,7 @@ export function MediaDetailPage() {
         void queryClient.invalidateQueries({ queryKey: queryKeys.itemImages(media.id) });
       }} /> : null}
       {editor === "subtitles" ? <MediaSubtitleEditor item={media} sourceId={source?.id} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
+      {deleteOpen ? <MediaDeleteDialog item={media} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(media.id, source?.id)} onDeleted={() => navigate("/libraries")} /> : null}
       {editor === "identify" ? <MediaIdentifier item={media} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
     </article>
   );

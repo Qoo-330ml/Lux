@@ -32,6 +32,7 @@ use tower_http::{
 
 use crate::{
     COMMIT, VERSION,
+    application::deletion::{MediaDeleteError, MediaDeleteService},
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
     application::playback::{ByteRange, RangeError, parse_single_range},
     application::probe::{FfprobeRunner, MediaProbeService},
@@ -98,6 +99,7 @@ pub struct AppState {
     metadata_writes: Option<MetadataWriteService>,
     downloads: Option<DownloadService>,
     metadata_reidentify: Option<MetadataReidentifyService>,
+    deletion: Option<MediaDeleteService>,
     probe: Option<MediaProbeService>,
     scan_jobs: Option<ScanJobService>,
     plugins: Option<PluginService>,
@@ -163,6 +165,7 @@ impl AppState {
                 config_dir.clone().join("downloads"),
             )),
             metadata_reidentify,
+            deletion: Some(MediaDeleteService::new(database.clone())),
             probe: Some(MediaProbeService::new(
                 database.clone(),
                 FfprobeRunner::default(),
@@ -292,6 +295,7 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/items/{item_id}/subtitles/{stream_index}",
             patch(admin_update_item_subtitle),
         )
+        .route("/api/v1/admin/items/{item_id}", delete(admin_delete_item))
         .route(
             "/api/v1/admin/items/{item_id}/collection/refresh",
             post(admin_refresh_collection),
@@ -5548,6 +5552,75 @@ async fn admin_update_item_subtitle(
         "isForced": request.is_forced,
     }))
     .into_response()
+}
+
+async fn admin_delete_item(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<LuxStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(deletion) = state.deletion.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let report = match deletion.delete(&item_id, query.source_id.as_deref()).await {
+        Ok(report) => report,
+        Err(MediaDeleteError::ItemNotFound) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体文件不存在",
+            )
+            .into_response();
+        }
+        Err(MediaDeleteError::PathOutsideRoot(_)) => {
+            return api_error(
+                &headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "媒体路径不在媒体库根目录内",
+            )
+            .into_response();
+        }
+        Err(MediaDeleteError::InvalidFileName(_)) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体文件名无效",
+            )
+            .into_response();
+        }
+        Err(MediaDeleteError::Io(_) | MediaDeleteError::Storage(_)) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "MEDIA_DELETED",
+        Some("media_source"),
+        Some(&report.source_id),
+        &format!(
+            r#"{{"itemId":"{}","fileCount":{}}}"#,
+            report.item_id, report.deleted_file_count
+        ),
+    )
+    .await;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn admin_refresh_collection(

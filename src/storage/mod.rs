@@ -2588,6 +2588,81 @@ impl Database {
         Ok(true)
     }
 
+    pub(crate) async fn delete_media_source(
+        &self,
+        item_id: &str,
+        source_id: &str,
+    ) -> Result<bool, StorageError> {
+        let Some((old_item_id, parent_id, series_id)) =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                "SELECT ms.item_id, old_item.parent_id, old_item.series_id
+                 FROM media_sources ms
+                 JOIN media_items old_item ON old_item.id = ms.item_id
+                 WHERE ms.id = ? AND ms.item_id = ?",
+            )
+            .bind(source_id)
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(false);
+        };
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query("DELETE FROM media_sources WHERE id = ? AND item_id = ?")
+            .bind(source_id)
+            .bind(&old_item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for related_item_id in [Some(old_item_id), parent_id, series_id]
+            .into_iter()
+            .flatten()
+        {
+            sqlx::query(
+                "UPDATE media_items
+                 SET removed_at = unixepoch()
+                 WHERE id = ? AND removed_at IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM media_sources WHERE item_id = media_items.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM media_items child
+                       WHERE child.parent_id = media_items.id
+                         AND child.removed_at IS NULL
+                   )",
+            )
+            .bind(related_item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn insert_filesystem_entry(
         &self,
         entry: NewFilesystemEntry<'_>,

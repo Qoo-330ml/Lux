@@ -2,6 +2,7 @@ pub mod access;
 pub mod candidates;
 pub mod catalog;
 pub mod collections;
+pub mod deletion;
 pub mod downloads;
 pub mod identification;
 pub mod images;

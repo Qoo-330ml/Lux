@@ -216,6 +216,13 @@ export class LuxApiClient {
     });
   }
 
+  deleteItem(itemId: string, sourceId?: string) {
+    const query = sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : "";
+    return this.request<void>(`/api/v1/admin/items/${encodeURIComponent(itemId)}${query}`, {
+      method: "DELETE",
+    });
+  }
+
   itemImages(itemId: string) {
     return this.request<{ images?: ItemImage[] }>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
   }

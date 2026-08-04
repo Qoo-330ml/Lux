@@ -1,4 +1,4 @@
-import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, RefreshCw, ScanLine, ScanSearch, Subtitles, Unlock, X } from "lucide-react";
+import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, RefreshCw, ScanLine, ScanSearch, Subtitles, Trash2, Unlock, X } from "lucide-react";
 import { createPortal } from "react-dom";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MediaItem } from "../../lib/api/types";
@@ -8,6 +8,7 @@ type MediaActionMenuProps = {
   onEditMetadata: () => void;
   onEditImages: () => void;
   onEditSubtitles?: () => void;
+  onDelete?: () => void;
   onIdentify?: () => void;
   onLockMetadata?: () => void;
   onUnlockMetadata?: () => void;
@@ -48,7 +49,7 @@ export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
   return `/api/v1/items/${encodeURIComponent(item.id)}/download${query}`;
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanLibrary, className = "", sourceId }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanLibrary, className = "", sourceId }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState({ left: 16, top: 16 });
   const rootRef = useRef<HTMLDivElement>(null);
@@ -173,6 +174,21 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
             >
               <Subtitles size={17} aria-hidden="true" />
               <span>编辑字幕</span>
+            </button>
+          ) : null}
+          {onDelete ? (
+            <button
+              className="lux-media-action lux-media-action-danger"
+              data-action="delete"
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onDelete();
+              }}
+            >
+              <Trash2 size={17} aria-hidden="true" />
+              <span>删除</span>
             </button>
           ) : null}
           {onIdentify ? (

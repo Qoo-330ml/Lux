@@ -26,6 +26,7 @@ describe("MediaActionMenu", () => {
     const onUnlockMetadata = vi.fn();
     const onRefreshMetadata = vi.fn();
     const onScanLibrary = vi.fn();
+    const onDelete = vi.fn();
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -51,6 +52,7 @@ describe("MediaActionMenu", () => {
             onUnlockMetadata={onUnlockMetadata}
             onRefreshMetadata={onRefreshMetadata}
             onScanLibrary={onScanLibrary}
+            onDelete={onDelete}
           />
         </MemoryRouter>,
       );
@@ -62,7 +64,7 @@ describe("MediaActionMenu", () => {
 
     const actions = [...document.body.querySelectorAll<HTMLElement>("[role=menuitem]")]
       .map((element) => element.textContent?.replace(/\s+/g, " ").trim());
-    expect(actions).toEqual(["下载", "下载到…", "编辑元数据", "编辑图像", "编辑字幕", "识别", "刷新元数据", "扫描媒体库文件", "锁定元数据", "解锁元数据"]);
+    expect(actions).toEqual(["下载", "下载到…", "编辑元数据", "编辑图像", "编辑字幕", "删除", "识别", "刷新元数据", "扫描媒体库文件", "锁定元数据", "解锁元数据"]);
     expect(document.body.querySelector<HTMLAnchorElement>("[data-action=download]")?.getAttribute("href"))
       .toBe("/api/v1/items/item-1/download?sourceId=source-4k");
 
@@ -96,6 +98,10 @@ describe("MediaActionMenu", () => {
     await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
     await act(async () => document.body.querySelector<HTMLElement>("[data-action=scan-library]")?.click());
     expect(onScanLibrary).toHaveBeenCalledOnce();
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+    await act(async () => document.body.querySelector<HTMLElement>("[data-action=delete]")?.click());
+    expect(onDelete).toHaveBeenCalledOnce();
   });
 
   it("keeps a menu opened from the first resource inside the viewport", () => {

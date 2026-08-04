@@ -183,6 +183,16 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("deletes the selected media source through the admin API", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+
+    await new LuxApiClient().deleteItem("item-1", "source-1");
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/admin/items/item-1?sourceId=source-1");
+    expect(options?.method).toBe("DELETE");
+  });
+
   it("exposes admin health and settings through the Lux API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

@@ -496,3 +496,67 @@ async fn admin_can_edit_an_external_subtitle_stream() -> Result<(), Box<dyn std:
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_delete_a_media_source_and_matching_sidecars()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    let media = movie_dir.join("Example.Movie.2020.mkv");
+    let subtitle = movie_dir.join("Example.Movie.2020.zh.srt");
+    let nfo = movie_dir.join("Example.Movie.2020.nfo");
+    tokio::fs::write(&media, b"fixture").await?;
+    tokio::fs::write(&subtitle, b"subtitle").await?;
+    tokio::fs::write(&nfo, b"nfo").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+
+    let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
+    let client = reqwest::Client::new();
+    let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
+    let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
+    let response = client
+        .delete(format!("{base_url}/api/v1/admin/items/{item_id}"))
+        .query(&[("sourceId", source_id.as_str())])
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", csrf)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(!media.exists());
+    assert!(!subtitle.exists());
+    assert!(!nfo.exists());
+    let source_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(source_count, 0);
+
+    server.abort();
+    Ok(())
+}
