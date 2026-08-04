@@ -152,6 +152,37 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("updates the editable flags of an indexed external subtitle", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("/api/v1/admin/items/item-1/subtitles/2");
+      expect(init?.method).toBe("PATCH");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        sourceId: "source-1",
+        title: "简体中文",
+        language: "zho",
+        isDefault: true,
+        isForced: false,
+      });
+      return new Response(JSON.stringify({
+        sourceId: "source-1",
+        streamIndex: 2,
+        title: "简体中文",
+        language: "zho",
+        isDefault: true,
+        isForced: false,
+      }), { status: 200 });
+    });
+
+    await expect(new LuxApiClient().updateItemSubtitle("item-1", 2, {
+      sourceId: "source-1",
+      title: "简体中文",
+      language: "zho",
+      isDefault: true,
+      isForced: false,
+    })).resolves.toMatchObject({ streamIndex: 2, isDefault: true });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("exposes admin health and settings through the Lux API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

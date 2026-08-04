@@ -192,6 +192,30 @@ export class LuxApiClient {
     );
   }
 
+  updateItemSubtitle(
+    itemId: string,
+    streamIndex: number,
+    input: {
+      sourceId: string;
+      title?: string;
+      language?: string;
+      isDefault: boolean;
+      isForced: boolean;
+    },
+  ) {
+    return this.request<{
+      sourceId: string;
+      streamIndex: number;
+      title?: string | null;
+      language?: string | null;
+      isDefault: boolean;
+      isForced: boolean;
+    }>(`/api/v1/admin/items/${encodeURIComponent(itemId)}/subtitles/${streamIndex}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
   itemImages(itemId: string) {
     return this.request<{ images?: ItemImage[] }>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
   }

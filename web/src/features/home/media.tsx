@@ -7,6 +7,7 @@ import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
 import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
+import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
 
 export function mediaTitle(item: MediaItem) {
   return item.title || item.name || "未命名媒体";
@@ -62,7 +63,7 @@ export function remainingRuntimeLabel(item: MediaItem) {
 export function MediaCard({ item, landscape = false }: { item: MediaItem; landscape?: boolean }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
-  const [editor, setEditor] = useState<"metadata" | "images" | "identify">();
+  const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
 
@@ -112,12 +113,13 @@ export function MediaCard({ item, landscape = false }: { item: MediaItem; landsc
             <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
           </div>
         </Link>
-        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
       {editor === "metadata" ? <MediaMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}
       {editor === "images" ? <MediaImageEditor item={item} onClose={() => setEditor(undefined)} /> : null}
+      {editor === "subtitles" ? <MediaSubtitleEditor item={item} onClose={() => setEditor(undefined)} /> : null}
       {editor === "identify" ? <MediaIdentifier item={item} onClose={() => setEditor(undefined)} /> : null}
     </>
   );

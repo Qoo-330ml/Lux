@@ -289,6 +289,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_start_item_scan),
         )
         .route(
+            "/api/v1/admin/items/{item_id}/subtitles/{stream_index}",
+            patch(admin_update_item_subtitle),
+        )
+        .route(
             "/api/v1/admin/items/{item_id}/collection/refresh",
             post(admin_refresh_collection),
         )
@@ -5009,6 +5013,16 @@ struct ItemImageSelectRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UpdateExternalSubtitleRequest {
+    source_id: String,
+    title: Option<String>,
+    language: Option<String>,
+    is_default: bool,
+    is_forced: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MetadataReidentifyRequest {
     #[serde(default)]
     item_ids: Vec<String>,
@@ -5430,6 +5444,110 @@ async fn admin_start_item_scan(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     admin_start_scan(headers, Path(library_id), State(state)).await
+}
+
+async fn admin_update_item_subtitle(
+    headers: HeaderMap,
+    Path((item_id, stream_index)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateExternalSubtitleRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() || request.source_id.trim().is_empty()
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "字幕或媒体条目参数无效",
+        )
+        .into_response();
+    }
+    let Ok(stream_index) = stream_index.parse::<i64>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "字幕轨道编号无效",
+        )
+        .into_response();
+    };
+    if stream_index < 0
+        || request.source_id.chars().count() > 128
+        || request
+            .title
+            .as_deref()
+            .is_some_and(|value| value.chars().count() > 256)
+        || request
+            .language
+            .as_deref()
+            .is_some_and(|value| value.chars().count() > 32)
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "字幕属性长度无效",
+        )
+        .into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let title = request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let language = request
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let updated = match database
+        .update_external_subtitle(
+            &item_id,
+            request.source_id.trim(),
+            stream_index,
+            title,
+            language,
+            request.is_default,
+            request.is_forced,
+        )
+        .await
+    {
+        Ok(updated) => updated,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if !updated {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "外挂字幕不存在",
+        )
+        .into_response();
+    }
+    record_audit_event(
+        &state,
+        &headers,
+        "SUBTITLE_UPDATED",
+        Some("media_stream"),
+        Some(&format!("{}:{}", request.source_id.trim(), stream_index)),
+        "{}",
+    )
+    .await;
+    Json(json!({
+        "sourceId": request.source_id.trim(),
+        "streamIndex": stream_index,
+        "title": title,
+        "language": language,
+        "isDefault": request.is_default,
+        "isForced": request.is_forced,
+    }))
+    .into_response()
 }
 
 async fn admin_refresh_collection(

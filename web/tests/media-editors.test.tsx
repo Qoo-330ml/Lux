@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MediaImageEditor } from "../src/features/media/MediaImageEditor";
 import { MediaMetadataEditor } from "../src/features/media/MediaMetadataEditor";
+import { MediaSubtitleEditor } from "../src/features/media/MediaSubtitleEditor";
 import { api } from "../src/lib/api/client";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -73,5 +74,54 @@ describe("media editors", () => {
     await act(async () => container.querySelectorAll<HTMLButtonElement>(".lux-select-trigger")[0]?.click());
     await act(async () => document.querySelector<HTMLButtonElement>("[role=option][data-value='en-US']")?.click());
     expect(search).toHaveBeenLastCalledWith("item-1", { imageType: "POSTER", language: "en-US", source: "TMDB" });
+  });
+
+  it("edits an indexed external subtitle without exposing embedded tracks", async () => {
+    const update = vi.spyOn(api, "updateItemSubtitle").mockResolvedValue({
+      sourceId: "source-1",
+      streamIndex: 2,
+      title: "简体中文",
+      language: "zho",
+      isDefault: true,
+      isForced: false,
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(<MediaSubtitleEditor item={{
+        id: "item-1",
+        title: "示例电影",
+        mediaSources: [{
+          id: "source-1",
+          isDefault: true,
+          streams: [
+            { index: 1, type: "SUBTITLE", language: "eng", isExternal: false },
+            { index: 2, type: "SUBTITLE", language: "zho", isExternal: true, isDefault: true, isForced: false },
+          ],
+        }],
+      }} onClose={() => undefined} />);
+    });
+    await act(async () => await Promise.resolve());
+
+    expect(container.querySelectorAll("[data-subtitle-index]")).toHaveLength(1);
+    await act(async () => {
+      const title = container.querySelector<HTMLInputElement>("#subtitle-title");
+      if (title) {
+        const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        setValue?.call(title, "简体中文");
+        title.dispatchEvent(new Event("input", { bubbles: true }));
+        title.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      container.querySelector<HTMLFormElement>("#subtitle-editor-form")?.requestSubmit();
+    });
+    expect(update).toHaveBeenCalledWith("item-1", 2, {
+      sourceId: "source-1",
+      title: "简体中文",
+      language: "zho",
+      isDefault: true,
+      isForced: false,
+    });
   });
 });

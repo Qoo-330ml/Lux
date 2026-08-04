@@ -1,4 +1,4 @@
-import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, RefreshCw, ScanLine, ScanSearch, Unlock, X } from "lucide-react";
+import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, RefreshCw, ScanLine, ScanSearch, Subtitles, Unlock, X } from "lucide-react";
 import { createPortal } from "react-dom";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MediaItem } from "../../lib/api/types";
@@ -7,6 +7,7 @@ type MediaActionMenuProps = {
   item: MediaItem;
   onEditMetadata: () => void;
   onEditImages: () => void;
+  onEditSubtitles?: () => void;
   onIdentify?: () => void;
   onLockMetadata?: () => void;
   onUnlockMetadata?: () => void;
@@ -47,7 +48,7 @@ export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
   return `/api/v1/items/${encodeURIComponent(item.id)}/download${query}`;
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanLibrary, className = "", sourceId }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanLibrary, className = "", sourceId }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState({ left: 16, top: 16 });
   const rootRef = useRef<HTMLDivElement>(null);
@@ -159,6 +160,21 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify
             <ImageIcon size={17} aria-hidden="true" />
             <span>编辑图像</span>
           </button>
+          {onEditSubtitles ? (
+            <button
+              className="lux-media-action"
+              data-action="edit-subtitles"
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onEditSubtitles();
+              }}
+            >
+              <Subtitles size={17} aria-hidden="true" />
+              <span>编辑字幕</span>
+            </button>
+          ) : null}
           {onIdentify ? (
             <button
               className="lux-media-action"

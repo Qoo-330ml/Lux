@@ -12,6 +12,7 @@ import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
 import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
+import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
@@ -21,7 +22,7 @@ export function MediaDetailPage() {
   const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
   const [selectedSourceId, setSelectedSourceId] = useState<string>();
   const [selectedSeasonId, setSelectedSeasonId] = useState<string>();
-  const [editor, setEditor] = useState<"metadata" | "images" | "identify">();
+  const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
   const isSeries = item.data?.itemType === "SERIES";
@@ -119,7 +120,7 @@ export function MediaDetailPage() {
               >
                 <Check size={20} strokeWidth={2.4} />
               </span>
-              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
               <span className="lux-detail-source"><Radio size={16} /> {source ? source.container || "DIRECT PLAY" : "暂无可播放版本"}</span>
             </div>
             {actionError ? <p className="lux-editor-error lux-detail-action-error" role="alert">{actionError}</p> : null}
@@ -150,6 +151,7 @@ export function MediaDetailPage() {
         setEditor(undefined);
         void queryClient.invalidateQueries({ queryKey: queryKeys.itemImages(media.id) });
       }} /> : null}
+      {editor === "subtitles" ? <MediaSubtitleEditor item={media} sourceId={source?.id} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
       {editor === "identify" ? <MediaIdentifier item={media} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
     </article>
   );

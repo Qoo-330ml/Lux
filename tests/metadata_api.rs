@@ -416,3 +416,83 @@ async fn admin_can_start_a_scan_from_an_item_action() -> Result<(), Box<dyn std:
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_edit_an_external_subtitle_stream() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams
+         (id, media_source_id, stream_index, stream_type, language, title,
+          external_path, is_external, is_default, is_forced)
+         VALUES (?, ?, 2, 'SUBTITLE', 'eng', 'English', 'Example.Movie.2020.en.srt', 1, 0, 0)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+
+    let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
+    let client = reqwest::Client::new();
+    let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
+    let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
+    let response = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/items/{item_id}/subtitles/2"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", csrf)
+        .json(&json!({
+            "sourceId": source_id,
+            "title": "简体中文",
+            "language": "zho",
+            "isDefault": true,
+            "isForced": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["title"], "简体中文");
+    assert_eq!(body["language"], "zho");
+    assert_eq!(body["isDefault"], true);
+
+    let flags: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT language, title, is_default, is_forced FROM media_streams
+         WHERE media_source_id = ? AND stream_index = 2",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(flags, ("zho".to_owned(), "简体中文".to_owned(), 1, 0));
+
+    server.abort();
+    Ok(())
+}

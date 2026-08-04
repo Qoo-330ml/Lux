@@ -2116,6 +2116,88 @@ impl Database {
         })
     }
 
+    pub(crate) async fn update_external_subtitle(
+        &self,
+        item_id: &str,
+        media_source_id: &str,
+        stream_index: i64,
+        title: Option<&str>,
+        language: Option<&str>,
+        is_default: bool,
+        is_forced: bool,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM media_streams mt
+             JOIN media_sources ms ON ms.id = mt.media_source_id
+             WHERE ms.id = ? AND ms.item_id = ? AND mt.stream_index = ?
+               AND mt.stream_type = 'SUBTITLE' AND mt.is_external = 1
+             LIMIT 1",
+        )
+        .bind(media_source_id)
+        .bind(item_id)
+        .bind(stream_index)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        if is_default {
+            sqlx::query(
+                "UPDATE media_streams
+                 SET is_default = 0, updated_at = unixepoch()
+                 WHERE media_source_id = ? AND stream_type = 'SUBTITLE'
+                   AND is_external = 1",
+            )
+            .bind(media_source_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        sqlx::query(
+            "UPDATE media_streams
+             SET title = ?, language = ?, is_default = ?, is_forced = ?,
+                 updated_at = unixepoch()
+             WHERE media_source_id = ? AND stream_index = ?
+               AND stream_type = 'SUBTITLE' AND is_external = 1",
+        )
+        .bind(title)
+        .bind(language)
+        .bind(is_default)
+        .bind(is_forced)
+        .bind(media_source_id)
+        .bind(stream_index)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn request_scan_job_cancel(&self, id: &str) -> Result<(), StorageError> {
         sqlx::query(
             "UPDATE scan_jobs SET cancel_requested = 1, updated_at = unixepoch()

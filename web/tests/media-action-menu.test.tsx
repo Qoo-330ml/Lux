@@ -20,6 +20,7 @@ describe("MediaActionMenu", () => {
   it("shows only the first four requested media actions and keeps the selected source in download links", async () => {
     const onEditMetadata = vi.fn();
     const onEditImages = vi.fn();
+    const onEditSubtitles = vi.fn();
     const onIdentify = vi.fn();
     const onLockMetadata = vi.fn();
     const onUnlockMetadata = vi.fn();
@@ -44,6 +45,7 @@ describe("MediaActionMenu", () => {
             }}
             onEditMetadata={onEditMetadata}
             onEditImages={onEditImages}
+            onEditSubtitles={onEditSubtitles}
             onIdentify={onIdentify}
             onLockMetadata={onLockMetadata}
             onUnlockMetadata={onUnlockMetadata}
@@ -60,7 +62,7 @@ describe("MediaActionMenu", () => {
 
     const actions = [...document.body.querySelectorAll<HTMLElement>("[role=menuitem]")]
       .map((element) => element.textContent?.replace(/\s+/g, " ").trim());
-    expect(actions).toEqual(["下载", "下载到…", "编辑元数据", "编辑图像", "识别", "刷新元数据", "扫描媒体库文件", "锁定元数据", "解锁元数据"]);
+    expect(actions).toEqual(["下载", "下载到…", "编辑元数据", "编辑图像", "编辑字幕", "识别", "刷新元数据", "扫描媒体库文件", "锁定元数据", "解锁元数据"]);
     expect(document.body.querySelector<HTMLAnchorElement>("[data-action=download]")?.getAttribute("href"))
       .toBe("/api/v1/items/item-1/download?sourceId=source-4k");
 
@@ -70,6 +72,10 @@ describe("MediaActionMenu", () => {
     });
     expect(onEditMetadata).toHaveBeenCalledOnce();
     expect(onEditImages).toHaveBeenCalledOnce();
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+    await act(async () => document.body.querySelector<HTMLElement>("[data-action=edit-subtitles]")?.click());
+    expect(onEditSubtitles).toHaveBeenCalledOnce();
 
     await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
     await act(async () => document.body.querySelector<HTMLElement>("[data-action=identify]")?.click());
