@@ -1,4 +1,58 @@
-use std::net::IpAddr;
+use std::{env, fmt, net::IpAddr};
+
+use reqwest::{Client, ClientBuilder, Proxy, Url};
+
+pub const PROXY_URL_ENV: &str = "LUX_PROXY_URL";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkProxyError {
+    InvalidUrl,
+}
+
+impl fmt::Display for NetworkProxyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUrl => {
+                formatter.write_str("network proxy URL must be a valid http(s) URL")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetworkProxyError {}
+
+pub fn proxy_url_from_env() -> Result<Option<String>, NetworkProxyError> {
+    match env::var(PROXY_URL_ENV) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => normalize_proxy_url(&value).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+pub fn client_builder_from_env() -> Result<ClientBuilder, NetworkProxyError> {
+    apply_proxy(Client::builder(), proxy_url_from_env()?.as_deref())
+}
+
+pub fn apply_proxy(
+    builder: ClientBuilder,
+    proxy_url: Option<&str>,
+) -> Result<ClientBuilder, NetworkProxyError> {
+    let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(builder);
+    };
+    let proxy_url = normalize_proxy_url(proxy_url)?;
+    let proxy = Proxy::all(proxy_url).map_err(|_| NetworkProxyError::InvalidUrl)?;
+    Ok(builder.proxy(proxy))
+}
+
+fn normalize_proxy_url(value: &str) -> Result<String, NetworkProxyError> {
+    let value = value.trim();
+    let url = Url::parse(value).map_err(|_| NetworkProxyError::InvalidUrl)?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(NetworkProxyError::InvalidUrl);
+    }
+    Ok(value.to_owned())
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteAccessPolicy {
@@ -149,5 +203,28 @@ fn is_public_address(address: IpAddr) -> bool {
                 && (value >> 121 != 0b1111110)
                 && (value >> 120 != 0b1111111010)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::Client;
+
+    use super::{NetworkProxyError, apply_proxy};
+
+    #[test]
+    fn proxy_configuration_accepts_http_and_https_and_rejects_other_schemes() {
+        assert!(apply_proxy(Client::builder(), Some("http://192.168.1.2:7890")).is_ok());
+        assert!(apply_proxy(Client::builder(), Some("https://proxy.invalid:8443")).is_ok());
+        assert!(matches!(
+            apply_proxy(Client::builder(), Some("socks5://proxy.invalid:1080")),
+            Err(NetworkProxyError::InvalidUrl)
+        ));
+    }
+
+    #[test]
+    fn empty_proxy_configuration_is_disabled() {
+        assert!(apply_proxy(Client::builder(), Some("  ")).is_ok());
+        assert!(apply_proxy(Client::builder(), None).is_ok());
     }
 }

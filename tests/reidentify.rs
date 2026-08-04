@@ -83,6 +83,7 @@ async fn admin_can_start_and_poll_batch_metadata_reidentify()
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
     let tmdb = TmdbClient::new(TmdbClientConfig {
         base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
         api_key: None,
         read_access_token: Some("stub-token".to_owned()),
         timeout: Duration::from_secs(1),

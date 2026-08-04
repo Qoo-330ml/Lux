@@ -21,6 +21,7 @@ use crate::{
         tmdb::TmdbError,
         tmdb_plugin::TmdbProvider,
     },
+    network::client_builder_from_env,
     storage::{Database, StorageError},
 };
 
@@ -62,7 +63,8 @@ impl ImageWriteService {
                 "image maximum size must be positive".to_owned(),
             ));
         }
-        let http = Client::builder()
+        let http = client_builder_from_env()
+            .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?
             .timeout(config.timeout)
             .build()
             .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;

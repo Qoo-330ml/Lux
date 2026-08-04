@@ -10,6 +10,7 @@ services:
     environment:
       LUX_HTTP_ADDR: 0.0.0.0:8097
       LUX_CONFIG_DIR: /data/config
+      LUX_PROXY_URL: ${LUX_PROXY_URL:-}
       LUX_TRUSTED_PROXY_CIDRS: ${LUX_TRUSTED_PROXY_CIDRS:-}
       LUX_TMDB_READ_ACCESS_TOKEN: ${LUX_TMDB_READ_ACCESS_TOKEN:-}
       RUST_LOG: ${RUST_LOG:-luxd=info,tower_http=info}

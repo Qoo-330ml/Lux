@@ -16,9 +16,12 @@ LUX_MEDIA_DIR=/srv/media docker compose up -d --build
 
 ```dotenv
 LUX_MEDIA_DIR=/srv/media
+LUX_PROXY_URL=http://192.168.1.2:7890
 LUX_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 LUX_TMDB_READ_ACCESS_TOKEN=***
 ```
+
+`LUX_PROXY_URL` 可选，用于 Lux 发出的 HTTP/HTTPS 请求，例如元数据、图片和人物头像下载。支持 `http://` 或 `https://` 代理地址；留空时不启用代理。代理地址不参与入站反向代理，也不改变 `.strm` 直交行为。
 
 `LUX_TRUSTED_PROXY_CIDRS` 只能填写实际代理节点或网关的地址范围，不能使用 `0.0.0.0/0`。Lux 只信任来自这些地址的 `X-Forwarded-For`。
 

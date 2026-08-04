@@ -1,5 +1,7 @@
 use std::{env, net::SocketAddr, path::PathBuf};
 
+use crate::network::proxy_url_from_env;
+
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8097";
 const DEFAULT_CONFIG_DIR: &str = "./config";
 
@@ -21,6 +23,7 @@ impl Config {
         let config_dir = env::var_os("LUX_CONFIG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR));
+        proxy_url_from_env().map_err(|_| ConfigError::InvalidProxyUrl)?;
 
         Ok(Self {
             http_addr,
@@ -35,6 +38,7 @@ pub enum ConfigError {
         value: String,
         source: std::net::AddrParseError,
     },
+    InvalidProxyUrl,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -42,6 +46,9 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::InvalidHttpAddr { value, source } => {
                 write!(formatter, "invalid LUX_HTTP_ADDR '{value}': {source}")
+            }
+            Self::InvalidProxyUrl => {
+                formatter.write_str("invalid LUX_PROXY_URL: expected an http(s) proxy URL")
             }
         }
     }

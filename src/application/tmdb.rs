@@ -11,6 +11,8 @@ use tokio::{
     time::sleep,
 };
 
+use crate::network::{apply_proxy, proxy_url_from_env};
+
 const DEFAULT_BASE_URL: &str = "https://api.themoviedb.org/";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const TMDB_MAX_CONCURRENT_REQUESTS: usize = 16;
@@ -20,6 +22,7 @@ pub(crate) const EMBEDDED_TMDB_API_KEY: &str = "f6bd687ffa63cd282b6ff2c6877f2669
 #[derive(Clone)]
 pub struct TmdbClientConfig {
     pub base_url: String,
+    pub proxy_url: Option<String>,
     pub api_key: Option<String>,
     pub read_access_token: Option<String>,
     pub timeout: Duration,
@@ -34,6 +37,7 @@ impl Default for TmdbClientConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_owned(),
+            proxy_url: None,
             api_key: None,
             read_access_token: None,
             timeout: Duration::from_secs(10),
@@ -93,8 +97,9 @@ impl TmdbClient {
             let nanos = (1_000_000_000_u64 / u64::from(requests_per_second)).max(1);
             Duration::from_nanos(nanos)
         });
-        let http = Client::builder()
-            .timeout(config.timeout)
+        let http = Client::builder().timeout(config.timeout);
+        let http = apply_proxy(http, config.proxy_url.as_deref())
+            .map_err(|error| TmdbError::InvalidProxyUrl(error.to_string()))?
             .build()
             .map_err(|error| TmdbError::ClientBuild(error.to_string()))?;
         Ok(Self {
@@ -123,6 +128,8 @@ impl TmdbClient {
             .or(fallback_token);
         let config = TmdbClientConfig {
             base_url: env::var("LUX_TMDB_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned()),
+            proxy_url: proxy_url_from_env()
+                .map_err(|error| TmdbError::InvalidProxyUrl(error.to_string()))?,
             api_key: None,
             read_access_token,
             ..TmdbClientConfig::default()
@@ -156,6 +163,8 @@ impl TmdbClient {
             .unwrap_or_else(|| TmdbCredential::ApiKey(EMBEDDED_TMDB_API_KEY.to_owned()));
         let config = TmdbClientConfig {
             base_url: env::var("LUX_TMDB_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned()),
+            proxy_url: proxy_url_from_env()
+                .map_err(|error| TmdbError::InvalidProxyUrl(error.to_string()))?,
             api_key: configured_api_key.or(environment_api_key),
             read_access_token: environment_token.or(configured_token),
             ..TmdbClientConfig::default()
@@ -1153,6 +1162,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 pub enum TmdbError {
     MissingToken,
     InvalidBaseUrl(String),
+    InvalidProxyUrl(String),
     ClientBuild(String),
     InvalidRequest(String),
     Timeout,
@@ -1170,6 +1180,7 @@ impl fmt::Display for TmdbError {
                 formatter.write_str("TMDb API read access token is not configured")
             }
             Self::InvalidBaseUrl(error) => write!(formatter, "invalid TMDb base URL: {error}"),
+            Self::InvalidProxyUrl(error) => write!(formatter, "invalid network proxy URL: {error}"),
             Self::ClientBuild(error) => {
                 write!(formatter, "TMDb HTTP client could not be built: {error}")
             }

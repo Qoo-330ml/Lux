@@ -102,6 +102,7 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
     let tmdb = TmdbClient::new(TmdbClientConfig {
         base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
         api_key: None,
         read_access_token: Some("stub-token".to_owned()),
         timeout: Duration::from_secs(1),

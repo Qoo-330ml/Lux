@@ -342,6 +342,7 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
 fn client_config(base_url: String, timeout: Duration, max_retries: u32) -> TmdbClientConfig {
     TmdbClientConfig {
         base_url,
+        proxy_url: None,
         api_key: None,
         read_access_token: Some("stub-token".to_owned()),
         timeout,
@@ -351,6 +352,23 @@ fn client_config(base_url: String, timeout: Duration, max_retries: u32) -> TmdbC
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     }
+}
+
+#[tokio::test]
+async fn tmdb_client_routes_requests_through_configured_network_proxy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (proxy_url, state, proxy_server) =
+        start_stub(vec![StatusCode::OK], None, false, false).await;
+    let mut config = client_config("http://tmdb.invalid".to_owned(), Duration::from_secs(1), 0);
+    config.proxy_url = Some(proxy_url);
+    let client = TmdbClient::new(config)?;
+
+    let response = client.search_movies("stub", Some(2020), "en-US").await?;
+
+    assert_eq!(response.results[0].id, 7);
+    assert_eq!(state.attempts.load(Ordering::Relaxed), 1);
+    proxy_server.abort();
+    Ok(())
 }
 
 #[test]
@@ -369,6 +387,15 @@ fn tmdb_client_requires_a_token_and_valid_http_base_url() {
         }),
         Err(TmdbError::InvalidBaseUrl(_))
     ));
+
+    assert!(matches!(
+        TmdbClient::new(TmdbClientConfig {
+            proxy_url: Some("ftp://proxy.invalid:7890".to_owned()),
+            read_access_token: Some("stub-token".to_owned()),
+            ..TmdbClientConfig::default()
+        }),
+        Err(TmdbError::InvalidProxyUrl(_))
+    ));
 }
 
 #[tokio::test]
@@ -377,6 +404,7 @@ async fn tmdb_client_sends_v3_api_key_as_a_query_parameter()
     let (base_url, state, server) = start_stub(vec![StatusCode::OK], None, false, false).await;
     let client = TmdbClient::new(TmdbClientConfig {
         base_url,
+        proxy_url: None,
         api_key: Some("custom-api-key".to_owned()),
         read_access_token: None,
         timeout: Duration::from_secs(1),
