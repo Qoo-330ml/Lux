@@ -1,5 +1,7 @@
 use std::{fmt, path::Path};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -88,6 +90,28 @@ impl PluginManifest {
             }
         }
         self.signature.validate()
+    }
+
+    pub fn signing_payload(&self) -> Result<Vec<u8>, PluginManifestError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| PluginManifestError::Invalid(error.to_string()))?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            PluginManifestError::Invalid("plugin manifest must serialize as an object".to_owned())
+        })?;
+        object.remove("signature");
+        serde_json::to_vec(&value).map_err(|error| PluginManifestError::Invalid(error.to_string()))
+    }
+
+    pub fn verify_signature(&self, key: &VerifyingKey) -> Result<(), PluginManifestError> {
+        let signature_bytes = BASE64.decode(&self.signature.value).map_err(|error| {
+            PluginManifestError::Invalid(format!("invalid signature encoding: {error}"))
+        })?;
+        let signature = Signature::from_slice(&signature_bytes)
+            .map_err(|error| PluginManifestError::Invalid(format!("invalid signature: {error}")))?;
+        let payload = self.signing_payload()?;
+        key.verify(&payload, &signature).map_err(|error| {
+            PluginManifestError::Invalid(format!("signature verification failed: {error}"))
+        })
     }
 }
 
@@ -184,7 +208,7 @@ impl PluginSignature {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginRequest {
     pub id: String,

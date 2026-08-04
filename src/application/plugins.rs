@@ -44,7 +44,7 @@ pub struct PluginService {
 impl PluginService {
     pub fn new(database: Database, config_dir: PathBuf) -> Self {
         let catalog = PluginCatalog::discover(&config_dir.join("plugins"));
-        let supervisor = PluginSupervisor::new(catalog.clone());
+        let supervisor = PluginSupervisor::new(catalog.clone()).with_config_dir(config_dir.clone());
         Self {
             database,
             config_dir,
@@ -166,10 +166,9 @@ impl PluginService {
     }
 
     async fn dynamic_view(&self, plugin: &DiscoveredPlugin, installed: bool) -> PluginView {
+        let runtime = self.supervisor.status(&plugin.manifest.id).await;
         let config_source = if is_tmdb_plugin_id(&plugin.manifest.id) {
             self.tmdb_config_source().await.to_owned()
-        } else if plugin.manifest.config_fields.is_empty() {
-            CONFIG_SOURCE_NONE.to_owned()
         } else {
             CONFIG_SOURCE_NONE.to_owned()
         };
@@ -183,13 +182,17 @@ impl PluginService {
             version: Some(plugin.manifest.version.clone()),
             runtime: Some(plugin.manifest.runtime.kind.clone()),
             capabilities: plugin.manifest.capabilities.clone(),
-            status: if installed {
-                "DISCOVERED".to_owned()
+            status: if runtime.running {
+                "RUNNING".to_owned()
+            } else if runtime.last_error.is_some() {
+                "ERROR".to_owned()
+            } else if installed {
+                "READY".to_owned()
             } else {
                 "AVAILABLE".to_owned()
             },
-            running: false,
-            last_error: None,
+            running: runtime.running,
+            last_error: runtime.last_error,
             installed,
             enabled: installed,
             configured,

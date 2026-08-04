@@ -1,12 +1,18 @@
 use std::{fs, io::Write, path::Path};
 
-use luxd::application::plugin_runtime::PluginCatalog;
-use serde_json::json;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ed25519_dalek::{Signer, SigningKey};
+use luxd::application::{plugin_protocol::PluginManifest, plugin_runtime::PluginCatalog};
+use serde_json::{Value, json};
 use tempfile::tempdir;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-fn manifest_bytes(entrypoint: &str) -> Vec<u8> {
-    serde_json::to_vec_pretty(&json!({
+fn test_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[7_u8; 32])
+}
+
+fn signed_manifest_value(entrypoint: &str) -> Value {
+    let mut value = json!({
         "formatVersion": 1,
         "id": "org.lux.example",
         "name": "Example plugin",
@@ -19,14 +25,34 @@ fn manifest_bytes(entrypoint: &str) -> Vec<u8> {
         "configFields": [],
         "permissions": {"network": [], "filesystem": ["plugin-cache"]},
         "files": [],
-        "signature": {"algorithm": "ed25519", "keyId": "test", "value": "signature"}
-    }))
-    .expect("manifest should serialize")
+        "signature": {"algorithm": "ed25519", "keyId": "test", "value": "placeholder"}
+    });
+    let manifest = PluginManifest::from_value(value.clone()).expect("manifest should validate");
+    let payload = manifest.signing_payload().expect("manifest payload");
+    let signature = test_signing_key().sign(&payload);
+    value["signature"]["value"] = Value::String(BASE64.encode(signature.to_bytes()));
+    value
+}
+
+fn manifest_bytes(entrypoint: &str) -> Vec<u8> {
+    serde_json::to_vec_pretty(&signed_manifest_value(entrypoint))
+        .expect("manifest should serialize")
 }
 
 fn write_manifest(path: &Path, entrypoint: &str) {
     fs::write(path.join("manifest.json"), manifest_bytes(entrypoint))
         .expect("manifest should be written");
+}
+
+fn write_trusted_keys(path: &Path) {
+    fs::write(
+        path.join("trusted_keys.json"),
+        serde_json::to_vec(&json!({
+            "test": BASE64.encode(test_signing_key().verifying_key().to_bytes())
+        }))
+        .expect("trusted keys should serialize"),
+    )
+    .expect("trusted keys should be written");
 }
 
 #[test]
@@ -36,6 +62,7 @@ fn discovers_an_exploded_plugin_directory() {
     fs::create_dir_all(plugin.join("binaries")).expect("plugin directory should be created");
     fs::write(plugin.join("binaries/plugin"), b"plugin").expect("entrypoint should be written");
     write_manifest(&plugin, "binaries/plugin");
+    write_trusted_keys(root.path());
 
     let catalog = PluginCatalog::discover(root.path());
 
@@ -68,6 +95,7 @@ fn discovers_a_zip_plugin_package_and_extracts_its_entrypoint() {
         .write_all(b"plugin")
         .expect("entrypoint should be written");
     archive.finish().expect("archive should finish");
+    write_trusted_keys(root.path());
 
     let catalog = PluginCatalog::discover(root.path());
 
@@ -95,6 +123,20 @@ fn ignores_unknown_files_and_reports_invalid_plugin_directories() {
     assert!(catalog.failures[0].message.contains("manifest"));
 }
 
+#[test]
+fn rejects_a_plugin_without_a_trusted_signature_key() {
+    let root = tempdir().expect("temp dir should be created");
+    let plugin = root.path().join("example");
+    fs::create_dir_all(plugin.join("binaries")).expect("plugin directory should be created");
+    fs::write(plugin.join("binaries/plugin"), b"plugin").expect("entrypoint should be written");
+    write_manifest(&plugin, "binaries/plugin");
+
+    let catalog = PluginCatalog::discover(root.path());
+
+    assert!(catalog.plugins.is_empty());
+    assert!(catalog.failures[0].message.contains("trusted"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn supervises_a_plugin_process_over_json_lines() {
@@ -114,6 +156,7 @@ async fn supervises_a_plugin_process_over_json_lines() {
     fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700))
         .expect("plugin process should be executable");
     write_manifest(&plugin, "binaries/plugin");
+    write_trusted_keys(root.path());
 
     let catalog = PluginCatalog::discover(root.path());
     let supervisor = PluginSupervisor::new(catalog);
@@ -123,5 +166,7 @@ async fn supervises_a_plugin_process_over_json_lines() {
         .expect("plugin call should succeed");
 
     assert_eq!(result["ok"], true);
+    assert!(supervisor.status("org.lux.example").await.running);
     supervisor.stop_all().await;
+    assert!(!supervisor.status("org.lux.example").await.running);
 }

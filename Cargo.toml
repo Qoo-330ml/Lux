@@ -10,6 +10,7 @@ license = "MIT"
 argon2 = "0.5.3"
 axum = "0.8"
 base64 = "0.22"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 httpdate = "1"
 quick-xml = "0.38"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -39,3 +40,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "luxd"
 path = "src/main.rs"
+
+[[bin]]
+name = "lux-plugin-tmdb"
+path = "src/bin/lux-plugin-tmdb.rs"
+
+[[bin]]
+name = "lux-plugin-pack"
+path = "src/bin/lux-plugin-pack.rs"

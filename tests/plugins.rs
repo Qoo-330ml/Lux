@@ -1,7 +1,10 @@
-use std::time::Duration;
+use std::{fs, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ed25519_dalek::{Signer, SigningKey};
 use luxd::{
     api::{AppState, app_with_state},
+    application::plugin_protocol::PluginManifest,
     application::setup::SetupService,
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -10,6 +13,38 @@ use luxd::{
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+
+fn signed_dynamic_manifest() -> Value {
+    let mut value = json!({
+        "formatVersion": 1,
+        "id": "org.lux.tmdb",
+        "name": "TMDb 动态插件",
+        "version": "1.0.0",
+        "apiVersion": 1,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "supportedItemTypes": ["Movie"],
+        "capabilities": ["metadata.search"],
+        "configFields": [{
+            "key": "apiKey",
+            "label": "TMDb API Key",
+            "type": "password",
+            "required": false,
+            "sensitive": true
+        }],
+        "permissions": {"network": ["api.themoviedb.org"], "filesystem": ["plugin-cache"]},
+        "files": [],
+        "signature": {"algorithm": "ed25519", "keyId": "test", "value": "placeholder"}
+    });
+    let manifest = PluginManifest::from_value(value.clone()).expect("manifest should validate");
+    let signature = SigningKey::from_bytes(&[7_u8; 32]).sign(
+        &manifest
+            .signing_payload()
+            .expect("manifest payload should serialize"),
+    );
+    value["signature"]["value"] = Value::String(BASE64.encode(signature.to_bytes()));
+    value
+}
 
 async fn start_server(
     config: Config,
@@ -223,6 +258,70 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_embedded_default()
     assert_eq!(
         created.json::<Value>().await?["library"]["scraperId"],
         "tmdb"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let plugin_dir = config_dir.join("plugins/org.lux.tmdb");
+    fs::create_dir_all(plugin_dir.join("binaries"))?;
+    fs::write(
+        config_dir.join("plugins/trusted_keys.json"),
+        serde_json::to_vec(&json!({
+            "test": BASE64.encode(
+                SigningKey::from_bytes(&[7_u8; 32])
+                    .verifying_key()
+                    .to_bytes()
+            )
+        }))?,
+    )?;
+    fs::write(plugin_dir.join("binaries/plugin"), b"plugin")?;
+    fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec(&signed_dynamic_manifest())?,
+    )?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir,
+    };
+    let (base_url, server) = start_server(config).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let (cookies, csrf) = admin_session(&client, &base_url).await?;
+
+    let catalog = client
+        .get(format!(
+            "{base_url}/api/v1/admin/plugins?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(catalog["total"], 1);
+    assert_eq!(catalog["plugins"][0]["id"], "org.lux.tmdb");
+    assert_eq!(catalog["plugins"][0]["version"], "1.0.0");
+    assert_eq!(catalog["plugins"][0]["runtime"], "process");
+
+    let installed = client
+        .post(format!(
+            "{base_url}/api/v1/admin/plugins/org.lux.tmdb/install"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(
+        installed.json::<Value>().await?["plugin"]["installed"],
+        true
     );
 
     server.abort();

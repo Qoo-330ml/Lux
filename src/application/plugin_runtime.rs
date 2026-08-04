@@ -1,6 +1,6 @@
 use std::{
-    collections::HashSet,
-    fmt,
+    collections::{HashMap, HashSet},
+    env, fmt,
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
@@ -48,6 +50,16 @@ pub struct PluginCatalog {
 impl PluginCatalog {
     pub fn discover(plugin_dir: &Path) -> Self {
         let mut catalog = Self::default();
+        let trusted_keys = match trusted_keys_for(plugin_dir) {
+            Ok(keys) => keys,
+            Err(message) => {
+                catalog.failures.push(PluginDiscoveryFailure {
+                    source_path: plugin_dir.join("trusted_keys.json"),
+                    message,
+                });
+                HashMap::new()
+            }
+        };
         let entries = match fs::read_dir(plugin_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return catalog,
@@ -69,12 +81,12 @@ impl PluginCatalog {
                 {
                     continue;
                 }
-                discover_directory(&source_path)
+                discover_directory(&source_path, &trusted_keys)
             } else if source_path
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
             {
-                discover_archive(&source_path)
+                discover_archive(&source_path, &trusted_keys)
             } else {
                 continue;
             };
@@ -150,7 +162,9 @@ const DEFAULT_PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct PluginSupervisor {
     catalog: Arc<PluginCatalog>,
     processes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<PluginProcess>>>>>,
+    last_errors: Arc<Mutex<HashMap<String, String>>>,
     call_timeout: Duration,
+    config_dir: Option<PathBuf>,
 }
 
 impl PluginSupervisor {
@@ -158,12 +172,19 @@ impl PluginSupervisor {
         Self {
             catalog: Arc::new(catalog),
             processes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            last_errors: Arc::new(Mutex::new(HashMap::new())),
             call_timeout: DEFAULT_PLUGIN_CALL_TIMEOUT,
+            config_dir: None,
         }
     }
 
     pub fn with_call_timeout(mut self, call_timeout: Duration) -> Self {
         self.call_timeout = call_timeout;
+        self
+    }
+
+    pub fn with_config_dir(mut self, config_dir: PathBuf) -> Self {
+        self.config_dir = Some(config_dir);
         self
     }
 
@@ -186,7 +207,13 @@ impl PluginSupervisor {
             if let Some(process) = processes.get(plugin_id) {
                 process.clone()
             } else {
-                let process = Arc::new(Mutex::new(spawn_process(plugin)?));
+                let process = match spawn_process(plugin, self.config_dir.as_deref()) {
+                    Ok(process) => Arc::new(Mutex::new(process)),
+                    Err(error) => {
+                        self.record_error(plugin_id, &error).await;
+                        return Err(error);
+                    }
+                };
                 processes.insert(plugin_id.to_owned(), process.clone());
                 process
             }
@@ -198,8 +225,22 @@ impl PluginSupervisor {
             .await;
         if result.is_err() {
             self.processes.lock().await.remove(plugin_id);
+            if let Err(error) = &result {
+                self.record_error(plugin_id, error).await;
+            }
+        } else {
+            self.last_errors.lock().await.remove(plugin_id);
         }
         result
+    }
+
+    pub async fn status(&self, plugin_id: &str) -> PluginRuntimeStatus {
+        let running = self.processes.lock().await.contains_key(plugin_id);
+        let last_error = self.last_errors.lock().await.get(plugin_id).cloned();
+        PluginRuntimeStatus {
+            running,
+            last_error,
+        }
     }
 
     pub async fn stop_all(&self) {
@@ -209,12 +250,31 @@ impl PluginSupervisor {
             let _ = process.child.kill().await;
         }
     }
+
+    async fn record_error(&self, plugin_id: &str, error: &PluginRuntimeError) {
+        self.last_errors
+            .lock()
+            .await
+            .insert(plugin_id.to_owned(), error.to_string());
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PluginRuntimeStatus {
+    pub running: bool,
+    pub last_error: Option<String>,
 }
 
 struct PluginProcess {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+}
+
+impl Drop for PluginProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
 }
 
 impl PluginProcess {
@@ -282,7 +342,10 @@ impl PluginProcess {
     }
 }
 
-fn spawn_process(plugin: &DiscoveredPlugin) -> Result<PluginProcess, PluginRuntimeError> {
+fn spawn_process(
+    plugin: &DiscoveredPlugin,
+    config_dir: Option<&Path>,
+) -> Result<PluginProcess, PluginRuntimeError> {
     let mut command = Command::new(&plugin.entrypoint);
     command
         .current_dir(&plugin.root_path)
@@ -294,6 +357,9 @@ fn spawn_process(plugin: &DiscoveredPlugin) -> Result<PluginProcess, PluginRunti
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some(config_dir) = config_dir {
+        command.env("LUX_CONFIG_DIR", config_dir);
+    }
     let mut child = command.spawn().map_err(PluginRuntimeError::Io)?;
     let stdin = child
         .stdin
@@ -343,8 +409,12 @@ impl fmt::Display for PluginRuntimeError {
 
 impl std::error::Error for PluginRuntimeError {}
 
-fn discover_directory(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
+fn discover_directory(
+    path: &Path,
+    trusted_keys: &HashMap<String, VerifyingKey>,
+) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
     let manifest = read_manifest(&path.join("manifest.json"))?;
+    verify_manifest_signature(&manifest, trusted_keys)?;
     let entrypoint = resolve_entrypoint(path, &manifest)?;
     verify_declared_files(path, &manifest)?;
     Ok(DiscoveredPlugin {
@@ -356,7 +426,10 @@ fn discover_directory(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryEr
     })
 }
 
-fn discover_archive(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
+fn discover_archive(
+    path: &Path,
+    trusted_keys: &HashMap<String, VerifyingKey>,
+) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
     let metadata = fs::metadata(path)?;
     if metadata.len() > MAX_PLUGIN_ARCHIVE_BYTES {
         return Err(PluginDiscoveryError::InvalidPackage(
@@ -377,6 +450,7 @@ fn discover_archive(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryErro
             .map_err(|error| PluginDiscoveryError::InvalidPackage(error.to_string()))?;
         PluginManifest::from_value(value)?
     };
+    verify_manifest_signature(&manifest, trusted_keys)?;
     let extracted_root = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -392,6 +466,48 @@ fn discover_archive(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryErro
         entrypoint,
         is_archive: true,
     })
+}
+
+fn verify_manifest_signature(
+    manifest: &PluginManifest,
+    trusted_keys: &HashMap<String, VerifyingKey>,
+) -> Result<(), PluginDiscoveryError> {
+    let key = trusted_keys
+        .get(&manifest.signature.key_id)
+        .ok_or_else(|| {
+            PluginDiscoveryError::InvalidPackage(format!(
+                "plugin signature key is not trusted: {}",
+                manifest.signature.key_id
+            ))
+        })?;
+    manifest.verify_signature(key)?;
+    Ok(())
+}
+
+fn trusted_keys_for(plugin_dir: &Path) -> Result<HashMap<String, VerifyingKey>, String> {
+    let contents = match env::var("LUX_PLUGIN_TRUSTED_KEYS") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => match fs::read_to_string(plugin_dir.join("trusted_keys.json")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => return Err(format!("could not read trusted plugin keys: {error}")),
+        },
+    };
+    let encoded: HashMap<String, String> = serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid trusted plugin keys: {error}"))?;
+    let mut keys = HashMap::with_capacity(encoded.len());
+    for (key_id, value) in encoded {
+        let bytes = BASE64
+            .decode(value)
+            .map_err(|error| format!("invalid trusted plugin key {key_id}: {error}"))?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| format!("trusted plugin key {key_id} must be 32 bytes"))?;
+        let key = VerifyingKey::from_bytes(&bytes)
+            .map_err(|error| format!("invalid trusted plugin key {key_id}: {error}"))?;
+        keys.insert(key_id, key);
+    }
+    Ok(keys)
 }
 
 fn read_manifest(path: &Path) -> Result<PluginManifest, PluginDiscoveryError> {
@@ -411,7 +527,12 @@ fn resolve_entrypoint(
     root: &Path,
     manifest: &PluginManifest,
 ) -> Result<PathBuf, PluginDiscoveryError> {
-    let entrypoint = root.join(&manifest.runtime.entrypoint);
+    let entrypoint_template = manifest
+        .runtime
+        .entrypoint
+        .replace("${platform}", current_platform())
+        .replace("${arch}", current_arch());
+    let entrypoint = root.join(entrypoint_template);
     if !entrypoint.is_file() {
         return Err(PluginDiscoveryError::InvalidPackage(format!(
             "plugin entrypoint does not exist: {}",
@@ -419,6 +540,20 @@ fn resolve_entrypoint(
         )));
     }
     Ok(entrypoint)
+}
+
+fn current_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        platform => platform,
+    }
+}
+
+fn current_arch() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "arm64",
+        (_, arch) => arch,
+    }
 }
 
 fn verify_declared_files(
@@ -448,6 +583,9 @@ fn extract_archive(
     archive: &mut ZipArchive<File>,
     destination: &Path,
 ) -> Result<(), PluginDiscoveryError> {
+    if destination.exists() {
+        fs::remove_dir_all(destination)?;
+    }
     fs::create_dir_all(destination)?;
     let mut total_size = 0_u64;
     for index in 0..archive.len() {
