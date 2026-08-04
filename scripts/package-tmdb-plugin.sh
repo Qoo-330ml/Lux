@@ -4,7 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${TMDB_PLUGIN_VERSION:-1.0.0}"
 KEY_ID="${LUX_PLUGIN_KEY_ID:-lux-official}"
-: "${LUX_PLUGIN_SIGNING_KEY_HEX:?set LUX_PLUGIN_SIGNING_KEY_HEX to a 32-byte Ed25519 private key in hex}"
 
 case "$(uname -s)" in
   Darwin) PLATFORM="darwin" ;;

@@ -46,10 +46,5 @@
       "plugin-cache"
     ]
   },
-  "files": [],
-  "signature": {
-    "algorithm": "ed25519",
-    "keyId": "lux-development",
-    "value": "development-package"
-  }
+  "files": []
 }

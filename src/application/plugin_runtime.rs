@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fmt,
+    fmt,
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -8,8 +8,6 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
@@ -50,16 +48,6 @@ pub struct PluginCatalog {
 impl PluginCatalog {
     pub fn discover(plugin_dir: &Path) -> Self {
         let mut catalog = Self::default();
-        let trusted_keys = match trusted_keys_for(plugin_dir) {
-            Ok(keys) => keys,
-            Err(message) => {
-                catalog.failures.push(PluginDiscoveryFailure {
-                    source_path: plugin_dir.join("trusted_keys.json"),
-                    message,
-                });
-                HashMap::new()
-            }
-        };
         let entries = match fs::read_dir(plugin_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return catalog,
@@ -81,12 +69,12 @@ impl PluginCatalog {
                 {
                     continue;
                 }
-                discover_directory(&source_path, &trusted_keys)
+                discover_directory(&source_path)
             } else if source_path
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
             {
-                discover_archive(&source_path, &trusted_keys)
+                discover_archive(&source_path)
             } else {
                 continue;
             };
@@ -417,12 +405,8 @@ impl fmt::Display for PluginRuntimeError {
 
 impl std::error::Error for PluginRuntimeError {}
 
-fn discover_directory(
-    path: &Path,
-    trusted_keys: &HashMap<String, VerifyingKey>,
-) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
+fn discover_directory(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
     let manifest = read_manifest(&path.join("manifest.json"))?;
-    verify_manifest_signature(&manifest, trusted_keys)?;
     let entrypoint = resolve_entrypoint(path, &manifest)?;
     verify_declared_files(path, &manifest)?;
     Ok(DiscoveredPlugin {
@@ -434,10 +418,7 @@ fn discover_directory(
     })
 }
 
-fn discover_archive(
-    path: &Path,
-    trusted_keys: &HashMap<String, VerifyingKey>,
-) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
+fn discover_archive(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
     let metadata = fs::metadata(path)?;
     if metadata.len() > MAX_PLUGIN_ARCHIVE_BYTES {
         return Err(PluginDiscoveryError::InvalidPackage(
@@ -458,7 +439,6 @@ fn discover_archive(
             .map_err(|error| PluginDiscoveryError::InvalidPackage(error.to_string()))?;
         PluginManifest::from_value(value)?
     };
-    verify_manifest_signature(&manifest, trusted_keys)?;
     let extracted_root = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -474,48 +454,6 @@ fn discover_archive(
         entrypoint,
         is_archive: true,
     })
-}
-
-fn verify_manifest_signature(
-    manifest: &PluginManifest,
-    trusted_keys: &HashMap<String, VerifyingKey>,
-) -> Result<(), PluginDiscoveryError> {
-    let key = trusted_keys
-        .get(&manifest.signature.key_id)
-        .ok_or_else(|| {
-            PluginDiscoveryError::InvalidPackage(format!(
-                "plugin signature key is not trusted: {}",
-                manifest.signature.key_id
-            ))
-        })?;
-    manifest.verify_signature(key)?;
-    Ok(())
-}
-
-fn trusted_keys_for(plugin_dir: &Path) -> Result<HashMap<String, VerifyingKey>, String> {
-    let contents = match env::var("LUX_PLUGIN_TRUSTED_KEYS") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => match fs::read_to_string(plugin_dir.join("trusted_keys.json")) {
-            Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
-            Err(error) => return Err(format!("could not read trusted plugin keys: {error}")),
-        },
-    };
-    let encoded: HashMap<String, String> = serde_json::from_str(&contents)
-        .map_err(|error| format!("invalid trusted plugin keys: {error}"))?;
-    let mut keys = HashMap::with_capacity(encoded.len());
-    for (key_id, value) in encoded {
-        let bytes = BASE64
-            .decode(value)
-            .map_err(|error| format!("invalid trusted plugin key {key_id}: {error}"))?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| format!("trusted plugin key {key_id} must be 32 bytes"))?;
-        let key = VerifyingKey::from_bytes(&bytes)
-            .map_err(|error| format!("invalid trusted plugin key {key_id}: {error}"))?;
-        keys.insert(key_id, key);
-    }
-    Ok(keys)
 }
 
 fn read_manifest(path: &Path) -> Result<PluginManifest, PluginDiscoveryError> {

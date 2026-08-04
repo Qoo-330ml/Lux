@@ -17,7 +17,7 @@ org.lux.tmdb-1.0.0.zip
 │   ├── darwin-arm64/lux-plugin-tmdb
 │   └── windows-x86_64/lux-plugin-tmdb.exe
 ├── assets/icon.png
-└── signature.json
+└── signature.json       # 可选
 ```
 
 开发时可以把同样的内容解压为 `/config/plugins/org.lux.tmdb/`。生产包的入口必须是 manifest 中的相对路径，禁止绝对路径和 `..` 路径。
@@ -52,32 +52,25 @@ org.lux.tmdb-1.0.0.zip
     "network": [],
     "filesystem": ["plugin-cache"]
   },
-  "files": [],
-  "signature": {
-    "algorithm": "ed25519",
-    "keyId": "lux-official",
-    "value": "..."
-  }
+  "files": []
 }
 ```
 
 `formatVersion` 是包格式；`apiVersion` 是 RPC 契约；`version` 是插件自身版本。三者不能混用。
 
-正式包必须使用 Ed25519 签名。Lux 从 `/config/plugins/trusted_keys.json` 读取公钥，格式为
-`{"keyId":"base64-encoded-32-byte-public-key"}`；也可以用同样 JSON 内容设置
-`LUX_PLUGIN_TRUSTED_KEYS`。没有匹配受信 key 的包不会被发现或启动。私钥只允许通过发布环境的
-`LUX_PLUGIN_SIGNING_KEY_HEX` 传入，不能写进仓库或 manifest。
+Lux 不再要求插件包使用 Lux Ed25519 签名。签名字段和 `signature.json` 保留为可选的兼容字段，
+不会作为插件发现或启动的阻断条件。插件仍必须通过 ZIP 大小、文件数量、路径、manifest、格式
+版本、协议版本、平台入口和声明文件 SHA-256 校验；插件继续在独立进程中运行。
 
-构建官方 TMDb 包：
+构建 TMDb 包：
 
 ```bash
-LUX_PLUGIN_KEY_ID=lux-official \\
-LUX_PLUGIN_SIGNING_KEY_HEX=<32-byte-ed25519-private-key-hex> \\
 ./scripts/package-tmdb-plugin.sh
 ```
 
-脚本输出 `org.lux.tmdb-<version>.zip`，包含 `manifest.json`、`signature.json` 和当前平台的
-`binaries/<platform>-<arch>/lux-plugin-tmdb`。插件目录只在 Lux 重启时扫描，升级包后需要重启。
+脚本输出 `org.lux.tmdb-<version>.zip`，包含 `manifest.json` 和当前平台的
+`binaries/<platform>-<arch>/lux-plugin-tmdb`。如设置 `LUX_PLUGIN_SIGNING_KEY_HEX`，才会额外写入
+签名字段和 `signature.json`。插件目录只在 Lux 重启时扫描，升级包后需要重启。
 
 ## RPC 方法
 

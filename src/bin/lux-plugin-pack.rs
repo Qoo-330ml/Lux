@@ -18,7 +18,7 @@ struct Arguments {
     version: String,
     platform: String,
     arch: String,
-    key_id: String,
+    key_id: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,18 +68,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "network": ["api.themoviedb.org", "image.tmdb.org"],
             "filesystem": ["plugin-cache"]
         },
-        "files": [{"path": relative_binary, "sha256": file_hash}],
-        "signature": {"algorithm": "ed25519", "keyId": arguments.key_id, "value": "placeholder"}
+        "files": [{"path": relative_binary, "sha256": file_hash}]
     }))?;
-    let signing_key_hex = env::var("LUX_PLUGIN_SIGNING_KEY_HEX")
-        .map_err(|_| "LUX_PLUGIN_SIGNING_KEY_HEX is not set")?;
-    let signing_key = parse_signing_key(&signing_key_hex)?;
-    let signature = signing_key.sign(&manifest.signing_payload()?);
-    manifest.signature = PluginSignature {
-        algorithm: "ed25519".to_owned(),
-        key_id: arguments.key_id,
-        value: BASE64.encode(signature.to_bytes()),
-    };
+    if let Ok(signing_key_hex) = env::var("LUX_PLUGIN_SIGNING_KEY_HEX") {
+        let signing_key = parse_signing_key(&signing_key_hex)?;
+        let signature = signing_key.sign(&manifest.signing_payload()?);
+        manifest.signature = Some(PluginSignature {
+            algorithm: "ed25519".to_owned(),
+            key_id: arguments
+                .key_id
+                .unwrap_or_else(|| "lux-official".to_owned()),
+            value: BASE64.encode(signature.to_bytes()),
+        });
+    }
     write_archive(&arguments.output, &relative_binary, &binary, &manifest)?;
     Ok(())
 }
@@ -115,7 +116,7 @@ impl Arguments {
             version: required(version, "--version")?,
             platform: required(platform, "--platform")?,
             arch: required(arch, "--arch")?,
-            key_id: required(key_id, "--key-id")?,
+            key_id,
         })
     }
 }
@@ -125,7 +126,7 @@ fn required(value: Option<String>, name: &str) -> Result<String, Box<dyn std::er
 }
 
 fn usage() -> &'static str {
-    "usage: lux-plugin-pack --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME --key-id ID (private key from LUX_PLUGIN_SIGNING_KEY_HEX)"
+    "usage: lux-plugin-pack --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME [--key-id ID] (optional private key from LUX_PLUGIN_SIGNING_KEY_HEX)"
 }
 
 fn parse_signing_key(value: &str) -> Result<SigningKey, Box<dyn std::error::Error>> {
@@ -163,8 +164,10 @@ fn write_archive(
     let options = SimpleFileOptions::default();
     archive.start_file("manifest.json", options)?;
     archive.write_all(&serde_json::to_vec_pretty(manifest)?)?;
-    archive.start_file("signature.json", options)?;
-    archive.write_all(&serde_json::to_vec_pretty(&manifest.signature)?)?;
+    if let Some(signature) = &manifest.signature {
+        archive.start_file("signature.json", options)?;
+        archive.write_all(&serde_json::to_vec_pretty(signature)?)?;
+    }
     archive.start_file(relative_binary, options)?;
     archive.write_all(binary)?;
     archive.finish()?;

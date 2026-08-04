@@ -40,6 +40,27 @@ fn accepts_a_versioned_process_plugin_manifest() {
 }
 
 #[test]
+fn accepts_a_versioned_process_plugin_manifest_without_a_signature() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.unsigned",
+        "name": "Unsigned plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "supportedItemTypes": [],
+        "capabilities": [],
+        "configFields": [],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect("manifest without a signature should validate");
+
+    assert!(manifest.signature.is_none());
+}
+
+#[test]
 fn rejects_manifest_entrypoints_that_escape_the_package() {
     let error = PluginManifest::from_value(json!({
         "formatVersion": PLUGIN_FORMAT_VERSION,

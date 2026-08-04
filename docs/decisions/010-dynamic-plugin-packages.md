@@ -14,12 +14,11 @@ Lux 需要把 Emby `MovieDb.dll` 的 TMDb 行为重写成可独立升级的 Lux 
 
 插件发布格式使用常规 ZIP 扩展名 `.zip`，例如 `org.lux.tmdb-1.0.0.zip`。包根目录必须包含 `manifest.json`，并可包含 `binaries/`、`assets/` 和 `signature.json`。manifest 声明稳定插件 ID、SemVer 版本、协议版本、运行时入口、平台架构、能力、配置字段、权限和文件哈希。
 
-Lux 在 `/config/plugins` 扫描 `.zip` 或开发用解压目录。包不会因为文件名存在就运行：必须通过路径、manifest、格式版本、协议版本、平台、哈希和签名校验。正式插件要求受信任签发者；首版不从任意远程 URL 自动下载包。
+Lux 在 `/config/plugins` 扫描 `.zip` 或开发用解压目录。包不会因为文件名存在就运行：必须通过路径、manifest、格式版本、协议版本、平台和哈希校验。Lux 不要求包签名；`signature` 字段和 `signature.json` 可以作为兼容信息保留，但不会阻止插件发现或启动。首版不从任意远程 URL 自动下载包。
 
-签名使用 Ed25519。受信公钥由 `/config/plugins/trusted_keys.json` 或
-`LUX_PLUGIN_TRUSTED_KEYS` 提供；签名覆盖去掉 `signature` 字段后的规范化 manifest，manifest
-中的 `files` 列表再覆盖包内可执行文件的 SHA-256。发布器使用 `lux-plugin-pack` 生成签名，私钥
-只从发布环境参数读取。
+如果发布流程选择附加签名，仍可使用 Ed25519；签名覆盖去掉 `signature` 字段后的规范化
+manifest，manifest 中的 `files` 列表再覆盖包内可执行文件的 SHA-256。发布器使用
+`lux-plugin-pack` 生成签名，私钥只从发布环境参数读取；运行时不依赖受信 key 配置。
 
 ### 运行时
 
@@ -54,4 +53,4 @@ Lux 在 `/config/plugins` 扫描 `.zip` 或开发用解压目录。包不会因�
 - 插件可以独立发布和升级，Lux 重启后从 `/config/plugins` 发现。
 - 插件崩溃不会直接终止 Lux 主进程，但同一操作系统用户下的子进程仍需要部署权限隔离，不能把进程监督误认为完整沙箱。
 - `org.lux.tmdb` 不再是 Rust 主进程内置实现；原始 Emby DLL 只作为行为参考。
-- 需要维护插件包格式、RPC 协议、签名信任和跨平台运行时矩阵。
+- 需要维护插件包格式、RPC 协议和跨平台运行时矩阵；签名不再是 Lux 运行时信任门槛。

@@ -34,7 +34,8 @@ pub struct PluginManifest {
     pub permissions: PluginPermissions,
     #[serde(default)]
     pub files: Vec<PluginFile>,
-    pub signature: PluginSignature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<PluginSignature>,
 }
 
 impl PluginManifest {
@@ -93,7 +94,10 @@ impl PluginManifest {
                 )));
             }
         }
-        self.signature.validate()
+        if let Some(signature) = &self.signature {
+            signature.validate()?;
+        }
+        Ok(())
     }
 
     pub fn signing_payload(&self) -> Result<Vec<u8>, PluginManifestError> {
@@ -107,7 +111,10 @@ impl PluginManifest {
     }
 
     pub fn verify_signature(&self, key: &VerifyingKey) -> Result<(), PluginManifestError> {
-        let signature_bytes = BASE64.decode(&self.signature.value).map_err(|error| {
+        let signature = self.signature.as_ref().ok_or_else(|| {
+            PluginManifestError::Invalid("plugin manifest has no signature".to_owned())
+        })?;
+        let signature_bytes = BASE64.decode(&signature.value).map_err(|error| {
             PluginManifestError::Invalid(format!("invalid signature encoding: {error}"))
         })?;
         let signature = Signature::from_slice(&signature_bytes)

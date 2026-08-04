@@ -44,6 +44,23 @@ fn write_manifest(path: &Path, entrypoint: &str) {
         .expect("manifest should be written");
 }
 
+fn unsigned_manifest_bytes(entrypoint: &str) -> Vec<u8> {
+    let mut value = signed_manifest_value(entrypoint);
+    value
+        .as_object_mut()
+        .expect("manifest should be an object")
+        .remove("signature");
+    serde_json::to_vec_pretty(&value).expect("manifest should serialize")
+}
+
+fn write_unsigned_manifest(path: &Path, entrypoint: &str) {
+    fs::write(
+        path.join("manifest.json"),
+        unsigned_manifest_bytes(entrypoint),
+    )
+    .expect("manifest should be written");
+}
+
 fn write_trusted_keys(path: &Path) {
     fs::write(
         path.join("trusted_keys.json"),
@@ -124,7 +141,7 @@ fn ignores_unknown_files_and_reports_invalid_plugin_directories() {
 }
 
 #[test]
-fn rejects_a_plugin_without_a_trusted_signature_key() {
+fn discovers_a_signed_plugin_without_a_trusted_signature_key() {
     let root = tempdir().expect("temp dir should be created");
     let plugin = root.path().join("example");
     fs::create_dir_all(plugin.join("binaries")).expect("plugin directory should be created");
@@ -133,8 +150,24 @@ fn rejects_a_plugin_without_a_trusted_signature_key() {
 
     let catalog = PluginCatalog::discover(root.path());
 
-    assert!(catalog.plugins.is_empty());
-    assert!(catalog.failures[0].message.contains("trusted"));
+    assert_eq!(catalog.plugins.len(), 1);
+    assert!(catalog.failures.is_empty());
+    assert_eq!(catalog.plugins[0].manifest.id, "org.lux.example");
+}
+
+#[test]
+fn discovers_an_unsigned_plugin_without_trusted_signature_key() {
+    let root = tempdir().expect("temp dir should be created");
+    let plugin = root.path().join("unsigned-example");
+    fs::create_dir_all(plugin.join("binaries")).expect("plugin directory should be created");
+    fs::write(plugin.join("binaries/plugin"), b"plugin").expect("entrypoint should be written");
+    write_unsigned_manifest(&plugin, "binaries/plugin");
+
+    let catalog = PluginCatalog::discover(root.path());
+
+    assert_eq!(catalog.plugins.len(), 1);
+    assert!(catalog.failures.is_empty());
+    assert_eq!(catalog.plugins[0].manifest.id, "org.lux.example");
 }
 
 #[cfg(unix)]
