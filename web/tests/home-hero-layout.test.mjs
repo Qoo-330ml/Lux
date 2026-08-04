@@ -20,3 +20,11 @@ test("hero keeps a shorter vertical footprint across responsive breakpoints", ()
   assert.match(stylesheet, /@media \(max-width: 900px\) \{[\s\S]*?\.lux-hero\s*\{\s*min-height:\s*680px/);
   assert.match(stylesheet, /@media \(max-width: 560px\) \{[\s\S]*?\.lux-hero\s*\{\s*min-height:\s*620px/);
 });
+
+test("hero logos fit inside the title area without distortion", () => {
+  const logoRule = stylesheet.match(/\.lux-hero-logo\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(logoRule, /max-height:\s*145px/);
+  assert.match(logoRule, /object-fit:\s*contain/);
+  assert.match(logoRule, /object-position:\s*left\s+center/);
+});

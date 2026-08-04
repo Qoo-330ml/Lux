@@ -75,6 +75,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-hero-copy { width: min(680px, calc(100% - 48px)); margin: 0 0 112px clamp(24px, 7.4vw, 150px); }
 .lux-eyebrow { display: inline-block; color: var(--lux-muted); font-size: .68rem; font-weight: 650; letter-spacing: .18em; text-transform: uppercase; }
 .lux-hero h1 { max-width: 700px; margin: 17px 0 10px; color: #fff; font-size: clamp(3.4rem, 7vw, 7rem); font-weight: 700; letter-spacing: -.075em; line-height: .94; text-shadow: 0 8px 28px rgba(0,0,0,.48); }
+.lux-hero-logo { display: block; max-width: min(440px, 100%); max-height: 145px; width: auto; height: auto; object-fit: contain; object-position: left center; filter: drop-shadow(0 8px 24px rgba(0,0,0,.4)); }
 .lux-hero-meta { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 22px; color: rgba(255,255,255,.72); font-size: 1rem; }
 .lux-hero-meta span + span::before { margin-right: 10px; color: rgba(255,255,255,.35); content: "·"; }
 .lux-hero-copy p { display: -webkit-box; max-width: 690px; margin: 0; overflow: hidden; color: rgba(255,255,255,.68); font-size: 1.02rem; line-height: 1.65; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; }
