@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer, SigningKey};
 use luxd::application::{plugin_protocol::PluginManifest, plugin_runtime::PluginCatalog};
 use serde_json::{Value, json};
-use tempfile::tempdir;
+use tempfile::{Builder, tempdir};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 fn test_signing_key() -> SigningKey {
@@ -202,4 +202,43 @@ async fn supervises_a_plugin_process_over_json_lines() {
     assert!(supervisor.status("org.lux.example").await.running);
     supervisor.stop_all().await;
     assert!(!supervisor.status("org.lux.example").await.running);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn supervises_a_plugin_process_when_catalog_paths_are_relative()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use luxd::application::plugin_runtime::PluginSupervisor;
+
+    let temporary_root = Builder::new()
+        .prefix("lux-plugin-runtime-")
+        .tempdir_in(".")?;
+    let current_dir = std::env::current_dir()?;
+    let relative_root = temporary_root
+        .path()
+        .strip_prefix(&current_dir)
+        .map(Path::to_owned)?;
+    let plugin = relative_root.join("example");
+    fs::create_dir_all(plugin.join("binaries"))?;
+    let entrypoint = plugin.join("binaries/plugin");
+    fs::write(
+        &entrypoint,
+        b"#!/bin/sh\ncase \"${LUX_CONFIG_DIR:-}\" in /*) config_absolute=true;; *) config_absolute=false;; esac\nwhile IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{\"id\":\"%s\",\"result\":{\"ok\":true,\"configAbsolute\":%s}}\\n' \"$id\" \"$config_absolute\"; done\n",
+    )?;
+    fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700))?;
+    write_manifest(&plugin, "binaries/plugin");
+    write_trusted_keys(&relative_root);
+
+    let catalog = PluginCatalog::discover(&relative_root);
+    let supervisor = PluginSupervisor::new(catalog).with_config_dir(relative_root.join("config"));
+    let result = supervisor
+        .call("org.lux.example", "plugin.health", json!({}))
+        .await?;
+
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["configAbsolute"], true);
+    supervisor.stop_all().await;
+    Ok(())
 }

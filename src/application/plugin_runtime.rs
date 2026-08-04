@@ -342,9 +342,15 @@ fn spawn_process(
     plugin: &DiscoveredPlugin,
     config_dir: Option<&Path>,
 ) -> Result<PluginProcess, PluginRuntimeError> {
-    let mut command = Command::new(&plugin.entrypoint);
+    let entrypoint = absolute_runtime_path(&plugin.entrypoint).map_err(PluginRuntimeError::Io)?;
+    let root_path = absolute_runtime_path(&plugin.root_path).map_err(PluginRuntimeError::Io)?;
+    let config_dir = config_dir
+        .map(absolute_runtime_path)
+        .transpose()
+        .map_err(PluginRuntimeError::Io)?;
+    let mut command = Command::new(entrypoint);
     command
-        .current_dir(&plugin.root_path)
+        .current_dir(root_path)
         .env("LUX_PLUGIN_ID", &plugin.manifest.id)
         .env(
             "LUX_PLUGIN_PROTOCOL_VERSION",
@@ -376,6 +382,13 @@ fn spawn_process(
         stdin: BufWriter::new(stdin),
         stdout: BufReader::new(stdout),
     })
+}
+
+fn absolute_runtime_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_owned());
+    }
+    std::env::current_dir().map(|current_dir| current_dir.join(path))
 }
 
 #[derive(Debug)]
