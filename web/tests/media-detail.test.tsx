@@ -98,6 +98,10 @@ describe("MediaDetailPage series hierarchy", () => {
     const watched = container.querySelector(".lux-detail-watched-status");
     expect(watched?.classList.contains("is-played")).toBe(true);
     expect(watched?.getAttribute("aria-label")).toBe("已看");
+
+    const actionItems = [...(container.querySelector(".lux-hero-actions")?.children ?? [])];
+    expect(actionItems[3]?.classList.contains("lux-media-actions")).toBe(true);
+    expect(actionItems[3]?.querySelector(".lux-media-actions-trigger")).not.toBeNull();
   });
 
   it("opens the complete overview from the three-line summary", async () => {

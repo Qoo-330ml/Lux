@@ -55,9 +55,6 @@ export function MediaDetailPage() {
       {backdrop ? <img className="lux-detail-backdrop" src={backdrop} alt="" /> : null}
       <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
-        <div className="lux-detail-action-anchor">
-          <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} />
-        </div>
         <div className="lux-detail-grid">
           <div className="lux-detail-poster">{poster ? <img src={poster} alt={`${mediaTitle(media)} 海报`} /> : <span><Sparkles size={32} />{mediaTitle(media)}</span>}</div>
           <div className="lux-detail-copy">
@@ -79,6 +76,7 @@ export function MediaDetailPage() {
               >
                 <Check size={20} strokeWidth={2.4} />
               </span>
+              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} />
               <span className="lux-detail-source"><Radio size={16} /> {source ? source.container || "DIRECT PLAY" : "暂无可播放版本"}</span>
             </div>
             {sources.length > 1 ? (
