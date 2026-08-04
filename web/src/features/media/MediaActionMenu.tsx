@@ -1,4 +1,4 @@
-import { Download, Ellipsis, FileDown, Image as ImageIcon, Pencil, X } from "lucide-react";
+import { Download, Ellipsis, FileDown, Image as ImageIcon, Pencil, ScanSearch, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { MediaItem } from "../../lib/api/types";
 
@@ -6,6 +6,7 @@ type MediaActionMenuProps = {
   item: MediaItem;
   onEditMetadata: () => void;
   onEditImages: () => void;
+  onIdentify?: () => void;
   className?: string;
   sourceId?: string;
 };
@@ -18,7 +19,7 @@ export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
   return `/api/v1/items/${encodeURIComponent(item.id)}/download${query}`;
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, className = "", sourceId }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify, className = "", sourceId }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const title = item.title || item.name || "媒体";
@@ -103,6 +104,21 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, className 
             <ImageIcon size={17} aria-hidden="true" />
             <span>编辑图像</span>
           </button>
+          {onIdentify ? (
+            <button
+              className="lux-media-action"
+              data-action="identify"
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onIdentify();
+              }}
+            >
+              <ScanSearch size={17} aria-hidden="true" />
+              <span>识别</span>
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>

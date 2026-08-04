@@ -71,6 +71,39 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("supports administrator candidate search and selection for identification", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/admin/items/item-1/identify/candidates?page=1&pageSize=50") {
+        return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+      }
+      if (path === "/api/v1/admin/items/item-1/identify/candidates") {
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toEqual({ query: "Example Movie", year: 2020 });
+        return new Response(JSON.stringify({ items: [{ id: "candidate-1" }], total: 1 }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/admin/items/item-1/identify/candidates/candidate-1/select");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({ mode: "fillMissing" });
+      return new Response(JSON.stringify({ status: "ONLINE_CONFIRMED" }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.adminItemCandidates("item-1")).resolves.toEqual({ items: [], total: 0 });
+    await expect(client.searchAdminItemCandidates("item-1", "Example Movie", 2020)).resolves.toEqual({
+      items: [{ id: "candidate-1" }],
+      total: 1,
+    });
+    await expect(client.selectAdminMetadata("item-1", "candidate-1", "fillMissing")).resolves.toEqual({
+      status: "ONLINE_CONFIRMED",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("exposes admin health and settings through the Lux API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

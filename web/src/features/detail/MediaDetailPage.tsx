@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Heart, Play, Radio, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -9,15 +9,17 @@ import { MediaInfoPanel } from "./MediaInfoPanel";
 import { imageUrl, mediaTitle, mediaTypeLabel, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
+import { MediaIdentifier } from "../media/MediaIdentifier";
 import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
+  const queryClient = useQueryClient();
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
   const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
   const [selectedSourceId, setSelectedSourceId] = useState<string>();
   const [selectedSeasonId, setSelectedSeasonId] = useState<string>();
-  const [editor, setEditor] = useState<"metadata" | "images">();
+  const [editor, setEditor] = useState<"metadata" | "images" | "identify">();
   const isSeries = item.data?.itemType === "SERIES";
   const seasons = useQuery({
     queryKey: queryKeys.children(itemId, "SEASON"),
@@ -76,7 +78,7 @@ export function MediaDetailPage() {
               >
                 <Check size={20} strokeWidth={2.4} />
               </span>
-              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} />
+              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} />
               <span className="lux-detail-source"><Radio size={16} /> {source ? source.container || "DIRECT PLAY" : "暂无可播放版本"}</span>
             </div>
             {sources.length > 1 ? (
@@ -101,6 +103,7 @@ export function MediaDetailPage() {
       </div>
       {editor === "metadata" ? <MediaMetadataEditor item={media} onClose={() => setEditor(undefined)} /> : null}
       {editor === "images" ? <MediaImageEditor item={media} onClose={() => setEditor(undefined)} /> : null}
+      {editor === "identify" ? <MediaIdentifier item={media} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
     </article>
   );
 }

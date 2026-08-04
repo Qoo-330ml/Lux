@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
+import { MediaIdentifier } from "../media/MediaIdentifier";
 import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
 
 export function mediaTitle(item: MediaItem) {
@@ -60,7 +61,7 @@ export function remainingRuntimeLabel(item: MediaItem) {
 export function MediaCard({ item, landscape = false }: { item: MediaItem; landscape?: boolean }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
-  const [editor, setEditor] = useState<"metadata" | "images">();
+  const [editor, setEditor] = useState<"metadata" | "images" | "identify">();
 
   return (
     <>
@@ -76,10 +77,11 @@ export function MediaCard({ item, landscape = false }: { item: MediaItem; landsc
             <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
           </div>
         </Link>
-        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} />
+        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} />
       </article>
       {editor === "metadata" ? <MediaMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}
       {editor === "images" ? <MediaImageEditor item={item} onClose={() => setEditor(undefined)} /> : null}
+      {editor === "identify" ? <MediaIdentifier item={item} onClose={() => setEditor(undefined)} /> : null}
     </>
   );
 }

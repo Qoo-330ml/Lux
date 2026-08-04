@@ -370,6 +370,19 @@ export class LuxApiClient {
     );
   }
 
+  adminItemCandidates(itemId: string) {
+    return this.request<{ items?: AdminMetadataCandidate[]; total?: number }>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/identify/candidates?page=1&pageSize=50`,
+    );
+  }
+
+  searchAdminItemCandidates(itemId: string, query: string, year?: number) {
+    return this.request<{ items?: AdminMetadataCandidate[]; total?: number }>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/identify/candidates`,
+      { method: "POST", body: JSON.stringify({ query, year }) },
+    );
+  }
+
   selectAdminMetadata(itemId: string, candidateId: string, mode: "fillMissing" | "refreshUnlocked") {
     return this.request<{ itemId: string; candidateId: string; status: string }>(
       `/api/v1/admin/items/${encodeURIComponent(itemId)}/identify/candidates/${encodeURIComponent(candidateId)}/select`,
