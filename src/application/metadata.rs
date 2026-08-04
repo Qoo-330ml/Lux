@@ -678,7 +678,8 @@ impl MetadataEnricher {
             let series_paths = read_directory_paths(&series_dir).await?;
             if series_seen.insert(source.series_id.clone()) {
                 if let Some(nfo_path) = find_tvshow_nfo(&series_dir).await {
-                    report.merge(self.enrich_nfo_item(&source.series_id, &nfo_path).await?);
+                    self.enrich_nfo_item_best_effort(&mut report, &source.series_id, &nfo_path)
+                        .await;
                 }
                 report.images_found += self
                     .index_images(&source.series_id, find_series_images(&series_paths, None))
@@ -692,7 +693,8 @@ impl MetadataEnricher {
                 if let Some(nfo_path) =
                     find_season_nfo(&series_dir, season_dir, season_number).await
                 {
-                    report.merge(self.enrich_nfo_item(&source.season_id, &nfo_path).await?);
+                    self.enrich_nfo_item_best_effort(&mut report, &source.season_id, &nfo_path)
+                        .await;
                 }
                 let mut season_paths = series_paths.clone();
                 if season_dir != series_dir {
@@ -714,11 +716,32 @@ impl MetadataEnricher {
 
             if episodes_seen.insert(source.episode_id.clone()) {
                 if let Some(nfo_path) = find_episode_nfo(&media_path).await {
-                    report.merge(self.enrich_nfo_item(&source.episode_id, &nfo_path).await?);
+                    self.enrich_nfo_item_best_effort(&mut report, &source.episode_id, &nfo_path)
+                        .await;
                 }
             }
         }
         Ok(report)
+    }
+
+    async fn enrich_nfo_item_best_effort(
+        &self,
+        report: &mut MetadataReport,
+        item_id: &str,
+        nfo_path: &Path,
+    ) {
+        match self.enrich_nfo_item(item_id, nfo_path).await {
+            Ok(nfo_report) => report.merge(nfo_report),
+            Err(error) => {
+                tracing::warn!(
+                    item_id,
+                    path = %nfo_path.display(),
+                    %error,
+                    "local NFO enrichment failed; continuing with remaining metadata"
+                );
+                report.nfo_failed += 1;
+            }
+        }
     }
 
     async fn enrich_nfo_item(
@@ -896,8 +919,37 @@ async fn read_directory_paths(directory: &Path) -> Result<Vec<PathBuf>, Metadata
 }
 
 fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {
-    let first = Path::new(relative_path).components().next()?.as_os_str();
-    Some(root.join(first))
+    let mut series_dir = root.to_owned();
+    let mut saw_series_component = false;
+    for component in Path::new(relative_path).parent()?.components() {
+        let value = component.as_os_str();
+        let value_text = value.to_str()?;
+        if is_season_directory(value_text) {
+            return saw_series_component.then_some(series_dir);
+        }
+        series_dir.push(value);
+        saw_series_component = true;
+    }
+    None
+}
+
+fn is_season_directory(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "specials" {
+        return true;
+    }
+    let Some(number) = normalized
+        .strip_prefix("season")
+        .or_else(|| normalized.strip_prefix('s'))
+    else {
+        return false;
+    };
+    let number = number.trim();
+    let number = number
+        .split_once('(')
+        .and_then(|(prefix, suffix)| suffix.strip_suffix(')').map(|_| prefix.trim()))
+        .unwrap_or(number);
+    !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
 }
 
 async fn find_tvshow_nfo(series_dir: &Path) -> Option<PathBuf> {
