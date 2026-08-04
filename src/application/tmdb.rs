@@ -569,7 +569,7 @@ impl TmdbClient {
                     }
                     return Err(TmdbError::Timeout);
                 }
-                Err(error) => return Err(TmdbError::Transport(error.to_string())),
+                Err(_) => return Err(TmdbError::Transport("request failed".to_owned())),
             };
             let status = response.status();
             let retry_after = retry_after(&response);
@@ -666,7 +666,7 @@ fn classify_transport_error(error: reqwest::Error) -> TmdbError {
     if error.is_timeout() {
         TmdbError::Timeout
     } else {
-        TmdbError::Transport(error.to_string())
+        TmdbError::Transport("response body could not be read".to_owned())
     }
 }
 
