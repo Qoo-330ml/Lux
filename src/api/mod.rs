@@ -60,8 +60,8 @@ use crate::{
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
-        settings::{read_tmdb_api_key, read_tmdb_token},
         tmdb::{TmdbClient, TmdbError},
+        tmdb_plugin::{TmdbPluginClient, TmdbProvider},
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
@@ -103,7 +103,7 @@ pub struct AppState {
     probe: Option<MediaProbeService>,
     scan_jobs: Option<ScanJobService>,
     plugins: Option<PluginService>,
-    tmdb: Option<TmdbClient>,
+    tmdb: Option<TmdbProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
     remote_access: RemoteAccessPolicy,
@@ -129,20 +129,14 @@ impl AppState {
         let metadata_selection = image_writes.clone().map(|images| {
             MetadataSelectionService::with_config_dir(database.clone(), images, config_dir.clone())
         });
-        let tmdb = TmdbClient::from_env_or_config(
-            read_tmdb_api_key(&config_dir),
-            read_tmdb_token(&config_dir),
-        )
-        .ok();
-        let collections = tmdb
-            .clone()
-            .map(|tmdb| CollectionService::new(database.clone(), tmdb));
-        let metadata_reidentify = tmdb
-            .clone()
-            .map(|tmdb| MetadataReidentifyService::new(database.clone(), tmdb));
-        let image_candidates = tmdb
-            .clone()
-            .map(|tmdb| ImageCandidateService::new(database.clone(), tmdb));
+        let plugins = PluginService::new(database.clone(), config_dir.clone());
+        let tmdb = TmdbProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
+        let collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
+        let metadata_reidentify = Some(MetadataReidentifyService::new(
+            database.clone(),
+            tmdb.clone(),
+        ));
+        let image_candidates = Some(ImageCandidateService::new(database.clone(), tmdb.clone()));
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -171,8 +165,8 @@ impl AppState {
                 FfprobeRunner::default(),
             )),
             scan_jobs: Some(ScanJobService::new(database.clone())),
-            plugins: Some(PluginService::new(database.clone(), config_dir.clone())),
-            tmdb,
+            plugins: Some(plugins),
+            tmdb: Some(tmdb),
             collections,
             people: Some(PeopleService::new(config_dir)),
             remote_access: RemoteAccessPolicy::from_env(),
@@ -184,6 +178,7 @@ impl AppState {
         let Some(database) = self.database.clone() else {
             return self;
         };
+        let tmdb = TmdbProvider::from(tmdb);
         self.tmdb = Some(tmdb.clone());
         self.collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
         self.metadata_reidentify = Some(MetadataReidentifyService::new(
@@ -192,6 +187,22 @@ impl AppState {
         ));
         self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
         self
+    }
+
+    pub async fn resume_metadata_reidentify_jobs(&self) {
+        let Some(service) = self.metadata_reidentify.clone() else {
+            return;
+        };
+        let Ok(job_ids) = service.active_job_ids().await else {
+            tracing::error!("failed to discover active metadata reidentify jobs during startup");
+            return;
+        };
+        for job_id in job_ids {
+            let worker = service.clone();
+            tokio::spawn(async move {
+                worker.run(&job_id).await;
+            });
+        }
     }
 
     pub fn with_remote_access_policy(mut self, policy: RemoteAccessPolicy) -> Self {
@@ -7521,6 +7532,7 @@ async fn admin_update_plugin_config(
                     tmdb.set_api_key((!api_key.is_empty()).then_some(api_key))
                         .await;
                 }
+                plugins.restart_tmdb().await;
             }
             record_audit_event(
                 &state,

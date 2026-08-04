@@ -53,6 +53,13 @@ struct MetadataRequest {
     episode_number: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TmdbRawRequest {
+    endpoint: String,
+    #[serde(default)]
+    params: Vec<(String, String)>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stdin = std::io::stdin();
@@ -121,12 +128,35 @@ async fn handle_method(method: &str, params: Value) -> Result<Value, PluginRpcEr
         | "metadata.externalIds"
         | "metadata.images"
         | "metadata.trailers" => cached_metadata_call(method, params).await,
+        "tmdb.request" => raw_tmdb_request(params).await,
         "plugin.shutdown" => Ok(json!({"accepted": true})),
         _ => Err(PluginRpcError {
             code: "PLUGIN_INVALID_REQUEST".to_owned(),
             message: format!("unsupported plugin method: {method}"),
         }),
     }
+}
+
+async fn raw_tmdb_request(params: Value) -> Result<Value, PluginRpcError> {
+    let request: TmdbRawRequest =
+        serde_json::from_value(params).map_err(|error| invalid(&error.to_string()))?;
+    if request.endpoint.len() > 256
+        || !request.endpoint.starts_with("3/")
+        || request.endpoint.contains("//")
+        || request.endpoint.contains("..")
+        || request.params.len() > 32
+        || request
+            .params
+            .iter()
+            .any(|(key, value)| key.len() > 64 || value.len() > 1024)
+    {
+        return Err(invalid("invalid TMDb raw request"));
+    }
+    client()
+        .await?
+        .request_value(&request.endpoint, &request.params)
+        .await
+        .map_err(tmdb_error)
 }
 
 async fn cached_metadata_call(method: &str, params: Value) -> Result<Value, PluginRpcError> {

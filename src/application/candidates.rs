@@ -13,7 +13,8 @@ use crate::{
         metadata::{MetadataCandidate, MetadataSource, MetadataState, NfoMetadata},
         nfo::{NfoWriteError, NfoWriteService},
         people::{ActorCredit, PeopleError},
-        tmdb::{TmdbCastMember, TmdbClient, TmdbError},
+        tmdb::{TmdbCastMember, TmdbError},
+        tmdb_plugin::TmdbProvider,
     },
     storage::{
         Database, NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
@@ -95,7 +96,7 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        tmdb: &TmdbClient,
+        tmdb: &TmdbProvider,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let current = self
             .database

@@ -14,7 +14,10 @@ use uuid::Uuid;
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
-    application::tmdb::{TmdbClient, TmdbError, TmdbImageReference, TmdbImagesResponse},
+    application::{
+        tmdb::{TmdbError, TmdbImageReference, TmdbImagesResponse},
+        tmdb_plugin::TmdbProvider,
+    },
     storage::{Database, StorageError},
 };
 
@@ -309,7 +312,7 @@ impl ImageWriteService {
 #[derive(Clone)]
 pub struct ImageCandidateService {
     database: Database,
-    tmdb: TmdbClient,
+    tmdb: TmdbProvider,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -325,8 +328,14 @@ pub struct ImageCandidate {
 }
 
 impl ImageCandidateService {
-    pub fn new(database: Database, tmdb: TmdbClient) -> Self {
-        Self { database, tmdb }
+    pub fn new<T>(database: Database, tmdb: T) -> Self
+    where
+        T: Into<TmdbProvider>,
+    {
+        Self {
+            database,
+            tmdb: tmdb.into(),
+        }
     }
 
     pub async fn search(

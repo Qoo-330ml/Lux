@@ -584,9 +584,37 @@ async fn tmdb_client_default_rate_limit_starts_no_more_than_thirty_two_requests_
     }
 
     let started_at = state.started_at.lock().await.clone();
-    assert!(started_at.windows(2).all(|pair| {
-        pair[1].duration_since(pair[0]) >= Duration::from_millis(30)
-    }));
+    assert!(
+        started_at
+            .windows(2)
+            .all(|pair| { pair[1].duration_since(pair[0]) >= Duration::from_millis(30) })
+    );
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn tmdb_client_clamps_configured_rate_to_thirty_two_requests_per_second()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (base_url, state, server) = start_stub(vec![StatusCode::OK; 2], None, false, false).await;
+    let client = TmdbClient::new(TmdbClientConfig {
+        base_url,
+        read_access_token: Some("stub-token".to_owned()),
+        requests_per_second: 128,
+        ..TmdbClientConfig::default()
+    })?;
+    for index in 0..2 {
+        client
+            .search_movies(&format!("stub-{index}"), None, "en-US")
+            .await?;
+    }
+
+    let started_at = state.started_at.lock().await.clone();
+    assert!(
+        started_at
+            .windows(2)
+            .all(|pair| { pair[1].duration_since(pair[0]) >= Duration::from_millis(30) })
+    );
     server.abort();
     Ok(())
 }

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::{
     application::{
         candidates::{MetadataCandidateError, MetadataCandidateService},
-        tmdb::TmdbClient,
+        tmdb_plugin::TmdbProvider,
     },
     storage::{Database, StorageError, StoredMetadataReidentifyItem},
 };
@@ -14,15 +14,18 @@ use crate::{
 pub struct MetadataReidentifyService {
     database: Database,
     candidates: MetadataCandidateService,
-    tmdb: TmdbClient,
+    tmdb: TmdbProvider,
 }
 
 impl MetadataReidentifyService {
-    pub fn new(database: Database, tmdb: TmdbClient) -> Self {
+    pub fn new<T>(database: Database, tmdb: T) -> Self
+    where
+        T: Into<TmdbProvider>,
+    {
         Self {
             candidates: MetadataCandidateService::new(database.clone()),
             database,
-            tmdb,
+            tmdb: tmdb.into(),
         }
     }
 

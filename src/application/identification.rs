@@ -1,4 +1,7 @@
-use crate::application::tmdb::{TmdbClient, TmdbError, TmdbMovieSummary};
+use crate::application::{
+    tmdb::{TmdbError, TmdbMovieSummary},
+    tmdb_plugin::TmdbProvider,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MovieIdentity {
@@ -33,12 +36,17 @@ pub struct IdentificationDecision {
 
 #[derive(Clone)]
 pub struct MovieIdentifier {
-    client: TmdbClient,
+    client: TmdbProvider,
 }
 
 impl MovieIdentifier {
-    pub fn new(client: TmdbClient) -> Self {
-        Self { client }
+    pub fn new<T>(client: T) -> Self
+    where
+        T: Into<TmdbProvider>,
+    {
+        Self {
+            client: client.into(),
+        }
     }
 
     pub async fn identify(

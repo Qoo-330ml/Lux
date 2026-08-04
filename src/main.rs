@@ -4,11 +4,8 @@ use luxd::{
     api::{AppState, app_with_state},
     application::{
         probe::{FfprobeRunner, MediaProbeService},
-        reidentify::MetadataReidentifyService,
         scanner::ScanJobService,
-        settings::{read_tmdb_api_key, read_tmdb_token},
         setup::SetupService,
-        tmdb::TmdbClient,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -37,20 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )),
     )
     .await;
-    if let Ok(tmdb) = TmdbClient::from_env_or_config(
-        read_tmdb_api_key(&config.config_dir),
-        read_tmdb_token(&config.config_dir),
-    ) {
-        resume_metadata_reidentify_jobs(MetadataReidentifyService::new(database.clone(), tmdb))
-            .await;
-    }
-    let app = app_with_state(AppState::ready(
-        config.clone(),
-        database.clone(),
-        setup,
-        auth,
-        emby_auth,
-    ));
+    let app_state = AppState::ready(config.clone(), database.clone(), setup, auth, emby_auth);
+    app_state.resume_metadata_reidentify_jobs().await;
+    let app = app_with_state(app_state);
 
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
@@ -78,19 +64,6 @@ async fn resume_scan_jobs(service: ScanJobService, probe: Option<MediaProbeServi
             if let Err(error) = worker.run_to_completion(&job_id, 100, worker_probe).await {
                 tracing::error!(job_id = %job_id, %error, "resumed scan job stopped");
             }
-        });
-    }
-}
-
-async fn resume_metadata_reidentify_jobs(service: MetadataReidentifyService) {
-    let Ok(job_ids) = service.active_job_ids().await else {
-        error!("failed to discover active metadata reidentify jobs during startup");
-        return;
-    };
-    for job_id in job_ids {
-        let worker = service.clone();
-        tokio::spawn(async move {
-            worker.run(&job_id).await;
         });
     }
 }

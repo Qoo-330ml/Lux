@@ -84,8 +84,13 @@ impl TmdbClient {
                 "TMDb base URL must use http or https".to_owned(),
             ));
         }
-        let request_interval = (config.requests_per_second > 0).then(|| {
-            let nanos = (1_000_000_000_u64 / u64::from(config.requests_per_second)).max(1);
+        let requests_per_second = if config.requests_per_second == 0 {
+            TMDB_REQUESTS_PER_SECOND
+        } else {
+            config.requests_per_second.min(TMDB_REQUESTS_PER_SECOND)
+        };
+        let request_interval = Some({
+            let nanos = (1_000_000_000_u64 / u64::from(requests_per_second)).max(1);
             Duration::from_nanos(nanos)
         });
         let http = Client::builder()
@@ -282,6 +287,34 @@ impl TmdbClient {
         let response: TmdbTvSearchResponse = self.request_json("3/search/tv", &params).await?;
         validate_tv_search_response(&response)?;
         Ok(response)
+    }
+
+    pub async fn search_tv_with_english_fallback(
+        &self,
+        query: &str,
+        first_air_date_year: Option<i32>,
+    ) -> Result<TmdbTvSearchResponse, TmdbError> {
+        let mut localized = self.search_tv(query, first_air_date_year, "zh-CN").await?;
+        if !localized.results.is_empty()
+            && localized.results.iter().all(localized_tv_fields_complete)
+        {
+            return Ok(localized);
+        }
+        let english = self.search_tv(query, first_air_date_year, "en-US").await?;
+        if localized.results.is_empty() {
+            return Ok(english);
+        }
+        for result in &mut localized.results {
+            let Some(fallback) = english.results.iter().find(|item| item.id == result.id) else {
+                continue;
+            };
+            fill_if_empty(&mut result.name, &fallback.name);
+            fill_if_empty(&mut result.original_name, &fallback.original_name);
+            fill_if_empty(&mut result.overview, &fallback.overview);
+            fill_if_empty(&mut result.first_air_date, &fallback.first_air_date);
+            fill_if_empty(&mut result.original_language, &fallback.original_language);
+        }
+        Ok(localized)
     }
 
     pub async fn search_people(
@@ -586,6 +619,19 @@ impl TmdbClient {
     where
         T: for<'de> Deserialize<'de>,
     {
+        let params = params
+            .iter()
+            .map(|(key, value)| (key.as_ref().to_owned(), value.clone()))
+            .collect::<Vec<_>>();
+        let value = self.request_value(endpoint, &params).await?;
+        serde_json::from_value(value).map_err(|error| TmdbError::InvalidResponse(error.to_string()))
+    }
+
+    pub async fn request_value(
+        &self,
+        endpoint: &str,
+        params: &[(String, String)],
+    ) -> Result<serde_json::Value, TmdbError> {
         let mut url = self
             .base_url
             .join(endpoint)
@@ -593,7 +639,7 @@ impl TmdbClient {
         {
             let mut query = url.query_pairs_mut();
             for (key, value) in params {
-                query.append_pair(key.as_ref(), value);
+                query.append_pair(key, value);
             }
         }
 
@@ -984,7 +1030,9 @@ pub struct TmdbVideoReference {
     pub iso_639_1: Option<String>,
 }
 
-fn validate_search_response(response: &TmdbMovieSearchResponse) -> Result<(), TmdbError> {
+pub(crate) fn validate_search_response(
+    response: &TmdbMovieSearchResponse,
+) -> Result<(), TmdbError> {
     if response.page < 1 || response.total_pages < 0 || response.total_results < 0 {
         return Err(TmdbError::InvalidResponse(
             "TMDb search pagination is invalid".to_owned(),
@@ -998,7 +1046,9 @@ fn validate_search_response(response: &TmdbMovieSearchResponse) -> Result<(), Tm
     Ok(())
 }
 
-fn validate_tv_search_response(response: &TmdbTvSearchResponse) -> Result<(), TmdbError> {
+pub(crate) fn validate_tv_search_response(
+    response: &TmdbTvSearchResponse,
+) -> Result<(), TmdbError> {
     validate_pagination(response.page, response.total_pages, response.total_results)?;
     if response.results.iter().any(|result| result.id <= 0) {
         return Err(TmdbError::InvalidResponse(
@@ -1048,7 +1098,11 @@ fn validate_pagination(page: i32, total_pages: i32, total_results: i32) -> Resul
     Ok(())
 }
 
-fn validate_id_language(id: i64, language: &str, item_type: &str) -> Result<(), TmdbError> {
+pub(crate) fn validate_id_language(
+    id: i64,
+    language: &str,
+    item_type: &str,
+) -> Result<(), TmdbError> {
     validate_id(id, item_type)?;
     if language.trim().is_empty() {
         return Err(TmdbError::InvalidRequest(format!(
@@ -1058,7 +1112,7 @@ fn validate_id_language(id: i64, language: &str, item_type: &str) -> Result<(), 
     Ok(())
 }
 
-fn validate_id(id: i64, item_type: &str) -> Result<(), TmdbError> {
+pub(crate) fn validate_id(id: i64, item_type: &str) -> Result<(), TmdbError> {
     if id <= 0 {
         return Err(TmdbError::InvalidResponse(format!(
             "{item_type} ID is invalid"
@@ -1067,13 +1121,19 @@ fn validate_id(id: i64, item_type: &str) -> Result<(), TmdbError> {
     Ok(())
 }
 
-fn localized_fields_complete(result: &TmdbMovieSummary) -> bool {
+pub(crate) fn localized_fields_complete(result: &TmdbMovieSummary) -> bool {
     [result.title.as_deref(), result.overview.as_deref()]
         .into_iter()
         .all(|value| value.is_some_and(|value| !value.trim().is_empty()))
 }
 
-fn fill_if_empty(target: &mut Option<String>, fallback: &Option<String>) {
+pub(crate) fn localized_tv_fields_complete(result: &TmdbTvSummary) -> bool {
+    [result.name.as_deref(), result.overview.as_deref()]
+        .into_iter()
+        .all(|value| value.is_some_and(|value| !value.trim().is_empty()))
+}
+
+pub(crate) fn fill_if_empty(target: &mut Option<String>, fallback: &Option<String>) {
     if target
         .as_deref()
         .and_then(|value| non_empty(Some(value)))

@@ -169,6 +169,34 @@ impl PluginService {
             .map_err(PluginServiceError::Runtime)
     }
 
+    pub async fn call_tmdb(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, PluginServiceError> {
+        let plugin = self
+            .catalog
+            .get(TMDB_DYNAMIC_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::Unavailable(TMDB_DYNAMIC_PLUGIN_ID.to_owned()))?;
+        let installed = self
+            .database
+            .is_plugin_installed(TMDB_DYNAMIC_PLUGIN_ID)
+            .await?;
+        if !self.dynamic_view(plugin, installed).await.available {
+            return Err(PluginServiceError::Unavailable(
+                TMDB_DYNAMIC_PLUGIN_ID.to_owned(),
+            ));
+        }
+        self.supervisor
+            .call(TMDB_DYNAMIC_PLUGIN_ID, method, params)
+            .await
+            .map_err(PluginServiceError::Runtime)
+    }
+
+    pub async fn restart_tmdb(&self) {
+        self.supervisor.stop(TMDB_DYNAMIC_PLUGIN_ID).await;
+    }
+
     pub async fn stop_all(&self) {
         self.supervisor.stop_all().await;
     }

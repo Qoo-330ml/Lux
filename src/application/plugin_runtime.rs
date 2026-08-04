@@ -251,6 +251,14 @@ impl PluginSupervisor {
         }
     }
 
+    pub async fn stop(&self, plugin_id: &str) {
+        let Some(process) = self.processes.lock().await.remove(plugin_id) else {
+            return;
+        };
+        let mut process = process.lock().await;
+        let _ = process.child.kill().await;
+    }
+
     async fn record_error(&self, plugin_id: &str, error: &PluginRuntimeError) {
         self.last_errors
             .lock()

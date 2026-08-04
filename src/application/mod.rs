@@ -22,4 +22,5 @@ pub mod scanner;
 pub mod settings;
 pub mod setup;
 pub mod tmdb;
+pub mod tmdb_plugin;
 pub mod watch;

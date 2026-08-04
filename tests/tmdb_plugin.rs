@@ -274,6 +274,34 @@ async fn standalone_tmdb_plugin_uses_the_lux_rpc_contract() -> Result<(), Box<dy
     assert_eq!(result["items"][0]["Name"], "Interstellar");
     assert_eq!(result["items"][0]["ProviderIds"]["Tmdb"], "157336");
 
+    let raw_response = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "request-raw",
+        "tmdb.request",
+        json!({
+            "endpoint": "3/search/movie",
+            "params": [["query", "Interstellar"], ["language", "en-US"]]
+        }),
+    )
+    .await?;
+    assert_eq!(raw_response["results"][0]["id"], 157336);
+
+    let invalid_raw_response = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "request-invalid",
+        "tmdb.request",
+        json!({"endpoint": "https://example.com/escape"}),
+    )
+    .await;
+    assert!(
+        invalid_raw_response
+            .expect_err("invalid raw endpoint should be rejected")
+            .to_string()
+            .contains("PLUGIN_INVALID_REQUEST")
+    );
+
     child.kill().await?;
     server.abort();
     Ok(())

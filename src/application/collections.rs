@@ -1,19 +1,25 @@
 use std::fmt;
 
 use crate::{
-    application::tmdb::{TmdbClient, TmdbError},
+    application::{tmdb::TmdbError, tmdb_plugin::TmdbProvider},
     storage::{Database, NewTmdbCollection, StorageError},
 };
 
 #[derive(Clone)]
 pub struct CollectionService {
     database: Database,
-    tmdb: TmdbClient,
+    tmdb: TmdbProvider,
 }
 
 impl CollectionService {
-    pub fn new(database: Database, tmdb: TmdbClient) -> Self {
-        Self { database, tmdb }
+    pub fn new<T>(database: Database, tmdb: T) -> Self
+    where
+        T: Into<TmdbProvider>,
+    {
+        Self {
+            database,
+            tmdb: tmdb.into(),
+        }
     }
 
     pub async fn refresh_for_item(
