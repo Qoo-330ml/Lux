@@ -48,7 +48,8 @@ use crate::{
         },
         collections::{CollectionError, CollectionService},
         images::{
-            ImageError, ImageService, ImageWriteError, ImageWriteService, normalize_image_type,
+            ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
+            ImageWriteService, normalize_image_type,
         },
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
@@ -88,6 +89,7 @@ pub struct AppState {
     catalog: Option<CatalogService>,
     images: Option<ImageService>,
     image_writes: Option<ImageWriteService>,
+    image_candidates: Option<ImageCandidateService>,
     library_covers: Option<LibraryCoverService>,
     access: Option<MediaAccessService>,
     metadata_candidates: Option<MetadataCandidateService>,
@@ -134,6 +136,9 @@ impl AppState {
         let metadata_reidentify = tmdb
             .clone()
             .map(|tmdb| MetadataReidentifyService::new(database.clone(), tmdb));
+        let image_candidates = tmdb
+            .clone()
+            .map(|tmdb| ImageCandidateService::new(database.clone(), tmdb));
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -145,6 +150,7 @@ impl AppState {
             catalog: Some(CatalogService::new(database.clone(), access.clone())),
             images: Some(ImageService::new(database.clone(), access.clone())),
             image_writes,
+            image_candidates,
             library_covers,
             access: Some(access),
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
@@ -174,7 +180,11 @@ impl AppState {
         };
         self.tmdb = Some(tmdb.clone());
         self.collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
-        self.metadata_reidentify = Some(MetadataReidentifyService::new(database, tmdb));
+        self.metadata_reidentify = Some(MetadataReidentifyService::new(
+            database.clone(),
+            tmdb.clone(),
+        ));
+        self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
         self
     }
 
@@ -338,6 +348,15 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/items/{item_id}/images/{image_type}/{image_index}",
             get(lux_image_at_index).head(lux_image_at_index),
+        )
+        .route("/api/v1/items/{item_id}/images", get(lux_list_item_images))
+        .route(
+            "/api/v1/items/{item_id}/images/search",
+            post(lux_search_item_images),
+        )
+        .route(
+            "/api/v1/items/{item_id}/images/select",
+            post(lux_select_item_image),
         )
         .route(
             "/api/v1/items/{item_id}/subtitles/{stream_index}",
@@ -3718,6 +3737,137 @@ async fn lux_image_at_index(
     .await
 }
 
+async fn lux_list_item_images(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(images) = state.image_writes.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match images.list_item_images(&item_id).await {
+        Ok(images) => Json(json!({
+            "images": images.iter().map(|image| item_image_json(&item_id, image)).collect::<Vec<_>>()
+        })).into_response(),
+        Err(error) => image_write_error(&headers, error),
+    }
+}
+
+async fn lux_search_item_images(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ItemImageSearchRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(candidates) = state.image_candidates.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match candidates
+        .search(
+            &item_id,
+            &request.image_type,
+            request.language.as_deref(),
+            request.source.as_deref(),
+        )
+        .await
+    {
+        Ok(images) => Json(json!({
+            "images": images.iter().map(image_candidate_json).collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => image_candidate_error(&headers, error),
+    }
+}
+
+async fn lux_select_item_image(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ItemImageSelectRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(images) = state.image_writes.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let report = match images
+        .download_item_image_from_tmdb_candidate(&item_id, &request.image_type, &request.url)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => return image_write_error(&headers, error),
+    };
+    let image = match images.list_item_images(&item_id).await {
+        Ok(images) => images.into_iter().find(|image| image.id == report.id),
+        Err(error) => return image_write_error(&headers, error),
+    };
+    let Some(image) = image else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "IMAGE_SELECTED",
+        Some("item_image"),
+        Some(&image.id),
+        "{}",
+    )
+    .await;
+    Json(json!({ "image": item_image_json(&item_id, &image) })).into_response()
+}
+
 async fn lux_subtitle(
     headers: HeaderMap,
     method: Method,
@@ -4127,16 +4277,19 @@ async fn serve_download_archive(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let body = if method == Method::HEAD {
+        drop(file);
+        let _ = fs::remove_file(&path).await;
         Body::empty()
     } else {
-        Body::from_stream(tokio_util::io::ReaderStream::new(CleanupFile::new(file, path)))
+        Body::from_stream(tokio_util::io::ReaderStream::new(CleanupFile::new(
+            file, path,
+        )))
     };
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        "Content-Type",
-        HeaderValue::from_static("application/zip"),
-    );
+    response
+        .headers_mut()
+        .insert("Content-Type", HeaderValue::from_static("application/zip"));
     if let Ok(value) = HeaderValue::from_str(&size.to_string()) {
         response.headers_mut().insert("Content-Length", value);
     }
@@ -4681,6 +4834,23 @@ struct MetadataCandidateQuery {
 struct MetadataCandidateSearchRequest {
     query: String,
     year: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemImageSearchRequest {
+    image_type: String,
+    language: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemImageSelectRequest {
+    image_type: String,
+    url: String,
+    #[allow(dead_code)]
+    language: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -6467,6 +6637,95 @@ fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> Response {
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "图片请求无效",
+        )
+        .into_response(),
+    }
+}
+
+fn item_image_json(item_id: &str, image: &crate::storage::StoredItemImage) -> Value {
+    let image_type = image.image_type.to_ascii_lowercase();
+    let index = if image.image_index > 0 {
+        format!("/{}", image.image_index)
+    } else {
+        String::new()
+    };
+    json!({
+        "id": image.id,
+        "itemId": item_id,
+        "imageType": image.image_type,
+        "imageIndex": image.image_index,
+        "fileSize": image.file_size,
+        "contentTag": image.content_tag,
+        "source": image.source,
+        "language": Value::Null,
+        "url": format!("/api/v1/items/{}/images/{}{}", encode_path_segment(item_id), image_type, index),
+    })
+}
+
+fn image_candidate_json(image: &crate::application::images::ImageCandidate) -> Value {
+    json!({
+        "id": image.id,
+        "imageType": image.image_type,
+        "imageIndex": image.image_index,
+        "language": image.language,
+        "width": image.width,
+        "height": image.height,
+        "source": image.source,
+        "url": image.url,
+    })
+}
+
+fn encode_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                vec![char::from(byte)]
+            } else {
+                format!("%{byte:02X}").chars().collect()
+            }
+        })
+        .collect()
+}
+
+fn image_candidate_error(headers: &HeaderMap, error: ImageCandidateError) -> Response {
+    match error {
+        ImageCandidateError::ItemNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
+        ImageCandidateError::ItemNotIdentified => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目尚未识别，暂时无法搜索图片",
+        )
+        .into_response(),
+        ImageCandidateError::InvalidItem
+        | ImageCandidateError::InvalidImageType(_)
+        | ImageCandidateError::InvalidLanguage
+        | ImageCandidateError::InvalidSource => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "图片搜索请求无效",
+        )
+        .into_response(),
+        ImageCandidateError::Tmdb(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "刮削器暂时不可用",
+        )
+        .into_response(),
+        ImageCandidateError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "图片搜索暂时不可用",
         )
         .into_response(),
     }

@@ -46,14 +46,14 @@ export function MediaMetadataEditor({ item, onClose, onSaved }: MediaMetadataEdi
         setLockedFields(metadata.lockedFields ?? []);
       })
       .catch(() => {
-        setError("元数据读取失败，将使用当前详情继续编辑。 ");
+        setError("元数据读取失败，将使用当前详情继续编辑。");
       })
       .finally(() => setLoading(false));
     return () => {
       document.removeEventListener("keydown", closeOnEscape);
       document.body.style.overflow = previousOverflow;
     };
-  }, [item.id, onClose]);
+  }, [item.id]);
 
   function updateField(key: keyof MetadataDraft, value: string) {
     setDraft((current) => ({ ...current, [key]: value }));

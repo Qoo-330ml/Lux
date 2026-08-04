@@ -56,7 +56,7 @@ export function MediaDetailPage() {
       <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
         <div className="lux-detail-action-anchor">
-          <MediaActionMenu item={media} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} />
+          <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} />
         </div>
         <div className="lux-detail-grid">
           <div className="lux-detail-poster">{poster ? <img src={poster} alt={`${mediaTitle(media)} 海报`} /> : <span><Sparkles size={32} />{mediaTitle(media)}</span>}</div>

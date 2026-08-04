@@ -59,13 +59,17 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
       document.removeEventListener("keydown", closeOnEscape);
       document.body.style.overflow = previousOverflow;
     };
-  }, [item.id, onClose]);
+  }, [item.id]);
 
   async function search() {
+    await searchWithFilters(language, source);
+  }
+
+  async function searchWithFilters(nextLanguage: string, nextSource: string) {
     setSearching(true);
     setError(undefined);
     try {
-      const response = await api.searchItemImages(item.id, { imageType, language, source });
+      const response = await api.searchItemImages(item.id, { imageType, language: nextLanguage, source: nextSource });
       setResults(response.images ?? []);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "图片搜索失败，请重试。");
@@ -113,9 +117,9 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
             ))}
           </div>
           <div className="lux-image-editor-toolbar">
-            <label><span>语言</span><LuxSelect value={language} options={languageOptions} onChange={setLanguage} aria-label="图片语言" /></label>
-            <label><span>来源</span><LuxSelect value={source} options={sourceOptions} onChange={setSource} aria-label="图片来源" /></label>
-            <button className="lux-button lux-button-primary" type="button" disabled={searching} onClick={() => void search}><Search size={16} /> {searching ? "搜索中…" : "搜索"}</button>
+            <label><span>语言</span><LuxSelect value={language} options={languageOptions} onChange={(value) => { setLanguage(value); if (results.length) void searchWithFilters(value, source); }} aria-label="图片语言" /></label>
+            <label><span>来源</span><LuxSelect value={source} options={sourceOptions} onChange={(value) => { setSource(value); if (results.length) void searchWithFilters(language, value); }} aria-label="图片来源" /></label>
+            <button className="lux-button lux-button-primary" type="button" disabled={searching} onClick={() => void search()}><Search size={16} /> {searching ? "搜索中…" : "搜索"}</button>
           </div>
           {error ? <p className="lux-editor-error" role="alert">{error}</p> : null}
           <div className="lux-image-editor-current">

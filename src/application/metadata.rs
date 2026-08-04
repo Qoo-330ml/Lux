@@ -403,6 +403,12 @@ fn assign_field(metadata: &mut NfoMetadata, field: NfoField, value: String) {
 pub enum ImageType {
     Poster,
     Fanart,
+    Logo,
+    Thumb,
+    Banner,
+    Disc,
+    Art,
+    Wallpaper,
 }
 
 impl ImageType {
@@ -410,6 +416,12 @@ impl ImageType {
         match self {
             Self::Poster => "POSTER",
             Self::Fanart => "FANART",
+            Self::Logo => "LOGO",
+            Self::Thumb => "THUMB",
+            Self::Banner => "BANNER",
+            Self::Disc => "DISC",
+            Self::Art => "ART",
+            Self::Wallpaper => "WALLPAPER",
         }
     }
 }
@@ -453,7 +465,13 @@ fn image_type_for(path: &Path) -> Option<ImageType> {
     }
     match stem.as_str() {
         "poster" => Some(ImageType::Poster),
-        "fanart" => Some(ImageType::Fanart),
+        "fanart" | "backdrop" => Some(ImageType::Fanart),
+        "logo" | "clearlogo" => Some(ImageType::Logo),
+        "thumb" | "thumbnail" => Some(ImageType::Thumb),
+        "banner" => Some(ImageType::Banner),
+        "disc" | "discart" => Some(ImageType::Disc),
+        "art" | "artwork" => Some(ImageType::Art),
+        "wallpaper" => Some(ImageType::Wallpaper),
         _ => None,
     }
 }
@@ -1016,6 +1034,12 @@ fn find_series_images(paths: &[PathBuf], season_number: Option<i64>) -> Vec<Loca
             None => match stem.as_str() {
                 "poster" => ImageType::Poster,
                 "fanart" | "backdrop" => ImageType::Fanart,
+                "logo" | "clearlogo" => ImageType::Logo,
+                "thumb" | "thumbnail" => ImageType::Thumb,
+                "banner" => ImageType::Banner,
+                "disc" | "discart" => ImageType::Disc,
+                "art" | "artwork" => ImageType::Art,
+                "wallpaper" => ImageType::Wallpaper,
                 _ => continue,
             },
             Some(number) => {

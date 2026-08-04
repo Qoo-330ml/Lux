@@ -242,7 +242,7 @@ fn partial_and_empty_nfo_are_accepted() {
 }
 
 #[test]
-fn image_discovery_only_returns_supported_poster_and_fanart_files() {
+fn image_discovery_returns_supported_local_image_types() {
     let paths = [
         "/media/poster.jpg",
         "/media/fanart.png",
@@ -262,6 +262,10 @@ fn image_discovery_only_returns_supported_poster_and_fanart_files() {
             LocalImage {
                 image_type: ImageType::Fanart,
                 path: std::path::PathBuf::from("/media/fanart.png"),
+            },
+            LocalImage {
+                image_type: ImageType::Thumb,
+                path: std::path::PathBuf::from("/media/thumb.jpg"),
             },
         ]
     );

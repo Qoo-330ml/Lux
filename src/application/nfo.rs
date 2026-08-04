@@ -314,8 +314,8 @@ impl MetadataWriteService {
                 "title is too long".to_owned(),
             ));
         }
-        let original_title = normalize_metadata_text(request.original_title, 512);
-        let overview = normalize_metadata_text(request.overview, 256 * 1024);
+        let original_title = normalize_metadata_text(request.original_title, 512)?;
+        let overview = normalize_metadata_text(request.overview, 256 * 1024)?;
         if let Some(year) = request.production_year
             && !(1800..=2200).contains(&year)
         {
@@ -389,10 +389,23 @@ impl MetadataWriteService {
     }
 }
 
-fn normalize_metadata_text(value: Option<String>, max_bytes: usize) -> Option<String> {
-    value
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty() && value.len() <= max_bytes)
+fn normalize_metadata_text(
+    value: Option<String>,
+    max_bytes: usize,
+) -> Result<Option<String>, NfoWriteError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max_bytes {
+        return Err(NfoWriteError::InvalidMetadata(
+            "metadata field is too long".to_owned(),
+        ));
+    }
+    Ok(Some(value))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -726,5 +739,16 @@ mod tests {
         ));
         let content = tokio::fs::read_to_string(&target).await.expect("target");
         assert!(content.contains("external"));
+    }
+
+    #[test]
+    fn oversized_metadata_text_is_rejected_instead_of_being_dropped() {
+        let value = Some("x".repeat(513));
+        let result = normalize_metadata_text(value, 512);
+
+        assert!(matches!(
+            result,
+            Err(NfoWriteError::InvalidMetadata(message)) if message == "metadata field is too long"
+        ));
     }
 }

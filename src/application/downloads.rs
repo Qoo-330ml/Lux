@@ -60,10 +60,11 @@ impl DownloadService {
         source_id: Option<&str>,
     ) -> Result<DownloadArtifact, DownloadError> {
         let source = match source_id {
-            Some(source_id) => self
-                .database
-                .find_media_source_path_by_id(item_id, source_id)
-                .await?,
+            Some(source_id) => {
+                self.database
+                    .find_media_source_path_by_id(item_id, source_id)
+                    .await?
+            }
             None => self.database.find_media_source_path(item_id).await?,
         }
         .ok_or(DownloadError::ItemNotFound)?;
@@ -88,7 +89,9 @@ impl DownloadService {
         let mut entries = fs::read_dir(parent).await?;
         while let Some(entry) = entries.next_entry().await? {
             let candidate = entry.path();
-            if candidate == media_path || !is_matching_sidecar(&file_name, entry.file_name().to_string_lossy().as_ref()) {
+            if candidate == media_path
+                || !is_matching_sidecar(&file_name, entry.file_name().to_string_lossy().as_ref())
+            {
                 continue;
             }
             let file_type = entry.file_type().await?;
@@ -109,7 +112,8 @@ impl DownloadService {
         }
 
         let temporary_directory = self.temporary_directory.clone();
-        let archive_path = temporary_directory.join(format!(".lux-download-{}.zip", Uuid::now_v7()));
+        let archive_path =
+            temporary_directory.join(format!(".lux-download-{}.zip", Uuid::now_v7()));
         let archive_name = format!(
             "{}.zip",
             media_path
@@ -179,7 +183,18 @@ pub(crate) fn is_matching_sidecar(selected_name: &str, candidate_name: &str) -> 
 fn is_sidecar_extension(extension: &str) -> bool {
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "srt" | "ass" | "ssa" | "vtt" | "sub" | "sup" | "idx" | "nfo" | "jpg" | "jpeg" | "png" | "webp"
+        "srt"
+            | "ass"
+            | "ssa"
+            | "vtt"
+            | "sub"
+            | "sup"
+            | "idx"
+            | "nfo"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "webp"
     )
 }
 
@@ -197,8 +212,14 @@ impl fmt::Display for DownloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ItemNotFound => formatter.write_str("download item not found"),
-            Self::InvalidFileName(path) => write!(formatter, "invalid media filename '{}'", path.display()),
-            Self::PathOutsideRoot(path) => write!(formatter, "download path is outside root: {}", path.display()),
+            Self::InvalidFileName(path) => {
+                write!(formatter, "invalid media filename '{}'", path.display())
+            }
+            Self::PathOutsideRoot(path) => write!(
+                formatter,
+                "download path is outside root: {}",
+                path.display()
+            ),
             Self::Archive(error) => write!(formatter, "download archive failed: {error}"),
             Self::Io(error) => write!(formatter, "download file operation failed: {error}"),
             Self::Storage(error) => error.fmt(formatter),

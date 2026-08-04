@@ -2616,6 +2616,39 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_media_item_image_identity(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredImageIdentity>, StorageError> {
+        sqlx::query(
+            "SELECT mi.item_type,
+                    COALESCE(
+                        json_extract(mi.provider_ids_json, '$.tmdb'),
+                        json_extract(series.provider_ids_json, '$.tmdb')
+                    ) AS provider_id,
+                    mi.season_number, mi.episode_number
+             FROM media_items mi
+             LEFT JOIN media_items series
+               ON series.id = COALESCE(mi.series_id, mi.parent_id)
+             WHERE mi.id = ? AND mi.removed_at IS NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredImageIdentity {
+                item_type: row.get("item_type"),
+                provider_id: row.get("provider_id"),
+                season_number: row.get("season_number"),
+                episode_number: row.get("episode_number"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_tmdb_movie_identity(
         &self,
         item_id: &str,
@@ -5198,6 +5231,14 @@ pub(crate) struct StoredMediaSourcePath {
     pub(crate) probe_status: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredImageIdentity {
+    pub(crate) item_type: String,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
 }
 
 #[derive(Debug)]

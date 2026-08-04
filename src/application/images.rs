@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
+    application::tmdb::{TmdbClient, TmdbError, TmdbImageReference, TmdbImagesResponse},
     storage::{Database, StorageError},
 };
 
@@ -261,6 +262,21 @@ impl ImageWriteService {
         })
     }
 
+    pub async fn download_item_image_from_tmdb_candidate(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        if !is_allowed_tmdb_image_url(image_url) {
+            return Err(ImageWriteError::InvalidUrl(
+                "selected image URL must be an HTTPS TMDb image path".to_owned(),
+            ));
+        }
+        self.download_item_image(item_id, image_type, image_url)
+            .await
+    }
+
     async fn media_directory(&self, item_id: &str) -> Result<PathBuf, ImageWriteError> {
         let source = self
             .database
@@ -287,6 +303,172 @@ impl ImageWriteService {
             return Err(ImageWriteError::PathOutsideRoot(directory));
         }
         Ok(directory)
+    }
+}
+
+#[derive(Clone)]
+pub struct ImageCandidateService {
+    database: Database,
+    tmdb: TmdbClient,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageCandidate {
+    pub id: String,
+    pub image_type: String,
+    pub image_index: i64,
+    pub language: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub source: String,
+    pub url: String,
+}
+
+impl ImageCandidateService {
+    pub fn new(database: Database, tmdb: TmdbClient) -> Self {
+        Self { database, tmdb }
+    }
+
+    pub async fn search(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        language: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<Vec<ImageCandidate>, ImageCandidateError> {
+        let image_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageCandidateError::InvalidImageType(image_type.to_owned()))?;
+        let source = source.unwrap_or("TMDB").trim();
+        if !source.is_empty() && !source.eq_ignore_ascii_case("TMDB") {
+            return Err(ImageCandidateError::InvalidSource);
+        }
+        let language = language.unwrap_or_default().trim();
+        if language.len() > 32 {
+            return Err(ImageCandidateError::InvalidLanguage);
+        }
+        let identity = self
+            .database
+            .find_media_item_image_identity(item_id)
+            .await?
+            .ok_or(ImageCandidateError::ItemNotFound)?;
+        let provider_id = identity
+            .provider_id
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or(ImageCandidateError::ItemNotIdentified)?;
+        let request_language = if language.is_empty() {
+            "en-US"
+        } else {
+            language
+        };
+        let images = match identity.item_type.as_str() {
+            "MOVIE" => {
+                self.tmdb
+                    .movie_images(provider_id, request_language)
+                    .await?
+            }
+            "SERIES" => self.tmdb.tv_images(provider_id, request_language).await?,
+            "SEASON" => {
+                self.tmdb
+                    .season_images(
+                        provider_id,
+                        i32::try_from(identity.season_number.unwrap_or_default())
+                            .map_err(|_| ImageCandidateError::InvalidItem)?,
+                        request_language,
+                    )
+                    .await?
+            }
+            "EPISODE" => {
+                self.tmdb
+                    .episode_images(
+                        provider_id,
+                        i32::try_from(identity.season_number.unwrap_or_default())
+                            .map_err(|_| ImageCandidateError::InvalidItem)?,
+                        i32::try_from(identity.episode_number.unwrap_or_default())
+                            .map_err(|_| ImageCandidateError::InvalidItem)?,
+                        request_language,
+                    )
+                    .await?
+            }
+            _ => return Ok(Vec::new()),
+        };
+        let references = references_for_type(&images, image_type);
+        let requested_language = language.split('-').next().filter(|value| !value.is_empty());
+        Ok(references
+            .into_iter()
+            .enumerate()
+            .filter(|(_, image)| {
+                requested_language.is_none()
+                    || image
+                        .iso_639_1
+                        .as_deref()
+                        .is_some_and(|value| Some(value) == requested_language)
+            })
+            .filter_map(|(index, image)| {
+                let path = image.file_path.as_deref()?.trim();
+                (!path.is_empty()).then(|| ImageCandidate {
+                    id: format!("tmdb-{image_type}-{index}-{path}"),
+                    image_type: image_type.to_owned(),
+                    image_index: i64::try_from(index).unwrap_or_default(),
+                    language: image.iso_639_1.clone(),
+                    width: image.width,
+                    height: image.height,
+                    source: "TMDB".to_owned(),
+                    url: format!("https://image.tmdb.org/t/p/w780{path}"),
+                })
+            })
+            .take(50)
+            .collect())
+    }
+}
+
+fn references_for_type(images: &TmdbImagesResponse, image_type: &str) -> Vec<TmdbImageReference> {
+    match image_type {
+        "POSTER" | "DISC" => images.posters.clone(),
+        "LOGO" => images.logos.clone(),
+        _ => images.backdrops.clone(),
+    }
+}
+
+#[derive(Debug)]
+pub enum ImageCandidateError {
+    ItemNotFound,
+    ItemNotIdentified,
+    InvalidItem,
+    InvalidImageType(String),
+    InvalidLanguage,
+    InvalidSource,
+    Tmdb(TmdbError),
+    Storage(StorageError),
+}
+
+impl fmt::Display for ImageCandidateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ItemNotFound => formatter.write_str("media item not found"),
+            Self::ItemNotIdentified => formatter.write_str("media item has no provider identity"),
+            Self::InvalidItem => formatter.write_str("media item image identity is invalid"),
+            Self::InvalidImageType(_) => formatter.write_str("unsupported image type"),
+            Self::InvalidLanguage => formatter.write_str("image language is invalid"),
+            Self::InvalidSource => formatter.write_str("unsupported image source"),
+            Self::Tmdb(error) => error.fmt(formatter),
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ImageCandidateError {}
+
+impl From<TmdbError> for ImageCandidateError {
+    fn from(error: TmdbError) -> Self {
+        Self::Tmdb(error)
+    }
+}
+
+impl From<StorageError> for ImageCandidateError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
     }
 }
 
@@ -377,6 +559,12 @@ async fn image_target(
     let stem = match image_type {
         "POSTER" => "poster",
         "FANART" => "fanart",
+        "LOGO" => "logo",
+        "THUMB" => "thumb",
+        "BANNER" => "banner",
+        "DISC" => "disc",
+        "ART" => "art",
+        "WALLPAPER" => "wallpaper",
         _ => return Err(ImageWriteError::InvalidImageType(image_type.to_owned())),
     };
     let mut candidates = Vec::new();
@@ -423,6 +611,12 @@ async fn find_any_image_path(
     let stem = match image_type {
         "POSTER" => "poster",
         "FANART" => "fanart",
+        "LOGO" => "logo",
+        "THUMB" => "thumb",
+        "BANNER" => "banner",
+        "DISC" => "disc",
+        "ART" => "art",
+        "WALLPAPER" => "wallpaper",
         _ => return Err(ImageWriteError::InvalidImageType(image_type.to_owned())),
     };
     let mut candidates = Vec::new();
@@ -654,6 +848,12 @@ pub fn normalize_image_type(value: &str) -> Option<&'static str> {
     match value.to_ascii_lowercase().as_str() {
         "poster" | "primary" => Some("POSTER"),
         "fanart" | "fan-art" | "backdrop" => Some("FANART"),
+        "logo" | "clearlogo" => Some("LOGO"),
+        "thumb" | "thumbnail" => Some("THUMB"),
+        "banner" => Some("BANNER"),
+        "disc" | "discart" => Some("DISC"),
+        "art" | "artwork" => Some("ART"),
+        "wallpaper" => Some("WALLPAPER"),
         _ => None,
     }
 }
@@ -833,5 +1033,42 @@ impl std::error::Error for ImageWriteError {
 impl From<StorageError> for ImageWriteError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+fn is_allowed_tmdb_image_url(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    url.scheme().eq_ignore_ascii_case("https")
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("image.tmdb.org"))
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path().starts_with("/t/p/")
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_tmdb_image_url;
+
+    #[test]
+    fn selected_image_urls_are_limited_to_tmdb_image_paths() {
+        assert!(is_allowed_tmdb_image_url(
+            "https://image.tmdb.org/t/p/w780/poster.jpg"
+        ));
+        assert!(!is_allowed_tmdb_image_url(
+            "http://image.tmdb.org/t/p/w780/poster.jpg"
+        ));
+        assert!(!is_allowed_tmdb_image_url(
+            "https://image.tmdb.org/t/p/w780/poster.jpg?redirect=http://127.0.0.1"
+        ));
+        assert!(!is_allowed_tmdb_image_url(
+            "https://example.com/t/p/w780/poster.jpg"
+        ));
     }
 }

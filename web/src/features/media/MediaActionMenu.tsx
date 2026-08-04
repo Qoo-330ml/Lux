@@ -7,22 +7,25 @@ type MediaActionMenuProps = {
   onEditMetadata: () => void;
   onEditImages: () => void;
   className?: string;
+  sourceId?: string;
 };
 
-export function mediaDownloadUrl(item: MediaItem) {
-  const source = item.mediaSources?.find((entry) => entry.isDefault) ?? item.mediaSources?.[0];
+export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
+  const source = sourceId
+    ? item.mediaSources?.find((entry) => entry.id === sourceId)
+    : item.mediaSources?.find((entry) => entry.isDefault) ?? item.mediaSources?.[0];
   const query = source ? `?sourceId=${encodeURIComponent(source.id)}` : "";
   return `/api/v1/items/${encodeURIComponent(item.id)}/download${query}`;
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, className = "" }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, className = "", sourceId }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const title = item.title || item.name || "媒体";
   const posterUrl = item.imageTags?.poster
     ? `/api/v1/items/${encodeURIComponent(item.id)}/images/poster`
     : undefined;
-  const downloadUrl = mediaDownloadUrl(item);
+  const downloadUrl = mediaDownloadUrl(item, sourceId);
 
   useEffect(() => {
     if (!open) return undefined;
