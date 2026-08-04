@@ -28,7 +28,6 @@ export function HomePage() {
           </div>
         </section>
         <MediaRail title="继续观看" items={data.continueWatching ?? []} landscape />
-        <MediaRail title="最近添加" items={data.recentlyAdded ?? []} />
       </div>
     </div>
   );
