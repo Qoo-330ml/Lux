@@ -39,7 +39,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-brand-name { font-size: 1.15rem; font-weight: 650; letter-spacing: -.04em; }
 .lux-icon-button, .lux-user-button { display: inline-grid; place-items: center; min-width: 54px; height: 54px; border: 1px solid var(--lux-line); border-radius: 50%; color: var(--lux-text); background: rgba(5, 5, 6, .3); box-shadow: 0 6px 22px rgba(0,0,0,.18); transition: background .2s ease, border-color .2s ease, transform .2s var(--lux-ease); }
 .lux-icon-button:hover, .lux-user-button:hover { border-color: rgba(255,255,255,.36); background: rgba(255,255,255,.1); transform: translateY(-1px); }
-.lux-back-button { margin-right: 2px; }
 .lux-user-button { padding: 4px; }
 .lux-avatar { display: inline-grid; place-items: center; width: 44px; height: 44px; border-radius: 50%; color: #fff; background: linear-gradient(145deg, #707074, #28282d); font-weight: 650; }
 .lux-desktop-nav { gap: 22px; margin-left: 24px; }
@@ -143,8 +142,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-backdrop { position: absolute; z-index: -3; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .58; filter: saturate(.78) brightness(.72) blur(1px); transform: scale(1.02); }
 .lux-detail-overlay { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg, rgba(5,5,6,.95), rgba(5,5,6,.7) 45%, rgba(5,5,6,.42)), linear-gradient(0deg, #050506 4%, transparent 58%); }
 .lux-detail-content { width: min(1280px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
-.lux-detail-back { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 70px; border: 0; color: var(--lux-muted); background: transparent; font-size: .84rem; }
-.lux-detail-back:hover { color: #fff; }
 .lux-detail-grid { display: grid; grid-template-columns: 250px minmax(0, 650px); align-items: start; gap: 54px; }
 .lux-detail-poster { aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 12px; background: #17171b; box-shadow: 0 22px 54px rgba(0,0,0,.45); }
 .lux-detail-poster img { display: block; width: 100%; height: 100%; object-fit: cover; }
@@ -198,7 +195,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-episode-link > span:last-child { flex: 0 0 auto; color: var(--lux-subtle); font-size: .72rem; }
 .lux-player-page { min-height: 100vh; padding: 100px 32px 42px; background: #050506; }
 .lux-player-topbar { display: flex; align-items: center; justify-content: space-between; width: min(1280px, 100%); margin: 0 auto 24px; color: #fff; }
-.lux-player-topbar > a, .lux-player-topbar button { display: inline-grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--lux-line-soft); border-radius: 50%; color: #fff; background: rgba(255,255,255,.04); }
+.lux-player-topbar button { display: inline-grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--lux-line-soft); border-radius: 50%; color: #fff; background: rgba(255,255,255,.04); }
 .lux-player-topbar > span { overflow: hidden; padding: 0 20px; text-overflow: ellipsis; white-space: nowrap; }
 .lux-player-topbar > div { display: flex; gap: 9px; }
 .lux-player-frame { position: relative; width: min(1280px, 100%); margin: 0 auto; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 14px; background: #000; box-shadow: 0 25px 70px rgba(0,0,0,.36); }
@@ -248,8 +245,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-nav-link { display: flex; align-items: center; gap: 11px; padding: 11px 12px; border: 1px solid transparent; border-radius: 10px; color: var(--lux-muted); font-size: .85rem; transition: color .2s ease, background .2s ease, border-color .2s ease; }
 .lux-admin-nav-link:hover { color: #fff; background: rgba(255,255,255,.05); }
 .lux-admin-nav-link.is-active { border-color: var(--lux-line-soft); color: #fff; background: rgba(255,255,255,.09); }
-.lux-admin-back { display: flex; align-items: center; gap: 7px; margin-top: auto; padding: 12px; color: var(--lux-subtle); font-size: .76rem; }
-.lux-admin-back:hover { color: #fff; }
 .lux-admin-content { width: min(1400px, 100%); padding: 24px clamp(24px, 4vw, 64px) 90px; }
 .lux-admin-page { width: 100%; }
 .lux-admin-page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 34px; }
@@ -451,7 +446,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-nav { display: flex; overflow-x: auto; padding-bottom: 3px; scrollbar-width: none; }
   .lux-admin-nav::-webkit-scrollbar { display: none; }
   .lux-admin-nav-link { flex: 0 0 auto; }
-  .lux-admin-back { display: none; }
   .lux-admin-content { padding: 24px 20px 64px; }
   .lux-admin-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lux-admin-dashboard-grid { grid-template-columns: 1fr; }
@@ -459,7 +453,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 @media (max-width: 560px) {
   .lux-header { padding: 14px 15px; }
-  .lux-back-button { display: none; }
   .lux-grid-button { display: none; }
   .lux-icon-button, .lux-user-button { min-width: 46px; height: 46px; }
   .lux-avatar { width: 36px; height: 36px; }
@@ -481,7 +474,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-search-panel .lux-button { flex: 1; }
   .lux-auth-card { padding: 30px 24px; }
   .lux-detail-content { width: calc(100% - 32px); }
-  .lux-detail-back { margin-bottom: 28px; }
   .lux-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-detail-poster { width: min(220px, 62vw); }
   .lux-detail-copy h1 { font-size: 3.25rem; }

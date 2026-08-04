@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Maximize, Pause, Play, Settings2, Volume2 } from "lucide-react";
+import { Maximize, Pause, Play, Settings2, Volume2 } from "lucide-react";
 import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { imageUrl, mediaTitle } from "../home/media";
@@ -22,7 +22,7 @@ export function PlayerPage() {
 
   return (
     <main className="lux-player-page">
-      <div className="lux-player-topbar"><Link to={`/items/${media.id}`} aria-label="返回媒体详情"><ArrowLeft size={20} /></Link><span>{mediaTitle(media)}</span><div><button type="button" aria-label="播放器设置"><Settings2 size={19} /></button><button type="button" aria-label="全屏"><Maximize size={19} /></button></div></div>
+      <div className="lux-player-topbar"><span>{mediaTitle(media)}</span><div><button type="button" aria-label="播放器设置"><Settings2 size={19} /></button><button type="button" aria-label="全屏"><Maximize size={19} /></button></div></div>
       <div className="lux-player-frame">
         <video className="lux-video" src={streamUrl} poster={poster} controls preload="metadata" onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} aria-label={`播放 ${mediaTitle(media)}`} />
         <div className="lux-player-controls" aria-hidden="true"><button type="button"><Play size={17} fill="currentColor" /></button><div className="lux-player-progress"><span /></div><span>00:00</span><Volume2 size={17} /><button type="button"><Pause size={17} /></button></div>

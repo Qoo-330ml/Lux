@@ -1,13 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Heart, Play, Radio, Sparkles } from "lucide-react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Heart, Play, Radio, Sparkles } from "lucide-react";
+import { Link, useParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { imageUrl, mediaTitle, runtimeLabel } from "../home/media";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
-  const navigate = useNavigate();
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
   const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
 
@@ -24,7 +23,6 @@ export function MediaDetailPage() {
       {backdrop ? <img className="lux-detail-backdrop" src={backdrop} alt="" /> : null}
       <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
-        <button className="lux-detail-back" type="button" onClick={() => navigate(-1)}><ArrowLeft size={18} /> 返回</button>
         <div className="lux-detail-grid">
           <div className="lux-detail-poster">{poster ? <img src={poster} alt={`${mediaTitle(media)} 海报`} /> : <span><Sparkles size={32} />{mediaTitle(media)}</span>}</div>
           <div className="lux-detail-copy">

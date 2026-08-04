@@ -1,5 +1,5 @@
-import { Activity, ChevronLeft, Database, FileClock, Image, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
-import { Link, NavLink, Outlet } from "react-router-dom";
+import { Activity, Database, FileClock, Image, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
+import { NavLink, Outlet } from "react-router-dom";
 
 const adminNav = [
   { to: "/admin", label: "仪表盘", icon: Activity, end: true },
@@ -26,7 +26,6 @@ export function AdminLayout() {
             </NavLink>
           ))}
         </nav>
-        <Link className="lux-admin-back" to="/"><ChevronLeft size={16} /> 返回媒体中心</Link>
       </aside>
       <div className="lux-admin-content"><Outlet /></div>
     </section>
