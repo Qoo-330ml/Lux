@@ -232,8 +232,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-poster { aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 12px; background: #17171b; box-shadow: 0 22px 54px rgba(0,0,0,.45); }
 .lux-detail-poster img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .lux-detail-poster span { display: grid; place-items: center; align-content: center; gap: 14px; height: 100%; padding: 25px; color: var(--lux-muted); text-align: center; }
-.lux-detail-title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-bottom: 14px; }
-.lux-detail-logo { display: block; flex: 0 1 auto; max-width: min(260px, 45%); max-height: 58px; width: auto; object-fit: contain; filter: drop-shadow(0 4px 12px rgba(0,0,0,.28)); }
+.lux-detail-title-row { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+.lux-detail-logo { display: block; flex: 0 1 auto; max-width: min(260px, 100%); max-height: 58px; width: auto; object-fit: contain; filter: drop-shadow(0 4px 12px rgba(0,0,0,.28)); }
 .lux-detail-title-row h1 { min-width: 0; margin: 0; color: #fff; font-size: 36px; letter-spacing: -.045em; line-height: 1.1; }
 .lux-detail-meta { display: flex; flex-wrap: wrap; gap: 10px; color: var(--lux-muted); }
 .lux-detail-meta span + span::before { margin-right: 10px; color: var(--lux-subtle); content: "·"; }

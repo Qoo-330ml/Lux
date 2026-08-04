@@ -284,7 +284,7 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.textContent).toContain("中文字幕");
   });
 
-  it("places an available media logo immediately before the title", async () => {
+  it("places the title on the line below an available media logo", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",
       title: "示例电影",
