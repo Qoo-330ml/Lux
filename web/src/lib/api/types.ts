@@ -231,6 +231,12 @@ export type AdminJob = {
   error?: string | null;
 };
 
+export type AdminMetadataReidentifyBatch = {
+  totalCount: number;
+  jobCount: number;
+  jobs: Array<Pick<AdminJob, "id" | "status" | "totalCount">>;
+};
+
 export type AdminAuditEvent = {
   id: string;
   actorUserId?: string | null;

@@ -8,6 +8,7 @@ import type {
   AdminSettings,
   AdminUser,
   AdminMetadataCandidate,
+  AdminMetadataReidentifyBatch,
   AdminPlugin,
   ApiErrorBody,
   HomeResponse,
@@ -338,6 +339,13 @@ export class LuxApiClient {
   startAdminScan(libraryId: string) {
     return this.request<{ job: AdminJob }>(
       `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/scan`,
+      { method: "POST" },
+    );
+  }
+
+  startLibraryMetadataReidentify(libraryId: string) {
+    return this.request<AdminMetadataReidentifyBatch>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/reidentify`,
       { method: "POST" },
     );
   }
