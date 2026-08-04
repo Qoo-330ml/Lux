@@ -43,4 +43,23 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-admin-plugin-content h2")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-admin-plugin-icon")).toContain("color: var(--lux-text)");
   });
+
+  it("keeps the mobile navigation readable in light mode", () => {
+    expect(lightThemeRule(".lux-mobile-nav")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-mobile-nav")).toContain("box-shadow: 0 18px 44px rgba(30,30,38");
+    expect(lightThemeRule(".lux-mobile-nav .lux-nav-link")).toContain("color: var(--lux-muted)");
+    expect(lightThemeRule(".lux-mobile-nav .lux-nav-link:hover")).toContain("background: rgba(28,28,34");
+  });
+
+  it("keeps light-theme header controls on a light surface", () => {
+    expect(lightThemeRule(".lux-icon-button")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-icon-button:hover")).toContain("background: rgba(28,28,34");
+  });
+
+  it("keeps the plugin configuration dialog readable in light mode", () => {
+    expect(lightThemeRule(".lux-admin-plugin-dialog")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-admin-plugin-dialog-heading h2")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-admin-plugin-dialog-form input")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-admin-plugin-dialog-form input")).toContain("background: rgba(28,28,34");
+  });
 });
