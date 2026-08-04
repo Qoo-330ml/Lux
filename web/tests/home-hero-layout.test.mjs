@@ -14,3 +14,9 @@ test("hero carousel controls share a flexible row and stay at its right edge", (
   assert.match(carouselRule, /margin-left:\s*auto/);
   assert.match(carouselRule, /margin-top:\s*0/);
 });
+
+test("hero keeps a shorter vertical footprint across responsive breakpoints", () => {
+  assert.match(stylesheet, /\.lux-hero\s*\{[^}]*min-height:\s*min\(82vh,\s*820px\)/);
+  assert.match(stylesheet, /@media \(max-width: 900px\) \{[\s\S]*?\.lux-hero\s*\{\s*min-height:\s*680px/);
+  assert.match(stylesheet, /@media \(max-width: 560px\) \{[\s\S]*?\.lux-hero\s*\{\s*min-height:\s*620px/);
+});

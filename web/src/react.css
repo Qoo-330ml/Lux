@@ -68,7 +68,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-main { min-height: 100vh; }
 .lux-main-detail { background: radial-gradient(circle at 50% -10%, rgba(56, 34, 50, .22), transparent 42%), var(--lux-bg); }
 .lux-home { min-height: 100vh; }
-.lux-hero { position: relative; display: flex; align-items: flex-end; min-height: min(92vh, 920px); overflow: hidden; isolation: isolate; }
+.lux-hero { position: relative; display: flex; align-items: flex-end; min-height: min(82vh, 820px); overflow: hidden; isolation: isolate; }
 .lux-hero-backdrop { position: absolute; z-index: -3; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; filter: saturate(.82) brightness(.74); transform: scale(1.015); }
 .lux-hero-backdrop-empty { background: radial-gradient(circle at 57% 28%, rgba(72, 72, 80, .32), transparent 36%), linear-gradient(118deg, #18181d, #050506 64%); }
 .lux-hero-overlay { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg, rgba(0,0,0,.88) 0%, rgba(0,0,0,.55) 40%, rgba(0,0,0,.1) 78%), linear-gradient(0deg, #050506 1%, rgba(5,5,6,.45) 25%, transparent 62%); }
@@ -536,7 +536,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-mobile-nav .lux-nav-link { padding: 10px 12px; }
   .lux-mobile-nav .lux-nav-link.is-active::after { display: none; }
   .lux-mobile-admin { display: flex; align-items: center; gap: 7px; padding: 10px 12px; border-top: 1px solid var(--lux-line-soft); color: var(--lux-subtle); font-size: .72rem; }
-  .lux-hero { min-height: 760px; }
+  .lux-hero { min-height: 680px; }
   .lux-hero-copy { margin-bottom: 74px; }
   .lux-home-content, .lux-page, .lux-page-narrow { width: min(100% - 32px, 1400px); }
   .lux-media-card { flex-basis: 150px; }
@@ -561,7 +561,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-grid-button { display: none; }
   .lux-icon-button, .lux-user-button { min-width: 46px; height: 46px; }
   .lux-avatar { width: 36px; height: 36px; }
-  .lux-hero { min-height: 700px; }
+  .lux-hero { min-height: 620px; }
   .lux-hero-copy { width: calc(100% - 32px); margin: 0 16px 58px; }
   .lux-hero h1 { font-size: clamp(2.8rem, 14vw, 4.4rem); }
   .lux-hero-copy p { font-size: .91rem; }
