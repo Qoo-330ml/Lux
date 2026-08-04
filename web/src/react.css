@@ -145,7 +145,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-content { width: min(1280px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
 .lux-detail-back { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 70px; border: 0; color: var(--lux-muted); background: transparent; font-size: .84rem; }
 .lux-detail-back:hover { color: #fff; }
-.lux-detail-grid { display: grid; grid-template-columns: 250px minmax(0, 650px); align-items: end; gap: 54px; }
+.lux-detail-grid { display: grid; grid-template-columns: 250px minmax(0, 650px); align-items: start; gap: 54px; }
 .lux-detail-poster { aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 12px; background: #17171b; box-shadow: 0 22px 54px rgba(0,0,0,.45); }
 .lux-detail-poster img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .lux-detail-poster span { display: grid; place-items: center; align-content: center; gap: 14px; height: 100%; padding: 25px; color: var(--lux-muted); text-align: center; }
