@@ -3722,12 +3722,14 @@ impl Database {
             })?;
         sqlx::query(
             "UPDATE media_sources
-             SET container = ?, duration_ticks = ?, bitrate = ?,
+             SET container = COALESCE(?, container), size = COALESCE(?, size),
+                 duration_ticks = ?, bitrate = ?,
                  probe_status = 'READY', probe_error = NULL,
                  updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(update.container)
+        .bind(update.source_size)
         .bind(update.duration_ticks)
         .bind(update.bitrate)
         .bind(update.source_id)
@@ -3749,8 +3751,9 @@ impl Database {
             sqlx::query(
                 "INSERT INTO media_streams (
                     id, media_source_id, stream_index, stream_type,
-                    codec, language, title, external_path, is_external, is_default, is_forced
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    codec, language, title, details_json, external_path,
+                    is_external, is_default, is_forced
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(update.source_id)
@@ -3759,6 +3762,7 @@ impl Database {
             .bind(stream.codec)
             .bind(stream.language)
             .bind(stream.title)
+            .bind(stream.details_json)
             .bind(stream.external_path)
             .bind(stream.is_external)
             .bind(stream.is_default)
@@ -5046,6 +5050,7 @@ pub(crate) struct NewMediaSource<'a> {
 pub(crate) struct MediaProbeUpdate<'a> {
     pub(crate) source_id: &'a str,
     pub(crate) container: Option<&'a str>,
+    pub(crate) source_size: Option<i64>,
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) bitrate: Option<i64>,
     pub(crate) streams: &'a [MediaStreamUpdate<'a>],
@@ -5057,6 +5062,7 @@ pub(crate) struct MediaStreamUpdate<'a> {
     pub(crate) codec: Option<&'a str>,
     pub(crate) language: Option<&'a str>,
     pub(crate) title: Option<&'a str>,
+    pub(crate) details_json: Option<&'a str>,
     pub(crate) external_path: Option<&'a str>,
     pub(crate) is_external: bool,
     pub(crate) is_default: bool,

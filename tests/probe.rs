@@ -5,7 +5,7 @@ use luxd::{
         libraries::LibraryService,
         probe::{
             FfprobeRunner, MediaProbeResult, MediaProbeService, MediaStreamResult, ProbeError,
-            StreamType, parse_probe_json,
+            StreamType, parse_media_info_json, parse_nfo_streamdetails, parse_probe_json,
         },
         scanner::LibraryScanner,
     },
@@ -33,6 +33,7 @@ fn probe_json_keeps_container_duration_bitrate_and_media_streams() {
         result,
         MediaProbeResult {
             container: Some("matroska,webm".to_owned()),
+            source_size: None,
             duration_ticks: Some(1_205_000_000),
             bitrate: Some(800_000),
             streams: vec![
@@ -42,6 +43,9 @@ fn probe_json_keeps_container_duration_bitrate_and_media_streams() {
                     codec: Some("h264".to_owned()),
                     language: None,
                     title: None,
+                    is_default: false,
+                    is_forced: false,
+                    details: Default::default(),
                 },
                 MediaStreamResult {
                     stream_index: 1,
@@ -49,6 +53,9 @@ fn probe_json_keeps_container_duration_bitrate_and_media_streams() {
                     codec: Some("aac".to_owned()),
                     language: Some("eng".to_owned()),
                     title: Some("English".to_owned()),
+                    is_default: false,
+                    is_forced: false,
+                    details: Default::default(),
                 },
                 MediaStreamResult {
                     stream_index: 2,
@@ -56,6 +63,9 @@ fn probe_json_keeps_container_duration_bitrate_and_media_streams() {
                     codec: Some("subrip".to_owned()),
                     language: Some("chi".to_owned()),
                     title: None,
+                    is_default: false,
+                    is_forced: false,
+                    details: Default::default(),
                 },
             ],
         }
@@ -88,6 +98,100 @@ fn unavailable_optional_probe_values_do_not_discard_streams() {
     .expect("valid probe with unavailable optional values");
     assert_eq!(result.duration_ticks, None);
     assert_eq!(result.bitrate, None);
+}
+
+#[test]
+fn media_info_sidecar_keeps_source_and_emby_stream_details() {
+    let result = parse_media_info_json(
+        br#"[
+            {
+                "MediaSourceInfo": {
+                    "Container": "mkv",
+                    "Size": 1573860454,
+                    "RunTimeTicks": 52636380000,
+                    "Bitrate": 2392049,
+                    "MediaStreams": [
+                        {
+                            "Index": 0,
+                            "Type": "Video",
+                            "Codec": "h264",
+                            "DisplayTitle": "1080p H264",
+                            "Width": 1920,
+                            "Height": 1080,
+                            "Profile": "High",
+                            "Level": 40,
+                            "BitRate": 2392049,
+                            "BitDepth": 8,
+                            "PixelFormat": "yuv420p",
+                            "AspectRatio": "16:9",
+                            "RealFrameRate": 30,
+                            "IsDefault": true,
+                            "IsForced": false
+                        },
+                        {
+                            "Index": 1,
+                            "Type": "Audio",
+                            "Codec": "aac",
+                            "DisplayTitle": "AAC stereo (default)",
+                            "ChannelLayout": "stereo",
+                            "Channels": 2,
+                            "SampleRate": 44100,
+                            "Profile": "LC",
+                            "BitRate": 192000,
+                            "IsDefault": true,
+                            "IsForced": false
+                        }
+                    ]
+                }
+            }
+        ]"#,
+    )
+    .expect("valid media info sidecar");
+
+    assert_eq!(result.container.as_deref(), Some("mkv"));
+    assert_eq!(result.source_size, Some(1573860454));
+    assert_eq!(result.duration_ticks, Some(52636380000));
+    assert_eq!(result.streams.len(), 2);
+    assert_eq!(result.streams[0].stream_type, StreamType::Video);
+    assert_eq!(result.streams[0].title.as_deref(), Some("1080p H264"));
+    assert!(result.streams[0].is_default);
+    assert_eq!(result.streams[0].details["Width"], serde_json::json!(1920));
+    assert_eq!(
+        result.streams[0].details["Profile"],
+        serde_json::json!("High")
+    );
+    assert_eq!(
+        result.streams[1].details["ChannelLayout"],
+        serde_json::json!("stereo")
+    );
+    assert_eq!(
+        result.streams[1].details["SampleRate"],
+        serde_json::json!(44100)
+    );
+}
+
+#[test]
+fn nfo_streamdetails_are_available_when_media_info_sidecar_is_missing() {
+    let result = parse_nfo_streamdetails(
+        br#"<movie><fileinfo><streamdetails>
+            <video><codec>h264</codec><width>1920</width><height>1080</height>
+                <framerate>30</framerate><default>True</default></video>
+            <audio><codec>aac</codec><channels>2</channels><samplingrate>44100</samplingrate>
+                <default>True</default></audio>
+            <subtitle><codec>subrip</codec><language>chi</language><forced>False</forced></subtitle>
+        </streamdetails></fileinfo></movie>"#,
+    )
+    .expect("valid NFO stream details")
+    .expect("NFO should contain stream details");
+
+    assert_eq!(result.streams.len(), 3);
+    assert_eq!(result.streams[0].stream_type, StreamType::Video);
+    assert_eq!(result.streams[0].codec.as_deref(), Some("h264"));
+    assert_eq!(result.streams[0].details["Height"], serde_json::json!(1080));
+    assert!(result.streams[1].is_default);
+    assert_eq!(result.streams[1].details["Channels"], serde_json::json!(2));
+    assert_eq!(result.streams[2].stream_type, StreamType::Subtitle);
+    assert_eq!(result.streams[2].language.as_deref(), Some("chi"));
 }
 
 #[tokio::test]
@@ -168,6 +272,73 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
     let third = service.probe_movie_library(library.id).await?;
     assert_eq!(third.attempted, 1);
     assert_eq!(third.ready, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn strm_probe_uses_media_info_sidecar_without_running_ffprobe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = config_for(&temp_dir);
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Sidecar Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    let strm_path = movie_dir.join("Sidecar.Movie.2024.strm");
+    tokio::fs::write(&strm_path, "https://example.invalid/movie").await?;
+    tokio::fs::write(
+        movie_dir.join("Sidecar.Movie.2024-mediainfo.json"),
+        br#"[{"MediaSourceInfo":{"Container":"mkv","Size":1234567,"RunTimeTicks":90000000,"Bitrate":800000,"MediaStreams":[{"Index":0,"Type":"Video","Codec":"h264","DisplayTitle":"1080p H264","Width":1920,"Height":1080,"IsDefault":true,"IsForced":false},{"Index":1,"Type":"Audio","Codec":"aac","DisplayTitle":"AAC stereo","Channels":2,"SampleRate":44100,"IsDefault":true,"IsForced":false},{"Index":2,"Type":"Subtitle","Codec":"subrip","Language":"chi","IsDefault":false,"IsForced":false}]}}]"#,
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let failing_probe = executable_script(
+        temp_dir.path(),
+        "#!/bin/sh\nprintf '%s' 'ffprobe must not run' >&2\nexit 1\n",
+    )?;
+    let report = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(failing_probe, Duration::from_secs(5)),
+    )
+    .probe_movie_library(library.id)
+    .await?;
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.ready, 1);
+    assert_eq!(report.failed, 0);
+
+    let source: (String, i64, i64, i64) =
+        sqlx::query_as("SELECT container, size, duration_ticks, bitrate FROM media_sources")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(source, ("mkv".to_owned(), 1234567, 90000000, 800000));
+    let streams: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT stream_index, stream_type, title, details_json
+         FROM media_streams ORDER BY stream_index",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(streams.len(), 3);
+    assert_eq!(streams[0].0, 0);
+    assert_eq!(streams[0].1, "VIDEO");
+    assert_eq!(streams[0].2.as_deref(), Some("1080p H264"));
+    assert!(
+        streams[0]
+            .3
+            .as_deref()
+            .is_some_and(|details| details.contains("1920"))
+    );
+    assert_eq!(streams[2].1, "SUBTITLE");
     Ok(())
 }
 
