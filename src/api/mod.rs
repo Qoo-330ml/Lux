@@ -1923,6 +1923,7 @@ fn emby_media_source_json(
         "Size": source.size,
         "Bitrate": source.bitrate,
         "RunTimeTicks": source.duration_ticks,
+        "Path": source.external_url,
         "IsDefault": source.is_default,
         "Protocol": if is_remote { "Http" } else { "File" },
         "Type": "Default",
@@ -1931,17 +1932,31 @@ fn emby_media_source_json(
         "SupportsDirectStream": false,
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
-        "MediaStreams": source.streams.iter().map(|stream| json!({
-            "Index": stream.index,
-            "Type": emby_stream_type(&stream.stream_type),
-            "Codec": stream.codec,
-            "Language": stream.language,
-            "DisplayTitle": stream.title,
-            "IsExternal": stream.is_external,
-            "IsDefault": stream.is_default,
-            "IsForced": stream.is_forced,
-        })).collect::<Vec<_>>(),
+        "MediaStreams": source
+            .streams
+            .iter()
+            .map(emby_media_stream_json)
+            .collect::<Vec<_>>(),
     })
+}
+
+fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
+    let mut value = json!({
+        "Index": stream.index,
+        "Type": emby_stream_type(&stream.stream_type),
+        "Codec": stream.codec,
+        "Language": stream.language,
+        "DisplayTitle": stream.title,
+        "IsExternal": stream.is_external,
+        "IsDefault": stream.is_default,
+        "IsForced": stream.is_forced,
+    });
+    if let Value::Object(object) = &mut value {
+        for (key, detail) in &stream.details {
+            object.entry(key.clone()).or_insert_with(|| detail.clone());
+        }
+    }
+    value
 }
 
 fn emby_library_view_json(library: &LibraryRecord, server_id: &str) -> Value {

@@ -3130,6 +3130,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3210,6 +3211,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3293,6 +3295,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3337,6 +3340,7 @@ impl Database {
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
+                        mt.details_json AS stream_details_json,
                         mt.is_external AS stream_is_external,
                         mt.is_default AS stream_is_default,
                         mt.is_forced AS stream_is_forced
@@ -3374,6 +3378,7 @@ impl Database {
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
+                        mt.details_json AS stream_details_json,
                         mt.is_external AS stream_is_external,
                         mt.is_default AS stream_is_default,
                         mt.is_forced AS stream_is_forced
@@ -3415,6 +3420,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3481,6 +3487,7 @@ impl Database {
                         codec: row.get("codec"),
                         language: row.get("language"),
                         stream_title: row.get("stream_title"),
+                        stream_details_json: row.get("stream_details_json"),
                         stream_is_external: row
                             .get::<Option<i64>, _>("stream_is_external")
                             .map(|value| value != 0),
@@ -4702,6 +4709,7 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) codec: Option<String>,
     pub(crate) language: Option<String>,
     pub(crate) stream_title: Option<String>,
+    pub(crate) stream_details_json: Option<String>,
     pub(crate) stream_is_external: Option<bool>,
     pub(crate) stream_is_default: Option<bool>,
     pub(crate) stream_is_forced: Option<bool>,

@@ -479,6 +479,7 @@ pub struct CatalogStream {
     pub is_external: bool,
     pub is_default: bool,
     pub is_forced: bool,
+    pub details: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
@@ -559,6 +560,11 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
             is_external: row.stream_is_external.unwrap_or(false),
             is_default: row.stream_is_default.unwrap_or(false),
             is_forced: row.stream_is_forced.unwrap_or(false),
+            details: row
+                .stream_details_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_default(),
         });
         let _ = stream_id;
     }
