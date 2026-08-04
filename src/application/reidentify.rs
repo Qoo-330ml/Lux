@@ -56,6 +56,44 @@ impl MetadataReidentifyService {
         self.get_job(&job_id).await
     }
 
+    pub async fn create_library_jobs(
+        &self,
+        library_id: &str,
+    ) -> Result<MetadataReidentifyBatch, MetadataReidentifyError> {
+        let Some(library) = self.database.find_library(library_id).await? else {
+            return Err(MetadataReidentifyError::ItemNotFound(library_id.to_owned()));
+        };
+        if !library.is_enabled {
+            return Err(MetadataReidentifyError::ItemNotFound(library_id.to_owned()));
+        }
+        let mut item_ids = Vec::new();
+        let mut offset = 0_i64;
+        loop {
+            let page = self
+                .database
+                .list_media_item_ids_for_library(library_id, offset, 500)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = i64::try_from(page.len()).unwrap_or(500);
+            item_ids.extend(page);
+            offset = offset.saturating_add(page_len);
+            if page_len < 500 {
+                break;
+            }
+        }
+        if item_ids.is_empty() {
+            return Err(MetadataReidentifyError::InvalidItemCount);
+        }
+        let total_count = i64::try_from(item_ids.len()).unwrap_or(i64::MAX);
+        let mut jobs = Vec::new();
+        for chunk in item_ids.chunks(100) {
+            jobs.push(self.create_job(chunk.to_vec()).await?);
+        }
+        Ok(MetadataReidentifyBatch { jobs, total_count })
+    }
+
     pub async fn run(&self, job_id: &str) {
         let Ok(Some(job)) = self.database.find_metadata_reidentify_job(job_id).await else {
             return;
@@ -171,6 +209,12 @@ impl MetadataReidentifyService {
             .list_active_metadata_reidentify_job_ids()
             .await
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataReidentifyBatch {
+    pub jobs: Vec<MetadataReidentifyJob>,
+    pub total_count: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

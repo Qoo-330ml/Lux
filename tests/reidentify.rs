@@ -262,6 +262,20 @@ async fn admin_can_start_and_poll_batch_metadata_reidentify()
         .await?;
     assert_eq!(unknown_job.status(), reqwest::StatusCode::NOT_FOUND);
 
+    let library_started = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{}/reidentify",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(library_started.status(), reqwest::StatusCode::ACCEPTED);
+    let library_body: Value = library_started.json().await?;
+    assert_eq!(library_body["totalCount"], 1);
+    assert_eq!(library_body["jobs"].as_array().map(Vec::len), Some(1));
+
     server.abort();
     tmdb_server.abort();
     Ok(())

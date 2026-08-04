@@ -522,6 +522,28 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_media_item_ids_for_library(
+        &self,
+        library_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+             ORDER BY id LIMIT ? OFFSET ?",
+        )
+        .bind(library_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn insert_library(&self, library: NewLibrary<'_>) -> Result<(), StorageError> {
         sqlx::query(
             "INSERT INTO libraries (

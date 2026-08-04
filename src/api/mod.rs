@@ -317,6 +317,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_start_scan),
         )
         .route(
+            "/api/v1/admin/libraries/{library_id}/reidentify",
+            post(admin_start_library_reidentify),
+        )
+        .route(
             "/api/v1/admin/libraries/{library_id}/reconcile",
             post(admin_start_scan),
         )
@@ -5410,6 +5414,74 @@ async fn admin_start_scan(
     (
         StatusCode::ACCEPTED,
         Json(json!({ "job": scan_job_json(&job) })),
+    )
+        .into_response()
+}
+
+async fn admin_start_library_reidentify(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "TMDb 重新识别服务尚未配置",
+        )
+        .into_response();
+    };
+    let batch = match reidentify
+        .create_library_jobs(&library_id.to_string())
+        .await
+    {
+        Ok(batch) => batch,
+        Err(error) => return metadata_reidentify_error(&headers, error),
+    };
+    for job in &batch.jobs {
+        let worker = reidentify.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            worker.run(&job_id).await;
+        });
+    }
+    record_audit_event(
+        &state,
+        &headers,
+        "METADATA_REIDENTIFY_STARTED",
+        Some("library"),
+        Some(&library_id.to_string()),
+        &format!(
+            r#"{{"itemCount":{},"jobCount":{}}}"#,
+            batch.total_count,
+            batch.jobs.len()
+        ),
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "totalCount": batch.total_count,
+            "jobCount": batch.jobs.len(),
+            "jobs": batch.jobs.iter().map(|job| json!({
+                "id": job.id,
+                "status": job.status,
+                "totalCount": job.total_count,
+            })).collect::<Vec<_>>(),
+        })),
     )
         .into_response()
 }
