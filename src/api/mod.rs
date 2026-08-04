@@ -922,6 +922,9 @@ async fn emby_user_views(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     match libraries.list_libraries().await {
         Ok(views) => {
             let mut items = Vec::new();
@@ -934,7 +937,18 @@ async fn emby_user_views(
                     Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
                 };
                 if view.library.is_enabled && can_view {
-                    items.push(emby_library_view_json(&view.library, &state.server_id));
+                    let child_count = match database
+                        .count_catalog_items(Some(&view.library.id.to_string()))
+                        .await
+                    {
+                        Ok(count) => count,
+                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    };
+                    items.push(emby_library_view_json(
+                        &view.library,
+                        &state.server_id,
+                        child_count,
+                    ));
                 }
             }
             let total = items.len();
@@ -2014,16 +2028,30 @@ fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -
     value
 }
 
-fn emby_library_view_json(library: &LibraryRecord, server_id: &str) -> Value {
+fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count: i64) -> Value {
     json!({
         "Name": library.name,
         "Id": library.id,
         "ServerId": server_id,
         "Type": "CollectionFolder",
         "IsFolder": true,
-        "CollectionType": "movies",
-        "ImageTags": {},
+        "CollectionType": emby_collection_type(library.kind),
+        "ChildCount": child_count,
+        "ImageTags": library
+            .cover_image_tag
+            .as_ref()
+            .map(|tag| json!({"Primary": tag}))
+            .unwrap_or_else(|| json!({})),
+        "BackdropImageTags": [],
     })
+}
+
+fn emby_collection_type(kind: LibraryKind) -> Option<&'static str> {
+    match kind {
+        LibraryKind::Movie => Some("movies"),
+        LibraryKind::Series => Some("tvshows"),
+        LibraryKind::Mixed => None,
+    }
 }
 
 fn emby_item_type(item_type: &str) -> &'static str {
@@ -4013,6 +4041,12 @@ async fn emby_image(
         Err(status) => return status.into_response(),
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
+    if normalize_image_type(&image_type) == Some("POSTER")
+        && let Some(response) =
+            serve_emby_library_cover(&state, principal, &headers, &method, &item_id, 0).await
+    {
+        return response;
+    }
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -4043,6 +4077,13 @@ async fn emby_image_at_index(
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if normalize_image_type(&image_type) == Some("POSTER")
+        && let Some(response) =
+            serve_emby_library_cover(&state, principal, &headers, &method, &item_id, image_index)
+                .await
+    {
+        return response;
+    }
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -4640,30 +4681,94 @@ async fn serve_image(
         Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    serve_image_file(
+        &image.path,
+        image.content_type,
+        image.content_length,
+        &image.etag,
+        headers,
+        method,
+    )
+    .await
+}
+
+async fn serve_emby_library_cover(
+    state: &AppState,
+    principal: AccessPrincipal,
+    headers: &HeaderMap,
+    method: &Method,
+    library_id: &str,
+    image_index: i64,
+) -> Option<Response> {
+    let library_id = library_id.parse::<crate::domain::ids::LibraryId>().ok()?;
+    let covers = state.library_covers.as_ref()?;
+    let cover = match covers.resolve(library_id).await {
+        Ok(Some(cover)) => cover,
+        Ok(None) => return None,
+        Err(LibraryCoverError::Storage(_)) => {
+            return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+        Err(_) => return Some(StatusCode::NOT_FOUND.into_response()),
+    };
+    if image_index != 0 {
+        return Some(StatusCode::NOT_FOUND.into_response());
+    }
+    let Some(access) = state.access.as_ref() else {
+        return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    match access
+        .can_view_library(principal, &library_id.to_string())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Some(StatusCode::NOT_FOUND.into_response()),
+        Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    }
+    Some(
+        serve_image_file(
+            &cover.path,
+            &cover.content_type,
+            cover.content_length,
+            &cover.etag,
+            headers,
+            method,
+        )
+        .await,
+    )
+}
+
+async fn serve_image_file(
+    path: &FsPath,
+    content_type: &str,
+    content_length: u64,
+    etag: &str,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Response {
     if headers
         .get("if-none-match")
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == image.etag))
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag))
     {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
-            .header("ETag", &image.etag)
+            .header("ETag", etag)
             .body(Body::empty())
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
     let body = if method == Method::HEAD {
         Body::empty()
     } else {
-        let Ok(file) = tokio::fs::File::open(&image.path).await else {
+        let Ok(file) = tokio::fs::File::open(path).await else {
             return StatusCode::NOT_FOUND.into_response();
         };
         Body::from_stream(tokio_util::io::ReaderStream::new(file))
     };
     Response::builder()
         .status(StatusCode::OK)
-        .header("Content-Type", image.content_type)
-        .header("Content-Length", image.content_length)
-        .header("ETag", &image.etag)
+        .header("Content-Type", content_type)
+        .header("Content-Length", content_length)
+        .header("ETag", etag)
         .header("Cache-Control", "private, max-age=3600")
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())

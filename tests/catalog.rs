@@ -10,6 +10,14 @@ use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
 #[tokio::test]
 async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -28,6 +36,9 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let series_library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
         .await?;
     let media_root = temp_dir.path().join("Movies");
     let first_dir = media_root.join("Alpha Movie (2020)");
@@ -96,6 +107,29 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .ok_or("missing admin token")?
         .to_owned();
 
+    let cover_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cover_session = cookie_value(cover_login.headers(), "lux_session");
+    let cover_csrf = cookie_value(cover_login.headers(), "lux_csrf");
+    let cover_upload = client
+        .put(format!(
+            "{base_url}/api/v1/admin/libraries/{}/cover",
+            library.id
+        ))
+        .header(
+            COOKIE,
+            format!("lux_session={cover_session}; lux_csrf={cover_csrf}"),
+        )
+        .header("X-CSRF-Token", &cover_csrf)
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(cover_upload.status(), reqwest::StatusCode::OK);
+
     let views = client
         .get(format!("{base_url}/Users/{}/Views", admin.id))
         .header("X-Emby-Token", &admin_token)
@@ -103,8 +137,40 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .await?;
     assert_eq!(views.status(), reqwest::StatusCode::OK);
     let views_body: Value = views.json().await?;
-    assert_eq!(views_body["TotalRecordCount"], 1);
-    assert_eq!(views_body["Items"][0]["CollectionType"], "movies");
+    assert_eq!(views_body["TotalRecordCount"], 2);
+    let movie_view = views_body["Items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["Id"] == library.id.to_string())
+        })
+        .ok_or("missing movie library view")?;
+    assert_eq!(movie_view["CollectionType"], "movies");
+    assert_eq!(movie_view["ChildCount"], 2);
+    let cover_tag = movie_view["ImageTags"]["Primary"]
+        .as_str()
+        .ok_or("missing movie library cover tag")?;
+    assert!(!cover_tag.is_empty());
+    let shows_view = views_body["Items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["Id"] == series_library.id.to_string())
+        })
+        .ok_or("missing series library view")?;
+    assert_eq!(shows_view["CollectionType"], "tvshows");
+    assert_eq!(shows_view["ChildCount"], 0);
+
+    let emby_cover = client
+        .get(format!("{base_url}/Items/{}/Images/Primary", library.id))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(emby_cover.headers()["content-type"], "image/png");
+    assert_eq!(emby_cover.bytes().await?.as_ref(), PNG_1X1);
 
     let emby_page = client
         .get(format!(
@@ -250,19 +316,21 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
     assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
     assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");
-    assert_eq!(home_body["libraries"].as_array().map(Vec::len), Some(1));
+    assert_eq!(home_body["libraries"].as_array().map(Vec::len), Some(2));
+    let home_movie_library = home_body["libraries"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["id"] == library.id.to_string())
+        })
+        .ok_or("missing movie library in home")?;
     assert_eq!(
-        home_body["libraries"][0]["latest"].as_array().map(Vec::len),
+        home_movie_library["latest"].as_array().map(Vec::len),
         Some(2)
     );
-    assert_eq!(
-        home_body["libraries"][0]["latest"][0]["title"],
-        "Alpha Movie"
-    );
-    assert_eq!(
-        home_body["libraries"][0]["latest"][1]["title"],
-        "Beta Movie"
-    );
+    assert_eq!(home_movie_library["latest"][0]["title"], "Alpha Movie");
+    assert_eq!(home_movie_library["latest"][1]["title"], "Beta Movie");
     assert_eq!(home_body["recommended"].as_array().map(Vec::len), Some(2));
     assert!(
         home_body["recommended"]

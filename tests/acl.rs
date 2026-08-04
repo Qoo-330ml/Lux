@@ -209,6 +209,20 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .as_str()
         .ok_or("missing viewer token")?
         .to_owned();
+    let allowed_emby_cover = client
+        .get(format!("{base_url}/Items/{}/Images/Primary", first.id))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(allowed_emby_cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(allowed_emby_cover.headers()["content-type"], "image/png");
+    assert_eq!(allowed_emby_cover.bytes().await?.as_ref(), PNG_1X1);
+    let denied_emby_cover = client
+        .get(format!("{base_url}/Items/{}/Images/Primary", second.id))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(denied_emby_cover.status(), reqwest::StatusCode::NOT_FOUND);
     let emby_search = client
         .get(format!("{base_url}/Search/Hints?SearchTerm=Denied"))
         .header("X-Emby-Token", &viewer_token)
