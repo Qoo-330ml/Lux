@@ -524,6 +524,121 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-job-actions, .lux-admin-log-row time { grid-column: 2; }
 }
 
+/* Library manager reference layout */
+.lux-admin-library-page {
+  --lux-library-page-bg: #fff;
+  --lux-library-card-bg: #f6f6f8;
+  --lux-library-text: #1e1e23;
+  --lux-library-muted: #77777e;
+  --lux-library-line: #e0e0e4;
+  min-height: calc(100vh - var(--lux-header-height));
+  margin: -24px clamp(-64px, -4vw, -24px) -90px;
+  padding: 14px clamp(24px, 4vw, 64px) 90px;
+  color: var(--lux-library-text);
+  background: var(--lux-library-page-bg);
+  color-scheme: light;
+}
+.lux-library-management-header { display: grid; justify-items: center; margin-bottom: 27px; }
+.lux-library-management-header h1 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+.lux-library-tabs { display: inline-flex; gap: 2px; padding: 3px; border-radius: 999px; background: #f1f1f5; }
+.lux-library-tabs button { min-width: 80px; min-height: 34px; padding: 0 17px; border: 0; border-radius: 999px; color: #72727a; background: transparent; font-size: .85rem; font-weight: 650; transition: color .2s ease, background .2s ease, box-shadow .2s ease; }
+.lux-library-tabs button:hover { color: #34343a; }
+.lux-library-tabs button.is-active { color: #fff; background: #98989d; box-shadow: 0 2px 5px rgba(0,0,0,.12); }
+.lux-library-management-toolbar { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 30px; color: #2e2e34; font-size: .78rem; }
+.lux-library-management-toolbar > div { display: flex; gap: 8px; }
+.lux-library-toolbar-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; padding: 0 16px; border: 0; border-radius: 999px; color: #38383e; background: #f1f1f5; font-size: .78rem; font-weight: 600; transition: background .2s ease, color .2s ease, transform .2s var(--lux-ease); }
+.lux-library-toolbar-button:hover { color: #17171b; background: #e7e7ec; transform: translateY(-1px); }
+.lux-library-toolbar-button.is-primary { color: #fff; background: #55555b; }
+.lux-library-toolbar-button.is-primary:hover { background: #3e3e44; }
+.lux-admin-library-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 20px; }
+.lux-admin-library-card { position: relative; overflow: visible; min-width: 0; border: 0; border-radius: 8px; color: var(--lux-library-text); background: var(--lux-library-card-bg); box-shadow: 0 3px 12px rgba(28,28,34,.035); }
+.lux-admin-library-cover-wrap { position: relative; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 7px 7px 0 0; background: #e7e7eb; }
+.lux-admin-library-cover-wrap::after { position: absolute; inset: 0; z-index: 1; background: rgba(0,0,0,.28); content: ""; opacity: 0; transition: opacity .2s ease; pointer-events: none; }
+.lux-admin-library-card:hover .lux-admin-library-cover-wrap::after { opacity: 1; }
+.lux-admin-library-cover { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .35s var(--lux-ease), filter .2s ease; }
+.lux-admin-library-card:hover .lux-admin-library-cover { filter: saturate(.86); transform: scale(1.035); }
+.lux-admin-library-cover-placeholder { display: grid; place-items: center; width: 100%; height: 100%; color: #9b9ba2; background: #e8e8ec; }
+.lux-admin-library-overflow { position: absolute; z-index: 2; right: 10px; bottom: 10px; display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; color: #34343a; background: rgba(255,255,255,.96); box-shadow: 0 4px 12px rgba(0,0,0,.16); opacity: 0; transform: translateY(4px); transition: opacity .2s ease, transform .2s var(--lux-ease), background .2s ease; }
+.lux-admin-library-card:hover .lux-admin-library-overflow, .lux-admin-library-overflow:focus-visible { opacity: 1; transform: translateY(0); }
+.lux-admin-library-overflow:hover { background: #fff; }
+.lux-admin-library-copy { min-width: 0; padding: 9px 12px 13px; text-align: center; }
+.lux-admin-library-copy strong, .lux-admin-library-copy span, .lux-admin-library-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-library-copy strong { color: var(--lux-library-text); font-size: .86rem; font-weight: 650; }
+.lux-admin-library-copy span { margin-top: 3px; color: var(--lux-library-muted); font-size: .75rem; }
+.lux-admin-library-copy small { margin-top: 6px; color: #8a8a91; font-size: .7rem; }
+.lux-library-action-menu { position: absolute; z-index: 15; top: 51px; right: 0; width: min(220px, calc(100vw - 32px)); overflow: hidden; border: 1px solid rgba(255,255,255,.72); border-radius: 12px; color: #36363c; background: linear-gradient(155deg, #fafafd, #f8e9e1); box-shadow: 0 15px 38px rgba(28,28,33,.2); }
+.lux-library-action-menu-heading { display: flex; align-items: center; gap: 10px; min-height: 61px; padding: 10px 14px; border-bottom: 1px solid rgba(70,70,76,.12); }
+.lux-library-action-menu-heading img, .lux-library-action-menu-heading > span { display: grid; place-items: center; flex: 0 0 auto; width: 62px; height: 36px; overflow: hidden; border-radius: 2px; color: #77777f; background: #e6e6eb; object-fit: cover; }
+.lux-library-action-menu-heading strong { overflow: hidden; font-size: .8rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-library-action-menu > span { display: block; }
+.lux-library-action-menu button { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 38px; padding: 0 14px; border: 0; color: inherit; text-align: left; background: transparent; font-size: .78rem; }
+.lux-library-action-menu button:hover:not(:disabled), .lux-library-action-menu button:focus-visible { color: #141419; background: rgba(255,255,255,.48); }
+.lux-library-action-menu button:disabled { color: #98989d; }
+.lux-library-action-menu button svg { flex: 0 0 auto; }
+.lux-library-action-divider { display: block; height: 1px; margin: 4px 14px; background: rgba(70,70,76,.14); }
+.lux-library-advanced-panel { max-width: 680px; margin: 72px auto 0; padding: 30px; border: 1px solid var(--lux-library-line); border-radius: 14px; color: var(--lux-library-muted); background: #fafafd; text-align: center; }
+.lux-library-advanced-panel h2 { margin: 10px 0 7px; color: var(--lux-library-text); font-size: 1.25rem; }
+.lux-library-advanced-panel p { margin: 0 auto 20px; max-width: 48ch; font-size: .82rem; line-height: 1.6; }
+.lux-library-dialog-backdrop { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; padding: 8px; background: rgba(26,26,30,.52); }
+.lux-library-dialog { display: flex; flex-direction: column; width: min(720px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow: hidden; border: 1px solid rgba(30,30,35,.18); border-radius: 14px; color: #303037; background: #fff; box-shadow: 0 25px 80px rgba(0,0,0,.28); }
+.lux-library-create-dialog { width: min(520px, calc(100vw - 32px)); }
+.lux-library-dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 23px 30px 17px; }
+.lux-library-dialog-header h2 { margin: 7px 0 0; color: #202026; font-size: 1.1rem; }
+.lux-library-dialog-close { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 50%; color: #323238; background: transparent; }
+.lux-library-dialog-close:hover { background: #f2f2f5; }
+.lux-library-dialog-scroll { overflow: auto; padding: 0 30px 30px; }
+.lux-library-warning { margin: 8px 0 24px; padding: 15px 14px; border-radius: 7px; color: #f05f3c; background: #fff0eb; font-size: .75rem; line-height: 1.6; }
+.lux-library-dialog-section { padding: 19px 0; border-top: 1px solid var(--lux-library-line); }
+.lux-library-dialog-section h3 { margin: 0 0 15px; color: #303037; font-size: 1.04rem; }
+.lux-library-dialog-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.lux-library-dialog-section-heading h3 { margin: 0; }
+.lux-library-dialog-section-heading > span { color: #88888f; font-size: .71rem; }
+.lux-library-dialog-root-list { display: grid; }
+.lux-library-dialog-root-row { display: grid; grid-template-columns: minmax(0, 1fr) 34px 34px; align-items: center; gap: 8px; min-height: 48px; border-bottom: 1px solid var(--lux-library-line); font-size: .8rem; }
+.lux-library-dialog-root-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-library-dialog-icon { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; color: #3f3f45; background: transparent; }
+.lux-library-dialog-icon:hover:not(:disabled) { background: #f0f0f3; }
+.lux-library-dialog-icon:disabled { color: #aaaab0; }
+.lux-library-root-form { display: flex; gap: 8px; margin-top: 14px; }
+.lux-library-root-form input { flex: 1; min-width: 0; }
+.lux-library-settings-form { display: grid; gap: 14px; }
+.lux-library-settings-form h3 { margin-bottom: 0; }
+.lux-library-settings-form label, .lux-library-dialog-form label { display: grid; gap: 7px; color: #595960; font-size: .75rem; }
+.lux-admin-library-page .lux-library-dialog input, .lux-admin-library-page .lux-library-dialog select { min-height: 40px; padding: 0 11px; border: 1px solid #d9d9de; border-radius: 7px; outline: 0; color: #2d2d34; background: #fff; }
+.lux-admin-library-page .lux-library-dialog input:focus, .lux-admin-library-page .lux-library-dialog select:focus { border-color: #96969c; box-shadow: 0 0 0 3px rgba(90,90,98,.1); }
+.lux-library-settings-form .lux-admin-toggle { display: flex; color: #595960; }
+.lux-library-settings-form .lux-admin-toggle input { min-height: 16px; accent-color: #5c5c62; }
+.lux-library-settings-form .lux-admin-scraper-field, .lux-library-settings-form .lux-admin-schedule-field { color: #595960; }
+.lux-library-settings-form .lux-admin-scraper-field select, .lux-library-settings-form .lux-admin-schedule-field input { color: #2d2d34; background: #fff; }
+.lux-library-settings-form .lux-admin-schedule-field > div { display: flex; gap: 7px; }
+.lux-library-settings-form .lux-admin-schedule-field input { flex: 1; }
+.lux-library-cover-editor { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.lux-library-cover-preview { display: grid; place-items: center; width: 94px; height: 53px; overflow: hidden; border-radius: 5px; color: #9999a0; background: #eeeeF1; }
+.lux-library-cover-preview img { width: 100%; height: 100%; object-fit: cover; }
+.lux-library-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 5px; }
+.lux-library-dialog-form { display: grid; gap: 16px; padding: 0 30px 30px; }
+.lux-library-dialog-form .lux-admin-toggle { color: #595960; }
+.lux-library-dialog-form .lux-admin-toggle input { min-height: 16px; accent-color: #5c5c62; }
+.lux-admin-library-page .lux-error-copy { color: #c94b49; font-size: .75rem; }
+
+@media (max-width: 1100px) {
+  .lux-admin-library-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .lux-admin-library-page { margin-right: -20px; margin-left: -20px; padding-right: 20px; padding-left: 20px; }
+  .lux-library-management-toolbar { align-items: stretch; flex-direction: column; text-align: center; }
+  .lux-library-management-toolbar > div { justify-content: center; flex-wrap: wrap; }
+  .lux-admin-library-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .lux-admin-library-overflow { opacity: 1; transform: none; }
+  .lux-library-dialog-header, .lux-library-dialog-scroll { padding-right: 20px; padding-left: 20px; }
+  .lux-library-dialog-form { padding-right: 20px; padding-left: 20px; }
+}
+@media (max-width: 460px) {
+  .lux-admin-library-grid { grid-template-columns: 1fr; }
+  .lux-library-toolbar-button { padding: 0 13px; }
+  .lux-library-dialog-root-row { grid-template-columns: minmax(0, 1fr) 32px 32px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
 }
