@@ -64,4 +64,26 @@ describe("LuxShell user control", () => {
 
     expect(container.querySelector(".lux-back-button")).toBeNull();
   });
+
+  it("hides the back button on nested pages too", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter initialEntries={["/items/item-1"]}>
+          <LuxShell
+            user={{
+              id: "user-1",
+              usernameNormalized: "test",
+              displayName: "test",
+            }}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector(".lux-back-button")).toBeNull();
+  });
 });
