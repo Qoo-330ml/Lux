@@ -1157,16 +1157,16 @@ impl ScanJobService {
         let Some(library) = self.database.find_library(&job.library_id).await? else {
             return Err(ScanJobError::LibraryNotFound);
         };
-        if library.kind != "MOVIE" {
-            return Ok(());
-        }
         let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
             tracing::warn!(job_id, library_id = %job.library_id, "local metadata enrichment skipped for invalid library ID");
             return Ok(());
         };
-        let result = MetadataEnricher::new(self.database.clone())
-            .enrich_movie_library(library_id)
-            .await;
+        let enricher = MetadataEnricher::new(self.database.clone());
+        let result = match library.kind.as_str() {
+            "MOVIE" => enricher.enrich_movie_library(library_id).await,
+            "SERIES" => enricher.enrich_series_library(library_id).await,
+            _ => return Ok(()),
+        };
         match result {
             Ok(report) => {
                 let details = format!(
