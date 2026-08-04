@@ -16,6 +16,7 @@ pub const TMDB_PLUGIN_ID: &str = "tmdb";
 pub const TMDB_DYNAMIC_PLUGIN_ID: &str = "org.lux.tmdb";
 const TMDB_PLUGIN_NAME: &str = "TMDb 元数据插件";
 const TMDB_PLUGIN_DESCRIPTION: &str = "使用 TMDb 补全电影和剧集元数据、海报与背景图。";
+const TMDB_PLUGIN_VERSION: &str = "1.0.0";
 const CONFIG_SOURCE_BUILT_IN: &str = "BUILT_IN";
 const CONFIG_SOURCE_CUSTOM: &str = "CUSTOM";
 const CONFIG_SOURCE_ENVIRONMENT: &str = "ENVIRONMENT";
@@ -362,7 +363,7 @@ fn legacy_tmdb_view(installed: bool, config_source: &str) -> PluginView {
         name: TMDB_PLUGIN_NAME.to_owned(),
         description: TMDB_PLUGIN_DESCRIPTION.to_owned(),
         category: PLUGIN_CATEGORY_SCRAPER.to_owned(),
-        version: None,
+        version: Some(TMDB_PLUGIN_VERSION.to_owned()),
         runtime: Some("built-in".to_owned()),
         capabilities: vec![
             "metadata.search".to_owned(),

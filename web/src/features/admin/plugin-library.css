@@ -38,21 +38,256 @@
   text-align: center;
 }
 
+.lux-admin-plugin-card {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 16px;
+  min-height: 104px;
+  padding: 20px 22px;
+}
+
+.lux-admin-plugin-icon {
+  align-self: start;
+}
+
+.lux-admin-plugin-content {
+  display: grid;
+  align-content: center;
+  min-width: 0;
+}
+
 .lux-admin-plugin-heading-line {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  gap: 12px;
+  min-width: 0;
+}
+
+.lux-admin-plugin-heading-line h2 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: #fff;
+  font-size: 1.08rem;
+  font-weight: 650;
+  letter-spacing: -.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lux-admin-plugin-content p {
+  display: -webkit-box;
+  margin: 7px 0 0;
+  overflow: hidden;
+  color: var(--lux-muted);
+  font-size: .8rem;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+}
+
+.lux-admin-plugin-meta {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  margin: 0 !important;
+  color: var(--lux-subtle);
+  font-size: .72rem !important;
+  white-space: nowrap;
+}
+
+.lux-admin-plugin-version {
+  color: var(--lux-subtle);
 }
 
 .lux-admin-plugin-category {
-  flex: 0 0 auto;
   padding: 4px 8px;
   border: 1px solid rgba(210, 71, 191, .24);
   border-radius: 999px;
   color: #efb2e4;
   background: rgba(210, 71, 191, .1);
   font-size: .68rem;
+}
+
+.lux-admin-plugin-actions {
+  display: flex;
+  grid-column: 3;
+  grid-row: 1;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 92px;
+}
+
+.lux-admin-plugin-install-status,
+.lux-admin-plugin-config-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  border-radius: 999px;
+  font-size: .73rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.lux-admin-plugin-install-status {
+  padding: 0 13px;
+  border: 1px solid transparent;
+}
+
+.lux-admin-plugin-install-status.is-installed {
+  color: #e8e8e9;
+  background: rgba(255, 255, 255, .16);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, .18);
+}
+
+.lux-admin-plugin-install-status.is-install {
+  border-color: var(--lux-line);
+  color: #fff;
+  background: rgba(255, 255, 255, .08);
+}
+
+.lux-admin-plugin-install-status.is-install:hover {
+  border-color: rgba(255, 255, 255, .4);
+  background: rgba(255, 255, 255, .14);
+}
+
+.lux-admin-plugin-config-button {
+  padding: 0 10px;
+  border: 1px solid transparent;
+  color: var(--lux-muted);
+  background: transparent;
+}
+
+.lux-admin-plugin-config-button:hover {
+  border-color: var(--lux-line-soft);
+  color: #fff;
+  background: rgba(255, 255, 255, .08);
+}
+
+.lux-admin-plugin-install-status:focus-visible,
+.lux-admin-plugin-config-button:focus-visible,
+.lux-admin-plugin-dialog-close:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 3px;
+}
+
+.lux-admin-plugin-dialog-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, .68);
+  backdrop-filter: blur(10px);
+}
+
+.lux-admin-plugin-dialog {
+  width: min(100%, 500px);
+  padding: 24px;
+  border: 1px solid var(--lux-line);
+  border-radius: 16px;
+  color: var(--lux-text);
+  background: var(--lux-surface-strong);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, .5);
+}
+
+.lux-admin-plugin-dialog-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 24px;
+}
+
+.lux-admin-plugin-dialog-heading h2 {
+  margin: 9px 0 0;
+  color: #fff;
+  font-size: 1.25rem;
+}
+
+.lux-admin-plugin-dialog-close {
+  min-width: 36px;
+  width: 36px;
+  height: 36px;
+}
+
+.lux-admin-plugin-dialog-form {
+  display: grid;
+  gap: 14px;
+}
+
+.lux-admin-plugin-dialog-form label {
+  display: grid;
+  gap: 8px;
+  color: var(--lux-muted);
+  font-size: .78rem;
+}
+
+.lux-admin-plugin-dialog-form input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 8px;
+  outline: 0;
+  color: #fff;
+  background: rgba(255, 255, 255, .05);
+}
+
+.lux-admin-plugin-dialog-form input:focus {
+  border-color: rgba(255, 255, 255, .46);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, .06);
+}
+
+.lux-admin-plugin-dialog-form p {
+  margin: 0;
+  color: var(--lux-subtle);
+  font-size: .73rem;
+  line-height: 1.6;
+}
+
+.lux-admin-plugin-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 5px;
+}
+
+@media (max-width: 640px) {
+  .lux-admin-plugin-card {
+    grid-template-columns: 42px minmax(0, 1fr) auto;
+    gap: 12px;
+    padding: 16px;
+  }
+
+  .lux-admin-plugin-heading-line {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .lux-admin-plugin-meta {
+    white-space: normal;
+  }
+
+  .lux-admin-plugin-actions {
+    min-width: 78px;
+  }
+
+  .lux-admin-plugin-install-status {
+    padding: 0 9px;
+  }
+
+  .lux-admin-plugin-dialog {
+    padding: 20px;
+  }
 }
 
 @media (max-width: 560px) {
