@@ -22,6 +22,7 @@ export function MediaDetailPage() {
   const [selectedSourceId, setSelectedSourceId] = useState<string>();
   const [selectedSeasonId, setSelectedSeasonId] = useState<string>();
   const [editor, setEditor] = useState<"metadata" | "images" | "identify">();
+  const [actionError, setActionError] = useState<string>();
   const isSeries = item.data?.itemType === "SERIES";
   const seasons = useQuery({
     queryKey: queryKeys.children(itemId, "SEASON"),
@@ -55,6 +56,16 @@ export function MediaDetailPage() {
     ? `/watch/${media.id}?sourceId=${encodeURIComponent(source.id)}`
     : `/watch/${media.id}`;
 
+  async function setMetadataLock(locked: boolean) {
+    setActionError(undefined);
+    try {
+      await api.setItemMetadataLock(media.id, locked);
+      await queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) });
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "元数据锁定状态更新失败，请重试。");
+    }
+  }
+
   return (
     <article className="lux-detail-page">
       {backdrop ? <img className="lux-detail-backdrop" src={backdrop} alt="" /> : null}
@@ -84,9 +95,10 @@ export function MediaDetailPage() {
               >
                 <Check size={20} strokeWidth={2.4} />
               </span>
-              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} />
+              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
               <span className="lux-detail-source"><Radio size={16} /> {source ? source.container || "DIRECT PLAY" : "暂无可播放版本"}</span>
             </div>
+            {actionError ? <p className="lux-editor-error lux-detail-action-error" role="alert">{actionError}</p> : null}
             {sources.length > 1 ? (
               <MediaSourceSelector
                 sources={sources}

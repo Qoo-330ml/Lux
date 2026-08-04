@@ -104,6 +104,36 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("locks or unlocks every editable metadata field without changing its values", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/items/item-1/metadata" && !init?.method) {
+        return new Response(JSON.stringify({
+          title: "标题",
+          originalTitle: "Original",
+          overview: "简介",
+          productionYear: 2020,
+          lockedFields: ["title"],
+        }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/items/item-1/metadata");
+      expect(init?.method).toBe("PATCH");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        title: "标题",
+        originalTitle: "Original",
+        overview: "简介",
+        productionYear: 2020,
+        lockedFields: ["title", "originalTitle", "overview", "productionYear"],
+      });
+      return new Response(JSON.stringify({ title: "标题", lockedFields: ["title", "originalTitle", "overview", "productionYear"] }), { status: 200 });
+    });
+
+    await expect(new LuxApiClient().setItemMetadataLock("item-1", true)).resolves.toMatchObject({
+      lockedFields: ["title", "originalTitle", "overview", "productionYear"],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("exposes admin health and settings through the Lux API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

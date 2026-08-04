@@ -167,6 +167,17 @@ export class LuxApiClient {
     });
   }
 
+  async setItemMetadataLock(itemId: string, locked: boolean) {
+    const metadata = await this.itemMetadata(itemId);
+    return this.updateItemMetadata(itemId, {
+      title: metadata.title,
+      originalTitle: metadata.originalTitle ?? undefined,
+      overview: metadata.overview ?? undefined,
+      productionYear: metadata.productionYear ?? undefined,
+      lockedFields: locked ? ["title", "originalTitle", "overview", "productionYear"] : [],
+    });
+  }
+
   itemImages(itemId: string) {
     return this.request<{ images?: ItemImage[] }>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
   }

@@ -1,5 +1,6 @@
-import { Download, Ellipsis, FileDown, Image as ImageIcon, Pencil, ScanSearch, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, ScanSearch, Unlock, X } from "lucide-react";
+import { createPortal } from "react-dom";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MediaItem } from "../../lib/api/types";
 
 type MediaActionMenuProps = {
@@ -7,9 +8,34 @@ type MediaActionMenuProps = {
   onEditMetadata: () => void;
   onEditImages: () => void;
   onIdentify?: () => void;
+  onLockMetadata?: () => void;
+  onUnlockMetadata?: () => void;
   className?: string;
   sourceId?: string;
 };
+
+type MediaActionRect = Pick<DOMRect, "top" | "bottom" | "left" | "right">;
+type MediaActionSize = Pick<DOMRect, "width" | "height">;
+type MediaViewport = Pick<DOMRect, "width" | "height">;
+
+export function positionMediaActionMenu(
+  trigger: MediaActionRect,
+  menu: MediaActionSize,
+  viewport: MediaViewport,
+) {
+  const edge = 16;
+  const gap = 8;
+  const left = Math.min(
+    Math.max(edge, trigger.right - menu.width),
+    Math.max(edge, viewport.width - menu.width - edge),
+  );
+  const below = trigger.bottom + gap;
+  const above = trigger.top - menu.height - gap;
+  const top = below + menu.height + edge <= viewport.height || above < edge
+    ? Math.min(below, Math.max(edge, viewport.height - menu.height - edge))
+    : Math.max(edge, above);
+  return { left, top };
+}
 
 export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
   const source = sourceId
@@ -19,9 +45,12 @@ export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
   return `/api/v1/items/${encodeURIComponent(item.id)}/download${query}`;
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify, className = "", sourceId }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify, onLockMetadata, onUnlockMetadata, className = "", sourceId }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
+  const [menuPosition, setMenuPosition] = useState({ left: 16, top: 16 });
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const title = item.title || item.name || "媒体";
   const posterUrl = item.imageTags?.poster
     ? `/api/v1/items/${encodeURIComponent(item.id)}/images/poster`
@@ -32,7 +61,7 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify
     if (!open) return undefined;
 
     const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (event.target instanceof Node && !rootRef.current?.contains(event.target)) setOpen(false);
+      if (event.target instanceof Node && !rootRef.current?.contains(event.target) && !menuRef.current?.contains(event.target)) setOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
@@ -45,9 +74,33 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify
     };
   }, [open]);
 
+  useLayoutEffect(() => {
+    if (!open || !triggerRef.current) return undefined;
+    const updatePosition = () => {
+      const menu = menuRef.current;
+      const menuSize = {
+        width: menu?.getBoundingClientRect().width || 246,
+        height: menu?.getBoundingClientRect().height || 360,
+      };
+      setMenuPosition(positionMediaActionMenu(
+        triggerRef.current!.getBoundingClientRect(),
+        menuSize,
+        { width: window.innerWidth, height: window.innerHeight },
+      ));
+    };
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [open]);
+
   return (
     <div ref={rootRef} className={`lux-media-actions ${className}`.trim()}>
       <button
+        ref={triggerRef}
         className="lux-media-actions-trigger"
         type="button"
         aria-label={`打开 ${title} 操作菜单`}
@@ -61,8 +114,8 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify
       >
         {open ? <X size={18} /> : <Ellipsis size={19} />}
       </button>
-      {open ? (
-        <div className="lux-media-action-menu" role="menu" aria-label={`${title} 操作`}>
+      {open ? createPortal(
+        <div ref={menuRef} className="lux-media-action-menu" role="menu" aria-label={`${title} 操作`} style={{ left: menuPosition.left, top: menuPosition.top, position: "fixed" }}>
           <div className="lux-media-action-menu-heading">
             {posterUrl ? <img src={posterUrl} alt="" /> : <span aria-hidden="true">{title.slice(0, 1)}</span>}
             <div>
@@ -119,7 +172,38 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify
               <span>识别</span>
             </button>
           ) : null}
-        </div>
+          {onLockMetadata ? (
+            <button
+              className="lux-media-action"
+              data-action="lock-metadata"
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onLockMetadata();
+              }}
+            >
+              <Lock size={17} aria-hidden="true" />
+              <span>锁定元数据</span>
+            </button>
+          ) : null}
+          {onUnlockMetadata ? (
+            <button
+              className="lux-media-action"
+              data-action="unlock-metadata"
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onUnlockMetadata();
+              }}
+            >
+              <Unlock size={17} aria-hidden="true" />
+              <span>解锁元数据</span>
+            </button>
+          ) : null}
+        </div>,
+        document.body,
       ) : null}
     </div>
   );

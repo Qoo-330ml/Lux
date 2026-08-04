@@ -1,6 +1,7 @@
 import { Play, Star } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useState } from "react";
+import { api } from "../../lib/api/client";
 import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
@@ -62,6 +63,16 @@ export function MediaCard({ item, landscape = false }: { item: MediaItem; landsc
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const [editor, setEditor] = useState<"metadata" | "images" | "identify">();
+  const [actionError, setActionError] = useState<string>();
+
+  async function setMetadataLock(locked: boolean) {
+    setActionError(undefined);
+    try {
+      await api.setItemMetadataLock(item.id, locked);
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "元数据锁定状态更新失败，请重试。");
+    }
+  }
 
   return (
     <>
@@ -77,7 +88,8 @@ export function MediaCard({ item, landscape = false }: { item: MediaItem; landsc
             <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
           </div>
         </Link>
-        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} />
+        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+        {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
       {editor === "metadata" ? <MediaMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}
       {editor === "images" ? <MediaImageEditor item={item} onClose={() => setEditor(undefined)} /> : null}
