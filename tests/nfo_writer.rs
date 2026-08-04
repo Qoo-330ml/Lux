@@ -129,6 +129,53 @@ async fn nfo_service_checks_library_root_and_refreshes_metadata_fingerprint()
 }
 
 #[tokio::test]
+async fn nfo_service_writes_next_to_strm_source() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example STRM Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(
+        movie_dir.join("Example.STRM.Movie.2020.strm"),
+        "https://example.invalid/movie",
+    )
+    .await?;
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+
+    let report = NfoWriteService::new(database)
+        .write_item_nfo(
+            &item_id,
+            &NfoMetadata {
+                title: Some("已识别 STRM 电影".to_owned()),
+                ..NfoMetadata::default()
+            },
+        )
+        .await?;
+
+    let canonical_movie_dir = tokio::fs::canonicalize(&movie_dir).await?;
+    assert_eq!(report.path, canonical_movie_dir.join("movie.nfo"));
+    let output = tokio::fs::read_to_string(&report.path).await?;
+    assert!(output.contains("<title>已识别 STRM 电影</title>"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn malformed_original_is_not_replaced() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let target = temp_dir.path().join("movie.nfo");

@@ -193,7 +193,11 @@ impl NfoWriteService {
             .await?
             .ok_or(NfoWriteError::ItemNotFound)?;
         let source = match kind.item_type.as_str() {
-            "MOVIE" | "EPISODE" => self.database.find_media_source_path(item_id).await?,
+            "MOVIE" | "EPISODE" => {
+                self.database
+                    .find_metadata_writeback_source_path(item_id)
+                    .await?
+            }
             "SERIES" | "SEASON" => {
                 self.database
                     .find_first_episode_source_path(item_id)

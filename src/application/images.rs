@@ -224,7 +224,7 @@ impl ImageWriteService {
         let directory = self.media_directory(item_id).await?;
         let root = self
             .database
-            .find_media_source_path(item_id)
+            .find_metadata_writeback_source_path(item_id)
             .await?
             .ok_or(ImageWriteError::ItemNotFound)?;
         let root = fs::canonicalize(&root.root_path)
@@ -280,7 +280,7 @@ impl ImageWriteService {
     async fn media_directory(&self, item_id: &str) -> Result<PathBuf, ImageWriteError> {
         let source = self
             .database
-            .find_media_source_path(item_id)
+            .find_metadata_writeback_source_path(item_id)
             .await?
             .ok_or(ImageWriteError::ItemNotFound)?;
         let root = fs::canonicalize(&source.root_path)
