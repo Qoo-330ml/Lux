@@ -99,6 +99,9 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
 async fn admin_selection_persists_cast_in_config_and_detail_api()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
+    let profile_dir = fixture.config.config_dir.join("people/profiles");
+    tokio::fs::create_dir_all(&profile_dir).await?;
+    tokio::fs::write(profile_dir.join("9.png"), PNG_1X1).await?;
     let candidate_id = insert_candidate(
         &fixture.database,
         &fixture.item_id,
@@ -108,7 +111,8 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
                 "id": 9,
                 "name": "演员甲",
                 "character": "角色甲",
-                "order": 0
+                "order": 0,
+                "profileUrl": "https://image.tmdb.org/t/p/w185/profile.jpg"
             }]
         }),
     )
@@ -148,6 +152,24 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let detail_body: Value = detail.json().await?;
     assert_eq!(detail_body["actors"][0]["name"], "演员甲");
     assert_eq!(detail_body["actors"][0]["character"], "角色甲");
+    assert_eq!(
+        detail_body["actors"][0]["imageUrl"],
+        "/api/v1/people/9/image"
+    );
+
+    let profile = client
+        .get(format!("{base_url}/api/v1/people/9/image"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(profile.status(), StatusCode::OK);
+    assert_eq!(
+        profile
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
 
     lux_server.abort();
     Ok(())
