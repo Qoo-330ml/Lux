@@ -43,6 +43,29 @@ describe("LuxShell user control", () => {
     expect(userButton?.textContent).toBe("T");
   });
 
+  it("does not render duplicate search or library actions in the header", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LuxShell
+            user={{
+              id: "user-1",
+              usernameNormalized: "test",
+              displayName: "test",
+            }}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector('[aria-label="搜索"]')).toBeNull();
+    expect(container.querySelector(".lux-grid-button")).toBeNull();
+  });
+
   it("hides the back button on the home page", () => {
     container = document.createElement("div");
     document.body.append(container);

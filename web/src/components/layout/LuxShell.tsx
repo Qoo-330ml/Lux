@@ -1,8 +1,6 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  Grid2X2,
   Menu,
-  Search,
   Settings2,
   Sparkles,
   UserRound,
@@ -45,22 +43,6 @@ export function LuxShell({ user }: LuxShellProps) {
         </div>
 
         <div className="lux-header-actions">
-          <button
-            className="lux-icon-button"
-            type="button"
-            aria-label="搜索"
-            onClick={() => navigate("/search")}
-          >
-            <Search size={20} strokeWidth={1.8} />
-          </button>
-          <button
-            className="lux-icon-button lux-grid-button"
-            type="button"
-            aria-label="打开媒体库"
-            onClick={() => navigate("/libraries")}
-          >
-            <Grid2X2 size={19} strokeWidth={1.8} />
-          </button>
           <button
             className="lux-user-button"
             type="button"
