@@ -4,12 +4,21 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
 use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex,
+    time::timeout,
+};
+use uuid::Uuid;
 use zip::ZipArchive;
 
-use super::plugin_protocol::{PluginManifest, PluginManifestError};
+use super::plugin_protocol::{PluginManifest, PluginManifestError, PluginRequest, PluginResponse};
 
 const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PLUGIN_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
@@ -134,6 +143,205 @@ impl From<PluginManifestError> for PluginDiscoveryError {
         Self::InvalidManifest(error)
     }
 }
+
+const DEFAULT_PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+pub struct PluginSupervisor {
+    catalog: Arc<PluginCatalog>,
+    processes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<PluginProcess>>>>>,
+    call_timeout: Duration,
+}
+
+impl PluginSupervisor {
+    pub fn new(catalog: PluginCatalog) -> Self {
+        Self {
+            catalog: Arc::new(catalog),
+            processes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            call_timeout: DEFAULT_PLUGIN_CALL_TIMEOUT,
+        }
+    }
+
+    pub fn with_call_timeout(mut self, call_timeout: Duration) -> Self {
+        self.call_timeout = call_timeout;
+        self
+    }
+
+    pub fn catalog(&self) -> &PluginCatalog {
+        &self.catalog
+    }
+
+    pub async fn call(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, PluginRuntimeError> {
+        let plugin = self
+            .catalog
+            .get(plugin_id)
+            .ok_or_else(|| PluginRuntimeError::UnknownPlugin(plugin_id.to_owned()))?;
+        let process = {
+            let mut processes = self.processes.lock().await;
+            if let Some(process) = processes.get(plugin_id) {
+                process.clone()
+            } else {
+                let process = Arc::new(Mutex::new(spawn_process(plugin)?));
+                processes.insert(plugin_id.to_owned(), process.clone());
+                process
+            }
+        };
+        let result = process
+            .lock()
+            .await
+            .call(method, params, self.call_timeout)
+            .await;
+        if result.is_err() {
+            self.processes.lock().await.remove(plugin_id);
+        }
+        result
+    }
+
+    pub async fn stop_all(&self) {
+        let processes = std::mem::take(&mut *self.processes.lock().await);
+        for process in processes.into_values() {
+            let mut process = process.lock().await;
+            let _ = process.child.kill().await;
+        }
+    }
+}
+
+struct PluginProcess {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl PluginProcess {
+    async fn call(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        call_timeout: Duration,
+    ) -> Result<serde_json::Value, PluginRuntimeError> {
+        if self
+            .child
+            .try_wait()
+            .map_err(PluginRuntimeError::Io)?
+            .is_some()
+        {
+            return Err(PluginRuntimeError::Exited);
+        }
+        let request = PluginRequest::new(Uuid::now_v7().to_string(), method, params);
+        let request_id = request.id.clone();
+        let result = timeout(call_timeout, async {
+            let mut line = serde_json::to_vec(&request).map_err(PluginRuntimeError::Json)?;
+            line.push(b'\n');
+            self.stdin
+                .write_all(&line)
+                .await
+                .map_err(PluginRuntimeError::Io)?;
+            self.stdin.flush().await.map_err(PluginRuntimeError::Io)?;
+            let mut response_line = String::new();
+            let bytes = self
+                .stdout
+                .read_line(&mut response_line)
+                .await
+                .map_err(PluginRuntimeError::Io)?;
+            if bytes == 0 {
+                return Err(PluginRuntimeError::Exited);
+            }
+            if response_line.len() > 4 * 1024 * 1024 {
+                return Err(PluginRuntimeError::Protocol(
+                    "plugin response is too large".to_owned(),
+                ));
+            }
+            let response: PluginResponse =
+                serde_json::from_str(&response_line).map_err(PluginRuntimeError::Json)?;
+            if response.id != request_id {
+                return Err(PluginRuntimeError::Protocol(
+                    "plugin response id does not match request".to_owned(),
+                ));
+            }
+            if let Some(error) = response.error {
+                return Err(PluginRuntimeError::Plugin {
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+            response.result.ok_or_else(|| {
+                PluginRuntimeError::Protocol("plugin response has no result".to_owned())
+            })
+        })
+        .await
+        .map_err(|_| PluginRuntimeError::Timeout)?;
+        if result.is_err() {
+            let _ = self.child.kill().await;
+        }
+        result
+    }
+}
+
+fn spawn_process(plugin: &DiscoveredPlugin) -> Result<PluginProcess, PluginRuntimeError> {
+    let mut command = Command::new(&plugin.entrypoint);
+    command
+        .current_dir(&plugin.root_path)
+        .env("LUX_PLUGIN_ID", &plugin.manifest.id)
+        .env(
+            "LUX_PLUGIN_PROTOCOL_VERSION",
+            plugin.manifest.api_version.to_string(),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(PluginRuntimeError::Io)?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| PluginRuntimeError::Protocol("plugin stdin was not captured".to_owned()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| PluginRuntimeError::Protocol("plugin stdout was not captured".to_owned()))?;
+    if let Some(mut stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut stderr, &mut sink).await;
+        });
+    }
+    Ok(PluginProcess {
+        child,
+        stdin: BufWriter::new(stdin),
+        stdout: BufReader::new(stdout),
+    })
+}
+
+#[derive(Debug)]
+pub enum PluginRuntimeError {
+    UnknownPlugin(String),
+    Io(io::Error),
+    Json(serde_json::Error),
+    Protocol(String),
+    Plugin { code: String, message: String },
+    Timeout,
+    Exited,
+}
+
+impl fmt::Display for PluginRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownPlugin(id) => write!(formatter, "unknown plugin: {id}"),
+            Self::Io(error) => write!(formatter, "plugin process IO error: {error}"),
+            Self::Json(error) => write!(formatter, "plugin protocol JSON error: {error}"),
+            Self::Protocol(message) => write!(formatter, "plugin protocol error: {message}"),
+            Self::Plugin { code, message } => write!(formatter, "plugin error {code}: {message}"),
+            Self::Timeout => formatter.write_str("plugin request timed out"),
+            Self::Exited => formatter.write_str("plugin process exited"),
+        }
+    }
+}
+
+impl std::error::Error for PluginRuntimeError {}
 
 fn discover_directory(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
     let manifest = read_manifest(&path.join("manifest.json"))?;
