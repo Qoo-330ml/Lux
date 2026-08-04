@@ -40,6 +40,8 @@ describe("LibraryCard", () => {
     expect(container.querySelector<HTMLImageElement>(".lux-library-cover")?.src).toContain(
       "/api/v1/libraries/library-1/cover",
     );
+    expect(container.querySelector(".lux-library-card-cover")).not.toBeNull();
+    expect(container.querySelector(".lux-library-cover-full")).not.toBeNull();
     expect(container.querySelector(".lux-library-icon")).toBeNull();
   });
 });
