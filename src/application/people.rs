@@ -63,10 +63,14 @@ pub struct PeopleService {
 
 impl PeopleService {
     pub fn new(config_dir: PathBuf) -> Self {
-        Self {
-            config_dir,
-            client: Client::new(),
-        }
+        let client = match crate::network::client_builder_from_env() {
+            Ok(builder) => match builder.build() {
+                Ok(client) => client,
+                Err(_) => Client::new(),
+            },
+            Err(_) => Client::new(),
+        };
+        Self { config_dir, client }
     }
 
     pub async fn persist_item_actors(
