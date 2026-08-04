@@ -1,6 +1,6 @@
-use axum::{body::Body, http::StatusCode, response::Response, routing::get, Router};
+use axum::{Router, body::Body, http::StatusCode, response::Response, routing::get};
 use luxd::{
-    api::{app_with_state, AppState},
+    api::{AppState, app_with_state},
     application::{
         candidates::{MetadataSelectionMode, MetadataSelectionService},
         images::ImageWriteService,
@@ -15,7 +15,7 @@ use luxd::{
     storage::Database,
 };
 use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -29,8 +29,8 @@ const PNG_1X1: &[u8] = &[
 ];
 
 #[tokio::test]
-async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
+-> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(true).await?;
     let (image_url, image_server) = start_image_stub().await?;
     let candidate_id = insert_candidate(
@@ -96,8 +96,8 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images(
 }
 
 #[tokio::test]
-async fn admin_selection_writes_only_configured_candidate_image_types(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn admin_selection_writes_only_configured_candidate_image_types()
+-> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
     configure_image_strategy(&fixture.database, &fixture.item_id).await?;
     let (image_url, image_server) = start_image_stub().await?;
@@ -171,8 +171,8 @@ async fn admin_selection_writes_only_configured_candidate_image_types(
 }
 
 #[tokio::test]
-async fn failed_selection_stays_pending_and_can_be_retried(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn failed_selection_stays_pending_and_can_be_retried()
+-> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
     let (image_url, image_server) = start_image_stub().await?;
     let candidate_id = insert_candidate(
@@ -355,8 +355,8 @@ async fn configure_image_strategy(
     Ok(())
 }
 
-async fn start_image_stub(
-) -> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
+async fn start_image_stub()
+-> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
 {
     let app = Router::new().route(
         "/{name}",

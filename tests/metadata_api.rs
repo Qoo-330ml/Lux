@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use axum::{routing::any, Json, Router};
+use axum::{Json, Router, routing::any};
 use luxd::{
-    api::{app_with_state, AppState},
+    api::{AppState, app_with_state},
     application::{
         libraries::LibraryService,
         scanner::LibraryScanner,
@@ -15,7 +15,7 @@ use luxd::{
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -69,8 +69,8 @@ async fn tmdb_search_stub(uri: axum::http::Uri) -> Json<Value> {
     }))
 }
 
-async fn start_tmdb_stub(
-) -> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
+async fn start_tmdb_stub()
+-> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
 {
     let app = Router::new().fallback(any(tmdb_search_stub));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -124,8 +124,8 @@ async fn login(
 }
 
 #[tokio::test]
-async fn admin_can_page_search_and_preview_pending_candidates(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn admin_can_page_search_and_preview_pending_candidates()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -301,8 +301,8 @@ async fn admin_can_page_search_and_preview_pending_candidates(
 }
 
 #[tokio::test]
-async fn admin_can_read_and_edit_item_metadata_with_field_locks(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn admin_can_read_and_edit_item_metadata_with_field_locks()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
