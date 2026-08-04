@@ -55,6 +55,7 @@ use crate::{
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
         metadata::MetadataField,
         nfo::{MetadataWriteRequest, MetadataWriteService, NfoWriteError},
+        people::{PeopleError, PeopleService},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
@@ -102,6 +103,7 @@ pub struct AppState {
     plugins: Option<PluginService>,
     tmdb: Option<TmdbClient>,
     collections: Option<CollectionService>,
+    people: Option<PeopleService>,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
 }
@@ -122,9 +124,9 @@ impl AppState {
             database.clone(),
             config.config_dir.join("library-covers"),
         ));
-        let metadata_selection = image_writes
-            .clone()
-            .map(|images| MetadataSelectionService::new(database.clone(), images));
+        let metadata_selection = image_writes.clone().map(|images| {
+            MetadataSelectionService::with_config_dir(database.clone(), images, config_dir.clone())
+        });
         let tmdb = TmdbClient::from_env_or_config(
             read_tmdb_api_key(&config_dir),
             read_tmdb_token(&config_dir),
@@ -166,9 +168,10 @@ impl AppState {
                 FfprobeRunner::default(),
             )),
             scan_jobs: Some(ScanJobService::new(database.clone())),
-            plugins: Some(PluginService::new(database.clone(), config_dir)),
+            plugins: Some(PluginService::new(database.clone(), config_dir.clone())),
             tmdb,
             collections,
+            people: Some(PeopleService::new(config_dir)),
             remote_access: RemoteAccessPolicy::from_env(),
             login_rate_limiter: LoginRateLimiter::default(),
         }
@@ -336,6 +339,10 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_list_library_items),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route(
+            "/api/v1/people/{person_id}/image",
+            get(lux_get_person_image),
+        )
         .route("/api/v1/items/{item_id}/children", get(lux_get_children))
         .route(
             "/api/v1/collections/{collection_id}",
@@ -3354,11 +3361,20 @@ async fn lux_get_item(
             .find_user_item_state(&user.id.to_string(), &item.id)
             .await
         {
-            Ok(user_state) => Json(lux_catalog_item_json_with_user_state(
-                &item,
-                user_state.as_ref(),
-            ))
-            .into_response(),
+            Ok(user_state) => {
+                let actors = match state.people.as_ref() {
+                    Some(people) => match people.list_item_actors(&item.id).await {
+                        Ok(actors) => actors,
+                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    },
+                    None => Vec::new(),
+                };
+                let mut body = lux_catalog_item_json_with_user_state(&item, user_state.as_ref());
+                if let Value::Object(object) = &mut body {
+                    object.insert("actors".to_owned(), json!(actors));
+                }
+                Json(body).into_response()
+            }
             Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         },
         Ok(None) => api_error(
@@ -4741,6 +4757,35 @@ fn lux_user_data_json(state: Option<&crate::storage::StoredUserItemState>) -> Va
         "isFavorite": state.map(|value| value.is_favorite).unwrap_or(false),
         "isPlayed": state.map(|value| value.is_played).unwrap_or(false),
     })
+}
+
+async fn lux_get_person_image(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_web_user(&headers, &state).await {
+        return response;
+    }
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let image = match people.profile_image(&person_id).await {
+        Ok(Some(image)) => image,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(PeopleError::InvalidComponent(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Ok(file) = tokio::fs::File::open(&image.path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", image.content_type)
+        .header("Content-Length", image.content_length)
+        .header("Cache-Control", "private, max-age=3600")
+        .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) -> Value {
@@ -6566,6 +6611,7 @@ async fn admin_select_candidate(
                 "mode": report.mode.as_str(),
                 "status": report.status,
                 "imageTypes": report.image_types,
+                "actorCount": report.actor_count,
             }))
             .into_response()
         }
@@ -6598,7 +6644,9 @@ fn metadata_selection_error(headers: &HeaderMap, error: MetadataSelectionError) 
             "候选数据无效",
         )
         .into_response(),
-        MetadataSelectionError::Nfo(_) | MetadataSelectionError::Image(_) => api_error(
+        MetadataSelectionError::Nfo(_)
+        | MetadataSelectionError::Image(_)
+        | MetadataSelectionError::People(_) => api_error(
             headers,
             StatusCode::INTERNAL_SERVER_ERROR,
             lux::ApiErrorCode::Internal,

@@ -9,6 +9,7 @@ pub mod libraries;
 pub mod library_covers;
 pub mod metadata;
 pub mod nfo;
+pub mod people;
 pub mod playback;
 pub mod plugin_protocol;
 pub mod plugin_runtime;

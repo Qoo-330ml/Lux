@@ -96,6 +96,64 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
 }
 
 #[tokio::test]
+async fn admin_selection_persists_cast_in_config_and_detail_api()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "演员电影",
+            "actors": [{
+                "id": 9,
+                "name": "演员甲",
+                "character": "角色甲",
+                "order": 0
+            }]
+        }),
+    )
+    .await?;
+    let (base_url, lux_server) = start_lux(&fixture).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = login(&client, &base_url).await?;
+
+    let selected = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{}/identify/candidates/{candidate_id}/select",
+            fixture.item_id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "fillMissing" }))
+        .send()
+        .await?;
+    assert_eq!(selected.status(), StatusCode::OK);
+    let selected_body: Value = selected.json().await?;
+    assert_eq!(selected_body["actorCount"], 1);
+
+    let people_file = fixture
+        .config
+        .config_dir
+        .join("people/items")
+        .join(format!("{}.json", fixture.item_id));
+    let people: Value = serde_json::from_slice(&tokio::fs::read(people_file).await?)?;
+    assert_eq!(people[0]["name"], "演员甲");
+
+    let detail = client
+        .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail_body: Value = detail.json().await?;
+    assert_eq!(detail_body["actors"][0]["name"], "演员甲");
+    assert_eq!(detail_body["actors"][0]["character"], "角色甲");
+
+    lux_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_selection_writes_only_configured_candidate_image_types()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;

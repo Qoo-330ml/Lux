@@ -12,7 +12,8 @@ use crate::{
         images::{ImageWriteError, ImageWriteService},
         metadata::{MetadataCandidate, MetadataSource, MetadataState, NfoMetadata},
         nfo::{NfoWriteError, NfoWriteService},
-        tmdb::{TmdbClient, TmdbError},
+        people::{ActorCredit, PeopleError},
+        tmdb::{TmdbCastMember, TmdbClient, TmdbError},
     },
     storage::{
         Database, NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
@@ -143,6 +144,11 @@ impl MetadataCandidateService {
                 .movie_images(result.id, "zh-CN")
                 .await
                 .unwrap_or_default();
+            let actors = tmdb
+                .movie_credits(result.id, "zh-CN")
+                .await
+                .map(|credits| tmdb_candidate_actors(&credits.cast))
+                .unwrap_or_default();
             let candidate_json = json!({
                 "title": title,
                 "originalTitle": result.original_title,
@@ -151,6 +157,7 @@ impl MetadataCandidateService {
                 "productionYear": production_year,
                 "originalLanguage": result.original_language,
                 "images": tmdb_candidate_images(&images),
+                "actors": actors,
             })
             .to_string();
             let id = uuid::Uuid::now_v7().to_string();
@@ -290,6 +297,7 @@ pub struct MetadataSelectionReport {
     pub mode: MetadataSelectionMode,
     pub status: &'static str,
     pub image_types: Vec<&'static str>,
+    pub actor_count: usize,
 }
 
 #[derive(Clone)]
@@ -297,14 +305,24 @@ pub struct MetadataSelectionService {
     database: Database,
     nfo: NfoWriteService,
     images: ImageWriteService,
+    people: crate::application::people::PeopleService,
 }
 
 impl MetadataSelectionService {
     pub fn new(database: Database, images: ImageWriteService) -> Self {
+        Self::with_config_dir(database, images, std::path::PathBuf::from("./config"))
+    }
+
+    pub fn with_config_dir(
+        database: Database,
+        images: ImageWriteService,
+        config_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             nfo: NfoWriteService::new(database.clone()),
             database,
             images,
+            people: crate::application::people::PeopleService::new(config_dir),
         }
     }
 
@@ -388,6 +406,10 @@ impl MetadataSelectionService {
                 }
             }
         }
+        let actor_count = self
+            .people
+            .persist_item_actors(item_id, &payload.actors)
+            .await?;
         let provider_ids_json =
             json!({ candidate.provider.to_ascii_lowercase(): candidate.provider_id }).to_string();
         let selected = self
@@ -416,6 +438,7 @@ impl MetadataSelectionService {
             mode,
             status: "ONLINE_CONFIRMED",
             image_types,
+            actor_count,
         })
     }
 
@@ -470,6 +493,7 @@ pub enum MetadataSelectionError {
     InvalidCandidate(String),
     Nfo(NfoWriteError),
     Image(ImageWriteError),
+    People(PeopleError),
     Storage(StorageError),
 }
 
@@ -486,6 +510,7 @@ impl fmt::Display for MetadataSelectionError {
             }
             Self::Nfo(error) => error.fmt(formatter),
             Self::Image(error) => error.fmt(formatter),
+            Self::People(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -496,6 +521,7 @@ impl std::error::Error for MetadataSelectionError {
         match self {
             Self::Nfo(error) => Some(error),
             Self::Image(error) => Some(error),
+            Self::People(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::ItemNotFound
             | Self::CandidateNotFound
@@ -523,12 +549,19 @@ impl From<ImageWriteError> for MetadataSelectionError {
     }
 }
 
+impl From<PeopleError> for MetadataSelectionError {
+    fn from(error: PeopleError) -> Self {
+        Self::People(error)
+    }
+}
+
 struct CandidatePayload {
     metadata: NfoMetadata,
     images: BTreeMap<String, Vec<String>>,
     typed_images_present: bool,
     poster_url: Option<String>,
     fanart_url: Option<String>,
+    actors: Vec<ActorCredit>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -645,6 +678,7 @@ fn candidate_payload(
             "backdrop",
         ],
     );
+    let actors = candidate_actors(&value)?;
     if metadata.title.is_none()
         && metadata.original_title.is_none()
         && metadata.overview.is_none()
@@ -652,6 +686,7 @@ fn candidate_payload(
         && images.values().all(Vec::is_empty)
         && poster_url.is_none()
         && fanart_url.is_none()
+        && actors.is_empty()
     {
         return Err(MetadataSelectionError::InvalidCandidate(
             "candidate contains no writable metadata or images".to_owned(),
@@ -663,7 +698,60 @@ fn candidate_payload(
         typed_images_present,
         poster_url,
         fanart_url,
+        actors,
     })
+}
+
+fn tmdb_candidate_actors(cast: &[TmdbCastMember]) -> Vec<ActorCredit> {
+    cast.iter()
+        .take(12)
+        .filter_map(|member| {
+            let name = member.name.as_deref()?.trim();
+            if member.id <= 0 || name.is_empty() {
+                return None;
+            }
+            Some(ActorCredit {
+                id: member.id,
+                name: name.to_owned(),
+                character: member
+                    .character
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                order: member.order,
+                profile_url: member
+                    .profile_path
+                    .as_deref()
+                    .filter(|path| path.starts_with('/') && path.len() > 1)
+                    .map(|path| format!("https://image.tmdb.org/t/p/w185{path}")),
+            })
+        })
+        .collect()
+}
+
+fn candidate_actors(value: &Value) -> Result<Vec<ActorCredit>, MetadataSelectionError> {
+    let Some(raw) = value.get("actors") else {
+        return Ok(Vec::new());
+    };
+    let actors = raw.as_array().ok_or_else(|| {
+        MetadataSelectionError::InvalidCandidate("actors must be an array".to_owned())
+    })?;
+    actors
+        .iter()
+        .take(12)
+        .map(|actor| {
+            let actor = serde_json::from_value::<ActorCredit>(actor.clone()).map_err(|error| {
+                MetadataSelectionError::InvalidCandidate(format!("actor is invalid: {error}"))
+            })?;
+            if actor.id <= 0 || actor.name.trim().is_empty() {
+                return Err(MetadataSelectionError::InvalidCandidate(
+                    "actor ID and name are required".to_owned(),
+                ));
+            }
+            Ok(actor)
+        })
+        .collect()
 }
 
 fn candidate_images(value: &Value) -> (BTreeMap<String, Vec<String>>, bool) {
