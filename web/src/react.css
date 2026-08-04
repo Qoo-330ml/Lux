@@ -730,7 +730,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-account-footer-card span { margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
 .lux-account-footer-card .lux-button { min-height: 36px; padding: 0 12px; font-size: .72rem; }
 
-html[data-lux-theme="light"] { color-scheme: light; --lux-bg: #f4f3f1; --lux-surface: rgba(255,255,255,.86); --lux-line: rgba(28,28,34,.16); --lux-line-soft: rgba(28,28,34,.1); --lux-text: #25252a; --lux-muted: rgba(37,37,42,.64); --lux-subtle: rgba(37,37,42,.43); }
+html[data-lux-theme="light"] { color-scheme: light; --lux-bg: #f4f3f1; --lux-surface: rgba(255,255,255,.9); --lux-surface-strong: #fff; --lux-line: rgba(28,28,34,.22); --lux-line-soft: rgba(28,28,34,.13); --lux-text: #25252a; --lux-muted: #55565e; --lux-subtle: #6c6d75; }
 html[data-lux-accent="berry"] { --lux-accent: #d247bf; }
 html[data-lux-accent="ocean"] { --lux-accent: #4f8cff; }
 html[data-lux-accent="amber"] { --lux-accent: #d99a47; }
@@ -753,6 +753,110 @@ html[data-lux-theme="light"] .lux-app.is-home-route .lux-user-button { color: #f
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link { color: rgba(255,255,255,.72); }
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link:hover,
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link.is-active { color: #fff; }
+
+/* Light content surfaces keep the media hero dark, while the page below it stays readable. */
+html[data-lux-theme="light"] .lux-home-content { margin-top: 0; background: var(--lux-bg); }
+html[data-lux-theme="light"] .lux-section-heading h2 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-library-card strong { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-media-copy strong { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-continue-copy strong { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-empty-card { border-color: var(--lux-line); color: var(--lux-muted); background: rgba(255,255,255,.78); }
+html[data-lux-theme="light"] .lux-empty-card a { color: var(--lux-text); }
+
+/* The admin console is a normal light surface, rather than a dark island inside it. */
+html[data-lux-theme="light"] .lux-admin-layout { color: var(--lux-text); background: radial-gradient(circle at 75% 0%, rgba(210,71,191,.06), transparent 34%), var(--lux-bg); }
+html[data-lux-theme="light"] .lux-admin-sidebar { border-color: var(--lux-line-soft); background: rgba(255,255,255,.84); }
+html[data-lux-theme="light"] .lux-admin-sidebar-heading strong { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-sidebar-heading small { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-admin-badge { border-color: var(--lux-line); color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-admin-nav-link:hover { color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-admin-nav-link.is-active { border-color: var(--lux-line); color: var(--lux-text); background: rgba(28,28,34,.09); }
+html[data-lux-theme="light"] .lux-admin-back:hover { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-page-heading h1 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-stat { border-color: var(--lux-line-soft); background: rgba(255,255,255,.88); box-shadow: 0 10px 26px rgba(30,30,38,.05); }
+html[data-lux-theme="light"] .lux-admin-stat-icon { border-color: var(--lux-line); color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-admin-stat small { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-admin-stat strong { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-panel { border-color: var(--lux-line-soft); background: rgba(255,255,255,.88); box-shadow: 0 10px 26px rgba(30,30,38,.05); }
+html[data-lux-theme="light"] .lux-admin-panel-heading h2 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-panel-icon { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-status-pill.is-ok { color: #247b4b; background: rgba(36,123,75,.12); }
+html[data-lux-theme="light"] .lux-status-pill.is-warn { color: #9a5f13; background: rgba(154,95,19,.12); }
+html[data-lux-theme="light"] .lux-admin-check { border-color: var(--lux-line-soft); color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-check small { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-check-icon.is-ok { color: #247b4b; }
+html[data-lux-theme="light"] .lux-check-icon.is-warn { color: #9a5f13; }
+html[data-lux-theme="light"] .lux-admin-quick-links a:hover { border-color: var(--lux-line-soft); color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-admin-quick-links a > svg, html[data-lux-theme="light"] .lux-quick-icon { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-admin-quick-links small { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-admin-page-state h1 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-empty h2 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-cover-editor strong { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-plugin-content h2 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-plugin-icon { border-color: var(--lux-line); color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-admin-plugin-status.is-ok { color: #247b4b; }
+html[data-lux-theme="light"] .lux-admin-plugin-status.is-warn { color: #9a5f13; }
+
+/* Apply the same semantic palette to the remaining admin views and their controls. */
+html[data-lux-theme="light"] .lux-admin-library-card,
+html[data-lux-theme="light"] .lux-admin-subpanel,
+html[data-lux-theme="light"] .lux-admin-user-row,
+html[data-lux-theme="light"] .lux-admin-job-row,
+html[data-lux-theme="light"] .lux-admin-log-row,
+html[data-lux-theme="light"] .lux-admin-metadata-card { background: rgba(255,255,255,.88); }
+html[data-lux-theme="light"] .lux-admin-library-heading h2,
+html[data-lux-theme="light"] .lux-admin-subpanel-heading,
+html[data-lux-theme="light"] .lux-admin-user-summary strong,
+html[data-lux-theme="light"] .lux-admin-job-heading strong,
+html[data-lux-theme="light"] .lux-admin-log-row strong,
+html[data-lux-theme="light"] .lux-admin-settings-form label,
+html[data-lux-theme="light"] .lux-admin-metadata-heading h3 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-library-edit,
+html[data-lux-theme="light"] .lux-admin-plugin-config,
+html[data-lux-theme="light"] .lux-admin-subpanel,
+html[data-lux-theme="light"] .lux-admin-access-block { background: rgba(28,28,34,.035); }
+html[data-lux-theme="light"] .lux-admin-form input,
+html[data-lux-theme="light"] .lux-admin-form select,
+html[data-lux-theme="light"] .lux-admin-schedule-field input,
+html[data-lux-theme="light"] .lux-admin-root-form input,
+html[data-lux-theme="light"] .lux-admin-password-row input,
+html[data-lux-theme="light"] .lux-admin-filter-select,
+html[data-lux-theme="light"] .lux-admin-input-with-suffix { color: var(--lux-text); background: rgba(28,28,34,.035); }
+html[data-lux-theme="light"] .lux-admin-form input:focus,
+html[data-lux-theme="light"] .lux-admin-form select:focus,
+html[data-lux-theme="light"] .lux-admin-schedule-field input:focus,
+html[data-lux-theme="light"] .lux-admin-root-form input:focus { border-color: rgba(28,28,34,.38); box-shadow: 0 0 0 3px rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-admin-form select,
+html[data-lux-theme="light"] .lux-admin-scraper-field select { color: var(--lux-text); background: rgba(28,28,34,.035); }
+html[data-lux-theme="light"] .lux-admin-library-page { --lux-library-page-bg: var(--lux-bg); --lux-library-card-bg: rgba(255,255,255,.88); --lux-library-text: var(--lux-text); --lux-library-muted: var(--lux-muted); color-scheme: light; }
+html[data-lux-theme="light"] .lux-library-tabs button.is-active { color: var(--lux-text); background: rgba(28,28,34,.1); }
+html[data-lux-theme="light"] .lux-library-tabs button:hover { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-library-toolbar-button { border-color: var(--lux-line-soft); color: var(--lux-text); background: rgba(255,255,255,.72); }
+html[data-lux-theme="light"] .lux-library-toolbar-button:hover { border-color: var(--lux-line); color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-library-action-menu { border-color: var(--lux-line); background: rgba(255,255,255,.98); box-shadow: 0 15px 38px rgba(30,30,38,.16); }
+html[data-lux-theme="light"] .lux-library-action-menu button:hover:not(:disabled), html[data-lux-theme="light"] .lux-library-action-menu button:focus-visible { color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-library-advanced-panel { background: rgba(255,255,255,.88); }
+html[data-lux-theme="light"] .lux-library-strategy-card { background: rgba(255,255,255,.88); }
+html[data-lux-theme="light"] .lux-library-strategy-heading h2,
+html[data-lux-theme="light"] .lux-library-strategy-callout strong,
+html[data-lux-theme="light"] .lux-library-strategy-card-heading h3,
+html[data-lux-theme="light"] .lux-library-strategy-toggle strong,
+html[data-lux-theme="light"] .lux-library-strategy-estimate strong { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-library-strategy-form-grid input,
+html[data-lux-theme="light"] .lux-library-strategy-form-grid select,
+html[data-lux-theme="light"] .lux-library-strategy-card input,
+html[data-lux-theme="light"] .lux-library-strategy-card select,
+html[data-lux-theme="light"] .lux-library-override-fields input,
+html[data-lux-theme="light"] .lux-library-override-fields select { color: var(--lux-text); background: rgba(28,28,34,.035); }
+html[data-lux-theme="light"] .lux-library-strategy-toggle,
+html[data-lux-theme="light"] .lux-library-override-modes label { background: rgba(28,28,34,.025); }
+html[data-lux-theme="light"] .lux-library-strategy-toggle:hover { background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-library-dialog { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.98); box-shadow: 0 25px 80px rgba(30,30,38,.2); }
+html[data-lux-theme="light"] .lux-library-dialog-header h2,
+html[data-lux-theme="light"] .lux-library-dialog-section h3 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog input,
+html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select { color: var(--lux-text); background: rgba(28,28,34,.035); }
+html[data-lux-theme="light"] .lux-library-cover-preview { background: #e7e6e3; }
 
 @media (max-width: 900px) {
   .lux-account-settings-grid { grid-template-columns: 1fr; gap: 20px; }
