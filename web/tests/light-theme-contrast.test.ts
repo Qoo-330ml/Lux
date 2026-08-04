@@ -62,4 +62,23 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-admin-plugin-dialog-form input")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-admin-plugin-dialog-form input")).toContain("background: rgba(28,28,34");
   });
+
+  it("keeps the media detail page light and readable", () => {
+    expect(lightThemeRule(".lux-detail-page")).toContain("background: var(--lux-bg)");
+    expect(lightThemeRule(".lux-detail-overlay")).toContain("rgba(244,243,241");
+    expect(lightThemeRule(".lux-detail-overlay")).not.toContain("rgba(5,5,6");
+    expect(lightThemeRule(".lux-detail-copy h1")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-detail-overview")).toContain("color: var(--lux-muted)");
+  });
+
+  it("keeps detail versions and media cards readable in light mode", () => {
+    expect(lightThemeRule(".lux-source-option")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-source-option.is-selected")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-media-info-row")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-media-info-row > strong")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-media-stream-card")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-media-stream-heading h3")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-season-tab.is-active")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-episode-link")).toContain("background: rgba(255,255,255");
+  });
 });
