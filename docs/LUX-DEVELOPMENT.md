@@ -1308,12 +1308,13 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - GET /api/v1/admin/metadata/reidentify/{jobId}
 - POST /api/v1/admin/metadata/reidentify/{jobId}
 - PATCH /api/v1/admin/items/{id}/metadata
+- DELETE /api/v1/admin/items/{id}
 - POST /api/v1/admin/items/{id}/metadata/refresh
 - GET/PATCH /api/v1/admin/settings
 - GET /api/v1/admin/health
 - GET /api/v1/admin/logs
 
-所有管理端点均在服务端检查 can_manage_server。敏感操作写审计事件。
+所有管理端点均在服务端检查 can_manage_server。敏感操作写审计事件。删除媒体源时，即使媒体文件已被外部删除，也会清理 Lux 中的媒体源记录；没有其他媒体源时同时标记逻辑条目移除。
 
 ---
 

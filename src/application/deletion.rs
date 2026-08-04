@@ -1,4 +1,7 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Component, PathBuf},
+};
 
 use tokio::fs;
 
@@ -25,45 +28,70 @@ impl MediaDeleteService {
         let source = match source_id {
             Some(source_id) => {
                 self.database
-                    .find_media_source_path_by_id(item_id, source_id)
+                    .find_deletable_media_source_path_by_id(item_id, source_id)
                     .await?
             }
-            None => self.database.find_media_source_path(item_id).await?,
+            None => {
+                self.database
+                    .find_deletable_media_source_path(item_id)
+                    .await?
+            }
         }
         .ok_or(MediaDeleteError::ItemNotFound)?;
         let root = fs::canonicalize(&source.root_path).await?;
-        let media_path = fs::canonicalize(root.join(&source.relative_path)).await?;
-        if !media_path.starts_with(&root) || media_path == root {
-            return Err(MediaDeleteError::PathOutsideRoot(media_path));
+        let relative_path = PathBuf::from(&source.relative_path);
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+        {
+            return Err(MediaDeleteError::PathOutsideRoot(root.join(relative_path)));
         }
-        let metadata = fs::metadata(&media_path).await?;
-        if !metadata.is_file() {
-            return Err(MediaDeleteError::ItemNotFound);
-        }
-        let file_name = media_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| MediaDeleteError::InvalidFileName(media_path.clone()))?
-            .to_owned();
-        let parent = media_path
-            .parent()
-            .ok_or_else(|| MediaDeleteError::PathOutsideRoot(media_path.clone()))?;
-        let mut paths = vec![media_path.clone()];
-        let mut entries = fs::read_dir(parent).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let candidate = entry.path();
-            if candidate == media_path
-                || !is_matching_sidecar(&file_name, entry.file_name().to_string_lossy().as_ref())
-            {
-                continue;
+
+        let media_path = match fs::canonicalize(root.join(&source.relative_path)).await {
+            Ok(media_path) => {
+                if !media_path.starts_with(&root) || media_path == root {
+                    return Err(MediaDeleteError::PathOutsideRoot(media_path));
+                }
+                let metadata = fs::metadata(&media_path).await?;
+                if !metadata.is_file() {
+                    return Err(MediaDeleteError::ItemNotFound);
+                }
+                Some(media_path)
             }
-            let file_type = entry.file_type().await?;
-            if !file_type.is_file() {
-                continue;
-            }
-            let canonical = fs::canonicalize(&candidate).await?;
-            if canonical.starts_with(&root) && canonical != root {
-                paths.push(canonical);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mut paths = Vec::new();
+        if let Some(media_path) = media_path {
+            let file_name = media_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| MediaDeleteError::InvalidFileName(media_path.clone()))?
+                .to_owned();
+            let parent = media_path
+                .parent()
+                .ok_or_else(|| MediaDeleteError::PathOutsideRoot(media_path.clone()))?;
+            paths.push(media_path.clone());
+            let mut entries = fs::read_dir(parent).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let candidate = entry.path();
+                if candidate == media_path
+                    || !is_matching_sidecar(
+                        &file_name,
+                        entry.file_name().to_string_lossy().as_ref(),
+                    )
+                {
+                    continue;
+                }
+                let file_type = entry.file_type().await?;
+                if !file_type.is_file() {
+                    continue;
+                }
+                let canonical = fs::canonicalize(&candidate).await?;
+                if canonical.starts_with(&root) && canonical != root {
+                    paths.push(canonical);
+                }
             }
         }
         for path in &paths {

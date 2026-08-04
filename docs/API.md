@@ -111,6 +111,7 @@ Lux 电影查询要求有效 Web session：
 - `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计事件。
 - `GET /api/v1/admin/jobs/{jobId}`：管理员读取单个扫描任务详情，包括状态、进度、游标和错误。
 - `GET /api/v1/admin/items/{itemId}/images`、`DELETE /api/v1/admin/items/{itemId}/images/{imageId}`：管理员查看图片索引并删除媒体根目录内的图片及索引；删除要求 CSRF，响应不暴露本地路径。
+- `DELETE /api/v1/admin/items/{itemId}`：管理员删除指定媒体源及其同名旁车文件；若媒体文件已被外部删除，仍会清理 Lux 中的媒体源记录，没有其他媒体源时同时标记逻辑条目移除。支持通过 `sourceId` 选择版本，要求 CSRF。
 - `GET /api/v1/auth/sessions`、`DELETE /api/v1/auth/sessions/{sessionId}`：当前用户查看并撤销其他 Web 会话；删除要求 CSRF，当前会话必须通过退出登录撤销。
 - `GET|HEAD /api/v1/items/{itemId}/images/{type}`、`/{type}/{index}`：读取本地 poster/fanart，支持 ETag 和 `If-None-Match`。
 
