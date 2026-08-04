@@ -403,7 +403,17 @@ function LibraryActionMenu({ library, onEdit, onScan, onRemove }: { library: Adm
 }
 
 function ScraperSelect({ id, value, plugins, onChange }: { id: string; value: string; plugins: AdminPlugin[]; onChange: (value: string) => void }) {
-  return <label className="lux-admin-scraper-field" htmlFor={id}>刮削器<LuxSelect id={id} value={value} options={[{ value: "", label: "仅使用本地元数据" }, ...plugins.map((plugin) => ({ value: plugin.id, label: `${plugin.name}${plugin.available ? "" : plugin.installed ? "（暂不可用）" : "（请先安装）"}`, disabled: !plugin.available }))]} onChange={onChange} aria-label="刮削器" /></label>;
+  const visiblePlugins = plugins.filter((plugin) => plugin.available || plugin.id === value);
+  const options = visiblePlugins.map((plugin) => ({
+    value: plugin.id,
+    label: `${plugin.name}${plugin.available ? "" : "（暂不可用）"}`,
+    disabled: !plugin.available,
+  }));
+  return <label className="lux-admin-scraper-field" htmlFor={id}>
+    刮削器
+    <LuxSelect id={id} value={value} options={options} placeholder="未配置刮削器" disabled={options.length === 0} onChange={onChange} aria-label="刮削器" />
+    {value ? <button className="lux-library-dialog-icon" type="button" aria-label="清除刮削器配置" onClick={() => onChange("")}>清除配置</button> : null}
+  </label>;
 }
 
 function ScheduleField({ label, value, onSave }: { label: string; value?: string | null; onSave: (value: string) => void }) {

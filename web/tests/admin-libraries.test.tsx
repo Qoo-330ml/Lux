@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AdminLibrariesPage } from "../src/features/admin/AdminLibrariesPage";
 import { api } from "../src/lib/api/client";
+import type { AdminPlugin } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -28,13 +29,34 @@ const library = {
   }],
 };
 
+const configuredScraper: AdminPlugin = {
+  id: "tmdb",
+  name: "TMDb 元数据插件",
+  description: "通过 TMDb 补全媒体元数据和图片。",
+  category: "SCRAPER",
+  version: "1.0.0",
+  runtime: "builtin",
+  capabilities: ["metadata"],
+  status: "READY",
+  running: true,
+  lastError: null,
+  installed: true,
+  enabled: true,
+  configured: true,
+  available: true,
+  unavailableReason: null,
+  configurable: true,
+  configFields: [],
+  configSource: "BUILT_IN",
+};
+
 describe("AdminLibrariesPage library cards", () => {
   let container: HTMLDivElement;
   let root: Root;
 
   beforeEach(() => {
     vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [library] });
-    vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [] });
+    vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [configuredScraper] });
     vi.spyOn(api, "adminSettings").mockResolvedValue({
       resumePlayedPercent: 90,
       resumeMinTicks: 1_200_000_000,
@@ -126,6 +148,28 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(container.querySelector('[role="dialog"]')?.textContent).toContain("01每日更新");
     expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 媒体库名称"]')?.value).toBe("01每日更新");
+  });
+
+  it("lists only configured scrapers without a local-only scraper option", async () => {
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+
+    expect(container.textContent).not.toContain("仅使用本地元数据");
+    const scraperTrigger = container.querySelector<HTMLButtonElement>("[aria-label='刮削器']");
+    expect(scraperTrigger).toBeTruthy();
+
+    await act(async () => scraperTrigger?.click());
+
+    expect(document.body.textContent).toContain("TMDb 元数据插件");
+    expect(document.body.textContent).not.toContain("仅使用本地元数据");
   });
 
   it("shows global image and subtitle defaults in the strategy view", async () => {
