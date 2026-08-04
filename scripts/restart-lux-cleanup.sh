@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 
-cleanup_old_debug_artifacts() {
+cleanup_old_target_if_stale() {
     local target_dir="${1:-}"
     local min_age_minutes="${2:-1440}"
-    local debug_dir
-    local cache_dir
+    local cargo_command
+    local recent_file
+
+    shift 2 || true
+    cargo_command=("$@")
 
     if [[ -z "$target_dir" || "$target_dir" == "/" || "$target_dir" == "." ]]; then
         printf '[lux] refusing to clean an unsafe target directory: %s\n' "$target_dir" >&2
@@ -16,15 +19,15 @@ cleanup_old_debug_artifacts() {
         return 2
     fi
 
-    debug_dir="$target_dir/debug"
-    [[ -d "$debug_dir" ]] || return 0
+    if ((${#cargo_command[@]} == 0)); then
+        printf '%s\n' '[lux] no Cargo command was provided for target cleanup' >&2
+        return 2
+    fi
 
-    for cache_dir in \
-        "$debug_dir/deps" \
-        "$debug_dir/incremental" \
-        "$debug_dir/build" \
-        "$debug_dir/.fingerprint"; do
-        [[ -d "$cache_dir" ]] || continue
-        find "$cache_dir" -type f -mmin "+$min_age_minutes" -delete
-    done
+    [[ -d "$target_dir" ]] || return 0
+
+    recent_file="$(find "$target_dir" -type f -mmin "-$min_age_minutes" -print -quit)"
+    [[ -z "$recent_file" ]] || return 0
+
+    "${cargo_command[@]}" clean --locked --target-dir "$target_dir"
 }

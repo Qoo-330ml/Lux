@@ -91,8 +91,8 @@ if ((${#lux_pids[@]} > 0)); then
     done
 fi
 
-log "cleaning Debug artifacts older than 24 hours"
-cleanup_old_debug_artifacts "$LUX_TARGET_DIR"
+log "cleaning complete target older than 24 hours"
+cleanup_old_target_if_stale "$LUX_TARGET_DIR" 1440 "${CARGO_COMMAND[@]}"
 
 log "building Web frontend"
 "${PNPM_COMMAND[@]}" --dir web install --frozen-lockfile
