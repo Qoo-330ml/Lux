@@ -946,3 +946,36 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
         .and_then(|value| value.parse::<i64>().ok())
         .map(Value::from)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{TmdbCastMember, tmdb_candidate_actors};
+
+    #[test]
+    fn tmdb_cast_becomes_ordered_candidate_actor_data() {
+        let actors = tmdb_candidate_actors(&[
+            TmdbCastMember {
+                id: 9,
+                name: Some(" 演员甲 ".to_owned()),
+                character: Some(" 角色甲 ".to_owned()),
+                profile_path: Some("/profile.jpg".to_owned()),
+                order: Some(0),
+            },
+            TmdbCastMember {
+                id: 10,
+                name: Some("演员乙".to_owned()),
+                character: None,
+                profile_path: None,
+                order: Some(1),
+            },
+        ]);
+
+        assert_eq!(actors[0].name, "演员甲");
+        assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
+        assert_eq!(
+            actors[0].profile_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w185/profile.jpg")
+        );
+        assert_eq!(actors[1].id, 10);
+    }
+}
