@@ -754,6 +754,33 @@ html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link { color: rgba(
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link:hover,
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link.is-active { color: #fff; }
 
+/* Light mode keeps the artwork visible with a pale reading layer instead of black fades. */
+html[data-lux-theme="light"] .lux-hero-backdrop { filter: saturate(.92) brightness(.96); }
+html[data-lux-theme="light"] .lux-hero-backdrop-empty { background: radial-gradient(circle at 57% 28%, rgba(210,204,215,.42), transparent 36%), linear-gradient(118deg, #e7e6e3, #f4f3f1 64%); }
+html[data-lux-theme="light"] .lux-hero-overlay { background: linear-gradient(90deg, rgba(244,243,241,.92) 0%, rgba(244,243,241,.72) 40%, rgba(244,243,241,.16) 78%, transparent 100%), linear-gradient(0deg, rgba(244,243,241,.98) 0%, rgba(244,243,241,.72) 24%, transparent 64%); }
+html[data-lux-theme="light"] .lux-hero h1 { color: var(--lux-text); text-shadow: 0 4px 20px rgba(255,255,255,.24); }
+html[data-lux-theme="light"] .lux-hero-meta { color: var(--lux-muted); }
+html[data-lux-theme="light"] .lux-hero-meta span + span::before { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-hero-copy p { color: var(--lux-muted); }
+html[data-lux-theme="light"] .lux-hero-carousel-arrow { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.66); }
+html[data-lux-theme="light"] .lux-hero-carousel-arrow:hover { border-color: var(--lux-line); background: rgba(255,255,255,.9); }
+html[data-lux-theme="light"] .lux-hero-dot { background: rgba(37,37,42,.38); }
+html[data-lux-theme="light"] .lux-hero-dot:hover { background: rgba(37,37,42,.68); }
+html[data-lux-theme="light"] .lux-hero-dot.is-active { background: var(--lux-text); }
+html[data-lux-theme="light"] .lux-button-glass { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.56); }
+html[data-lux-theme="light"] .lux-button-glass:hover { border-color: var(--lux-line); background: rgba(255,255,255,.88); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-header { background: linear-gradient(180deg, rgba(244,243,241,.94), rgba(244,243,241,0)); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-brand-mark { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.58); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-brand-name,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-icon-button,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-user-button { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link { color: var(--lux-muted); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link:hover,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link.is-active { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-icon-button,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-user-button { border-color: var(--lux-line); background: rgba(255,255,255,.66); }
+
 /* Light content surfaces keep the media hero dark, while the page below it stays readable. */
 html[data-lux-theme="light"] .lux-home-content { margin-top: 0; background: var(--lux-bg); }
 html[data-lux-theme="light"] .lux-section-heading h2 { color: var(--lux-text); }

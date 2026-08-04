@@ -5,10 +5,10 @@ const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "u
 
 function lightThemeRule(selector: string) {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rule = stylesheet.match(
-    new RegExp(`html\\[data-lux-theme="light"\\] ${escapedSelector}\\s*\\{([^}]*)\\}`),
-  );
-  return rule?.[1] ?? "";
+  const rules = [...stylesheet.matchAll(
+    new RegExp(`html\\[data-lux-theme="light"\\] ${escapedSelector}\\s*\\{([^}]*)\\}`, "g"),
+  )];
+  return rules.at(-1)?.[1] ?? "";
 }
 
 describe("light theme contrast", () => {
@@ -18,6 +18,14 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-library-card strong")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-copy strong")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-empty-card")).toContain("color: var(--lux-muted)");
+  });
+
+  it("uses a light hero mask and readable dark hero copy", () => {
+    expect(lightThemeRule(".lux-hero-overlay")).toContain("rgba(244,243,241");
+    expect(lightThemeRule(".lux-hero-overlay")).not.toContain("rgba(0,0,0");
+    expect(lightThemeRule(".lux-hero h1")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-hero-copy p")).toContain("color: var(--lux-muted)");
+    expect(lightThemeRule(".lux-app.is-home-route .lux-header")).toContain("rgba(244,243,241");
   });
 
   it("uses light surfaces and dark text throughout the admin dashboard", () => {
