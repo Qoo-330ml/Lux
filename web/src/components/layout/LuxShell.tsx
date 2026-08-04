@@ -18,6 +18,7 @@ export function LuxShell({ user }: LuxShellProps) {
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
   const isDetail = location.pathname.startsWith("/libraries/");
+  const isHome = location.pathname === "/";
 
   useEffect(() => {
     const settings = readAccountSettings(user.id);
@@ -26,7 +27,7 @@ export function LuxShell({ user }: LuxShellProps) {
   }, [user.id]);
 
   return (
-    <div className="lux-app">
+    <div className={isHome ? "lux-app is-home-route" : "lux-app"}>
       <header className="lux-header">
         <div className="lux-header-left">
           <NavLink className="lux-brand" to="/" aria-label="Lux 首页">

@@ -745,6 +745,14 @@ html[data-lux-theme="light"] .lux-account-library-row:hover, html[data-lux-theme
 html[data-lux-theme="light"] .lux-setting-field input, html[data-lux-theme="light"] .lux-setting-field select { background: rgba(28,28,34,.035); }
 html[data-lux-theme="light"] .lux-setting-field input:focus, html[data-lux-theme="light"] .lux-setting-field select:focus { border-color: rgba(28,28,34,.38); box-shadow: 0 0 0 3px rgba(28,28,34,.06); }
 html[data-lux-theme="light"] .lux-account-footer-card { background: rgba(255,255,255,.74); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-header { background: linear-gradient(180deg, rgba(0,0,0,.58), transparent); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-brand-name,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-icon-button,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-user-button { color: #fff; }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link { color: rgba(255,255,255,.72); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link:hover,
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link.is-active { color: #fff; }
 
 @media (max-width: 900px) {
   .lux-account-settings-grid { grid-template-columns: 1fr; gap: 20px; }

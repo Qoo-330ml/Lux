@@ -86,6 +86,7 @@ describe("LuxShell user control", () => {
     });
 
     expect(container.querySelector(".lux-back-button")).toBeNull();
+    expect(container.querySelector(".lux-app.is-home-route")).toBeTruthy();
   });
 
   it("hides the back button on nested pages too", () => {
