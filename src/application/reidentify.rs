@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::{
     application::{
         candidates::{MetadataCandidateError, MetadataCandidateService},
+        scraper::{ScraperError, ScraperResolver},
         tmdb_plugin::TmdbProvider,
     },
     storage::{Database, StorageError, StoredMetadataReidentifyItem},
@@ -15,6 +16,7 @@ pub struct MetadataReidentifyService {
     database: Database,
     candidates: MetadataCandidateService,
     tmdb: TmdbProvider,
+    resolver: Option<ScraperResolver>,
 }
 
 impl MetadataReidentifyService {
@@ -26,6 +28,19 @@ impl MetadataReidentifyService {
             candidates: MetadataCandidateService::new(database.clone()),
             database,
             tmdb: tmdb.into(),
+            resolver: None,
+        }
+    }
+
+    pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
+    where
+        T: Into<TmdbProvider>,
+    {
+        Self {
+            candidates: MetadataCandidateService::new(database.clone()),
+            database,
+            tmdb: tmdb.into(),
+            resolver: Some(resolver),
         }
     }
 
@@ -127,11 +142,15 @@ impl MetadataReidentifyService {
                     if item.title.trim().is_empty() {
                         Err(MetadataReidentifyError::InvalidSearch)
                     } else {
-                        self.candidates
-                            .search_and_store(&item_id, &item.title, None, &self.tmdb)
-                            .await
-                            .map(|page| i64::try_from(page.items.len()).unwrap_or(i64::MAX))
-                            .map_err(MetadataReidentifyError::Candidate)
+                        match self.provider_for_item(&item_id).await {
+                            Ok(provider) => self
+                                .candidates
+                                .search_and_store(&item_id, &item.title, None, &provider)
+                                .await
+                                .map(|page| i64::try_from(page.items.len()).unwrap_or(i64::MAX))
+                                .map_err(MetadataReidentifyError::Candidate),
+                            Err(error) => Err(MetadataReidentifyError::Scraper(error)),
+                        }
                     }
                 }
                 Ok(None) => Err(MetadataReidentifyError::ItemNotFound(item_id.clone())),
@@ -172,6 +191,17 @@ impl MetadataReidentifyService {
                 (status == "FAILED").then_some("ITEM_FAILED"),
             )
             .await;
+    }
+
+    async fn provider_for_item(&self, item_id: &str) -> Result<TmdbProvider, ScraperError> {
+        let Some(resolver) = &self.resolver else {
+            return Ok(self.tmdb.clone());
+        };
+        resolver.for_item(item_id).await.map(|client| {
+            client
+                .map(TmdbProvider::from_scraper)
+                .unwrap_or_else(|| self.tmdb.clone())
+        })
     }
 
     pub async fn get_job(
@@ -252,6 +282,7 @@ pub enum MetadataReidentifyError {
     JobNotFound,
     JobNotRetryable,
     Candidate(MetadataCandidateError),
+    Scraper(ScraperError),
     Storage(StorageError),
 }
 
@@ -266,6 +297,7 @@ impl MetadataReidentifyError {
             Self::Candidate(MetadataCandidateError::Tmdb(_)) => "TMDB_UNAVAILABLE",
             Self::Candidate(MetadataCandidateError::InvalidSearch) => "INVALID_SEARCH",
             Self::Candidate(_) => "CANDIDATE_ERROR",
+            Self::Scraper(_) => "SCRAPER_UNAVAILABLE",
             Self::Storage(_) => "STORAGE_ERROR",
         }
     }
@@ -284,6 +316,7 @@ impl fmt::Display for MetadataReidentifyError {
                 formatter.write_str("metadata reidentify job is not retryable")
             }
             Self::Candidate(error) => error.fmt(formatter),
+            Self::Scraper(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }

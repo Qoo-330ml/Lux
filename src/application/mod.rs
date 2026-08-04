@@ -19,6 +19,7 @@ pub mod probe;
 pub mod recommendations;
 pub mod reidentify;
 pub mod scanner;
+pub mod scraper;
 pub mod settings;
 pub mod setup;
 pub mod tmdb;

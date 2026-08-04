@@ -60,6 +60,7 @@ use crate::{
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
+        scraper::ScraperResolver,
         tmdb::{TmdbClient, TmdbError},
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
     },
@@ -103,6 +104,7 @@ pub struct AppState {
     probe: Option<MediaProbeService>,
     scan_jobs: Option<ScanJobService>,
     plugins: Option<PluginService>,
+    scraper_resolver: Option<ScraperResolver>,
     tmdb: Option<TmdbProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
@@ -131,12 +133,22 @@ impl AppState {
         });
         let plugins = PluginService::new(database.clone(), config_dir.clone());
         let tmdb = TmdbProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
-        let collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
-        let metadata_reidentify = Some(MetadataReidentifyService::new(
+        let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
+        let collections = Some(CollectionService::with_resolver(
             database.clone(),
             tmdb.clone(),
+            scraper_resolver.clone(),
         ));
-        let image_candidates = Some(ImageCandidateService::new(database.clone(), tmdb.clone()));
+        let metadata_reidentify = Some(MetadataReidentifyService::with_resolver(
+            database.clone(),
+            tmdb.clone(),
+            scraper_resolver.clone(),
+        ));
+        let image_candidates = Some(ImageCandidateService::with_resolver(
+            database.clone(),
+            tmdb.clone(),
+            scraper_resolver.clone(),
+        ));
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -166,6 +178,7 @@ impl AppState {
             )),
             scan_jobs: Some(ScanJobService::new(database.clone())),
             plugins: Some(plugins),
+            scraper_resolver: Some(scraper_resolver),
             tmdb: Some(tmdb),
             collections,
             people: Some(PeopleService::new(config_dir)),
@@ -180,12 +193,28 @@ impl AppState {
         };
         let tmdb = TmdbProvider::from(tmdb);
         self.tmdb = Some(tmdb.clone());
-        self.collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
-        self.metadata_reidentify = Some(MetadataReidentifyService::new(
-            database.clone(),
-            tmdb.clone(),
-        ));
-        self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
+        if let Some(resolver) = self.scraper_resolver.clone() {
+            self.collections = Some(CollectionService::with_resolver(
+                database.clone(),
+                tmdb.clone(),
+                resolver.clone(),
+            ));
+            self.metadata_reidentify = Some(MetadataReidentifyService::with_resolver(
+                database.clone(),
+                tmdb.clone(),
+                resolver.clone(),
+            ));
+            self.image_candidates = Some(ImageCandidateService::with_resolver(
+                database, tmdb, resolver,
+            ));
+        } else {
+            self.collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
+            self.metadata_reidentify = Some(MetadataReidentifyService::new(
+                database.clone(),
+                tmdb.clone(),
+            ));
+            self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
+        }
         self
     }
 
@@ -3917,7 +3946,7 @@ async fn lux_select_item_image(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let report = match images
-        .download_item_image_from_tmdb_candidate(&item_id, &request.image_type, &request.url)
+        .download_item_image_from_scraper_candidate(&item_id, &request.image_type, &request.url)
         .await
     {
         Ok(report) => report,
@@ -5454,7 +5483,7 @@ async fn admin_start_library_reidentify(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "TMDb 重新识别服务尚未配置",
+            "刮削器重新识别服务尚未配置",
         )
         .into_response();
     };
@@ -5722,7 +5751,7 @@ async fn admin_refresh_collection(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "TMDb 合集服务尚未配置",
+            "刮削器合集服务尚未配置",
         )
         .into_response();
     };
@@ -5751,21 +5780,23 @@ async fn admin_refresh_collection(
             &headers,
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
-            "电影没有可用的 TMDb 合集",
+            "电影没有可用的刮削器合集",
         )
         .into_response(),
         Err(CollectionError::InvalidProviderId) => api_error(
             &headers,
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
-            "TMDb provider ID 无效",
+            "刮削器 provider ID 无效",
         )
         .into_response(),
-        Err(CollectionError::Tmdb(_) | CollectionError::Storage(_)) => api_error(
+        Err(
+            CollectionError::Tmdb(_) | CollectionError::Scraper(_) | CollectionError::Storage(_),
+        ) => api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "TMDb 合集刷新失败，可重试",
+            "刮削器合集刷新失败，可重试",
         )
         .into_response(),
     }
@@ -6691,7 +6722,7 @@ async fn admin_start_metadata_reidentify(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "TMDb 重新识别服务尚未配置",
+            "刮削器重新识别服务尚未配置",
         )
         .into_response();
     };
@@ -6733,7 +6764,7 @@ async fn admin_get_metadata_reidentify(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "TMDb 重新识别服务尚未配置",
+            "刮削器重新识别服务尚未配置",
         )
         .into_response();
     };
@@ -6756,7 +6787,7 @@ async fn admin_retry_metadata_reidentify(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "TMDb 重新识别服务尚未配置",
+            "刮削器重新识别服务尚未配置",
         )
         .into_response();
     };
@@ -6851,14 +6882,31 @@ async fn admin_search_item_candidates(
         )
         .into_response();
     }
-    let Some(tmdb) = state.tmdb.as_ref() else {
+    let Some(fallback_tmdb) = state.tmdb.as_ref().cloned() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "TMDb 尚未配置",
+            "刮削器尚未配置",
         )
         .into_response();
+    };
+    let tmdb = if let Some(resolver) = state.scraper_resolver.as_ref() {
+        match resolver.for_item(&item_id).await {
+            Ok(Some(scraper)) => TmdbProvider::from_scraper(scraper),
+            Ok(None) => fallback_tmdb,
+            Err(error) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    &format!("刮削器不可用: {error}"),
+                )
+                .into_response();
+            }
+        }
+    } else {
+        fallback_tmdb
     };
     let Some(candidates) = state.metadata_candidates.as_ref() else {
         return api_error(
@@ -6870,7 +6918,7 @@ async fn admin_search_item_candidates(
         .into_response();
     };
     match candidates
-        .search_and_store(&item_id, &request.query, request.year, tmdb)
+        .search_and_store(&item_id, &request.query, request.year, &tmdb)
         .await
     {
         Ok(page) => {
@@ -7197,6 +7245,13 @@ fn image_candidate_error(headers: &HeaderMap, error: ImageCandidateError) -> Res
             "刮削器暂时不可用",
         )
         .into_response(),
+        ImageCandidateError::Scraper(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "刮削器暂时不可用",
+        )
+        .into_response(),
         ImageCandidateError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7339,6 +7394,8 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
             .into_response()
         }
         MetadataReidentifyError::Candidate(MetadataCandidateError::Tmdb(_))
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(_))
+        | MetadataReidentifyError::Scraper(_)
         | MetadataReidentifyError::Candidate(MetadataCandidateError::Storage(_))
         | MetadataReidentifyError::Storage(_) => api_error(
             headers,
@@ -7377,14 +7434,21 @@ fn metadata_candidate_error(headers: &HeaderMap, error: MetadataCandidateError) 
             headers,
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
-            "TMDb 搜索条件无效",
+            "刮削器搜索条件无效",
         )
         .into_response(),
         MetadataCandidateError::Tmdb(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "TMDb 暂时不可用，请稍后重试",
+            "刮削器暂时不可用，请稍后重试",
+        )
+        .into_response(),
+        MetadataCandidateError::Scraper(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "刮削器暂时不可用，请稍后重试",
         )
         .into_response(),
         MetadataCandidateError::Storage(_) => api_error(
@@ -7532,7 +7596,7 @@ async fn admin_update_plugin_config(
                     tmdb.set_api_key((!api_key.is_empty()).then_some(api_key))
                         .await;
                 }
-                plugins.restart_tmdb().await;
+                plugins.restart(&plugin_id).await;
             }
             record_audit_event(
                 &state,

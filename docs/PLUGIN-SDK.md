@@ -41,8 +41,9 @@ org.lux.tmdb-1.0.0.zip
   "supportedItemTypes": ["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
   "capabilities": [
     "metadata.search",
-    "metadata.details",
+    "metadata.get",
     "metadata.images",
+    "metadata.credits",
     "metadata.externalIds",
     "metadata.trailers"
   ],
@@ -89,6 +90,7 @@ LUX_PLUGIN_SIGNING_KEY_HEX=<32-byte-ed25519-private-key-hex> \\
 - `metadata.search`：返回 Emby 风格 `RemoteSearchResult` 列表。
 - `metadata.get`：返回 `MetadataResult<T>`。
 - `metadata.images`：返回 `RemoteImageInfo` 列表。
+- `metadata.credits`：返回演员/人物的 provider-neutral cast 列表。
 - `metadata.externalIds`：返回 `ProviderIds`。
 - `metadata.trailers`：返回预告片候选。
 - `plugin.shutdown`：请求插件优雅退出。
@@ -109,6 +111,26 @@ RemoteImageInfo
 ProviderIds
 ImageType
 ```
+
+### 刮削器调用约定
+
+媒体库保存的 `scraperId` 是插件的稳定 ID。Lux 不会根据插件名称或上游服务写死调用路径，所有
+媒体库级刮削都通过以下 provider-neutral 请求字段发送：
+
+```json
+{
+  "itemType": "Movie",
+  "name": "片名",
+  "year": 2019,
+  "language": "zh-CN",
+  "providerId": "provider-specific-id"
+}
+```
+
+搜索返回 `items`，详情返回 `metadata`，图片返回 `images`，演员返回 `cast`。`ProviderIds` 的
+值必须是字符串，键由插件定义（例如 `Tmdb`、`Douban`）；Lux 只把它当作不透明 ID 保存，不能
+假设是数字或 TMDb URL。图片必须返回完整 HTTPS `Url`，并声明 `Type`、语言和可选尺寸。
+插件缺少某种媒体类型或能力时，应返回 `PLUGIN_PROVIDER_NOT_FOUND`，不能伪造空的 TMDb 数据。
 
 ## 错误码
 

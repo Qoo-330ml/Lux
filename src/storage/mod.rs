@@ -522,6 +522,26 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_item_scraper_id(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(l.scraper_id, '')
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.id = ? AND mi.removed_at IS NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(value.filter(|value| !value.trim().is_empty()))
+    }
+
     pub(crate) async fn list_media_item_ids_for_library(
         &self,
         library_id: &str,
@@ -2766,7 +2786,7 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredMediaMetadata>, StorageError> {
         sqlx::query(
-            "SELECT title, original_title, overview, production_year,
+            "SELECT item_type, title, original_title, overview, production_year,
                     metadata_provenance_json, locked_fields_json
              FROM media_items WHERE id = ?",
         )
@@ -2775,6 +2795,7 @@ impl Database {
         .await
         .map(|row| {
             row.map(|row| StoredMediaMetadata {
+                item_type: row.get("item_type"),
                 title: row.get("title"),
                 original_title: row.get("original_title"),
                 overview: row.get("overview"),
@@ -2794,13 +2815,12 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredImageIdentity>, StorageError> {
         sqlx::query(
-            "SELECT mi.item_type,
-                    COALESCE(
-                        json_extract(mi.provider_ids_json, '$.tmdb'),
-                        json_extract(series.provider_ids_json, '$.tmdb')
-                    ) AS provider_id,
-                    mi.season_number, mi.episode_number
+            "SELECT mi.item_type, mi.provider_ids_json,
+                    series.provider_ids_json AS series_provider_ids_json,
+                    mi.season_number, mi.episode_number,
+                    l.scraper_id
              FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id
              LEFT JOIN media_items series
                ON series.id = COALESCE(mi.series_id, mi.parent_id)
              WHERE mi.id = ? AND mi.removed_at IS NULL",
@@ -2809,11 +2829,19 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| {
-            row.map(|row| StoredImageIdentity {
-                item_type: row.get("item_type"),
-                provider_id: row.get("provider_id"),
-                season_number: row.get("season_number"),
-                episode_number: row.get("episode_number"),
+            row.map(|row| {
+                let provider = first_provider_id(
+                    row.get("provider_ids_json"),
+                    row.get("series_provider_ids_json"),
+                    row.get::<Option<String>, _>("scraper_id").as_deref(),
+                );
+                StoredImageIdentity {
+                    item_type: row.get("item_type"),
+                    provider_name: provider.as_ref().map(|(name, _)| name.clone()),
+                    provider_id: provider.map(|(_, id)| id),
+                    season_number: row.get("season_number"),
+                    episode_number: row.get("episode_number"),
+                }
             })
         })
         .map_err(|source| StorageError::Sqlx {
@@ -2822,25 +2850,29 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_tmdb_movie_identity(
+    pub(crate) async fn find_movie_identity(
         &self,
         item_id: &str,
-    ) -> Result<Option<StoredTmdbMovieIdentity>, StorageError> {
+    ) -> Result<Option<StoredMovieIdentity>, StorageError> {
         sqlx::query(
-            "SELECT library_id,
-                    json_extract(provider_ids_json, '$.tmdb') AS provider_id
-             FROM media_items
-             WHERE id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
-               AND json_valid(provider_ids_json)
-               AND json_extract(provider_ids_json, '$.tmdb') IS NOT NULL",
+            "SELECT mi.library_id, mi.provider_ids_json, l.scraper_id
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id
+             WHERE mi.id = ? AND mi.item_type = 'MOVIE' AND mi.removed_at IS NULL",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
         .map(|row| {
-            row.map(|row| StoredTmdbMovieIdentity {
-                library_id: row.get("library_id"),
-                provider_id: row.get("provider_id"),
+            row.and_then(|row| {
+                let scraper_id = row.get::<Option<String>, _>("scraper_id");
+                let provider =
+                    first_provider_id(row.get("provider_ids_json"), None, scraper_id.as_deref())?;
+                Some(StoredMovieIdentity {
+                    library_id: row.get("library_id"),
+                    provider_name: provider.0,
+                    provider_id: provider.1,
+                })
             })
         })
         .map_err(|source| StorageError::Sqlx {
@@ -2849,12 +2881,13 @@ impl Database {
         })
     }
 
-    pub(crate) async fn upsert_tmdb_collection(
+    pub(crate) async fn upsert_collection(
         &self,
-        collection: NewTmdbCollection<'_>,
+        collection: NewCollection<'_>,
     ) -> Result<StoredCollectionRefresh, StorageError> {
-        let NewTmdbCollection {
+        let NewCollection {
             library_id,
+            provider,
             provider_id,
             title,
             overview,
@@ -2862,6 +2895,8 @@ impl Database {
             backdrop_path,
             member_provider_ids,
         } = collection;
+        let provider_name = provider.to_ascii_uppercase();
+        let provider_key = provider.to_ascii_lowercase();
         let mut transaction = self
             .pool
             .begin()
@@ -2873,9 +2908,10 @@ impl Database {
         let existing = sqlx::query(
             "SELECT id, item_id
              FROM collections
-             WHERE library_id = ? AND provider = 'TMDB' AND provider_id = ?",
+             WHERE library_id = ? AND lower(provider) = lower(?) AND provider_id = ?",
         )
         .bind(library_id)
+        .bind(provider)
         .bind(provider_id)
         .fetch_optional(&mut *transaction)
         .await
@@ -2888,8 +2924,11 @@ impl Database {
         } else {
             let collection_id = Uuid::now_v7().to_string();
             let item_id = Uuid::now_v7().to_string();
-            let identity_key = format!("collection:tmdb:{library_id}:{provider_id}");
-            let provider_ids_json = format!(r#"{{"tmdbCollection":"{provider_id}"}}"#);
+            let identity_key = format!("collection:{provider_key}:{library_id}:{provider_id}");
+            let provider_ids_json = serde_json::json!({
+                format!("{provider_key}Collection"): provider_id
+            })
+            .to_string();
             sqlx::query(
                 "INSERT INTO media_items (
                     id, library_id, item_type, title, sort_title, original_title,
@@ -2914,11 +2953,12 @@ impl Database {
                 "INSERT INTO collections (
                     id, item_id, library_id, provider, provider_id,
                     title, overview, poster_path, backdrop_path
-                ) VALUES (?, ?, ?, 'TMDB', ?, ?, ?, ?, ?)",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&collection_id)
             .bind(&item_id)
             .bind(library_id)
+            .bind(&provider_name)
             .bind(provider_id)
             .bind(title)
             .bind(overview)
@@ -2974,18 +3014,23 @@ impl Database {
                 source,
             })?;
         let mut member_count = 0_usize;
-        for (member_provider_id, sort_order) in member_provider_ids {
-            let member_provider_id = member_provider_id.to_string();
+        for (member_provider, member_provider_id, sort_order) in member_provider_ids {
             let Some(member_item_id) = sqlx::query_scalar::<_, String>(
-                "SELECT id
-                 FROM media_items
-                 WHERE library_id = ? AND item_type = 'MOVIE'
-                   AND removed_at IS NULL AND json_valid(provider_ids_json)
-                   AND json_extract(provider_ids_json, '$.tmdb') = ?
+                "SELECT mi.id
+                 FROM media_items mi
+                 JOIN json_each(
+                    CASE WHEN json_valid(mi.provider_ids_json)
+                         THEN mi.provider_ids_json ELSE '{}' END
+                 ) provider_id ON 1 = 1
+                 WHERE mi.library_id = ? AND mi.item_type = 'MOVIE'
+                   AND mi.removed_at IS NULL
+                   AND lower(provider_id.key) = lower(?)
+                   AND provider_id.value = ?
                  LIMIT 1",
             )
             .bind(library_id)
-            .bind(&member_provider_id)
+            .bind(member_provider)
+            .bind(member_provider_id)
             .fetch_optional(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -5180,29 +5225,25 @@ pub(crate) struct StoredMediaItem {
 }
 
 #[derive(Debug)]
-pub(crate) struct StoredTmdbMovieIdentity {
-    pub(crate) library_id: String,
-    pub(crate) provider_id: String,
-}
-
-#[derive(Debug)]
 pub(crate) struct StoredCollectionRefresh {
     pub(crate) collection_item_id: String,
     pub(crate) member_count: usize,
 }
 
-pub(crate) struct NewTmdbCollection<'a> {
+pub(crate) struct NewCollection<'a> {
     pub(crate) library_id: &'a str,
+    pub(crate) provider: &'a str,
     pub(crate) provider_id: &'a str,
     pub(crate) title: &'a str,
     pub(crate) overview: Option<&'a str>,
     pub(crate) poster_path: Option<&'a str>,
     pub(crate) backdrop_path: Option<&'a str>,
-    pub(crate) member_provider_ids: &'a [(i64, i64)],
+    pub(crate) member_provider_ids: &'a [(String, String, i64)],
 }
 
 #[derive(Debug)]
 pub(crate) struct StoredMediaMetadata {
+    pub(crate) item_type: String,
     pub(crate) title: String,
     pub(crate) original_title: Option<String>,
     pub(crate) overview: Option<String>,
@@ -5526,9 +5567,47 @@ pub(crate) struct StoredMediaSourcePath {
 #[derive(Debug)]
 pub(crate) struct StoredImageIdentity {
     pub(crate) item_type: String,
+    pub(crate) provider_name: Option<String>,
     pub(crate) provider_id: Option<String>,
     pub(crate) season_number: Option<i64>,
     pub(crate) episode_number: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredMovieIdentity {
+    pub(crate) library_id: String,
+    pub(crate) provider_name: String,
+    pub(crate) provider_id: String,
+}
+
+fn first_provider_id(
+    primary: Option<String>,
+    secondary: Option<String>,
+    preferred: Option<&str>,
+) -> Option<(String, String)> {
+    let providers = [primary, secondary]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw).ok()
+        })
+        .flat_map(|object| object.into_iter())
+        .filter_map(|(name, value)| {
+            let id = value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_i64().map(|value| value.to_string()))?;
+            (!name.trim().is_empty() && !id.trim().is_empty()).then_some((name, id))
+        })
+        .collect::<Vec<_>>();
+    preferred
+        .and_then(|preferred| {
+            providers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(preferred))
+                .cloned()
+        })
+        .or_else(|| providers.into_iter().next())
 }
 
 #[derive(Debug)]

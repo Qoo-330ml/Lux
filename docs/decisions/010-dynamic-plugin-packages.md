@@ -25,7 +25,7 @@ Lux 在 `/config/plugins` 扫描 `.zip` 或开发用解压目录。包不会因�
 
 插件默认以独立子进程运行。Lux 负责启动、stdin/stdout RPC 通信、超时、取消、健康检查、崩溃记录和重启；插件不能获得 Lux SQLite、内部任务对象或媒体根目录的直接引用。插件使用声明的能力访问网络和自己的缓存目录，元数据写回、图片下载和 Emby API 输出由 Lux 完成。
 
-协议采用 JSON-RPC 风格的请求 ID 和稳定错误码，方法包括 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。协议的公开数据模型使用 Emby 风格名字，包括 `BaseItem`、`Movie`、`Series`、`Season`、`Episode`、`Person`、`BoxSet`、`MetadataResult`、`RemoteSearchResult`、`RemoteImageInfo`、`ProviderIds` 和 `ImageType`；Lux 内部仍保留独立领域模型。
+协议采用 JSON-RPC 风格的请求 ID 和稳定错误码，方法包括 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.credits`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。协议的公开数据模型使用 Emby 风格名字，包括 `BaseItem`、`Movie`、`Series`、`Season`、`Episode`、`Person`、`BoxSet`、`MetadataResult`、`RemoteSearchResult`、`RemoteImageInfo`、`ProviderIds` 和 `ImageType`；`ProviderIds` 值是 provider-neutral 的不透明字符串，图片使用插件返回的完整 HTTPS URL，Lux 内部仍保留独立领域模型。
 
 ### TMDb
 

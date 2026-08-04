@@ -50,8 +50,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "supportedItemTypes": ["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
         "capabilities": [
             "metadata.search",
-            "metadata.details",
+            "metadata.get",
             "metadata.images",
+            "metadata.credits",
             "metadata.externalIds",
             "metadata.trailers"
         ],

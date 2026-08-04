@@ -159,42 +159,49 @@ impl PluginService {
         method: &str,
         params: Value,
     ) -> Result<Value, PluginServiceError> {
-        self.ensure_known_plugin(plugin_id)?;
-        if plugin_id == TMDB_PLUGIN_ID {
-            return Err(PluginServiceError::Unavailable(plugin_id.to_owned()));
-        }
+        let plugin_id = self.canonical_plugin_id(plugin_id);
+        self.ensure_known_plugin(&plugin_id)?;
         self.supervisor
-            .call(plugin_id, method, params)
+            .call(&plugin_id, method, params)
             .await
             .map_err(PluginServiceError::Runtime)
     }
 
-    pub async fn call_tmdb(
+    /// Calls a scraper by its persisted ID. The method is intentionally
+    /// provider-neutral; a plugin selected by a library owns the upstream
+    /// request details and the Lux process only speaks the scraper RPC.
+    pub async fn call_scraper(
         &self,
+        scraper_id: &str,
         method: &str,
         params: Value,
     ) -> Result<Value, PluginServiceError> {
-        let plugin = self
-            .catalog
-            .get(TMDB_DYNAMIC_PLUGIN_ID)
-            .ok_or_else(|| PluginServiceError::Unavailable(TMDB_DYNAMIC_PLUGIN_ID.to_owned()))?;
-        let installed = self
-            .database
-            .is_plugin_installed(TMDB_DYNAMIC_PLUGIN_ID)
-            .await?;
-        if !self.dynamic_view(plugin, installed).await.available {
-            return Err(PluginServiceError::Unavailable(
-                TMDB_DYNAMIC_PLUGIN_ID.to_owned(),
-            ));
-        }
-        self.supervisor
-            .call(TMDB_DYNAMIC_PLUGIN_ID, method, params)
-            .await
-            .map_err(PluginServiceError::Runtime)
+        self.call(scraper_id, method, params).await
     }
 
-    pub async fn restart_tmdb(&self) {
-        self.supervisor.stop(TMDB_DYNAMIC_PLUGIN_ID).await;
+    pub async fn scraper_client(
+        &self,
+        scraper_id: &str,
+    ) -> Result<crate::application::scraper::ScraperPluginClient, PluginServiceError> {
+        let plugin_id = self.canonical_plugin_id(scraper_id);
+        self.ensure_known_plugin(&plugin_id)?;
+        if plugin_id == TMDB_PLUGIN_ID {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        let installed = self.database.is_plugin_installed(&plugin_id).await?;
+        let view = self.view_for_id(&plugin_id, installed).await?;
+        if !view.available {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        Ok(crate::application::scraper::ScraperPluginClient::new(
+            self.clone(),
+            plugin_id,
+        ))
+    }
+
+    pub async fn restart(&self, plugin_id: &str) {
+        let plugin_id = self.canonical_plugin_id(plugin_id);
+        self.supervisor.stop(&plugin_id).await;
     }
 
     pub async fn stop_all(&self) {
@@ -270,6 +277,14 @@ impl PluginService {
             Ok(())
         } else {
             Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()))
+        }
+    }
+
+    fn canonical_plugin_id(&self, plugin_id: &str) -> String {
+        if plugin_id == TMDB_PLUGIN_ID && self.catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some() {
+            TMDB_DYNAMIC_PLUGIN_ID.to_owned()
+        } else {
+            plugin_id.trim().to_owned()
         }
     }
 
@@ -395,8 +410,9 @@ fn legacy_tmdb_view(installed: bool, config_source: &str) -> PluginView {
         runtime: Some("built-in".to_owned()),
         capabilities: vec![
             "metadata.search".to_owned(),
-            "metadata.details".to_owned(),
+            "metadata.get".to_owned(),
             "metadata.images".to_owned(),
+            "metadata.credits".to_owned(),
             "metadata.externalIds".to_owned(),
             "metadata.trailers".to_owned(),
         ],

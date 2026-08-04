@@ -15,7 +15,10 @@ use uuid::Uuid;
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
     application::{
-        tmdb::{TmdbError, TmdbImageReference, TmdbImagesResponse},
+        scraper::{
+            ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperResolver,
+        },
+        tmdb::TmdbError,
         tmdb_plugin::TmdbProvider,
     },
     storage::{Database, StorageError},
@@ -79,7 +82,22 @@ impl ImageWriteService {
         if self.local_image_exists(item_id, image_type).await? {
             return Ok(None);
         }
-        self.download_item_image(item_id, image_type, image_url)
+        self.download_item_image_with_source(item_id, image_type, image_url, "TMDB")
+            .await
+            .map(Some)
+    }
+
+    pub(crate) async fn download_item_image_if_missing_from_scraper(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
+        if self.local_image_exists(item_id, image_type).await? {
+            return Ok(None);
+        }
+        self.download_item_image_from_scraper(item_id, image_type, image_url, source)
             .await
             .map(Some)
     }
@@ -160,6 +178,17 @@ impl ImageWriteService {
         item_id: &str,
         image_type: &str,
         image_url: &str,
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        self.download_item_image_with_source(item_id, image_type, image_url, "TMDB")
+            .await
+    }
+
+    async fn download_item_image_impl(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
@@ -252,7 +281,7 @@ impl ImageWriteService {
                 &target,
                 file_size,
                 &content_tag,
-                "TMDB",
+                source,
             )
             .await?;
         Ok(ImageWriteReport {
@@ -276,7 +305,56 @@ impl ImageWriteService {
                 "selected image URL must be an HTTPS TMDb image path".to_owned(),
             ));
         }
-        self.download_item_image(item_id, image_type, image_url)
+        self.download_item_image_with_source(item_id, image_type, image_url, "TMDB")
+            .await
+    }
+
+    pub async fn download_item_image_from_scraper_candidate(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        if !is_allowed_scraper_image_url(image_url) {
+            return Err(ImageWriteError::InvalidUrl(
+                "selected image URL must be a valid HTTPS scraper image URL".to_owned(),
+            ));
+        }
+        let source = self
+            .database
+            .find_media_item_image_identity(item_id)
+            .await?
+            .and_then(|identity| identity.provider_name)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "SCRAPER".to_owned());
+        self.download_item_image_with_source(item_id, image_type, image_url, &source)
+            .await
+    }
+
+    pub(crate) async fn download_item_image_from_scraper(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        if !source.eq_ignore_ascii_case("TMDB") && !is_allowed_scraper_image_url(image_url) {
+            return Err(ImageWriteError::InvalidUrl(
+                "scraper image URL must be a valid HTTPS URL".to_owned(),
+            ));
+        }
+        self.download_item_image_with_source(item_id, image_type, image_url, source)
+            .await
+    }
+
+    async fn download_item_image_with_source(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        self.download_item_image_impl(item_id, image_type, image_url, source)
             .await
     }
 
@@ -313,6 +391,7 @@ impl ImageWriteService {
 pub struct ImageCandidateService {
     database: Database,
     tmdb: TmdbProvider,
+    resolver: Option<ScraperResolver>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -335,6 +414,18 @@ impl ImageCandidateService {
         Self {
             database,
             tmdb: tmdb.into(),
+            resolver: None,
+        }
+    }
+
+    pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
+    where
+        T: Into<TmdbProvider>,
+    {
+        Self {
+            database,
+            tmdb: tmdb.into(),
+            resolver: Some(resolver),
         }
     }
 
@@ -347,8 +438,8 @@ impl ImageCandidateService {
     ) -> Result<Vec<ImageCandidate>, ImageCandidateError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageCandidateError::InvalidImageType(image_type.to_owned()))?;
-        let source = source.unwrap_or("TMDB").trim();
-        if !source.is_empty() && !source.eq_ignore_ascii_case("TMDB") {
+        let source = source.map(str::trim).filter(|value| !value.is_empty());
+        if source.is_some_and(|value| value.chars().count() > 64) {
             return Err(ImageCandidateError::InvalidSource);
         }
         let language = language.unwrap_or_default().trim();
@@ -362,81 +453,104 @@ impl ImageCandidateService {
             .ok_or(ImageCandidateError::ItemNotFound)?;
         let provider_id = identity
             .provider_id
-            .as_deref()
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|value| *value > 0)
+            .clone()
+            .filter(|value| !value.trim().is_empty())
             .ok_or(ImageCandidateError::ItemNotIdentified)?;
         let request_language = if language.is_empty() {
             "en-US"
         } else {
             language
         };
-        let images = match identity.item_type.as_str() {
-            "MOVIE" => {
-                self.tmdb
-                    .movie_images(provider_id, request_language)
-                    .await?
-            }
-            "SERIES" => self.tmdb.tv_images(provider_id, request_language).await?,
-            "SEASON" => {
-                self.tmdb
-                    .season_images(
-                        provider_id,
-                        i32::try_from(identity.season_number.unwrap_or_default())
-                            .map_err(|_| ImageCandidateError::InvalidItem)?,
-                        request_language,
-                    )
-                    .await?
-            }
-            "EPISODE" => {
-                self.tmdb
-                    .episode_images(
-                        provider_id,
-                        i32::try_from(identity.season_number.unwrap_or_default())
-                            .map_err(|_| ImageCandidateError::InvalidItem)?,
-                        i32::try_from(identity.episode_number.unwrap_or_default())
-                            .map_err(|_| ImageCandidateError::InvalidItem)?,
-                        request_language,
-                    )
-                    .await?
-            }
+        let item_type = match identity.item_type.as_str() {
+            "MOVIE" => ScraperItemType::Movie,
+            "SERIES" => ScraperItemType::Series,
+            "SEASON" => ScraperItemType::Season,
+            "EPISODE" => ScraperItemType::Episode,
             _ => return Ok(Vec::new()),
         };
-        let references = references_for_type(&images, image_type);
+        let tmdb = self.provider_for_item(item_id).await?;
+        let mut image_request = ScraperImageRequest::new(item_type, provider_id, request_language);
+        image_request.season_number = identity
+            .season_number
+            .map(|value| i32::try_from(value).map_err(|_| ImageCandidateError::InvalidItem))
+            .transpose()?;
+        image_request.episode_number = identity
+            .episode_number
+            .map(|value| i32::try_from(value).map_err(|_| ImageCandidateError::InvalidItem))
+            .transpose()?;
+        let images = tmdb
+            .images_generic(image_request)
+            .await
+            .map_err(ImageCandidateError::Scraper)?
+            .images;
         let requested_language = language.split('-').next().filter(|value| !value.is_empty());
-        Ok(references
+        Ok(images
             .into_iter()
             .enumerate()
+            .filter(|(_, image)| matches_image_type(image, image_type))
+            .filter(|(_, image)| {
+                source.is_none_or(|source| {
+                    image
+                        .provider_name
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(source))
+                })
+            })
             .filter(|(_, image)| {
                 requested_language.is_none()
                     || image
-                        .iso_639_1
+                        .language
                         .as_deref()
                         .is_some_and(|value| Some(value) == requested_language)
             })
-            .filter_map(|(index, image)| {
-                let path = image.file_path.as_deref()?.trim();
-                (!path.is_empty()).then(|| ImageCandidate {
-                    id: format!("tmdb-{image_type}-{index}-{path}"),
+            .map(|(index, image)| {
+                let provider_name = image
+                    .provider_name
+                    .clone()
+                    .or_else(|| identity.provider_name.clone())
+                    .unwrap_or_else(|| "SCRAPER".to_owned());
+                ImageCandidate {
+                    id: format!(
+                        "{}-{image_type}-{index}",
+                        provider_name.to_ascii_lowercase()
+                    ),
                     image_type: image_type.to_owned(),
                     image_index: i64::try_from(index).unwrap_or_default(),
-                    language: image.iso_639_1.clone(),
+                    language: image.language,
                     width: image.width,
                     height: image.height,
-                    source: "TMDB".to_owned(),
-                    url: format!("https://image.tmdb.org/t/p/w780{path}"),
-                })
+                    source: provider_name,
+                    url: image.url,
+                }
             })
             .take(50)
             .collect())
     }
+
+    async fn provider_for_item(&self, item_id: &str) -> Result<TmdbProvider, ImageCandidateError> {
+        let Some(resolver) = &self.resolver else {
+            return Ok(self.tmdb.clone());
+        };
+        resolver
+            .for_item(item_id)
+            .await
+            .map_err(ImageCandidateError::Scraper)
+            .map(|client| {
+                client
+                    .map(TmdbProvider::from_scraper)
+                    .unwrap_or_else(|| self.tmdb.clone())
+            })
+    }
 }
 
-fn references_for_type(images: &TmdbImagesResponse, image_type: &str) -> Vec<TmdbImageReference> {
+fn matches_image_type(image: &ScraperImage, image_type: &str) -> bool {
     match image_type {
-        "POSTER" | "DISC" => images.posters.clone(),
-        "LOGO" => images.logos.clone(),
-        _ => images.backdrops.clone(),
+        "POSTER" | "DISC" => matches!(image.image_type.as_str(), "Primary" | "Poster" | "POSTER"),
+        "LOGO" => matches!(image.image_type.as_str(), "Logo" | "LOGO"),
+        "FANART" | "THUMB" | "BANNER" | "ART" | "WALLPAPER" => {
+            matches!(image.image_type.as_str(), "Backdrop" | "Fanart" | "FANART")
+        }
+        _ => false,
     }
 }
 
@@ -449,6 +563,7 @@ pub enum ImageCandidateError {
     InvalidLanguage,
     InvalidSource,
     Tmdb(TmdbError),
+    Scraper(ScraperError),
     Storage(StorageError),
 }
 
@@ -462,6 +577,7 @@ impl fmt::Display for ImageCandidateError {
             Self::InvalidLanguage => formatter.write_str("image language is invalid"),
             Self::InvalidSource => formatter.write_str("unsupported image source"),
             Self::Tmdb(error) => error.fmt(formatter),
+            Self::Scraper(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -1061,9 +1177,23 @@ fn is_allowed_tmdb_image_url(value: &str) -> bool {
         && url.fragment().is_none()
 }
 
+fn is_allowed_scraper_image_url(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    url.scheme().eq_ignore_ascii_case("https")
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && !url.path().is_empty()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_allowed_tmdb_image_url;
+    use super::{is_allowed_scraper_image_url, is_allowed_tmdb_image_url};
 
     #[test]
     fn selected_image_urls_are_limited_to_tmdb_image_paths() {
@@ -1078,6 +1208,22 @@ mod tests {
         ));
         assert!(!is_allowed_tmdb_image_url(
             "https://example.com/t/p/w780/poster.jpg"
+        ));
+    }
+
+    #[test]
+    fn scraper_image_urls_accept_any_safe_https_host() {
+        assert!(is_allowed_scraper_image_url(
+            "https://img.douban.example/poster.jpg"
+        ));
+        assert!(!is_allowed_scraper_image_url(
+            "http://img.douban.example/poster.jpg"
+        ));
+        assert!(!is_allowed_scraper_image_url(
+            "https://img.douban.example/poster.jpg?redirect=http://127.0.0.1"
+        ));
+        assert!(!is_allowed_scraper_image_url(
+            "https://user:pass@img.douban.example/poster.jpg"
         ));
     }
 }
