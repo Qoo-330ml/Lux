@@ -466,6 +466,8 @@ async fn admin_can_update_independent_library_schedules_without_restart()
             "banner": false,
             "logo": true,
             "thumbnail": false,
+            "disc": true,
+            "wallpaper": false,
             "maxBackdropCount": 3,
             "minDownloadWidth": 1920
         },
@@ -492,6 +494,10 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     assert_eq!(
         strategy_body["library"]["mediaStrategy"]["images"]["maxBackdropCount"],
         3
+    );
+    assert_eq!(
+        strategy_body["library"]["mediaStrategy"]["images"]["disc"],
+        true
     );
 
     let listed = client

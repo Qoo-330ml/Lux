@@ -46,7 +46,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
 - `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
-- `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）、`resumeMinTicks`（非负）和 `mediaStrategy`。媒体策略包含元数据/图片语言、地区、默认刮削器、图像类型开关、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。写操作需要管理员 Web session 和 CSRF；响应不包含任何插件凭据。
+- `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）、`resumeMinTicks`（非负）和 `mediaStrategy`。媒体策略的图像开关为 `poster`、`logo`、`thumbnail`、`banner`、`disc`、`artwork`、`wallpaper`，另有元数据/图片语言、地区、默认刮削器、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。旧策略 JSON 缺少新增开关时按 `false` 处理；写操作需要管理员 Web session 和 CSRF，响应不包含任何插件凭据。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、配置目录实际写入能力、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，支持 `page`、`pageSize`、`level` 和 `eventCode` 筛选。
 
@@ -68,7 +68,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/metadata/pending?page=1&pageSize=50`：管理员分页查看 pending 候选；页大小限制为 1-100。
 - `GET /api/v1/admin/items/{itemId}/identify/candidates?q=关键词&page=1&pageSize=50`：管理员按 provider ID 或候选 JSON 搜索指定条目的 pending 候选，并返回 `fieldDiffs` 预览。
 - `POST /api/v1/admin/items/{itemId}/identify/candidates`：管理员发送 `{ "query": "标题", "year": 2020 }` 搜索 TMDb；最多写入 20 个带 24 小时过期时间的 pending 候选，并返回当前条目的候选页。需要 `X-CSRF-Token`；TMDb 无可用凭据时返回服务不可用，TMDb 请求失败不会改变本地条目。
-- `POST /api/v1/admin/items/{itemId}/identify/candidates/{candidateId}/select`：管理员选择候选并发送 `{ "mode": "fillMissing" }` 或 `{ "mode": "refreshUnlocked" }`，需要 `X-CSRF-Token`。前者只补空元数据字段和缺失图片，后者刷新未锁定字段和图片；NFO/图片写回全部成功后才返回 `ONLINE_CONFIRMED`，失败返回可重试错误且候选保持 pending。
+- `POST /api/v1/admin/items/{itemId}/identify/candidates/{candidateId}/select`：管理员选择候选并发送 `{ "mode": "fillMissing" }` 或 `{ "mode": "refreshUnlocked" }`，需要 `X-CSRF-Token`。前者只补空元数据字段和缺失图片，后者刷新未锁定字段和图片；候选中的每类图片只使用第一张，所属媒体库未启用的类型不写回，找不到的类型跳过；NFO/图片写回全部成功后才返回 `ONLINE_CONFIRMED`，失败返回可重试错误且候选保持 pending。
 - `POST /api/v1/admin/metadata/reidentify`：管理员发送 `{ "itemIds": ["..."] }` 创建批量重新识别任务；条目去重后限制为 1-100 个，任务持久化为 `QUEUED/RUNNING/COMPLETED/FAILED`，需要 `X-CSRF-Token`。
 - `GET /api/v1/admin/metadata/reidentify/{jobId}`：管理员读取批量重新识别任务及逐条状态、候选数量和稳定错误代码；前端可按任务 ID 轮询。
 - `POST /api/v1/admin/metadata/reidentify/{jobId}`：管理员对 `FAILED` 任务重新排队失败条目，保留已经成功的条目，需要 `X-CSRF-Token`；非失败任务返回冲突。

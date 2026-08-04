@@ -50,6 +50,8 @@ describe("AdminLibrariesPage library cards", () => {
           banner: false,
           logo: true,
           thumbnail: true,
+          disc: false,
+          wallpaper: false,
           maxBackdropCount: 1,
           minDownloadWidth: 1280,
         },
@@ -137,6 +139,8 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(container.textContent).toContain("全局策略");
     expect(container.textContent).toContain("图像抓取");
+    expect(container.textContent).toContain("光盘封面");
+    expect(container.textContent).toContain("壁纸");
     expect(container.textContent).toContain("最小下载宽度");
     expect(container.textContent).toContain("字幕默认值");
     expect(container.textContent).toContain("存储预估");
@@ -152,7 +156,7 @@ describe("AdminLibrariesPage library cards", () => {
         region: "CN",
         scraperId: null,
         applyScope: "NEW_CONTENT",
-        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, maxBackdropCount: 1, minDownloadWidth: 1280 },
+        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, disc: false, wallpaper: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
       },
     });

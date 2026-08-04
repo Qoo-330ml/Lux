@@ -4911,6 +4911,10 @@ struct MediaImageStrategySettings {
     banner: bool,
     logo: bool,
     thumbnail: bool,
+    #[serde(default)]
+    disc: bool,
+    #[serde(default)]
+    wallpaper: bool,
     max_backdrop_count: i64,
     min_download_width: i64,
 }
@@ -4938,6 +4942,8 @@ impl Default for MediaStrategySettings {
                 banner: false,
                 logo: true,
                 thumbnail: true,
+                disc: false,
+                wallpaper: false,
                 max_backdrop_count: 1,
                 min_download_width: 1280,
             },
@@ -7672,15 +7678,17 @@ fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
         "incrementalSchedule": library.incremental_schedule,
         "reconciliationSchedule": library.reconciliation_schedule,
         "metadataSchedule": library.metadata_schedule,
-        "mediaStrategy": library
-            .media_strategy_json
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok()),
+        "mediaStrategy": library_media_strategy_json(library.media_strategy_json.as_deref()),
         "scanConcurrency": library.scan_concurrency,
         "probeConcurrency": library.probe_concurrency,
         "lastScanAt": library.last_scan_at,
         "roots": roots.iter().map(root_json).collect::<Vec<_>>(),
     })
+}
+
+fn library_media_strategy_json(value: Option<&str>) -> Option<Value> {
+    let strategy = serde_json::from_str::<MediaStrategySettings>(value?).ok()?;
+    serde_json::to_value(strategy).ok()
 }
 
 fn library_cover_url(library: &LibraryRecord) -> Option<String> {

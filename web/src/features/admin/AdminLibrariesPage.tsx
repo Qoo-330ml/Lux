@@ -192,6 +192,8 @@ function GlobalStrategyPanel({
             <StrategyToggle label="横幅图" description="宽屏入口和合集" checked={strategy.images.banner} onChange={(checked) => updateImages("banner", checked)} />
             <StrategyToggle label="徽标" description="透明标题标识" checked={strategy.images.logo} onChange={(checked) => updateImages("logo", checked)} />
             <StrategyToggle label="缩略图" description="剧集和快速浏览" checked={strategy.images.thumbnail} onChange={(checked) => updateImages("thumbnail", checked)} />
+            <StrategyToggle label="光盘封面" description="光盘样式封面图" checked={strategy.images.disc} onChange={(checked) => updateImages("disc", checked)} />
+            <StrategyToggle label="壁纸" description="全屏背景和详情页" checked={strategy.images.wallpaper} onChange={(checked) => updateImages("wallpaper", checked)} />
           </div>
           <div className="lux-library-strategy-form-grid lux-library-strategy-image-limits">
             <label>每项最大背景图数量<input type="number" min="0" max="20" value={strategy.images.maxBackdropCount} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))} /></label>
@@ -233,8 +235,8 @@ function StrategySelect({ label, value, options, onChange }: { label: string; va
 }
 
 function estimateStrategyStorage(strategy: MediaStrategySettings) {
-  const enabledTypes = [strategy.images.poster, strategy.images.artwork, strategy.images.banner, strategy.images.logo, strategy.images.thumbnail].filter(Boolean).length;
-  const extraBackdrops = strategy.images.artwork || strategy.images.banner ? Math.max(0, strategy.images.maxBackdropCount - 1) : 0;
+  const enabledTypes = [strategy.images.poster, strategy.images.artwork, strategy.images.banner, strategy.images.logo, strategy.images.thumbnail, strategy.images.disc, strategy.images.wallpaper].filter(Boolean).length;
+  const extraBackdrops = strategy.images.artwork || strategy.images.banner || strategy.images.wallpaper ? Math.max(0, strategy.images.maxBackdropCount - 1) : 0;
   const imagesPerItem = enabledTypes + extraBackdrops;
   return { imagesPerItem, storage: `${Math.max(0.1, imagesPerItem * 1.8).toFixed(1)} GB` };
 }
@@ -367,6 +369,8 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
         <StrategyToggle label="横幅图" checked={draft.images.banner} onChange={(checked) => updateImages("banner", checked)} />
         <StrategyToggle label="徽标" checked={draft.images.logo} onChange={(checked) => updateImages("logo", checked)} />
         <StrategyToggle label="缩略图" checked={draft.images.thumbnail} onChange={(checked) => updateImages("thumbnail", checked)} />
+        <StrategyToggle label="光盘封面" checked={draft.images.disc} onChange={(checked) => updateImages("disc", checked)} />
+        <StrategyToggle label="壁纸" checked={draft.images.wallpaper} onChange={(checked) => updateImages("wallpaper", checked)} />
       </div>
       <div className="lux-library-override-fields">
         <StrategySelect label="元数据语言" value={draft.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"], ["ja-JP", "日本語"]]} onChange={(value) => setDraft((current) => ({ ...current, metadataLanguage: value }))} />

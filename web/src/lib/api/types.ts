@@ -279,6 +279,8 @@ export type MediaImageStrategySettings = {
   banner: boolean;
   logo: boolean;
   thumbnail: boolean;
+  disc: boolean;
+  wallpaper: boolean;
   maxBackdropCount: number;
   minDownloadWidth: number;
 };

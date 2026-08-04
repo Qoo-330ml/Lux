@@ -136,6 +136,10 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         default_settings_body["mediaStrategy"]["images"]["minDownloadWidth"],
         1280
     );
+    assert_eq!(
+        default_settings_body["mediaStrategy"]["images"]["disc"],
+        false
+    );
 
     let media_strategy = json!({
         "metadataLanguage": "en-US",
@@ -149,6 +153,8 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
             "banner": true,
             "logo": false,
             "thumbnail": false,
+            "disc": false,
+            "wallpaper": true,
             "maxBackdropCount": 2,
             "minDownloadWidth": 1920
         },
