@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${TMDB_PLUGIN_VERSION:-1.0.0}"
-KEY_ID="${LUX_PLUGIN_KEY_ID:-lux-official}"
 
 case "$(uname -s)" in
   Darwin) PLATFORM="darwin" ;;
@@ -29,7 +28,6 @@ cargo run --locked --bin lux-plugin-pack -- \
   --output "$OUTPUT" \
   --version "$VERSION" \
   --platform "$PLATFORM" \
-  --arch "$ARCH" \
-  --key-id "$KEY_ID"
+  --arch "$ARCH"
 
 echo "created $OUTPUT"

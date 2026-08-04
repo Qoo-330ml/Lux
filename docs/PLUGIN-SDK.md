@@ -17,7 +17,7 @@ org.lux.tmdb-1.0.0.zip
 │   ├── darwin-arm64/lux-plugin-tmdb
 │   └── windows-x86_64/lux-plugin-tmdb.exe
 ├── assets/icon.png
-└── signature.json       # 可选
+└── signature.json       # 仅历史包兼容
 ```
 
 开发时可以把同样的内容解压为 `/config/plugins/org.lux.tmdb/`。生产包的入口必须是 manifest 中的相对路径，禁止绝对路径和 `..` 路径。
@@ -58,9 +58,9 @@ org.lux.tmdb-1.0.0.zip
 
 `formatVersion` 是包格式；`apiVersion` 是 RPC 契约；`version` 是插件自身版本。三者不能混用。
 
-Lux 不再要求插件包使用 Lux Ed25519 签名。签名字段和 `signature.json` 保留为可选的兼容字段，
-不会作为插件发现或启动的阻断条件。插件仍必须通过 ZIP 大小、文件数量、路径、manifest、格式
-版本、协议版本、平台入口和声明文件 SHA-256 校验；插件继续在独立进程中运行。
+Lux 不再要求插件包使用 Lux Ed25519 签名。运行时仅兼容读取历史签名字段，签名不会作为插件发现
+或启动的阻断条件；当前打包器始终只生成普通包。插件仍必须通过 ZIP 大小、文件数量、路径、
+manifest、格式版本、协议版本、平台入口和声明文件 SHA-256 校验；插件继续在独立进程中运行。
 
 构建 TMDb 包：
 
@@ -68,9 +68,8 @@ Lux 不再要求插件包使用 Lux Ed25519 签名。签名字段和 `signature.
 ./scripts/package-tmdb-plugin.sh
 ```
 
-脚本输出 `org.lux.tmdb-<version>.zip`，包含 `manifest.json` 和当前平台的
-`binaries/<platform>-<arch>/lux-plugin-tmdb`。如设置 `LUX_PLUGIN_SIGNING_KEY_HEX`，才会额外写入
-签名字段和 `signature.json`。插件目录只在 Lux 重启时扫描，升级包后需要重启。
+脚本输出 `org.lux.tmdb-<version>.zip`，只包含 `manifest.json` 和当前平台的
+`binaries/<platform>-<arch>/lux-plugin-tmdb`。插件目录只在 Lux 重启时扫描，升级包后需要重启。
 
 ## RPC 方法
 

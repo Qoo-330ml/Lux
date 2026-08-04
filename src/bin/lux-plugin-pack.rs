@@ -5,9 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use ed25519_dalek::{Signer, SigningKey};
-use luxd::application::plugin_protocol::{PluginManifest, PluginSignature};
+use luxd::application::plugin_protocol::PluginManifest;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use zip::{ZipWriter, write::SimpleFileOptions};
@@ -18,7 +16,6 @@ struct Arguments {
     version: String,
     platform: String,
     arch: String,
-    key_id: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         arguments.platform, arguments.arch, binary_name
     );
     let file_hash = format!("{:x}", Sha256::digest(&binary));
-    let mut manifest = PluginManifest::from_value(json!({
+    let manifest = PluginManifest::from_value(json!({
         "formatVersion": 1,
         "id": "org.lux.tmdb",
         "name": "TMDb 元数据插件",
@@ -70,17 +67,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         "files": [{"path": relative_binary, "sha256": file_hash}]
     }))?;
-    if let Ok(signing_key_hex) = env::var("LUX_PLUGIN_SIGNING_KEY_HEX") {
-        let signing_key = parse_signing_key(&signing_key_hex)?;
-        let signature = signing_key.sign(&manifest.signing_payload()?);
-        manifest.signature = Some(PluginSignature {
-            algorithm: "ed25519".to_owned(),
-            key_id: arguments
-                .key_id
-                .unwrap_or_else(|| "lux-official".to_owned()),
-            value: BASE64.encode(signature.to_bytes()),
-        });
-    }
     write_archive(&arguments.output, &relative_binary, &binary, &manifest)?;
     Ok(())
 }
@@ -92,7 +78,6 @@ impl Arguments {
         let mut version = None;
         let mut platform = None;
         let mut arch = None;
-        let mut key_id = None;
         while let Some(flag) = values.next() {
             let target = match flag.as_str() {
                 "--binary" => &mut binary,
@@ -100,7 +85,6 @@ impl Arguments {
                 "--version" => &mut version,
                 "--platform" => &mut platform,
                 "--arch" => &mut arch,
-                "--key-id" => &mut key_id,
                 "--help" => return Err(usage().into()),
                 unknown => return Err(format!("unknown argument: {unknown}\n{}", usage()).into()),
             };
@@ -116,7 +100,6 @@ impl Arguments {
             version: required(version, "--version")?,
             platform: required(platform, "--platform")?,
             arch: required(arch, "--arch")?,
-            key_id,
         })
     }
 }
@@ -126,28 +109,7 @@ fn required(value: Option<String>, name: &str) -> Result<String, Box<dyn std::er
 }
 
 fn usage() -> &'static str {
-    "usage: lux-plugin-pack --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME [--key-id ID] (optional private key from LUX_PLUGIN_SIGNING_KEY_HEX)"
-}
-
-fn parse_signing_key(value: &str) -> Result<SigningKey, Box<dyn std::error::Error>> {
-    let bytes = decode_hex(value)?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| "signing key must contain exactly 32 bytes")?;
-    Ok(SigningKey::from_bytes(&bytes))
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if value.len() % 2 != 0 {
-        return Err("signing key hex must have an even length".into());
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&value[index..index + 2], 16)
-                .map_err(|error| format!("invalid signing key hex: {error}").into())
-        })
-        .collect()
+    "usage: lux-plugin-pack --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME"
 }
 
 fn write_archive(
@@ -164,10 +126,6 @@ fn write_archive(
     let options = SimpleFileOptions::default();
     archive.start_file("manifest.json", options)?;
     archive.write_all(&serde_json::to_vec_pretty(manifest)?)?;
-    if let Some(signature) = &manifest.signature {
-        archive.start_file("signature.json", options)?;
-        archive.write_all(&serde_json::to_vec_pretty(signature)?)?;
-    }
     archive.start_file(relative_binary, options)?;
     archive.write_all(binary)?;
     archive.finish()?;

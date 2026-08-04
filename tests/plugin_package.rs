@@ -1,26 +1,16 @@
 use std::{fs, process::Command};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use ed25519_dalek::SigningKey;
 use luxd::application::plugin_runtime::PluginCatalog;
-use serde_json::json;
 use tempfile::tempdir;
 use zip::ZipArchive;
 
 #[test]
-fn packages_a_signed_tmdb_zip_for_backward_compatibility() -> Result<(), Box<dyn std::error::Error>>
-{
+fn packages_an_unsigned_tmdb_zip_even_when_a_signing_key_is_configured()
+-> Result<(), Box<dyn std::error::Error>> {
     let root = tempdir()?;
     let binary = root.path().join("lux-plugin-tmdb");
     let archive = root.path().join("org.lux.tmdb-1.0.0.zip");
-    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
     fs::write(&binary, b"standalone plugin binary")?;
-    fs::write(
-        root.path().join("trusted_keys.json"),
-        serde_json::to_vec(&json!({
-            "test": BASE64.encode(signing_key.verifying_key().to_bytes())
-        }))?,
-    )?;
 
     let packer = std::env::var("CARGO_BIN_EXE_lux-plugin-pack")
         .or_else(|_| std::env::var("CARGO_BIN_EXE_lux_plugin_pack"))?;
@@ -38,11 +28,12 @@ fn packages_a_signed_tmdb_zip_for_backward_compatibility() -> Result<(), Box<dyn
             "linux",
             "--arch",
             "x86_64",
-            "--key-id",
-            "test",
         ])
         .status()?;
     assert!(status.success());
+
+    let mut zip = ZipArchive::new(fs::File::open(&archive)?)?;
+    assert!(zip.by_name("signature.json").is_err());
 
     let catalog = PluginCatalog::discover(root.path());
 
