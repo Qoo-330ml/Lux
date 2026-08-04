@@ -37,7 +37,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 - `GET /api/v1/admin/libraries`：列出媒体库及其根路径。
 - `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false, "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；`scraperId` 可省略或为 `null`，表示只使用本地元数据。
-- `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时监听开关、增量/调和/元数据计划、扫描/探测并发和 `scraperId`。字段均可省略；计划和 `scraperId` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。例如 `{ "scraperId": "tmdb", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
+- `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时监听开关、增量/调和/元数据计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。`mediaStrategy` 的结构与全局策略相同，未设置时返回 `null` 并继承全局默认。例如 `{ "scraperId": "tmdb", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
@@ -46,26 +46,28 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
 - `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
-- `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）和 `resumeMinTicks`（非负）。写操作需要管理员 Web session 和 CSRF。
+- `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）、`resumeMinTicks`（非负）和 `mediaStrategy`。媒体策略包含元数据/图片语言、地区、默认刮削器、图像类型开关、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。写操作需要管理员 Web session 和 CSRF；响应不包含任何插件凭据。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、配置目录实际写入能力、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，支持 `page`、`pageSize`、`level` 和 `eventCode` 筛选。
 
-## 内置插件与刮削器（LUX-140）
+## 插件与刮削器（LUX-142）
 
 以下接口要求 `canManageServer`；写操作还要求 `X-CSRF-Token`：
 
-- `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回已编译的插件目录及 `installed`、`configured`、`available`、`configurable`、`configFields`、`configSource` 状态。`configFields` 只包含非敏感 schema，不包含当前值。首版目录包含 `tmdb`。
-- `POST /api/v1/admin/plugins/{pluginId}/install`：安装/启用内置插件，首次安装返回 201，重复请求返回 200。未知插件返回 404。
+- `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回启动时从 `/config/plugins` 发现的插件包及 `installed`、`enabled`、`running`、`configured`、`available`、`configurable`、`configFields`、`configSource`、`version`、`runtime`、`capabilities`、`status` 和脱敏 `lastError` 状态。`configFields` 只包含非敏感 schema，不包含当前值。
+- `POST /api/v1/admin/plugins/{pluginId}/install`：启用已发现的插件包；它不会从网络下载代码。首次启用返回 201，重复请求返回 200。未知插件返回 404。
 - `PUT /api/v1/admin/plugins/{pluginId}/config`：替换插件配置。TMDb 请求体为 `{ "apiKey": "..." }`；空字符串清除自定义 Key 并恢复内置 fallback。成功返回不含明文凭据的插件状态。
-- 未安装、无可用凭据或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
+- 插件包必须是 `.zip` 或开发用解压目录，根目录包含 `manifest.json`。Lux 启动时校验包格式、协议版本、平台架构、文件哈希和签名；校验失败的包不会运行。
+- 插件通过独立进程和 JSON-RPC 风格协议提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。
+- 未安装、未启用、无可用凭据、运行失败或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
-插件不会从网络下载或加载任意代码。TMDb API Key 和 Read Access Token 只存在配置目录或内置实现，不出现在插件 API、媒体库 API 或日志中。
+插件包不从任意远程 URL 自动下载。插件 API、媒体库 API 和日志不返回插件配置中的敏感值；TMDb API Key 和 Read Access Token 只存在受限配置或内置实现中。
 
 ## 元数据候选管理（LUX-053）
 
 - `GET /api/v1/admin/metadata/pending?page=1&pageSize=50`：管理员分页查看 pending 候选；页大小限制为 1-100。
 - `GET /api/v1/admin/items/{itemId}/identify/candidates?q=关键词&page=1&pageSize=50`：管理员按 provider ID 或候选 JSON 搜索指定条目的 pending 候选，并返回 `fieldDiffs` 预览。
-- `POST /api/v1/admin/items/{itemId}/identify/candidates`：管理员发送 `{ "query": "标题", "year": 2020 }` 搜索 TMDb；最多写入 20 个带 24 小时过期时间的 pending 候选，并返回当前条目的候选页。需要 `X-CSRF-Token`；未配置 TMDb token 返回服务不可用，TMDb 请求失败不会改变本地条目。
+- `POST /api/v1/admin/items/{itemId}/identify/candidates`：管理员发送 `{ "query": "标题", "year": 2020 }` 搜索 TMDb；最多写入 20 个带 24 小时过期时间的 pending 候选，并返回当前条目的候选页。需要 `X-CSRF-Token`；TMDb 无可用凭据时返回服务不可用，TMDb 请求失败不会改变本地条目。
 - `POST /api/v1/admin/items/{itemId}/identify/candidates/{candidateId}/select`：管理员选择候选并发送 `{ "mode": "fillMissing" }` 或 `{ "mode": "refreshUnlocked" }`，需要 `X-CSRF-Token`。前者只补空元数据字段和缺失图片，后者刷新未锁定字段和图片；NFO/图片写回全部成功后才返回 `ONLINE_CONFIRMED`，失败返回可重试错误且候选保持 pending。
 - `POST /api/v1/admin/metadata/reidentify`：管理员发送 `{ "itemIds": ["..."] }` 创建批量重新识别任务；条目去重后限制为 1-100 个，任务持久化为 `QUEUED/RUNNING/COMPLETED/FAILED`，需要 `X-CSRF-Token`。
 - `GET /api/v1/admin/metadata/reidentify/{jobId}`：管理员读取批量重新识别任务及逐条状态、候选数量和稳定错误代码；前端可按任务 ID 轮询。
@@ -96,7 +98,7 @@ Lux 电影查询要求有效 Web session：
 - `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回条目；支持 `itemType`、`year`、`isPlayed`、`isFavorite`、`sortBy=DateCreated` 和 `sortOrder=Ascending|Descending`，筛选和分页在 SQLite 查询中完成。
 - `GET /api/v1/favorites?page=1&pageSize=50`：返回当前用户跨可见媒体库的收藏条目，按最近添加倒序分页；服务端执行用户状态和媒体库 ACL。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，结果执行媒体库 ACL。
-- `GET /api/v1/home`：返回当前用户继续观看、最近添加（按 `media_items.added_at` 倒序）和可见媒体库入口；最近添加与继续观看都执行媒体库 ACL。
+- `GET /api/v1/home`：返回当前用户继续观看、推荐和可见媒体库入口；每个媒体库入口包含最多 12 条该库最新资源，按 `media_items.added_at` 倒序。所有内容均执行媒体库 ACL；响应中的 `recentlyAdded` 字段保留用于旧客户端兼容，Lux Web 首页按媒体库分别展示最新资源。
 - `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看和收藏状态。
 - `POST /api/v1/items/{itemId}/progress`：写入播放进度，需要当前 Web session 和 CSRF。
 - `PUT /api/v1/items/{itemId}/favorite`：设置当前 Web 用户的收藏状态，需要当前 Web session 和 CSRF。
@@ -134,6 +136,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Items/{itemId}/Download`：需要 `can_download` 和媒体库 ACL，返回附件下载流。
 - `GET|HEAD /api/v1/items/{itemId}/download`：Lux 下载端点，需要 Web session、`can_download` 和媒体库 ACL。
 - `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流和 DirectPlay 能力；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。每个媒体源可带 `Edition`/`Quality` 版本标签。
+- `MediaSources.Path` 对 `.strm` 源返回旁车记录中的外部媒体地址；`MediaStreams` 除基础轨道字段外，还返回旁车中的分辨率、画面比例、码率、色深、帧率、Profile、像素格式、声道布局和采样率等已验证字段。
 - `GET /Items/{collectionId}/Children`：返回按当前用户媒体库权限过滤的合集成员。
 
 `.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 和原始 `DirectStreamUrl` 返回；服务端不请求、不验证、不代理该 URL。具有媒体库访问权限的客户端会直接获得该地址，因此 URL 中的令牌也会按产品设计暴露给客户端。
@@ -150,6 +153,8 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 字幕索引来自 ffprobe 内嵌轨和媒体文件同目录的同名外挂文件，支持 srt、ass、ssa、vtt、sub、sup；外挂字幕的语言、标题、forced 和 default 标记来自文件名，媒体流 DTO 会返回 `IsExternal`、`IsDefault` 和 `IsForced`。内嵌字幕不通过本阶段的读取端点抽取。
 
 媒体 DTO 只返回客户端所需的标题、年份、简介、时长、容器、大小、码率和轨道信息，不返回服务器内部文件路径。图片内容端点属于 LUX-035。
+
+媒体探测优先使用本地文件的 ffprobe；`.strm` 源优先读取同名 `-mediainfo.json`，没有有效旁车时回退到同名 NFO 的 `<fileinfo><streamdetails>`。旁车内容只接受受限字段，不执行外部地址探测。
 
 ## 媒体库 ACL（LUX-036）
 

@@ -35,6 +35,32 @@ describe("AdminLibrariesPage library cards", () => {
   beforeEach(() => {
     vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [library] });
     vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [] });
+    vi.spyOn(api, "adminSettings").mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: {
+        metadataLanguage: "zh-CN",
+        imageLanguage: "zh-CN",
+        region: "CN",
+        scraperId: null,
+        applyScope: "NEW_CONTENT",
+        images: {
+          poster: true,
+          artwork: false,
+          banner: false,
+          logo: true,
+          thumbnail: true,
+          maxBackdropCount: 1,
+          minDownloadWidth: 1280,
+        },
+        subtitles: {
+          autoDownload: false,
+          languages: ["zh-CN"],
+          forcedOnly: false,
+          hearingImpaired: false,
+        },
+      },
+    });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -98,5 +124,86 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(container.querySelector('[role="dialog"]')?.textContent).toContain("01每日更新");
     expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 媒体库名称"]')?.value).toBe("01每日更新");
+  });
+
+  it("shows global image and subtitle defaults in the strategy view", async () => {
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+
+    expect(container.textContent).toContain("全局策略");
+    expect(container.textContent).toContain("图像抓取");
+    expect(container.textContent).toContain("最小下载宽度");
+    expect(container.textContent).toContain("字幕默认值");
+    expect(container.textContent).toContain("存储预估");
+  });
+
+  it("saves an edited global strategy through the server settings API", async () => {
+    const updateSettings = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: {
+        metadataLanguage: "zh-CN",
+        imageLanguage: "zh-CN",
+        region: "CN",
+        scraperId: null,
+        applyScope: "NEW_CONTENT",
+        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, maxBackdropCount: 1, minDownloadWidth: 1280 },
+        subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
+      },
+    });
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+    const artworkToggle = container.querySelectorAll<HTMLInputElement>(".lux-library-strategy-toggle input")[1];
+    await act(async () => artworkToggle?.click());
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("保存全局策略"))
+        ?.click();
+    });
+
+    expect(updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+      mediaStrategy: expect.objectContaining({
+        images: expect.objectContaining({ artwork: true }),
+      }),
+    }));
+  });
+
+  it("lets a library switch from inherited to a custom image strategy", async () => {
+    const updateLibrary = vi.spyOn(api, "updateAdminLibrary").mockResolvedValue({ library });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+    expect(container.textContent).toContain("继承全局");
+
+    const customMode = container.querySelectorAll<HTMLInputElement>(".lux-library-override-modes input")[1];
+    await act(async () => customMode?.click());
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>(".lux-library-override-actions button")]
+        .find((button) => button.textContent?.includes("保存策略"))
+        ?.click();
+    });
+
+    expect(updateLibrary).toHaveBeenCalledWith("library-1", expect.objectContaining({
+      mediaStrategy: expect.objectContaining({
+        images: expect.objectContaining({ poster: true }),
+      }),
+    }));
   });
 });

@@ -32,6 +32,7 @@ pub struct LibraryRecord {
     pub incremental_schedule: Option<String>,
     pub reconciliation_schedule: Option<String>,
     pub metadata_schedule: Option<String>,
+    pub media_strategy_json: Option<String>,
     pub scan_concurrency: i64,
     pub probe_concurrency: i64,
     pub last_scan_at: Option<i64>,

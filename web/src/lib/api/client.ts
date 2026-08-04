@@ -14,6 +14,10 @@ import type {
   Library,
   LuxUser,
   MediaItem,
+  ItemMetadata,
+  ItemImage,
+  ImageSearchResult,
+  MetadataFieldName,
   PageResponse,
   PlaybackState,
   SetupStatus,
@@ -141,6 +145,44 @@ export class LuxApiClient {
 
   item(itemId: string) {
     return this.request<MediaItem>(`/api/v1/items/${encodeURIComponent(itemId)}`);
+  }
+
+  itemMetadata(itemId: string) {
+    return this.request<ItemMetadata>(`/api/v1/items/${encodeURIComponent(itemId)}/metadata`);
+  }
+
+  updateItemMetadata(
+    itemId: string,
+    input: {
+      title: string;
+      originalTitle?: string;
+      overview?: string;
+      productionYear?: number;
+      lockedFields: MetadataFieldName[];
+    },
+  ) {
+    return this.request<ItemMetadata>(`/api/v1/items/${encodeURIComponent(itemId)}/metadata`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  itemImages(itemId: string) {
+    return this.request<{ images?: ItemImage[] }>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
+  }
+
+  searchItemImages(itemId: string, input: { imageType: string; language: string; source: string }) {
+    return this.request<{ images?: ImageSearchResult[] }>(
+      `/api/v1/items/${encodeURIComponent(itemId)}/images/search`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  selectItemImage(itemId: string, input: { imageType: string; url: string; language?: string | null }) {
+    return this.request<{ image: ItemImage }>(
+      `/api/v1/items/${encodeURIComponent(itemId)}/images/select`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
   }
 
   children(itemId: string, options: { itemType?: string; seasonId?: string } = {}) {

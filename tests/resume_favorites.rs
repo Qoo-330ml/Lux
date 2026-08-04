@@ -121,6 +121,73 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .send()
         .await?;
     assert_eq!(settings.status(), reqwest::StatusCode::OK);
+    let default_settings = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .send()
+        .await?;
+    assert_eq!(default_settings.status(), reqwest::StatusCode::OK);
+    let default_settings_body = default_settings.json::<Value>().await?;
+    assert_eq!(
+        default_settings_body["mediaStrategy"]["images"]["poster"],
+        true
+    );
+    assert_eq!(
+        default_settings_body["mediaStrategy"]["images"]["minDownloadWidth"],
+        1280
+    );
+
+    let media_strategy = json!({
+        "metadataLanguage": "en-US",
+        "imageLanguage": "en",
+        "region": "US",
+        "scraperId": null,
+        "applyScope": "ALL_CONTENT",
+        "images": {
+            "poster": true,
+            "artwork": false,
+            "banner": true,
+            "logo": false,
+            "thumbnail": false,
+            "maxBackdropCount": 2,
+            "minDownloadWidth": 1920
+        },
+        "subtitles": {
+            "autoDownload": true,
+            "languages": ["en", "zh-CN"],
+            "forcedOnly": false,
+            "hearingImpaired": true
+        }
+    });
+    let updated_settings = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "mediaStrategy": media_strategy }))
+        .send()
+        .await?;
+    assert_eq!(updated_settings.status(), reqwest::StatusCode::OK);
+    let updated_settings_body = updated_settings.json::<Value>().await?;
+    assert_eq!(updated_settings_body["mediaStrategy"]["region"], "US");
+    assert_eq!(
+        updated_settings_body["mediaStrategy"]["applyScope"],
+        "ALL_CONTENT"
+    );
+    assert_eq!(
+        updated_settings_body["mediaStrategy"]["images"]["minDownloadWidth"],
+        1920
+    );
+
+    let persisted_settings = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .send()
+        .await?;
+    let persisted_settings_body = persisted_settings.json::<Value>().await?;
+    assert_eq!(
+        persisted_settings_body["mediaStrategy"]["subtitles"]["hearingImpaired"],
+        true
+    );
     let relaxed_resume = client
         .get(format!("{base_url}/Users/{admin_id}/Items/Resume"))
         .query(&[("api_key", token.as_str()), ("Limit", "10")])

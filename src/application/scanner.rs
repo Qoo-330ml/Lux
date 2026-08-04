@@ -266,11 +266,26 @@ impl LibraryScanner {
         let (device, inode) = file_identity(&metadata);
         let fingerprint =
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let hierarchy = episode_hierarchy(&relative_path, &parsed);
+        let ensured = self
+            .ensure_episode_hierarchy(library_id_text, root, &parsed, &hierarchy)
+            .await?;
         if let Some(existing_entry) = self
             .database
             .find_filesystem_entry(&root.id, &relative_path)
             .await?
         {
+            let hierarchy_changed = self
+                .database
+                .reassign_media_source_item(&existing_entry.id, &ensured.episode_id)
+                .await?;
+            self.database
+                .update_media_source_variant_labels(
+                    &existing_entry.id,
+                    parsed.edition_name.as_deref(),
+                    parsed.quality_label.as_deref(),
+                )
+                .await?;
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
                 if is_strm {
                     self.database
@@ -285,6 +300,8 @@ impl LibraryScanner {
                     .await?;
                 return Ok(ScanReport {
                     discovered_files: 1,
+                    created_items: ensured.created_items,
+                    changed_files: usize::from(hierarchy_changed),
                     skipped_files: 1,
                     ..ScanReport::default()
                 });
@@ -308,87 +325,12 @@ impl LibraryScanner {
             }
             return Ok(ScanReport {
                 discovered_files: 1,
+                created_items: ensured.created_items,
                 changed_files: 1,
                 ..ScanReport::default()
             });
         }
 
-        let components = relative_path
-            .split(['/', '\\'])
-            .filter(|component| !component.is_empty())
-            .collect::<Vec<_>>();
-        let series_name = components.first().copied().unwrap_or("Series");
-        let series_title = clean_hierarchy_title(series_name);
-        let series_sort_title = series_title.to_lowercase();
-        let series_identity = format!("series:{}:{}", root.id, series_name);
-        let series_new_id = ItemId::new().to_string();
-        let (series_id, series_created) = self
-            .ensure_hierarchy_item(NewHierarchyItem {
-                id: &series_new_id,
-                library_id: library_id_text,
-                item_type: "SERIES",
-                parent_id: None,
-                series_id: None,
-                season_number: None,
-                episode_number: None,
-                absolute_number: None,
-                title: &series_title,
-                sort_title: &series_sort_title,
-                original_title: Some(&series_title),
-                production_year: None,
-                identification_status: "LOCAL_CONFIRMED",
-                identity_key: &series_identity,
-            })
-            .await?;
-        let season_number = season_directory_number(&components).unwrap_or(parsed.season);
-        let season_title = if season_number == 0 {
-            "Specials".to_owned()
-        } else {
-            format!("Season {season_number:02}")
-        };
-        let season_identity = format!("{series_identity}:season:{season_number}");
-        let season_sort_title = season_title.to_lowercase();
-        let season_new_id = ItemId::new().to_string();
-        let (season_id, season_created) = self
-            .ensure_hierarchy_item(NewHierarchyItem {
-                id: &season_new_id,
-                library_id: library_id_text,
-                item_type: "SEASON",
-                parent_id: Some(&series_id),
-                series_id: Some(&series_id),
-                season_number: Some(i64::from(season_number)),
-                episode_number: None,
-                absolute_number: None,
-                title: &season_title,
-                sort_title: &season_sort_title,
-                original_title: Some(&season_title),
-                production_year: None,
-                identification_status: "LOCAL_CONFIRMED",
-                identity_key: &season_identity,
-            })
-            .await?;
-        let episode_identity = format!("episode:{}:{}", root.id, relative_path);
-        let episode_title = parsed.title.clone();
-        let episode_sort_title = episode_title.to_lowercase();
-        let episode_new_id = ItemId::new().to_string();
-        let (episode_id, episode_created) = self
-            .ensure_hierarchy_item(NewHierarchyItem {
-                id: &episode_new_id,
-                library_id: library_id_text,
-                item_type: "EPISODE",
-                parent_id: Some(&season_id),
-                series_id: Some(&series_id),
-                season_number: Some(i64::from(season_number)),
-                episode_number: Some(i64::from(parsed.episode)),
-                absolute_number: parsed.absolute_number.map(i64::from),
-                title: &episode_title,
-                sort_title: &episode_sort_title,
-                original_title: Some(&episode_title),
-                production_year: None,
-                identification_status: "LOCAL_CONFIRMED",
-                identity_key: &episode_identity,
-            })
-            .await?;
         let entry_id = FilesystemEntryId::new().to_string();
         self.database
             .insert_filesystem_entry(NewFilesystemEntry {
@@ -411,22 +353,20 @@ impl LibraryScanner {
         self.database
             .insert_media_source(NewMediaSource {
                 id: &source_id,
-                item_id: &episode_id,
+                item_id: &ensured.episode_id,
                 source_kind: if is_strm { "STRM_URL" } else { "LOCAL_FILE" },
                 filesystem_entry_id: &entry_id,
-                edition_name: None,
-                quality_label: None,
+                edition_name: parsed.edition_name.as_deref(),
+                quality_label: parsed.quality_label.as_deref(),
                 container: &container,
                 size,
                 external_url: external_url.as_deref(),
-                is_default: true,
+                is_default: ensured.episode_created,
             })
             .await?;
         Ok(ScanReport {
             discovered_files: 1,
-            created_items: usize::from(series_created)
-                + usize::from(season_created)
-                + usize::from(episode_created),
+            created_items: ensured.created_items,
             created_sources: 1,
             ..ScanReport::default()
         })
@@ -601,6 +541,99 @@ impl LibraryScanner {
         let id = item.id.to_owned();
         self.database.insert_hierarchy_item(item).await?;
         Ok((id, true))
+    }
+
+    async fn ensure_episode_hierarchy(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        parsed: &ParsedEpisodeFilename,
+        hierarchy: &EpisodeHierarchy,
+    ) -> Result<EnsuredEpisodeHierarchy, ScannerError> {
+        let series_sort_title = hierarchy.series_title.to_lowercase();
+        let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
+        let series_new_id = ItemId::new().to_string();
+        let (series_id, series_created) = self
+            .ensure_hierarchy_item(NewHierarchyItem {
+                id: &series_new_id,
+                library_id: library_id_text,
+                item_type: "SERIES",
+                parent_id: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+                absolute_number: None,
+                title: &hierarchy.series_title,
+                sort_title: &series_sort_title,
+                original_title: Some(&hierarchy.series_title),
+                production_year: None,
+                identification_status: "LOCAL_CONFIRMED",
+                identity_key: &series_identity,
+            })
+            .await?;
+        let season_title = if hierarchy.season_number == 0 {
+            "Specials".to_owned()
+        } else {
+            format!("Season {:02}", hierarchy.season_number)
+        };
+        let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
+        let season_sort_title = season_title.to_lowercase();
+        let season_new_id = ItemId::new().to_string();
+        let (season_id, season_created) = self
+            .ensure_hierarchy_item(NewHierarchyItem {
+                id: &season_new_id,
+                library_id: library_id_text,
+                item_type: "SEASON",
+                parent_id: Some(&series_id),
+                series_id: Some(&series_id),
+                season_number: Some(i64::from(hierarchy.season_number)),
+                episode_number: None,
+                absolute_number: None,
+                title: &season_title,
+                sort_title: &season_sort_title,
+                original_title: Some(&season_title),
+                production_year: None,
+                identification_status: "LOCAL_CONFIRMED",
+                identity_key: &season_identity,
+            })
+            .await?;
+        let edition_key = parsed
+            .edition_name
+            .as_deref()
+            .unwrap_or("standard")
+            .to_ascii_lowercase();
+        let episode_identity = format!(
+            "episode:{}:{}:season:{}:episode:{}:edition:{}",
+            root.id, hierarchy.series_path, hierarchy.season_number, parsed.episode, edition_key
+        );
+        let episode_title = parsed.title.clone();
+        let episode_sort_title = episode_title.to_lowercase();
+        let episode_new_id = ItemId::new().to_string();
+        let (episode_id, episode_created) = self
+            .ensure_hierarchy_item(NewHierarchyItem {
+                id: &episode_new_id,
+                library_id: library_id_text,
+                item_type: "EPISODE",
+                parent_id: Some(&season_id),
+                series_id: Some(&series_id),
+                season_number: Some(i64::from(hierarchy.season_number)),
+                episode_number: Some(i64::from(parsed.episode)),
+                absolute_number: parsed.absolute_number.map(i64::from),
+                title: &episode_title,
+                sort_title: &episode_sort_title,
+                original_title: Some(&episode_title),
+                production_year: None,
+                identification_status: "LOCAL_CONFIRMED",
+                identity_key: &episode_identity,
+            })
+            .await?;
+        Ok(EnsuredEpisodeHierarchy {
+            episode_id,
+            created_items: usize::from(series_created)
+                + usize::from(season_created)
+                + usize::from(episode_created),
+            episode_created,
+        })
     }
 
     pub async fn scan_movie_directory(
@@ -1440,6 +1473,8 @@ pub struct ParsedEpisodeFilename {
     pub season: u32,
     pub episode: u32,
     pub absolute_number: Option<u32>,
+    pub edition_name: Option<String>,
+    pub quality_label: Option<String>,
 }
 
 enum MixedClassification {
@@ -1587,18 +1622,28 @@ fn parse_edition_name(words: &[&str]) -> Option<String> {
 }
 
 fn parse_quality_label(words: &[&str]) -> Option<String> {
-    words.iter().find_map(|word| {
+    let resolution = words.iter().find_map(|word| {
         let normalized = word.to_ascii_lowercase();
         match normalized.as_str() {
-            "4k" | "uhd" | "2160p" => Some(if normalized == "4k" || normalized == "uhd" {
-                "4K".to_owned()
-            } else {
-                "2160p".to_owned()
-            }),
-            "1080p" | "720p" | "576p" | "480p" => Some(normalized),
+            "4k" | "uhd" => Some("4K".to_owned()),
+            "2160p" | "1080p" | "720p" | "576p" | "480p" => Some(normalized),
             _ => None,
         }
-    })
+    });
+    let dynamic_range = words.iter().find_map(|word| {
+        let normalized = word.to_ascii_lowercase();
+        match normalized.as_str() {
+            "hdr" | "hdr10" | "hdr10+" => Some("HDR"),
+            "sdr" => Some("SDR"),
+            _ => None,
+        }
+    });
+    match (resolution, dynamic_range) {
+        (Some(resolution), Some(dynamic_range)) => Some(format!("{resolution} {dynamic_range}")),
+        (Some(resolution), None) => Some(resolution),
+        (None, Some(dynamic_range)) => Some(dynamic_range.to_owned()),
+        (None, None) => None,
+    }
 }
 
 pub fn parse_episode_filename(filename: &str) -> Option<ParsedEpisodeFilename> {
@@ -1636,18 +1681,23 @@ pub fn parse_episode_filename(filename: &str) -> Option<ParsedEpisodeFilename> {
         }
     }
     let (start, end, season, episode) = marker?;
-    let title = clean_hierarchy_title(&format!("{} {}", &stem[..start], &stem[end..]));
+    let suffix = remove_episode_version_markers(&stem[end..]);
+    let title = clean_hierarchy_title(&format!("{} {suffix}", &stem[..start]));
     let title = if title.is_empty() {
         format!("Episode {episode:02}")
     } else {
         title
     };
+    let suffix_words = normalized_filename_words(&stem[end..]);
+    let suffix_word_refs = suffix_words.iter().map(String::as_str).collect::<Vec<_>>();
     Some(ParsedEpisodeFilename {
         sort_title: title.to_lowercase(),
         title,
         season,
         episode,
         absolute_number: None,
+        edition_name: parse_edition_name(&suffix_word_refs),
+        quality_label: parse_quality_label(&suffix_word_refs),
     })
 }
 
@@ -1678,10 +1728,113 @@ fn clean_hierarchy_title(value: &str) -> String {
         .join(" ")
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct EpisodeHierarchy {
+    series_path: String,
+    series_title: String,
+    season_number: u32,
+}
+
+struct EnsuredEpisodeHierarchy {
+    episode_id: String,
+    created_items: usize,
+    episode_created: bool,
+}
+
+fn normalized_filename_words(value: &str) -> Vec<String> {
+    value
+        .chars()
+        .map(|character| match character {
+            '.' | '_' | '(' | ')' | '[' | ']' => ' ',
+            character => character,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn remove_episode_version_markers(value: &str) -> String {
+    normalized_filename_words(value)
+        .into_iter()
+        .filter(|word| !is_episode_version_marker(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_episode_version_marker(word: &str) -> bool {
+    let normalized = word.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "4k" | "uhd"
+            | "2160p"
+            | "1080p"
+            | "720p"
+            | "576p"
+            | "480p"
+            | "hdr"
+            | "hdr10"
+            | "hdr10+"
+            | "sdr"
+            | "dv"
+            | "dolbyvision"
+            | "web-dl"
+            | "webrip"
+            | "bluray"
+            | "bdrip"
+            | "hdtv"
+            | "remux"
+            | "proper"
+            | "repack"
+            | "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "av1"
+            | "8bit"
+            | "10bit"
+    )
+}
+
+fn episode_hierarchy(relative_path: &str, parsed: &ParsedEpisodeFilename) -> EpisodeHierarchy {
+    let components = relative_path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let directories = components
+        .split_last()
+        .map(|(_, directories)| directories)
+        .unwrap_or(&[]);
+    let season_directory_index = directories
+        .iter()
+        .rposition(|value| parse_season_directory_name(value).is_some());
+    let series_components = season_directory_index
+        .map(|index| &directories[..index])
+        .unwrap_or(directories);
+    let series_path = if series_components.is_empty() {
+        "Series".to_owned()
+    } else {
+        series_components.join("/")
+    };
+    let series_title = series_components
+        .last()
+        .map(|value| clean_hierarchy_title(value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Series".to_owned());
+    let season_number = season_directory_number(directories).unwrap_or(parsed.season);
+    EpisodeHierarchy {
+        series_path,
+        series_title,
+        season_number,
+    }
+}
+
 fn season_directory_number(components: &[&str]) -> Option<u32> {
     components
-        .get(components.len().saturating_sub(2))
-        .and_then(|value| parse_season_directory_name(value))
+        .iter()
+        .rev()
+        .find_map(|value| parse_season_directory_name(value))
 }
 
 fn parse_season_directory_name(value: &str) -> Option<u32> {
@@ -1693,6 +1846,14 @@ fn parse_season_directory_name(value: &str) -> Option<u32> {
         .strip_prefix("season")
         .or_else(|| normalized.strip_prefix('s'))?
         .trim();
+    let digits = if let Some((prefix, suffix)) = digits.split_once('(') {
+        suffix.strip_suffix(')').filter(|value| {
+            !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+        })?;
+        prefix.trim()
+    } else {
+        digits
+    };
     digits.parse::<u32>().ok()
 }
 

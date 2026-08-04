@@ -1,7 +1,10 @@
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
+    application::recommendations::{
+        RECOMMENDATION_CANDIDATE_POOL, current_day_bucket, daily_recommendation_items,
+    },
     storage::{CatalogFilterQuery, Database, StorageError, StoredCatalogRow},
 };
 
@@ -308,19 +311,44 @@ impl CatalogService {
         })
     }
 
+    pub async fn list_recently_added_by_library(
+        &self,
+        principal: AccessPrincipal,
+        limit: i64,
+    ) -> Result<Vec<(String, Vec<CatalogItem>)>, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let rows = self
+            .database
+            .list_recent_catalog_rows_by_library(&library_ids, limit)
+            .await?;
+        let mut grouped = BTreeMap::<String, Vec<CatalogItem>>::new();
+        for item in assemble_items(rows) {
+            grouped
+                .entry(item.library_id.clone())
+                .or_default()
+                .push(item);
+        }
+        Ok(grouped.into_iter().collect())
+    }
+
     pub async fn list_recommended(
         &self,
         principal: AccessPrincipal,
         user_id: &str,
-        offset: i64,
         limit: i64,
     ) -> Result<Vec<CatalogItem>, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
         let rows = self
             .database
-            .list_recommended_catalog_rows(user_id, &library_ids, offset, limit)
+            .list_recommended_catalog_rows(user_id, &library_ids, 0, RECOMMENDATION_CANDIDATE_POOL)
             .await?;
-        Ok(assemble_items(rows))
+        let items = assemble_items(rows);
+        Ok(daily_recommendation_items(
+            items,
+            user_id,
+            current_day_bucket(),
+            usize::try_from(limit).unwrap_or(0),
+        ))
     }
 
     pub async fn find_item(
@@ -494,6 +522,7 @@ pub struct CatalogStream {
     pub is_external: bool,
     pub is_default: bool,
     pub is_forced: bool,
+    pub details: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
@@ -574,6 +603,11 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
             is_external: row.stream_is_external.unwrap_or(false),
             is_default: row.stream_is_default.unwrap_or(false),
             is_forced: row.stream_is_forced.unwrap_or(false),
+            details: row
+                .stream_details_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_default(),
         });
         let _ = stream_id;
     }
@@ -617,5 +651,22 @@ impl From<AccessError> for CatalogError {
         match error {
             AccessError::Storage(error) => Self::Storage(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::application::recommendations::daily_recommendation_items;
+
+    #[test]
+    fn daily_recommendations_are_stable_for_one_day_and_change_next_day() {
+        let items = || (1..=6).collect::<Vec<_>>();
+
+        let day_one = daily_recommendation_items(items(), "user-1", 20, 3);
+        let same_day = daily_recommendation_items(items(), "user-1", 20, 3);
+        let next_day = daily_recommendation_items(items(), "user-1", 21, 3);
+
+        assert_eq!(day_one, same_day);
+        assert_ne!(day_one, next_day);
     }
 }

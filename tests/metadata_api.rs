@@ -269,3 +269,73 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     tmdb_server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_read_and_edit_item_metadata_with_field_locks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+
+    let (base_url, server) = start_server(config, database, setup, None).await?;
+    let client = reqwest::Client::new();
+    let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
+    let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
+
+    let before = client
+        .get(format!("{base_url}/api/v1/items/{item_id}/metadata"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(before.status(), reqwest::StatusCode::OK);
+    let before_body: Value = before.json().await?;
+    assert_eq!(before_body["title"], "Example Movie");
+    assert_eq!(before_body["lockedFields"], json!([]));
+
+    let updated = client
+        .patch(format!("{base_url}/api/v1/items/{item_id}/metadata"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", csrf)
+        .json(&json!({
+            "title": "Edited Movie",
+            "originalTitle": "Edited Original",
+            "overview": "Edited overview",
+            "productionYear": 2021,
+            "lockedFields": ["title"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    let updated_body: Value = updated.json().await?;
+    assert_eq!(updated_body["title"], "Edited Movie");
+    assert_eq!(updated_body["productionYear"], 2021);
+    assert_eq!(updated_body["lockedFields"], json!(["title"]));
+    let nfo = tokio::fs::read_to_string(movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("Edited Movie"));
+    assert!(nfo.contains("Edited overview"));
+
+    server.abort();
+    Ok(())
+}

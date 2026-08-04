@@ -97,6 +97,9 @@ Lux 的核心价值不是功能数量，而是：
 - 媒体库封面图首版只接受 JPEG、PNG、WebP，大小上限为 5 MiB，并通过 Lux 的受保护图片接口提供。
 - 每个媒体库独立配置文件实时监听、增量扫描、全量校验和元数据任务。
 - 每个媒体库可选择一个已安装的元数据刮削器；未选择时仅使用本地 NFO 和图片。
+- 管理员可在“全局策略”中设置媒体库的默认元数据、图像和字幕策略；媒体库可以继承全局默认值，也可以单独覆盖。
+- 全局图像策略至少包括海报、艺术图、横幅图、徽标、缩略图开关、每项最大背景图数量和最小下载宽度。
+- 全局策略支持保守的存储预估，并明确应用范围：仅新内容、刷新选中内容或后台刷新全部内容；批量刷新必须进入任务队列。
 - 不在用户请求路径中扫描目录、读取 NFO、调用 ffprobe 或访问 TMDb。
 
 ### 3.2 媒体来源
@@ -211,7 +214,7 @@ Lux 的核心价值不是功能数量，而是：
 普通用户首页：
 
 - 继续观看。
-- 推荐轮播：服务端基于用户收藏、播放状态、播放活跃度和媒体入库新鲜度，对可访问的已入库电影与剧集进行可解释的加权排序；冷启动时优先最近入库内容。
+- 推荐轮播：服务端基于用户收藏、播放状态、播放活跃度和媒体入库新鲜度，对可访问的已入库电影与剧集进行可解释的加权排序；按用户和 UTC 日期生成每日批次，同一天保持稳定，跨天更换推荐内容；冷启动时优先最近入库内容。
 - 用户有权访问的多个媒体库入口。
 - 搜索入口。
 
@@ -265,11 +268,12 @@ Lux 的核心价值不是功能数量，而是：
 
 ### 3.14 内置插件与刮削器
 
-- Lux 提供安全的内置元数据插件注册表；插件以服务端已编译实现提供能力，不加载任意第三方动态库、脚本或远程代码。
-- 首个内置插件为 TMDb。管理员从插件库安装/启用后，创建或编辑媒体库时可以选择 `TMDB` 作为刮削器。
+- Lux 提供安全的插件注册表；插件以标准 `.zip` 插件包放入 `/config/plugins`，服务重启时扫描并加载。插件代码运行在受监督的独立进程中，不直接注入 Lux Rust 主进程。
+- 首个独立插件为 `org.lux.tmdb`。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
 - 只有已安装、已启用且有可用凭据的插件才能被媒体库选择。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用服务端内置的默认 API Key；任何凭据都不返回 API 或写入日志。
 - 媒体库的 `scraperId` 为空表示只使用本地元数据；插件安装状态与媒体库选择均持久化，服务重启后保持不变。
 - 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
+- 全局策略的服务器设置不得返回任何凭据；插件凭据仍只在插件管理页面配置。播放进度阈值继续属于服务器设置，不在媒体库策略页重复管理。
 
 ---
 
@@ -278,7 +282,7 @@ Lux 的核心价值不是功能数量，而是：
 - 音频转码、视频转码、HLS 转码、容器转换。
 - 在线字幕搜索、字幕下载、OCR 或字幕格式转换。
 - 直播电视、DVR、DLNA、Chromecast 控制。
-- 任意外部插件代码加载、动态 native/WASM 运行时和远程插件执行。
+- 未经插件包校验、权限声明和独立进程监督的任意外部代码执行。
 - Emby Connect、Quick Connect 或官方云账户。
 - 公网穿透、自动端口映射和自动证书申请。
 - 音乐库、照片库、有声书库和游戏库。
@@ -1336,6 +1340,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 
 - 仪表盘。
 - 媒体库列表和编辑。
+- 全局策略：元数据、图像和字幕默认值，以及应用范围和存储预估。
 - 路径选择/输入、读写检测。
 - 扫描计划与元数据计划，明确分开。
 - 扫描/任务页。
@@ -1634,6 +1639,7 @@ services:
 | LUX-120 至 123 | src/api/emby/、tests/fixtures/emby-contract/、tests/api/、docs/COMPATIBILITY.md |
 | LUX-130 至 136 | migrations/、tests/performance/、Dockerfile、compose.yaml、docs/ |
 | LUX-140 | src/application/plugins.rs、src/storage/、src/api/、migrations/、web/src/features/admin/、tests/ |
+| LUX-142 | src/application/plugin_runtime.rs、src/application/plugin_protocol.rs、src/storage/、src/api/、migrations/、plugins/、docs/、tests/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2294,7 +2300,7 @@ services:
 
 验收：
 
-- 一次 Lux API 返回继续观看和库入口。
+- 一次 Lux API 返回继续观看、可见库入口，以及每个可见媒体库按 `added_at` 从新到旧排列的最新资源横栏数据。
 - Emby Latest/Resume/Views 分别正确。
 - 无 N+1 查询。
 
@@ -2419,7 +2425,7 @@ services:
 验收：
 
 - 创建首个管理员。
-- 可设置 TMDb token。
+- 首次引导不要求设置 TMDb 凭据；自定义 API Key 在 TMDb 插件详情页配置。
 - 可创建首个库或跳过。
 - 初始化后不能再次访问。
 
@@ -2713,7 +2719,7 @@ services:
 验收：
 
 - [ ] 空数据库迁移后，插件目录分页返回 TMDb，且未安装时不能被媒体库选择。
-- [ ] 管理员安装 TMDb 后，插件状态显示为已安装；已配置 token 时 TMDb 可作为媒体库刮削器，未配置时显示不可用原因。
+- [ ] 管理员安装 TMDb 后，插件状态显示为已安装并可作为媒体库刮削器；管理员可在插件详情页填写自定义 API Key。
 - [ ] 创建和编辑媒体库可以选择或清空 `scraperId`，重启服务后选择保持；无效、未安装或未配置插件选择被拒绝。
 - [ ] 非管理员不能查看或修改插件安装状态，也不能修改媒体库刮削器配置。
 - [ ] Web 管理员可以完成安装 TMDb、创建媒体库并选择 TMDb、编辑已有媒体库并保存选择。
@@ -2759,6 +2765,48 @@ services:
 明确不做：
 
 - 不在本任务实现扫描流水线对 `scraperId` 的后台任务接线；继续沿用已有 TMDb application service 边界。
+
+#### LUX-142：动态插件包与独立 TMDb 插件
+
+范围：将插件库从仅内置注册项升级为可发现的 `.zip` 插件包注册表。插件包必须包含 `manifest.json`、平台运行时、文件哈希和签名信息；Lux 在服务重启时扫描 `/config/plugins`，验证后通过独立进程和稳定 RPC 协议调用插件。将现有 TMDb 客户端和已反编译确认的 Emby MovieDb 行为重写为独立 `org.lux.tmdb` 插件，不直接加载原始 `MovieDb.dll`。
+
+插件协议保留 Emby 风格的公开类型名称和字段语义，包括 `BaseItem`、`Movie`、`Series`、`Season`、`Episode`、`Person`、`BoxSet`、`MetadataResult`、`RemoteSearchResult`、`RemoteImageInfo`、`ProviderIds`、`ImageType` 及元数据/图片 Provider 能力。Lux 内部领域模型仍与 Emby DTO 分离，由适配层完成映射。
+
+插件包采用跨平台 ZIP 格式，例如 `org.lux.tmdb-1.0.0.zip`。ZIP 根目录必须包含：
+
+- `manifest.json`：包格式、插件 ID、版本、协议版本、运行时、能力、配置和权限声明。
+- `binaries/`：按平台和架构组织的独立插件进程。
+- `assets/`：图标等非执行资源。
+- `signature.json`：签名算法、签发者和签名值。
+
+插件进程通过 JSON-RPC over stdin/stdout 提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。插件不能直接访问 Lux SQLite、媒体根目录或内部任务对象；元数据写回、图片下载和 Emby API 输出由 Lux 负责。
+
+验收：
+
+- [ ] 放入合法 `.zip` 插件包并重启 Lux 后，插件目录能发现、校验并展示插件；无 manifest、哈希错误、签名错误、协议不兼容或平台不匹配的包不会运行。
+- [ ] 插件进程故障、超时或异常退出不会导致 Lux 主进程退出；状态和最后错误可由管理员查看。
+- [ ] 管理员启用动态插件后，媒体库可以选择稳定的 `scraperId`，重启后选择保持。
+- [ ] 独立 `org.lux.tmdb` 插件覆盖 MovieDb 的电影、剧集、季、集、人物、合集、图片、外部 ID、预告片、语言、缓存、限流和重试行为。
+- [ ] TMDb 插件保留自定义 API Key、历史 Read Access Token 和内置 fallback 优先级；凭据不进入 RPC 响应、API 或日志。
+- [ ] Emby 客户端登录、浏览、详情、ProviderIds 和图片展示不因插件拆分回归。
+
+验证：
+
+- `cargo test --locked --test plugin_protocol --test plugin_runtime`
+- `cargo test --locked --test tmdb_plugin`
+- `cargo test --locked --test plugins`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-140、LUX-141、LUX-120。
+
+明确不做：
+
+- 不在 Lux Rust 主进程中 `dlopen` 任意 native DLL。
+- 不直接运行或模拟完整 Emby 服务端以兼容原始 `MovieDb.dll`；原始 DLL 只作为行为参考。
+- 不自动从任意远程地址下载第三方插件包。
 
 ---
 

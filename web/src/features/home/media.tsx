@@ -1,6 +1,10 @@
 import { Play, Star } from "lucide-react";
 import { Link } from "react-router-dom";
+import { useState } from "react";
 import type { Library, MediaItem } from "../../lib/api/types";
+import { MediaActionMenu } from "../media/MediaActionMenu";
+import { MediaImageEditor } from "../media/MediaImageEditor";
+import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
 
 export function mediaTitle(item: MediaItem) {
   return item.title || item.name || "未命名媒体";
@@ -56,19 +60,27 @@ export function remainingRuntimeLabel(item: MediaItem) {
 export function MediaCard({ item, landscape = false }: { item: MediaItem; landscape?: boolean }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
+  const [editor, setEditor] = useState<"metadata" | "images">();
 
   return (
-    <Link className={landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card"} to={`/items/${item.id}`}>
-      <div className="lux-media-art">
-        {image ? <img src={image} alt="" loading="lazy" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
-        <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
-        {progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
-      </div>
-      <div className="lux-media-copy">
-        <strong>{mediaTitle(item)}</strong>
-        <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
-      </div>
-    </Link>
+    <>
+      <article className={landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card"}>
+        <Link className="lux-media-card-link" to={`/items/${item.id}`}>
+          <div className="lux-media-art">
+            {image ? <img src={image} alt="" loading="lazy" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
+            <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
+            {progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
+          </div>
+          <div className="lux-media-copy">
+            <strong>{mediaTitle(item)}</strong>
+            <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
+          </div>
+        </Link>
+        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} />
+      </article>
+      {editor === "metadata" ? <MediaMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}
+      {editor === "images" ? <MediaImageEditor item={item} onClose={() => setEditor(undefined)} /> : null}
+    </>
   );
 }
 

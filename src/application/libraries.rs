@@ -125,6 +125,10 @@ impl LibraryService {
                         .map(|value| value.as_deref()),
                     metadata_schedule: metadata_schedule.as_ref().map(|value| value.as_deref()),
                     scraper_id: scraper_id.as_ref().map(|value| value.as_deref()),
+                    media_strategy_json: settings
+                        .media_strategy_json
+                        .as_ref()
+                        .map(|value| value.as_deref()),
                     scan_concurrency: settings.scan_concurrency,
                     probe_concurrency: settings.probe_concurrency,
                 },
@@ -269,6 +273,7 @@ pub struct LibrarySettingsPatch {
     pub reconciliation_schedule: Option<Option<String>>,
     pub metadata_schedule: Option<Option<String>>,
     pub scraper_id: Option<Option<String>>,
+    pub media_strategy_json: Option<Option<String>>,
     pub scan_concurrency: Option<i64>,
     pub probe_concurrency: Option<i64>,
 }
@@ -369,6 +374,14 @@ fn validate_concurrency(value: Option<i64>) -> Result<(), LibraryServiceError> {
     Ok(())
 }
 
+fn normalize_library_name(value: &str) -> Result<String, LibraryServiceError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 128 {
+        return Err(LibraryServiceError::InvalidName);
+    }
+    Ok(value.to_owned())
+}
+
 fn normalize_scraper_id(value: Option<&str>) -> Result<Option<String>, LibraryServiceError> {
     value
         .map(str::trim)
@@ -445,6 +458,7 @@ fn stored_library(stored: StoredLibrary) -> Result<LibraryRecord, LibraryService
         id,
         name: stored.name,
         kind,
+        scraper_id: stored.scraper_id,
         cover_image_path: stored.cover_image_path,
         cover_image_content_type: stored.cover_image_content_type,
         cover_image_size: stored.cover_image_size,
@@ -454,6 +468,7 @@ fn stored_library(stored: StoredLibrary) -> Result<LibraryRecord, LibraryService
         incremental_schedule: stored.incremental_schedule,
         reconciliation_schedule: stored.reconciliation_schedule,
         metadata_schedule: stored.metadata_schedule,
+        media_strategy_json: stored.media_strategy_json,
         scan_concurrency: stored.scan_concurrency,
         probe_concurrency: stored.probe_concurrency,
         last_scan_at: stored.last_scan_at,
@@ -482,12 +497,4 @@ fn stored_library_root(
         unavailable_since: stored.unavailable_since,
         scan_cursor: stored.scan_cursor,
     })
-}
-
-fn normalize_library_name(value: &str) -> Result<String, LibraryServiceError> {
-    let value = value.trim();
-    if value.is_empty() || value.chars().count() > 128 {
-        return Err(LibraryServiceError::InvalidName);
-    }
-    Ok(value.to_owned())
 }

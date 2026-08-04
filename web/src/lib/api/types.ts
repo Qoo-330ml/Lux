@@ -17,6 +17,7 @@ export type Library = {
   kind: "MOVIE" | "SERIES" | "MIXED" | string;
   coverImageUrl?: string | null;
   itemCount?: number;
+  latest?: MediaItem[];
 };
 
 export type ImageTags = Partial<Record<"poster" | "fanart" | "backdrop", string>>;
@@ -24,16 +25,36 @@ export type ImageTags = Partial<Record<"poster" | "fanart" | "backdrop", string>
 export type UserData = {
   isPlayed?: boolean;
   isFavorite?: boolean;
+  positionTicks?: number;
+  /** @deprecated Older Web clients used this name; prefer positionTicks. */
   playbackPositionTicks?: number;
+};
+
+export type MediaStream = {
+  index: number;
+  type?: string | null;
+  codec?: string | null;
+  language?: string | null;
+  title?: string | null;
+  isExternal?: boolean;
+  isDefault?: boolean;
+  isForced?: boolean;
+  details?: Record<string, unknown>;
 };
 
 export type MediaSource = {
   id: string;
+  sourceKind?: string | null;
   qualityLabel?: string | null;
   editionName?: string | null;
   container?: string | null;
+  size?: number | null;
+  bitrate?: number | null;
   durationTicks?: number | null;
+  externalUrl?: string | null;
+  probeStatus?: string | null;
   isDefault?: boolean;
+  streams?: MediaStream[];
 };
 
 export type MediaItem = {
@@ -50,6 +71,39 @@ export type MediaItem = {
   parentId?: string | null;
   indexNumber?: number | null;
   parentIndexNumber?: number | null;
+};
+
+export type MetadataFieldName = "title" | "originalTitle" | "overview" | "productionYear";
+
+export type ItemMetadata = {
+  title: string;
+  originalTitle?: string | null;
+  overview?: string | null;
+  productionYear?: number | null;
+  lockedFields: MetadataFieldName[];
+};
+
+export type ItemImage = {
+  id: string;
+  itemId: string;
+  imageType: string;
+  imageIndex: number;
+  fileSize?: number | null;
+  contentTag?: string | null;
+  source?: string | null;
+  language?: string | null;
+  url: string;
+};
+
+export type ImageSearchResult = {
+  id: string;
+  imageType: string;
+  imageIndex: number;
+  language?: string | null;
+  width?: number | null;
+  height?: number | null;
+  source: string;
+  url: string;
 };
 
 export type HomeResponse = {
@@ -92,6 +146,7 @@ export type AdminLibrary = Library & {
   incrementalSchedule?: string | null;
   reconciliationSchedule?: string | null;
   metadataSchedule?: string | null;
+  mediaStrategy?: MediaStrategySettings | null;
   scanConcurrency?: number;
   probeConcurrency?: number;
   lastScanAt?: string | null;
@@ -103,6 +158,12 @@ export type AdminPlugin = {
   name: string;
   description: string;
   category: string;
+  version?: string | null;
+  runtime?: string | null;
+  capabilities?: string[];
+  status?: string;
+  running?: boolean;
+  lastError?: string | null;
   installed: boolean;
   enabled: boolean;
   configured: boolean;
@@ -199,6 +260,34 @@ export type AdminImage = {
 export type AdminSettings = {
   resumePlayedPercent: number;
   resumeMinTicks: number;
+  mediaStrategy: MediaStrategySettings;
+};
+
+export type MediaStrategySettings = {
+  metadataLanguage: string;
+  imageLanguage: string;
+  region: string;
+  scraperId?: string | null;
+  applyScope: "NEW_CONTENT" | "SELECTED_CONTENT" | "ALL_CONTENT" | string;
+  images: MediaImageStrategySettings;
+  subtitles: MediaSubtitleStrategySettings;
+};
+
+export type MediaImageStrategySettings = {
+  poster: boolean;
+  artwork: boolean;
+  banner: boolean;
+  logo: boolean;
+  thumbnail: boolean;
+  maxBackdropCount: number;
+  minDownloadWidth: number;
+};
+
+export type MediaSubtitleStrategySettings = {
+  autoDownload: boolean;
+  languages: string[];
+  forcedOnly: boolean;
+  hearingImpaired: boolean;
 };
 
 export type ApiErrorBody = {

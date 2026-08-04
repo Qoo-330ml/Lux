@@ -73,7 +73,7 @@ async fn login_me_logout_and_csrf_are_session_backed() -> Result<(), Box<dyn std
         .find(|value| value.starts_with("lux_session="))
         .ok_or("missing session set-cookie")?;
     assert!(session_set_cookie.contains("HttpOnly"));
-    assert!(session_set_cookie.contains("Secure"));
+    assert!(!session_set_cookie.contains("Secure"));
     assert!(session_set_cookie.contains("SameSite=Lax"));
     let cookie_header = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
 

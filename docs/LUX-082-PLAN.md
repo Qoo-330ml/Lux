@@ -2,11 +2,12 @@
 
 ## 范围
 
-提供一次 Lux 首页请求所需的继续观看和媒体库入口，并补齐 Emby Latest；继续观看使用现有用户状态和媒体库 ACL。
+提供一次 Lux 首页请求所需的继续观看、媒体库入口和每个媒体库的最新资源横栏，并补齐 Emby Latest；继续观看和最新资源使用现有用户状态和媒体库 ACL。
 
 ## 实现
 
 - [x] 新增 `GET /api/v1/home`，返回继续观看摘要和可见媒体库入口。
+- [x] 首页每个可见媒体库入口返回最多 12 条按 `added_at` 倒序的 `latest` 资源，避免前端逐库请求。
 - [x] 新增 `GET /Users/{userId}/Items/Latest`，复用 ACL、筛选和稳定排序路径。
 - [x] Latest 使用 DateCreated/UUID v7 倒序作为当前稳定的最近添加排序。
 

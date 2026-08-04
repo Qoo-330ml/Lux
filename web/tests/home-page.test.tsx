@@ -27,6 +27,7 @@ describe("HomePage shelves", () => {
         name: "华语电影",
         kind: "MOVIE",
         coverImageUrl: "/covers/chinese.jpg",
+        latest: [{ id: "latest-1", title: "最新华语片", itemType: "MOVIE" }],
       }],
       recommended: [],
       continueWatching: [],
@@ -53,6 +54,8 @@ describe("HomePage shelves", () => {
 
     expect(container.querySelector('[aria-label="我的媒体库"] .lux-library-card')?.textContent)
       .toContain("华语电影");
+    expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
+      .toContain("最新华语片");
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
 });

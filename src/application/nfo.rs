@@ -18,9 +18,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::application::metadata::{
-    MetadataField, NfoError, NfoMetadata, find_nfo_path, nfo_fingerprint, parse_nfo,
+    MetadataField, MetadataSource, MetadataState, NfoError, NfoMetadata, find_nfo_path,
+    nfo_fingerprint, parse_nfo,
 };
-use crate::storage::{Database, StorageError};
+use crate::storage::{Database, MediaMetadataUpdate, StorageError};
 
 pub fn rewrite_nfo(original: &[u8], patch: &NfoMetadata) -> Result<Vec<u8>, NfoWriteError> {
     if original.is_empty() {
@@ -258,6 +259,140 @@ impl NfoWriteService {
             fingerprint,
         })
     }
+}
+
+#[derive(Clone)]
+pub struct MetadataWriteService {
+    database: Database,
+    nfo: NfoWriteService,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataWriteRequest {
+    pub title: String,
+    pub original_title: Option<String>,
+    pub overview: Option<String>,
+    pub production_year: Option<i32>,
+    pub locked_fields: BTreeSet<MetadataField>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataWriteResult {
+    pub title: String,
+    pub original_title: Option<String>,
+    pub overview: Option<String>,
+    pub production_year: Option<i32>,
+    pub locked_fields: BTreeSet<MetadataField>,
+}
+
+impl MetadataWriteService {
+    pub fn new(database: Database) -> Self {
+        Self {
+            nfo: NfoWriteService::new(database.clone()),
+            database,
+        }
+    }
+
+    pub async fn write_item_metadata(
+        &self,
+        item_id: &str,
+        request: MetadataWriteRequest,
+    ) -> Result<MetadataWriteResult, NfoWriteError> {
+        let current = self
+            .database
+            .find_media_item_metadata(item_id)
+            .await?
+            .ok_or(NfoWriteError::ItemNotFound)?;
+        let mut title = request.title.trim().to_owned();
+        if title.is_empty() {
+            return Err(NfoWriteError::InvalidMetadata(
+                "title must not be empty".to_owned(),
+            ));
+        }
+        if title.len() > 512 {
+            return Err(NfoWriteError::InvalidMetadata(
+                "title is too long".to_owned(),
+            ));
+        }
+        let original_title = normalize_metadata_text(request.original_title, 512);
+        let overview = normalize_metadata_text(request.overview, 256 * 1024);
+        if let Some(year) = request.production_year
+            && !(1800..=2200).contains(&year)
+        {
+            return Err(NfoWriteError::InvalidMetadata(
+                "production year is out of range".to_owned(),
+            ));
+        }
+
+        let mut state = MetadataState::from_persisted(
+            NfoMetadata {
+                title: Some(current.title),
+                original_title: current.original_title,
+                overview: current.overview,
+                production_year: current
+                    .production_year
+                    .and_then(|year| i32::try_from(year).ok()),
+            },
+            current.provenance_json.as_deref(),
+            current.locked_fields_json.as_deref(),
+        );
+        state.metadata = NfoMetadata {
+            title: Some(std::mem::take(&mut title)),
+            original_title: original_title.clone(),
+            overview: overview.clone(),
+            production_year: request.production_year,
+        };
+        state.locked_fields = request.locked_fields;
+        for field in [
+            MetadataField::Title,
+            MetadataField::OriginalTitle,
+            MetadataField::Overview,
+            MetadataField::ProductionYear,
+        ] {
+            let has_value = match field {
+                MetadataField::Title => state.metadata.title.is_some(),
+                MetadataField::OriginalTitle => state.metadata.original_title.is_some(),
+                MetadataField::Overview => state.metadata.overview.is_some(),
+                MetadataField::ProductionYear => state.metadata.production_year.is_some(),
+            };
+            if !has_value {
+                state.provenance.remove(&field);
+            } else if state.locked_fields.contains(&field) {
+                state.provenance.insert(field, MetadataSource::LockedLocal);
+            } else {
+                state.provenance.insert(field, MetadataSource::LocalNfo);
+            }
+        }
+
+        let report = self.nfo.write_item_nfo(item_id, &state.metadata).await?;
+        let provenance_json = state.provenance_json();
+        let locked_fields_json = state.locked_fields_json();
+        self.database
+            .update_media_item_metadata(MediaMetadataUpdate {
+                item_id,
+                title: state.metadata.title.as_deref().unwrap_or_default(),
+                original_title: state.metadata.original_title.as_deref(),
+                overview: state.metadata.overview.as_deref(),
+                production_year: state.metadata.production_year.map(i64::from),
+                metadata_fingerprint: &report.fingerprint,
+                provenance_json: &provenance_json,
+                locked_fields_json: &locked_fields_json,
+            })
+            .await?;
+        Ok(MetadataWriteResult {
+            title: state.metadata.title.unwrap_or_default(),
+            original_title: state.metadata.original_title,
+            overview: state.metadata.overview,
+            production_year: state.metadata.production_year,
+            locked_fields: state.locked_fields,
+        })
+    }
+}
+
+fn normalize_metadata_text(value: Option<String>, max_bytes: usize) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty() && value.len() <= max_bytes)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -499,6 +634,7 @@ fn io_error(path: &Path, source: std::io::Error) -> NfoWriteError {
 pub enum NfoWriteError {
     Nfo(NfoError),
     ItemNotFound,
+    InvalidMetadata(String),
     InvalidXml(String),
     Io {
         path: PathBuf,
@@ -515,6 +651,7 @@ impl fmt::Display for NfoWriteError {
         match self {
             Self::Nfo(error) => error.fmt(formatter),
             Self::ItemNotFound => formatter.write_str("media item has no local media source"),
+            Self::InvalidMetadata(message) => formatter.write_str(message),
             Self::InvalidXml(error) => write!(formatter, "NFO rewrite failed: {error}"),
             Self::Io { path, source } => {
                 write!(formatter, "NFO write '{}': {source}", path.display())

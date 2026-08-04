@@ -91,13 +91,13 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
             "degraded"
         }
     );
-    assert_eq!(body["schemaVersion"], 23);
+    assert_eq!(body["schemaVersion"], 28);
     assert_eq!(body["database"]["status"], "ok");
     assert_eq!(body["database"]["writable"], true);
     assert_eq!(body["config"]["available"], true);
     assert_eq!(body["config"]["writable"], true);
     assert!(body["ffprobe"]["available"].is_boolean());
-    assert_eq!(body["tmdb"]["configured"], false);
+    assert_eq!(body["tmdb"]["configured"], true);
     assert_eq!(body["libraries"][0]["rootCount"], 1);
     assert!(body.get("configDir").is_none());
     let body_text = body.to_string();

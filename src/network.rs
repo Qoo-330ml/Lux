@@ -28,16 +28,30 @@ impl RemoteAccessPolicy {
         let Some(peer) = peer.and_then(|value| value.parse::<IpAddr>().ok()) else {
             return false;
         };
-        let client = if self
-            .trusted_proxies
-            .iter()
-            .any(|proxy| proxy.contains(peer))
-        {
+        let client = if self.is_trusted_ip(peer) {
             forwarded_for.and_then(first_forwarded_ip).unwrap_or(peer)
         } else {
             peer
         };
         is_public_address(client)
+    }
+
+    pub fn is_trusted_proxy(&self, peer: Option<&str>) -> bool {
+        peer.and_then(|value| value.parse::<IpAddr>().ok())
+            .is_some_and(|peer| self.is_trusted_ip(peer))
+    }
+
+    pub fn is_secure_request(&self, peer: Option<&str>, forwarded_proto: Option<&str>) -> bool {
+        self.is_trusted_proxy(peer)
+            && forwarded_proto
+                .and_then(first_forwarded_proto)
+                .is_some_and(|value| value.eq_ignore_ascii_case("https"))
+    }
+
+    fn is_trusted_ip(&self, peer: IpAddr) -> bool {
+        self.trusted_proxies
+            .iter()
+            .any(|proxy| proxy.contains(peer))
     }
 }
 
@@ -101,6 +115,14 @@ fn first_forwarded_ip(value: &str) -> Option<IpAddr> {
         .next()
         .map(str::trim)
         .and_then(|value| value.parse::<IpAddr>().ok())
+}
+
+fn first_forwarded_proto(value: &str) -> Option<&str> {
+    value
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn is_public_address(address: IpAddr) -> bool {

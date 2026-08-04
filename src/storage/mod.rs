@@ -554,7 +554,8 @@ impl Database {
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
-                    cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag
+                    cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
+                    media_strategy_json
              FROM libraries ORDER BY name, id",
         )
         .fetch_all(&self.pool)
@@ -578,6 +579,7 @@ impl Database {
                     cover_image_content_type: row.get("cover_image_content_type"),
                     cover_image_size: row.get("cover_image_size"),
                     cover_image_tag: row.get("cover_image_tag"),
+                    media_strategy_json: row.get("media_strategy_json"),
                 })
                 .collect()
         })
@@ -595,7 +597,8 @@ impl Database {
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
-                    cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag
+                    cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
+                    media_strategy_json
              FROM libraries WHERE id = ?",
         )
         .bind(id)
@@ -619,6 +622,7 @@ impl Database {
                 cover_image_content_type: row.get("cover_image_content_type"),
                 cover_image_size: row.get("cover_image_size"),
                 cover_image_tag: row.get("cover_image_tag"),
+                media_strategy_json: row.get("media_strategy_json"),
             })
         })
         .map_err(|source| StorageError::Sqlx {
@@ -802,6 +806,21 @@ impl Database {
             sqlx::query(
                 "UPDATE libraries
                  SET scraper_id = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        if let Some(value) = settings.media_strategy_json {
+            sqlx::query(
+                "UPDATE libraries
+                 SET media_strategy_json = ?, updated_at = unixepoch()
                  WHERE id = ?",
             )
             .bind(value)
@@ -1085,10 +1104,11 @@ impl Database {
         Ok((percent, min_ticks))
     }
 
-    pub(crate) async fn set_resume_settings(
+    pub(crate) async fn set_server_settings(
         &self,
         percent: i64,
         min_ticks: i64,
+        media_strategy: &str,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -1101,6 +1121,7 @@ impl Database {
         for (key, value) in [
             ("resume_played_percent", percent.to_string()),
             ("resume_min_ticks", min_ticks.to_string()),
+            ("media_strategy", media_strategy.to_owned()),
         ] {
             sqlx::query(
                 "INSERT INTO server_settings (key, value)
@@ -1123,6 +1144,19 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn media_strategy_settings(&self) -> Result<Option<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT value FROM server_settings
+             WHERE key = 'media_strategy'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn set_user_item_played(
@@ -2332,6 +2366,146 @@ impl Database {
         })
     }
 
+    pub(crate) async fn update_media_source_variant_labels(
+        &self,
+        filesystem_entry_id: &str,
+        edition_name: Option<&str>,
+        quality_label: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE media_sources
+             SET edition_name = ?, quality_label = ?, updated_at = unixepoch()
+             WHERE filesystem_entry_id = ?",
+        )
+        .bind(edition_name)
+        .bind(quality_label)
+        .bind(filesystem_entry_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn reassign_media_source_item(
+        &self,
+        filesystem_entry_id: &str,
+        new_item_id: &str,
+    ) -> Result<bool, StorageError> {
+        let Some((old_item_id, parent_id, series_id)) =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                "SELECT ms.item_id, old_item.parent_id, old_item.series_id
+             FROM media_sources ms
+             JOIN media_items old_item ON old_item.id = ms.item_id
+             WHERE ms.filesystem_entry_id = ?",
+            )
+            .bind(filesystem_entry_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(false);
+        };
+        if old_item_id == new_item_id {
+            return Ok(false);
+        }
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                user_id, item_id, position_ticks, is_played, is_favorite,
+                play_count, last_played_at, version
+             )
+             SELECT user_id, ?, position_ticks, is_played, is_favorite,
+                    play_count, last_played_at, version
+             FROM user_item_state
+             WHERE item_id = ?
+             ON CONFLICT(user_id, item_id) DO UPDATE SET
+                position_ticks = MAX(user_item_state.position_ticks, excluded.position_ticks),
+                is_played = MAX(user_item_state.is_played, excluded.is_played),
+                is_favorite = MAX(user_item_state.is_favorite, excluded.is_favorite),
+                play_count = MAX(user_item_state.play_count, excluded.play_count),
+                last_played_at = MAX(user_item_state.last_played_at, excluded.last_played_at),
+                version = MAX(user_item_state.version, excluded.version)",
+        )
+        .bind(new_item_id)
+        .bind(&old_item_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        sqlx::query("DELETE FROM user_item_state WHERE item_id = ?")
+            .bind(&old_item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "UPDATE media_sources
+             SET item_id = ?, updated_at = unixepoch()
+             WHERE filesystem_entry_id = ?",
+        )
+        .bind(new_item_id)
+        .bind(filesystem_entry_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        for item_id in [Some(old_item_id), parent_id, series_id]
+            .into_iter()
+            .flatten()
+        {
+            sqlx::query(
+                "UPDATE media_items
+                 SET removed_at = unixepoch()
+                 WHERE id = ?
+                   AND removed_at IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM media_sources WHERE item_id = media_items.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM media_items child
+                       WHERE child.parent_id = media_items.id
+                         AND child.removed_at IS NULL
+                   )",
+            )
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn insert_filesystem_entry(
         &self,
         entry: NewFilesystemEntry<'_>,
@@ -3089,6 +3263,60 @@ impl Database {
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
 
+    pub(crate) async fn list_recent_catalog_rows_by_library(
+        &self,
+        library_ids: &[String],
+        limit: i64,
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "WITH ranked AS (
+                 SELECT mi.id, mi.library_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY mi.library_id
+                            ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC
+                        ) AS library_rank
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type IN ('MOVIE', 'SERIES')
+                   AND mi.library_id IN ({placeholders})
+             )
+             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    mi.title, mi.sort_title, mi.original_title, mi.overview,
+                    mi.production_year, mi.runtime_ticks,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
+                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
+             FROM ranked
+             JOIN media_items mi ON mi.id = ranked.id
+             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             WHERE ranked.library_rank <= ?
+             ORDER BY ranked.library_id, ranked.library_rank, ms.id, mt.stream_index"
+        );
+        let mut binds = Vec::with_capacity(library_ids.len() + 1);
+        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
+        binds.push(CatalogBind::Integer(limit));
+        self.fetch_catalog_rows(&query, &binds).await
+    }
+
     pub(crate) async fn list_recommended_catalog_rows(
         &self,
         user_id: &str,
@@ -3144,6 +3372,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3203,6 +3432,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3283,6 +3513,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3366,6 +3597,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3410,6 +3642,7 @@ impl Database {
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
+                        mt.details_json AS stream_details_json,
                         mt.is_external AS stream_is_external,
                         mt.is_default AS stream_is_default,
                         mt.is_forced AS stream_is_forced
@@ -3447,6 +3680,7 @@ impl Database {
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                         mt.id AS stream_id, mt.stream_index, mt.stream_type,
                         mt.codec, mt.language, mt.title AS stream_title,
+                        mt.details_json AS stream_details_json,
                         mt.is_external AS stream_is_external,
                         mt.is_default AS stream_is_default,
                         mt.is_forced AS stream_is_forced
@@ -3488,6 +3722,7 @@ impl Database {
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
                     mt.id AS stream_id, mt.stream_index, mt.stream_type,
                     mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
@@ -3554,6 +3789,7 @@ impl Database {
                         codec: row.get("codec"),
                         language: row.get("language"),
                         stream_title: row.get("stream_title"),
+                        stream_details_json: row.get("stream_details_json"),
                         stream_is_external: row
                             .get::<Option<i64>, _>("stream_is_external")
                             .map(|value| value != 0),
@@ -4512,6 +4748,7 @@ pub(crate) struct StoredLibrary {
     pub(crate) cover_image_content_type: Option<String>,
     pub(crate) cover_image_size: Option<i64>,
     pub(crate) cover_image_tag: Option<String>,
+    pub(crate) media_strategy_json: Option<String>,
 }
 
 #[derive(Debug)]
@@ -4775,6 +5012,7 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) codec: Option<String>,
     pub(crate) language: Option<String>,
     pub(crate) stream_title: Option<String>,
+    pub(crate) stream_details_json: Option<String>,
     pub(crate) stream_is_external: Option<bool>,
     pub(crate) stream_is_default: Option<bool>,
     pub(crate) stream_is_forced: Option<bool>,
@@ -5059,6 +5297,7 @@ pub(crate) struct LibrarySettingsUpdate<'a> {
     pub(crate) scan_concurrency: Option<i64>,
     pub(crate) probe_concurrency: Option<i64>,
     pub(crate) scraper_id: Option<Option<&'a str>>,
+    pub(crate) media_strategy_json: Option<Option<&'a str>>,
 }
 
 pub(crate) struct NewLibraryRoot<'a> {

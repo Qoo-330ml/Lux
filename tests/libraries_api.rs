@@ -454,6 +454,46 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         .await?;
     assert_eq!(second_update.status(), reqwest::StatusCode::OK);
 
+    let library_strategy = json!({
+        "metadataLanguage": "ja-JP",
+        "imageLanguage": "ja",
+        "region": "JP",
+        "scraperId": null,
+        "applyScope": "NEW_CONTENT",
+        "images": {
+            "poster": true,
+            "artwork": true,
+            "banner": false,
+            "logo": true,
+            "thumbnail": false,
+            "maxBackdropCount": 3,
+            "minDownloadWidth": 1920
+        },
+        "subtitles": {
+            "autoDownload": true,
+            "languages": ["ja", "zh-CN"],
+            "forcedOnly": false,
+            "hearingImpaired": false
+        }
+    });
+    let strategy_update = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/libraries/{}",
+            library_ids[0]
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mediaStrategy": library_strategy }))
+        .send()
+        .await?;
+    assert_eq!(strategy_update.status(), reqwest::StatusCode::OK);
+    let strategy_body: Value = strategy_update.json().await?;
+    assert_eq!(strategy_body["library"]["mediaStrategy"]["region"], "JP");
+    assert_eq!(
+        strategy_body["library"]["mediaStrategy"]["images"]["maxBackdropCount"],
+        3
+    );
+
     let listed = client
         .get(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookies)
@@ -480,6 +520,23 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     assert_eq!(second["incrementalSchedule"], "interval:2h");
     assert_eq!(second["reconciliationSchedule"], Value::Null);
     assert_eq!(second["scanConcurrency"], 7);
+    assert_eq!(first["mediaStrategy"]["imageLanguage"], "ja");
+
+    let inherited = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/libraries/{}",
+            library_ids[0]
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mediaStrategy": null }))
+        .send()
+        .await?;
+    assert_eq!(inherited.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        inherited.json::<Value>().await?["library"]["mediaStrategy"],
+        Value::Null
+    );
 
     let scheduled_tasks: Vec<(String, String, Option<String>, i64, String)> = sqlx::query_as(
         "SELECT owner_id, task_type, cron_or_interval, is_enabled, resource_limit_json

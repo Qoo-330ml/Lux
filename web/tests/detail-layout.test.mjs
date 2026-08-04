@@ -18,3 +18,11 @@ test("active React pages do not render global back controls", () => {
 
   assert.doesNotMatch(sources, /className="lux-detail-back"|lux-player-topbar[^\n]*返回媒体详情|className="lux-admin-back"/);
 });
+
+test("detail page uses a compact title and a three-line expandable overview", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+
+  assert.match(stylesheet, /\.lux-detail-copy h1\s*\{[^}]*font-size:\s*36px/);
+  assert.match(stylesheet, /\.lux-detail-overview-text\s*\{[^}]*max-height:\s*calc\(1\.7em\s*\*\s*3\)/);
+  assert.match(stylesheet, /\.lux-detail-overview-more\.is-underlined\s*\{[^}]*text-decoration:\s*underline/);
+});

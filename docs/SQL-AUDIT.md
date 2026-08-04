@@ -6,7 +6,7 @@
 
 - 日期：2026-08-03
 - 架构：macOS `arm64`
-- 数据库：从空目录启动 `target/debug/luxd`，自动运行 migration 至 schema version 23
+- 数据库：从空目录启动 `target/debug/luxd`，自动运行 migration 至 schema version 28
 - 工具：SQLite `EXPLAIN QUERY PLAN`
 
 实际输出：

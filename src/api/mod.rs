@@ -1,7 +1,10 @@
 pub mod lux;
 
 use std::{
+    collections::BTreeMap,
     path::{Component, Path as FsPath, PathBuf},
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -17,7 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::fs;
 use tower_http::{
@@ -29,6 +32,7 @@ use tower_http::{
 
 use crate::{
     COMMIT, VERSION,
+    application::downloads::{DownloadArtifact, DownloadError, DownloadService},
     application::playback::{ByteRange, RangeError, parse_single_range},
     application::probe::{FfprobeRunner, MediaProbeService},
     application::setup::{SetupError, SetupService},
@@ -48,6 +52,8 @@ use crate::{
         },
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
+        metadata::MetadataField,
+        nfo::{MetadataWriteRequest, MetadataWriteService, NfoWriteError},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
@@ -66,7 +72,7 @@ use crate::{
     storage::{Database, NewPlaybackEvent, StorageError},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf, SeekFrom},
     process::Command,
 };
 
@@ -86,6 +92,8 @@ pub struct AppState {
     access: Option<MediaAccessService>,
     metadata_candidates: Option<MetadataCandidateService>,
     metadata_selection: Option<MetadataSelectionService>,
+    metadata_writes: Option<MetadataWriteService>,
+    downloads: Option<DownloadService>,
     metadata_reidentify: Option<MetadataReidentifyService>,
     probe: Option<MediaProbeService>,
     scan_jobs: Option<ScanJobService>,
@@ -141,6 +149,11 @@ impl AppState {
             access: Some(access),
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
+            metadata_writes: Some(MetadataWriteService::new(database.clone())),
+            downloads: Some(DownloadService::new(
+                database.clone(),
+                config_dir.clone().join("downloads"),
+            )),
             metadata_reidentify,
             probe: Some(MediaProbeService::new(
                 database.clone(),
@@ -338,6 +351,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/items/{item_id}/progress", post(lux_post_progress))
         .route("/api/v1/items/{item_id}/favorite", put(lux_set_favorite))
         .route("/api/v1/items/{item_id}/played", put(lux_set_played))
+        .route(
+            "/api/v1/items/{item_id}/metadata",
+            get(lux_get_metadata).patch(lux_update_metadata),
+        )
         .route(
             "/api/v1/items/{item_id}/download",
             get(lux_download).head(lux_download),
@@ -1935,6 +1952,7 @@ fn emby_media_source_json(
         "Size": source.size,
         "Bitrate": source.bitrate,
         "RunTimeTicks": source.duration_ticks,
+        "Path": source.external_url,
         "IsDefault": source.is_default,
         "Protocol": if is_remote { "Http" } else { "File" },
         "Type": "Default",
@@ -1943,17 +1961,31 @@ fn emby_media_source_json(
         "SupportsDirectStream": false,
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
-        "MediaStreams": source.streams.iter().map(|stream| json!({
-            "Index": stream.index,
-            "Type": emby_stream_type(&stream.stream_type),
-            "Codec": stream.codec,
-            "Language": stream.language,
-            "DisplayTitle": stream.title,
-            "IsExternal": stream.is_external,
-            "IsDefault": stream.is_default,
-            "IsForced": stream.is_forced,
-        })).collect::<Vec<_>>(),
+        "MediaStreams": source
+            .streams
+            .iter()
+            .map(emby_media_stream_json)
+            .collect::<Vec<_>>(),
     })
+}
+
+fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
+    let mut value = json!({
+        "Index": stream.index,
+        "Type": emby_stream_type(&stream.stream_type),
+        "Codec": stream.codec,
+        "Language": stream.language,
+        "DisplayTitle": stream.title,
+        "IsExternal": stream.is_external,
+        "IsDefault": stream.is_default,
+        "IsForced": stream.is_forced,
+    });
+    if let Value::Object(object) = &mut value {
+        for (key, detail) in &stream.details {
+            object.entry(key.clone()).or_insert_with(|| detail.clone());
+        }
+    }
+    value
 }
 
 fn emby_library_view_json(library: &LibraryRecord, server_id: &str) -> Value {
@@ -2318,8 +2350,14 @@ async fn auth_login(
     }
 
     let mut response_headers = HeaderMap::new();
-    let Some(session_cookie) = build_cookie("lux_session", &session.session_token, true, None)
-    else {
+    let secure_cookie = secure_cookie_for_request(&headers, &state.remote_access);
+    let Some(session_cookie) = build_cookie(
+        "lux_session",
+        &session.session_token,
+        true,
+        None,
+        secure_cookie,
+    ) else {
         return api_error(
             &headers,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2328,7 +2366,9 @@ async fn auth_login(
         )
         .into_response();
     };
-    let Some(csrf_cookie) = build_cookie("lux_csrf", &session.csrf_token, false, None) else {
+    let Some(csrf_cookie) =
+        build_cookie("lux_csrf", &session.csrf_token, false, None, secure_cookie)
+    else {
         return api_error(
             &headers,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2594,10 +2634,11 @@ async fn auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Respo
     }
 
     let mut response_headers = HeaderMap::new();
-    if let Some(cookie) = build_cookie("lux_session", "", true, Some(0)) {
+    let secure_cookie = secure_cookie_for_request(&headers, &state.remote_access);
+    if let Some(cookie) = build_cookie("lux_session", "", true, Some(0), secure_cookie) {
         response_headers.append(SET_COOKIE, cookie);
     }
-    if let Some(cookie) = build_cookie("lux_csrf", "", false, Some(0)) {
+    if let Some(cookie) = build_cookie("lux_csrf", "", false, Some(0), secure_cookie) {
         response_headers.append(SET_COOKIE, cookie);
     }
     (StatusCode::NO_CONTENT, response_headers).into_response()
@@ -2827,12 +2868,37 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let recommended = match catalog
-        .list_recommended(principal, &user.id.to_string(), 0, 12)
+        .list_recommended(principal, &user.id.to_string(), 12)
         .await
     {
         Ok(items) => items,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let latest_groups = match catalog.list_recently_added_by_library(principal, 12).await {
+        Ok(groups) => groups,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let latest_items = latest_groups
+        .iter()
+        .flat_map(|(_, items)| items.iter().cloned())
+        .collect::<Vec<_>>();
+    let latest_values = match lux_catalog_items_json_for_user(
+        database,
+        &user.id.to_string(),
+        &latest_items,
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut latest_by_library = BTreeMap::<String, Vec<Value>>::new();
+    for (item, value) in latest_items.iter().zip(latest_values) {
+        latest_by_library
+            .entry(item.library_id.clone())
+            .or_default()
+            .push(value);
+    }
     let views = match libraries.list_libraries().await {
         Ok(views) => views,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2854,6 +2920,10 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
                 "name": view.library.name,
                 "kind": view.library.kind.as_str(),
                 "coverImageUrl": library_cover_url(&view.library),
+                "latest": latest_by_library
+                    .get(&view.library.id.to_string())
+                    .cloned()
+                    .unwrap_or_default(),
             })),
             Ok(false) => {}
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -3292,6 +3362,141 @@ async fn lux_get_item(
     }
 }
 
+async fn lux_get_metadata(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_media_item_metadata(&item_id).await {
+        Ok(Some(metadata)) => Json(metadata_json(
+            &metadata.title,
+            metadata.original_title.as_deref(),
+            metadata.overview.as_deref(),
+            metadata.production_year,
+            metadata.locked_fields_json.as_deref(),
+        ))
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn lux_update_metadata(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateItemMetadataRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(writes) = state.metadata_writes.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match writes
+        .write_item_metadata(
+            &item_id,
+            MetadataWriteRequest {
+                title: request.title,
+                original_title: request.original_title,
+                overview: request.overview,
+                production_year: request.production_year,
+                locked_fields: request.locked_fields.into_iter().collect(),
+            },
+        )
+        .await
+    {
+        Ok(result) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "METADATA_EDITED",
+                Some("item"),
+                Some(&item_id),
+                "{}",
+            )
+            .await;
+            let locked_fields_json =
+                serde_json::to_string(&result.locked_fields).unwrap_or_else(|_| "[]".to_owned());
+            Json(metadata_json(
+                &result.title,
+                result.original_title.as_deref(),
+                result.overview.as_deref(),
+                result.production_year.map(i64::from),
+                Some(&locked_fields_json),
+            ))
+            .into_response()
+        }
+        Err(error) => metadata_write_error(&headers, error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateItemMetadataRequest {
+    title: String,
+    original_title: Option<String>,
+    overview: Option<String>,
+    production_year: Option<i32>,
+    #[serde(default)]
+    locked_fields: Vec<MetadataField>,
+}
+
+fn metadata_json(
+    title: &str,
+    original_title: Option<&str>,
+    overview: Option<&str>,
+    production_year: Option<i64>,
+    locked_fields_json: Option<&str>,
+) -> Value {
+    let locked_fields = locked_fields_json
+        .and_then(|value| serde_json::from_str::<Vec<MetadataField>>(value).ok())
+        .unwrap_or_default();
+    json!({
+        "title": title,
+        "originalTitle": original_title,
+        "overview": overview,
+        "productionYear": production_year,
+        "lockedFields": locked_fields,
+    })
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct LuxChildrenQuery {
@@ -3592,18 +3797,42 @@ async fn lux_download(
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let mut response = serve_media_file(
-        &state,
-        AccessPrincipal::new(user.id, user.is_admin),
-        &headers,
-        &method,
-        &item_id,
-        query.source_id.as_deref(),
-        None,
-    )
-    .await;
-    add_download_header(&mut response);
-    response
+    let Some(downloads) = state.downloads.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let artifact = match downloads
+        .prepare(&item_id, query.source_id.as_deref())
+        .await
+    {
+        Ok(artifact) => artifact,
+        Err(DownloadError::ItemNotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(DownloadError::PathOutsideRoot(_)) => return StatusCode::FORBIDDEN.into_response(),
+        Err(DownloadError::InvalidFileName(_)) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(DownloadError::Archive(_) | DownloadError::Io(_) | DownloadError::Storage(_)) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    match artifact {
+        DownloadArtifact::File { file_name, .. } => {
+            let mut response = serve_media_file(
+                &state,
+                AccessPrincipal::new(user.id, user.is_admin),
+                &headers,
+                &method,
+                &item_id,
+                query.source_id.as_deref(),
+                None,
+            )
+            .await;
+            add_download_header_with_name(&mut response, &file_name);
+            response
+        }
+        DownloadArtifact::Archive {
+            path,
+            file_name,
+            size,
+        } => serve_download_archive(&method, path, &file_name, size).await,
+    }
 }
 
 async fn emby_image(
@@ -3858,6 +4087,104 @@ fn add_download_header(response: &mut Response) {
             "Content-Disposition",
             HeaderValue::from_static("attachment"),
         );
+    }
+}
+
+fn add_download_header_with_name(response: &mut Response, file_name: &str) {
+    if !response.status().is_success() {
+        return;
+    }
+    let encoded = percent_encode_filename(file_name);
+    let value = format!("attachment; filename=\"download\"; filename*=UTF-8''{encoded}");
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        response.headers_mut().insert("Content-Disposition", value);
+    } else {
+        add_download_header(response);
+    }
+}
+
+fn percent_encode_filename(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                vec![char::from(*byte)]
+            } else {
+                format!("%{byte:02X}").chars().collect()
+            }
+        })
+        .collect()
+}
+
+async fn serve_download_archive(
+    method: &Method,
+    path: PathBuf,
+    file_name: &str,
+    size: u64,
+) -> Response {
+    let Ok(file) = fs::File::open(&path).await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from_stream(tokio_util::io::ReaderStream::new(CleanupFile::new(file, path)))
+    };
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        "Content-Type",
+        HeaderValue::from_static("application/zip"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&size.to_string()) {
+        response.headers_mut().insert("Content-Length", value);
+    }
+    add_download_header_with_name(&mut response, file_name);
+    response
+}
+
+struct CleanupFile {
+    file: fs::File,
+    path: Option<PathBuf>,
+}
+
+impl CleanupFile {
+    fn new(file: fs::File, path: PathBuf) -> Self {
+        Self {
+            file,
+            path: Some(path),
+        }
+    }
+
+    fn cleanup(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = fs::remove_file(path).await;
+        });
+    }
+}
+
+impl AsyncRead for CleanupFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        match Pin::new(&mut self.file).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) if buffer.filled().len() == before => {
+                self.cleanup();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                self.cleanup();
+                Poll::Ready(Err(error))
+            }
+            result => result,
+        }
     }
 }
 
@@ -4285,6 +4612,7 @@ fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) 
             "isExternal": stream.is_external,
             "isDefault": stream.is_default,
             "isForced": stream.is_forced,
+            "details": &stream.details,
         })).collect::<Vec<_>>(),
     })
 }
@@ -4319,6 +4647,8 @@ struct UpdateLibraryRequest {
     metadata_schedule: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     scraper_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    media_strategy: Option<Option<MediaStrategySettings>>,
     scan_concurrency: Option<i64>,
     probe_concurrency: Option<i64>,
 }
@@ -4367,14 +4697,20 @@ async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Re
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match database.resume_settings().await {
-        Ok((played_percent, minimum_ticks)) => Json(json!({
-            "resumePlayedPercent": played_percent,
-            "resumeMinTicks": minimum_ticks,
-        }))
-        .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    let (played_percent, minimum_ticks) = match database.resume_settings().await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let media_strategy = match read_media_strategy_settings(database).await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(json!({
+        "resumePlayedPercent": played_percent,
+        "resumeMinTicks": minimum_ticks,
+        "mediaStrategy": media_strategy,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -4382,6 +4718,106 @@ async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Re
 struct UpdatePlaybackSettingsRequest {
     resume_played_percent: Option<i64>,
     resume_min_ticks: Option<i64>,
+    media_strategy: Option<MediaStrategySettings>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaStrategySettings {
+    metadata_language: String,
+    image_language: String,
+    region: String,
+    scraper_id: Option<String>,
+    apply_scope: String,
+    images: MediaImageStrategySettings,
+    subtitles: MediaSubtitleStrategySettings,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaImageStrategySettings {
+    poster: bool,
+    artwork: bool,
+    banner: bool,
+    logo: bool,
+    thumbnail: bool,
+    max_backdrop_count: i64,
+    min_download_width: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaSubtitleStrategySettings {
+    auto_download: bool,
+    languages: Vec<String>,
+    forced_only: bool,
+    hearing_impaired: bool,
+}
+
+impl Default for MediaStrategySettings {
+    fn default() -> Self {
+        Self {
+            metadata_language: "zh-CN".to_owned(),
+            image_language: "zh-CN".to_owned(),
+            region: "CN".to_owned(),
+            scraper_id: None,
+            apply_scope: "NEW_CONTENT".to_owned(),
+            images: MediaImageStrategySettings {
+                poster: true,
+                artwork: false,
+                banner: false,
+                logo: true,
+                thumbnail: true,
+                max_backdrop_count: 1,
+                min_download_width: 1280,
+            },
+            subtitles: MediaSubtitleStrategySettings {
+                auto_download: false,
+                languages: vec!["zh-CN".to_owned()],
+                forced_only: false,
+                hearing_impaired: false,
+            },
+        }
+    }
+}
+
+async fn read_media_strategy_settings(database: &Database) -> Result<MediaStrategySettings, ()> {
+    let stored = database.media_strategy_settings().await.map_err(|_| ())?;
+    match stored {
+        Some(value) => serde_json::from_str(&value).map_err(|_| ()),
+        None => Ok(MediaStrategySettings::default()),
+    }
+}
+
+fn valid_strategy_code(value: &str, max_length: usize) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= max_length
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+fn validate_media_strategy(settings: &MediaStrategySettings) -> bool {
+    valid_strategy_code(&settings.metadata_language, 32)
+        && valid_strategy_code(&settings.image_language, 32)
+        && valid_strategy_code(&settings.region, 16)
+        && matches!(
+            settings.apply_scope.as_str(),
+            "NEW_CONTENT" | "SELECTED_CONTENT" | "ALL_CONTENT"
+        )
+        && settings
+            .scraper_id
+            .as_deref()
+            .map(|value| valid_strategy_code(value, 64))
+            .unwrap_or(true)
+        && (0..=20).contains(&settings.images.max_backdrop_count)
+        && (0..=8192).contains(&settings.images.min_download_width)
+        && (1..=8).contains(&settings.subtitles.languages.len())
+        && settings
+            .subtitles
+            .languages
+            .iter()
+            .all(|value| valid_strategy_code(value, 32))
 }
 
 async fn admin_update_settings(
@@ -4399,12 +4835,33 @@ async fn admin_update_settings(
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let current_media_strategy = match read_media_strategy_settings(database).await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let percent = request.resume_played_percent.unwrap_or(current_percent);
     let minimum_ticks = request.resume_min_ticks.unwrap_or(current_ticks);
-    if !(1..=100).contains(&percent) || minimum_ticks < 0 {
+    let media_strategy = request.media_strategy.unwrap_or(current_media_strategy);
+    if !(1..=100).contains(&percent)
+        || minimum_ticks < 0
+        || !validate_media_strategy(&media_strategy)
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    match database.set_resume_settings(percent, minimum_ticks).await {
+    if let Some(scraper_id) = media_strategy.scraper_id.as_deref() {
+        if let Err(response) = validate_scraper_selection(&headers, &state, Some(scraper_id)).await
+        {
+            return response;
+        }
+    }
+    let media_strategy_json = match serde_json::to_string(&media_strategy) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match database
+        .set_server_settings(percent, minimum_ticks, &media_strategy_json)
+        .await
+    {
         Ok(()) => {
             record_audit_event(
                 &state,
@@ -4418,6 +4875,7 @@ async fn admin_update_settings(
             Json(json!({
                 "resumePlayedPercent": percent,
                 "resumeMinTicks": minimum_ticks,
+                "mediaStrategy": media_strategy,
             }))
             .into_response()
         }
@@ -6014,6 +6472,49 @@ fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> Response {
     }
 }
 
+fn metadata_write_error(headers: &HeaderMap, error: NfoWriteError) -> Response {
+    match error {
+        NfoWriteError::ItemNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在或没有本地媒体源",
+        )
+        .into_response(),
+        NfoWriteError::InvalidMetadata(_) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "元数据请求无效",
+        )
+        .into_response(),
+        NfoWriteError::PathOutsideRoot(_) | NfoWriteError::SymlinkTarget(_) => api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "元数据路径不在媒体根目录内",
+        )
+        .into_response(),
+        NfoWriteError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据保存暂时不可用",
+        )
+        .into_response(),
+        NfoWriteError::Nfo(_)
+        | NfoWriteError::InvalidXml(_)
+        | NfoWriteError::Io { .. }
+        | NfoWriteError::ConcurrentModification(_) => api_error(
+            headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            "元数据写回失败，可重试",
+        )
+        .into_response(),
+    }
+}
+
 fn metadata_candidate_page_json(page: &MetadataCandidatePage) -> Value {
     json!({
         "items": page.items.iter().map(|item| json!({
@@ -6289,7 +6790,9 @@ async fn admin_update_plugin_config(
     let result = plugins.update_config(&plugin_id, api_key).await;
     match result {
         Ok(plugin) => {
-            if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID {
+            if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID
+                || plugin_id == crate::application::plugins::TMDB_DYNAMIC_PLUGIN_ID
+            {
                 if let Some(tmdb) = state.tmdb.as_ref() {
                     tmdb.set_api_key((!api_key.is_empty()).then_some(api_key))
                         .await;
@@ -6443,6 +6946,32 @@ async fn admin_update_library(
         },
         None => None,
     };
+    let media_strategy_json = match request.media_strategy.as_ref() {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(strategy)) => {
+            if !validate_media_strategy(strategy) {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "媒体库策略无效",
+                )
+                .into_response();
+            }
+            if let Some(scraper_id) = strategy.scraper_id.as_deref() {
+                if let Err(response) =
+                    validate_scraper_selection(&headers, &state, Some(scraper_id)).await
+                {
+                    return response;
+                }
+            }
+            match serde_json::to_string(strategy) {
+                Ok(value) => Some(Some(value)),
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+    };
     let settings = LibrarySettingsPatch {
         name: request.name,
         kind,
@@ -6451,9 +6980,21 @@ async fn admin_update_library(
         incremental_schedule: request.incremental_schedule,
         reconciliation_schedule: request.reconciliation_schedule,
         metadata_schedule: request.metadata_schedule,
+        scraper_id: request.scraper_id.clone(),
+        media_strategy_json,
         scan_concurrency: request.scan_concurrency,
         probe_concurrency: request.probe_concurrency,
     };
+    if let Some(scraper_id) = request
+        .scraper_id
+        .as_ref()
+        .and_then(|value| value.as_deref())
+    {
+        if let Err(response) = validate_scraper_selection(&headers, &state, Some(scraper_id)).await
+        {
+            return response;
+        }
+    }
     match libraries.update_settings(library_id, settings).await {
         Ok(view) => {
             let target_id = library_id.to_string();
@@ -6804,6 +7345,13 @@ fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
             "插件配置保存失败",
         )
         .into_response(),
+        PluginServiceError::Runtime(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            "插件进程暂时不可用",
+        )
+        .into_response(),
         PluginServiceError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6865,6 +7413,10 @@ fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
         "incrementalSchedule": library.incremental_schedule,
         "reconciliationSchedule": library.reconciliation_schedule,
         "metadataSchedule": library.metadata_schedule,
+        "mediaStrategy": library
+            .media_strategy_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok()),
         "scanConcurrency": library.scan_concurrency,
         "probeConcurrency": library.probe_concurrency,
         "lastScanAt": library.last_scan_at,
@@ -6942,13 +7494,25 @@ fn request_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
+fn secure_cookie_for_request(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> bool {
+    policy.is_secure_request(
+        header_str(headers, "x-lux-peer-ip"),
+        header_str(headers, "x-forwarded-proto"),
+    )
+}
+
 fn build_cookie(
     name: &str,
     value: &str,
     http_only: bool,
     max_age: Option<i64>,
+    secure: bool,
 ) -> Option<HeaderValue> {
-    let mut cookie = format!("{name}={value}; Path=/; Secure; SameSite=Lax");
+    let mut cookie = format!("{name}={value}; Path=/;");
+    if secure {
+        cookie.push_str(" Secure;");
+    }
+    cookie.push_str(" SameSite=Lax");
     if http_only {
         cookie.push_str("; HttpOnly");
     }
@@ -6960,13 +7524,139 @@ fn build_cookie(
 
 #[cfg(test)]
 mod tests {
-    use super::safe_trace_path;
-    use axum::http::Uri;
+    use std::collections::BTreeMap;
+
+    use super::{
+        build_cookie, emby_media_source_json, lux_catalog_source_json, safe_trace_path,
+        secure_cookie_for_request,
+    };
+    use crate::application::catalog::{CatalogSource, CatalogStream};
+    use crate::network::RemoteAccessPolicy;
+    use axum::http::{HeaderMap, HeaderValue, Uri};
+
+    #[test]
+    fn direct_http_cookie_is_not_marked_secure() {
+        let headers = HeaderMap::new();
+
+        assert!(!secure_cookie_for_request(
+            &headers,
+            &RemoteAccessPolicy::default()
+        ));
+        let cookie = build_cookie("lux_session", "token", true, None, false)
+            .expect("cookie value should be valid");
+        assert!(
+            !cookie
+                .to_str()
+                .expect("cookie should be valid")
+                .contains("Secure")
+        );
+    }
+
+    #[test]
+    fn trusted_https_forwarding_marks_cookie_secure() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.2"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let policy = RemoteAccessPolicy::from_cidrs(["10.0.0.0/8"])
+            .expect("trusted proxy CIDR should be valid");
+
+        assert!(secure_cookie_for_request(&headers, &policy));
+        let cookie = build_cookie("lux_session", "token", true, None, true)
+            .expect("cookie value should be valid");
+        assert!(
+            cookie
+                .to_str()
+                .expect("cookie should be valid")
+                .contains("Secure")
+        );
+    }
+
+    #[test]
+    fn untrusted_forwarded_https_does_not_mark_cookie_secure() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.2"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        assert!(!secure_cookie_for_request(
+            &headers,
+            &RemoteAccessPolicy::default()
+        ));
+    }
 
     #[test]
     fn trace_path_excludes_query_credentials() {
         let uri: Uri = "/System/Info?api_key=do-not-log".parse().unwrap();
 
         assert_eq!(safe_trace_path(&uri), "/System/Info");
+    }
+
+    #[test]
+    fn emby_media_source_includes_path_and_detailed_stream_fields() {
+        let source = CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "STRM_URL".to_owned(),
+            container: Some("mkv".to_owned()),
+            size: Some(1_234_567),
+            external_url: Some("https://example.invalid/media.mkv".to_owned()),
+            edition_name: None,
+            quality_label: Some("1080p".to_owned()),
+            bitrate: Some(800_000),
+            duration_ticks: Some(90_000_000),
+            is_default: true,
+            probe_status: "READY".to_owned(),
+            streams: vec![CatalogStream {
+                index: 0,
+                stream_type: "VIDEO".to_owned(),
+                codec: Some("h264".to_owned()),
+                language: None,
+                title: Some("1080p H264".to_owned()),
+                is_external: false,
+                is_default: true,
+                is_forced: false,
+                details: BTreeMap::from([
+                    ("Width".to_owned(), serde_json::json!(1920)),
+                    ("Height".to_owned(), serde_json::json!(1080)),
+                    ("Profile".to_owned(), serde_json::json!("High")),
+                ]),
+            }],
+        };
+
+        let body = emby_media_source_json("item-1", &source);
+        assert_eq!(body["Path"], "https://example.invalid/media.mkv");
+        assert_eq!(body["Size"], 1_234_567);
+        assert_eq!(body["MediaStreams"][0]["Width"], 1920);
+        assert_eq!(body["MediaStreams"][0]["Height"], 1080);
+        assert_eq!(body["MediaStreams"][0]["Profile"], "High");
+    }
+
+    #[test]
+    fn lux_media_source_keeps_detailed_stream_fields_for_web_clients() {
+        let source = CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "LOCAL_FILE".to_owned(),
+            container: Some("mkv".to_owned()),
+            size: Some(1_234_567),
+            external_url: None,
+            edition_name: None,
+            quality_label: None,
+            bitrate: Some(800_000),
+            duration_ticks: Some(90_000_000),
+            is_default: true,
+            probe_status: "READY".to_owned(),
+            streams: vec![CatalogStream {
+                index: 0,
+                stream_type: "VIDEO".to_owned(),
+                codec: Some("h264".to_owned()),
+                language: None,
+                title: Some("1080p H264".to_owned()),
+                is_external: false,
+                is_default: true,
+                is_forced: false,
+                details: BTreeMap::from([("Width".to_owned(), serde_json::json!(1920))]),
+            }],
+        };
+
+        let body = lux_catalog_source_json(&source);
+        assert_eq!(body["streams"][0]["details"]["Width"], 1920);
     }
 }
