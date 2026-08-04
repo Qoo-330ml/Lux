@@ -246,6 +246,7 @@ fn image_discovery_returns_supported_local_image_types() {
     let paths = [
         "/media/poster.jpg",
         "/media/fanart.png",
+        "/media/clearlogo.png",
         "/media/poster.txt",
         "/media/thumb.jpg",
     ];
@@ -262,6 +263,10 @@ fn image_discovery_returns_supported_local_image_types() {
             LocalImage {
                 image_type: ImageType::Fanart,
                 path: std::path::PathBuf::from("/media/fanart.png"),
+            },
+            LocalImage {
+                image_type: ImageType::Logo,
+                path: std::path::PathBuf::from("/media/clearlogo.png"),
             },
             LocalImage {
                 image_type: ImageType::Thumb,

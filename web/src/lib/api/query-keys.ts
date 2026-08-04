@@ -6,6 +6,7 @@ export const queryKeys = {
   library: (libraryId: string, page: number, itemTypes?: string) =>
     ["library", libraryId, page, itemTypes ?? "root"] as const,
   item: (itemId: string) => ["item", itemId] as const,
+  itemImages: (itemId: string) => ["item-images", itemId] as const,
   children: (itemId: string, itemType?: string, seasonId?: string) =>
     ["children", itemId, itemType ?? "default", seasonId ?? "all"] as const,
   playback: (itemId: string) => ["playback", itemId] as const,

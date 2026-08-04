@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { MediaDetailPage } from "../src/features/detail/MediaDetailPage";
 import { PlayerPage } from "../src/features/player/PlayerPage";
@@ -14,6 +14,10 @@ import { api } from "../src/lib/api/client";
 describe("MediaDetailPage series hierarchy", () => {
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
+
+  beforeEach(() => {
+    vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
+  });
 
   afterEach(() => {
     if (root) act(() => root?.unmount());
@@ -278,6 +282,54 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.textContent).toContain("H264");
     expect(details?.textContent).toContain("stereo");
     expect(details?.textContent).toContain("中文字幕");
+  });
+
+  it("places an available media logo immediately before the title", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-1",
+      title: "示例电影",
+      itemType: "MOVIE",
+      mediaSources: [],
+    });
+    vi.mocked(api.itemImages).mockResolvedValue({
+      images: [{
+        id: "logo-1",
+        itemId: "movie-1",
+        imageType: "LOGO",
+        imageIndex: 0,
+        url: "/api/v1/items/movie-1/images/logo",
+      }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/movie-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const titleRow = container.querySelector(".lux-detail-title-row");
+    expect(titleRow?.querySelector<HTMLImageElement>(".lux-detail-logo")?.getAttribute("src"))
+      .toBe("/api/v1/items/movie-1/images/logo");
+    expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
+    expect(titleRow?.children[1]?.tagName).toBe("H1");
   });
 
   it("plays the source selected in the detail URL", async () => {

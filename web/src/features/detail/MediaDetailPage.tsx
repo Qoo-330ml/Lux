@@ -16,6 +16,7 @@ export function MediaDetailPage() {
   const { itemId = "" } = useParams();
   const queryClient = useQueryClient();
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
+  const itemImages = useQuery({ queryKey: queryKeys.itemImages(itemId), queryFn: () => api.itemImages(itemId), enabled: Boolean(itemId) });
   const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
   const [selectedSourceId, setSelectedSourceId] = useState<string>();
   const [selectedSeasonId, setSelectedSeasonId] = useState<string>();
@@ -42,6 +43,7 @@ export function MediaDetailPage() {
   if (item.error) return <section className="lux-page-state"><h1>媒体详情加载失败</h1><p>{item.error.message}</p></section>;
 
   const media = item.data;
+  const logo = itemImages.data?.images?.find((image) => image.imageType.toUpperCase() === "LOGO");
   const backdrop = imageUrl(media, "fanart") ?? imageUrl(media);
   const poster = imageUrl(media);
   const sources = media.mediaSources ?? [];
@@ -60,7 +62,10 @@ export function MediaDetailPage() {
         <div className="lux-detail-grid">
           <div className="lux-detail-poster">{poster ? <img src={poster} alt={`${mediaTitle(media)} 海报`} /> : <span><Sparkles size={32} />{mediaTitle(media)}</span>}</div>
           <div className="lux-detail-copy">
-            <h1>{mediaTitle(media)}</h1>
+            <div className="lux-detail-title-row">
+              {logo ? <img className="lux-detail-logo" src={logo.url} alt={`${mediaTitle(media)} 徽标`} /> : null}
+              <h1>{mediaTitle(media)}</h1>
+            </div>
             <div className="lux-detail-meta">
               {media.productionYear ? <span>{media.productionYear}</span> : null}
               {runtimeLabel(media.runtimeTicks) ? <span>{runtimeLabel(media.runtimeTicks)}</span> : null}
@@ -102,7 +107,10 @@ export function MediaDetailPage() {
         ) : null}
       </div>
       {editor === "metadata" ? <MediaMetadataEditor item={media} onClose={() => setEditor(undefined)} /> : null}
-      {editor === "images" ? <MediaImageEditor item={media} onClose={() => setEditor(undefined)} /> : null}
+      {editor === "images" ? <MediaImageEditor item={media} onClose={() => {
+        setEditor(undefined);
+        void queryClient.invalidateQueries({ queryKey: queryKeys.itemImages(media.id) });
+      }} /> : null}
       {editor === "identify" ? <MediaIdentifier item={media} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
     </article>
   );
