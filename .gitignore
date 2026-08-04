@@ -6,6 +6,7 @@
 /.env
 /.env.local
 /config/
+/media/
 *.db
 *.db-shm
 *.db-wal
