@@ -1,5 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { libraryItemTypeFilter } from "../src/features/library/LibraryPage";
+// @vitest-environment jsdom
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { LibraryPage, libraryItemTypeFilter } from "../src/features/library/LibraryPage";
+import { api } from "../src/lib/api/client";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("libraryItemTypeFilter", () => {
   it("shows only series at the root of a series library", () => {
@@ -12,5 +21,84 @@ describe("libraryItemTypeFilter", () => {
 
   it("shows both top-level types in a mixed library", () => {
     expect(libraryItemTypeFilter("MIXED")).toBe("MOVIE,SERIES");
+  });
+});
+
+describe("LibraryPage infinite scroll", () => {
+  let container: HTMLDivElement | undefined;
+  let root: Root | undefined;
+  let triggerIntersection: (() => void) | undefined;
+
+  afterEach(() => {
+    if (root) act(() => root?.unmount());
+    container?.remove();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    triggerIntersection = undefined;
+  });
+
+  it("loads the next library page when the scroll sentinel becomes visible", async () => {
+    vi.stubGlobal("IntersectionObserver", class {
+      constructor(callback: IntersectionObserverCallback) {
+        triggerIntersection = () => callback(
+          [{ isIntersecting: true } as IntersectionObserverEntry],
+          this as unknown as IntersectionObserver,
+        );
+      }
+
+      observe() {}
+
+      disconnect() {}
+    });
+
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电视剧", kind: "SERIES" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockImplementation(async (_libraryId, page) => ({
+      items: [{
+        id: `series-${page}`,
+        title: `电视剧 ${page}`,
+        itemType: "SERIES",
+      }],
+      page,
+      pageSize: 24,
+      total: 48,
+    }));
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(1));
+    });
+
+    expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "SERIES");
+    expect(container.querySelectorAll(".lux-media-card")).toHaveLength(1);
+
+    await act(async () => {
+      triggerIntersection?.();
+      await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(2));
+    });
+
+    expect(libraryItems).toHaveBeenCalledWith("library-1", 2, "SERIES");
+    expect(container.querySelectorAll(".lux-media-card")).toHaveLength(2);
+    expect(container.textContent).toContain("电视剧 2");
   });
 });
