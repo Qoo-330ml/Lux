@@ -440,18 +440,50 @@ impl TmdbClient {
 
     pub async fn season_images(
         &self,
-        season_id: i64,
+        series_id: i64,
+        season_number: i32,
         language: &str,
     ) -> Result<TmdbImagesResponse, TmdbError> {
-        self.images("tv/season", season_id, language).await
+        validate_id_language(series_id, language, "series")?;
+        if !(-1..=1000).contains(&season_number) {
+            return Err(TmdbError::InvalidRequest(
+                "season number is out of range".to_owned(),
+            ));
+        }
+        let endpoint = format!("3/tv/{series_id}/season/{season_number}/images");
+        let params = [
+            ("language", language.trim().to_owned()),
+            (
+                "include_image_language",
+                format!("{},en,null", language.trim()),
+            ),
+        ];
+        self.request_json(&endpoint, &params).await
     }
 
     pub async fn episode_images(
         &self,
-        episode_id: i64,
+        series_id: i64,
+        season_number: i32,
+        episode_number: i32,
         language: &str,
     ) -> Result<TmdbImagesResponse, TmdbError> {
-        self.images("tv/episode", episode_id, language).await
+        validate_id_language(series_id, language, "series")?;
+        if !(-1..=1000).contains(&season_number) || !(0..=10000).contains(&episode_number) {
+            return Err(TmdbError::InvalidRequest(
+                "episode number is out of range".to_owned(),
+            ));
+        }
+        let endpoint =
+            format!("3/tv/{series_id}/season/{season_number}/episode/{episode_number}/images");
+        let params = [
+            ("language", language.trim().to_owned()),
+            (
+                "include_image_language",
+                format!("{},en,null", language.trim()),
+            ),
+        ];
+        self.request_json(&endpoint, &params).await
     }
 
     pub async fn person_images(

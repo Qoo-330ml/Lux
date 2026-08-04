@@ -355,7 +355,8 @@ async fn images(params: Value) -> Result<Value, PluginRpcError> {
     let request = parse_request(params)?;
     let id = request
         .tmdb_id
-        .ok_or_else(|| invalid("tmdbId is required"))?;
+        .or(request.collection_id)
+        .ok_or_else(|| invalid("tmdbId or collectionId is required"))?;
     let language = language(&request);
     let images = match request.item_type.as_deref().unwrap_or("Movie") {
         "Movie" => client()
@@ -373,6 +374,38 @@ async fn images(params: Value) -> Result<Value, PluginRpcError> {
             .person_images(id, language)
             .await
             .map_err(tmdb_error)?,
+        "Season" => {
+            let season_number = request
+                .season_number
+                .ok_or_else(|| invalid("seasonNumber is required"))?;
+            client()
+                .await?
+                .season_images(id, season_number, language)
+                .await
+                .map_err(tmdb_error)?
+        }
+        "Episode" => {
+            let season_number = request
+                .season_number
+                .ok_or_else(|| invalid("seasonNumber is required"))?;
+            let episode_number = request
+                .episode_number
+                .ok_or_else(|| invalid("episodeNumber is required"))?;
+            client()
+                .await?
+                .episode_images(id, season_number, episode_number, language)
+                .await
+                .map_err(tmdb_error)?
+        }
+        "BoxSet" | "Collection" => {
+            let collection_id = request.collection_id.unwrap_or(id);
+            let collection = client()
+                .await?
+                .collection_details(collection_id, language)
+                .await
+                .map_err(tmdb_error)?;
+            return Ok(json!({"images": collection_image_results(collection)}));
+        }
         item_type => {
             return Err(PluginRpcError {
                 code: "PLUGIN_PROVIDER_NOT_FOUND".to_owned(),
@@ -619,6 +652,27 @@ fn image_results(response: TmdbImagesResponse) -> Vec<Value> {
             })
         })
     }));
+    images
+}
+
+fn collection_image_results(details: TmdbCollectionDetails) -> Vec<Value> {
+    let mut images = Vec::new();
+    if let Some(path) = details.poster_path {
+        images.push(json!({
+            "Type": "Primary",
+            "Url": image_url(&path),
+            "ThumbnailUrl": image_url(&path),
+            "ProviderName": "Tmdb"
+        }));
+    }
+    if let Some(path) = details.backdrop_path {
+        images.push(json!({
+            "Type": "Backdrop",
+            "Url": image_url(&path),
+            "ThumbnailUrl": image_url(&path),
+            "ProviderName": "Tmdb"
+        }));
+    }
     images
 }
 

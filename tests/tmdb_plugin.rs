@@ -166,6 +166,18 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
             "backdrops": [{"file_path": "/movie-backdrop.jpg", "iso_639_1": null, "width": 1920, "height": 1080}],
             "profiles": []
         }))
+    } else if path == "/3/tv/8/season/1/images" {
+        json_response(json!({
+            "posters": [{"file_path": "/season-poster.jpg", "iso_639_1": "en", "width": 100, "height": 150}],
+            "backdrops": [],
+            "profiles": []
+        }))
+    } else if path == "/3/tv/8/season/1/episode/2/images" {
+        json_response(json!({
+            "posters": [],
+            "backdrops": [{"file_path": "/still.jpg", "iso_639_1": null, "width": 1920, "height": 1080}],
+            "profiles": []
+        }))
     } else if path == "/3/movie/157336/videos" {
         json_response(json!({
             "results": [{
@@ -366,6 +378,36 @@ async fn standalone_tmdb_plugin_maps_emby_media_types_and_provider_data()
     .await?;
     assert_eq!(images["images"][0]["Type"], "Primary");
     assert_eq!(images["images"][0]["ProviderName"], "Tmdb");
+
+    let season_images = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "season-images",
+        "metadata.images",
+        json!({"itemType": "Season", "tmdbId": 8, "seasonNumber": 1}),
+    )
+    .await?;
+    assert_eq!(season_images["images"][0]["Type"], "Primary");
+
+    let episode_images = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "episode-images",
+        "metadata.images",
+        json!({"itemType": "Episode", "tmdbId": 8, "seasonNumber": 1, "episodeNumber": 2}),
+    )
+    .await?;
+    assert_eq!(episode_images["images"][0]["Type"], "Backdrop");
+
+    let collection_images = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "collection-images",
+        "metadata.images",
+        json!({"itemType": "BoxSet", "collectionId": 10}),
+    )
+    .await?;
+    assert_eq!(collection_images["images"][0]["Type"], "Primary");
 
     let ids = rpc_call(
         &mut stdin,
