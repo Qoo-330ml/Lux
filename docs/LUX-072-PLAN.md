@@ -11,7 +11,7 @@
 - [x] 保存 `STRM_URL` source kind 和明文 `external_url`，重扫时更新地址。
 - [x] PlaybackInfo 返回外部 URL、Http 协议、远程标记和 DirectPlay 能力，不执行网络探测。
 - [x] 本地文件流端点不会把 `.strm` 当作本地媒体转发。
-- [ ] `.strm` 后台探测不调用 ffprobe；有同名 `-mediainfo.json` 时只读取旁车，没有旁车时保留空技术信息。
+- [x] `.strm` 后台探测不调用 ffprobe；有同名 `-mediainfo.json` 时只读取旁车，没有旁车时保留空技术信息。
 
 ## 验证
 

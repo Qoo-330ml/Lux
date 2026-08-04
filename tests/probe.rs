@@ -343,6 +343,89 @@ async fn strm_probe_uses_media_info_sidecar_without_running_ffprobe()
 }
 
 #[tokio::test]
+async fn strm_probe_without_sidecar_does_not_run_ffprobe() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = config_for(&temp_dir);
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("No Sidecar Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(
+        movie_dir.join("No.Sidecar.Movie.2024.strm"),
+        "https://example.invalid/no-sidecar",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let failing_probe = executable_script(
+        temp_dir.path(),
+        "#!/bin/sh\nprintf '%s' 'ffprobe must not run' >&2\nexit 1\n",
+    )?;
+    let report = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(failing_probe, Duration::from_secs(5)),
+    )
+    .probe_movie_library(library.id)
+    .await?;
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.ready, 1);
+    assert_eq!(report.failed, 0);
+
+    let source: (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT probe_status, container, duration_ticks, bitrate, probe_error,
+                    (SELECT COUNT(*) FROM media_streams WHERE media_source_id = media_sources.id)
+             FROM media_sources",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        source,
+        (
+            "READY".to_owned(),
+            Some("strm".to_owned()),
+            None,
+            None,
+            None,
+            0
+        )
+    );
+
+    let second = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(
+            executable_script(
+                temp_dir.path(),
+                "#!/bin/sh\nprintf '%s' 'ffprobe must not run twice' >&2\nexit 1\n",
+            )?,
+            Duration::from_secs(5),
+        ),
+    )
+    .probe_movie_library(library.id)
+    .await?;
+    assert_eq!(second.attempted, 0);
+    assert_eq!(second.skipped, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn probe_service_persists_exit_failure_without_retrying_automatically()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

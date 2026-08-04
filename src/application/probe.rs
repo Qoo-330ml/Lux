@@ -778,7 +778,7 @@ impl MediaProbeService {
             report.attempted += 1;
             let path = safe_media_path(&source.root_path, &source.relative_path)?;
             match self.probe_source(&path).await {
-                Ok(result) => {
+                Ok(Some(result)) => {
                     let detail_json = result
                         .streams
                         .iter()
@@ -844,6 +844,19 @@ impl MediaProbeService {
                         .await?;
                     report.ready += 1;
                 }
+                Ok(None) => {
+                    self.database
+                        .save_media_probe(MediaProbeUpdate {
+                            source_id: &source.source_id,
+                            container: None,
+                            source_size: None,
+                            duration_ticks: None,
+                            bitrate: None,
+                            streams: &[],
+                        })
+                        .await?;
+                    report.ready += 1;
+                }
                 Err(error) => {
                     if matches!(error, ProbeError::Timeout) {
                         report.timed_out += 1;
@@ -863,20 +876,18 @@ impl MediaProbeService {
         Ok(report)
     }
 
-    async fn probe_source(&self, path: &Path) -> Result<MediaProbeResult, ProbeError> {
+    async fn probe_source(&self, path: &Path) -> Result<Option<MediaProbeResult>, ProbeError> {
         if is_strm_path(path) {
-            if let Some(result) = read_media_info_sidecar(path).await {
-                return Ok(result);
-            }
-            if let Some(result) = read_nfo_streamdetails(path).await {
-                return Ok(result);
-            }
+            return Ok(read_media_info_sidecar(path)
+                .await
+                .or(read_nfo_streamdetails(path).await));
         }
         match self.runner.probe_path(path).await {
-            Ok(result) => Ok(result),
+            Ok(result) => Ok(Some(result)),
             Err(error) => read_media_info_sidecar(path)
                 .await
                 .or(read_nfo_streamdetails(path).await)
+                .map(Some)
                 .ok_or(error),
         }
     }
