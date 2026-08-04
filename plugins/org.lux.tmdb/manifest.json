@@ -3,7 +3,7 @@
   "id": "org.lux.tmdb",
   "name": "TMDb 元数据插件",
   "description": "提取 Emby MovieDb 行为并通过 Lux 插件协议提供 TMDb 元数据。",
-  "version": "1.0.0",
+  "version": "0.0.2",
   "apiVersion": 1,
   "runtime": {
     "kind": "process",
