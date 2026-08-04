@@ -190,6 +190,52 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("存储预估");
   });
 
+  it("lets the global strategy choose a metadata refresh mode", async () => {
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+
+    expect(container.textContent).toContain("元数据刮削模式");
+    const modeTrigger = container.querySelector<HTMLButtonElement>("[aria-label='元数据刮削模式']");
+    expect(modeTrigger).toBeTruthy();
+    await act(async () => modeTrigger?.click());
+    const fullRefresh = document.querySelector<HTMLButtonElement>("[data-value='FULL_REFRESH']");
+    expect(fullRefresh).toBeTruthy();
+    await act(async () => fullRefresh?.click());
+    expect(modeTrigger?.textContent).toContain("完整刮削");
+    expect(container.textContent).toContain("锁定的 NFO 字段不会被替换");
+  });
+
+  it("starts a global refresh using the selected mode", async () => {
+    const refresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
+      totalCount: 1,
+      jobCount: 1,
+      mode: "FULL_REFRESH",
+      jobs: [],
+    });
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>("[aria-label='元数据刮削模式']")?.click());
+    await act(async () => document.querySelector<HTMLButtonElement>("[data-value='FULL_REFRESH']")?.click());
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("开始全局刮削"))
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(refresh).toHaveBeenCalledWith("library-1", "FULL_REFRESH");
+  });
+
   it("saves an edited global strategy through the server settings API", async () => {
     const updateSettings = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
       resumePlayedPercent: 90,

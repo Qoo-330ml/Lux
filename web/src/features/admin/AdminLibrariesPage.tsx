@@ -24,7 +24,7 @@ import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminLibrary, AdminPlugin, MediaStrategySettings } from "../../lib/api/types";
+import type { AdminLibrary, AdminPlugin, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
 
 export function AdminLibrariesPage() {
   const queryClient = useQueryClient();
@@ -59,6 +59,14 @@ export function AdminLibrariesPage() {
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminHealth });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
+    },
+  });
+  const refreshAll = useMutation({
+    mutationFn: async (mode: MetadataRefreshMode) => {
+      for (const library of itemsForScan) await api.startLibraryMetadataRefresh(library.id, mode);
+    },
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
     },
   });
@@ -110,7 +118,7 @@ export function AdminLibrariesPage() {
           {items.length === 0 ? <div className="lux-admin-empty"><Database size={24} /><h2>还没有媒体库</h2><p>创建第一个媒体库后，Lux 才能开始索引内容。</p></div> : <div className="lux-admin-library-grid">{items.map((library) => <LibraryAdminCard key={library.id} library={library} plugins={pluginItems} globalStrategy={strategy ?? undefined} />)}</div>}
         </>
       ) : (
-        strategy ? <GlobalStrategyPanel strategy={strategy} plugins={pluginItems} saved={strategySaved} saving={saveStrategy.isPending} error={saveStrategy.error?.message} onChange={(next) => { setStrategySaved(false); setStrategy(next); }} onSave={(next) => saveStrategy.mutate(next)} onBack={() => setActiveView("libraries")} /> : null
+        strategy ? <GlobalStrategyPanel strategy={strategy} plugins={pluginItems} saved={strategySaved} saving={saveStrategy.isPending} refreshing={refreshAll.isPending} error={saveStrategy.error?.message || refreshAll.error?.message} onChange={(next) => { setStrategySaved(false); setStrategy(next); }} onSave={(next) => saveStrategy.mutate(next)} onRefresh={(mode) => refreshAll.mutate(mode)} onBack={() => setActiveView("libraries")} /> : null
       )}
 
       {createOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreateOpen(false); }}>
@@ -135,18 +143,22 @@ function GlobalStrategyPanel({
   plugins,
   saved,
   saving,
+  refreshing,
   error,
   onChange,
   onSave,
+  onRefresh,
   onBack,
 }: {
   strategy: MediaStrategySettings;
   plugins: AdminPlugin[];
   saved: boolean;
   saving: boolean;
+  refreshing: boolean;
   error?: string;
   onChange: (strategy: MediaStrategySettings) => void;
   onSave: (strategy: MediaStrategySettings) => void;
+  onRefresh: (mode: MetadataRefreshMode) => void;
   onBack: () => void;
 }) {
   const updateImages = (key: keyof MediaStrategySettings["images"], value: boolean | number) => {
@@ -180,8 +192,10 @@ function GlobalStrategyPanel({
             <StrategySelect label="元数据语言" value={strategy.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"]]} onChange={(value) => onChange({ ...strategy, metadataLanguage: value })} />
             <StrategySelect label="图片语言" value={strategy.imageLanguage} options={[["zh-CN", "简体中文"], ["en", "English"], ["", "无语言偏好"]]} onChange={(value) => onChange({ ...strategy, imageLanguage: value })} />
             <StrategySelect label="认证地区" value={strategy.region} options={[["CN", "中国大陆"], ["US", "美国"], ["JP", "日本"]]} onChange={(value) => onChange({ ...strategy, region: value })} />
+            <StrategySelect label="元数据刮削模式" value={strategy.metadataRefreshMode ?? "FILL_MISSING"} options={[["FILL_MISSING", "仅补全"], ["FULL_REFRESH", "完整刮削"]]} onChange={(value) => onChange({ ...strategy, metadataRefreshMode: value as MetadataRefreshMode })} />
             <ScraperSelect id="global-strategy-scraper" value={strategy.scraperId ?? ""} plugins={plugins} onChange={(value) => onChange({ ...strategy, scraperId: value || null })} />
           </div>
+          <p className="lux-library-strategy-help">仅补全只写入缺失内容；完整刮削会替换已有图片，但锁定的 NFO 字段不会被替换。</p>
         </section>
 
         <section className="lux-library-strategy-card lux-library-strategy-card-wide">
@@ -220,7 +234,10 @@ function GlobalStrategyPanel({
 
       <footer className="lux-library-strategy-footer">
         <span>{saved ? "全局策略已保存" : "保存后，新内容会按此策略处理。"}{error ? ` ${error}` : ""}</span>
-        <button className="lux-library-toolbar-button is-primary" type="button" onClick={() => onSave(strategy)} disabled={saving}><Save size={15} /> {saving ? "保存中…" : "保存全局策略"}</button>
+        <div className="lux-library-strategy-footer-actions">
+          <button className="lux-library-toolbar-button" type="button" onClick={() => onRefresh((strategy.metadataRefreshMode ?? "FILL_MISSING") as MetadataRefreshMode)} disabled={refreshing}><RefreshCw size={15} /> {refreshing ? "提交中…" : "开始全局刮削"}</button>
+          <button className="lux-library-toolbar-button is-primary" type="button" onClick={() => onSave(strategy)} disabled={saving}><Save size={15} /> {saving ? "保存中…" : "保存全局策略"}</button>
+        </div>
       </footer>
     </section>
   );

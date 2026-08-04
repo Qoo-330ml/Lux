@@ -234,8 +234,11 @@ export type AdminJob = {
 export type AdminMetadataReidentifyBatch = {
   totalCount: number;
   jobCount: number;
+  mode?: MetadataRefreshMode;
   jobs: Array<Pick<AdminJob, "id" | "status" | "totalCount">>;
 };
+
+export type MetadataRefreshMode = "FILL_MISSING" | "FULL_REFRESH";
 
 export type AdminAuditEvent = {
   id: string;
@@ -282,6 +285,7 @@ export type MediaStrategySettings = {
   imageLanguage: string;
   region: string;
   scraperId?: string | null;
+  metadataRefreshMode?: MetadataRefreshMode;
   applyScope: "NEW_CONTENT" | "SELECTED_CONTENT" | "ALL_CONTENT" | string;
   images: MediaImageStrategySettings;
   subtitles: MediaSubtitleStrategySettings;

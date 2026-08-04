@@ -36,7 +36,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 以下接口要求有效 Web session；写操作还要求 `X-CSRF-Token`，并检查当前用户的 `canManageServer` 权限：
 
 - `GET /api/v1/admin/libraries`：列出媒体库及其根路径。
-- `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false, "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；`scraperId` 可省略或为 `null`，表示只使用本地元数据。
+- `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false, "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；`scraperId` 可省略或为 `null`，表示不进行在线刮削，但仍读取本地 NFO 和图片。
 - `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时监听开关、增量/调和/元数据计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。`mediaStrategy` 的结构与全局策略相同，未设置时返回 `null` 并继承全局默认。例如 `{ "scraperId": "tmdb", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
@@ -46,7 +46,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
 - `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
-- `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）、`resumeMinTicks`（非负）和 `mediaStrategy`。媒体策略的图像开关为 `poster`、`logo`、`thumbnail`、`banner`、`disc`、`artwork`、`wallpaper`，另有元数据/图片语言、地区、默认刮削器、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。旧策略 JSON 缺少新增开关时按 `false` 处理；写操作需要管理员 Web session 和 CSRF，响应不包含任何插件凭据。
+- `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）、`resumeMinTicks`（非负）和 `mediaStrategy`。媒体策略的图像开关为 `poster`、`logo`、`thumbnail`、`banner`、`disc`、`artwork`、`wallpaper`，另有元数据/图片语言、地区、默认刮削器、`metadataRefreshMode`（`FILL_MISSING` 或 `FULL_REFRESH`）、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。旧策略 JSON 缺少新增字段时默认按 `FILL_MISSING` 处理；写操作需要管理员 Web session 和 CSRF，响应不包含任何插件凭据。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、配置目录实际写入能力、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，支持 `page`、`pageSize`、`level` 和 `eventCode` 筛选。
 
@@ -72,6 +72,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/admin/metadata/reidentify`：管理员发送 `{ "itemIds": ["..."] }` 创建批量重新识别任务；条目去重后限制为 1-100 个，任务持久化为 `QUEUED/RUNNING/COMPLETED/FAILED`，需要 `X-CSRF-Token`。
 - `GET /api/v1/admin/metadata/reidentify/{jobId}`：管理员读取批量重新识别任务及逐条状态、候选数量和稳定错误代码；前端可按任务 ID 轮询。
 - `POST /api/v1/admin/metadata/reidentify/{jobId}`：管理员对 `FAILED` 任务重新排队失败条目，保留已经成功的条目，需要 `X-CSRF-Token`；非失败任务返回冲突。
+- `POST /api/v1/admin/libraries/{libraryId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" }` 或 `{ "mode": "FULL_REFRESH" }`，按库拆分持久化后台任务并立即返回。前者只补缺失的未锁定 NFO 字段和图片，后者刷新未锁定 NFO 字段并替换已有图片；锁定的 NFO 字段始终保留。未配置刮削器时任务不发起在线请求并保留本地元数据。
 
 根路径会先 canonicalize，再检查目录存在且可读；`isWritable` 独立返回。只读目录可以保存，但返回 `LIBRARY_PATH_NOT_WRITABLE` 警告。同一库的重复/重叠路径分别返回冲突/不可处理实体错误，跨库重叠返回结构化警告。
 

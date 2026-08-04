@@ -174,6 +174,25 @@ describe("LuxApiClient", () => {
     expect(options?.method).toBe("POST");
   });
 
+  it("starts a whole-library metadata refresh with the selected mode", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        totalCount: 125,
+        jobCount: 2,
+        mode: "FULL_REFRESH",
+        jobs: [],
+      }), { status: 202 }),
+    );
+
+    await expect(new LuxApiClient().startLibraryMetadataRefresh("library/1", "FULL_REFRESH"))
+      .resolves.toMatchObject({ mode: "FULL_REFRESH", totalCount: 125 });
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/admin/libraries/library%2F1/metadata/refresh");
+    expect(options?.method).toBe("POST");
+    expect(JSON.parse(String(options?.body))).toEqual({ mode: "FULL_REFRESH" });
+  });
+
   it("updates the editable flags of an indexed external subtitle", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       expect(String(input)).toBe("/api/v1/admin/items/item-1/subtitles/2");

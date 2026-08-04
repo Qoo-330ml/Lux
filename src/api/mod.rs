@@ -139,10 +139,11 @@ impl AppState {
             tmdb.clone(),
             scraper_resolver.clone(),
         ));
-        let metadata_reidentify = Some(MetadataReidentifyService::with_resolver(
+        let metadata_reidentify = Some(MetadataReidentifyService::with_resolver_and_selection(
             database.clone(),
             tmdb.clone(),
             scraper_resolver.clone(),
+            metadata_selection.clone(),
         ));
         let image_candidates = Some(ImageCandidateService::with_resolver(
             database.clone(),
@@ -199,19 +200,22 @@ impl AppState {
                 tmdb.clone(),
                 resolver.clone(),
             ));
-            self.metadata_reidentify = Some(MetadataReidentifyService::with_resolver(
-                database.clone(),
-                tmdb.clone(),
-                resolver.clone(),
-            ));
+            self.metadata_reidentify =
+                Some(MetadataReidentifyService::with_resolver_and_selection(
+                    database.clone(),
+                    tmdb.clone(),
+                    resolver.clone(),
+                    self.metadata_selection.clone(),
+                ));
             self.image_candidates = Some(ImageCandidateService::with_resolver(
                 database, tmdb, resolver,
             ));
         } else {
             self.collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
-            self.metadata_reidentify = Some(MetadataReidentifyService::new(
+            self.metadata_reidentify = Some(MetadataReidentifyService::with_selection(
                 database.clone(),
                 tmdb.clone(),
+                self.metadata_selection.clone(),
             ));
             self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
         }
@@ -359,6 +363,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries/{library_id}/reidentify",
             post(admin_start_library_reidentify),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}/metadata/refresh",
+            post(admin_start_library_metadata_refresh),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/reconcile",
@@ -5079,6 +5087,34 @@ struct MetadataReidentifyRequest {
     item_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum MetadataRefreshRequestMode {
+    FillMissing,
+    FullRefresh,
+}
+
+#[derive(Deserialize)]
+struct MetadataRefreshRequest {
+    mode: MetadataRefreshRequestMode,
+}
+
+impl MetadataRefreshRequestMode {
+    const fn application_mode(&self) -> crate::application::reidentify::MetadataRefreshMode {
+        match self {
+            Self::FillMissing => crate::application::reidentify::MetadataRefreshMode::FillMissing,
+            Self::FullRefresh => crate::application::reidentify::MetadataRefreshMode::FullRefresh,
+        }
+    }
+
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::FillMissing => "FILL_MISSING",
+            Self::FullRefresh => "FULL_REFRESH",
+        }
+    }
+}
+
 async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -5117,6 +5153,8 @@ struct MediaStrategySettings {
     image_language: String,
     region: String,
     scraper_id: Option<String>,
+    #[serde(default = "default_metadata_refresh_mode")]
+    metadata_refresh_mode: String,
     apply_scope: String,
     images: MediaImageStrategySettings,
     subtitles: MediaSubtitleStrategySettings,
@@ -5154,6 +5192,7 @@ impl Default for MediaStrategySettings {
             image_language: "zh-CN".to_owned(),
             region: "CN".to_owned(),
             scraper_id: None,
+            metadata_refresh_mode: default_metadata_refresh_mode(),
             apply_scope: "NEW_CONTENT".to_owned(),
             images: MediaImageStrategySettings {
                 poster: true,
@@ -5174,6 +5213,10 @@ impl Default for MediaStrategySettings {
             },
         }
     }
+}
+
+fn default_metadata_refresh_mode() -> String {
+    "FILL_MISSING".to_owned()
 }
 
 async fn read_media_strategy_settings(database: &Database) -> Result<MediaStrategySettings, ()> {
@@ -5199,6 +5242,10 @@ fn validate_media_strategy(settings: &MediaStrategySettings) -> bool {
         && matches!(
             settings.apply_scope.as_str(),
             "NEW_CONTENT" | "SELECTED_CONTENT" | "ALL_CONTENT"
+        )
+        && matches!(
+            settings.metadata_refresh_mode.as_str(),
+            "FILL_MISSING" | "FULL_REFRESH"
         )
         && settings
             .scraper_id
@@ -5522,6 +5569,79 @@ async fn admin_start_library_reidentify(
             "jobs": batch.jobs.iter().map(|job| json!({
                 "id": job.id,
                 "status": job.status,
+                "totalCount": job.total_count,
+            })).collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
+}
+
+async fn admin_start_library_metadata_refresh(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MetadataRefreshRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据刷新服务尚未配置",
+        )
+        .into_response();
+    };
+    let mode = request.mode.application_mode();
+    let batch = match reidentify
+        .create_library_refresh_jobs(&library_id.to_string(), mode)
+        .await
+    {
+        Ok(batch) => batch,
+        Err(error) => return metadata_reidentify_error(&headers, error),
+    };
+    for job in &batch.jobs {
+        let worker = reidentify.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            worker.run(&job_id).await;
+        });
+    }
+    record_audit_event(
+        &state,
+        &headers,
+        "METADATA_REFRESH_STARTED",
+        Some("library"),
+        Some(&library_id.to_string()),
+        &format!(
+            r#"{{"itemCount":{},"jobCount":{},"mode":"{}"}}"#,
+            batch.total_count,
+            batch.jobs.len(),
+            request.mode.as_str()
+        ),
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "totalCount": batch.total_count,
+            "jobCount": batch.jobs.len(),
+            "mode": request.mode.as_str(),
+            "jobs": batch.jobs.iter().map(|job| json!({
+                "id": job.id,
+                "status": job.status,
+                "mode": job.mode,
                 "totalCount": job.total_count,
             })).collect::<Vec<_>>(),
         })),
@@ -7336,6 +7456,7 @@ fn metadata_reidentify_job_json(
     json!({
         "id": job.id,
         "status": job.status,
+        "mode": job.mode,
         "processedCount": job.processed_count,
         "totalCount": job.total_count,
         "error": job.error,
@@ -7357,6 +7478,7 @@ fn metadata_reidentify_job_json(
 fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError) -> Response {
     match error {
         MetadataReidentifyError::InvalidItemCount
+        | MetadataReidentifyError::InvalidRefreshMode
         | MetadataReidentifyError::InvalidSearch
         | MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidSearch)
         | MetadataReidentifyError::Candidate(MetadataCandidateError::Tmdb(
@@ -7396,6 +7518,9 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
         MetadataReidentifyError::Candidate(MetadataCandidateError::Tmdb(_))
         | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(_))
         | MetadataReidentifyError::Scraper(_)
+        | MetadataReidentifyError::Selection(_)
+        | MetadataReidentifyError::SelectionUnavailable
+        | MetadataReidentifyError::LowConfidence
         | MetadataReidentifyError::Candidate(MetadataCandidateError::Storage(_))
         | MetadataReidentifyError::Storage(_) => api_error(
             headers,

@@ -22,6 +22,7 @@ import type {
   PageResponse,
   PlaybackState,
   SetupStatus,
+  MetadataRefreshMode,
 } from "./types";
 
 const csrfCookie = "lux_csrf";
@@ -347,6 +348,13 @@ export class LuxApiClient {
     return this.request<AdminMetadataReidentifyBatch>(
       `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/reidentify`,
       { method: "POST" },
+    );
+  }
+
+  startLibraryMetadataRefresh(libraryId: string, mode: MetadataRefreshMode) {
+    return this.request<AdminMetadataReidentifyBatch>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/metadata/refresh`,
+      { method: "POST", body: JSON.stringify({ mode }) },
     );
   }
 

@@ -96,6 +96,51 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
 }
 
 #[tokio::test]
+async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(true).await?;
+    tokio::fs::write(fixture.movie_dir.join("poster.png"), b"old-poster").await?;
+    sqlx::query("UPDATE media_items SET locked_fields_json = ? WHERE id = ?")
+        .bind(json!(["title"]).to_string())
+        .bind(&fixture.item_id)
+        .execute(fixture.database.pool())
+        .await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "overview": "Online Overview",
+            "posterUrl": format!("{image_url}/poster")
+        }),
+    )
+    .await?;
+    let service = ImageWriteService::new(fixture.database.clone())?;
+    let selection = MetadataSelectionService::new(fixture.database.clone(), service);
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert_eq!(report.mode, MetadataSelectionMode::RefreshUnlocked);
+    let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<title>本地标题</title>"));
+    assert!(nfo.contains("<plot>Online Overview</plot>"));
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
+        PNG_1X1
+    );
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_selection_persists_cast_in_config_and_detail_api()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;

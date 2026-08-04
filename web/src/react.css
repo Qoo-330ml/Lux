@@ -717,6 +717,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-strategy-form-grid input, .lux-library-strategy-form-grid select, .lux-library-strategy-card input, .lux-library-strategy-card select { width: 100%; min-height: 39px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
 .lux-library-strategy-form-grid input:focus, .lux-library-strategy-form-grid select:focus, .lux-library-strategy-card input:focus, .lux-library-strategy-card select:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.08); }
 .lux-library-strategy-form-grid small, .lux-library-strategy-scope small, .lux-library-strategy-language-input small { color: var(--lux-subtle); font-size: .68rem; line-height: 1.45; }
+.lux-library-strategy-help { margin: 12px 0 0; color: var(--lux-subtle); font-size: .7rem; line-height: 1.5; }
 .lux-library-strategy-toggle-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
 .lux-library-strategy-toggle-list { display: grid; gap: 8px; }
 .lux-library-strategy-toggle { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; min-height: 57px; padding: 10px 11px; border: 1px solid var(--lux-line-soft); border-radius: 9px; color: var(--lux-muted); background: rgba(255,255,255,.025); cursor: pointer; transition: border-color .2s ease, background .2s ease; }
@@ -740,6 +741,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-strategy-scope { margin-top: 14px; }
 .lux-library-strategy-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 15px; color: var(--lux-muted); font-size: .73rem; }
 .lux-library-strategy-footer > span { min-width: 0; }
+.lux-library-strategy-footer-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .lux-library-override-section { display: grid; gap: 15px; }
 .lux-library-override-section .lux-library-dialog-section-heading { align-items: center; }
 .lux-library-override-section .lux-library-dialog-section-heading > div { display: flex; align-items: baseline; justify-content: space-between; gap: 15px; min-width: 0; flex: 1; }
@@ -828,6 +830,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-library-strategy-card-wide { grid-column: auto; }
   .lux-library-strategy-form-grid, .lux-library-strategy-image-limits, .lux-library-strategy-toggle-grid { grid-template-columns: 1fr; }
   .lux-library-strategy-footer { align-items: stretch; flex-direction: column; }
+  .lux-library-strategy-footer-actions { justify-content: stretch; }
+  .lux-library-strategy-footer-actions .lux-library-toolbar-button { flex: 1; }
   .lux-library-override-modes, .lux-library-override-toggles, .lux-library-override-fields { grid-template-columns: 1fr; }
 }
 

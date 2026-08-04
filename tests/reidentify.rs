@@ -155,6 +155,7 @@ async fn admin_can_start_and_poll_batch_metadata_reidentify()
         .ok_or("missing metadata reidentify job ID")?
         .to_owned();
     assert_eq!(started_body["job"]["totalCount"], 1);
+    assert_eq!(started_body["job"]["mode"], "REIDENTIFY");
 
     let mut job = Value::Null;
     for _ in 0..80 {
@@ -275,6 +276,44 @@ async fn admin_can_start_and_poll_batch_metadata_reidentify()
     let library_body: Value = library_started.json().await?;
     assert_eq!(library_body["totalCount"], 1);
     assert_eq!(library_body["jobs"].as_array().map(Vec::len), Some(1));
+
+    let refresh_started = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{}/metadata/refresh",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "FULL_REFRESH" }))
+        .send()
+        .await?;
+    assert_eq!(refresh_started.status(), reqwest::StatusCode::ACCEPTED);
+    let refresh_body: Value = refresh_started.json().await?;
+    assert_eq!(refresh_body["mode"], "FULL_REFRESH");
+    assert_eq!(refresh_body["totalCount"], 1);
+    assert_eq!(refresh_body["jobs"][0]["mode"], "FULL_REFRESH");
+    let refresh_job_id = refresh_body["jobs"][0]["id"]
+        .as_str()
+        .ok_or("missing metadata refresh job ID")?
+        .to_owned();
+    let mut refresh_job = Value::Null;
+    for _ in 0..80 {
+        let response = client
+            .get(format!(
+                "{base_url}/api/v1/admin/metadata/reidentify/{refresh_job_id}"
+            ))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        refresh_job = response.json().await?;
+        if refresh_job["job"]["status"] == "COMPLETED" || refresh_job["job"]["status"] == "FAILED" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(refresh_job["job"]["mode"], "FULL_REFRESH");
+    assert_eq!(refresh_job["job"]["status"], "COMPLETED");
+    assert_eq!(refresh_job["job"]["items"][0]["candidateCount"], 0);
 
     server.abort();
     tmdb_server.abort();

@@ -1677,6 +1677,7 @@ impl Database {
         &self,
         job_id: &str,
         item_ids: &[String],
+        mode: &str,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -1687,11 +1688,12 @@ impl Database {
                 source,
             })?;
         sqlx::query(
-            "INSERT INTO metadata_reidentify_jobs (id, status, total_count)
-             VALUES (?, 'QUEUED', ?)",
+            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode)
+             VALUES (?, 'QUEUED', ?, ?)",
         )
         .bind(job_id)
         .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
+        .bind(mode)
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -1727,7 +1729,7 @@ impl Database {
     ) -> Result<Option<StoredMetadataReidentifyJob>, StorageError> {
         sqlx::query(
             "SELECT id, status, processed_count, total_count, error,
-                    created_at, updated_at, started_at, finished_at
+                    created_at, updated_at, started_at, finished_at, mode
              FROM metadata_reidentify_jobs WHERE id = ?",
         )
         .bind(job_id)
@@ -5286,6 +5288,7 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) updated_at: i64,
     pub(crate) started_at: Option<i64>,
     pub(crate) finished_at: Option<i64>,
+    pub(crate) mode: String,
 }
 
 #[derive(Debug)]
@@ -5309,6 +5312,7 @@ fn stored_metadata_reidentify_job(row: sqlx::sqlite::SqliteRow) -> StoredMetadat
         updated_at: row.get("updated_at"),
         started_at: row.get("started_at"),
         finished_at: row.get("finished_at"),
+        mode: row.get("mode"),
     }
 }
 

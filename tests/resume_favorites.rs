@@ -140,6 +140,10 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         default_settings_body["mediaStrategy"]["images"]["disc"],
         false
     );
+    assert_eq!(
+        default_settings_body["mediaStrategy"]["metadataRefreshMode"],
+        "FILL_MISSING"
+    );
 
     let media_strategy = json!({
         "metadataLanguage": "en-US",
@@ -182,6 +186,10 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(
         updated_settings_body["mediaStrategy"]["images"]["minDownloadWidth"],
         1920
+    );
+    assert_eq!(
+        updated_settings_body["mediaStrategy"]["metadataRefreshMode"],
+        "FILL_MISSING"
     );
 
     let persisted_settings = client
