@@ -139,6 +139,10 @@ impl MetadataCandidateService {
                 .as_deref()
                 .and_then(|value| value.get(..4))
                 .and_then(|value| value.parse::<i32>().ok());
+            let images = tmdb
+                .movie_images(result.id, "zh-CN")
+                .await
+                .unwrap_or_default();
             let candidate_json = json!({
                 "title": title,
                 "originalTitle": result.original_title,
@@ -146,6 +150,7 @@ impl MetadataCandidateService {
                 "releaseDate": result.release_date,
                 "productionYear": production_year,
                 "originalLanguage": result.original_language,
+                "images": tmdb_candidate_images(&images),
             })
             .to_string();
             let id = uuid::Uuid::now_v7().to_string();
@@ -229,6 +234,37 @@ impl From<StorageError> for MetadataCandidateError {
 
 fn same_title(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn tmdb_candidate_images(
+    images: &crate::application::tmdb::TmdbImagesResponse,
+) -> BTreeMap<String, Vec<String>> {
+    let posters = tmdb_image_urls(&images.posters);
+    let backdrops = tmdb_image_urls(&images.backdrops);
+    let logos = tmdb_image_urls(&images.logos);
+    [
+        ("POSTER", posters.clone()),
+        ("LOGO", logos),
+        ("THUMB", backdrops.clone()),
+        ("BANNER", backdrops.clone()),
+        ("DISC", posters),
+        ("ART", backdrops.clone()),
+        ("WALLPAPER", backdrops),
+    ]
+    .into_iter()
+    .map(|(image_type, urls)| (image_type.to_owned(), urls))
+    .collect()
+}
+
+fn tmdb_image_urls(images: &[crate::application::tmdb::TmdbImageReference]) -> Vec<String> {
+    images
+        .iter()
+        .filter_map(|image| {
+            let path = image.file_path.as_deref()?.trim();
+            (path.starts_with('/') && path.len() > 1)
+                .then(|| format!("https://image.tmdb.org/t/p/w780{path}"))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

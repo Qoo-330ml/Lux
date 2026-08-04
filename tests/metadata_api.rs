@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use axum::{Json, Router, routing::any};
+use axum::{routing::any, Json, Router};
 use luxd::{
-    api::{AppState, app_with_state},
+    api::{app_with_state, AppState},
     application::{
         libraries::LibraryService,
         scanner::LibraryScanner,
@@ -15,7 +15,7 @@ use luxd::{
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -39,7 +39,21 @@ async fn start_server(
     ))
 }
 
-async fn tmdb_search_stub() -> Json<Value> {
+async fn tmdb_search_stub(uri: axum::http::Uri) -> Json<Value> {
+    if uri.path().ends_with("/images") {
+        return Json(json!({
+            "posters": [
+                { "file_path": "/poster-first.jpg", "iso_639_1": "zh" },
+                { "file_path": "/poster-second.jpg", "iso_639_1": "en" }
+            ],
+            "backdrops": [
+                { "file_path": "/backdrop-first.jpg", "iso_639_1": null }
+            ],
+            "logos": [
+                { "file_path": "/logo-first.png", "iso_639_1": null }
+            ]
+        }));
+    }
     Json(json!({
         "page": 1,
         "total_pages": 1,
@@ -55,8 +69,8 @@ async fn tmdb_search_stub() -> Json<Value> {
     }))
 }
 
-async fn start_tmdb_stub()
--> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
+async fn start_tmdb_stub(
+) -> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
 {
     let app = Router::new().fallback(any(tmdb_search_stub));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -110,8 +124,8 @@ async fn login(
 }
 
 #[tokio::test]
-async fn admin_can_page_search_and_preview_pending_candidates()
--> Result<(), Box<dyn std::error::Error>> {
+async fn admin_can_page_search_and_preview_pending_candidates(
+) -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -238,6 +252,22 @@ async fn admin_can_page_search_and_preview_pending_candidates()
                 && item["score"] == 80.0
         })
     }));
+    let searched_candidate = reidentified_body["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["providerId"] == "999"))
+        .ok_or("missing searched candidate")?;
+    assert_eq!(
+        searched_candidate["candidate"]["images"]["POSTER"][0],
+        "https://image.tmdb.org/t/p/w780/poster-first.jpg"
+    );
+    assert_eq!(
+        searched_candidate["candidate"]["images"]["LOGO"][0],
+        "https://image.tmdb.org/t/p/w780/logo-first.png"
+    );
+    assert_eq!(
+        searched_candidate["candidate"]["images"]["ART"][0],
+        "https://image.tmdb.org/t/p/w780/backdrop-first.jpg"
+    );
 
     let forbidden = client
         .get(format!("{base_url}/api/v1/admin/metadata/pending"))
@@ -271,8 +301,8 @@ async fn admin_can_page_search_and_preview_pending_candidates()
 }
 
 #[tokio::test]
-async fn admin_can_read_and_edit_item_metadata_with_field_locks()
--> Result<(), Box<dyn std::error::Error>> {
+async fn admin_can_read_and_edit_item_metadata_with_field_locks(
+) -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
