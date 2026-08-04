@@ -6,9 +6,10 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import type { LuxUser } from "../../lib/api/types";
+import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
 
 type LuxShellProps = { user: LuxUser };
 
@@ -17,6 +18,12 @@ export function LuxShell({ user }: LuxShellProps) {
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
   const isDetail = location.pathname.startsWith("/libraries/");
+
+  useEffect(() => {
+    const settings = readAccountSettings(user.id);
+    applyAccountTheme(settings.theme);
+    applyAccountAccent(settings.accentColor);
+  }, [user.id]);
 
   return (
     <div className="lux-app">

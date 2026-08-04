@@ -634,3 +634,138 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
 }
+
+/* Account settings */
+.lux-account-page { --lux-settings-surface: rgba(20,20,24,.72); --lux-settings-line: var(--lux-line-soft); }
+.lux-account-page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 42px; }
+.lux-account-page-heading h1 { margin: 10px 0 8px; color: var(--lux-text); font-size: clamp(2.4rem, 5vw, 4.6rem); letter-spacing: -.075em; }
+.lux-account-page-heading p { margin: 0; color: var(--lux-muted); }
+.lux-account-sync-status { display: inline-flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid var(--lux-settings-line); border-radius: 999px; color: var(--lux-muted); font-size: .72rem; white-space: nowrap; }
+.lux-account-sync-status span { width: 6px; height: 6px; border-radius: 50%; background: #76d39a; box-shadow: 0 0 0 4px rgba(118,211,154,.1); }
+.lux-account-settings-grid { display: grid; grid-template-columns: 220px minmax(0, 760px); align-items: start; justify-content: space-between; gap: clamp(28px, 5vw, 84px); }
+.lux-account-settings-sidebar { position: sticky; top: 32px; }
+.lux-account-profile-card { display: flex; align-items: center; gap: 11px; padding: 0 10px 26px; border-bottom: 1px solid var(--lux-settings-line); }
+.lux-account-profile-card strong, .lux-account-profile-card span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-account-profile-card strong { color: var(--lux-text); font-size: .86rem; }
+.lux-account-profile-card span { margin-top: 4px; color: var(--lux-subtle); font-size: .7rem; }
+.lux-settings-avatar { display: grid; place-items: center; flex: 0 0 auto; width: 42px; height: 42px; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 50%; color: var(--lux-text); background: linear-gradient(145deg, #74747b, #28282e); font-size: .95rem; font-weight: 650; }
+.lux-settings-avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.lux-account-settings-nav { display: grid; gap: 4px; padding-top: 18px; }
+.lux-account-settings-nav a { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 0 10px; border-radius: 8px; color: var(--lux-muted); font-size: .78rem; transition: color .2s ease, background .2s ease; }
+.lux-account-settings-nav a:hover, .lux-account-settings-nav a:focus-visible { color: var(--lux-text); background: rgba(255,255,255,.06); }
+.lux-account-settings-nav a svg { color: var(--lux-subtle); }
+.lux-account-settings-content { display: grid; gap: 14px; min-width: 0; }
+.lux-account-settings-section { overflow: hidden; border: 1px solid var(--lux-settings-line); border-radius: 14px; background: var(--lux-settings-surface); }
+.lux-account-settings-section-heading { display: flex; align-items: center; gap: 12px; padding: 20px 22px; border-bottom: 1px solid var(--lux-settings-line); }
+.lux-account-settings-section-heading h2 { margin: 5px 0 0; color: var(--lux-text); font-size: 1.15rem; letter-spacing: -.025em; }
+.lux-account-section-icon { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--lux-settings-line); border-radius: 9px; color: var(--lux-text); background: rgba(255,255,255,.06); }
+.lux-account-settings-section-body { padding: 4px 22px 22px; }
+.lux-setting-row, .lux-setting-toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 78px; }
+.lux-setting-row strong, .lux-setting-block-heading strong, .lux-setting-toggle-row strong, .lux-account-profile-editor strong { display: block; color: var(--lux-text); font-size: .84rem; font-weight: 600; }
+.lux-setting-row p, .lux-setting-block-heading p, .lux-setting-toggle-row small, .lux-account-profile-editor p { display: block; margin: 5px 0 0; color: var(--lux-muted); font-size: .74rem; line-height: 1.55; }
+.lux-theme-options { display: flex; gap: 4px; padding: 4px; border: 1px solid var(--lux-settings-line); border-radius: 9px; background: rgba(255,255,255,.035); }
+.lux-theme-options button { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 11px; border: 0; border-radius: 6px; color: var(--lux-subtle); background: transparent; font-size: .74rem; transition: color .2s ease, background .2s ease; }
+.lux-theme-options button:hover, .lux-theme-options button.is-selected { color: var(--lux-text); background: rgba(255,255,255,.11); }
+.lux-accent-row { min-height: 86px; }
+.lux-accent-options { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+.lux-accent-option { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 9px; border: 1px solid transparent; border-radius: 7px; color: var(--lux-subtle); background: transparent; font-size: .72rem; transition: color .2s ease, border-color .2s ease, background .2s ease; }
+.lux-accent-option:hover, .lux-accent-option.is-selected { border-color: var(--lux-settings-line); color: var(--lux-text); background: rgba(255,255,255,.07); }
+.lux-accent-swatch { display: block; width: 13px; height: 13px; border-radius: 50%; background: var(--lux-accent); box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+.lux-accent-option.is-berry .lux-accent-swatch { background: #d247bf; }
+.lux-accent-option.is-ocean .lux-accent-swatch { background: #4f8cff; }
+.lux-accent-option.is-amber .lux-accent-swatch { background: #d99a47; }
+.lux-accent-option.is-mint .lux-accent-swatch { background: #54c59b; }
+.lux-setting-block { padding: 17px 0 10px; }
+.lux-setting-block-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.lux-setting-hint { flex: 0 0 auto; padding: 5px 8px; border: 1px solid var(--lux-settings-line); border-radius: 5px; color: var(--lux-subtle); font-size: .65rem; }
+.lux-account-library-list { display: grid; gap: 5px; margin-top: 15px; }
+.lux-account-library-row { display: grid; grid-template-columns: 18px 29px minmax(0,1fr) auto; align-items: center; gap: 10px; min-height: 57px; padding: 7px 8px; border: 1px solid transparent; border-radius: 9px; background: rgba(255,255,255,.035); cursor: grab; transition: border-color .2s ease, background .2s ease, transform .2s var(--lux-ease); }
+.lux-account-library-row:active { cursor: grabbing; }
+.lux-account-library-row:hover { border-color: var(--lux-settings-line); background: rgba(255,255,255,.065); transform: translateX(2px); }
+.lux-drag-handle { color: var(--lux-subtle); }
+.lux-account-library-index { display: grid; place-items: center; width: 29px; height: 29px; border-radius: 7px; color: var(--lux-subtle); background: rgba(255,255,255,.07); font-size: .67rem; font-variant-numeric: tabular-nums; }
+.lux-account-library-copy { min-width: 0; }
+.lux-account-library-copy strong, .lux-account-library-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-account-library-copy strong { color: var(--lux-text); font-size: .79rem; font-weight: 550; }
+.lux-account-library-copy span { margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-account-library-actions { display: flex; gap: 3px; }
+.lux-account-library-actions button { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 1px solid transparent; border-radius: 6px; color: var(--lux-muted); background: transparent; }
+.lux-account-library-actions button:hover:not(:disabled), .lux-account-library-actions button:focus-visible { border-color: var(--lux-settings-line); color: var(--lux-text); background: rgba(255,255,255,.08); }
+.lux-account-library-actions button:disabled { color: var(--lux-subtle); opacity: .35; }
+.lux-account-library-skeleton { height: 57px; border-radius: 9px; background: linear-gradient(100deg, rgba(255,255,255,.04) 25%, rgba(255,255,255,.09) 50%, rgba(255,255,255,.04) 75%); background-size: 200% 100%; animation: lux-shimmer 1.8s ease-in-out infinite; }
+.lux-account-empty { margin-top: 15px; padding: 18px; border: 1px dashed var(--lux-settings-line); border-radius: 9px; color: var(--lux-muted); font-size: .76rem; text-align: center; }
+.lux-setting-divider { height: 1px; margin: 10px 0; background: var(--lux-settings-line); }
+.lux-setting-toggle-row { position: relative; min-height: 65px; cursor: pointer; }
+.lux-setting-toggle-row > span:first-child { min-width: 0; }
+.lux-setting-toggle-row small { display: block; }
+.lux-setting-toggle-row input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.lux-setting-switch { display: inline-flex; align-items: center; flex: 0 0 auto; width: 39px; height: 23px; padding: 3px; border-radius: 999px; background: rgba(255,255,255,.16); transition: background .2s ease; }
+.lux-setting-switch span { display: block; width: 17px; height: 17px; border-radius: 50%; background: rgba(255,255,255,.72); transition: transform .2s var(--lux-ease), background .2s ease; }
+.lux-setting-toggle-row input:checked + .lux-setting-switch { background: var(--lux-accent); }
+.lux-setting-toggle-row input:checked + .lux-setting-switch span { background: #fff; transform: translateX(16px); }
+.lux-setting-toggle-row input:focus-visible + .lux-setting-switch { outline: 2px solid var(--lux-text); outline-offset: 3px; }
+.lux-setting-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 15px; padding: 17px 0; }
+.lux-setting-field { display: grid; gap: 7px; min-width: 0; color: var(--lux-text); font-size: .76rem; }
+.lux-setting-field span { font-weight: 550; }
+.lux-setting-field small { color: var(--lux-subtle); font-size: .68rem; line-height: 1.45; }
+.lux-setting-field input, .lux-setting-field select { width: 100%; min-height: 41px; padding: 0 11px; border: 1px solid var(--lux-settings-line); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
+.lux-setting-field input:focus, .lux-setting-field select:focus { border-color: rgba(255,255,255,.45); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.lux-setting-field input[readonly] { color: var(--lux-subtle); cursor: not-allowed; }
+.lux-account-profile-editor { display: flex; align-items: center; gap: 15px; padding: 17px 0; }
+.lux-settings-avatar-large { width: 68px; height: 68px; font-size: 1.4rem; }
+.lux-upload-button { display: inline-flex; align-items: center; min-height: 33px; margin-top: 10px; padding: 0 11px; border: 1px solid var(--lux-settings-line); border-radius: 7px; color: var(--lux-text); background: rgba(255,255,255,.06); font-size: .72rem; cursor: pointer; transition: background .2s ease, border-color .2s ease; }
+.lux-upload-button:hover { border-color: rgba(255,255,255,.38); background: rgba(255,255,255,.1); }
+.lux-upload-button input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
+.lux-account-form-grid { padding-top: 4px; }
+.lux-password-panel { margin-top: 5px; padding: 17px; border: 1px solid var(--lux-settings-line); border-radius: 10px; background: rgba(255,255,255,.025); }
+.lux-password-panel > .lux-setting-block-heading > svg { flex: 0 0 auto; color: var(--lux-subtle); }
+.lux-password-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); padding-bottom: 5px; }
+.lux-account-password-button { min-height: 37px; padding: 0 13px; font-size: .73rem; }
+.lux-account-notice { margin: 12px 0 0; color: #f3c788; font-size: .72rem; line-height: 1.5; }
+.lux-account-footer-card { display: grid; grid-template-columns: 1fr 1fr auto; align-items: center; gap: 12px; margin-top: 4px; padding: 16px 18px; border: 1px solid var(--lux-settings-line); border-radius: 12px; color: var(--lux-muted); background: rgba(20,20,24,.54); }
+.lux-account-footer-card > div { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.lux-account-footer-card > div > svg { flex: 0 0 auto; color: var(--lux-subtle); }
+.lux-account-footer-card strong, .lux-account-footer-card span { display: block; }
+.lux-account-footer-card strong { color: var(--lux-text); font-size: .75rem; font-weight: 550; }
+.lux-account-footer-card span { margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-account-footer-card .lux-button { min-height: 36px; padding: 0 12px; font-size: .72rem; }
+
+html[data-lux-theme="light"] { color-scheme: light; --lux-bg: #f4f3f1; --lux-surface: rgba(255,255,255,.86); --lux-line: rgba(28,28,34,.16); --lux-line-soft: rgba(28,28,34,.1); --lux-text: #25252a; --lux-muted: rgba(37,37,42,.64); --lux-subtle: rgba(37,37,42,.43); }
+html[data-lux-accent="berry"] { --lux-accent: #d247bf; }
+html[data-lux-accent="ocean"] { --lux-accent: #4f8cff; }
+html[data-lux-accent="amber"] { --lux-accent: #d99a47; }
+html[data-lux-accent="mint"] { --lux-accent: #54c59b; }
+html[data-lux-theme="light"] body, html[data-lux-theme="light"] .lux-app { color: var(--lux-text); background: var(--lux-bg); }
+html[data-lux-theme="light"] .lux-header { background: linear-gradient(180deg, rgba(244,243,241,.94), rgba(244,243,241,0)); }
+html[data-lux-theme="light"] .lux-brand-name, html[data-lux-theme="light"] .lux-nav-link, html[data-lux-theme="light"] .lux-icon-button, html[data-lux-theme="light"] .lux-user-button { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-nav-link { color: var(--lux-muted); }
+html[data-lux-theme="light"] .lux-nav-link:hover, html[data-lux-theme="light"] .lux-nav-link.is-active { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-account-settings-section, html[data-lux-theme="light"] .lux-account-footer-card { --lux-settings-surface: rgba(255,255,255,.82); background: var(--lux-settings-surface); box-shadow: 0 10px 30px rgba(30,30,38,.04); }
+html[data-lux-theme="light"] .lux-account-library-row:hover, html[data-lux-theme="light"] .lux-theme-options button:hover, html[data-lux-theme="light"] .lux-theme-options button.is-selected { background: rgba(28,28,34,.07); }
+html[data-lux-theme="light"] .lux-setting-field input, html[data-lux-theme="light"] .lux-setting-field select { background: rgba(28,28,34,.035); }
+html[data-lux-theme="light"] .lux-setting-field input:focus, html[data-lux-theme="light"] .lux-setting-field select:focus { border-color: rgba(28,28,34,.38); box-shadow: 0 0 0 3px rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-account-footer-card { background: rgba(255,255,255,.74); }
+
+@media (max-width: 900px) {
+  .lux-account-settings-grid { grid-template-columns: 1fr; gap: 20px; }
+  .lux-account-settings-sidebar { position: static; }
+  .lux-account-profile-card { padding-bottom: 16px; }
+  .lux-account-settings-nav { display: flex; overflow-x: auto; padding: 10px 0 2px; }
+  .lux-account-settings-nav a { flex: 0 0 auto; padding: 0 12px; }
+}
+
+@media (max-width: 560px) {
+  .lux-account-page-heading { align-items: flex-start; flex-direction: column; gap: 15px; margin-bottom: 28px; }
+  .lux-account-page-heading h1 { font-size: 2.55rem; }
+  .lux-account-settings-section-heading { padding: 17px; }
+  .lux-account-settings-section-body { padding: 2px 17px 17px; }
+  .lux-setting-row { align-items: flex-start; flex-direction: column; gap: 13px; padding: 15px 0; }
+  .lux-theme-options { align-self: stretch; }
+  .lux-theme-options button { flex: 1; justify-content: center; }
+  .lux-accent-row { gap: 10px; }
+  .lux-accent-options { justify-content: flex-start; }
+  .lux-setting-form-grid, .lux-password-grid { grid-template-columns: 1fr; gap: 13px; }
+  .lux-account-profile-editor { align-items: flex-start; }
+  .lux-account-footer-card { grid-template-columns: 1fr 1fr; }
+  .lux-account-footer-card .lux-button { grid-column: 1 / -1; width: 100%; }
+}
