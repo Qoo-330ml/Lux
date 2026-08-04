@@ -2118,13 +2118,7 @@ impl Database {
 
     pub(crate) async fn update_external_subtitle(
         &self,
-        item_id: &str,
-        media_source_id: &str,
-        stream_index: i64,
-        title: Option<&str>,
-        language: Option<&str>,
-        is_default: bool,
-        is_forced: bool,
+        update: ExternalSubtitleUpdate<'_>,
     ) -> Result<bool, StorageError> {
         let mut transaction = self
             .pool
@@ -2141,9 +2135,9 @@ impl Database {
                AND mt.stream_type = 'SUBTITLE' AND mt.is_external = 1
              LIMIT 1",
         )
-        .bind(media_source_id)
-        .bind(item_id)
-        .bind(stream_index)
+        .bind(update.media_source_id)
+        .bind(update.item_id)
+        .bind(update.stream_index)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -2154,14 +2148,14 @@ impl Database {
         if !exists {
             return Ok(false);
         }
-        if is_default {
+        if update.is_default {
             sqlx::query(
                 "UPDATE media_streams
                  SET is_default = 0, updated_at = unixepoch()
                  WHERE media_source_id = ? AND stream_type = 'SUBTITLE'
                    AND is_external = 1",
             )
-            .bind(media_source_id)
+            .bind(update.media_source_id)
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -2176,12 +2170,12 @@ impl Database {
              WHERE media_source_id = ? AND stream_index = ?
                AND stream_type = 'SUBTITLE' AND is_external = 1",
         )
-        .bind(title)
-        .bind(language)
-        .bind(is_default)
-        .bind(is_forced)
-        .bind(media_source_id)
-        .bind(stream_index)
+        .bind(update.title)
+        .bind(update.language)
+        .bind(update.is_default)
+        .bind(update.is_forced)
+        .bind(update.media_source_id)
+        .bind(update.stream_index)
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -5501,6 +5495,16 @@ pub(crate) struct MediaMetadataUpdate<'a> {
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
+}
+
+pub(crate) struct ExternalSubtitleUpdate<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) media_source_id: &'a str,
+    pub(crate) stream_index: i64,
+    pub(crate) title: Option<&'a str>,
+    pub(crate) language: Option<&'a str>,
+    pub(crate) is_default: bool,
+    pub(crate) is_forced: bool,
 }
 
 pub(crate) struct SelectedMetadataUpdate<'a> {

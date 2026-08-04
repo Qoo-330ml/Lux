@@ -72,7 +72,7 @@ use crate::{
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
     network::RemoteAccessPolicy,
     security::LoginRateLimiter,
-    storage::{Database, NewPlaybackEvent, StorageError},
+    storage::{Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf, SeekFrom},
@@ -5511,15 +5511,15 @@ async fn admin_update_item_subtitle(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let updated = match database
-        .update_external_subtitle(
-            &item_id,
-            request.source_id.trim(),
+        .update_external_subtitle(ExternalSubtitleUpdate {
+            item_id: &item_id,
+            media_source_id: request.source_id.trim(),
             stream_index,
             title,
             language,
-            request.is_default,
-            request.is_forced,
-        )
+            is_default: request.is_default,
+            is_forced: request.is_forced,
+        })
         .await
     {
         Ok(updated) => updated,
