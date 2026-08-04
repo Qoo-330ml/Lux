@@ -1940,6 +1940,13 @@ fn emby_catalog_item_json_with_state(
     let runtime_ticks = item
         .runtime_ticks
         .or_else(|| default_source.and_then(|source| source.duration_ticks));
+    let mut image_tags = serde_json::Map::new();
+    if let Some(tag) = item.poster_image_tag.as_ref() {
+        image_tags.insert("Primary".to_owned(), json!(tag));
+    }
+    if let Some(tag) = item.logo_image_tag.as_ref() {
+        image_tags.insert("Logo".to_owned(), json!(tag));
+    }
     json!({
         "Name": item.title,
         "OriginalTitle": item.original_title,
@@ -1964,11 +1971,7 @@ fn emby_catalog_item_json_with_state(
             .iter()
             .map(|source| emby_media_source_json(&item.id, source))
             .collect::<Vec<_>>(),
-        "ImageTags": item
-            .poster_image_tag
-            .as_ref()
-            .map(|tag| json!({"Primary": tag}))
-            .unwrap_or_else(|| json!({})),
+        "ImageTags": image_tags,
         "BackdropImageTags": item
             .fanart_image_tag
             .as_ref()

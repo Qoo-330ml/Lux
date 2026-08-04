@@ -3501,6 +3501,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -3573,6 +3575,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -3633,6 +3637,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -3714,6 +3720,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -3798,6 +3806,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -3843,6 +3853,8 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                          ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                         ORDER BY image_index LIMIT 1) AS logo_image_tag,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -3881,6 +3893,8 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                          ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                         ORDER BY image_index LIMIT 1) AS logo_image_tag,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -3923,6 +3937,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
                      ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -3976,6 +3992,7 @@ impl Database {
                         runtime_ticks: row.get("runtime_ticks"),
                         poster_image_tag: row.get("poster_image_tag"),
                         fanart_image_tag: row.get("fanart_image_tag"),
+                        logo_image_tag: row.get("logo_image_tag"),
                         source_id: row.get("source_id"),
                         source_kind: row.get("source_kind"),
                         container: row.get("container"),
@@ -5300,6 +5317,7 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) runtime_ticks: Option<i64>,
     pub(crate) poster_image_tag: Option<String>,
     pub(crate) fanart_image_tag: Option<String>,
+    pub(crate) logo_image_tag: Option<String>,
     pub(crate) source_id: Option<String>,
     pub(crate) source_kind: Option<String>,
     pub(crate) container: Option<String>,

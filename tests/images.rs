@@ -33,6 +33,7 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     tokio::fs::create_dir_all(&movie_dir).await?;
     tokio::fs::write(movie_dir.join("Image.Movie.2020.mkv"), b"movie").await?;
     tokio::fs::write(movie_dir.join("poster.jpg"), b"poster-bytes").await?;
+    tokio::fs::write(movie_dir.join("clearlogo.png"), b"logo-bytes").await?;
     libraries
         .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
         .await?;
@@ -52,6 +53,11 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     .bind(&item_id)
     .fetch_one(database.pool())
     .await?;
+    let logo_image_id: String =
+        sqlx::query_scalar("SELECT id FROM item_images WHERE item_id = ? AND image_type = 'LOGO'")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
 
     let outside_path = temp_dir.path().join("outside.jpg");
     tokio::fs::write(&outside_path, b"outside").await?;
@@ -90,6 +96,7 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
         .await?;
     let item_detail_body: Value = item_detail.json().await?;
     assert_eq!(item_detail_body["ImageTags"]["Primary"], image_id);
+    assert_eq!(item_detail_body["ImageTags"]["Logo"], logo_image_id);
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))
@@ -148,6 +155,18 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     assert_eq!(emby_image.headers().get(ETAG).unwrap(), etag.as_str());
     assert_eq!(emby_image.bytes().await?, "poster-bytes".as_bytes());
 
+    let emby_logo = client
+        .get(format!("{base_url}/Items/{item_id}/Images/Logo"))
+        .header("X-Emby-Token", &emby_token)
+        .send()
+        .await?;
+    assert_eq!(emby_logo.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        emby_logo.headers().get("content-type").unwrap(),
+        "image/png"
+    );
+    assert_eq!(emby_logo.bytes().await?, "logo-bytes".as_bytes());
+
     let missing = client
         .get(format!("{base_url}/Items/{item_id}/Images/Backdrop"))
         .header("X-Emby-Token", &emby_token)
@@ -185,9 +204,16 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     let admin_images_body = admin_images.json::<Value>().await?;
     assert_eq!(
         admin_images_body["images"].as_array().map(Vec::len),
-        Some(1)
+        Some(2)
     );
-    assert_eq!(admin_images_body["images"][0]["imageType"], "POSTER");
+    let image_types = admin_images_body["images"]
+        .as_array()
+        .ok_or("missing admin image list")?
+        .iter()
+        .filter_map(|image| image["imageType"].as_str())
+        .collect::<Vec<_>>();
+    assert!(image_types.contains(&"POSTER"));
+    assert!(image_types.contains(&"LOGO"));
     let deleted = client
         .delete(format!(
             "{base_url}/api/v1/admin/items/{item_id}/images/{image_id}"
