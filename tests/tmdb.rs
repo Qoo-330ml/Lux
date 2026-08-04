@@ -2,7 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -21,6 +21,9 @@ use tokio::sync::Mutex;
 struct StubState {
     statuses: Arc<Mutex<Vec<StatusCode>>>,
     attempts: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+    started_at: Arc<Mutex<Vec<Instant>>>,
     auth_seen: Arc<AtomicBool>,
     api_key_seen: Arc<AtomicBool>,
     delay: Option<Duration>,
@@ -41,6 +44,9 @@ async fn start_stub(
     let state = StubState {
         statuses: Arc::new(Mutex::new(statuses)),
         attempts: Arc::new(AtomicUsize::new(0)),
+        active: Arc::new(AtomicUsize::new(0)),
+        max_active: Arc::new(AtomicUsize::new(0)),
+        started_at: Arc::new(Mutex::new(Vec::new())),
         auth_seen: Arc::new(AtomicBool::new(false)),
         api_key_seen: Arc::new(AtomicBool::new(false)),
         delay,
@@ -58,7 +64,19 @@ async fn start_stub(
     (format!("http://{address}"), state, server)
 }
 
+struct ActiveRequestGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn stub_response(State(state): State<StubState>, request: Request<Body>) -> Response {
+    let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
+    state.max_active.fetch_max(active, Ordering::Relaxed);
+    state.started_at.lock().await.push(Instant::now());
+    let _active_request = ActiveRequestGuard(state.active.clone());
     if request
         .headers()
         .get("authorization")
@@ -518,6 +536,57 @@ async fn tmdb_client_reads_tv_people_images_external_ids_and_videos()
     let videos = client.movie_videos(7, "zh-CN").await?;
     assert_eq!(videos.results[0].key.as_deref(), Some("abc123"));
 
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn tmdb_client_caps_upstream_concurrency_at_sixteen() -> Result<(), Box<dyn std::error::Error>> {
+    let (base_url, state, server) = start_stub(
+        vec![StatusCode::OK; 40],
+        Some(Duration::from_millis(80)),
+        false,
+        false,
+    )
+    .await;
+    let client = TmdbClient::new(client_config(base_url, Duration::from_secs(1), 0))?;
+    let mut requests = Vec::new();
+    for index in 0..40 {
+        let client = client.clone();
+        requests.push(tokio::spawn(async move {
+            client
+                .search_movies(&format!("stub-{index}"), None, "en-US")
+                .await
+        }));
+    }
+    for request in requests {
+        request.await??;
+    }
+
+    assert!(state.max_active.load(Ordering::Relaxed) <= 16);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn tmdb_client_default_rate_limit_starts_no_more_than_thirty_two_requests_per_second()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (base_url, state, server) = start_stub(vec![StatusCode::OK; 4], None, false, false).await;
+    let client = TmdbClient::new(TmdbClientConfig {
+        base_url,
+        read_access_token: Some("stub-token".to_owned()),
+        ..TmdbClientConfig::default()
+    })?;
+    for index in 0..4 {
+        client
+            .search_movies(&format!("stub-{index}"), None, "en-US")
+            .await?;
+    }
+
+    let started_at = state.started_at.lock().await.clone();
+    assert!(started_at.windows(2).all(|pair| {
+        pair[1].duration_since(pair[0]) >= Duration::from_millis(30)
+    }));
     server.abort();
     Ok(())
 }

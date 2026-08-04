@@ -7,12 +7,14 @@ use std::{
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, Semaphore},
     time::sleep,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.themoviedb.org/";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const TMDB_MAX_CONCURRENT_REQUESTS: usize = 16;
+pub const TMDB_REQUESTS_PER_SECOND: u32 = 32;
 pub(crate) const EMBEDDED_TMDB_API_KEY: &str = "f6bd687ffa63cd282b6ff2c6877f2669";
 
 #[derive(Clone)]
@@ -39,7 +41,7 @@ impl Default for TmdbClientConfig {
             initial_backoff: Duration::from_millis(250),
             max_backoff: Duration::from_secs(4),
             retry_jitter: Duration::from_millis(100),
-            requests_per_second: 35,
+            requests_per_second: TMDB_REQUESTS_PER_SECOND,
         }
     }
 }
@@ -56,6 +58,7 @@ pub struct TmdbClient {
     retry_jitter: Duration,
     request_interval: Option<Duration>,
     next_request: Arc<Mutex<Instant>>,
+    request_concurrency: Arc<Semaphore>,
 }
 
 impl TmdbClient {
@@ -100,6 +103,7 @@ impl TmdbClient {
             retry_jitter: config.retry_jitter,
             request_interval,
             next_request: Arc::new(Mutex::new(Instant::now())),
+            request_concurrency: Arc::new(Semaphore::new(TMDB_MAX_CONCURRENT_REQUESTS)),
         })
     }
 
@@ -595,6 +599,11 @@ impl TmdbClient {
 
         let mut retry_count = 0;
         loop {
+            let request_permit = self
+                .request_concurrency
+                .acquire()
+                .await
+                .map_err(|_| TmdbError::Transport("TMDb request limiter closed".to_owned()))?;
             self.wait_for_rate_limit().await;
             let credential = self.credential.read().await.clone();
             let request = self.http.get(url.clone());
@@ -608,6 +617,7 @@ impl TmdbClient {
                 Ok(response) => response,
                 Err(error) if error.is_timeout() => {
                     if retry_count < self.max_retries {
+                        drop(request_permit);
                         self.wait_before_retry(retry_count, None).await;
                         retry_count += 1;
                         continue;
@@ -633,6 +643,7 @@ impl TmdbClient {
             }
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 if retry_count < self.max_retries {
+                    drop(request_permit);
                     self.wait_before_retry(retry_count, retry_after).await;
                     retry_count += 1;
                     continue;
@@ -640,6 +651,7 @@ impl TmdbClient {
                 return Err(TmdbError::RateLimited);
             }
             if status.is_server_error() && retry_count < self.max_retries {
+                drop(request_permit);
                 self.wait_before_retry(retry_count, retry_after).await;
                 retry_count += 1;
                 continue;
