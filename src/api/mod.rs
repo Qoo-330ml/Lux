@@ -285,6 +285,10 @@ pub fn app_with_state(state: AppState) -> Router {
             delete(admin_delete_item_image),
         )
         .route(
+            "/api/v1/admin/items/{item_id}/scan",
+            post(admin_start_item_scan),
+        )
+        .route(
             "/api/v1/admin/items/{item_id}/collection/refresh",
             post(admin_refresh_collection),
         )
@@ -5390,6 +5394,42 @@ async fn admin_start_scan(
         Json(json!({ "job": scan_job_json(&job) })),
     )
         .into_response()
+}
+
+async fn admin_start_item_scan(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_id = match database.find_item_library_id(&item_id).await {
+        Ok(Some(library_id)) => library_id,
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体条目不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    admin_start_scan(headers, Path(library_id), State(state)).await
 }
 
 async fn admin_refresh_collection(

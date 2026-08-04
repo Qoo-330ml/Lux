@@ -64,13 +64,37 @@ export function MediaCard({ item, landscape = false }: { item: MediaItem; landsc
   const progress = playbackProgress(item);
   const [editor, setEditor] = useState<"metadata" | "images" | "identify">();
   const [actionError, setActionError] = useState<string>();
+  const [actionNotice, setActionNotice] = useState<string>();
 
   async function setMetadataLock(locked: boolean) {
     setActionError(undefined);
+    setActionNotice(undefined);
     try {
       await api.setItemMetadataLock(item.id, locked);
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "元数据锁定状态更新失败，请重试。");
+    }
+  }
+
+  async function refreshMetadata() {
+    setActionError(undefined);
+    setActionNotice(undefined);
+    try {
+      await api.startItemMetadataRefresh(item.id);
+      setActionNotice("刷新任务已提交");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "元数据刷新任务提交失败，请重试。");
+    }
+  }
+
+  async function scanLibrary() {
+    setActionError(undefined);
+    setActionNotice(undefined);
+    try {
+      await api.startItemLibraryScan(item.id);
+      setActionNotice("扫描任务已提交");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "媒体库扫描任务提交失败，请重试。");
     }
   }
 
@@ -88,7 +112,8 @@ export function MediaCard({ item, landscape = false }: { item: MediaItem; landsc
             <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
           </div>
         </Link>
-        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+        {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
       {editor === "metadata" ? <MediaMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}

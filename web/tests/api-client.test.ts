@@ -134,6 +134,24 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("starts item metadata refresh and library scan jobs through the admin API", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      expect(init?.method).toBe("POST");
+      if (path === "/api/v1/admin/metadata/reidentify") {
+        expect(JSON.parse(String(init?.body))).toEqual({ itemIds: ["item-1"] });
+        return new Response(JSON.stringify({ job: { id: "metadata-job-1" } }), { status: 202 });
+      }
+      expect(path).toBe("/api/v1/admin/items/item-1/scan");
+      return new Response(JSON.stringify({ job: { id: "scan-job-1" } }), { status: 202 });
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.startItemMetadataRefresh("item-1")).resolves.toEqual({ job: { id: "metadata-job-1" } });
+    await expect(client.startItemLibraryScan("item-1")).resolves.toEqual({ job: { id: "scan-job-1" } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("exposes admin health and settings through the Lux API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

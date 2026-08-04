@@ -178,6 +178,20 @@ export class LuxApiClient {
     });
   }
 
+  startItemMetadataRefresh(itemId: string) {
+    return this.request<{ job: AdminJob }>("/api/v1/admin/metadata/reidentify", {
+      method: "POST",
+      body: JSON.stringify({ itemIds: [itemId] }),
+    });
+  }
+
+  startItemLibraryScan(itemId: string) {
+    return this.request<{ job: AdminJob }>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/scan`,
+      { method: "POST" },
+    );
+  }
+
   itemImages(itemId: string) {
     return this.request<{ images?: ItemImage[] }>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
   }

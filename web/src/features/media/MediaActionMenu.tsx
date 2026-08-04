@@ -1,4 +1,4 @@
-import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, ScanSearch, Unlock, X } from "lucide-react";
+import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, RefreshCw, ScanLine, ScanSearch, Unlock, X } from "lucide-react";
 import { createPortal } from "react-dom";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MediaItem } from "../../lib/api/types";
@@ -10,6 +10,8 @@ type MediaActionMenuProps = {
   onIdentify?: () => void;
   onLockMetadata?: () => void;
   onUnlockMetadata?: () => void;
+  onRefreshMetadata?: () => void;
+  onScanLibrary?: () => void;
   className?: string;
   sourceId?: string;
 };
@@ -45,7 +47,7 @@ export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
   return `/api/v1/items/${encodeURIComponent(item.id)}/download${query}`;
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify, onLockMetadata, onUnlockMetadata, className = "", sourceId }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanLibrary, className = "", sourceId }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState({ left: 16, top: 16 });
   const rootRef = useRef<HTMLDivElement>(null);
@@ -170,6 +172,36 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onIdentify
             >
               <ScanSearch size={17} aria-hidden="true" />
               <span>识别</span>
+            </button>
+          ) : null}
+          {onRefreshMetadata ? (
+            <button
+              className="lux-media-action"
+              data-action="refresh-metadata"
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onRefreshMetadata();
+              }}
+            >
+              <RefreshCw size={17} aria-hidden="true" />
+              <span>刷新元数据</span>
+            </button>
+          ) : null}
+          {onScanLibrary ? (
+            <button
+              className="lux-media-action"
+              data-action="scan-library"
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onScanLibrary();
+              }}
+            >
+              <ScanLine size={17} aria-hidden="true" />
+              <span>扫描媒体库文件</span>
             </button>
           ) : null}
           {onLockMetadata ? (

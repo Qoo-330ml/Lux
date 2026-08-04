@@ -23,6 +23,7 @@ export function MediaDetailPage() {
   const [selectedSeasonId, setSelectedSeasonId] = useState<string>();
   const [editor, setEditor] = useState<"metadata" | "images" | "identify">();
   const [actionError, setActionError] = useState<string>();
+  const [actionNotice, setActionNotice] = useState<string>();
   const isSeries = item.data?.itemType === "SERIES";
   const seasons = useQuery({
     queryKey: queryKeys.children(itemId, "SEASON"),
@@ -58,11 +59,34 @@ export function MediaDetailPage() {
 
   async function setMetadataLock(locked: boolean) {
     setActionError(undefined);
+    setActionNotice(undefined);
     try {
       await api.setItemMetadataLock(media.id, locked);
       await queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) });
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "元数据锁定状态更新失败，请重试。");
+    }
+  }
+
+  async function refreshMetadata() {
+    setActionError(undefined);
+    setActionNotice(undefined);
+    try {
+      await api.startItemMetadataRefresh(media.id);
+      setActionNotice("元数据刷新任务已提交，可在管理任务中查看进度。");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "元数据刷新任务提交失败，请重试。");
+    }
+  }
+
+  async function scanLibrary() {
+    setActionError(undefined);
+    setActionNotice(undefined);
+    try {
+      await api.startItemLibraryScan(media.id);
+      setActionNotice("媒体库扫描任务已提交，可在管理任务中查看进度。");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "媒体库扫描任务提交失败，请重试。");
     }
   }
 
@@ -95,10 +119,11 @@ export function MediaDetailPage() {
               >
                 <Check size={20} strokeWidth={2.4} />
               </span>
-              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
               <span className="lux-detail-source"><Radio size={16} /> {source ? source.container || "DIRECT PLAY" : "暂无可播放版本"}</span>
             </div>
             {actionError ? <p className="lux-editor-error lux-detail-action-error" role="alert">{actionError}</p> : null}
+            {actionNotice ? <p className="lux-muted-copy lux-detail-action-error" role="status">{actionNotice}</p> : null}
             {sources.length > 1 ? (
               <MediaSourceSelector
                 sources={sources}
