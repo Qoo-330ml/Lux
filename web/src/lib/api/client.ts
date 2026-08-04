@@ -172,6 +172,12 @@ export class LuxApiClient {
     );
   }
 
+  adminInstalledPlugins() {
+    return this.request<{ plugins?: AdminPlugin[]; total?: number; page?: number; pageSize?: number }>(
+      "/api/v1/admin/plugins/installed?page=1&pageSize=50",
+    );
+  }
+
   installAdminPlugin(pluginId: string) {
     return this.request<{ plugin: AdminPlugin }>(
       `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/install`,

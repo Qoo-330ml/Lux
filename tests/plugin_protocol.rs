@@ -35,6 +35,7 @@ fn accepts_a_versioned_process_plugin_manifest() {
 
     assert_eq!(manifest.id, "org.lux.example");
     assert_eq!(manifest.version, "1.2.3");
+    assert_eq!(manifest.category, "SCRAPER");
     assert_eq!(manifest.runtime.kind, "process");
 }
 

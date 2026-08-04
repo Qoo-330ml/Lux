@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "apiVersion": 1,
         "runtime": {"kind": "process", "entrypoint": relative_binary},
         "type": "metadata",
+        "category": "SCRAPER",
         "supportedItemTypes": ["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
         "capabilities": [
             "metadata.search",

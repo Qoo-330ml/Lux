@@ -10,6 +10,7 @@ export const queryKeys = {
   adminHealth: ["admin", "health"] as const,
   adminLibraries: ["admin", "libraries"] as const,
   adminPlugins: ["admin", "plugins"] as const,
+  adminInstalledPlugins: ["admin", "plugins", "installed"] as const,
   adminUsers: ["admin", "users"] as const,
   adminJobs: (status?: string) => ["admin", "jobs", status ?? "all"] as const,
   adminLogs: ["admin", "logs"] as const,

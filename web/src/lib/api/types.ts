@@ -102,6 +102,7 @@ export type AdminPlugin = {
   id: string;
   name: string;
   description: string;
+  category: string;
   installed: boolean;
   enabled: boolean;
   configured: boolean;

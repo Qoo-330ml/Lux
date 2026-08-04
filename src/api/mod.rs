@@ -207,6 +207,10 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
         .route(
+            "/api/v1/admin/plugins/installed",
+            get(admin_list_installed_plugins),
+        )
+        .route(
             "/api/v1/admin/plugins/{plugin_id}/install",
             post(admin_install_plugin),
         )
@@ -6162,6 +6166,23 @@ async fn admin_list_plugins(
     Query(query): Query<LuxPageQuery>,
     State(state): State<AppState>,
 ) -> Response {
+    admin_list_plugins_with_scope(headers, query, state, false).await
+}
+
+async fn admin_list_installed_plugins(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_plugins_with_scope(headers, query, state, true).await
+}
+
+async fn admin_list_plugins_with_scope(
+    headers: HeaderMap,
+    query: LuxPageQuery,
+    state: AppState,
+    installed_only: bool,
+) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
@@ -6186,7 +6207,12 @@ async fn admin_list_plugins(
         )
         .into_response();
     };
-    match plugins.list(offset, limit).await {
+    let page = if installed_only {
+        plugins.list_installed(offset, limit).await
+    } else {
+        plugins.list(offset, limit).await
+    };
+    match page {
         Ok(page) => Json(plugin_page_json(&page)).into_response(),
         Err(error) => plugin_error(&headers, error),
     }
@@ -6802,6 +6828,13 @@ fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
         "id": plugin.id,
         "name": plugin.name,
         "description": plugin.description,
+        "category": plugin.category,
+        "version": plugin.version,
+        "runtime": plugin.runtime,
+        "capabilities": plugin.capabilities,
+        "status": plugin.status,
+        "running": plugin.running,
+        "lastError": plugin.last_error,
         "installed": plugin.installed,
         "enabled": plugin.enabled,
         "configured": plugin.configured,

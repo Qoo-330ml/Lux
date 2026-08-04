@@ -135,6 +135,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     let catalog_body: Value = catalog.json().await?;
     assert_eq!(catalog_body["total"], 1);
     assert_eq!(catalog_body["plugins"][0]["id"], "tmdb");
+    assert_eq!(catalog_body["plugins"][0]["category"], "SCRAPER");
     assert_eq!(catalog_body["plugins"][0]["installed"], false);
     assert_eq!(catalog_body["plugins"][0]["configured"], true);
     assert_eq!(catalog_body["plugins"][0]["configurable"], true);
@@ -156,6 +157,18 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
         installed.json::<Value>().await?["plugin"]["installed"],
         true
     );
+
+    let managed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/plugins/installed?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(managed.status(), reqwest::StatusCode::OK);
+    let managed_body: Value = managed.json().await?;
+    assert_eq!(managed_body["total"], 1);
+    assert_eq!(managed_body["plugins"][0]["id"], "tmdb");
 
     let created = client
         .post(format!("{base_url}/api/v1/admin/libraries"))
@@ -307,6 +320,7 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
         .await?;
     assert_eq!(catalog["total"], 1);
     assert_eq!(catalog["plugins"][0]["id"], "org.lux.tmdb");
+    assert_eq!(catalog["plugins"][0]["category"], "SCRAPER");
     assert_eq!(catalog["plugins"][0]["version"], "1.0.0");
     assert_eq!(catalog["plugins"][0]["runtime"], "process");
 

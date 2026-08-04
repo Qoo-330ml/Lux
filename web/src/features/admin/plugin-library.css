@@ -1,0 +1,61 @@
+.lux-admin-plugin-tabs {
+  display: inline-flex;
+  gap: 4px;
+  margin-bottom: 22px;
+  padding: 4px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .045);
+}
+
+.lux-admin-plugin-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--lux-muted);
+  background: transparent;
+  font-size: .78rem;
+  font-weight: 650;
+}
+
+.lux-admin-plugin-tabs button:hover,
+.lux-admin-plugin-tabs button.is-active {
+  color: #fff;
+  background: rgba(255, 255, 255, .13);
+}
+
+.lux-admin-plugin-tabs button span {
+  min-width: 18px;
+  padding: 2px 5px;
+  border-radius: 999px;
+  color: var(--lux-subtle);
+  background: rgba(255, 255, 255, .08);
+  font-size: .68rem;
+  text-align: center;
+}
+
+.lux-admin-plugin-heading-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.lux-admin-plugin-category {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid rgba(210, 71, 191, .24);
+  border-radius: 999px;
+  color: #efb2e4;
+  background: rgba(210, 71, 191, .1);
+  font-size: .68rem;
+}
+
+@media (max-width: 560px) {
+  .lux-admin-plugin-tabs { display: flex; width: 100%; }
+  .lux-admin-plugin-tabs button { flex: 1; justify-content: center; }
+}

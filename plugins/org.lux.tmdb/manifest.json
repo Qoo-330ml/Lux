@@ -10,6 +10,7 @@
     "entrypoint": "binaries/${platform}-${arch}/lux-plugin-tmdb"
   },
   "type": "metadata",
+  "category": "SCRAPER",
   "supportedItemTypes": [
     "Movie",
     "Series",

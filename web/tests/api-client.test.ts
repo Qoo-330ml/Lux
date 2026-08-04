@@ -105,6 +105,9 @@ describe("LuxApiClient", () => {
       if (path === "/api/v1/admin/plugins?page=1&pageSize=50") {
         return new Response(JSON.stringify({ plugins: [{ id: "tmdb", installed: false }] }), { status: 200 });
       }
+      if (path === "/api/v1/admin/plugins/installed?page=1&pageSize=50") {
+        return new Response(JSON.stringify({ plugins: [{ id: "tmdb", installed: true }] }), { status: 200 });
+      }
       if (path === "/api/v1/admin/plugins/tmdb/install") {
         expect(init?.method).toBe("POST");
         expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
@@ -123,9 +126,10 @@ describe("LuxApiClient", () => {
 
     const client = new LuxApiClient();
     await expect(client.adminPlugins()).resolves.toEqual({ plugins: [{ id: "tmdb", installed: false }] });
+    await expect(client.adminInstalledPlugins()).resolves.toEqual({ plugins: [{ id: "tmdb", installed: true }] });
     await expect(client.installAdminPlugin("tmdb")).resolves.toEqual({ plugin: { id: "tmdb", installed: true } });
     await expect(client.updateAdminPluginConfig("tmdb", "custom-key")).resolves.toEqual({ plugin: { id: "tmdb", installed: true, configSource: "CUSTOM" } });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("unwraps the authenticated user from the login envelope", async () => {

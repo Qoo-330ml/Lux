@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::{
     application::{
-        plugin_protocol::PluginConfigField,
+        plugin_protocol::{PLUGIN_CATEGORY_SCRAPER, PluginConfigField},
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         settings::{TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, write_tmdb_api_key},
         tmdb::EMBEDDED_TMDB_API_KEY,
@@ -54,6 +54,23 @@ impl PluginService {
     }
 
     pub async fn list(&self, offset: i64, limit: i64) -> Result<PluginPage, PluginServiceError> {
+        self.list_filtered(offset, limit, false).await
+    }
+
+    pub async fn list_installed(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<PluginPage, PluginServiceError> {
+        self.list_filtered(offset, limit, true).await
+    }
+
+    async fn list_filtered(
+        &self,
+        offset: i64,
+        limit: i64,
+        installed_only: bool,
+    ) -> Result<PluginPage, PluginServiceError> {
         let mut views = Vec::with_capacity(self.catalog.plugins.len() + 1);
         let has_tmdb_package = self
             .catalog
@@ -62,14 +79,18 @@ impl PluginService {
             .any(|plugin| is_tmdb_plugin_id(&plugin.manifest.id));
         if !has_tmdb_package {
             let installed = self.database.is_plugin_installed(TMDB_PLUGIN_ID).await?;
-            views.push(legacy_tmdb_view(installed, self.tmdb_config_source().await));
+            if !installed_only || installed {
+                views.push(legacy_tmdb_view(installed, self.tmdb_config_source().await));
+            }
         }
         for plugin in &self.catalog.plugins {
             let installed = self
                 .database
                 .is_plugin_installed(&plugin.manifest.id)
                 .await?;
-            views.push(self.dynamic_view(plugin, installed).await);
+            if !installed_only || installed {
+                views.push(self.dynamic_view(plugin, installed).await);
+            }
         }
         let total = i64::try_from(views.len()).unwrap_or(i64::MAX);
         let start = offset.max(0).min(total) as usize;
@@ -179,6 +200,7 @@ impl PluginService {
             id: plugin.manifest.id.clone(),
             name: plugin.manifest.name.clone(),
             description: plugin.manifest.description.clone().unwrap_or_default(),
+            category: plugin.manifest.category.clone(),
             version: Some(plugin.manifest.version.clone()),
             runtime: Some(plugin.manifest.runtime.kind.clone()),
             capabilities: plugin.manifest.capabilities.clone(),
@@ -275,6 +297,7 @@ pub struct PluginView {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub category: String,
     pub version: Option<String>,
     pub runtime: Option<String>,
     pub capabilities: Vec<String>,
@@ -338,6 +361,7 @@ fn legacy_tmdb_view(installed: bool, config_source: &str) -> PluginView {
         id: TMDB_PLUGIN_ID.to_owned(),
         name: TMDB_PLUGIN_NAME.to_owned(),
         description: TMDB_PLUGIN_DESCRIPTION.to_owned(),
+        category: PLUGIN_CATEGORY_SCRAPER.to_owned(),
         version: None,
         runtime: Some("built-in".to_owned()),
         capabilities: vec![

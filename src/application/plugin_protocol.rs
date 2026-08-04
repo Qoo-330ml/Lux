@@ -7,6 +7,7 @@ use serde_json::Value;
 
 pub const PLUGIN_FORMAT_VERSION: u32 = 1;
 pub const PLUGIN_API_VERSION: u32 = 1;
+pub const PLUGIN_CATEGORY_SCRAPER: &str = "SCRAPER";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +22,8 @@ pub struct PluginManifest {
     pub runtime: PluginRuntime,
     #[serde(rename = "type")]
     pub plugin_type: String,
+    #[serde(default = "default_plugin_category")]
+    pub category: String,
     #[serde(default)]
     pub supported_item_types: Vec<String>,
     #[serde(default)]
@@ -58,6 +61,7 @@ impl PluginManifest {
         validate_identifier("id", &self.id, 128)?;
         validate_text("name", &self.name, 256)?;
         validate_semver(&self.version)?;
+        validate_identifier("category", &self.category, 64)?;
         if self.plugin_type != "metadata" {
             return Err(PluginManifestError::Invalid(
                 "only metadata plugins are supported".to_owned(),
@@ -113,6 +117,10 @@ impl PluginManifest {
             PluginManifestError::Invalid(format!("signature verification failed: {error}"))
         })
     }
+}
+
+fn default_plugin_category() -> String {
+    PLUGIN_CATEGORY_SCRAPER.to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

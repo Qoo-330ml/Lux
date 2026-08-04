@@ -37,6 +37,7 @@ org.lux.tmdb-1.0.0.zip
     "entrypoint": "binaries/${platform}-${arch}/lux-plugin-tmdb"
   },
   "type": "metadata",
+  "category": "SCRAPER",
   "supportedItemTypes": ["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
   "capabilities": [
     "metadata.search",
