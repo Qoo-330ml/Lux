@@ -5,10 +5,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LUX_HTTP_ADDR="${LUX_HTTP_ADDR:-0.0.0.0:8097}"
 LUX_CONFIG_DIR="${LUX_CONFIG_DIR:-./config}"
+LUX_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 RUST_LOG="${RUST_LOG:-luxd=info,tower_http=info}"
 PORT="${LUX_HTTP_ADDR##*:}"
 
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/restart-lux-cleanup.sh"
 
 log() {
     printf '[lux] %s\n' "$*"
@@ -88,6 +90,9 @@ if ((${#lux_pids[@]} > 0)); then
         sleep 0.25
     done
 fi
+
+log "cleaning Debug artifacts older than 5 minutes"
+cleanup_old_debug_artifacts "$LUX_TARGET_DIR" 5
 
 log "building Web frontend"
 "${PNPM_COMMAND[@]}" --dir web install --frozen-lockfile
