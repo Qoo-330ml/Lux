@@ -109,6 +109,7 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
         && !request.uri().path().contains("/external_ids")
         && !request.uri().path().contains("/videos")
         && !request.uri().path().contains("/images")
+        && !request.uri().path().contains("/credits")
     {
         return axum::Json(json!({
             "id": 7,
@@ -121,6 +122,18 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
                 "id": 10,
                 "name": "Stub Collection"
             }
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/movie/7/credits") {
+        return axum::Json(json!({
+            "cast": [{
+                "id": 9,
+                "name": "Stub Person",
+                "character": "主角",
+                "profile_path": "/profile.jpg",
+                "order": 0
+            }]
         }))
         .into_response();
     }
@@ -499,6 +512,9 @@ async fn tmdb_client_reads_tv_people_images_external_ids_and_videos()
     assert_eq!(external_ids.imdb_id.as_deref(), Some("tt0000007"));
     let images = client.movie_images(7, "zh-CN").await?;
     assert_eq!(images.posters[0].file_path.as_deref(), Some("/poster.jpg"));
+    let credits = client.movie_credits(7, "zh-CN").await?;
+    assert_eq!(credits.cast[0].id, 9);
+    assert_eq!(credits.cast[0].character.as_deref(), Some("主角"));
     let videos = client.movie_videos(7, "zh-CN").await?;
     assert_eq!(videos.results[0].key.as_deref(), Some("abc123"));
 

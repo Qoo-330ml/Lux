@@ -430,6 +430,19 @@ impl TmdbClient {
         self.images("movie", movie_id, language).await
     }
 
+    pub async fn movie_credits(
+        &self,
+        movie_id: i64,
+        language: &str,
+    ) -> Result<TmdbCreditsResponse, TmdbError> {
+        validate_id_language(movie_id, language, "movie")?;
+        let endpoint = format!("3/movie/{movie_id}/credits");
+        let params = [("language", language.trim().to_owned())];
+        let credits: TmdbCreditsResponse = self.request_json(&endpoint, &params).await?;
+        validate_credits_response(&credits)?;
+        Ok(credits)
+    }
+
     pub async fn tv_images(
         &self,
         series_id: i64,
@@ -765,6 +778,21 @@ pub struct TmdbMovieDetails {
     pub belongs_to_collection: Option<TmdbCollectionReference>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbCreditsResponse {
+    #[serde(default)]
+    pub cast: Vec<TmdbCastMember>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbCastMember {
+    pub id: i64,
+    pub name: Option<String>,
+    pub character: Option<String>,
+    pub profile_path: Option<String>,
+    pub order: Option<i32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct TmdbTvSearchResponse {
     pub page: i32,
@@ -973,6 +1001,15 @@ fn validate_person_search_response(response: &TmdbPersonSearchResponse) -> Resul
     if response.results.iter().any(|result| result.id <= 0) {
         return Err(TmdbError::InvalidResponse(
             "TMDb person result ID is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_credits_response(response: &TmdbCreditsResponse) -> Result<(), TmdbError> {
+    if response.cast.iter().any(|member| member.id <= 0) {
+        return Err(TmdbError::InvalidResponse(
+            "TMDb cast member ID is invalid".to_owned(),
         ));
     }
     Ok(())
