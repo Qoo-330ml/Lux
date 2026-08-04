@@ -23,7 +23,9 @@ fn packages_a_signed_tmdb_zip_that_the_catalog_can_verify() -> Result<(), Box<dy
 
     let packer = std::env::var("CARGO_BIN_EXE_lux-plugin-pack")
         .or_else(|_| std::env::var("CARGO_BIN_EXE_lux_plugin_pack"))?;
+    let signing_key_hex = "07".repeat(32);
     let status = Command::new(packer)
+        .env("LUX_PLUGIN_SIGNING_KEY_HEX", &signing_key_hex)
         .args([
             "--binary",
             binary.to_str().ok_or("binary path is not UTF-8")?,
@@ -37,8 +39,6 @@ fn packages_a_signed_tmdb_zip_that_the_catalog_can_verify() -> Result<(), Box<dy
             "x86_64",
             "--key-id",
             "test",
-            "--signing-key-hex",
-            &"07".repeat(32),
         ])
         .status()?;
     assert!(status.success());

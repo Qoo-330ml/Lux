@@ -19,7 +19,6 @@ struct Arguments {
     platform: String,
     arch: String,
     key_id: String,
-    signing_key_hex: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -70,7 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "files": [{"path": relative_binary, "sha256": file_hash}],
         "signature": {"algorithm": "ed25519", "keyId": arguments.key_id, "value": "placeholder"}
     }))?;
-    let signing_key = parse_signing_key(&arguments.signing_key_hex)?;
+    let signing_key_hex = env::var("LUX_PLUGIN_SIGNING_KEY_HEX")
+        .map_err(|_| "LUX_PLUGIN_SIGNING_KEY_HEX is not set")?;
+    let signing_key = parse_signing_key(&signing_key_hex)?;
     let signature = signing_key.sign(&manifest.signing_payload()?);
     manifest.signature = PluginSignature {
         algorithm: "ed25519".to_owned(),
@@ -89,7 +90,6 @@ impl Arguments {
         let mut platform = None;
         let mut arch = None;
         let mut key_id = None;
-        let mut signing_key_hex = None;
         while let Some(flag) = values.next() {
             let target = match flag.as_str() {
                 "--binary" => &mut binary,
@@ -98,7 +98,6 @@ impl Arguments {
                 "--platform" => &mut platform,
                 "--arch" => &mut arch,
                 "--key-id" => &mut key_id,
-                "--signing-key-hex" => &mut signing_key_hex,
                 "--help" => return Err(usage().into()),
                 unknown => return Err(format!("unknown argument: {unknown}\n{}", usage()).into()),
             };
@@ -115,7 +114,6 @@ impl Arguments {
             platform: required(platform, "--platform")?,
             arch: required(arch, "--arch")?,
             key_id: required(key_id, "--key-id")?,
-            signing_key_hex: required(signing_key_hex, "--signing-key-hex")?,
         })
     }
 }
@@ -125,7 +123,7 @@ fn required(value: Option<String>, name: &str) -> Result<String, Box<dyn std::er
 }
 
 fn usage() -> &'static str {
-    "usage: lux-plugin-pack --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME --key-id ID --signing-key-hex HEX"
+    "usage: lux-plugin-pack --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME --key-id ID (private key from LUX_PLUGIN_SIGNING_KEY_HEX)"
 }
 
 fn parse_signing_key(value: &str) -> Result<SigningKey, Box<dyn std::error::Error>> {

@@ -25,6 +25,12 @@ cargo build --locked --release --bin lux-plugin-tmdb
 OUTPUT="${1:-$ROOT_DIR/dist/org.lux.tmdb-${VERSION}.zip}"
 mkdir -p "$(dirname "$OUTPUT")"
 
-cargo run --locked --bin lux-plugin-pack -- +  --binary "$TARGET_DIR/release/lux-plugin-tmdb" +  --output "$OUTPUT" +  --version "$VERSION" +  --platform "$PLATFORM" +  --arch "$ARCH" +  --key-id "$KEY_ID" +  --signing-key-hex "$LUX_PLUGIN_SIGNING_KEY_HEX"
+cargo run --locked --bin lux-plugin-pack -- \
+  --binary "$TARGET_DIR/release/lux-plugin-tmdb" \
+  --output "$OUTPUT" \
+  --version "$VERSION" \
+  --platform "$PLATFORM" \
+  --arch "$ARCH" \
+  --key-id "$KEY_ID"
 
 echo "created $OUTPUT"
