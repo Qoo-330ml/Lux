@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::{
     application::{
@@ -293,6 +294,7 @@ impl MetadataSelectionService {
             ));
         }
         let payload = candidate_payload(&candidate)?;
+        let image_policy = self.image_selection_policy(item_id).await?;
         let mut state = MetadataState::from_persisted(
             NfoMetadata {
                 title: Some(current.title.clone()),
@@ -317,38 +319,37 @@ impl MetadataSelectionService {
         }
         let nfo_report = self.nfo.write_item_nfo(item_id, &state.metadata).await?;
         let mut image_types = Vec::new();
-        if let Some(url) = payload.poster_url.as_deref() {
-            let report = match mode {
-                MetadataSelectionMode::FillMissing => {
-                    self.images
-                        .download_item_image_if_missing(item_id, "POSTER", url)
-                        .await?
+        if payload.typed_images_present {
+            for image_type in image_policy.enabled_types() {
+                let Some(url) = payload.images.get(image_type).and_then(|urls| urls.first()) else {
+                    continue;
+                };
+                if self
+                    .write_selected_image(item_id, image_type, url, mode)
+                    .await?
+                    .is_some()
+                {
+                    image_types.push(image_type);
                 }
-                MetadataSelectionMode::RefreshUnlocked => Some(
-                    self.images
-                        .download_item_image(item_id, "POSTER", url)
-                        .await?,
-                ),
-            };
-            if report.is_some() {
-                image_types.push("POSTER");
             }
-        }
-        if let Some(url) = payload.fanart_url.as_deref() {
-            let report = match mode {
-                MetadataSelectionMode::FillMissing => {
-                    self.images
-                        .download_item_image_if_missing(item_id, "FANART", url)
-                        .await?
+        } else {
+            if let Some(url) = payload.poster_url.as_deref() {
+                if self
+                    .write_selected_image(item_id, "POSTER", url, mode)
+                    .await?
+                    .is_some()
+                {
+                    image_types.push("POSTER");
                 }
-                MetadataSelectionMode::RefreshUnlocked => Some(
-                    self.images
-                        .download_item_image(item_id, "FANART", url)
-                        .await?,
-                ),
-            };
-            if report.is_some() {
-                image_types.push("FANART");
+            }
+            if let Some(url) = payload.fanart_url.as_deref() {
+                if self
+                    .write_selected_image(item_id, "FANART", url, mode)
+                    .await?
+                    .is_some()
+                {
+                    image_types.push("FANART");
+                }
             }
         }
         let provider_ids_json =
@@ -380,6 +381,48 @@ impl MetadataSelectionService {
             status: "ONLINE_CONFIRMED",
             image_types,
         })
+    }
+
+    async fn write_selected_image(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        url: &str,
+        mode: MetadataSelectionMode,
+    ) -> Result<Option<crate::application::images::ImageWriteReport>, ImageWriteError> {
+        match mode {
+            MetadataSelectionMode::FillMissing => {
+                self.images
+                    .download_item_image_if_missing(item_id, image_type, url)
+                    .await
+            }
+            MetadataSelectionMode::RefreshUnlocked => self
+                .images
+                .download_item_image(item_id, image_type, url)
+                .await
+                .map(Some),
+        }
+    }
+
+    async fn image_selection_policy(
+        &self,
+        item_id: &str,
+    ) -> Result<ImageSelectionPolicy, MetadataSelectionError> {
+        let library_id = self
+            .database
+            .find_item_library_id(item_id)
+            .await?
+            .ok_or(MetadataSelectionError::ItemNotFound)?;
+        let library = self
+            .database
+            .find_library(&library_id)
+            .await?
+            .ok_or(MetadataSelectionError::ItemNotFound)?;
+        let global = self.database.media_strategy_settings().await?;
+        Ok(ImageSelectionPolicy::from_json(
+            library.media_strategy_json.as_deref(),
+            global.as_deref(),
+        ))
     }
 }
 
@@ -446,8 +489,96 @@ impl From<ImageWriteError> for MetadataSelectionError {
 
 struct CandidatePayload {
     metadata: NfoMetadata,
+    images: BTreeMap<String, Vec<String>>,
+    typed_images_present: bool,
     poster_url: Option<String>,
     fanart_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ImageSelectionPolicy {
+    poster: bool,
+    artwork: bool,
+    banner: bool,
+    logo: bool,
+    thumbnail: bool,
+    disc: bool,
+    wallpaper: bool,
+}
+
+impl ImageSelectionPolicy {
+    fn from_json(library: Option<&str>, global: Option<&str>) -> Self {
+        library
+            .and_then(parse_image_selection_policy)
+            .or_else(|| global.and_then(parse_image_selection_policy))
+            .unwrap_or_else(default_image_selection_policy)
+    }
+
+    fn enabled_types(self) -> impl Iterator<Item = &'static str> {
+        [
+            (self.poster, "POSTER"),
+            (self.logo, "LOGO"),
+            (self.thumbnail, "THUMB"),
+            (self.banner, "BANNER"),
+            (self.disc, "DISC"),
+            (self.artwork, "ART"),
+            (self.wallpaper, "WALLPAPER"),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, image_type)| enabled.then_some(image_type))
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredImageStrategy {
+    #[serde(default = "default_true")]
+    poster: bool,
+    #[serde(default)]
+    artwork: bool,
+    #[serde(default)]
+    banner: bool,
+    #[serde(default = "default_true")]
+    logo: bool,
+    #[serde(default = "default_true")]
+    thumbnail: bool,
+    #[serde(default)]
+    disc: bool,
+    #[serde(default)]
+    wallpaper: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMediaStrategy {
+    #[serde(default)]
+    images: StoredImageStrategy,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_image_selection_policy() -> ImageSelectionPolicy {
+    ImageSelectionPolicy {
+        poster: true,
+        logo: true,
+        thumbnail: true,
+        ..ImageSelectionPolicy::default()
+    }
+}
+
+fn parse_image_selection_policy(value: &str) -> Option<ImageSelectionPolicy> {
+    let strategy = serde_json::from_str::<StoredMediaStrategy>(value).ok()?;
+    Some(ImageSelectionPolicy {
+        poster: strategy.images.poster,
+        artwork: strategy.images.artwork,
+        banner: strategy.images.banner,
+        logo: strategy.images.logo,
+        thumbnail: strategy.images.thumbnail,
+        disc: strategy.images.disc,
+        wallpaper: strategy.images.wallpaper,
+    })
 }
 
 fn candidate_payload(
@@ -466,6 +597,7 @@ fn candidate_payload(
         overview: candidate_text(&value, &["overview", "plot"]),
         production_year: candidate_year(&value)?,
     };
+    let (images, typed_images_present) = candidate_images(&value);
     let poster_url = candidate_url(&value, &["posterUrl", "poster_url", "poster"]);
     let fanart_url = candidate_url(
         &value,
@@ -481,6 +613,7 @@ fn candidate_payload(
         && metadata.original_title.is_none()
         && metadata.overview.is_none()
         && metadata.production_year.is_none()
+        && images.values().all(Vec::is_empty)
         && poster_url.is_none()
         && fanart_url.is_none()
     {
@@ -490,9 +623,56 @@ fn candidate_payload(
     }
     Ok(CandidatePayload {
         metadata,
+        images,
+        typed_images_present,
         poster_url,
         fanart_url,
     })
+}
+
+fn candidate_images(value: &Value) -> (BTreeMap<String, Vec<String>>, bool) {
+    let Some(object) = value.get("images").and_then(Value::as_object) else {
+        return (BTreeMap::new(), false);
+    };
+    let mut images = BTreeMap::new();
+    for (key, raw) in object {
+        let Some(image_type) = candidate_image_type(key) else {
+            continue;
+        };
+        let urls = candidate_values(raw);
+        if !urls.is_empty() {
+            images.insert(image_type.to_owned(), urls);
+        }
+    }
+    (images, true)
+}
+
+fn candidate_image_type(value: &str) -> Option<&'static str> {
+    match value.to_ascii_uppercase().as_str() {
+        "POSTER" => Some("POSTER"),
+        "FANART" => Some("FANART"),
+        "LOGO" => Some("LOGO"),
+        "THUMB" | "THUMBNAIL" => Some("THUMB"),
+        "BANNER" => Some("BANNER"),
+        "DISC" | "DISCART" => Some("DISC"),
+        "ART" | "ARTWORK" => Some("ART"),
+        "WALLPAPER" => Some("WALLPAPER"),
+        _ => None,
+    }
+}
+
+fn candidate_values(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Value::String(value) if !value.trim().is_empty() => vec![value.trim().to_owned()],
+        _ => Vec::new(),
+    }
 }
 
 fn candidate_text(value: &Value, fields: &[&str]) -> Option<String> {

@@ -1,8 +1,12 @@
-use axum::{Router, body::Body, http::StatusCode, response::Response, routing::get};
+use axum::{body::Body, http::StatusCode, response::Response, routing::get, Router};
 use luxd::{
-    api::{AppState, app_with_state},
+    api::{app_with_state, AppState},
     application::{
-        libraries::LibraryService, metadata::MetadataEnricher, scanner::LibraryScanner,
+        candidates::{MetadataSelectionMode, MetadataSelectionService},
+        images::ImageWriteService,
+        libraries::LibraryService,
+        metadata::MetadataEnricher,
+        scanner::LibraryScanner,
         setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
@@ -11,7 +15,7 @@ use luxd::{
     storage::Database,
 };
 use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -25,8 +29,8 @@ const PNG_1X1: &[u8] = &[
 ];
 
 #[tokio::test]
-async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
--> Result<(), Box<dyn std::error::Error>> {
+async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images(
+) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(true).await?;
     let (image_url, image_server) = start_image_stub().await?;
     let candidate_id = insert_candidate(
@@ -92,8 +96,83 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
 }
 
 #[tokio::test]
-async fn failed_selection_stays_pending_and_can_be_retried()
--> Result<(), Box<dyn std::error::Error>> {
+async fn admin_selection_writes_only_configured_candidate_image_types(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Configured Images",
+            "images": {
+                "POSTER": [
+                    format!("{image_url}/poster-first"),
+                    format!("{image_url}/poster-second")
+                ],
+                "LOGO": [format!("{image_url}/logo")],
+                "THUMB": [format!("{image_url}/thumb")],
+                "BANNER": [format!("{image_url}/banner")],
+                "DISC": [],
+                "ART": [format!("{image_url}/art")],
+                "WALLPAPER": [format!("{image_url}/wallpaper")]
+            }
+        }),
+    )
+    .await?;
+    let service = ImageWriteService::new(fixture.database.clone())?;
+    let selection = MetadataSelectionService::new(fixture.database.clone(), service);
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert_eq!(report.image_types, vec!["POSTER", "LOGO", "THUMB", "ART"]);
+    let image_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT image_type, local_path FROM item_images WHERE item_id = ? ORDER BY image_type",
+    )
+    .bind(&fixture.item_id)
+    .fetch_all(fixture.database.pool())
+    .await?;
+    let image_names = image_rows
+        .iter()
+        .map(|(image_type, path)| {
+            (
+                image_type.clone(),
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        image_names,
+        vec![
+            ("ART".to_owned(), "art.png".to_owned()),
+            ("LOGO".to_owned(), "logo.png".to_owned()),
+            ("POSTER".to_owned(), "poster.png".to_owned()),
+            ("THUMB".to_owned(), "thumb.png".to_owned()),
+        ]
+    );
+    assert!(fixture.movie_dir.join("poster.png").exists());
+    assert!(!fixture.movie_dir.join("poster-second.png").exists());
+    assert!(!fixture.movie_dir.join("banner.png").exists());
+    assert!(!fixture.movie_dir.join("wallpaper.png").exists());
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_selection_stays_pending_and_can_be_retried(
+) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
     let (image_url, image_server) = start_image_stub().await?;
     let candidate_id = insert_candidate(
@@ -247,8 +326,37 @@ async fn insert_candidate(
     Ok(candidate_id)
 }
 
-async fn start_image_stub()
--> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
+async fn configure_image_strategy(
+    database: &Database,
+    item_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(
+            json!({
+                "images": {
+                    "poster": true,
+                    "artwork": true,
+                    "banner": false,
+                    "logo": true,
+                    "thumbnail": true,
+                    "disc": true,
+                    "wallpaper": false
+                }
+            })
+            .to_string(),
+        )
+        .bind(library_id)
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
+
+async fn start_image_stub(
+) -> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
 {
     let app = Router::new().route(
         "/{name}",
@@ -262,6 +370,16 @@ async fn start_image_stub()
                     .header(CONTENT_TYPE, "image/webp")
                     .body(Body::from(b"RIFF\x04\x00\x00\x00WEBP".to_vec()))
                     .unwrap(),
+                "poster-second" => Response::builder()
+                    .header(CONTENT_TYPE, "image/png")
+                    .body(Body::from(b"broken".to_vec()))
+                    .unwrap(),
+                "poster-first" | "logo" | "thumb" | "banner" | "art" | "wallpaper" => {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "image/png")
+                        .body(Body::from(PNG_1X1.to_vec()))
+                        .unwrap()
+                }
                 "bad" => Response::builder()
                     .header(CONTENT_TYPE, "image/png")
                     .body(Body::from(b"broken".to_vec()))
