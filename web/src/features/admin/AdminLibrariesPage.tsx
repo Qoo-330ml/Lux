@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
+import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminPlugin } from "../../lib/api/types";
@@ -103,7 +104,7 @@ export function AdminLibrariesPage() {
           <div className="lux-library-dialog-header"><div><span className="lux-eyebrow">NEW LIBRARY</span><h2 id="new-library-title">新增媒体库</h2></div><button className="lux-library-dialog-close" type="button" aria-label="关闭新增媒体库弹窗" onClick={() => setCreateOpen(false)}><X size={20} /></button></div>
           <form className="lux-admin-form lux-library-dialog-form" onSubmit={submit}>
             <label htmlFor="new-library-name">名称<input id="new-library-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：电影" /></label>
-            <label htmlFor="new-library-kind">类型<select id="new-library-kind" value={kind} onChange={(event) => setKind(event.target.value)}><option value="MOVIE">电影</option><option value="SERIES">剧集</option><option value="MIXED">混合</option></select></label>
+            <label htmlFor="new-library-kind">类型<LuxSelect id="new-library-kind" value={kind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setKind} aria-label="媒体库类型" /></label>
             <ScraperSelect id="new-library-scraper" value={scraperId} plugins={pluginItems} onChange={setScraperId} />
             <label className="lux-admin-toggle"><input type="checkbox" checked={watchEnabled} onChange={(event) => setWatchEnabled(event.target.checked)} /><span>启用实时监听</span></label>
             {formError ? <p className="lux-error-copy">{formError}</p> : null}
@@ -223,7 +224,7 @@ function LibraryActionMenu({ library, onEdit, onScan, onRemove }: { library: Adm
 }
 
 function ScraperSelect({ id, value, plugins, onChange }: { id: string; value: string; plugins: AdminPlugin[]; onChange: (value: string) => void }) {
-  return <label className="lux-admin-scraper-field" htmlFor={id}>刮削器<select id={id} value={value} onChange={(event) => onChange(event.target.value)}><option value="">仅使用本地元数据</option>{plugins.map((plugin) => <option key={plugin.id} value={plugin.id} disabled={!plugin.available}>{plugin.name}{plugin.available ? "" : plugin.installed ? "（暂不可用）" : "（请先安装）"}</option>)}</select></label>;
+  return <label className="lux-admin-scraper-field" htmlFor={id}>刮削器<LuxSelect id={id} value={value} options={[{ value: "", label: "仅使用本地元数据" }, ...plugins.map((plugin) => ({ value: plugin.id, label: `${plugin.name}${plugin.available ? "" : plugin.installed ? "（暂不可用）" : "（请先安装）"}`, disabled: !plugin.available }))]} onChange={onChange} aria-label="刮削器" /></label>;
 }
 
 function ScheduleField({ label, value, onSave }: { label: string; value?: string | null; onSave: (value: string) => void }) {

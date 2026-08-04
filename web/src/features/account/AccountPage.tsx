@@ -17,6 +17,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { Library, LuxUser } from "../../lib/api/types";
+import { LuxSelect } from "../../components/LuxSelect";
 import {
   applyAccountTheme,
   applyAccountAccent,
@@ -220,22 +221,22 @@ export function AccountPage({ user }: { user: LuxUser }) {
             <div className="lux-setting-form-grid">
               <label className="lux-setting-field">
                 <span>默认音轨语言</span>
-                <select value={settings.audioLanguage} onChange={(event) => updateSettings({ audioLanguage: event.target.value })}>
-                  <option>原始音轨</option>
-                  <option>简体中文</option>
-                  <option>English</option>
-                  <option>日本語</option>
-                </select>
+                <LuxSelect
+                  value={settings.audioLanguage}
+                  options={["原始音轨", "简体中文", "English", "日本語"].map((language) => ({ value: language, label: language }))}
+                  onChange={(audioLanguage) => updateSettings({ audioLanguage })}
+                  aria-label="默认音轨语言"
+                />
                 <small>播放时优先选择匹配的音频轨道。</small>
               </label>
               <label className="lux-setting-field">
                 <span>默认字幕语言</span>
-                <select value={settings.subtitleLanguage} onChange={(event) => updateSettings({ subtitleLanguage: event.target.value })}>
-                  <option>关闭字幕</option>
-                  <option>简体中文</option>
-                  <option>繁體中文</option>
-                  <option>English</option>
-                </select>
+                <LuxSelect
+                  value={settings.subtitleLanguage}
+                  options={["关闭字幕", "简体中文", "繁體中文", "English"].map((language) => ({ value: language, label: language }))}
+                  onChange={(subtitleLanguage) => updateSettings({ subtitleLanguage })}
+                  aria-label="默认字幕语言"
+                />
                 <small>没有匹配轨道时由播放器决定回退策略。</small>
               </label>
             </div>
