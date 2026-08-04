@@ -117,7 +117,10 @@ impl PeopleService {
             });
         }
 
-        stored.sort_by_key(|actor| actor.order.unwrap_or(i32::MAX));
+        stored.sort_by_key(|actor| match actor.order {
+            Some(order) => order,
+            None => i32::MAX,
+        });
         let bytes = serde_json::to_vec_pretty(&stored)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
         let path = items_dir.join(format!("{item_id}.json"));
@@ -136,7 +139,7 @@ impl PeopleService {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) => return Err(PeopleError::Io { path, source }),
         };
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PEOPLE_FILE_BYTES {
+        if bytes.len() as u64 > MAX_PEOPLE_FILE_BYTES {
             return Err(PeopleError::Serialization(
                 "people data is too large".to_owned(),
             ));
