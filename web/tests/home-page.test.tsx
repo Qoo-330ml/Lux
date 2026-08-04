@@ -58,4 +58,40 @@ describe("HomePage shelves", () => {
       .toContain("最新华语片");
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
+
+  it("keeps carousel controls in the same row as the playback actions", async () => {
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [],
+      recommended: [
+        { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
+        { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
+      ],
+      continueWatching: [],
+      recentlyAdded: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const actionRow = container.querySelector(".lux-hero-action-row");
+    expect(actionRow).not.toBeNull();
+    expect(actionRow?.querySelector(".lux-hero-actions")).not.toBeNull();
+    expect(actionRow?.querySelector(".lux-hero-carousel-controls")).not.toBeNull();
+    expect(actionRow?.querySelector(".lux-hero-carousel-controls")?.parentElement).toBe(actionRow);
+  });
 });
