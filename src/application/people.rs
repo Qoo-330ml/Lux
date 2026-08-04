@@ -134,6 +134,13 @@ impl PeopleService {
             .people_dir()
             .join(ITEMS_DIR)
             .join(format!("{item_id}.json"));
+        if let Some(metadata) = safe_metadata(&path).await?
+            && !metadata.is_file()
+        {
+            return Err(PeopleError::Serialization(
+                "people data path is not a file".to_owned(),
+            ));
+        }
         let bytes = match fs::read(&path).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -178,23 +185,23 @@ impl PeopleService {
         let profiles_dir = self.people_dir().join(PROFILES_DIR);
         for extension in PROFILE_EXTENSIONS {
             let path = profiles_dir.join(format!("{person_id}.{extension}"));
-            match fs::metadata(&path).await {
-                Ok(metadata) => {
-                    let content_type = match extension {
-                        "jpg" => "image/jpeg",
-                        "png" => "image/png",
-                        "webp" => "image/webp",
-                        _ => continue,
-                    };
-                    return Ok(Some(PersonImage {
-                        path,
-                        content_type,
-                        content_length: metadata.len(),
-                    }));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => return Err(PeopleError::Io { path, source }),
+            let Some(metadata) = safe_metadata(&path).await? else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
             }
+            let content_type = match extension {
+                "jpg" => "image/jpeg",
+                "png" => "image/png",
+                "webp" => "image/webp",
+                _ => continue,
+            };
+            return Ok(Some(PersonImage {
+                path,
+                content_type,
+                content_length: metadata.len(),
+            }));
         }
         Ok(None)
     }
@@ -210,12 +217,10 @@ impl PeopleService {
         profiles_dir: &Path,
     ) -> Result<Option<String>, PeopleError> {
         for extension in PROFILE_EXTENSIONS {
-            if fs::try_exists(profiles_dir.join(format!("{person_id}.{extension}")))
-                .await
-                .map_err(|source| PeopleError::Io {
-                    path: profiles_dir.to_owned(),
-                    source,
-                })?
+            let path = profiles_dir.join(format!("{person_id}.{extension}"));
+            if safe_metadata(&path)
+                .await?
+                .is_some_and(|metadata| metadata.is_file())
             {
                 return Ok(Some(format!("{PROFILES_DIR}/{person_id}.{extension}")));
             }
@@ -290,6 +295,20 @@ fn validate_component(value: &str) -> Result<(), PeopleError> {
         return Err(PeopleError::InvalidComponent(value.to_owned()));
     }
     Ok(())
+}
+
+async fn safe_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, PeopleError> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(PeopleError::Symlink(path.to_owned()))
+        }
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(PeopleError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 async fn create_private_dir(path: &Path) -> Result<(), PeopleError> {
@@ -382,6 +401,7 @@ pub enum PeopleError {
     UpstreamStatus(u16),
     Download(String),
     Serialization(String),
+    Symlink(PathBuf),
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -399,6 +419,9 @@ impl fmt::Display for PeopleError {
                 write!(formatter, "people image upstream returned {status}")
             }
             Self::Serialization(message) => write!(formatter, "people data is invalid: {message}"),
+            Self::Symlink(path) => {
+                write!(formatter, "people path is a symlink: {}", path.display())
+            }
             Self::Io { path, source } => {
                 write!(formatter, "people file {}: {source}", path.display())
             }
@@ -415,7 +438,32 @@ impl std::error::Error for PeopleError {
             | Self::InvalidImage(_)
             | Self::UpstreamStatus(_)
             | Self::Download(_)
-            | Self::Serialization(_) => None,
+            | Self::Serialization(_)
+            | Self::Symlink(_) => None,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{PeopleError, PeopleService};
+
+    #[tokio::test]
+    async fn profile_image_rejects_symlinked_files() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let config = tempfile::tempdir()?;
+        let profiles = config.path().join("people/profiles");
+        tokio::fs::create_dir_all(&profiles).await?;
+        let outside = config.path().join("outside.png");
+        tokio::fs::write(&outside, b"not an image").await?;
+        symlink(&outside, profiles.join("9.png"))?;
+
+        let error = PeopleService::new(config.path().to_owned())
+            .profile_image("9")
+            .await
+            .expect_err("symlinked profile must be rejected");
+        assert!(matches!(error, PeopleError::Symlink(_)));
+        Ok(())
     }
 }
