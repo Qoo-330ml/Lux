@@ -154,7 +154,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 媒体 DTO 只返回客户端所需的标题、年份、简介、时长、容器、大小、码率和轨道信息，不返回服务器内部文件路径。图片内容端点属于 LUX-035。
 
-媒体探测优先使用本地文件的 ffprobe；`.strm` 源优先读取同名 `-mediainfo.json`，没有有效旁车时回退到同名 NFO 的 `<fileinfo><streamdetails>`。旁车内容只接受受限字段，不执行外部地址探测。
+媒体探测仅对本地文件优先使用 ffprobe；`.strm` 源不主动读取外部媒体的容器信息或索引，只优先读取同名 `-mediainfo.json`，再读取同名 NFO 的 `<fileinfo><streamdetails>`。没有有效旁车时技术信息保持为空，首次播放由客户端直接访问外部地址。旁车内容只接受受限字段，不执行外部地址探测。
 
 ## 媒体库 ACL（LUX-036）
 
