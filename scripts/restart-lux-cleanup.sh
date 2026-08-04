@@ -2,7 +2,7 @@
 
 cleanup_old_debug_artifacts() {
     local target_dir="${1:-}"
-    local min_age_minutes="${2:-5}"
+    local min_age_minutes="${2:-1440}"
     local debug_dir
     local cache_dir
 
