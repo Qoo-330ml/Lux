@@ -57,6 +57,13 @@ export type MediaSource = {
   streams?: MediaStream[];
 };
 
+export type MediaActor = {
+  id: string;
+  name: string;
+  character?: string | null;
+  imageUrl?: string | null;
+};
+
 export type MediaItem = {
   id: string;
   title?: string | null;
@@ -68,6 +75,7 @@ export type MediaItem = {
   imageTags?: ImageTags;
   userData?: UserData;
   mediaSources?: MediaSource[];
+  actors?: MediaActor[];
   parentId?: string | null;
   indexNumber?: number | null;
   parentIndexNumber?: number | null;

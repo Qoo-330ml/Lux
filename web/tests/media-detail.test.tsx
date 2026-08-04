@@ -108,6 +108,49 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(actionItems[3]?.querySelector(".lux-media-actions-trigger")).not.toBeNull();
   });
 
+  it("shows identified actors with local portraits or initial placeholders", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-1",
+      title: "示例电影",
+      itemType: "MOVIE",
+      actors: [
+        { id: "9", name: "演员甲", character: "角色甲", imageUrl: "/api/v1/people/9/image" },
+        { id: "10", name: "演员乙", character: "角色乙", imageUrl: null },
+      ],
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/movie-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const cast = container.querySelector(".lux-media-cast");
+    expect(cast?.querySelector("h2")?.textContent).toBe("演职人员");
+    expect(cast?.querySelectorAll(".lux-media-cast-card")).toHaveLength(2);
+    expect(cast?.querySelector<HTMLImageElement>(".lux-media-cast-avatar img")?.src)
+      .toContain("/api/v1/people/9/image");
+    expect(cast?.textContent).toContain("演员甲");
+    expect(cast?.textContent).toContain("角色甲");
+    expect(cast?.querySelector(".lux-media-cast-initial")?.textContent).toBe("演");
+  });
+
   it("opens the complete overview from the three-line summary", async () => {
     const overview = "这是一段足够长的剧情简介，用来验证详情页只展示三行内容，并在末尾提供更多入口。".repeat(5);
     vi.spyOn(api, "item").mockResolvedValue({

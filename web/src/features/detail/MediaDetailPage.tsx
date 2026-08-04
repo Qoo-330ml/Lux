@@ -6,6 +6,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource } from "../../lib/api/types";
 import { MediaInfoPanel } from "./MediaInfoPanel";
+import { MediaCast } from "./MediaCast";
 import { imageUrl, mediaTitle, mediaTypeLabel, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
@@ -95,6 +96,7 @@ export function MediaDetailPage() {
             ) : null}
           </div>
         </div>
+        <MediaCast actors={media.actors ?? []} />
         {source ? <MediaInfoPanel source={source} itemType={media.itemType} /> : null}
         {isSeries ? (
           <SeriesChildren
