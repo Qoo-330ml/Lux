@@ -16,6 +16,8 @@
   --lux-subtle: rgba(245, 245, 245, 0.42);
   --lux-accent: #d247bf;
   --lux-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --lux-header-height: 102px;
+  --lux-page-top: 126px;
 }
 
 * { box-sizing: border-box; }
@@ -118,7 +120,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-empty-card { display: flex; flex: 1 1 100%; align-items: center; justify-content: space-between; min-height: 92px; padding: 17px 20px; border: 1px dashed var(--lux-line); border-radius: 14px; color: var(--lux-muted); background: rgba(255,255,255,.025); font-size: .88rem; }
 .lux-empty-card a { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
 
-.lux-page { width: min(1400px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: 150px 0 90px; }
+.lux-page { width: min(1400px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 90px; }
 .lux-page-narrow { width: min(1280px, calc(100% - 48px)); }
 .lux-page-heading { display: block; margin-bottom: 38px; }
 .lux-page-heading h1 { margin: 10px 0 7px; font-size: clamp(2.2rem, 5vw, 4rem); letter-spacing: -.07em; }
@@ -140,7 +142,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-page { position: relative; min-height: 100vh; overflow: hidden; isolation: isolate; background: #08080a; }
 .lux-detail-backdrop { position: absolute; z-index: -3; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .58; filter: saturate(.78) brightness(.72) blur(1px); transform: scale(1.02); }
 .lux-detail-overlay { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg, rgba(5,5,6,.95), rgba(5,5,6,.7) 45%, rgba(5,5,6,.42)), linear-gradient(0deg, #050506 4%, transparent 58%); }
-.lux-detail-content { width: min(1280px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: 145px 0 110px; }
+.lux-detail-content { width: min(1280px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
 .lux-detail-back { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 70px; border: 0; color: var(--lux-muted); background: transparent; font-size: .84rem; }
 .lux-detail-back:hover { color: #fff; }
 .lux-detail-grid { display: grid; grid-template-columns: 250px minmax(0, 650px); align-items: end; gap: 54px; }
@@ -235,8 +237,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-skeleton-row { height: 250px; margin-top: 22px; border-radius: 12px; }
 @keyframes lux-shimmer { to { background-position: -200% 0; } }
 
-.lux-admin-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; padding-top: 88px; background: radial-gradient(circle at 75% 0%, rgba(72, 37, 69, .14), transparent 34%), var(--lux-bg); }
-.lux-admin-sidebar { position: sticky; top: 88px; display: flex; flex-direction: column; height: calc(100vh - 88px); padding: 24px 16px 22px; border-right: 1px solid var(--lux-line-soft); background: rgba(9, 9, 12, .68); backdrop-filter: blur(20px); }
+.lux-admin-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; padding-top: var(--lux-header-height); background: radial-gradient(circle at 75% 0%, rgba(72, 37, 69, .14), transparent 34%), var(--lux-bg); }
+.lux-admin-sidebar { position: sticky; top: var(--lux-header-height); display: flex; flex-direction: column; height: calc(100vh - var(--lux-header-height)); padding: 24px 16px 22px; border-right: 1px solid var(--lux-line-soft); background: rgba(9, 9, 12, .68); backdrop-filter: blur(20px); }
 .lux-admin-sidebar-heading { display: flex; align-items: center; gap: 11px; padding: 6px 10px 28px; }
 .lux-admin-sidebar-heading strong, .lux-admin-sidebar-heading small { display: block; }
 .lux-admin-sidebar-heading strong { color: #fff; font-size: .94rem; }
@@ -248,7 +250,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-nav-link.is-active { border-color: var(--lux-line-soft); color: #fff; background: rgba(255,255,255,.09); }
 .lux-admin-back { display: flex; align-items: center; gap: 7px; margin-top: auto; padding: 12px; color: var(--lux-subtle); font-size: .76rem; }
 .lux-admin-back:hover { color: #fff; }
-.lux-admin-content { width: min(1400px, 100%); padding: 52px clamp(24px, 4vw, 64px) 90px; }
+.lux-admin-content { width: min(1400px, 100%); padding: 24px clamp(24px, 4vw, 64px) 90px; }
 .lux-admin-page { width: 100%; }
 .lux-admin-page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 34px; }
 .lux-admin-page-heading h1 { margin: 9px 0 7px; color: #fff; font-size: clamp(2.35rem, 5vw, 4.2rem); letter-spacing: -.075em; }
@@ -442,14 +444,15 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-media-card { flex-basis: 150px; }
   .lux-media-card-landscape { flex-basis: 260px; }
   .lux-continue-card { flex-basis: 260px; }
-  .lux-admin-layout { display: block; padding-top: 78px; }
+  :root { --lux-header-height: 90px; --lux-page-top: 114px; }
+  .lux-admin-layout { display: block; padding-top: var(--lux-header-height); }
   .lux-admin-sidebar { position: static; height: auto; padding: 18px 16px 12px; border-right: 0; border-bottom: 1px solid var(--lux-line-soft); }
   .lux-admin-sidebar-heading { padding: 5px 5px 16px; }
   .lux-admin-nav { display: flex; overflow-x: auto; padding-bottom: 3px; scrollbar-width: none; }
   .lux-admin-nav::-webkit-scrollbar { display: none; }
   .lux-admin-nav-link { flex: 0 0 auto; }
   .lux-admin-back { display: none; }
-  .lux-admin-content { padding: 34px 20px 64px; }
+  .lux-admin-content { padding: 24px 20px 64px; }
   .lux-admin-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lux-admin-dashboard-grid { grid-template-columns: 1fr; }
 }
@@ -467,7 +470,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-hero-carousel-controls { margin-top: 20px; }
   .lux-home-content { width: calc(100% - 32px); padding-bottom: 52px; }
   .lux-section { margin-top: 38px; }
-  .lux-page { width: calc(100% - 32px); padding-top: 112px; }
+  :root { --lux-header-height: 74px; --lux-page-top: 98px; }
+  .lux-page { width: calc(100% - 32px); }
   .lux-page-heading { margin-bottom: 28px; }
   .lux-page-heading h1 { font-size: 2.5rem; }
   .lux-poster-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 25px 12px; }
@@ -476,7 +480,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-search-panel input { flex-basis: calc(100% - 40px); min-height: 32px; }
   .lux-search-panel .lux-button { flex: 1; }
   .lux-auth-card { padding: 30px 24px; }
-  .lux-detail-content { width: calc(100% - 32px); padding-top: 105px; }
+  .lux-detail-content { width: calc(100% - 32px); }
   .lux-detail-back { margin-bottom: 28px; }
   .lux-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-detail-poster { width: min(220px, 62vw); }
@@ -491,6 +495,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-player-frame { border-radius: 9px; }
   .lux-player-controls { right: 8px; bottom: 8px; left: 8px; gap: 7px; padding: 7px 9px; }
   .lux-admin-page-heading { align-items: flex-start; flex-direction: column; margin-bottom: 26px; }
+  .lux-admin-layout { padding-top: var(--lux-header-height); }
   .lux-admin-stat-grid { gap: 9px; }
   .lux-admin-stat { min-height: 92px; padding: 13px; }
   .lux-admin-stat-icon { width: 34px; height: 34px; }
