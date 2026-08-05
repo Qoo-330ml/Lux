@@ -48,7 +48,9 @@ impl std::fmt::Display for ConfigError {
                 write!(formatter, "invalid LUX_HTTP_ADDR '{value}': {source}")
             }
             Self::InvalidProxyUrl => {
-                formatter.write_str("invalid LUX_PROXY_URL: expected an http(s) proxy URL")
+                formatter.write_str(
+                    "invalid LUX_PROXY_URL: expected an http, https, socks4, socks4a, socks5, or socks5h proxy URL",
+                )
             }
         }
     }

@@ -12,9 +12,9 @@ pub enum NetworkProxyError {
 impl fmt::Display for NetworkProxyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidUrl => {
-                formatter.write_str("network proxy URL must be a valid http(s) URL")
-            }
+            Self::InvalidUrl => formatter.write_str(
+                "network proxy URL must use http, https, socks4, socks4a, socks5, or socks5h",
+            ),
         }
     }
 }
@@ -41,14 +41,20 @@ pub fn apply_proxy(
         return Ok(builder);
     };
     let proxy_url = normalize_proxy_url(proxy_url)?;
-    let proxy = Proxy::all(proxy_url).map_err(|_| NetworkProxyError::InvalidUrl)?;
+    let proxy = Proxy::all(proxy_url)
+        .map_err(|_| NetworkProxyError::InvalidUrl)?
+        .no_proxy(reqwest::NoProxy::from_env());
     Ok(builder.proxy(proxy))
 }
 
 fn normalize_proxy_url(value: &str) -> Result<String, NetworkProxyError> {
     let value = value.trim();
     let url = Url::parse(value).map_err(|_| NetworkProxyError::InvalidUrl)?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+    if !matches!(
+        url.scheme(),
+        "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+    ) || url.host_str().is_none()
+    {
         return Err(NetworkProxyError::InvalidUrl);
     }
     Ok(value.to_owned())
@@ -213,11 +219,27 @@ mod tests {
     use super::{NetworkProxyError, apply_proxy};
 
     #[test]
-    fn proxy_configuration_accepts_http_and_https_and_rejects_other_schemes() {
-        assert!(apply_proxy(Client::builder(), Some("http://192.168.1.2:7890")).is_ok());
-        assert!(apply_proxy(Client::builder(), Some("https://proxy.invalid:8443")).is_ok());
+    fn proxy_configuration_accepts_supported_schemes_and_proxy_credentials() {
+        for proxy_url in [
+            "http://192.168.1.2:7890",
+            "https://192.168.1.2:8443",
+            "socks4://127.0.0.1:1080",
+            "socks4a://127.0.0.1:1080",
+            "socks5://127.0.0.1:1080",
+            "socks5h://127.0.0.1:1080",
+        ] {
+            let result = apply_proxy(Client::builder(), Some(proxy_url)).and_then(|builder| {
+                builder
+                    .build()
+                    .map(|_| ())
+                    .map_err(|_| NetworkProxyError::InvalidUrl)
+            });
+            assert!(result.is_ok(), "proxy URL should be supported: {proxy_url}");
+        }
+
+        assert!(apply_proxy(Client::builder(), Some("http://proxy-user:@127.0.0.1:8080")).is_ok());
         assert!(matches!(
-            apply_proxy(Client::builder(), Some("socks5://proxy.invalid:1080")),
+            apply_proxy(Client::builder(), Some("ftp://proxy.invalid:7890")),
             Err(NetworkProxyError::InvalidUrl)
         ));
     }
