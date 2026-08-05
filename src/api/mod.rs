@@ -3,8 +3,6 @@ pub mod lux;
 use std::{
     collections::BTreeMap,
     path::{Component, Path as FsPath, PathBuf},
-    pin::Pin,
-    task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -33,7 +31,7 @@ use tower_http::{
 use crate::{
     COMMIT, VERSION,
     application::deletion::{MediaDeleteError, MediaDeleteService},
-    application::downloads::{DownloadArtifact, DownloadError, DownloadService},
+    application::downloads::{DownloadError, DownloadService},
     application::playback::{ByteRange, RangeError, parse_single_range},
     application::probe::{FfprobeRunner, MediaProbeService},
     application::setup::{SetupError, SetupService},
@@ -80,7 +78,7 @@ use crate::{
     storage::{Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf, SeekFrom},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     process::Command,
 };
 
@@ -187,10 +185,7 @@ impl AppState {
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
             metadata_writes: Some(MetadataWriteService::new(database.clone())),
-            downloads: Some(DownloadService::new(
-                database.clone(),
-                config_dir.clone().join("downloads"),
-            )),
+            downloads: Some(DownloadService::new(database.clone())),
             metadata_reidentify,
             deletion: Some(MediaDeleteService::new(database.clone())),
             probe: Some(MediaProbeService::new(
@@ -4089,31 +4084,13 @@ async fn lux_download(
         Err(DownloadError::ItemNotFound) => return StatusCode::NOT_FOUND.into_response(),
         Err(DownloadError::PathOutsideRoot(_)) => return StatusCode::FORBIDDEN.into_response(),
         Err(DownloadError::InvalidFileName(_)) => return StatusCode::BAD_REQUEST.into_response(),
-        Err(DownloadError::Archive(_) | DownloadError::Io(_) | DownloadError::Storage(_)) => {
+        Err(DownloadError::Io(_) | DownloadError::Storage(_)) => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    match artifact {
-        DownloadArtifact::File { file_name, .. } => {
-            let mut response = serve_media_file(
-                &state,
-                AccessPrincipal::new(user.id, user.is_admin),
-                &headers,
-                &method,
-                &item_id,
-                query.source_id.as_deref(),
-                None,
-            )
-            .await;
-            add_download_header_with_name(&mut response, &file_name);
-            response
-        }
-        DownloadArtifact::Archive {
-            path,
-            file_name,
-            size,
-        } => serve_download_archive(&method, path, &file_name, size).await,
-    }
+    let mut response = serve_download_file(&method, &headers, artifact.path()).await;
+    add_download_header_with_name(&mut response, artifact.file_name());
+    response
 }
 
 async fn emby_image(
@@ -4361,27 +4338,24 @@ async fn emby_download(
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let mut response = serve_media_file(
-        &state,
-        AccessPrincipal::new(user.id, user.is_admin),
-        &headers,
-        &method,
-        &item_id,
-        query.media_source_id.as_deref(),
-        None,
-    )
-    .await;
-    add_download_header(&mut response);
+    let Some(downloads) = state.downloads.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let artifact = match downloads
+        .prepare(&item_id, query.media_source_id.as_deref())
+        .await
+    {
+        Ok(artifact) => artifact,
+        Err(DownloadError::ItemNotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(DownloadError::PathOutsideRoot(_)) => return StatusCode::FORBIDDEN.into_response(),
+        Err(DownloadError::InvalidFileName(_)) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(DownloadError::Io(_) | DownloadError::Storage(_)) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let mut response = serve_download_file(&method, &headers, artifact.path()).await;
+    add_download_header_with_name(&mut response, artifact.file_name());
     response
-}
-
-fn add_download_header(response: &mut Response) {
-    if response.status().is_success() {
-        response.headers_mut().insert(
-            "Content-Disposition",
-            HeaderValue::from_static("attachment"),
-        );
-    }
 }
 
 fn add_download_header_with_name(response: &mut Response, file_name: &str) {
@@ -4389,11 +4363,28 @@ fn add_download_header_with_name(response: &mut Response, file_name: &str) {
         return;
     }
     let encoded = percent_encode_filename(file_name);
-    let value = format!("attachment; filename=\"download\"; filename*=UTF-8''{encoded}");
+    let fallback = ascii_download_filename(file_name);
+    let value = format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}");
     if let Ok(value) = HeaderValue::from_str(&value) {
         response.headers_mut().insert("Content-Disposition", value);
+    }
+}
+
+fn ascii_download_filename(value: &str) -> String {
+    let fallback = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if fallback.is_empty() {
+        "download".to_owned()
     } else {
-        add_download_header(response);
+        fallback
     }
 }
 
@@ -4409,80 +4400,6 @@ fn percent_encode_filename(value: &str) -> String {
             }
         })
         .collect()
-}
-
-async fn serve_download_archive(
-    method: &Method,
-    path: PathBuf,
-    file_name: &str,
-    size: u64,
-) -> Response {
-    let Ok(file) = fs::File::open(&path).await else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let body = if method == Method::HEAD {
-        drop(file);
-        let _ = fs::remove_file(&path).await;
-        Body::empty()
-    } else {
-        Body::from_stream(tokio_util::io::ReaderStream::new(CleanupFile::new(
-            file, path,
-        )))
-    };
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::OK;
-    response
-        .headers_mut()
-        .insert("Content-Type", HeaderValue::from_static("application/zip"));
-    if let Ok(value) = HeaderValue::from_str(&size.to_string()) {
-        response.headers_mut().insert("Content-Length", value);
-    }
-    add_download_header_with_name(&mut response, file_name);
-    response
-}
-
-struct CleanupFile {
-    file: fs::File,
-    path: Option<PathBuf>,
-}
-
-impl CleanupFile {
-    fn new(file: fs::File, path: PathBuf) -> Self {
-        Self {
-            file,
-            path: Some(path),
-        }
-    }
-
-    fn cleanup(&mut self) {
-        let Some(path) = self.path.take() else {
-            return;
-        };
-        tokio::spawn(async move {
-            let _ = fs::remove_file(path).await;
-        });
-    }
-}
-
-impl AsyncRead for CleanupFile {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buffer.filled().len();
-        match Pin::new(&mut self.file).poll_read(context, buffer) {
-            Poll::Ready(Ok(())) if buffer.filled().len() == before => {
-                self.cleanup();
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(error)) => {
-                self.cleanup();
-                Poll::Ready(Err(error))
-            }
-            result => result,
-        }
-    }
 }
 
 async fn serve_media_file(
@@ -4538,6 +4455,18 @@ async fn serve_media_file(
     }) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    serve_media_path(headers, method, &path).await
+}
+
+async fn serve_download_file(method: &Method, headers: &HeaderMap, path: &FsPath) -> Response {
+    serve_media_path(headers, method, path).await
+}
+
+async fn serve_media_path(headers: &HeaderMap, method: &Method, path: &FsPath) -> Response {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
     let metadata = match fs::metadata(&path).await {
         Ok(metadata) if metadata.is_file() => metadata,
         _ => return StatusCode::NOT_FOUND.into_response(),
