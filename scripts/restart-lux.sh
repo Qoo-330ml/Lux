@@ -91,6 +91,9 @@ if ((${#lux_pids[@]} > 0)); then
     done
 fi
 
+log "cleaning Git temporary packs older than 1 hour"
+cleanup_stale_git_temp_packs "${TMPDIR:-/tmp}" 60
+
 log "cleaning complete target older than 24 hours"
 cleanup_old_target_if_stale "$LUX_TARGET_DIR" 1440 "${CARGO_COMMAND[@]}"
 
