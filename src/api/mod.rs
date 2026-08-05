@@ -31,7 +31,7 @@ use tower_http::{
 use crate::{
     COMMIT, VERSION,
     application::deletion::{MediaDeleteError, MediaDeleteService},
-    application::downloads::{DownloadError, DownloadService},
+    application::downloads::{DownloadArtifact, DownloadError, DownloadService},
     application::playback::{ByteRange, RangeError, parse_single_range},
     application::probe::{FfprobeRunner, MediaProbeService},
     application::setup::{SetupError, SetupService},
@@ -186,7 +186,8 @@ impl AppState {
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
             metadata_writes: Some(MetadataWriteService::new(database.clone())),
-            downloads: Some(DownloadService::new(database.clone())),
+            downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
+                .ok(),
             metadata_reidentify,
             deletion: Some(MediaDeleteService::new(database.clone())),
             probe: Some(MediaProbeService::new(
@@ -4086,14 +4087,9 @@ async fn lux_download(
         .await
     {
         Ok(artifact) => artifact,
-        Err(DownloadError::ItemNotFound) => return StatusCode::NOT_FOUND.into_response(),
-        Err(DownloadError::PathOutsideRoot(_)) => return StatusCode::FORBIDDEN.into_response(),
-        Err(DownloadError::InvalidFileName(_)) => return StatusCode::BAD_REQUEST.into_response(),
-        Err(DownloadError::Io(_) | DownloadError::Storage(_)) => {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+        Err(error) => return download_error_response(error),
     };
-    let mut response = serve_download_file(&method, &headers, artifact.path()).await;
+    let mut response = serve_download_artifact(downloads, &artifact, &method, &headers).await;
     add_download_header_with_name(&mut response, artifact.file_name());
     response
 }
@@ -4351,14 +4347,9 @@ async fn emby_download(
         .await
     {
         Ok(artifact) => artifact,
-        Err(DownloadError::ItemNotFound) => return StatusCode::NOT_FOUND.into_response(),
-        Err(DownloadError::PathOutsideRoot(_)) => return StatusCode::FORBIDDEN.into_response(),
-        Err(DownloadError::InvalidFileName(_)) => return StatusCode::BAD_REQUEST.into_response(),
-        Err(DownloadError::Io(_) | DownloadError::Storage(_)) => {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+        Err(error) => return download_error_response(error),
     };
-    let mut response = serve_download_file(&method, &headers, artifact.path()).await;
+    let mut response = serve_download_artifact(downloads, &artifact, &method, &headers).await;
     add_download_header_with_name(&mut response, artifact.file_name());
     response
 }
@@ -4463,8 +4454,72 @@ async fn serve_media_file(
     serve_media_path(headers, method, &path).await
 }
 
-async fn serve_download_file(method: &Method, headers: &HeaderMap, path: &FsPath) -> Response {
-    serve_media_path(headers, method, path).await
+fn download_error_response(error: DownloadError) -> Response {
+    let status = match error {
+        DownloadError::ItemNotFound => StatusCode::NOT_FOUND,
+        DownloadError::PathOutsideRoot(_) => StatusCode::FORBIDDEN,
+        DownloadError::InvalidFileName(_)
+        | DownloadError::RemoteUrl(
+            crate::application::remote_url_policy::RemoteMediaUrlError::Invalid
+            | crate::application::remote_url_policy::RemoteMediaUrlError::BlockedHost,
+        ) => StatusCode::BAD_REQUEST,
+        DownloadError::RemoteUrl(
+            crate::application::remote_url_policy::RemoteMediaUrlError::ResolutionFailed,
+        )
+        | DownloadError::RemoteRequest => StatusCode::BAD_GATEWAY,
+        DownloadError::Io(_)
+        | DownloadError::Storage(_)
+        | DownloadError::ProxyConfiguration(_)
+        | DownloadError::ClientBuild(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    status.into_response()
+}
+
+async fn serve_download_artifact(
+    downloads: &DownloadService,
+    artifact: &DownloadArtifact,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
+    if let Some(path) = artifact.local_path() {
+        return serve_media_path(headers, method, path).await;
+    }
+    let range = headers.get("range").and_then(|value| value.to_str().ok());
+    let upstream = match downloads.fetch_remote(artifact, method, range).await {
+        Ok(response) => response,
+        Err(error) => return download_error_response(error),
+    };
+    let status = match StatusCode::from_u16(upstream.status().as_u16()) {
+        Ok(status) => status,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let upstream_headers = upstream.headers().clone();
+    let is_success = status.is_success();
+    let body = if is_success && method != Method::HEAD {
+        Body::from_stream(upstream.bytes_stream())
+    } else {
+        Body::empty()
+    };
+    let mut response = Response::builder().status(status);
+    for header_name in [
+        "accept-ranges",
+        "content-length",
+        "content-range",
+        "content-type",
+        "etag",
+        "last-modified",
+    ] {
+        if let Some(value) = upstream_headers.get(header_name) {
+            response = response.header(header_name, value.clone());
+        }
+    }
+    if is_success && upstream_headers.get("content-type").is_none() {
+        response = response.header("content-type", "application/octet-stream");
+    }
+    match response.body(body) {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 async fn serve_media_path(headers: &HeaderMap, method: &Method, path: &FsPath) -> Response {

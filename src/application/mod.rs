@@ -19,6 +19,7 @@ pub mod plugins;
 pub mod probe;
 pub mod recommendations;
 pub mod reidentify;
+pub mod remote_url_policy;
 pub mod scanner;
 pub mod scraper;
 pub mod settings;

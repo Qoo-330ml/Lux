@@ -8,7 +8,82 @@ use luxd::{
 };
 use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::json;
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+
+async fn spawn_test_proxy()
+-> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                    if request.len() > 16 * 1024 {
+                        return;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let forwards_credentials = request.lines().any(|line| {
+                    let line = line.to_ascii_lowercase();
+                    line.starts_with("authorization:") || line.starts_with("cookie:")
+                });
+                if forwards_credentials {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+                let method = request.split_whitespace().next().unwrap_or_default();
+                let has_range = request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("range: bytes=0-5"));
+                let (status, body, content_range) = if has_range {
+                    (
+                        "206 Partial Content",
+                        b"remote".as_slice(),
+                        Some("bytes 0-5/17"),
+                    )
+                } else {
+                    ("200 OK", b"remote video data".as_slice(), None)
+                };
+                let body_length = body.len();
+                let headers = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: video/x-matroska\r\nContent-Length: {body_length}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n{}\r\n",
+                    content_range
+                        .map(|value| format!("Content-Range: {value}\r\n"))
+                        .unwrap_or_default()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                if method != "HEAD" {
+                    let _ = stream.write_all(body).await;
+                }
+            });
+        }
+    });
+    Ok((address, task))
+}
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
@@ -55,7 +130,7 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
     .await?;
     tokio::fs::write(
         root.join("Remote.Movie.2024.strm"),
-        b"https://example.invalid/video.mkv\nignored\n",
+        b"http://example.com/Remote.Movie.2024.mkv\nignored\n",
     )
     .await?;
     libraries
@@ -100,7 +175,15 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let (proxy_address, proxy_task) = spawn_test_proxy().await?;
+    let app = app_with_state(AppState::ready_with_proxy(
+        config,
+        database,
+        setup,
+        auth,
+        emby_auth,
+        Some(format!("http://{proxy_address}")),
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -147,22 +230,30 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
             "{base_url}/api/v1/items/{remote_item_id}/download?sourceId={remote_source_id}"
         ))
         .header(COOKIE, &cookie)
+        .header("Range", "bytes=0-5")
         .send()
         .await?;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response.headers()["content-type"],
-        "application/octet-stream"
-    );
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["content-type"], "video/x-matroska");
+    assert_eq!(response.headers()["content-range"], "bytes 0-5/17");
     assert!(
         response.headers()["content-disposition"]
             .to_str()?
-            .contains("Remote.Movie.2024.strm")
+            .contains("Remote.Movie.2024.mkv")
     );
-    assert_eq!(
-        response.bytes().await?.as_ref(),
-        b"https://example.invalid/video.mkv\nignored\n"
-    );
+    assert_eq!(response.bytes().await?.as_ref(), b"remote");
+
+    let response = client
+        .head(format!(
+            "{base_url}/api/v1/items/{remote_item_id}/download?sourceId={remote_source_id}"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "video/x-matroska");
+    assert_eq!(response.headers()["content-length"], "17");
+    assert!(response.bytes().await?.is_empty());
 
     let emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
@@ -213,20 +304,15 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
         .send()
         .await?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response.headers()["content-type"],
-        "application/octet-stream"
-    );
+    assert_eq!(response.headers()["content-type"], "video/x-matroska");
     assert!(
         response.headers()["content-disposition"]
             .to_str()?
-            .contains("Remote.Movie.2024.strm")
+            .contains("Remote.Movie.2024.mkv")
     );
-    assert_eq!(
-        response.bytes().await?.as_ref(),
-        b"https://example.invalid/video.mkv\nignored\n"
-    );
+    assert_eq!(response.bytes().await?.as_ref(), b"remote video data");
 
     server.abort();
+    proxy_task.abort();
     Ok(())
 }

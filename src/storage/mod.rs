@@ -4199,12 +4199,12 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_download_source_path(
+    pub(crate) async fn find_download_source(
         &self,
         item_id: &str,
-    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+    ) -> Result<Option<StoredDownloadSource>, StorageError> {
         sqlx::query(
-            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+            "SELECT ms.source_kind,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -4217,10 +4217,8 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| {
-            row.map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
+            row.map(|row| StoredDownloadSource {
+                source_kind: row.get("source_kind"),
                 root_path: row.get("root_path"),
                 relative_path: row.get("relative_path"),
             })
@@ -4297,13 +4295,13 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_download_source_path_by_id(
+    pub(crate) async fn find_download_source_by_id(
         &self,
         item_id: &str,
         source_id: &str,
-    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+    ) -> Result<Option<StoredDownloadSource>, StorageError> {
         sqlx::query(
-            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+            "SELECT ms.source_kind,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -4317,10 +4315,8 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| {
-            row.map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
+            row.map(|row| StoredDownloadSource {
+                source_kind: row.get("source_kind"),
                 root_path: row.get("root_path"),
                 relative_path: row.get("relative_path"),
             })
@@ -5717,6 +5713,13 @@ pub(crate) struct StoredWebSessionSummary {
     pub(crate) expires_at: i64,
     pub(crate) last_seen_at: Option<i64>,
     pub(crate) is_current: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredDownloadSource {
+    pub(crate) source_kind: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
 }
 
 pub(crate) struct NewAccessToken<'a> {

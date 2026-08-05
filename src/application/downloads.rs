@@ -1,33 +1,75 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use tokio::fs;
+use reqwest::{Method, Response, Url, header::RANGE, redirect::Policy};
+use tokio::{fs, io::AsyncReadExt};
 
-use crate::storage::{Database, StorageError};
+use crate::{
+    application::remote_url_policy::{RemoteMediaUrlError, validate_and_resolve_remote_media_url},
+    network::{NetworkProxyError, client_builder_from_env_or},
+    storage::{Database, StorageError},
+};
+
+const MAX_STRM_BYTES: u64 = 8 * 1024;
 
 #[derive(Clone)]
 pub struct DownloadService {
     database: Database,
+    proxy_url: Option<String>,
 }
 
 #[derive(Debug)]
-pub struct DownloadArtifact {
-    path: PathBuf,
-    file_name: String,
+pub enum DownloadArtifact {
+    LocalFile {
+        path: PathBuf,
+        file_name: String,
+    },
+    Remote {
+        url: Url,
+        address: SocketAddr,
+        file_name: String,
+    },
 }
 
 impl DownloadArtifact {
-    pub fn path(&self) -> &PathBuf {
-        &self.path
+    pub fn local_path(&self) -> Option<&Path> {
+        match self {
+            Self::LocalFile { path, .. } => Some(path),
+            Self::Remote { .. } => None,
+        }
     }
 
     pub fn file_name(&self) -> &str {
-        &self.file_name
+        match self {
+            Self::LocalFile { file_name, .. } | Self::Remote { file_name, .. } => file_name,
+        }
     }
 }
 
 impl DownloadService {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            proxy_url: None,
+        }
+    }
+
+    pub fn new_with_proxy(
+        database: Database,
+        proxy_url: Option<String>,
+    ) -> Result<Self, DownloadError> {
+        client_builder_from_env_or(proxy_url.as_deref())
+            .map_err(DownloadError::ProxyConfiguration)?
+            .build()
+            .map_err(|error| DownloadError::ClientBuild(error.to_string()))?;
+        Ok(Self {
+            database,
+            proxy_url,
+        })
     }
 
     pub async fn prepare(
@@ -38,10 +80,10 @@ impl DownloadService {
         let source = match source_id {
             Some(source_id) => {
                 self.database
-                    .find_download_source_path_by_id(item_id, source_id)
+                    .find_download_source_by_id(item_id, source_id)
                     .await?
             }
-            None => self.database.find_download_source_path(item_id).await?,
+            None => self.database.find_download_source(item_id).await?,
         }
         .ok_or(DownloadError::ItemNotFound)?;
         let root = fs::canonicalize(&source.root_path).await?;
@@ -58,11 +100,90 @@ impl DownloadService {
             .and_then(|value| value.to_str())
             .ok_or_else(|| DownloadError::InvalidFileName(media_path.clone()))?
             .to_owned();
-        Ok(DownloadArtifact {
-            path: media_path,
-            file_name,
-        })
+        if source.source_kind == "STRM_URL" {
+            let strm_url = read_strm_url(&media_path).await?;
+            let (url, address) = validate_and_resolve_remote_media_url(&strm_url)
+                .await
+                .map_err(DownloadError::RemoteUrl)?;
+            let file_name = remote_file_name(&url).unwrap_or(file_name);
+            Ok(DownloadArtifact::Remote {
+                url,
+                address,
+                file_name,
+            })
+        } else {
+            Ok(DownloadArtifact::LocalFile {
+                path: media_path,
+                file_name,
+            })
+        }
     }
+
+    pub async fn fetch_remote(
+        &self,
+        artifact: &DownloadArtifact,
+        method: &Method,
+        range: Option<&str>,
+    ) -> Result<Response, DownloadError> {
+        let DownloadArtifact::Remote { url, address, .. } = artifact else {
+            return Err(DownloadError::RemoteRequest);
+        };
+        let host = url
+            .host_str()
+            .ok_or(DownloadError::RemoteUrl(RemoteMediaUrlError::Invalid))?;
+        let client = client_builder_from_env_or(self.proxy_url.as_deref())
+            .map_err(DownloadError::ProxyConfiguration)?
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
+            .resolve(host, *address)
+            .build()
+            .map_err(|error| DownloadError::ClientBuild(error.to_string()))?;
+        let mut request = match *method {
+            Method::GET => client.get(url.clone()),
+            Method::HEAD => client.head(url.clone()),
+            _ => return Err(DownloadError::RemoteRequest),
+        };
+        if let Some(range) = range {
+            request = request.header(RANGE, range);
+        }
+        request
+            .send()
+            .await
+            .map_err(|_| DownloadError::RemoteRequest)
+    }
+}
+
+async fn read_strm_url(path: &Path) -> Result<String, DownloadError> {
+    let file = fs::File::open(path).await?;
+    let mut contents = Vec::new();
+    file.take(MAX_STRM_BYTES + 1)
+        .read_to_end(&mut contents)
+        .await?;
+    if contents.len() as u64 > MAX_STRM_BYTES {
+        return Err(DownloadError::RemoteUrl(RemoteMediaUrlError::Invalid));
+    }
+    let contents = String::from_utf8(contents)
+        .map_err(|_| DownloadError::RemoteUrl(RemoteMediaUrlError::Invalid))?;
+    contents
+        .lines()
+        .map(|line| line.trim_start_matches('\u{feff}').trim())
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+        .ok_or(DownloadError::RemoteUrl(RemoteMediaUrlError::Invalid))
+}
+
+fn remote_file_name(url: &Url) -> Option<String> {
+    url.path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .filter(|segment| {
+            *segment != "."
+                && *segment != ".."
+                && segment.chars().all(|character| {
+                    !character.is_control() && !matches!(character, '/' | '\\' | '"')
+                })
+        })
+        .map(str::to_owned)
 }
 
 pub(crate) fn is_matching_sidecar(selected_name: &str, candidate_name: &str) -> bool {
@@ -109,6 +230,10 @@ pub enum DownloadError {
     PathOutsideRoot(PathBuf),
     Io(std::io::Error),
     Storage(StorageError),
+    ProxyConfiguration(NetworkProxyError),
+    ClientBuild(String),
+    RemoteUrl(RemoteMediaUrlError),
+    RemoteRequest,
 }
 
 impl fmt::Display for DownloadError {
@@ -125,6 +250,20 @@ impl fmt::Display for DownloadError {
             ),
             Self::Io(error) => write!(formatter, "download file operation failed: {error}"),
             Self::Storage(error) => error.fmt(formatter),
+            Self::ProxyConfiguration(_) => {
+                formatter.write_str("download proxy configuration is invalid")
+            }
+            Self::ClientBuild(_) => formatter.write_str("download client could not be created"),
+            Self::RemoteUrl(error) => match error {
+                RemoteMediaUrlError::Invalid => formatter.write_str("STRM remote URL is invalid"),
+                RemoteMediaUrlError::BlockedHost => {
+                    formatter.write_str("STRM remote host is blocked")
+                }
+                RemoteMediaUrlError::ResolutionFailed => {
+                    formatter.write_str("STRM remote host could not be resolved")
+                }
+            },
+            Self::RemoteRequest => formatter.write_str("STRM remote request failed"),
         }
     }
 }
@@ -140,6 +279,12 @@ impl From<std::io::Error> for DownloadError {
 impl From<StorageError> for DownloadError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<NetworkProxyError> for DownloadError {
+    fn from(error: NetworkProxyError) -> Self {
+        Self::ProxyConfiguration(error)
     }
 }
 
