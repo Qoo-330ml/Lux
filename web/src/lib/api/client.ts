@@ -324,21 +324,19 @@ export class LuxApiClient {
 
   updateAdminPluginConfig(
     pluginId: string,
-    input:
-      | string
-      | {
-          apiKey?: string;
-          preferredLanguage?: string;
-          languageFallbackEnabled?: boolean;
-          fallbackLanguages?: string[];
-          alternateApiEnabled?: boolean;
-          apiBaseUrl?: string;
-        },
+    input: string | Record<string, unknown>,
   ) {
     const body = typeof input === "string" ? { apiKey: input } : input;
     return this.request<{ plugin: AdminPlugin }>(
       `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/config`,
       { method: "PUT", body: JSON.stringify(body) },
+    );
+  }
+
+  runAdminPlugin(pluginId: string) {
+    return this.request<{ operationId: string; jobs: Array<Record<string, unknown>> }>(
+      `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/run`,
+      { method: "POST" },
     );
   }
 

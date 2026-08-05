@@ -63,6 +63,7 @@ describe("AdminPluginsPage plugin cards", () => {
     vi.spyOn(api, "adminPlugins").mockImplementation(async () => ({ plugins: [currentPlugin], total: 1 }));
     vi.spyOn(api, "adminInstalledPlugins").mockImplementation(async () => ({ plugins: currentPlugin.installed ? [currentPlugin] : [], total: currentPlugin.installed ? 1 : 0 }));
     vi.spyOn(api, "updateAdminPluginConfig").mockResolvedValue({ plugin: configuredPlugin });
+    vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
     vi.spyOn(api, "installAdminPlugin").mockResolvedValue({ plugin: configuredPlugin });
     container = document.createElement("div");
     document.body.append(container);
@@ -243,6 +244,55 @@ describe("AdminPluginsPage plugin cards", () => {
 
     expect(container.querySelector('[aria-label="安装 TMDb 元数据插件"]')).toBeTruthy();
     expect(container.querySelector('[aria-label="插件状态：已安装"]')).toBeNull();
+  });
+
+  it("renders media-info settings and runs with the saved plugin configuration", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.media-info",
+      name: "strm媒体信息提取",
+      category: "MEDIA",
+      configSource: "PLUGIN_CONFIG",
+      configValues: {
+        libraryIds: ["library-1"],
+        concurrency: 2,
+        existingInfoPolicy: "SKIP",
+        writeSidecars: true,
+      },
+      configFields: [
+        { key: "libraryIds", label: "媒体库", type: "select", required: true, sensitive: false, multiple: true, optionsSource: "media-libraries", options: [{ value: "library-1", label: "电影库" }, { value: "library-2", label: "剧集库" }] },
+        { key: "concurrency", label: "并发数", type: "number", required: true, sensitive: false, defaultValue: 2, minimum: 1, maximum: 64 },
+        { key: "existingInfoPolicy", label: "已有媒体信息处理方式", type: "select", required: false, sensitive: false, defaultValue: "SKIP", options: [{ value: "SKIP", label: "跳过已有媒体信息" }, { value: "OVERWRITE", label: "覆盖已有媒体信息" }] },
+        { key: "writeSidecars", label: "写入 mediainfo.json", type: "toggle", required: false, sensitive: false },
+      ],
+    };
+    await renderPage();
+
+    expect(container.querySelector('[aria-label="开始提取"]')).toBeTruthy();
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 strm媒体信息提取"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const selects = Array.from(dialog?.querySelectorAll("select") ?? []);
+    expect(selects[0]?.multiple).toBe(true);
+    expect(selects[0]?.options[0]?.textContent).toBe("电影库");
+    expect(dialog?.querySelector('input[type="number"]')).toBeTruthy();
+    expect(dialog?.querySelectorAll('select')).toHaveLength(2);
+    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(1);
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+    });
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.media-info", expect.objectContaining({
+      libraryIds: ["library-1"],
+      concurrency: 2,
+      existingInfoPolicy: "SKIP",
+      writeSidecars: true,
+    }));
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="开始提取"]')?.click();
+    });
+    expect(api.runAdminPlugin).toHaveBeenCalledWith("org.lux.media-info");
   });
 
   it("does not show configuration action for plugins without configuration", async () => {

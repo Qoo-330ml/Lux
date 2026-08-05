@@ -112,6 +112,17 @@ impl StrmProbeService {
         Ok(jobs)
     }
 
+    pub async fn create_configured_jobs(&self) -> Result<Vec<StrmProbeJob>, StrmProbeError> {
+        let settings = self.plugins.media_info_settings().await?;
+        self.create_jobs(
+            &settings.library_ids,
+            settings.concurrency,
+            settings.include_ready,
+            settings.write_sidecars,
+        )
+        .await
+    }
+
     pub async fn run(&self, job_id: &str) -> Result<(), StrmProbeError> {
         let job = self
             .database
@@ -510,6 +521,7 @@ pub enum StrmProbeError {
     JobNotFound,
     NotRetryable,
     WorkerFailed,
+    Plugin(PluginServiceError),
     Storage(StorageError),
 }
 
@@ -523,6 +535,7 @@ impl fmt::Display for StrmProbeError {
             Self::JobNotFound => formatter.write_str("STRM probe job not found"),
             Self::NotRetryable => formatter.write_str("STRM probe job is not retryable"),
             Self::WorkerFailed => formatter.write_str("STRM probe worker failed"),
+            Self::Plugin(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -533,5 +546,11 @@ impl std::error::Error for StrmProbeError {}
 impl From<StorageError> for StrmProbeError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<PluginServiceError> for StrmProbeError {
+    fn from(error: PluginServiceError) -> Self {
+        Self::Plugin(error)
     }
 }

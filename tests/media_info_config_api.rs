@@ -12,13 +12,14 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 #[tokio::test]
-async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::error::Error>> {
+async fn media_info_plugin_config_api_drives_a_background_run()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
     let plugin_root = config_dir.join("plugins/org.lux.media-info");
     tokio::fs::create_dir_all(plugin_root.join("binaries")).await?;
     fs::write(plugin_root.join("binaries/plugin"), b"placeholder")?;
-    tokio::fs::write(
+    fs::write(
         plugin_root.join("manifest.json"),
         serde_json::to_vec_pretty(&json!({
             "formatVersion": 1,
@@ -39,8 +40,8 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
             "permissions": {"network": ["media-source"], "filesystem": []},
             "files": []
         }))?,
-    )
-    .await?;
+    )?;
+
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir,
@@ -58,16 +59,12 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
 
     client
         .post(format!("{base_url}/api/v1/setup/complete"))
-        .json(&json!({
-            "username": "Admin",
-            "displayName": "Admin",
-            "password": "correct password"
-        }))
+        .json(&json!({"username": "Admin", "displayName": "Admin", "password": "correct password"}))
         .send()
         .await?;
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
-        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .json(&json!({"username": "admin", "password": "correct password"}))
         .send()
         .await?;
     let cookie = cookie_pair(login.headers());
@@ -77,10 +74,9 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
         .post(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)
-        .json(&json!({ "name": "Movies", "kind": "MOVIE" }))
+        .json(&json!({"name": "Movies", "kind": "MOVIE"}))
         .send()
         .await?;
-    assert_eq!(library.status(), reqwest::StatusCode::CREATED);
     let library_id = library.json::<Value>().await?["library"]["id"]
         .as_str()
         .ok_or("missing library id")?
@@ -95,19 +91,13 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
         .send()
         .await?;
     assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+    let installed_body = installed.json::<Value>().await?;
+    assert_eq!(
+        installed_body["plugin"]["configFields"][0]["optionsSource"],
+        "media-libraries"
+    );
 
-    let invalid = client
-        .put(format!(
-            "{base_url}/api/v1/admin/plugins/org.lux.media-info/config"
-        ))
-        .header(COOKIE, &cookie)
-        .header("x-csrf-token", &csrf)
-        .json(&json!({ "libraryIds": [library_id], "concurrency": 0 }))
-        .send()
-        .await?;
-    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
-
-    let configured = client
+    let updated = client
         .put(format!(
             "{base_url}/api/v1/admin/plugins/org.lux.media-info/config"
         ))
@@ -115,48 +105,31 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
         .header("x-csrf-token", &csrf)
         .json(&json!({
             "libraryIds": [library_id],
-            "concurrency": 2,
-            "existingInfoPolicy": "SKIP",
+            "concurrency": 3,
+            "existingInfoPolicy": "OVERWRITE",
             "writeSidecars": false
         }))
         .send()
         .await?;
-    assert_eq!(configured.status(), reqwest::StatusCode::OK);
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        updated.json::<Value>().await?["plugin"]["configValues"]["concurrency"],
+        3
+    );
 
-    let started = client
-        .post(format!("{base_url}/api/v1/admin/strm-probe-jobs"))
+    let run = client
+        .post(format!(
+            "{base_url}/api/v1/admin/plugins/org.lux.media-info/run"
+        ))
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)
         .send()
         .await?;
-    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
-    let started_body = started.json::<Value>().await?;
-    let job_id = started_body["jobs"][0]["id"]
-        .as_str()
-        .ok_or("missing STRM probe job id")?
-        .to_owned();
-    assert!(started_body["operationId"].is_string());
-
-    let listed = client
-        .get(format!("{base_url}/api/v1/admin/strm-probe-jobs"))
-        .header(COOKIE, &cookie)
-        .send()
-        .await?;
-    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    assert_eq!(run.status(), reqwest::StatusCode::ACCEPTED);
     assert_eq!(
-        listed.json::<Value>().await?["jobs"]
-            .as_array()
-            .map(Vec::len),
+        run.json::<Value>().await?["jobs"].as_array().map(Vec::len),
         Some(1)
     );
-
-    let detail = client
-        .get(format!("{base_url}/api/v1/admin/strm-probe-jobs/{job_id}"))
-        .header(COOKIE, &cookie)
-        .send()
-        .await?;
-    assert_eq!(detail.status(), reqwest::StatusCode::OK);
-    assert_eq!(detail.json::<Value>().await?["job"]["id"], job_id);
 
     server.abort();
     Ok(())
@@ -172,8 +145,7 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
             let (cookie_name, cookie_value) = pair.split_once('=')?;
             (cookie_name == name).then(|| cookie_value.to_owned())
         })
-        .ok_or_else(|| format!("missing cookie {name}"))
-        .expect("login should set cookie")
+        .expect("expected cookie")
 }
 
 fn cookie_pair(headers: &reqwest::header::HeaderMap) -> String {

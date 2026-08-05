@@ -391,6 +391,10 @@ pub fn app_with_state(state: AppState) -> Router {
             put(admin_update_plugin_config),
         )
         .route(
+            "/api/v1/admin/plugins/{plugin_id}/run",
+            post(admin_run_plugin),
+        )
+        .route(
             "/api/v1/admin/users",
             get(admin_list_users).post(admin_create_user),
         )
@@ -6641,60 +6645,14 @@ async fn admin_cancel_scan(
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StrmProbeRequest {
-    #[serde(default)]
-    library_ids: Vec<String>,
-    #[serde(default = "default_strm_probe_concurrency")]
-    concurrency: i64,
-    #[serde(default)]
-    include_ready: bool,
-    #[serde(default)]
-    write_sidecars: bool,
-}
-
-const fn default_strm_probe_concurrency() -> i64 {
-    2
-}
-
-async fn admin_start_strm_probe(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-    Json(request): Json<StrmProbeRequest>,
-) -> Response {
+async fn admin_start_strm_probe(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let library_ids = match request
-        .library_ids
-        .iter()
-        .map(|value| value.parse::<crate::domain::ids::LibraryId>())
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(ids) => ids,
-        Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::BAD_REQUEST,
-                lux::ApiErrorCode::InvalidRequest,
-                "媒体库 ID 无效",
-            )
-            .into_response();
-        }
-    };
     let Some(service) = state.strm_probe.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let jobs = match service
-        .create_jobs(
-            &library_ids,
-            request.concurrency,
-            request.include_ready,
-            request.write_sidecars,
-        )
-        .await
-    {
+    let jobs = match service.create_configured_jobs().await {
         Ok(jobs) => jobs,
         Err(error) => return strm_probe_error(&headers, error),
     };
@@ -9091,6 +9049,8 @@ struct PluginConfigRequest {
     alternate_api_enabled: Option<bool>,
     #[serde(default)]
     api_base_url: Option<String>,
+    #[serde(flatten)]
+    values: serde_json::Map<String, Value>,
 }
 
 async fn admin_update_plugin_config(
@@ -9112,19 +9072,27 @@ async fn admin_update_plugin_config(
         .into_response();
     };
     let api_key = request.api_key.as_deref().map(str::trim);
-    let result = plugins
-        .update_config(
-            &plugin_id,
-            crate::application::plugins::TmdbConfigUpdate {
-                api_key,
-                preferred_language: request.preferred_language.as_deref(),
-                language_fallback_enabled: request.language_fallback_enabled,
-                fallback_languages: request.fallback_languages,
-                alternate_api_enabled: request.alternate_api_enabled,
-                api_base_url: request.api_base_url.as_deref(),
-            },
-        )
-        .await;
+    let result = if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID
+        || plugin_id == crate::application::plugins::TMDB_DYNAMIC_PLUGIN_ID
+    {
+        plugins
+            .update_config(
+                &plugin_id,
+                crate::application::plugins::TmdbConfigUpdate {
+                    api_key,
+                    preferred_language: request.preferred_language.as_deref(),
+                    language_fallback_enabled: request.language_fallback_enabled,
+                    fallback_languages: request.fallback_languages,
+                    alternate_api_enabled: request.alternate_api_enabled,
+                    api_base_url: request.api_base_url.as_deref(),
+                },
+            )
+            .await
+    } else {
+        plugins
+            .update_dynamic_config(&plugin_id, request.values)
+            .await
+    };
     match result {
         Ok(plugin) => {
             if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID
@@ -9798,6 +9766,14 @@ fn strm_probe_error(headers: &HeaderMap, error: StrmProbeError) -> Response {
             "STRM 探测服务暂时不可用",
         )
         .into_response(),
+        StrmProbeError::Plugin(PluginServiceError::InvalidConfig) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "STRM 插件配置无效",
+        )
+        .into_response(),
+        StrmProbeError::Plugin(error) => plugin_error(headers, error),
     }
 }
 
@@ -9808,6 +9784,62 @@ fn plugin_page_json(page: &PluginPage) -> Value {
         "page": page.offset / page.limit + 1,
         "pageSize": page.limit,
     })
+}
+
+async fn admin_run_plugin(
+    headers: HeaderMap,
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if plugin_id != crate::application::plugins::MEDIA_INFO_PLUGIN_ID {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "该插件不支持后台运行",
+        )
+        .into_response();
+    }
+    let Some(service) = state.strm_probe.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let jobs = match service.create_configured_jobs().await {
+        Ok(jobs) => jobs,
+        Err(error) => return strm_probe_error(&headers, error),
+    };
+    for job in &jobs {
+        let worker = service.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = worker.run(&job_id).await {
+                tracing::error!(job_id = %job_id, %error, "configured STRM probe job stopped");
+            }
+        });
+    }
+    let operation_id = jobs
+        .first()
+        .map(|job| job.operation_id.clone())
+        .unwrap_or_default();
+    record_audit_event(
+        &state,
+        &headers,
+        "STRM_PROBE_STARTED",
+        Some("strm_probe_operation"),
+        Some(&operation_id),
+        &format!(r#"{{"jobCount":{}}}"#, jobs.len()),
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "operationId": operation_id,
+            "jobs": jobs,
+        })),
+    )
+        .into_response()
 }
 
 fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
@@ -9836,6 +9868,10 @@ fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
             "sensitive": field.sensitive,
             "description": field.description,
             "multiple": field.multiple,
+            "optionsSource": field.options_source,
+            "defaultValue": field.default_value,
+            "minimum": field.minimum,
+            "maximum": field.maximum,
             "options": field.options.iter().map(|option| json!({
                 "value": option.value,
                 "label": option.label,

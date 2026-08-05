@@ -1,6 +1,7 @@
 use std::{fs, process::Command};
 
 use luxd::application::plugin_runtime::PluginCatalog;
+use serde_json::json;
 use tempfile::tempdir;
 use zip::ZipArchive;
 
@@ -137,5 +138,34 @@ fn packages_a_media_info_zip_with_the_media_probe_manifest()
     assert_eq!(manifest.plugin_type, "media_probe");
     assert_eq!(manifest.category, "MEDIA");
     assert_eq!(manifest.capabilities, vec!["media.probe"]);
+    assert_eq!(
+        manifest
+            .config_fields
+            .iter()
+            .map(|field| field.key.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "libraryIds",
+            "concurrency",
+            "existingInfoPolicy",
+            "writeSidecars"
+        ]
+    );
+    assert_eq!(
+        manifest.config_fields[0].options_source.as_deref(),
+        Some("media-libraries")
+    );
+    assert_eq!(manifest.config_fields[1].minimum, Some(1));
+    assert_eq!(manifest.config_fields[1].maximum, Some(64));
+    assert_eq!(manifest.config_fields[2].input_type, "select");
+    assert_eq!(manifest.config_fields[2].default_value, Some(json!("SKIP")));
+    assert_eq!(
+        manifest.config_fields[2]
+            .options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["SKIP", "OVERWRITE"]
+    );
     Ok(())
 }

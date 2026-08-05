@@ -119,6 +119,31 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
             .map(Vec::len),
         Some(2)
     );
+
+    fs::write(&fake_ffprobe, "#!/bin/sh\nexit 9\n")?;
+    let skip_jobs = service.create_jobs(&[library.id], 2, false, false).await?;
+    service.run(&skip_jobs[0].id).await?;
+    let skipped_codec: String = sqlx::query_scalar(
+        "SELECT codec FROM media_streams WHERE media_source_id = (SELECT id FROM media_sources)\n         AND stream_type = 'VIDEO'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(skipped_codec, "h264");
+
+    fs::write(
+        &fake_ffprobe,
+        r#"#!/bin/sh
+printf '%s' '{"format":{"format_name":"matroska"},"streams":[{"index":0,"codec_type":"video","codec_name":"vp9"}]}'
+"#,
+    )?;
+    let overwrite_jobs = service.create_jobs(&[library.id], 2, true, false).await?;
+    service.run(&overwrite_jobs[0].id).await?;
+    let overwritten_codec: String = sqlx::query_scalar(
+        "SELECT codec FROM media_streams WHERE media_source_id = (SELECT id FROM media_sources)\n         AND stream_type = 'VIDEO'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(overwritten_codec, "vp9");
     Ok(())
 }
 

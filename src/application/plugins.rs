@@ -1,12 +1,19 @@
-use std::{collections::HashSet, env, fmt, io, path::PathBuf};
+use std::{
+    collections::HashSet,
+    env, fmt, io,
+    path::{Path, PathBuf},
+};
 
-use serde_json::Value;
+use serde_json::{Map, Value, json};
+use tokio::{fs, io::AsyncWriteExt};
+use uuid::Uuid;
 
 use crate::{
     application::{
         plugin_protocol::{
-            MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult, MediaProbeRpcStreamType,
-            PLUGIN_CATEGORY_SCRAPER, PluginConfigField, PluginConfigOption,
+            CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
+            MediaProbeRpcStreamType, PLUGIN_CATEGORY_SCRAPER, PluginConfigField,
+            PluginConfigOption,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
@@ -17,6 +24,7 @@ use crate::{
         },
         tmdb::EMBEDDED_TMDB_API_KEY,
     },
+    domain::ids::LibraryId,
     storage::{Database, StorageError},
 };
 
@@ -31,6 +39,11 @@ const CONFIG_SOURCE_CUSTOM: &str = "CUSTOM";
 const CONFIG_SOURCE_ENVIRONMENT: &str = "ENVIRONMENT";
 const CONFIG_SOURCE_READ_ACCESS_TOKEN: &str = "READ_ACCESS_TOKEN";
 const CONFIG_SOURCE_NONE: &str = "NONE";
+const CONFIG_SOURCE_PLUGIN: &str = "PLUGIN_CONFIG";
+const PLUGIN_CONFIG_DIR: &str = "plugin-config";
+const MEDIA_INFO_EXISTING_INFO_POLICY_KEY: &str = "existingInfoPolicy";
+const MEDIA_INFO_EXISTING_INFO_POLICY_SKIP: &str = "SKIP";
+const MEDIA_INFO_EXISTING_INFO_POLICY_OVERWRITE: &str = "OVERWRITE";
 
 pub struct TmdbConfigUpdate<'a> {
     pub api_key: Option<&'a str>,
@@ -39,6 +52,14 @@ pub struct TmdbConfigUpdate<'a> {
     pub fallback_languages: Option<Vec<String>>,
     pub alternate_api_enabled: Option<bool>,
     pub api_base_url: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaInfoSettings {
+    pub library_ids: Vec<LibraryId>,
+    pub concurrency: i64,
+    pub include_ready: bool,
+    pub write_sidecars: bool,
 }
 
 fn tmdb_config_fields() -> Vec<PluginConfigField> {
@@ -59,6 +80,10 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
             description: Some("可选。留空时使用 Lux 内置的 TMDb Key。".to_owned()),
             multiple: false,
             options: Vec::new(),
+            options_source: None,
+            default_value: None,
+            minimum: None,
+            maximum: None,
         },
         PluginConfigField {
             key: "preferredLanguage".to_owned(),
@@ -69,6 +94,10 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
             description: Some("TMDb 电影、剧集、季和集元数据的首选语言。".to_owned()),
             multiple: false,
             options: options.clone(),
+            options_source: None,
+            default_value: None,
+            minimum: None,
+            maximum: None,
         },
         PluginConfigField {
             key: "languageFallbackEnabled".to_owned(),
@@ -79,6 +108,10 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
             description: Some("按备选语言顺序逐字段补全缺失元数据。".to_owned()),
             multiple: false,
             options: Vec::new(),
+            options_source: None,
+            default_value: None,
+            minimum: None,
+            maximum: None,
         },
         PluginConfigField {
             key: "fallbackLanguages".to_owned(),
@@ -89,6 +122,10 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
             description: Some("开启语言回退后按此顺序请求 TMDb。".to_owned()),
             multiple: true,
             options,
+            options_source: None,
+            default_value: None,
+            minimum: None,
+            maximum: None,
         },
         PluginConfigField {
             key: "alternateApiEnabled".to_owned(),
@@ -99,6 +136,10 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
             description: Some("开启后使用下方地址访问 TMDb，默认使用官方地址。".to_owned()),
             multiple: false,
             options: Vec::new(),
+            options_source: None,
+            default_value: None,
+            minimum: None,
+            maximum: None,
         },
         PluginConfigField {
             key: "apiBaseUrl".to_owned(),
@@ -115,6 +156,10 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
                     label: option.label,
                 })
                 .collect(),
+            options_source: None,
+            default_value: None,
+            minimum: None,
+            maximum: None,
         },
     ]
 }
@@ -188,7 +233,7 @@ impl PluginService {
                 .is_plugin_installed(&plugin.manifest.id)
                 .await?;
             if !installed_only || installed {
-                views.push(self.dynamic_view(plugin, installed).await);
+                views.push(self.dynamic_view(plugin, installed).await?);
             }
         }
         let total = i64::try_from(views.len()).unwrap_or(i64::MAX);
@@ -314,6 +359,164 @@ impl PluginService {
         self.call(scraper_id, method, params).await
     }
 
+    pub async fn update_dynamic_config(
+        &self,
+        plugin_id: &str,
+        values: Map<String, Value>,
+    ) -> Result<PluginView, PluginServiceError> {
+        let plugin_id = self.canonical_plugin_id(plugin_id);
+        self.ensure_known_plugin(&plugin_id)?;
+        if is_tmdb_plugin_id(&plugin_id) {
+            return Err(PluginServiceError::InvalidConfig);
+        }
+        let plugin = self
+            .catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let values = normalize_plugin_config(&plugin_id, values);
+        let values = validate_config_values(&fields, &values)?;
+        self.write_plugin_config(&plugin_id, &values).await?;
+        let installed = self.database.is_plugin_installed(&plugin_id).await?;
+        self.view_for_id(&plugin_id, installed).await
+    }
+
+    pub async fn media_info_settings(&self) -> Result<MediaInfoSettings, PluginServiceError> {
+        let plugin = self
+            .catalog
+            .get(MEDIA_INFO_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(MEDIA_INFO_PLUGIN_ID.to_owned()))?;
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let values = merge_default_config_values(
+            &fields,
+            self.read_plugin_config(MEDIA_INFO_PLUGIN_ID).await?,
+        );
+        let values = validate_config_values(&fields, &values)?;
+        let library_ids = values
+            .get("libraryIds")
+            .and_then(Value::as_array)
+            .ok_or(PluginServiceError::InvalidConfig)?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or(PluginServiceError::InvalidConfig)
+                    .and_then(|value| {
+                        value
+                            .parse::<LibraryId>()
+                            .map_err(|_| PluginServiceError::InvalidConfig)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let existing_info_policy = values
+            .get(MEDIA_INFO_EXISTING_INFO_POLICY_KEY)
+            .and_then(Value::as_str)
+            .ok_or(PluginServiceError::InvalidConfig)?;
+        let include_ready = match existing_info_policy {
+            MEDIA_INFO_EXISTING_INFO_POLICY_SKIP => false,
+            MEDIA_INFO_EXISTING_INFO_POLICY_OVERWRITE => true,
+            _ => return Err(PluginServiceError::InvalidConfig),
+        };
+        Ok(MediaInfoSettings {
+            library_ids,
+            concurrency: values
+                .get("concurrency")
+                .and_then(Value::as_i64)
+                .ok_or(PluginServiceError::InvalidConfig)?,
+            include_ready,
+            write_sidecars: values
+                .get("writeSidecars")
+                .and_then(Value::as_bool)
+                .ok_or(PluginServiceError::InvalidConfig)?,
+        })
+    }
+
+    async fn config_fields_for_plugin(
+        &self,
+        plugin: &DiscoveredPlugin,
+    ) -> Result<Vec<PluginConfigField>, PluginServiceError> {
+        let mut fields = plugin.manifest.config_fields.clone();
+        if fields.iter().any(|field| {
+            field.options_source.as_deref() == Some(CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES)
+        }) {
+            let options = self
+                .database
+                .list_libraries()
+                .await?
+                .into_iter()
+                .filter(|library| library.is_enabled)
+                .map(|library| PluginConfigOption {
+                    value: library.id,
+                    label: library.name,
+                })
+                .collect::<Vec<_>>();
+            for field in &mut fields {
+                if field.options_source.as_deref() == Some(CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES) {
+                    field.options = options.clone();
+                }
+            }
+        }
+        Ok(fields)
+    }
+
+    async fn read_plugin_config(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Map<String, Value>, PluginServiceError> {
+        let path = plugin_config_path(&self.config_dir, plugin_id);
+        match fs::read_to_string(path).await {
+            Ok(contents) => {
+                let values = serde_json::from_str(&contents)
+                    .map_err(|_| PluginServiceError::InvalidConfig)?;
+                Ok(normalize_plugin_config(plugin_id, values))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
+            Err(error) => Err(PluginServiceError::ConfigIo(error)),
+        }
+    }
+
+    async fn write_plugin_config(
+        &self,
+        plugin_id: &str,
+        values: &Map<String, Value>,
+    ) -> Result<(), PluginServiceError> {
+        let directory = self.config_dir.join(PLUGIN_CONFIG_DIR);
+        fs::create_dir_all(&directory)
+            .await
+            .map_err(PluginServiceError::ConfigIo)?;
+        let path = plugin_config_path(&self.config_dir, plugin_id);
+        let temporary = directory.join(format!(".{plugin_id}.{}.tmp", Uuid::now_v7()));
+        let contents =
+            serde_json::to_vec_pretty(values).map_err(|_| PluginServiceError::InvalidConfig)?;
+        let mut file = fs::File::create(&temporary)
+            .await
+            .map_err(PluginServiceError::ConfigIo)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = file
+                .metadata()
+                .await
+                .map_err(PluginServiceError::ConfigIo)?
+                .permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&temporary, permissions)
+                .await
+                .map_err(PluginServiceError::ConfigIo)?;
+        }
+        file.write_all(&contents)
+            .await
+            .map_err(PluginServiceError::ConfigIo)?;
+        file.sync_all()
+            .await
+            .map_err(PluginServiceError::ConfigIo)?;
+        drop(file);
+        fs::rename(&temporary, &path)
+            .await
+            .map_err(PluginServiceError::ConfigIo)
+    }
+
     pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult, PluginServiceError> {
         let plugin = self
             .catalog
@@ -392,20 +595,34 @@ impl PluginService {
         let Some(plugin) = self.catalog.get(plugin_id) else {
             return Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()));
         };
-        Ok(self.dynamic_view(plugin, installed).await)
+        self.dynamic_view(plugin, installed).await
     }
 
-    async fn dynamic_view(&self, plugin: &DiscoveredPlugin, installed: bool) -> PluginView {
+    async fn dynamic_view(
+        &self,
+        plugin: &DiscoveredPlugin,
+        installed: bool,
+    ) -> Result<PluginView, PluginServiceError> {
         let runtime = self.supervisor.status(&plugin.manifest.id).await;
         let config_source = if is_tmdb_plugin_id(&plugin.manifest.id) {
             self.tmdb_config_source().await.to_owned()
-        } else {
+        } else if plugin.manifest.config_fields.is_empty() {
             CONFIG_SOURCE_NONE.to_owned()
+        } else {
+            CONFIG_SOURCE_PLUGIN.to_owned()
         };
-        let configured = plugin.manifest.config_fields.is_empty()
-            || (is_tmdb_plugin_id(&plugin.manifest.id) && config_source != CONFIG_SOURCE_NONE);
+        let config_fields = self.config_fields_for_plugin(plugin).await?;
+        let stored_values = self.read_plugin_config(&plugin.manifest.id).await?;
+        let config_values = merge_default_config_values(&config_fields, stored_values);
+        let public_config_values = public_config_values(&config_fields, &config_values);
+        let configured = if is_tmdb_plugin_id(&plugin.manifest.id) {
+            config_source != CONFIG_SOURCE_NONE
+        } else {
+            config_fields.is_empty()
+                || validate_config_values(&config_fields, &config_values).is_ok()
+        };
         let available = installed && configured;
-        PluginView {
+        Ok(PluginView {
             id: plugin.manifest.id.clone(),
             name: plugin.manifest.name.clone(),
             description: plugin.manifest.description.clone().unwrap_or_default(),
@@ -435,19 +652,19 @@ impl PluginService {
             } else {
                 None
             },
-            configurable: !plugin.manifest.config_fields.is_empty(),
+            configurable: !config_fields.is_empty(),
             config_fields: if is_tmdb_plugin_id(&plugin.manifest.id) {
                 tmdb_config_fields()
             } else {
-                plugin.manifest.config_fields.clone()
+                config_fields
             },
             config_source,
             config_values: if is_tmdb_plugin_id(&plugin.manifest.id) {
                 tmdb_config_values(&self.config_dir).await
             } else {
-                serde_json::Map::new()
+                public_config_values
             },
-        }
+        })
     }
 
     fn ensure_known_plugin(&self, plugin_id: &str) -> Result<(), PluginServiceError> {
@@ -483,6 +700,27 @@ impl PluginService {
     }
 }
 
+fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> Map<String, Value> {
+    if plugin_id != MEDIA_INFO_PLUGIN_ID {
+        return values;
+    }
+    let legacy_include_ready = values.remove("includeReady");
+    if !values.contains_key(MEDIA_INFO_EXISTING_INFO_POLICY_KEY) {
+        if let Some(include_ready) = legacy_include_ready.and_then(|value| value.as_bool()) {
+            let policy = if include_ready {
+                MEDIA_INFO_EXISTING_INFO_POLICY_OVERWRITE
+            } else {
+                MEDIA_INFO_EXISTING_INFO_POLICY_SKIP
+            };
+            values.insert(
+                MEDIA_INFO_EXISTING_INFO_POLICY_KEY.to_owned(),
+                json!(policy),
+            );
+        }
+    }
+    values
+}
+
 async fn secret_file_configured(config_dir: &std::path::Path, file_name: &str) -> bool {
     tokio::fs::read_to_string(config_dir.join(file_name))
         .await
@@ -498,6 +736,116 @@ fn has_environment_value(name: &str) -> bool {
 
 fn is_tmdb_plugin_id(plugin_id: &str) -> bool {
     plugin_id == TMDB_PLUGIN_ID || plugin_id == TMDB_DYNAMIC_PLUGIN_ID
+}
+
+fn plugin_config_path(config_dir: &Path, plugin_id: &str) -> PathBuf {
+    config_dir
+        .join(PLUGIN_CONFIG_DIR)
+        .join(format!("{plugin_id}.json"))
+}
+
+fn merge_default_config_values(
+    fields: &[PluginConfigField],
+    stored: Map<String, Value>,
+) -> Map<String, Value> {
+    let mut values = Map::new();
+    for field in fields {
+        if let Some(default_value) = field.default_value.clone() {
+            values.insert(field.key.clone(), default_value);
+        }
+    }
+    values.extend(stored);
+    values
+}
+
+fn public_config_values(
+    fields: &[PluginConfigField],
+    values: &Map<String, Value>,
+) -> Map<String, Value> {
+    fields
+        .iter()
+        .filter(|field| !field.sensitive)
+        .filter_map(|field| {
+            values
+                .get(&field.key)
+                .cloned()
+                .map(|value| (field.key.clone(), value))
+        })
+        .collect()
+}
+
+fn validate_config_values(
+    fields: &[PluginConfigField],
+    values: &Map<String, Value>,
+) -> Result<Map<String, Value>, PluginServiceError> {
+    let allowed = fields
+        .iter()
+        .map(|field| field.key.as_str())
+        .collect::<HashSet<_>>();
+    if values.keys().any(|key| !allowed.contains(key.as_str())) {
+        return Err(PluginServiceError::InvalidConfig);
+    }
+    let mut normalized = Map::new();
+    for field in fields {
+        let Some(value) = values.get(&field.key) else {
+            if field.required {
+                return Err(PluginServiceError::InvalidConfig);
+            }
+            continue;
+        };
+        match field.input_type.as_str() {
+            "text" | "password" => {
+                if value
+                    .as_str()
+                    .is_none_or(|value| value.chars().count() > 4096)
+                {
+                    return Err(PluginServiceError::InvalidConfig);
+                }
+            }
+            "toggle" => {
+                if !value.is_boolean() {
+                    return Err(PluginServiceError::InvalidConfig);
+                }
+            }
+            "number" => {
+                let Some(value) = value.as_i64() else {
+                    return Err(PluginServiceError::InvalidConfig);
+                };
+                if field.minimum.is_some_and(|minimum| value < minimum)
+                    || field.maximum.is_some_and(|maximum| value > maximum)
+                {
+                    return Err(PluginServiceError::InvalidConfig);
+                }
+            }
+            "select" => {
+                if field.multiple {
+                    let Some(values) = value.as_array() else {
+                        return Err(PluginServiceError::InvalidConfig);
+                    };
+                    if field.required && values.is_empty() {
+                        return Err(PluginServiceError::InvalidConfig);
+                    }
+                    if values
+                        .iter()
+                        .any(|value| !select_option_is_valid(field, value))
+                    {
+                        return Err(PluginServiceError::InvalidConfig);
+                    }
+                } else if !select_option_is_valid(field, value) {
+                    return Err(PluginServiceError::InvalidConfig);
+                }
+            }
+            _ => return Err(PluginServiceError::InvalidConfig),
+        }
+        normalized.insert(field.key.clone(), value.clone());
+    }
+    Ok(normalized)
+}
+
+fn select_option_is_valid(field: &PluginConfigField, value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|value| field.options.iter().any(|option| option.value == value))
 }
 
 #[derive(Debug)]

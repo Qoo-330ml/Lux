@@ -444,6 +444,42 @@ describe("LuxApiClient", () => {
     });
   });
 
+  it("saves media-info configuration and starts the configured plugin", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path.endsWith("/config")) {
+        expect(init?.method).toBe("PUT");
+        expect(JSON.parse(String(init?.body))).toEqual({
+          libraryIds: ["library-1"],
+          concurrency: 3,
+          existingInfoPolicy: "SKIP",
+          writeSidecars: true,
+        });
+        return new Response(JSON.stringify({ plugin: { id: "org.lux.media-info" } }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/admin/plugins/org.lux.media-info/run");
+      expect(init?.method).toBe("POST");
+      return new Response(JSON.stringify({ operationId: "operation-1", jobs: [] }), { status: 202 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.updateAdminPluginConfig("org.lux.media-info", {
+      libraryIds: ["library-1"],
+      concurrency: 3,
+      existingInfoPolicy: "SKIP",
+      writeSidecars: true,
+    })).resolves.toEqual({ plugin: { id: "org.lux.media-info" } });
+    await expect(client.runAdminPlugin("org.lux.media-info")).resolves.toEqual({
+      operationId: "operation-1",
+      jobs: [],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("unwraps the authenticated user when restoring a session", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ user: { id: "admin-1", canManageServer: true } }), { status: 200 }),

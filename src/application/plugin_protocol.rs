@@ -11,6 +11,7 @@ pub const PLUGIN_CATEGORY_SCRAPER: &str = "SCRAPER";
 pub const PLUGIN_CATEGORY_MEDIA: &str = "MEDIA";
 pub const PLUGIN_TYPE_MEDIA_PROBE: &str = "media_probe";
 pub const MEDIA_PROBE_CAPABILITY: &str = "media.probe";
+pub const CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES: &str = "media-libraries";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,7 +103,7 @@ impl PluginManifest {
             validate_text("config field label", &field.label, 128)?;
             if !matches!(
                 field.input_type.as_str(),
-                "text" | "password" | "select" | "toggle"
+                "text" | "password" | "select" | "toggle" | "number"
             ) {
                 return Err(PluginManifestError::Invalid(format!(
                     "unsupported config field type: {}",
@@ -110,19 +111,54 @@ impl PluginManifest {
                 )));
             }
             if field.input_type == "select" {
-                if field.options.is_empty() || field.options.len() > 256 {
+                if field.options.is_empty() == field.options_source.is_none()
+                    || field.options.len() > 256
+                {
                     return Err(PluginManifestError::Invalid(
-                        "select config field must declare 1 to 256 options".to_owned(),
+                        "select config field must declare options or an optionsSource".to_owned(),
                     ));
                 }
                 for option in &field.options {
                     validate_identifier("config option value", &option.value, 128)?;
                     validate_text("config option label", &option.label, 128)?;
                 }
-            } else if field.multiple || !field.options.is_empty() {
+                if let Some(source) = field.options_source.as_deref()
+                    && source != CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES
+                {
+                    return Err(PluginManifestError::Invalid(
+                        "unsupported config optionsSource".to_owned(),
+                    ));
+                }
+            } else if field.multiple || !field.options.is_empty() || field.options_source.is_some()
+            {
                 return Err(PluginManifestError::Invalid(
-                    "only select config fields may declare options or multiple".to_owned(),
+                    "only select config fields may declare options, multiple or optionsSource"
+                        .to_owned(),
                 ));
+            }
+            if field.input_type == "number" {
+                if field
+                    .minimum
+                    .is_some_and(|minimum| field.maximum.is_some_and(|maximum| minimum > maximum))
+                {
+                    return Err(PluginManifestError::Invalid(
+                        "number config field minimum exceeds maximum".to_owned(),
+                    ));
+                }
+                if let Some(default_value) = field.default_value.as_ref() {
+                    let Some(default_value) = default_value.as_i64() else {
+                        return Err(PluginManifestError::Invalid(
+                            "number config field defaultValue must be an integer".to_owned(),
+                        ));
+                    };
+                    if field.minimum.is_some_and(|minimum| default_value < minimum)
+                        || field.maximum.is_some_and(|maximum| default_value > maximum)
+                    {
+                        return Err(PluginManifestError::Invalid(
+                            "number config field defaultValue is outside its range".to_owned(),
+                        ));
+                    }
+                }
             }
         }
         self.permissions.validate()?;
@@ -207,6 +243,14 @@ pub struct PluginConfigField {
     pub multiple: bool,
     #[serde(default)]
     pub options: Vec<PluginConfigOption>,
+    #[serde(default)]
+    pub options_source: Option<String>,
+    #[serde(default)]
+    pub default_value: Option<Value>,
+    #[serde(default)]
+    pub minimum: Option<i64>,
+    #[serde(default)]
+    pub maximum: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

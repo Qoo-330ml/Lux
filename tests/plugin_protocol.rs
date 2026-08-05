@@ -77,7 +77,24 @@ fn accepts_a_media_probe_plugin_manifest() {
         "category": "MEDIA",
         "supportedItemTypes": [],
         "capabilities": ["media.probe"],
-        "configFields": [],
+        "configFields": [
+            {
+                "key": "libraryIds",
+                "label": "媒体库",
+                "type": "select",
+                "multiple": true,
+                "required": true,
+                "optionsSource": "media-libraries"
+            },
+            {
+                "key": "concurrency",
+                "label": "并发数",
+                "type": "number",
+                "defaultValue": 2,
+                "minimum": 1,
+                "maximum": 64
+            }
+        ],
         "permissions": {
             "network": ["media-source"],
             "filesystem": []
@@ -89,6 +106,12 @@ fn accepts_a_media_probe_plugin_manifest() {
     assert_eq!(manifest.plugin_type, "media_probe");
     assert_eq!(manifest.category, "MEDIA");
     assert_eq!(manifest.capabilities, vec!["media.probe"]);
+    assert_eq!(
+        manifest.config_fields[0].options_source.as_deref(),
+        Some("media-libraries")
+    );
+    assert_eq!(manifest.config_fields[1].input_type, "number");
+    assert_eq!(manifest.config_fields[1].default_value, Some(json!(2)));
 }
 
 #[test]

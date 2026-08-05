@@ -87,7 +87,7 @@ HTTP handler 只负责解析请求、权限校验和调用应用服务；库扫�
 ```json
 {
   "libraryIds": ["library-id-1", "library-id-2"],
-  "includeReady": false,
+  "existingInfoPolicy": "SKIP",
   "writeSidecars": false
 }
 ```
@@ -95,7 +95,8 @@ HTTP handler 只负责解析请求、权限校验和调用应用服务；库扫�
 字段为提案，不是已冻结的 API：
 
 - `libraryIds` 必填，不能为空，服务端限制最大数量。
-- `includeReady` 控制是否重新探测已有成功结果；默认跳过。
+- `existingInfoPolicy` 控制已有成功结果的处理方式：`SKIP` 默认跳过，`OVERWRITE` 重新探测并覆盖。
+  旧版本的 `includeReady` 布尔配置按 `false → SKIP`、`true → OVERWRITE` 兼容读取。
 - `writeSidecars` 控制是否写回旁车文件；建议默认关闭，避免未确认的文件系统副作用。
 
 如果需要“全部媒体库”，应由 API 显式接受 `allLibraries: true`，并记录当次展开后的媒体库快照；不能把空数组同时解释为“全部媒体库”和“没有选择”。
@@ -194,10 +195,12 @@ MediaInfoKeeper 的行为是探测后写入旁车文件；Lux 建议把这个行
 当前管理员操作端点为：
 
 ```text
+PUT  /api/v1/admin/plugins/org.lux.media-info/config
+POST /api/v1/admin/plugins/org.lux.media-info/run
 POST /api/v1/admin/strm-probe-jobs
 ```
 
-响应使用 `202 Accepted`，返回任务 ID 或按媒体库拆分的任务 ID；不返回 URL。任务使用独立 `strm_probe_jobs` 表，提供分页列表、详情、取消和重试接口；列表仍设置服务端分页上限。
+插件配置由 `org.lux.media-info` manifest 声明，包括动态媒体库多选、并发数、是否重探测已有结果和是否写旁车。Lux 管理页解析配置 schema，动态填充媒体库选项并保存配置；`run` 和兼容的 STRM 任务入口只读取已保存配置，不接受宿主覆盖参数。响应使用 `202 Accepted`，返回任务 ID 或按媒体库拆分的任务 ID；不返回 URL。任务使用独立 `strm_probe_jobs` 表，提供分页列表、详情、取消和重试接口；列表仍设置服务端分页上限。
 
 建议在管理界面展示：
 
@@ -259,9 +262,10 @@ RPC          = media.probe
 - 让任务重启后可以从游标继续，不重复处理已完成媒体源。
 - 从空数据库运行迁移并验证旧数据库升级。
 
-### 阶段 3：管理 API（核心 API 已完成）
+### 阶段 3：配置、管理 API 与 Web（已完成）
 
 - 增加管理员触发接口和请求校验。
+- 增加插件声明配置、动态媒体库选项、通用配置持久化和插件管理页表单。
 - 复用分页任务查询、取消、重试和事件接口。
 - 错误响应只返回错误码和安全摘要，不返回 URL。
 

@@ -2999,8 +2999,13 @@ services:
 `media.probe`；插件只负责接收单个已校验 URL、调用 `ffprobe` 并返回受限的 format/stream
 结果。媒体库选择、任务、并发、URL 安全、数据库写入和兼容旁车写回均由 Lux 宿主负责。
 
-管理员通过 `POST /api/v1/admin/strm-probe-jobs` 提交 `libraryIds`、`concurrency`、
-`includeReady` 和 `writeSidecars`。服务为每个选定媒体库建立持久化任务，使用全局操作信号量
+插件 manifest 声明 `libraryIds`、`concurrency`、`existingInfoPolicy` 和 `writeSidecars` 配置项；
+其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
+（覆盖已有媒体信息）。读取旧版本配置时，`includeReady: false` 迁移为 `SKIP`，
+`includeReady: true` 迁移为 `OVERWRITE`。
+Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理员通过
+`POST /api/v1/admin/plugins/org.lux.media-info/run` 或兼容的
+`POST /api/v1/admin/strm-probe-jobs` 按已保存配置启动任务，不从请求体接收宿主覆盖参数。服务为每个选定媒体库建立持久化任务，使用全局操作信号量
 和媒体库 `probeConcurrency` 的较小值限制并发；任务支持分页列表、详情、取消、重试，并在服务
 重启后恢复 PENDING/RUNNING 状态。探测结果保存到 `media_sources`/`media_streams`，旁车写回
 使用同目录 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。
@@ -3017,6 +3022,7 @@ services:
 验收：
 
 - [ ] 管理员只能选择已有媒体库，未选媒体库不创建任务、不发起插件 RPC；空选择、无效 ID、并发超范围均被拒绝。
+- [ ] 插件详情页展示并保存媒体库多选、并发数、已有媒体信息处理方式和旁车写回配置；配置文件原子保存且权限受限，插件列表回显非敏感值。
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
@@ -3026,7 +3032,8 @@ services:
 
 验证：
 
-- `cargo test --locked --test plugin_protocol --test plugin_runtime --test plugin_package --test media_info_plugin --test strm_probe --test strm_probe_api`
+- `cargo test --locked --test plugin_protocol --test plugin_runtime --test plugin_package --test media_info_plugin --test media_info_config --test media_info_config_api --test strm_probe --test strm_probe_api`
+- `pnpm --dir web test -- plugin-library.test.ts`
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 
@@ -3036,7 +3043,7 @@ services:
 
 - 不改变 `.strm` 播放直连语义，不做代理、转码、缓存或 AList API 访问。
 - 不在普通扫描或用户请求路径中探测远程 `.strm`，不把插件权限扩展为媒体库/数据库访问。
-- 第一版不提供 Web 管理页面和计划任务；继续使用管理员 API，待后续任务接入。
+- 第一版不接入计划任务；配置和手动启动通过插件管理页及管理员 API 提供。
 
 ---
 

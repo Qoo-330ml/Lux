@@ -208,7 +208,44 @@ fn manifest_value(
             "category": "MEDIA",
             "supportedItemTypes": [],
             "capabilities": ["media.probe"],
-            "configFields": [],
+            "configFields": [
+                {
+                    "key": "libraryIds",
+                    "label": "媒体库",
+                    "type": "select",
+                    "required": true,
+                    "multiple": true,
+                    "optionsSource": "media-libraries",
+                    "description": "选择需要提取媒体信息的媒体库。"
+                },
+                {
+                    "key": "concurrency",
+                    "label": "并发数",
+                    "type": "number",
+                    "required": true,
+                    "defaultValue": 2,
+                    "minimum": 1,
+                    "maximum": 64,
+                    "description": "远程媒体信息提取的最大并发数。"
+                },
+                {
+                    "key": "existingInfoPolicy",
+                    "label": "已有媒体信息处理方式",
+                    "type": "select",
+                    "required": true,
+                    "defaultValue": "SKIP",
+                    "options": [
+                        {"value": "SKIP", "label": "跳过已有媒体信息"},
+                        {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}
+                    ]
+                },
+                {
+                    "key": "writeSidecars",
+                    "label": "写入 mediainfo.json",
+                    "type": "toggle",
+                    "defaultValue": true
+                }
+            ],
             "permissions": {
                 "network": ["media-source"],
                 "filesystem": []

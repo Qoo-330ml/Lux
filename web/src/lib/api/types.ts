@@ -202,11 +202,15 @@ export type AdminPlugin = {
 export type AdminPluginConfigField = {
   key: string;
   label: string;
-  type: "password" | "text" | "select" | "toggle" | string;
+  type: "password" | "text" | "select" | "toggle" | "number" | string;
   required: boolean;
   sensitive: boolean;
   description?: string | null;
   multiple?: boolean;
+  optionsSource?: string | null;
+  defaultValue?: unknown;
+  minimum?: number | null;
+  maximum?: number | null;
   options?: Array<{ value: string; label: string }>;
 };
 

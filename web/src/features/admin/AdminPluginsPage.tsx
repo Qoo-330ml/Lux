@@ -53,27 +53,38 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
   const [alternateApiEnabled, setAlternateApiEnabled] = useState(false);
   const [apiBaseUrlChoice, setApiBaseUrlChoice] = useState("official");
   const [customApiBaseUrl, setCustomApiBaseUrl] = useState("");
+  const [libraryIds, setLibraryIds] = useState<string[]>([]);
+  const [concurrency, setConcurrency] = useState(2);
+  const [existingInfoPolicy, setExistingInfoPolicy] = useState("SKIP");
+  const [writeSidecars, setWriteSidecars] = useState(true);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const isMediaInfo = plugin.id === "org.lux.media-info";
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
   const preferredLanguageField = plugin.configFields.find((field) => field.key === "preferredLanguage");
   const fallbackEnabledField = plugin.configFields.find((field) => field.key === "languageFallbackEnabled");
   const fallbackLanguagesField = plugin.configFields.find((field) => field.key === "fallbackLanguages");
   const alternateApiField = plugin.configFields.find((field) => field.key === "alternateApiEnabled");
   const apiBaseUrlField = plugin.configFields.find((field) => field.key === "apiBaseUrl");
+  const libraryIdsField = plugin.configFields.find((field) => field.key === "libraryIds");
+  const concurrencyField = plugin.configFields.find((field) => field.key === "concurrency");
+  const existingInfoPolicyField = plugin.configFields.find((field) => field.key === "existingInfoPolicy");
+  const writeSidecarsField = plugin.configFields.find((field) => field.key === "writeSidecars");
   const customApiBaseUrlOption = apiBaseUrlField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
   const canConfigure = plugin.installed && plugin.configurable && plugin.configFields.length > 0;
   const closeDialog = useCallback(() => setOpen(false), []);
   const save = useMutation({
-    mutationFn: () => api.updateAdminPluginConfig(plugin.id, {
-      ...(apiKeyDirty ? { apiKey } : {}),
-      preferredLanguage,
-      languageFallbackEnabled,
-      fallbackLanguages,
-      alternateApiEnabled,
-      apiBaseUrl: apiBaseUrlChoice === customApiBaseUrlOption
-        ? customApiBaseUrl.trim()
-        : apiBaseUrlField?.options?.find((option) => option.value === apiBaseUrlChoice)?.label ?? customApiBaseUrl.trim(),
-    }),
+    mutationFn: () => isMediaInfo
+      ? api.updateAdminPluginConfig(plugin.id, { libraryIds, concurrency, existingInfoPolicy, writeSidecars })
+      : api.updateAdminPluginConfig(plugin.id, {
+          ...(apiKeyDirty ? { apiKey } : {}),
+          preferredLanguage,
+          languageFallbackEnabled,
+          fallbackLanguages,
+          alternateApiEnabled,
+          apiBaseUrl: apiBaseUrlChoice === customApiBaseUrlOption
+            ? customApiBaseUrl.trim()
+            : apiBaseUrlField?.options?.find((option) => option.value === apiBaseUrlChoice)?.label ?? customApiBaseUrl.trim(),
+        }),
     onSuccess: () => {
       setApiKey("");
       closeDialog();
@@ -81,6 +92,10 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
     },
+  });
+  const run = useMutation({
+    mutationFn: () => api.runAdminPlugin(plugin.id),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "jobs"] }),
   });
 
   useEffect(() => {
@@ -117,9 +132,19 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
     setAlternateApiEnabled(values.alternateApiEnabled === true);
     setApiBaseUrlChoice(selectedApiOption?.value ?? customApiBaseUrlOption);
     setCustomApiBaseUrl(selectedApiOption ? "" : configuredApiBaseUrl);
+    const configuredLibraryIds = Array.isArray(values.libraryIds)
+      ? values.libraryIds.filter((value): value is string => typeof value === "string")
+      : [];
+    setLibraryIds(configuredLibraryIds);
+    setConcurrency(typeof values.concurrency === "number" ? values.concurrency : Number(concurrencyField?.defaultValue ?? 2));
+    const configuredExistingInfoPolicy = typeof values.existingInfoPolicy === "string"
+      ? values.existingInfoPolicy
+      : String(existingInfoPolicyField?.defaultValue ?? "SKIP");
+    setExistingInfoPolicy(configuredExistingInfoPolicy);
+    setWriteSidecars(values.writeSidecars !== false);
     setApiKey("");
     setApiKeyDirty(false);
-  }, [apiBaseUrlField?.options, customApiBaseUrlOption, open, plugin.configValues, preferredLanguageField?.options]);
+  }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options]);
 
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
@@ -140,6 +165,7 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
         ) : (
           <button className="lux-admin-plugin-install-status is-install" type="button" aria-label={`安装 ${plugin.name}`} disabled={installing} onClick={onInstall}><Download size={15} /> {installing ? "安装中…" : "安装"}</button>
         )}
+        {isMediaInfo && plugin.installed && plugin.configured ? <button className="lux-button lux-button-secondary" type="button" aria-label="开始提取" onClick={() => run.mutate()} disabled={run.isPending}>{run.isPending ? "启动中…" : "开始提取"}</button> : null}
         {canConfigure ? <button className="lux-admin-plugin-config-button" type="button" aria-label={`配置 ${plugin.name}`} onClick={() => setOpen(true)}><Settings2 size={15} /> 配置</button> : null}
       </div>
       {open && canConfigure ? (
@@ -150,13 +176,20 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
               <button ref={closeRef} className="lux-icon-button lux-admin-plugin-dialog-close" type="button" aria-label={`关闭 ${plugin.name}配置`} onClick={closeDialog}><X size={17} /></button>
             </div>
             <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
-              {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空可恢复内置 Key" autoComplete="new-password" /></label> : null}
-              {preferredLanguageField ? <label htmlFor={"plugin-config-" + plugin.id + "-preferred-language"}>{preferredLanguageField.label}<select id={"plugin-config-" + plugin.id + "-preferred-language"} value={preferredLanguage} onChange={(event) => setPreferredLanguage(event.target.value)}>{(preferredLanguageField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label> : null}
-              {fallbackEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={languageFallbackEnabled} onChange={(event) => setLanguageFallbackEnabled(event.target.checked)} /> <span><strong>{fallbackEnabledField.label}</strong><small>{fallbackEnabledField.description}</small></span></label> : null}
-              {fallbackLanguagesField ? <label htmlFor={"plugin-config-" + plugin.id + "-fallback-languages"}>{fallbackLanguagesField.label}<select id={"plugin-config-" + plugin.id + "-fallback-languages"} multiple value={fallbackLanguages} onChange={(event) => setFallbackLanguages(Array.from(event.target.selectedOptions, (option) => option.value))}>{(fallbackLanguagesField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{fallbackLanguagesField.description}</small></label> : null}
-              {alternateApiField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={alternateApiEnabled} onChange={(event) => setAlternateApiEnabled(event.target.checked)} /> <span><strong>{alternateApiField.label}</strong><small>{alternateApiField.description}</small></span></label> : null}
-              {apiBaseUrlField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlField.label}<select id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} disabled={!alternateApiEnabled} onChange={(event) => setApiBaseUrlChoice(event.target.value)}>{(apiBaseUrlField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{apiBaseUrlField.description}</small></label> : null}
-              {apiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>自定义 API 地址<input id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>只填写 TMDb API 的基础地址，不要附带查询参数。</small></label> : null}
+              {isMediaInfo ? <>
+                {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<select id={"plugin-config-" + plugin.id + "-library-ids"} multiple required={libraryIdsField.required} value={libraryIds} onChange={(event) => setLibraryIds(Array.from(event.target.selectedOptions, (option) => option.value))}>{(libraryIdsField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{libraryIdsField.description}</small></label> : null}
+                {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
+                {existingInfoPolicyField ? <label htmlFor={"plugin-config-" + plugin.id + "-existing-info-policy"}>{existingInfoPolicyField.label}<select id={"plugin-config-" + plugin.id + "-existing-info-policy"} value={existingInfoPolicy} onChange={(event) => setExistingInfoPolicy(event.target.value)}>{(existingInfoPolicyField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{existingInfoPolicyField.description}</small></label> : null}
+                {writeSidecarsField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={writeSidecars} onChange={(event) => setWriteSidecars(event.target.checked)} /> <span><strong>{writeSidecarsField.label}</strong><small>{writeSidecarsField.description}</small></span></label> : null}
+              </> : <>
+                {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空可恢复内置 Key" autoComplete="new-password" /></label> : null}
+                {preferredLanguageField ? <label htmlFor={"plugin-config-" + plugin.id + "-preferred-language"}>{preferredLanguageField.label}<select id={"plugin-config-" + plugin.id + "-preferred-language"} value={preferredLanguage} onChange={(event) => setPreferredLanguage(event.target.value)}>{(preferredLanguageField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label> : null}
+                {fallbackEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={languageFallbackEnabled} onChange={(event) => setLanguageFallbackEnabled(event.target.checked)} /> <span><strong>{fallbackEnabledField.label}</strong><small>{fallbackEnabledField.description}</small></span></label> : null}
+                {fallbackLanguagesField ? <label htmlFor={"plugin-config-" + plugin.id + "-fallback-languages"}>{fallbackLanguagesField.label}<select id={"plugin-config-" + plugin.id + "-fallback-languages"} multiple value={fallbackLanguages} onChange={(event) => setFallbackLanguages(Array.from(event.target.selectedOptions, (option) => option.value))}>{(fallbackLanguagesField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{fallbackLanguagesField.description}</small></label> : null}
+                {alternateApiField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={alternateApiEnabled} onChange={(event) => setAlternateApiEnabled(event.target.checked)} /> <span><strong>{alternateApiField.label}</strong><small>{alternateApiField.description}</small></span></label> : null}
+                {apiBaseUrlField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlField.label}<select id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} disabled={!alternateApiEnabled} onChange={(event) => setApiBaseUrlChoice(event.target.value)}>{(apiBaseUrlField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{apiBaseUrlField.description}</small></label> : null}
+                {apiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>自定义 API 地址<input id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>只填写 TMDb API 的基础地址，不要附带查询参数。</small></label> : null}
+              </>}
               <p>{configField?.description ?? "插件配置"} 当前：{availabilityLabel(plugin.configSource)}。</p>
               <div className="lux-admin-plugin-dialog-actions">
                 <button className="lux-button lux-button-secondary" type="button" onClick={closeDialog}>取消</button>
@@ -184,6 +217,7 @@ function availabilityLabel(source: AdminPlugin["configSource"]) {
   if (source === "ENVIRONMENT") return "使用环境变量 Key";
   if (source === "READ_ACCESS_TOKEN") return "使用 Read Access Token";
   if (source === "BUILT_IN") return "使用内置 Key";
+  if (source === "PLUGIN_CONFIG") return "使用插件配置";
   return "未配置凭据";
 }
 
