@@ -175,8 +175,9 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
     } else if path == "/3/tv/8/season/1/episode/2/images" {
         json_response(json!({
             "posters": [],
-            "backdrops": [{"file_path": "/still.jpg", "iso_639_1": null, "width": 1920, "height": 1080}],
-            "profiles": []
+            "backdrops": [],
+            "profiles": [],
+            "stills": [{"file_path": "/still.jpg", "iso_639_1": null, "width": 1920, "height": 1080}]
         }))
     } else if path == "/3/movie/157336/videos" {
         json_response(json!({

@@ -669,6 +669,19 @@ fn image_results(response: TmdbImagesResponse) -> Vec<Value> {
             })
         })
     }));
+    images.extend(response.stills.into_iter().filter_map(|image| {
+        image.file_path.map(|path| {
+            json!({
+                "Type": "Backdrop",
+                "Url": image_url(&path),
+                "ThumbnailUrl": image_url(&path),
+                "Language": image.iso_639_1,
+                "Width": image.width,
+                "Height": image.height,
+                "ProviderName": "Tmdb"
+            })
+        })
+    }));
     images.extend(response.profiles.into_iter().filter_map(|image| {
         image.file_path.map(|path| {
             json!({

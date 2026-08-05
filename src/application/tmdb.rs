@@ -1006,6 +1006,8 @@ pub struct TmdbImagesResponse {
     #[serde(default)]
     pub backdrops: Vec<TmdbImageReference>,
     #[serde(default)]
+    pub stills: Vec<TmdbImageReference>,
+    #[serde(default)]
     pub logos: Vec<TmdbImageReference>,
     #[serde(default)]
     pub profiles: Vec<TmdbImageReference>,
