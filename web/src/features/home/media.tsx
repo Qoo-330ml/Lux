@@ -62,7 +62,7 @@ export function remainingRuntimeLabel(item: MediaItem) {
   return remaining > 0 ? runtimeLabel(remaining) : undefined;
 }
 
-export function MediaCard({ item, landscape = false }: { item: MediaItem; landscape?: boolean }) {
+export function MediaCard({ item, landscape = false, compactRating = false }: { item: MediaItem; landscape?: boolean; compactRating?: boolean }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
@@ -112,6 +112,7 @@ export function MediaCard({ item, landscape = false }: { item: MediaItem; landsc
           <Link className="lux-media-card-link" to={`/items/${item.id}`} aria-label={`查看 ${mediaTitle(item)} 详情`}>
             <div className="lux-media-art">
               {image ? <img src={image} alt="" loading="lazy" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
+              <Rating value={item.rating} source={item.ratingSource} compact={compactRating} />
               <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
               {progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
             </div>
@@ -157,6 +158,7 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
     <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={`继续播放 ${mediaTitle(item)}`}>
       <div className="lux-media-art">
         {image ? <img src={image} alt="" loading="lazy" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
+        <Rating value={item.rating} source={item.ratingSource} compact />
         <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
         {progress > 0 && progress < 100 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
       </div>
@@ -174,7 +176,7 @@ export function MediaRail({ title, items, landscape = false }: { title: string; 
     <section className="lux-section" aria-label={title}>
       <div className="lux-section-heading"><h2>{title}</h2><span>{items.length} 项</span></div>
       <div className={landscape ? "lux-media-rail lux-media-rail-landscape" : "lux-media-rail"}>
-        {items.map((item) => <MediaCard item={item} landscape={landscape} key={item.id} />)}
+        {items.map((item) => <MediaCard item={item} landscape={landscape} compactRating key={item.id} />)}
       </div>
     </section>
   );
@@ -349,14 +351,14 @@ export function LibraryCard({ library }: { library: Library }) {
   );
 }
 
-export function Rating({ value, source }: { value?: number | null; source?: string | null }) {
+export function Rating({ value, source, compact = false }: { value?: number | null; source?: string | null; compact?: boolean }) {
   if (value == null || !Number.isFinite(value) || value < 0 || value > 10) return null;
   const score = value.toFixed(1);
-  const label = source ? source + " 评分 " + score : "评分 " + score;
+  const label = compact ? "评分 " + score : source ? source + " 评分 " + score : "评分 " + score;
   return (
-    <span className="lux-rating" aria-label={label} title={label}>
-      <Star size={14} fill="currentColor" aria-hidden="true" />
-      {source ? <span className="lux-rating-source">{source}</span> : null}
+    <span className={compact ? "lux-rating is-compact" : "lux-rating"} aria-label={label} title={label}>
+      {compact ? null : <Star size={14} fill="currentColor" aria-hidden="true" />}
+      {compact ? null : source ? <span className="lux-rating-source">{source}</span> : null}
       <strong>{score}</strong>
     </span>
   );

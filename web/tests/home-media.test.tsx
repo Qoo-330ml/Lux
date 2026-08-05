@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
-import { ContinueWatchingRail } from "../src/features/home/media";
+import { ContinueWatchingRail, MediaRail } from "../src/features/home/media";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -31,6 +31,8 @@ describe("ContinueWatchingRail", () => {
                 id: "episode-1",
                 title: "第一集",
                 itemType: "EPISODE",
+                rating: 8.4,
+                ratingSource: "TMDb",
                 runtimeTicks: 3_600_000_000,
                 imageTags: { fanart: "fanart-tag" },
                 userData: { positionTicks: 1_200_000_000 },
@@ -45,8 +47,34 @@ describe("ContinueWatchingRail", () => {
     expect(container.querySelector<HTMLAnchorElement>(".lux-continue-card")?.getAttribute("href")).toBe(
       "/watch/episode-1",
     );
+    expect(container.querySelector(".lux-continue-card .lux-rating")?.textContent).toBe("8.4");
+    expect(container.querySelector(".lux-continue-card .lux-rating-source")).toBeNull();
+    expect(container.querySelector(".lux-continue-card .lux-rating svg")).toBeNull();
     expect(container.querySelector(".lux-progress span")?.getAttribute("style")).toContain("width: 33%");
     expect(container.querySelector(".lux-continue-remaining")?.textContent).toBe("还剩 4m");
+  });
+
+  it("shows latest media ratings as numeric TMDb-blue pills", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaRail
+            title="最新电影"
+            items={[{ id: "movie-1", title: "示例电影", itemType: "MOVIE", rating: 7.6, ratingSource: "TMDb" }]}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const badge = container.querySelector(".lux-media-card .lux-rating");
+    expect(badge?.textContent).toBe("7.6");
+    expect(badge?.classList.contains("is-compact")).toBe(true);
+    expect(badge?.querySelector(".lux-rating-source")).toBeNull();
+    expect(badge?.querySelector("svg")).toBeNull();
   });
 
   it("hides the section when there are no resume items", () => {
