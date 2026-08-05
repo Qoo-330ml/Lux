@@ -169,7 +169,11 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .send()
         .await?;
     assert_eq!(web_seasons.status(), reqwest::StatusCode::OK);
-    assert_eq!(web_seasons.json::<Value>().await?["total"], 1);
+    let web_seasons_body = web_seasons.json::<Value>().await?;
+    assert_eq!(web_seasons_body["total"], 1);
+    assert_eq!(web_seasons_body["items"][0]["parentId"], series_id);
+    assert_eq!(web_seasons_body["items"][0]["seriesId"], series_id);
+    assert_eq!(web_seasons_body["items"][0]["parentIndexNumber"], 1);
     let web_episodes = client
         .get(format!(
             "{base_url}/api/v1/items/{series_id}/children?itemType=EPISODE&seasonId={season_id}"
@@ -181,6 +185,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     let web_episodes_body = web_episodes.json::<Value>().await?;
     assert_eq!(web_episodes_body["total"], 3);
     assert_eq!(web_episodes_body["items"][0]["id"], episode_id);
+    assert_eq!(web_episodes_body["items"][0]["parentId"], season_id);
+    assert_eq!(web_episodes_body["items"][0]["seriesId"], series_id);
+    assert_eq!(web_episodes_body["items"][0]["parentIndexNumber"], 1);
+    assert_eq!(web_episodes_body["items"][0]["indexNumber"], 1);
     assert_eq!(
         web_episodes_body["items"][0]["userData"]["isFavorite"],
         true

@@ -4910,6 +4910,10 @@ fn lux_catalog_item_json(item: &CatalogItem) -> Value {
         "sortTitle": item.sort_title,
         "originalTitle": item.original_title,
         "overview": item.overview,
+        "parentId": item.parent_id,
+        "seriesId": item.series_id,
+        "parentIndexNumber": item.season_number,
+        "indexNumber": item.episode_number,
         "productionYear": item.production_year,
         "runtimeTicks": item.runtime_ticks,
         "imageTags": {
