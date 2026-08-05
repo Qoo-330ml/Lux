@@ -99,6 +99,7 @@ describe("account settings", () => {
     expect(container.textContent).toContain("首页排版");
     expect(container.textContent).toContain("播放");
     expect(container.textContent).toContain("账户");
+    expect(container.querySelector("#appearance .lux-setting-divider")).toBeNull();
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
   });
 

@@ -154,7 +154,6 @@ export function AccountPage({ user }: { user: LuxUser }) {
                 </button>
               </div>
             </div>
-            <div className="lux-setting-divider" />
             <div className="lux-setting-row lux-accent-row">
               <div>
                 <strong>强调色</strong>
