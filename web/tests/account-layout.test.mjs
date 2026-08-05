@@ -21,7 +21,7 @@ test("account settings sections use separators instead of card chrome", () => {
   assert.match(sectionRule, /border:\s*0/);
   assert.match(sectionRule, /border-radius:\s*0/);
   assert.match(sectionRule, /background:\s*transparent/);
-  assert.match(accountStyles, /\.lux-account-settings-section\s*\+\s*\.lux-account-settings-section\s*\{[^}]*border-top:\s*1px\s+solid\s+var\(--lux-settings-line\)/);
+  assert.match(accountStyles, /\.lux-account-settings-section\s*\+\s*\.lux-account-settings-section\s*\{[^}]*margin-top:\s*28px[^}]*border-top:\s*1px\s+solid\s+var\(--lux-settings-line\)/);
   assert.doesNotMatch(accountStyles, /html\[data-lux-theme="light"\]\s+\.lux-account-settings-section/);
 });
 

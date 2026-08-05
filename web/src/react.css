@@ -907,7 +907,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-account-settings-nav a svg { color: var(--lux-subtle); }
 .lux-account-settings-content { display: grid; gap: 0; min-width: 0; }
 .lux-account-settings-section { overflow: visible; border: 0; border-radius: 0; background: transparent; }
-.lux-account-settings-section + .lux-account-settings-section { border-top: 1px solid var(--lux-settings-line); }
+.lux-account-settings-section + .lux-account-settings-section { margin-top: 28px; border-top: 1px solid var(--lux-settings-line); }
 .lux-account-settings-section-heading { display: flex; align-items: center; gap: 12px; padding: 20px 22px; border-bottom: 1px solid var(--lux-settings-line); }
 .lux-account-settings-section-heading h2 { margin: 5px 0 0; color: var(--lux-text); font-size: 1.15rem; letter-spacing: -.025em; }
 .lux-account-section-icon { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--lux-settings-line); border-radius: 9px; color: var(--lux-text); background: rgba(255,255,255,.06); }
