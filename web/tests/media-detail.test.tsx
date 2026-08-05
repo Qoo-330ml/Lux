@@ -229,7 +229,7 @@ describe("MediaDetailPage series hierarchy", () => {
     const watched = container.querySelector(".lux-detail-watched-status");
     expect(watched?.classList.contains("is-played")).toBe(true);
     expect(watched?.getAttribute("aria-label")).toBe("已看");
-    expect(container.querySelector(".lux-detail-poster .lux-rating")?.textContent).toContain("8.2");
+    expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
 
     const actionItems = [...(container.querySelector(".lux-hero-actions")?.children ?? [])];
     expect(actionItems[3]?.classList.contains("lux-media-actions")).toBe(true);

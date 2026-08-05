@@ -132,7 +132,6 @@ export function MediaDetailPage() {
               : poster
                 ? <img src={poster} alt={`${mediaTitle(media)} 海报`} />
                 : <span><Sparkles size={32} />{mediaTitle(media)}</span>}
-            {!isSeries ? <Rating value={media.rating} source={media.ratingSource} /> : null}
           </div>
           <div className="lux-detail-copy">
             <div className="lux-detail-title-row">
