@@ -71,8 +71,11 @@ export type MediaItem = {
   originalTitle?: string | null;
   overview?: string | null;
   itemType?: "MOVIE" | "SERIES" | "SEASON" | "EPISODE" | "BOX_SET" | string;
-  productionYear?: number | null;
   premiereDate?: string | null;
+  lastAirDate?: string | null;
+  status?: string | null;
+  originalLanguage?: string | null;
+  productionYear?: number | null;
   rating?: number | null;
   ratingSource?: string | null;
   runtimeTicks?: number | null;

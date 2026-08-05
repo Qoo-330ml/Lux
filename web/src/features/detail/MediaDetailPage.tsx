@@ -186,7 +186,15 @@ export function MediaDetailPage() {
           </div>
         </div>
         <MediaCast actors={media.actors ?? []} />
-        {source ? <MediaInfoPanel source={source} itemType={media.itemType} /> : null}
+        {source ? (
+          <MediaInfoPanel
+            source={source}
+            itemType={media.itemType}
+            lastAirDate={media.lastAirDate}
+            status={media.status}
+            originalLanguage={media.originalLanguage}
+          />
+        ) : null}
         {isSeries ? (
           <SeriesChildren
             seasons={seasons.data?.items ?? []}

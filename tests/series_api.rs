@@ -64,11 +64,15 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     .await?;
     sqlx::query(
         "UPDATE media_items
-         SET original_title = ?, premiere_date = ?, provider_ids_json = ?
+         SET original_title = ?, premiere_date = ?, last_air_date = ?, status = ?,
+             original_language = ?, provider_ids_json = ?
          WHERE id = ?",
     )
     .bind("Rick and Morty")
     .bind("2013-12-02")
+    .bind("2025-05-25")
+    .bind("Ended")
+    .bind("en")
     .bind(r#"{"tmdb":"60625"}"#)
     .bind(&series_id)
     .execute(database.pool())
@@ -181,6 +185,9 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     let web_series_body = web_series.json::<Value>().await?;
     assert_eq!(web_series_body["originalTitle"], "Rick and Morty");
     assert_eq!(web_series_body["premiereDate"], "2013-12-02");
+    assert_eq!(web_series_body["lastAirDate"], "2025-05-25");
+    assert_eq!(web_series_body["status"], "Ended");
+    assert_eq!(web_series_body["originalLanguage"], "en");
     assert_eq!(web_series_body["providerIds"]["tmdb"], "60625");
     assert_eq!(web_series_body["seasonCount"], 1);
     assert_eq!(web_series_body["episodeCount"], 3);

@@ -4011,7 +4011,8 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredCatalogDetail>, StorageError> {
         sqlx::query(
-            "SELECT mi.premiere_date, mi.provider_ids_json,
+            "SELECT mi.premiere_date, mi.last_air_date, mi.status, mi.original_language,
+                    mi.provider_ids_json,
                     (SELECT COUNT(*) FROM media_items child
                      WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
                        AND child.removed_at IS NULL) AS season_count,
@@ -4028,6 +4029,9 @@ impl Database {
         .map(|row| {
             row.map(|row| StoredCatalogDetail {
                 premiere_date: row.get("premiere_date"),
+                last_air_date: row.get("last_air_date"),
+                status: row.get("status"),
+                original_language: row.get("original_language"),
                 provider_ids_json: row.get("provider_ids_json"),
                 season_count: row.get("season_count"),
                 episode_count: row.get("episode_count"),
@@ -5484,6 +5488,9 @@ pub(crate) struct StoredCatalogRow {
 #[derive(Debug)]
 pub(crate) struct StoredCatalogDetail {
     pub(crate) premiere_date: Option<String>,
+    pub(crate) last_air_date: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) original_language: Option<String>,
     pub(crate) provider_ids_json: Option<String>,
     pub(crate) season_count: i64,
     pub(crate) episode_count: i64,

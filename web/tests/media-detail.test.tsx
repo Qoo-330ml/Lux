@@ -83,12 +83,15 @@ describe("MediaDetailPage series hierarchy", () => {
       originalTitle: "Rick and Morty",
       itemType: "SERIES",
       premiereDate: "2013-12-02",
+      lastAirDate: "2025-05-25",
+      status: "Ended",
+      originalLanguage: "en",
       rating: 8.68,
       ratingSource: "TMDb",
       providerIds: { tmdb: "60625" },
       seasonCount: 7,
       episodeCount: 91,
-      mediaSources: [],
+      mediaSources: [{ id: "source-1", sourceKind: "LOCAL_FILE", isDefault: true }],
     });
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "children").mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 60 });
@@ -123,6 +126,10 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("91 集");
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("TMDb 60625");
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("评分 8.7");
+    expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
+    expect(container.querySelector(".lux-media-info-extra")?.textContent).toContain("最后播出2025-05-25");
+    expect(container.querySelector(".lux-media-info-extra")?.textContent).toContain("状态Ended");
+    expect(container.querySelector(".lux-media-info-extra")?.textContent).toContain("原始语言英语");
     expect(container.querySelector(".lux-season-rail")).not.toBeNull();
   });
 

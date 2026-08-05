@@ -2,6 +2,7 @@ import type { MediaSource, MediaStream } from "../../lib/api/types";
 import { mediaTypeLabel, runtimeLabel } from "../home/media";
 
 const LANGUAGE_NAMES: Record<string, string> = {
+  en: "英语",
   chi: "中文",
   zho: "中文",
   eng: "英语",
@@ -13,7 +14,19 @@ const LANGUAGE_NAMES: Record<string, string> = {
   und: "未知语言",
 };
 
-export function MediaInfoPanel({ source, itemType }: { source: MediaSource; itemType?: string | null }) {
+export function MediaInfoPanel({
+  source,
+  itemType,
+  lastAirDate,
+  status,
+  originalLanguage,
+}: {
+  source: MediaSource;
+  itemType?: string | null;
+  lastAirDate?: string | null;
+  status?: string | null;
+  originalLanguage?: string | null;
+}) {
   const streams = source.streams ?? [];
   const streamGroups = ["VIDEO", "AUDIO", "SUBTITLE"]
     .map((type) => ({ type, streams: streams.filter((stream) => stream.type?.toUpperCase() === type) }))
@@ -25,6 +38,9 @@ export function MediaInfoPanel({ source, itemType }: { source: MediaSource; item
         <h2>其它信息</h2>
         <div className="lux-media-info-extra-list">
           <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
+          <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
+          <InfoRow label="状态" value={status ?? undefined} />
+          <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} />
           <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} />
           <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
         </div>

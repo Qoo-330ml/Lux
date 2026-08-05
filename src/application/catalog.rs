@@ -365,7 +365,10 @@ impl CatalogService {
         };
         if let Some(detail) = self.database.find_catalog_detail(item_id).await? {
             item.premiere_date = detail.premiere_date;
-            item.provider_ids = detail.provider_ids;
+            item.last_air_date = detail.last_air_date;
+            item.status = detail.status;
+            item.original_language = detail.original_language;
+            item.provider_ids = provider_ids_from_json(detail.provider_ids_json.as_deref());
             if item.item_type == "SERIES" {
                 item.season_count = Some(detail.season_count);
                 item.episode_count = Some(detail.episode_count);
@@ -498,6 +501,9 @@ pub struct CatalogItem {
     pub episode_number: Option<i64>,
     pub title: String,
     pub sort_title: String,
+    pub last_air_date: Option<String>,
+    pub status: Option<String>,
+    pub original_language: Option<String>,
     pub original_title: Option<String>,
     pub overview: Option<String>,
     pub premiere_date: Option<String>,
@@ -557,6 +563,9 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     parent_id: row.parent_id.clone(),
                     series_id: row.series_id.clone(),
                     season_number: row.season_number,
+                    last_air_date: None,
+                    status: None,
+                    original_language: None,
                     episode_number: row.episode_number,
                     title: row.title.clone(),
                     sort_title: row.sort_title.clone(),
@@ -633,6 +642,25 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
         let _ = stream_id;
     }
     items
+}
+
+fn provider_ids_from_json(raw: Option<&str>) -> BTreeMap<String, String> {
+    raw.and_then(|value| {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value).ok()
+    })
+    .map(|object| {
+        object
+            .into_iter()
+            .filter_map(|(name, value)| {
+                let id = value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| value.as_i64().map(|value| value.to_string()))?;
+                (!name.trim().is_empty() && !id.trim().is_empty()).then_some((name, id))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 #[derive(Debug)]
