@@ -38,6 +38,14 @@
   text-align: center;
 }
 
+.lux-admin-plugin-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.lux-admin-plugin-grid > .lux-admin-empty {
+  grid-column: 1 / -1;
+}
+
 .lux-admin-plugin-card {
   display: grid;
   grid-template-columns: 48px minmax(0, 1fr) auto;
@@ -258,6 +266,12 @@
   justify-content: flex-end;
   gap: 9px;
   margin-top: 5px;
+}
+
+@media (max-width: 760px) {
+  .lux-admin-plugin-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 640px) {
