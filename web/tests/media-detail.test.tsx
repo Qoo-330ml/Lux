@@ -202,8 +202,20 @@ describe("MediaDetailPage series hierarchy", () => {
       title: "第一集",
       itemType: "EPISODE",
       mediaSources: [
-        { id: "source-sdr", qualityLabel: "1080p SDR", container: "mkv", isDefault: true },
-        { id: "source-hdr", qualityLabel: "2160p HDR", container: "mkv", isDefault: false },
+        {
+          id: "source-sdr",
+          qualityLabel: "1080p",
+          container: "mkv",
+          isDefault: true,
+          streams: [{ index: 0, type: "VIDEO", codec: "h264", details: { VideoRangeType: "SDR", BitDepth: 8 } }],
+        },
+        {
+          id: "source-hdr",
+          qualityLabel: "2160p",
+          container: "mkv",
+          isDefault: false,
+          streams: [{ index: 0, type: "VIDEO", codec: "hevc", details: { VideoRangeType: "HDR10", BitDepth: 10 } }],
+        },
       ],
     });
     vi.spyOn(api, "playback").mockResolvedValue({});
@@ -229,18 +241,18 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     const sourceSelect = container.querySelector<HTMLButtonElement>(".lux-source-selector [role=\"combobox\"]");
-    expect(sourceSelect?.textContent).toContain("1080p SDR");
+    expect(sourceSelect?.textContent).toContain("1080p · H.264 · SDR · 8-bit");
     expect(sourceSelect?.getAttribute("aria-expanded")).toBe("false");
 
     await act(async () => sourceSelect?.click());
 
     expect(sourceSelect?.getAttribute("aria-expanded")).toBe("true");
     const hdrOption = [...document.querySelectorAll<HTMLButtonElement>("[role=\"option\"]")]
-      .find((button) => button.textContent?.includes("2160p HDR"));
+      .find((button) => button.textContent?.includes("2160p · HEVC · HDR10 · 10-bit"));
     expect(hdrOption).toBeDefined();
     await act(async () => hdrOption?.click());
 
-    expect(sourceSelect?.textContent).toContain("2160p HDR");
+    expect(sourceSelect?.textContent).toContain("2160p · HEVC · HDR10 · 10-bit");
     expect(sourceSelect?.getAttribute("aria-expanded")).toBe("false");
     expect(container.querySelector<HTMLAnchorElement>("a.lux-button-primary")?.getAttribute("href"))
       .toBe("/watch/episode-1?sourceId=source-hdr");
