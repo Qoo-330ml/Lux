@@ -63,6 +63,17 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     .fetch_one(database.pool())
     .await?;
     sqlx::query(
+        "UPDATE media_items
+         SET original_title = ?, premiere_date = ?, provider_ids_json = ?
+         WHERE id = ?",
+    )
+    .bind("Rick and Morty")
+    .bind("2013-12-02")
+    .bind(r#"{"tmdb":"60625"}"#)
+    .bind(&series_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
         "INSERT INTO user_item_state
          (user_id, item_id, position_ticks, is_played, is_favorite, play_count, last_played_at)
          VALUES (?, ?, 12345, 0, 1, 2, 200)",
@@ -161,6 +172,18 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .await?;
     assert_eq!(web_login.status(), reqwest::StatusCode::OK);
     let web_cookie = cookie_pair(web_login.headers());
+    let web_series = client
+        .get(format!("{base_url}/api/v1/items/{series_id}"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(web_series.status(), reqwest::StatusCode::OK);
+    let web_series_body = web_series.json::<Value>().await?;
+    assert_eq!(web_series_body["originalTitle"], "Rick and Morty");
+    assert_eq!(web_series_body["premiereDate"], "2013-12-02");
+    assert_eq!(web_series_body["providerIds"]["tmdb"], "60625");
+    assert_eq!(web_series_body["seasonCount"], 1);
+    assert_eq!(web_series_body["episodeCount"], 3);
     let web_seasons = client
         .get(format!(
             "{base_url}/api/v1/items/{series_id}/children?itemType=SEASON"

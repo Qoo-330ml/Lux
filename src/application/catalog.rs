@@ -360,7 +360,18 @@ impl CatalogService {
             return Ok(None);
         }
         let rows = self.database.find_catalog_rows(item_id).await?;
-        Ok(assemble_items(rows).into_iter().next())
+        let Some(mut item) = assemble_items(rows).into_iter().next() else {
+            return Ok(None);
+        };
+        if let Some(detail) = self.database.find_catalog_detail(item_id).await? {
+            item.premiere_date = detail.premiere_date;
+            item.provider_ids = detail.provider_ids;
+            if item.item_type == "SERIES" {
+                item.season_count = Some(detail.season_count);
+                item.episode_count = Some(detail.episode_count);
+            }
+        }
+        Ok(Some(item))
     }
 
     pub async fn list_all_items(
@@ -489,6 +500,10 @@ pub struct CatalogItem {
     pub sort_title: String,
     pub original_title: Option<String>,
     pub overview: Option<String>,
+    pub premiere_date: Option<String>,
+    pub provider_ids: BTreeMap<String, String>,
+    pub season_count: Option<i64>,
+    pub episode_count: Option<i64>,
     pub production_year: Option<i64>,
     pub runtime_ticks: Option<i64>,
     pub poster_image_tag: Option<String>,
@@ -547,6 +562,10 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     sort_title: row.sort_title.clone(),
                     original_title: row.original_title.clone(),
                     overview: row.overview.clone(),
+                    premiere_date: None,
+                    provider_ids: BTreeMap::new(),
+                    season_count: None,
+                    episode_count: None,
                     production_year: row.production_year,
                     runtime_ticks: row.runtime_ticks,
                     poster_image_tag: row.poster_image_tag.clone(),

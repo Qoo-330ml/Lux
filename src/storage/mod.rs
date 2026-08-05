@@ -4006,6 +4006,39 @@ impl Database {
         .await
     }
 
+    pub(crate) async fn find_catalog_detail(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredCatalogDetail>, StorageError> {
+        sqlx::query(
+            "SELECT mi.premiere_date, mi.provider_ids_json,
+                    (SELECT COUNT(*) FROM media_items child
+                     WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
+                       AND child.removed_at IS NULL) AS season_count,
+                    (SELECT COUNT(*) FROM media_items child
+                     WHERE child.series_id = mi.id AND child.item_type = 'EPISODE'
+                       AND child.removed_at IS NULL) AS episode_count
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.id = ? AND mi.removed_at IS NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredCatalogDetail {
+                premiere_date: row.get("premiere_date"),
+                provider_ids_json: row.get("provider_ids_json"),
+                season_count: row.get("season_count"),
+                episode_count: row.get("episode_count"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     async fn fetch_catalog_rows(
         &self,
         query: &str,
@@ -5446,6 +5479,14 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) stream_is_external: Option<bool>,
     pub(crate) stream_is_default: Option<bool>,
     pub(crate) stream_is_forced: Option<bool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredCatalogDetail {
+    pub(crate) premiere_date: Option<String>,
+    pub(crate) provider_ids_json: Option<String>,
+    pub(crate) season_count: i64,
+    pub(crate) episode_count: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
