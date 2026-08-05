@@ -51,7 +51,7 @@ const configuredScraper: AdminPlugin = {
 };
 
 const mediaProbePlugin: AdminPlugin = {
-  id: "org.lux.media-info",
+  id: "org.lux.strm-media-info",
   name: "strm媒体信息提取",
   description: "使用 ffprobe 提取 STRM 外部媒体的技术信息。",
   category: "MEDIA",

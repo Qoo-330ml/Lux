@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${MEDIA_INFO_PLUGIN_VERSION:-0.0.2}"
+VERSION="${STRM_MEDIA_INFO_PLUGIN_VERSION:-${MEDIA_INFO_PLUGIN_VERSION:-2.0.0}}"
 
 case "$(uname -s)" in
   Darwin) PLATFORM="darwin" ;;
@@ -18,14 +18,14 @@ case "$(uname -m)" in
 esac
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
-cargo build --locked --release --bin lux-plugin-media-info
+cargo build --locked --release --bin lux-plugin-strm-media-info
 
-OUTPUT="${1:-$ROOT_DIR/dist/org.lux.media-info-${VERSION}.zip}"
+OUTPUT="${1:-$ROOT_DIR/dist/org.lux.strm-media-info-${VERSION}.zip}"
 mkdir -p "$(dirname "$OUTPUT")"
 
 cargo run --locked --bin lux-plugin-pack -- \
-  --plugin media-info \
-  --binary "$TARGET_DIR/release/lux-plugin-media-info" \
+  --plugin strm-media-info \
+  --binary "$TARGET_DIR/release/lux-plugin-strm-media-info" \
   --output "$OUTPUT" \
   --version "$VERSION" \
   --platform "$PLATFORM" \

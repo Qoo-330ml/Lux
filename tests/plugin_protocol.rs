@@ -64,14 +64,14 @@ fn accepts_a_versioned_process_plugin_manifest_without_a_signature() {
 fn accepts_a_media_probe_plugin_manifest() {
     let manifest = PluginManifest::from_value(json!({
         "formatVersion": PLUGIN_FORMAT_VERSION,
-        "id": "org.lux.media-info",
+        "id": "org.lux.strm-media-info",
         "name": "Media information probe",
         "description": "Probes STRM media sources with ffprobe",
         "version": "1.0.0",
         "apiVersion": PLUGIN_API_VERSION,
         "runtime": {
             "kind": "process",
-            "entrypoint": "binaries/${platform}-${arch}/lux-plugin-media-info"
+            "entrypoint": "binaries/${platform}-${arch}/lux-plugin-strm-media-info"
         },
         "type": "media_probe",
         "category": "MEDIA",

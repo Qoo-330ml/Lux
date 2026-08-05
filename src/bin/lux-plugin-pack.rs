@@ -37,8 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let binary_name = match (arguments.plugin, arguments.platform.as_str()) {
         (PluginKind::Tmdb, "windows") => "lux-plugin-tmdb.exe",
         (PluginKind::Tmdb, _) => "lux-plugin-tmdb",
-        (PluginKind::MediaInfo, "windows") => "lux-plugin-media-info.exe",
-        (PluginKind::MediaInfo, _) => "lux-plugin-media-info",
+        (PluginKind::MediaInfo, "windows") => "lux-plugin-strm-media-info.exe",
+        (PluginKind::MediaInfo, _) => "lux-plugin-strm-media-info",
     };
     let relative_binary = format!(
         "binaries/{}-{}/{}",
@@ -71,7 +71,7 @@ impl Arguments {
                     .as_str()
                 {
                     "tmdb" => PluginKind::Tmdb,
-                    "media-info" => PluginKind::MediaInfo,
+                    "strm-media-info" | "media-info" => PluginKind::MediaInfo,
                     value => return Err(format!("unsupported plugin: {value}").into()),
                 };
                 continue;
@@ -107,7 +107,7 @@ fn required(value: Option<String>, name: &str) -> Result<String, Box<dyn std::er
 }
 
 fn usage() -> &'static str {
-    "usage: lux-plugin-pack [--plugin tmdb|media-info] --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME"
+    "usage: lux-plugin-pack [--plugin tmdb|strm-media-info] --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME"
 }
 
 fn manifest_value(
@@ -198,7 +198,7 @@ fn manifest_value(
         }),
         PluginKind::MediaInfo => json!({
             "formatVersion": 1,
-            "id": "org.lux.media-info",
+            "id": "org.lux.strm-media-info",
             "name": "strm媒体信息提取",
             "description": "使用 ffprobe 提取 STRM 外部媒体的技术信息。",
             "version": version,

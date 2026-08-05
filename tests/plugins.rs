@@ -411,14 +411,14 @@ async fn admin_cannot_select_a_media_probe_plugin_as_a_library_scraper()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
-    let plugin_dir = config_dir.join("plugins/org.lux.media-info");
+    let plugin_dir = config_dir.join("plugins/org.lux.strm-media-info");
     fs::create_dir_all(plugin_dir.join("binaries"))?;
     fs::write(plugin_dir.join("binaries/plugin"), b"plugin")?;
     fs::write(
         plugin_dir.join("manifest.json"),
         serde_json::to_vec(&json!({
             "formatVersion": 1,
-            "id": "org.lux.media-info",
+            "id": "org.lux.strm-media-info",
             "name": "strm媒体信息提取",
             "version": "1.0.0",
             "apiVersion": 1,
@@ -440,7 +440,7 @@ async fn admin_cannot_select_a_media_probe_plugin_as_a_library_scraper()
 
     let installed = client
         .post(format!(
-            "{base_url}/api/v1/admin/plugins/org.lux.media-info/install"
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/install"
         ))
         .header(COOKIE, &cookies)
         .header("x-csrf-token", &csrf)
@@ -455,7 +455,7 @@ async fn admin_cannot_select_a_media_probe_plugin_as_a_library_scraper()
         .json(&json!({
             "name": "STRM",
             "kind": "MOVIE",
-            "scraperId": "org.lux.media-info"
+            "scraperId": "org.lux.strm-media-info"
         }))
         .send()
         .await?;

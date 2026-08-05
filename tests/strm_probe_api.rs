@@ -15,14 +15,14 @@ use tokio::net::TcpListener;
 async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
-    let plugin_root = config_dir.join("plugins/org.lux.media-info");
+    let plugin_root = config_dir.join("plugins/org.lux.strm-media-info");
     tokio::fs::create_dir_all(plugin_root.join("binaries")).await?;
     fs::write(plugin_root.join("binaries/plugin"), b"placeholder")?;
     tokio::fs::write(
         plugin_root.join("manifest.json"),
         serde_json::to_vec_pretty(&json!({
             "formatVersion": 1,
-            "id": "org.lux.media-info",
+            "id": "org.lux.strm-media-info",
             "name": "strm媒体信息提取",
             "version": "1.0.0",
             "apiVersion": 1,
@@ -88,7 +88,7 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
 
     let installed = client
         .post(format!(
-            "{base_url}/api/v1/admin/plugins/org.lux.media-info/install"
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/install"
         ))
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)
@@ -98,7 +98,7 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
 
     let invalid = client
         .put(format!(
-            "{base_url}/api/v1/admin/plugins/org.lux.media-info/config"
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/config"
         ))
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)
@@ -109,7 +109,7 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
 
     let configured = client
         .put(format!(
-            "{base_url}/api/v1/admin/plugins/org.lux.media-info/config"
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/config"
         ))
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)

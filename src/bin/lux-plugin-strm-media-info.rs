@@ -16,7 +16,7 @@ use tokio::{
     time::timeout,
 };
 
-const PLUGIN_ID: &str = "org.lux.media-info";
+const PLUGIN_ID: &str = "org.lux.strm-media-info";
 const PLUGIN_NAME: &str = "strm媒体信息提取";
 const FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;

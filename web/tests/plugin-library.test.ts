@@ -249,7 +249,7 @@ describe("AdminPluginsPage plugin cards", () => {
   it("renders media-info settings and runs with the saved plugin configuration", async () => {
     currentPlugin = {
       ...configuredPlugin,
-      id: "org.lux.media-info",
+      id: "org.lux.strm-media-info",
       name: "strm媒体信息提取",
       category: "MEDIA",
       configSource: "PLUGIN_CONFIG",
@@ -283,7 +283,7 @@ describe("AdminPluginsPage plugin cards", () => {
     await act(async () => {
       dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
     });
-    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.media-info", expect.objectContaining({
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.strm-media-info", expect.objectContaining({
       libraryIds: ["library-1"],
       concurrency: 2,
       existingInfoPolicy: "SKIP",
@@ -292,7 +292,7 @@ describe("AdminPluginsPage plugin cards", () => {
     await act(async () => {
       container.querySelector<HTMLButtonElement>('[aria-label="开始提取"]')?.click();
     });
-    expect(api.runAdminPlugin).toHaveBeenCalledWith("org.lux.media-info");
+    expect(api.runAdminPlugin).toHaveBeenCalledWith("org.lux.strm-media-info");
   });
 
   it("does not show configuration action for plugins without configuration", async () => {

@@ -10,7 +10,7 @@
 
 可以改写，采用“外部进程插件 + Lux 宿主任务”的拆分：
 
-1. `org.lux.media-info` 是遵循 Lux Plugin SDK v1 的独立 `media_probe` 进程，负责调用 `ffprobe` 并返回受限结果。
+1. `org.lux.strm-media-info` 是遵循 Lux Plugin SDK v1 的独立 `media_probe` 进程，负责调用 `ffprobe` 并返回受限结果。
 2. Lux 核心负责媒体库选择、任务生命周期、URL 安全、并发、结果落库和 `*-mediainfo.json` 写回。
 
 MediaInfoKeeper 的核心流程不是单纯的元数据转换，而是：选择媒体库、遍历媒体项、读取 `.strm` 指向的外部地址、调度并发 `ffprobe`、保存探测结果，并在需要时写入旁车文件。这些操作都属于 Lux 核心服务负责的资源边界。当前插件 SDK 的插件不能直接访问 Lux 数据库、媒体库根目录或内部任务对象，因此不适合直接承载这一流程。
@@ -34,7 +34,7 @@ MediaInfoKeeper 的核心流程不是单纯的元数据转换，而是：选择�
 - 已存在的旁车文件或 NFO 可以提供技术信息。
 - 本地媒体仍由现有 Lux `MediaProbeService` 使用 `ffprobe` 探测。
 
-管理员创建 STRM 探测任务后，Lux 才会按本说明调用 `org.lux.media-info`。
+管理员创建 STRM 探测任务后，Lux 才会按本说明调用 `org.lux.strm-media-info`。
 
 ## 3. MediaInfoKeeper 功能到 Lux 的映射
 
@@ -195,12 +195,12 @@ MediaInfoKeeper 的行为是探测后写入旁车文件；Lux 建议把这个行
 当前管理员操作端点为：
 
 ```text
-PUT  /api/v1/admin/plugins/org.lux.media-info/config
-POST /api/v1/admin/plugins/org.lux.media-info/run
+PUT  /api/v1/admin/plugins/org.lux.strm-media-info/config
+POST /api/v1/admin/plugins/org.lux.strm-media-info/run
 POST /api/v1/admin/strm-probe-jobs
 ```
 
-插件配置由 `org.lux.media-info` manifest 声明，包括动态媒体库多选、并发数、是否重探测已有结果和是否写旁车。Lux 管理页解析配置 schema，动态填充媒体库选项并保存配置；`run` 和兼容的 STRM 任务入口只读取已保存配置，不接受宿主覆盖参数。响应使用 `202 Accepted`，返回任务 ID 或按媒体库拆分的任务 ID；不返回 URL。任务使用独立 `strm_probe_jobs` 表，提供分页列表、详情、取消和重试接口；列表仍设置服务端分页上限。
+插件配置由 `org.lux.strm-media-info` manifest 声明，包括动态媒体库多选、并发数、已有媒体信息处理方式和是否写旁车。Lux 管理页解析配置 schema，动态填充媒体库选项并保存配置；`run` 和兼容的 STRM 任务入口只读取已保存配置，不接受宿主覆盖参数。响应使用 `202 Accepted`，返回任务 ID 或按媒体库拆分的任务 ID；不返回 URL。任务使用独立 `strm_probe_jobs` 表，提供分页列表、详情、取消和重试接口；列表仍设置服务端分页上限。
 
 建议在管理界面展示：
 
@@ -292,7 +292,7 @@ RPC          = media.probe
 - `src/application/probe.rs`：旁车导入、结果映射和兼容旁车写入。
 - `src/application/strm_probe.rs`：STRM 任务、并发、取消、恢复和插件结果持久化。
 - `src/application/strm_probe_policy.rs`：远程 URL 协议和 SSRF 基础策略。
-- `src/bin/lux-plugin-media-info.rs`：独立 `ffprobe` 插件进程。
+- `src/bin/lux-plugin-strm-media-info.rs`：独立 `ffprobe` 插件进程。
 - `src/application/plugin_protocol.rs`、`src/application/plugin_runtime.rs`：媒体插件 manifest、RPC DTO 和隔离调用。
 - `src/application/scanner.rs`：扫描完成后的后台探测衔接。
 - `src/api/mod.rs`：管理 API 和任务服务注入。

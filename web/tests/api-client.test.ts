@@ -455,9 +455,9 @@ describe("LuxApiClient", () => {
           existingInfoPolicy: "SKIP",
           writeSidecars: true,
         });
-        return new Response(JSON.stringify({ plugin: { id: "org.lux.media-info" } }), { status: 200 });
+        return new Response(JSON.stringify({ plugin: { id: "org.lux.strm-media-info" } }), { status: 200 });
       }
-      expect(path).toBe("/api/v1/admin/plugins/org.lux.media-info/run");
+      expect(path).toBe("/api/v1/admin/plugins/org.lux.strm-media-info/run");
       expect(init?.method).toBe("POST");
       return new Response(JSON.stringify({ operationId: "operation-1", jobs: [] }), { status: 202 });
     });
@@ -467,13 +467,13 @@ describe("LuxApiClient", () => {
     });
 
     const client = new LuxApiClient();
-    await expect(client.updateAdminPluginConfig("org.lux.media-info", {
+    await expect(client.updateAdminPluginConfig("org.lux.strm-media-info", {
       libraryIds: ["library-1"],
       concurrency: 3,
       existingInfoPolicy: "SKIP",
       writeSidecars: true,
-    })).resolves.toEqual({ plugin: { id: "org.lux.media-info" } });
-    await expect(client.runAdminPlugin("org.lux.media-info")).resolves.toEqual({
+    })).resolves.toEqual({ plugin: { id: "org.lux.strm-media-info" } });
+    await expect(client.runAdminPlugin("org.lux.strm-media-info")).resolves.toEqual({
       operationId: "operation-1",
       jobs: [],
     });

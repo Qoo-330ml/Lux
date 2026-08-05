@@ -104,8 +104,8 @@ fn packages_an_unsigned_tmdb_zip_without_a_signing_key() -> Result<(), Box<dyn s
 fn packages_a_media_info_zip_with_the_media_probe_manifest()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempdir()?;
-    let binary = root.path().join("lux-plugin-media-info");
-    let archive = root.path().join("org.lux.media-info-1.0.0.zip");
+    let binary = root.path().join("lux-plugin-strm-media-info");
+    let archive = root.path().join("org.lux.strm-media-info-1.0.0.zip");
     fs::write(&binary, b"standalone media info plugin binary")?;
 
     let packer = std::env::var("CARGO_BIN_EXE_lux-plugin-pack")
@@ -114,7 +114,7 @@ fn packages_a_media_info_zip_with_the_media_probe_manifest()
         .env_remove("LUX_PLUGIN_SIGNING_KEY_HEX")
         .args([
             "--plugin",
-            "media-info",
+            "strm-media-info",
             "--binary",
             binary.to_str().ok_or("binary path is not UTF-8")?,
             "--output",
@@ -133,7 +133,7 @@ fn packages_a_media_info_zip_with_the_media_probe_manifest()
     assert!(catalog.failures.is_empty());
     assert_eq!(catalog.plugins.len(), 1);
     let manifest = &catalog.plugins[0].manifest;
-    assert_eq!(manifest.id, "org.lux.media-info");
+    assert_eq!(manifest.id, "org.lux.strm-media-info");
     assert_eq!(manifest.name, "strm媒体信息提取");
     assert_eq!(manifest.plugin_type, "media_probe");
     assert_eq!(manifest.category, "MEDIA");

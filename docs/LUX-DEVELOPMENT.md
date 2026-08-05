@@ -109,7 +109,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - .strm 文件的第一个非空文本内容被视为外部播放地址。
-- .strm 地址在播放路径中直接交给客户端，不校验、不探测、不做代理、不访问 AList API；独立的管理员 STRM 探测任务可以在 URL 安全策略通过后将地址交给 `org.lux.media-info` 插件。
+- .strm 地址在播放路径中直接交给客户端，不校验、不探测、不做代理、不访问 AList API；独立的管理员 STRM 探测任务可以在 URL 安全策略通过后将地址交给 `org.lux.strm-media-info` 插件。
 - Lux 不负责保护 .strm URL 中可能包含的令牌；管理员应理解该 URL 会暴露给有播放权限的客户端。
 
 ### 3.3 播放
@@ -292,7 +292,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - Lux 提供安全的插件注册表；插件以标准 `.zip` 插件包放入 `/config/plugins`，服务重启时扫描并加载。插件代码运行在受监督的独立进程中，不直接注入 Lux Rust 主进程。
 - 首个独立插件为 `org.lux.tmdb`。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
-- SDK v1 同时支持 `media_probe` 插件类型。`org.lux.media-info` 只接收 Lux 宿主按单个任务提交的已校验 URL，调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
+- SDK v1 同时支持 `media_probe` 插件类型。`org.lux.strm-media-info` 只接收 Lux 宿主按单个任务提交的已校验 URL，调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
 - 只有已安装、已启用且有可用凭据的插件才能被媒体库选择。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用服务端内置的默认 API Key；任何凭据都不返回 API 或写入日志。
 - 媒体库的 `scraperId` 为空表示不进行在线刮削、只使用本地元数据；插件安装状态与媒体库选择均持久化，服务重启后保持不变。
 - 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
@@ -1740,7 +1740,7 @@ services:
 | LUX-142 | src/application/plugin_runtime.rs、src/application/plugin_protocol.rs、src/storage/、src/api/、migrations/、plugins/、docs/、tests/ |
 | LUX-144 | src/application/settings.rs、src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、src/bin/lux-plugin-tmdb.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-145 | src/application/thumbnails.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、tests/thumbnails.rs、docs/ |
-| LUX-146 | src/application/plugin_protocol.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/application/strm_probe.rs、src/application/strm_probe_policy.rs、src/application/probe.rs、src/storage/、src/api/mod.rs、src/bin/lux-plugin-media-info.rs、src/bin/lux-plugin-pack.rs、migrations/、scripts/、tests/、docs/ |
+| LUX-146 | src/application/plugin_protocol.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/application/strm_probe.rs、src/application/strm_probe_policy.rs、src/application/probe.rs、src/storage/、src/api/mod.rs、src/bin/lux-plugin-strm-media-info.rs、src/bin/lux-plugin-pack.rs、migrations/、scripts/、tests/、docs/ |
 | LUX-150 | src/application/danmaku.rs、src/storage/、src/api/mod.rs、migrations/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
@@ -2995,16 +2995,19 @@ services:
 #### LUX-146：STRM 远程媒体信息插件
 
 范围：将 MediaInfoKeeper 的 `.strm` 远程媒体信息提取能力改写为 Lux Plugin SDK v1 的独立
-`media_probe` 插件和 Lux 宿主后台任务。插件 ID 固定为 `org.lux.media-info`，能力为
+`media_probe` 插件和 Lux 宿主后台任务。插件 ID 固定为 `org.lux.strm-media-info`，能力为
 `media.probe`；插件只负责接收单个已校验 URL、调用 `ffprobe` 并返回受限的 format/stream
 结果。媒体库选择、任务、并发、URL 安全、数据库写入和兼容旁车写回均由 Lux 宿主负责。
+
+旧版本的 `org.lux.media-info` 作为迁移别名处理：已有插件配置会迁移到新的插件配置路径，
+新的 API、manifest 和插件进程只使用 `org.lux.strm-media-info`。
 
 插件 manifest 声明 `libraryIds`、`concurrency`、`existingInfoPolicy` 和 `writeSidecars` 配置项；
 其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
 （覆盖已有媒体信息）。读取旧版本配置时，`includeReady: false` 迁移为 `SKIP`，
 `includeReady: true` 迁移为 `OVERWRITE`。
 Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理员通过
-`POST /api/v1/admin/plugins/org.lux.media-info/run` 或兼容的
+`POST /api/v1/admin/plugins/org.lux.strm-media-info/run` 或兼容的
 `POST /api/v1/admin/strm-probe-jobs` 按已保存配置启动任务，不从请求体接收宿主覆盖参数。服务为每个选定媒体库建立持久化任务，使用全局操作信号量
 和媒体库 `probeConcurrency` 的较小值限制并发；任务支持分页列表、详情、取消、重试，并在服务
 重启后恢复 PENDING/RUNNING 状态。探测结果保存到 `media_sources`/`media_streams`，旁车写回

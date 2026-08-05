@@ -18,7 +18,7 @@ async fn strm_probe_plugin_persists_media_info_and_compatible_sidecar()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
-    let plugin_dir = config_dir.join("plugins/org.lux.media-info");
+    let plugin_dir = config_dir.join("plugins/org.lux.strm-media-info");
     let binary_dir = plugin_dir.join("binaries");
     tokio::fs::create_dir_all(&binary_dir).await?;
 
@@ -31,9 +31,9 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     )?;
     make_executable(&fake_ffprobe)?;
 
-    let plugin_binary = std::env::var_os("CARGO_BIN_EXE_lux-plugin-media-info")
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_lux_plugin_media_info"))
-        .ok_or("media-info plugin binary path is missing")?;
+    let plugin_binary = std::env::var_os("CARGO_BIN_EXE_lux-plugin-strm-media-info")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_lux_plugin_strm_media_info"))
+        .ok_or("strm-media-info plugin binary path is missing")?;
     let wrapper = binary_dir.join("plugin");
     fs::write(
         &wrapper,

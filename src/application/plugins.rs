@@ -30,7 +30,8 @@ use crate::{
 
 pub const TMDB_PLUGIN_ID: &str = "tmdb";
 pub const TMDB_DYNAMIC_PLUGIN_ID: &str = "org.lux.tmdb";
-pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.media-info";
+pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.strm-media-info";
+pub const MEDIA_INFO_LEGACY_PLUGIN_ID: &str = "org.lux.media-info";
 const TMDB_PLUGIN_NAME: &str = "TMDb 元数据插件";
 const TMDB_PLUGIN_DESCRIPTION: &str = "使用 TMDb 补全电影和剧集元数据、海报与背景图。";
 const TMDB_PLUGIN_VERSION: &str = "1.0.0";
@@ -248,10 +249,11 @@ impl PluginService {
     }
 
     pub async fn install(&self, plugin_id: &str) -> Result<PluginInstall, PluginServiceError> {
-        self.ensure_known_plugin(plugin_id)?;
-        let was_installed = self.database.is_plugin_installed(plugin_id).await?;
-        self.database.install_plugin(plugin_id).await?;
-        let plugin = self.view_for_id(plugin_id, true).await?;
+        let plugin_id = self.canonical_plugin_id(plugin_id);
+        self.ensure_known_plugin(&plugin_id)?;
+        let was_installed = self.database.is_plugin_installed(&plugin_id).await?;
+        self.database.install_plugin(&plugin_id).await?;
+        let plugin = self.view_for_id(&plugin_id, true).await?;
         Ok(PluginInstall {
             plugin,
             was_installed,
@@ -322,13 +324,14 @@ impl PluginService {
         let Some(scraper_id) = scraper_id.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(());
         };
-        self.ensure_known_plugin(scraper_id)?;
-        if !self.database.is_plugin_installed(scraper_id).await? {
-            return Err(PluginServiceError::Unavailable(scraper_id.to_owned()));
+        let scraper_id = self.canonical_plugin_id(scraper_id);
+        self.ensure_known_plugin(&scraper_id)?;
+        if !self.database.is_plugin_installed(&scraper_id).await? {
+            return Err(PluginServiceError::Unavailable(scraper_id));
         }
-        let view = self.view_for_id(scraper_id, true).await?;
+        let view = self.view_for_id(&scraper_id, true).await?;
         if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
-            return Err(PluginServiceError::Unavailable(scraper_id.to_owned()));
+            return Err(PluginServiceError::Unavailable(scraper_id));
         }
         Ok(())
     }
@@ -464,15 +467,35 @@ impl PluginService {
         plugin_id: &str,
     ) -> Result<Map<String, Value>, PluginServiceError> {
         let path = plugin_config_path(&self.config_dir, plugin_id);
-        match fs::read_to_string(path).await {
-            Ok(contents) => {
-                let values = serde_json::from_str(&contents)
-                    .map_err(|_| PluginServiceError::InvalidConfig)?;
-                Ok(normalize_plugin_config(plugin_id, values))
+        let (contents, should_migrate) = match fs::read_to_string(&path).await {
+            Ok(contents) => (Some(contents), false),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && plugin_id == MEDIA_INFO_PLUGIN_ID =>
+            {
+                match fs::read_to_string(plugin_config_path(
+                    &self.config_dir,
+                    MEDIA_INFO_LEGACY_PLUGIN_ID,
+                ))
+                .await
+                {
+                    Ok(contents) => (Some(contents), true),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => (None, false),
+                    Err(error) => return Err(PluginServiceError::ConfigIo(error)),
+                }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
-            Err(error) => Err(PluginServiceError::ConfigIo(error)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (None, false),
+            Err(error) => return Err(PluginServiceError::ConfigIo(error)),
+        };
+        let Some(contents) = contents else {
+            return Ok(Map::new());
+        };
+        let values =
+            serde_json::from_str(&contents).map_err(|_| PluginServiceError::InvalidConfig)?;
+        let values = normalize_plugin_config(plugin_id, values);
+        if should_migrate {
+            self.write_plugin_config(plugin_id, &values).await?;
         }
+        Ok(values)
     }
 
     async fn write_plugin_config(
@@ -676,10 +699,14 @@ impl PluginService {
     }
 
     fn canonical_plugin_id(&self, plugin_id: &str) -> String {
-        if plugin_id == TMDB_PLUGIN_ID && self.catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some() {
+        let plugin_id = plugin_id.trim();
+        if plugin_id == MEDIA_INFO_LEGACY_PLUGIN_ID {
+            MEDIA_INFO_PLUGIN_ID.to_owned()
+        } else if plugin_id == TMDB_PLUGIN_ID && self.catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some()
+        {
             TMDB_DYNAMIC_PLUGIN_ID.to_owned()
         } else {
-            plugin_id.trim().to_owned()
+            plugin_id.to_owned()
         }
     }
 

@@ -37,7 +37,7 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     let mut stdout = BufReader::new(stdout);
 
     let hello = call(&mut stdin, &mut stdout, "hello", "plugin.hello", json!({})).await?;
-    assert_eq!(hello["id"], "org.lux.media-info");
+    assert_eq!(hello["id"], "org.lux.strm-media-info");
     assert_eq!(hello["name"], "strm媒体信息提取");
     assert_eq!(hello["capabilities"][0], "media.probe");
 
@@ -130,8 +130,8 @@ async fn send(
 }
 
 fn plugin_binary() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    std::env::var_os("CARGO_BIN_EXE_lux-plugin-media-info")
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_lux_plugin_media_info"))
+    std::env::var_os("CARGO_BIN_EXE_lux-plugin-strm-media-info")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_lux_plugin_strm_media_info"))
         .map(std::path::PathBuf::from)
-        .ok_or_else(|| "media-info plugin binary path is missing".into())
+        .ok_or_else(|| "strm-media-info plugin binary path is missing".into())
 }

@@ -16,14 +16,14 @@ async fn media_info_plugin_config_api_drives_a_background_run()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
-    let plugin_root = config_dir.join("plugins/org.lux.media-info");
+    let plugin_root = config_dir.join("plugins/org.lux.strm-media-info");
     tokio::fs::create_dir_all(plugin_root.join("binaries")).await?;
     fs::write(plugin_root.join("binaries/plugin"), b"placeholder")?;
     fs::write(
         plugin_root.join("manifest.json"),
         serde_json::to_vec_pretty(&json!({
             "formatVersion": 1,
-            "id": "org.lux.media-info",
+            "id": "org.lux.strm-media-info",
             "name": "strm媒体信息提取",
             "version": "1.0.0",
             "apiVersion": 1,
@@ -84,7 +84,7 @@ async fn media_info_plugin_config_api_drives_a_background_run()
 
     let installed = client
         .post(format!(
-            "{base_url}/api/v1/admin/plugins/org.lux.media-info/install"
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/install"
         ))
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)
@@ -99,7 +99,7 @@ async fn media_info_plugin_config_api_drives_a_background_run()
 
     let updated = client
         .put(format!(
-            "{base_url}/api/v1/admin/plugins/org.lux.media-info/config"
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/config"
         ))
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)
@@ -119,7 +119,7 @@ async fn media_info_plugin_config_api_drives_a_background_run()
 
     let run = client
         .post(format!(
-            "{base_url}/api/v1/admin/plugins/org.lux.media-info/run"
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/run"
         ))
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)

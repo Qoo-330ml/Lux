@@ -52,8 +52,8 @@ name = "lux-plugin-tmdb"
 path = "src/bin/lux-plugin-tmdb.rs"
 
 [[bin]]
-name = "lux-plugin-media-info"
-path = "src/bin/lux-plugin-media-info.rs"
+name = "lux-plugin-strm-media-info"
+path = "src/bin/lux-plugin-strm-media-info.rs"
 
 [[bin]]
 name = "lux-plugin-pack"

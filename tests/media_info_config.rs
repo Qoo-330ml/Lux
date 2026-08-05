@@ -16,7 +16,7 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
-    let plugin_dir = config_dir.join("plugins/org.lux.media-info/binaries");
+    let plugin_dir = config_dir.join("plugins/org.lux.strm-media-info/binaries");
     tokio::fs::create_dir_all(&plugin_dir).await?;
     let entrypoint = plugin_dir.join("plugin");
     fs::write(&entrypoint, b"placeholder")?;
@@ -40,7 +40,7 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
         "files": []
     });
     tokio::fs::write(
-        config_dir.join("plugins/org.lux.media-info/manifest.json"),
+        config_dir.join("plugins/org.lux.strm-media-info/manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )
     .await?;
@@ -99,7 +99,7 @@ async fn media_info_plugin_migrates_legacy_include_ready_configuration()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
-    let plugin_dir = config_dir.join("plugins/org.lux.media-info/binaries");
+    let plugin_dir = config_dir.join("plugins/org.lux.strm-media-info/binaries");
     tokio::fs::create_dir_all(&plugin_dir).await?;
     fs::write(plugin_dir.join("plugin"), b"placeholder")?;
     let manifest = json!({
@@ -122,7 +122,7 @@ async fn media_info_plugin_migrates_legacy_include_ready_configuration()
         "files": []
     });
     tokio::fs::write(
-        config_dir.join("plugins/org.lux.media-info/manifest.json"),
+        config_dir.join("plugins/org.lux.strm-media-info/manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )
     .await?;
@@ -156,6 +156,11 @@ async fn media_info_plugin_migrates_legacy_include_ready_configuration()
         .find(|plugin| plugin.id == MEDIA_INFO_PLUGIN_ID)
         .ok_or("media info plugin missing")?;
     assert_eq!(plugin.config_values["existingInfoPolicy"], "OVERWRITE");
+    assert!(
+        config_dir
+            .join("plugin-config/org.lux.strm-media-info.json")
+            .is_file()
+    );
 
     let settings = plugins.media_info_settings().await?;
     assert_eq!(settings.library_ids, vec![library.id]);

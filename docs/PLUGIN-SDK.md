@@ -81,11 +81,11 @@ org.lux.tmdb-1.0.0.zip
 
 `type` 当前允许 `metadata` 和 `media_probe`。媒体探测插件必须同时声明
 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。例如内置的
-`org.lux.media-info` 使用以下 manifest 核心字段：
+`org.lux.strm-media-info` 使用以下 manifest 核心字段：
 
 ```json
 {
-  "id": "org.lux.media-info",
+  "id": "org.lux.strm-media-info",
   "type": "media_probe",
   "category": "MEDIA",
   "capabilities": ["media.probe"],
@@ -161,7 +161,7 @@ manifest、格式版本、协议版本、平台入口和声明文件 SHA-256 校
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。管理 API 返回的 `configValues` 只允许包含非敏感当前值。
 
 插件配置通过 `PUT /api/v1/admin/plugins/{pluginId}/config` 保存。媒体探测插件通过
-`POST /api/v1/admin/plugins/org.lux.media-info/run` 按已保存配置创建后台任务；旧的
+`POST /api/v1/admin/plugins/org.lux.strm-media-info/run` 按已保存配置创建后台任务；旧的
 `POST /api/v1/admin/strm-probe-jobs` 也只读取该插件配置。插件进程仍只收到单个 `media.probe`
 请求，配置 schema 和任务执行不意味着插件可以访问 Lux 数据库或媒体根目录。
 

@@ -58,7 +58,7 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
   const [existingInfoPolicy, setExistingInfoPolicy] = useState("SKIP");
   const [writeSidecars, setWriteSidecars] = useState(true);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const isMediaInfo = plugin.id === "org.lux.media-info";
+  const isMediaInfo = plugin.id === "org.lux.strm-media-info";
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
   const preferredLanguageField = plugin.configFields.find((field) => field.key === "preferredLanguage");
   const fallbackEnabledField = plugin.configFields.find((field) => field.key === "languageFallbackEnabled");
