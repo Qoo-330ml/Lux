@@ -7,7 +7,7 @@
 | 客户端 | 版本 | 平台/设备 | 添加服务器 | 登录 | 浏览/详情 | 播放 | 进度/收藏 | 字幕/多版本 | 证据/备注 |
 |---|---|---|---|---|---|---|---|---|---|
 | Infuse | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 待 LUX-025 |
-| VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目详情通过 | 通过 | 部分通过 | 未测试 | 2026-08-03 本机 ARM64 独立实例真实 UI 流程通过；有效 MP4 播放、收藏/已观看状态通过，实际播放位置未观察到 |
+| VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目详情通过 | 通过 | 通过 | 未测试 | 2026-08-05 本机 ARM64 真实 UI 播放本地 MKV，Playing/Progress/Stopped 回传和 Resume 读回通过；收藏/已观看状态另有 2026-08-03 证据 |
 | SenPlayer | 6.0.6 | macOS arm64 | 通过 | 已添加，客户端读取失败 | 未测试 | 未测试 | 未测试 | 未测试 | 认证 HTTP 200 后客户端报“未能读取数据，数据已丢失”；项目所有者接受该边界 |
 | Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
 
@@ -23,7 +23,7 @@
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
 - Web 的“已实现”仅表示代码路径和服务端静态集成已完成；当前 Chrome smoke 覆盖登录、筛选、播放、收藏、账户会话和管理流程，不等同于所有浏览器/编码格式兼容。
 - LUX-121 兼容补齐：Emby `Views` 返回媒体库类型、`ChildCount` 和标准 `ImageTags.Primary`；条目详情同时返回本地徽标的 `ImageTags.Logo`，并通过 `/Items/{itemId}/Images/Logo` 提供标准图片读取；媒体库封面支持 `/Items/{libraryId}/Images/Primary` 及带索引、HEAD、ETag 和 ACL。尚待 VidHub UI 重新实测确认。
-- 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，尚待 VidHub 重新实测确认。
+- 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - LUX-091 下载回归已覆盖 Lux/Emby 的 GET/HEAD 单资源响应、Range/文件名响应，以及 `.strm` 远程资源流式转发；尚未完成第三方客户端的真实下载 UI 实测，因此不据此宣称 Infuse、VidHub 或 SenPlayer 下载兼容。
 
 ## LUX-025 本机探针进度（2026-08-02）
@@ -59,6 +59,21 @@ VidHub 2.1.8 登录后请求序列（动态用户 ID 已脱敏；这是服务端
 | GET | `/emby/Users/:userId/Items/Resume` | 404 | 未实现的继续观看路径 |
 
 这组 404 只代表当时运行的服务端版本，不代表当前源码状态。当前源码已提供这两条路径；`tests/acl.rs` 覆盖 `Views`，`tests/resume_favorites.rs` 覆盖 `Items/Resume`。上述最新 ARM64 实测已补充真实客户端浏览、详情、播放和用户状态证据。
+
+## VidHub 播放进度回传实测（2026-08-05）
+
+VidHub 2.1.8（macOS arm64）连接当前 Mac 地址 `http://192.168.50.108:8097`，使用包含回调字段兼容和 `PlaySessionId` 响应修复的工作树构建。此前保存的 `192.168.50.113:8097` 已失效，切换地址后客户端重新加载媒体库。
+
+本次明确选择了二毛条目的本地 4K 标记 MKV 媒体源；Lux 收到的直放路径为脱敏后的 `/emby/Videos/:itemId/:mediaSourceId/stream.mkv`，没有请求 `.strm` 外部地址。客户端实际播放画面后，服务端结构化日志和 SQLite 均观察到：
+
+| 流程 | 请求 | 状态/结果 |
+|---|---|---|
+| 建立播放 | `POST /emby/Sessions/Playing` | `204`，位置 0 |
+| 播放进度 | 多次 `POST /emby/Sessions/Playing/Progress` | 均 `204`，位置从 `126000000` 增长至 `861670000` ticks |
+| 停止播放 | `POST /emby/Sessions/Playing/Stopped` | `204`，最终状态 `STOPPED` |
+| 客户端读回 | `GET /emby/Users/:userId/Items/Resume` | `200`；VidHub 详情页显示“继续播放” |
+
+最终数据库记录绑定到该本地 MKV 的 `media_source_id`，`user_item_state.position_ticks=861670000`；播放会话的 `state=STOPPED`。该实测证明 VidHub 播放、退出停止和继续观看进度回传链路已打通。文件名中的 `2160p` 只属于媒体源标签，本机 ffprobe 对该夹具实际识别为 1920x1080 H.264，属于现有测试媒体内容差异。
 
 SenPlayer 6.0.6 的实际结果：服务器已添加，但客户端重复请求 `POST /emby/Users/AuthenticateByName`，服务端均返回 `200`；客户端随后显示“未能读取数据，数据已丢失”，没有继续请求 `System/Info`。项目所有者已接受暂不为该客户端补齐未实现的后续媒体接口，作为已知阻塞记录。
 

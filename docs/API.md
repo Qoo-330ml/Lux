@@ -157,7 +157,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定本地媒体源。
 - `GET|HEAD /Items/{itemId}/Download`：需要 `can_download` 和媒体库 ACL，返回所选单个媒体源的附件下载流；不打包同目录旁车文件。`mediaSourceId` 可选择源，`LOCAL_FILE` 直接读取库内文件，`STRM_URL` 读取 `.strm` 的首个非空 URL 后由 Lux 流式转发远程资源。
 - `GET|HEAD /api/v1/items/{itemId}/download`：Lux 下载端点，需要 Web session、`can_download` 和媒体库 ACL；返回所选单个媒体源，不打包 ZIP。`sourceId` 可选择源；本地源直接流式读取，`.strm` 读取首个非空远程 URL 并由 Lux 请求、流式转发该资源，不返回 `.strm` 文本。
-- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流和 DirectPlay 能力；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。每个媒体源可带 `Edition`/`Quality` 版本标签。
+- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流、DirectPlay 能力和服务端生成的 `PlaySessionId`；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。每个媒体源可带 `Edition`/`Quality` 版本标签。
 - 本地媒体源的 `MediaSources.Container` 使用实际文件扩展名（例如 `mkv`、`mp4`），不暴露 ffprobe 的复合 `format_name`。`DirectStreamUrl` 通过 `MediaSourceId` 定位源；`stream.{container}` 的后缀仅作兼容性后缀，服务端仍按媒体源记录读取文件。
 - `MediaSources.Path` 对 `.strm` 源返回旁车记录中的外部媒体地址；`MediaStreams` 除基础轨道字段外，还返回旁车中的分辨率、画面比例、码率、色深、帧率、Profile、像素格式、声道布局和采样率等已验证字段。
 - `MediaStreams` 不返回 Matroska/MP4 中标记为 `attached_pic` 的封面附加图轨，避免客户端将封面误认为可播放视频轨。
