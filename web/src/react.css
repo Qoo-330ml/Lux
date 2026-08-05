@@ -1136,8 +1136,8 @@ html[data-lux-theme="light"] .lux-empty-card { border-color: var(--lux-line); co
 html[data-lux-theme="light"] .lux-empty-card a { color: var(--lux-text); }
 
 /* The admin console is a normal light surface, rather than a dark island inside it. */
-html[data-lux-theme="light"] .lux-admin-layout { color: var(--lux-text); background: radial-gradient(circle at 75% 0%, rgba(210,71,191,.06), transparent 34%), var(--lux-bg); }
-html[data-lux-theme="light"] .lux-admin-sidebar { border-color: var(--lux-line-soft); background: rgba(255,255,255,.84); }
+html[data-lux-theme="light"] .lux-admin-layout { color: var(--lux-text); background: var(--lux-bg); }
+html[data-lux-theme="light"] .lux-admin-sidebar { border-color: transparent; background: transparent; }
 html[data-lux-theme="light"] .lux-admin-sidebar-heading strong { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-admin-sidebar-heading small { color: var(--lux-subtle); }
 html[data-lux-theme="light"] .lux-admin-badge { border-color: var(--lux-line); color: var(--lux-text); background: rgba(28,28,34,.06); }
@@ -1145,11 +1145,11 @@ html[data-lux-theme="light"] .lux-admin-nav-link:hover { color: var(--lux-text);
 html[data-lux-theme="light"] .lux-admin-nav-link.is-active { border-color: var(--lux-line); color: var(--lux-text); background: rgba(28,28,34,.09); }
 html[data-lux-theme="light"] .lux-admin-back:hover { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-admin-page-heading h1 { color: var(--lux-text); }
-html[data-lux-theme="light"] .lux-admin-stat { border-color: var(--lux-line-soft); background: rgba(255,255,255,.88); box-shadow: 0 10px 26px rgba(30,30,38,.05); }
+html[data-lux-theme="light"] .lux-admin-stat { border-color: var(--lux-line-soft); background: transparent; box-shadow: none; }
 html[data-lux-theme="light"] .lux-admin-stat-icon { border-color: var(--lux-line); color: var(--lux-text); background: rgba(28,28,34,.06); }
 html[data-lux-theme="light"] .lux-admin-stat small { color: var(--lux-subtle); }
 html[data-lux-theme="light"] .lux-admin-stat strong { color: var(--lux-text); }
-html[data-lux-theme="light"] .lux-admin-panel { border-color: var(--lux-line-soft); background: rgba(255,255,255,.88); box-shadow: 0 10px 26px rgba(30,30,38,.05); }
+html[data-lux-theme="light"] .lux-admin-panel { border-color: var(--lux-line-soft); background: transparent; box-shadow: none; }
 html[data-lux-theme="light"] .lux-admin-panel-heading h2 { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-admin-panel-icon { color: var(--lux-subtle); }
 html[data-lux-theme="light"] .lux-status-pill.is-ok { color: #247b4b; background: rgba(36,123,75,.12); }
