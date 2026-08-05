@@ -1109,6 +1109,7 @@ fn tmdb_images_generic(response: TmdbImagesResponse) -> ScraperImagesResponse {
     let mut images = Vec::new();
     append_tmdb_images(&mut images, response.posters, "Primary");
     append_tmdb_images(&mut images, response.backdrops, "Backdrop");
+    append_tmdb_images(&mut images, response.stills, "Backdrop");
     append_tmdb_images(&mut images, response.logos, "Logo");
     append_tmdb_images(&mut images, response.profiles, "Profile");
     ScraperImagesResponse { images }
@@ -1140,4 +1141,37 @@ fn parse_year(value: &str) -> Option<i32> {
 
 fn tmdb_image_url(path: &str) -> String {
     format!("https://image.tmdb.org/t/p/w780{path}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::tmdb::TmdbImageReference;
+
+    #[test]
+    fn maps_season_posters_and_episode_stills_to_their_expected_orientations() {
+        let images = tmdb_images_generic(TmdbImagesResponse {
+            posters: vec![TmdbImageReference {
+                file_path: Some("/season-poster.jpg".to_owned()),
+                width: Some(1000),
+                height: Some(1500),
+                ..TmdbImageReference::default()
+            }],
+            stills: vec![TmdbImageReference {
+                file_path: Some("/episode-still.jpg".to_owned()),
+                width: Some(1920),
+                height: Some(1080),
+                ..TmdbImageReference::default()
+            }],
+            ..TmdbImagesResponse::default()
+        });
+
+        assert_eq!(images.images.len(), 2);
+        assert_eq!(images.images[0].image_type, "Primary");
+        assert_eq!(images.images[0].width, Some(1000));
+        assert_eq!(images.images[0].height, Some(1500));
+        assert_eq!(images.images[1].image_type, "Backdrop");
+        assert_eq!(images.images[1].width, Some(1920));
+        assert_eq!(images.images[1].height, Some(1080));
+    }
 }
