@@ -278,6 +278,19 @@ export type AdminSettings = {
   resumePlayedPercent: number;
   resumeMinTicks: number;
   mediaStrategy: MediaStrategySettings;
+  networkProxy?: AdminNetworkProxySettings;
+};
+
+export type AdminNetworkProxySettings = {
+  configured: boolean;
+  url: string | null;
+  hasCredentials: boolean;
+  source: "settings" | "environment" | "none" | string;
+  restartRequired: boolean;
+};
+
+export type AdminSettingsPatch = Partial<AdminSettings> & {
+  networkProxyUrl?: string | null;
 };
 
 export type MediaStrategySettings = {

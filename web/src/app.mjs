@@ -493,7 +493,14 @@ function renderChildrenPanel(item, result, showingEpisodes = false) {
 }
 
 function renderAdminSettings(settings = {}) {
-  return "<section class=\"section\"><div class=\"section-heading\"><h2>服务端播放设置</h2><span>播放完成度与继续观看阈值</span></div><form class=\"admin-form\" data-action=\"update-settings\"><label>标记已看百分比 <input name=\"resumePlayedPercent\" type=\"number\" min=\"1\" max=\"100\" value=\"" + escapeHtml(settings.resumePlayedPercent ?? 90) + "\" required></label><label>最短进度 (Ticks) <input name=\"resumeMinTicks\" type=\"number\" min=\"0\" value=\"" + escapeHtml(settings.resumeMinTicks ?? 1200000000) + "\" required></label><button class=\"button\" type=\"submit\">保存设置</button></form><p>注：1 秒等于 10,000,000 ticks。</p></section>";
+  const networkProxy = settings.networkProxy || {};
+  const proxySource = networkProxy.source === "environment" && !networkProxy.url
+    ? "当前代理由环境变量提供。"
+    : "";
+  const credentialNote = networkProxy.hasCredentials
+    ? "代理认证信息已配置，页面不会显示密码；保存当前脱敏地址会保留现有认证信息。"
+    : "如代理需要认证，可在地址中填写用户名；认证信息只保存在服务器配置文件中。";
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>服务端播放设置</h2><span>播放完成度与继续观看阈值</span></div><form class=\"admin-form\" data-action=\"update-settings\"><label>标记已看百分比 <input name=\"resumePlayedPercent\" type=\"number\" min=\"1\" max=\"100\" value=\"" + escapeHtml(settings.resumePlayedPercent ?? 90) + "\" required></label><label>最短进度 (Ticks) <input name=\"resumeMinTicks\" type=\"number\" min=\"0\" value=\"" + escapeHtml(settings.resumeMinTicks ?? 1200000000) + "\" required></label><button class=\"button\" type=\"submit\">保存设置</button></form><p>注：1 秒等于 10,000,000 ticks。</p></section><section class=\"section\"><div class=\"section-heading\"><h2>网络代理设置</h2><span>供 Lux 发出的外部网络请求使用</span></div><form class=\"admin-form\" data-action=\"update-settings\"><label>代理地址 <input name=\"networkProxyUrl\" type=\"url\" aria-label=\"网络代理地址\" autocomplete=\"off\" placeholder=\"http://192.168.1.2:7890\" value=\"" + escapeHtml(networkProxy.url || "") + "\"></label><p>支持 HTTP、HTTPS、SOCKS4、SOCKS4A、SOCKS5 和 SOCKS5H。" + escapeHtml(credentialNote) + "</p>" + (proxySource ? "<p>" + escapeHtml(proxySource) + "</p>" : "") + "<button class=\"button\" type=\"submit\">保存网络代理</button></form><p>保存后需要重启 Lux 才会生效。</p></section>";
 }
 
 function renderAdminLogs(logs) {
@@ -687,11 +694,17 @@ function bind() {
           });
           loadRoute();
         } else if (action === "update-settings") {
-          await api.updateSettings({
-            resumePlayedPercent: Number(field(form, "resumePlayedPercent").value),
-            resumeMinTicks: Number(field(form, "resumeMinTicks").value),
-          });
-          state.notice = "设置已成功更新";
+          const update = {};
+          const playedField = field(form, "resumePlayedPercent");
+          const minimumField = field(form, "resumeMinTicks");
+          if (playedField) update.resumePlayedPercent = Number(playedField.value);
+          if (minimumField) update.resumeMinTicks = Number(minimumField.value);
+          const networkProxyField = field(form, "networkProxyUrl");
+          if (networkProxyField) update.networkProxyUrl = networkProxyField.value.trim() || null;
+          await api.updateSettings(update);
+          state.notice = field(form, "networkProxyUrl")
+            ? "网络代理设置已保存，重启 Lux 后生效"
+            : "设置已成功更新";
           render();
         } else if (action === "search-candidates") {
           const query = field(form, "query").value;

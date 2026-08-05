@@ -153,6 +153,7 @@ pub struct PluginSupervisor {
     last_errors: Arc<Mutex<HashMap<String, String>>>,
     call_timeout: Duration,
     config_dir: Option<PathBuf>,
+    network_proxy_url: Option<String>,
 }
 
 impl PluginSupervisor {
@@ -163,6 +164,7 @@ impl PluginSupervisor {
             last_errors: Arc::new(Mutex::new(HashMap::new())),
             call_timeout: DEFAULT_PLUGIN_CALL_TIMEOUT,
             config_dir: None,
+            network_proxy_url: None,
         }
     }
 
@@ -173,6 +175,11 @@ impl PluginSupervisor {
 
     pub fn with_config_dir(mut self, config_dir: PathBuf) -> Self {
         self.config_dir = Some(config_dir);
+        self
+    }
+
+    pub fn with_network_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.network_proxy_url = proxy_url;
         self
     }
 
@@ -195,7 +202,11 @@ impl PluginSupervisor {
             if let Some(process) = processes.get(plugin_id) {
                 process.clone()
             } else {
-                let process = match spawn_process(plugin, self.config_dir.as_deref()) {
+                let process = match spawn_process(
+                    plugin,
+                    self.config_dir.as_deref(),
+                    self.network_proxy_url.as_deref(),
+                ) {
                     Ok(process) => Arc::new(Mutex::new(process)),
                     Err(error) => {
                         self.record_error(plugin_id, &error).await;
@@ -341,6 +352,7 @@ impl PluginProcess {
 fn spawn_process(
     plugin: &DiscoveredPlugin,
     config_dir: Option<&Path>,
+    network_proxy_url: Option<&str>,
 ) -> Result<PluginProcess, PluginRuntimeError> {
     let entrypoint = absolute_runtime_path(&plugin.entrypoint).map_err(PluginRuntimeError::Io)?;
     let root_path = absolute_runtime_path(&plugin.root_path).map_err(PluginRuntimeError::Io)?;
@@ -361,6 +373,9 @@ fn spawn_process(
         .stderr(std::process::Stdio::piped());
     if let Some(config_dir) = config_dir {
         command.env("LUX_CONFIG_DIR", config_dir);
+    }
+    if let Some(proxy_url) = network_proxy_url {
+        command.env("LUX_PROXY_URL", proxy_url);
     }
     let mut child = command.spawn().map_err(PluginRuntimeError::Io)?;
     let stdin = child

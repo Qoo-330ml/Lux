@@ -5,6 +5,7 @@ use luxd::{
     application::{
         probe::{FfprobeRunner, MediaProbeService},
         scanner::ScanJobService,
+        settings::read_network_proxy_url,
         setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
@@ -34,7 +35,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )),
     )
     .await;
-    let app_state = AppState::ready(config.clone(), database.clone(), setup, auth, emby_auth);
+    let app_state = AppState::ready_with_proxy(
+        config.clone(),
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+        read_network_proxy_url(&config.config_dir),
+    );
     app_state.resume_metadata_reidentify_jobs().await;
     let app = app_with_state(app_state);
 

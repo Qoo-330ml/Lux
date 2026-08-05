@@ -33,6 +33,46 @@ pub fn client_builder_from_env() -> Result<ClientBuilder, NetworkProxyError> {
     apply_proxy(Client::builder(), proxy_url_from_env()?.as_deref())
 }
 
+pub fn client_builder_from_env_or(
+    proxy_url: Option<&str>,
+) -> Result<ClientBuilder, NetworkProxyError> {
+    match proxy_url {
+        Some(proxy_url) => apply_proxy(Client::builder(), Some(proxy_url)),
+        None => client_builder_from_env(),
+    }
+}
+
+pub fn normalize_proxy_url(value: &str) -> Result<String, NetworkProxyError> {
+    let value = value.trim();
+    let url = Url::parse(value).map_err(|_| NetworkProxyError::InvalidUrl)?;
+    if value.len() > 4096
+        || !matches!(
+            url.scheme(),
+            "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+        )
+        || url.host_str().is_none()
+    {
+        return Err(NetworkProxyError::InvalidUrl);
+    }
+    Ok(value.to_owned())
+}
+
+pub fn redact_proxy_url(value: &str) -> Result<String, NetworkProxyError> {
+    let value = normalize_proxy_url(value)?;
+    let mut url = Url::parse(&value).map_err(|_| NetworkProxyError::InvalidUrl)?;
+    url.set_username("")
+        .map_err(|_| NetworkProxyError::InvalidUrl)?;
+    url.set_password(None)
+        .map_err(|_| NetworkProxyError::InvalidUrl)?;
+    Ok(url.to_string())
+}
+
+pub fn proxy_url_has_credentials(value: &str) -> Result<bool, NetworkProxyError> {
+    let value = normalize_proxy_url(value)?;
+    let url = Url::parse(&value).map_err(|_| NetworkProxyError::InvalidUrl)?;
+    Ok(!url.username().is_empty() || url.password().is_some())
+}
+
 pub fn apply_proxy(
     builder: ClientBuilder,
     proxy_url: Option<&str>,
@@ -45,19 +85,6 @@ pub fn apply_proxy(
         .map_err(|_| NetworkProxyError::InvalidUrl)?
         .no_proxy(reqwest::NoProxy::from_env());
     Ok(builder.proxy(proxy))
-}
-
-fn normalize_proxy_url(value: &str) -> Result<String, NetworkProxyError> {
-    let value = value.trim();
-    let url = Url::parse(value).map_err(|_| NetworkProxyError::InvalidUrl)?;
-    if !matches!(
-        url.scheme(),
-        "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
-    ) || url.host_str().is_none()
-    {
-        return Err(NetworkProxyError::InvalidUrl);
-    }
-    Ok(value.to_owned())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -216,7 +243,16 @@ fn is_public_address(address: IpAddr) -> bool {
 mod tests {
     use reqwest::Client;
 
-    use super::{NetworkProxyError, apply_proxy};
+    use super::{NetworkProxyError, apply_proxy, redact_proxy_url};
+
+    #[test]
+    fn proxy_status_redacts_credentials() {
+        let redacted = redact_proxy_url("http://proxy-user@127.0.0.1:7890")
+            .expect("proxy URL should be valid");
+
+        assert_eq!(redacted, "http://127.0.0.1:7890/");
+        assert!(!redacted.contains("proxy-user"));
+    }
 
     #[test]
     fn proxy_configuration_accepts_supported_schemes_and_proxy_credentials() {

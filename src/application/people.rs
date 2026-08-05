@@ -63,7 +63,15 @@ pub struct PeopleService {
 
 impl PeopleService {
     pub fn new(config_dir: PathBuf) -> Self {
-        let client = match crate::network::client_builder_from_env() {
+        Self::with_proxy(config_dir, None)
+    }
+
+    pub fn new_with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
+        Self::with_proxy(config_dir, proxy_url)
+    }
+
+    fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
+        let client = match crate::network::client_builder_from_env_or(proxy_url.as_deref()) {
             Ok(builder) => match builder.build() {
                 Ok(client) => client,
                 Err(_) => Client::new(),

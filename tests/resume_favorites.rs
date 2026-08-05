@@ -144,6 +144,47 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         default_settings_body["mediaStrategy"]["metadataRefreshMode"],
         "FILL_MISSING"
     );
+    assert_eq!(default_settings_body["networkProxy"]["configured"], false);
+    assert_eq!(default_settings_body["networkProxy"]["source"], "none");
+
+    let network_proxy = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "networkProxyUrl": "socks5h://127.0.0.1:1080" }))
+        .send()
+        .await?;
+    assert_eq!(network_proxy.status(), reqwest::StatusCode::OK);
+    let network_proxy_body = network_proxy.json::<Value>().await?;
+    assert_eq!(network_proxy_body["networkProxy"]["configured"], true);
+    assert_eq!(network_proxy_body["networkProxy"]["source"], "settings");
+    assert_eq!(
+        network_proxy_body["networkProxy"]["url"],
+        "socks5h://127.0.0.1:1080"
+    );
+    assert_eq!(network_proxy_body["networkProxy"]["restartRequired"], true);
+
+    let credentialed_proxy = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "networkProxyUrl": "http://proxy-user@127.0.0.1:7890" }))
+        .send()
+        .await?;
+    let credentialed_proxy_body = credentialed_proxy.text().await?;
+    assert!(credentialed_proxy_body.contains("http://127.0.0.1:7890/"));
+    assert!(!credentialed_proxy_body.contains("proxy-user"));
+
+    let clear_proxy = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "networkProxyUrl": null }))
+        .send()
+        .await?;
+    assert_eq!(clear_proxy.status(), reqwest::StatusCode::OK);
+    let cleared_proxy_body = clear_proxy.json::<Value>().await?;
+    assert_eq!(cleared_proxy_body["networkProxy"]["configured"], false);
 
     let media_strategy = json!({
         "metadataLanguage": "en-US",

@@ -533,6 +533,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-input-with-suffix { display: flex; align-items: center; max-width: 250px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.05); }
 .lux-admin-input-with-suffix input { width: 100%; min-height: 42px; padding: 0 12px; border: 0; outline: 0; color: #fff; background: transparent; }
 .lux-admin-input-with-suffix em { padding-right: 12px; color: var(--lux-subtle); font-size: .74rem; font-style: normal; }
+.lux-admin-settings-form > label > input[type="url"] { min-height: 42px; padding: 0 12px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
+.lux-admin-settings-form > label > input[type="url"]:focus { border-color: rgba(184,164,236,.7); box-shadow: 0 0 0 3px rgba(154,126,232,.12); }
+.lux-network-proxy-help, .lux-network-proxy-status { margin: -10px 0 0; color: var(--lux-subtle); font-size: .72rem; line-height: 1.55; }
+.lux-network-proxy-status { color: var(--lux-muted); }
 .lux-settings-save { justify-self: start; margin-top: 2px; }
 .lux-settings-saved { display: flex; align-items: center; gap: 7px; margin: 17px 0 0; color: #9bdcb3; font-size: .78rem; }
 .lux-admin-settings-note { max-width: 760px; margin-top: 16px; }
@@ -1123,7 +1127,8 @@ html[data-lux-theme="light"] .lux-admin-schedule-field input,
 html[data-lux-theme="light"] .lux-admin-root-form input,
 html[data-lux-theme="light"] .lux-admin-password-row input,
 html[data-lux-theme="light"] .lux-admin-filter-select,
-html[data-lux-theme="light"] .lux-admin-input-with-suffix { color: var(--lux-text); background: rgba(28,28,34,.035); }
+html[data-lux-theme="light"] .lux-admin-input-with-suffix,
+html[data-lux-theme="light"] .lux-admin-settings-form > label > input[type="url"] { color: var(--lux-text); background: rgba(28,28,34,.035); }
 html[data-lux-theme="light"] .lux-admin-form input:focus,
 html[data-lux-theme="light"] .lux-admin-form select:focus,
 html[data-lux-theme="light"] .lux-admin-schedule-field input:focus,

@@ -21,7 +21,7 @@ use crate::{
         tmdb::TmdbError,
         tmdb_plugin::TmdbProvider,
     },
-    network::client_builder_from_env,
+    network::client_builder_from_env_or,
     storage::{Database, StorageError},
 };
 
@@ -54,16 +54,31 @@ impl ImageWriteService {
         Self::with_config(database, ImageDownloadConfig::default())
     }
 
+    pub fn new_with_proxy(
+        database: Database,
+        proxy_url: Option<String>,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config(database, ImageDownloadConfig::default(), proxy_url)
+    }
+
     pub fn with_config(
         database: Database,
         config: ImageDownloadConfig,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config(database, config, None)
+    }
+
+    fn with_proxy_config(
+        database: Database,
+        config: ImageDownloadConfig,
+        proxy_url: Option<String>,
     ) -> Result<Self, ImageWriteError> {
         if config.max_bytes == 0 {
             return Err(ImageWriteError::InvalidConfiguration(
                 "image maximum size must be positive".to_owned(),
             ));
         }
-        let http = client_builder_from_env()
+        let http = client_builder_from_env_or(proxy_url.as_deref())
             .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?
             .timeout(config.timeout)
             .build()

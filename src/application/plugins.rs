@@ -44,8 +44,18 @@ pub struct PluginService {
 
 impl PluginService {
     pub fn new(database: Database, config_dir: PathBuf) -> Self {
+        Self::new_with_proxy(database, config_dir, None)
+    }
+
+    pub fn new_with_proxy(
+        database: Database,
+        config_dir: PathBuf,
+        proxy_url: Option<String>,
+    ) -> Self {
         let catalog = PluginCatalog::discover(&config_dir.join("plugins"));
-        let supervisor = PluginSupervisor::new(catalog.clone()).with_config_dir(config_dir.clone());
+        let supervisor = PluginSupervisor::new(catalog.clone())
+            .with_config_dir(config_dir.clone())
+            .with_network_proxy_url(proxy_url);
         Self {
             database,
             config_dir,

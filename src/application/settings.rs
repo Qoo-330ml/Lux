@@ -4,6 +4,7 @@ use tokio::fs;
 
 pub const TMDB_TOKEN_FILE: &str = "tmdb_read_access_token";
 pub const TMDB_API_KEY_FILE: &str = "tmdb_api_key";
+pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
 
 pub fn read_tmdb_api_key(config_dir: &Path) -> Option<String> {
     read_secret(config_dir.join(TMDB_API_KEY_FILE))
@@ -11,6 +12,10 @@ pub fn read_tmdb_api_key(config_dir: &Path) -> Option<String> {
 
 pub fn read_tmdb_token(config_dir: &Path) -> Option<String> {
     read_secret(config_dir.join(TMDB_TOKEN_FILE))
+}
+
+pub fn read_network_proxy_url(config_dir: &Path) -> Option<String> {
+    read_secret(config_dir.join(NETWORK_PROXY_URL_FILE))
 }
 
 fn read_secret(path: impl AsRef<Path>) -> Option<String> {
@@ -26,6 +31,21 @@ pub async fn write_tmdb_api_key(config_dir: &Path, api_key: Option<&str>) -> std
 
 pub async fn write_tmdb_token(config_dir: &Path, token: &str) -> std::io::Result<()> {
     write_secret_file(config_dir, TMDB_TOKEN_FILE, Some(token)).await
+}
+
+pub async fn read_network_proxy_url_async(config_dir: &Path) -> Option<String> {
+    fs::read_to_string(config_dir.join(NETWORK_PROXY_URL_FILE))
+        .await
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+pub async fn write_network_proxy_url(
+    config_dir: &Path,
+    proxy_url: Option<&str>,
+) -> std::io::Result<()> {
+    write_secret_file(config_dir, NETWORK_PROXY_URL_FILE, proxy_url).await
 }
 
 async fn write_secret_file(

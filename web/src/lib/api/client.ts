@@ -6,6 +6,7 @@ import type {
   AdminLibrary,
   AdminRoot,
   AdminSettings,
+  AdminSettingsPatch,
   AdminUser,
   AdminMetadataCandidate,
   AdminMetadataReidentifyBatch,
@@ -429,7 +430,7 @@ export class LuxApiClient {
     return this.request<AdminSettings>("/api/v1/admin/settings");
   }
 
-  updateAdminSettings(input: Partial<AdminSettings>) {
+  updateAdminSettings(input: AdminSettingsPatch) {
     return this.request<AdminSettings>("/api/v1/admin/settings", {
       method: "PATCH",
       body: JSON.stringify(input),

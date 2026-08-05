@@ -61,6 +61,7 @@ use crate::{
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJobError, ScanJobService},
         scraper::ScraperResolver,
+        settings::{read_network_proxy_url_async, write_network_proxy_url},
         tmdb::{TmdbClient, TmdbError},
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
     },
@@ -71,7 +72,10 @@ use crate::{
     },
     config::Config,
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
-    network::RemoteAccessPolicy,
+    network::{
+        RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
+        redact_proxy_url,
+    },
     security::LoginRateLimiter,
     storage::{Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError},
 };
@@ -120,10 +124,22 @@ impl AppState {
         auth: WebAuthService,
         emby_auth: EmbyAuthService,
     ) -> Self {
+        Self::ready_with_proxy(config, database, setup, auth, emby_auth, None)
+    }
+
+    pub fn ready_with_proxy(
+        config: Config,
+        database: Database,
+        setup: SetupService,
+        auth: WebAuthService,
+        emby_auth: EmbyAuthService,
+        network_proxy_url: Option<String>,
+    ) -> Self {
         let server_id = database.server_id().to_owned();
         let config_dir = config.config_dir.clone();
         let access = MediaAccessService::new(database.clone());
-        let image_writes = ImageWriteService::new(database.clone()).ok();
+        let image_writes =
+            ImageWriteService::new_with_proxy(database.clone(), network_proxy_url.clone()).ok();
         let library_covers = Some(LibraryCoverService::new(
             database.clone(),
             config.config_dir.join("library-covers"),
@@ -131,7 +147,11 @@ impl AppState {
         let metadata_selection = image_writes.clone().map(|images| {
             MetadataSelectionService::with_config_dir(database.clone(), images, config_dir.clone())
         });
-        let plugins = PluginService::new(database.clone(), config_dir.clone());
+        let plugins = PluginService::new_with_proxy(
+            database.clone(),
+            config_dir.clone(),
+            network_proxy_url.clone(),
+        );
         let tmdb = TmdbProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
         let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
         let collections = Some(CollectionService::with_resolver(
@@ -182,7 +202,7 @@ impl AppState {
             scraper_resolver: Some(scraper_resolver),
             tmdb: Some(tmdb),
             collections,
-            people: Some(PeopleService::new(config_dir)),
+            people: Some(PeopleService::new_with_proxy(config_dir, network_proxy_url)),
             remote_access: RemoteAccessPolicy::from_env(),
             login_rate_limiter: LoginRateLimiter::default(),
         }
@@ -5130,12 +5150,82 @@ async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Re
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let network_proxy = network_proxy_settings(&state).await;
     Json(json!({
         "resumePlayedPercent": played_percent,
         "resumeMinTicks": minimum_ticks,
         "mediaStrategy": media_strategy,
+        "networkProxy": network_proxy,
     }))
     .into_response()
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkProxySettingsResponse {
+    configured: bool,
+    url: Option<String>,
+    has_credentials: bool,
+    source: &'static str,
+    restart_required: bool,
+}
+
+async fn network_proxy_settings(state: &AppState) -> NetworkProxySettingsResponse {
+    if let Some(config_dir) = state.config_dir.as_deref()
+        && let Some(proxy_url) = read_network_proxy_url_async(config_dir).await
+    {
+        let url = redact_proxy_url(&proxy_url).ok();
+        let has_credentials = proxy_url_has_credentials(&proxy_url).unwrap_or(false);
+        return NetworkProxySettingsResponse {
+            configured: true,
+            url,
+            has_credentials,
+            source: "settings",
+            restart_required: true,
+        };
+    }
+    if let Ok(Some(proxy_url)) = proxy_url_from_env() {
+        return NetworkProxySettingsResponse {
+            configured: true,
+            url: redact_proxy_url(&proxy_url).ok(),
+            has_credentials: proxy_url_has_credentials(&proxy_url).unwrap_or(false),
+            source: "environment",
+            restart_required: true,
+        };
+    }
+    if standard_environment_proxy_configured() {
+        return NetworkProxySettingsResponse {
+            configured: true,
+            url: None,
+            has_credentials: false,
+            source: "environment",
+            restart_required: true,
+        };
+    }
+    NetworkProxySettingsResponse {
+        configured: false,
+        url: None,
+        has_credentials: false,
+        source: "none",
+        restart_required: true,
+    }
+}
+
+fn standard_environment_proxy_configured() -> bool {
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+    .into_iter()
+    .any(|name| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 #[derive(Deserialize)]
@@ -5144,6 +5234,8 @@ struct UpdatePlaybackSettingsRequest {
     resume_played_percent: Option<i64>,
     resume_min_ticks: Option<i64>,
     media_strategy: Option<MediaStrategySettings>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5270,6 +5362,7 @@ async fn admin_update_settings(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
+    let requested_proxy = request.extra.get("networkProxyUrl").cloned();
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -5300,6 +5393,53 @@ async fn admin_update_settings(
         Ok(value) => value,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    if let Some(requested_proxy) = requested_proxy {
+        let Some(config_dir) = state.config_dir.as_deref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let proxy_url = match requested_proxy {
+            Value::Null => None,
+            Value::String(value) => {
+                let normalized = match normalize_proxy_url(&value) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return api_error(
+                            &headers,
+                            StatusCode::BAD_REQUEST,
+                            lux::ApiErrorCode::InvalidRequest,
+                            "网络代理地址无效",
+                        )
+                        .into_response();
+                    }
+                };
+                let current = read_network_proxy_url_async(config_dir).await;
+                let keep_current_credentials = current.as_deref().is_some_and(|current| {
+                    !proxy_url_has_credentials(&normalized).unwrap_or(true)
+                        && redact_proxy_url(current).ok() == redact_proxy_url(&normalized).ok()
+                });
+                Some(if keep_current_credentials {
+                    current.unwrap_or(normalized)
+                } else {
+                    normalized
+                })
+            }
+            _ => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "网络代理地址无效",
+                )
+                .into_response();
+            }
+        };
+        if write_network_proxy_url(config_dir, proxy_url.as_deref())
+            .await
+            .is_err()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
     match database
         .set_server_settings(percent, minimum_ticks, &media_strategy_json)
         .await
@@ -5318,6 +5458,7 @@ async fn admin_update_settings(
                 "resumePlayedPercent": percent,
                 "resumeMinTicks": minimum_ticks,
                 "mediaStrategy": media_strategy,
+                "networkProxy": network_proxy_settings(&state).await,
             }))
             .into_response()
         }
