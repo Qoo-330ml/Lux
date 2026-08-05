@@ -251,6 +251,7 @@ Lux 的核心价值不是功能数量，而是：
 - 外网通过 Tailscale、反向代理或用户域名接入。
 - 网络代理设置是全局出站配置，支持 HTTP、HTTPS、SOCKS4、SOCKS4a、SOCKS5 和 SOCKS5h；可通过代理 URL 携带认证信息。
 - 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置仅影响 Lux 发出的网络请求，不代理 `.strm` 地址和入站反向代理。
+- 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
 - 远程访问权限由用户策略控制。
 - 只有受信代理来源的 X-Forwarded-For、X-Forwarded-Proto 等请求头可以影响远近端判断。
 - 反向代理场景必须使用 HTTPS；用户名和密码登录协议本身不能替代 TLS。

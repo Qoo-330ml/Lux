@@ -9,6 +9,7 @@ pub mod images;
 pub mod libraries;
 pub mod library_covers;
 pub mod metadata;
+pub mod network_diagnostics;
 pub mod nfo;
 pub mod people;
 pub mod playback;

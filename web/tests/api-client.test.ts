@@ -262,6 +262,27 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("tests the fixed network proxy targets with the configured CSRF token", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("/api/v1/admin/settings/network-proxy/test");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({ networkProxyUrl: "http://192.168.1.2:7890" });
+      expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      return new Response(JSON.stringify({ probes: [], egressIp: null, egressCountry: null }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    await expect(new LuxApiClient().testAdminNetworkProxy("http://192.168.1.2:7890")).resolves.toMatchObject({
+      probes: [],
+      egressIp: null,
+      egressCountry: null,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("exposes the paginated plugin catalog and installs a built-in plugin with CSRF", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

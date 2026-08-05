@@ -7,6 +7,7 @@ import type {
   AdminRoot,
   AdminSettings,
   AdminSettingsPatch,
+  NetworkProxyDiagnostics,
   AdminUser,
   AdminMetadataCandidate,
   AdminMetadataReidentifyBatch,
@@ -435,6 +436,16 @@ export class LuxApiClient {
       method: "PATCH",
       body: JSON.stringify(input),
     });
+  }
+
+  testAdminNetworkProxy(networkProxyUrl?: string) {
+    return this.request<NetworkProxyDiagnostics>(
+      "/api/v1/admin/settings/network-proxy/test",
+      {
+        method: "POST",
+        body: JSON.stringify(networkProxyUrl ? { networkProxyUrl } : {}),
+      },
+    );
   }
 
   adminPendingMetadata() {

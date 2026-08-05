@@ -22,6 +22,7 @@ const state = {
   children: null,
   error: "",
   notice: "",
+  networkProxyDiagnostics: null,
   setupNotice: "",
   drawerOpen: false,
 };
@@ -89,6 +90,7 @@ const api = {
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
   adminSettings() { return this.request("/api/v1/admin/settings"); },
   updateSettings(data) { return this.request("/api/v1/admin/settings", { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
+  testNetworkProxy(networkProxyUrl) { return this.request("/api/v1/admin/settings/network-proxy/test", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(networkProxyUrl ? { networkProxyUrl } : {}) }); },
   logs() { return this.request("/api/v1/admin/logs?page=1&pageSize=50"); },
   pendingMetadata() { return this.request("/api/v1/admin/metadata/pending?page=1&pageSize=50"); },
   startBatchReidentify(itemIds) { return this.request("/api/v1/admin/metadata/reidentify", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ itemIds }) }); },
@@ -492,7 +494,19 @@ function renderChildrenPanel(item, result, showingEpisodes = false) {
   return `<div class="section-heading"><h3>季度列表</h3><span>${result.total || items.length} 个季度</span></div><div class="library-grid">${seasons || "<div class=\"empty\"><span>暂无季度</span></div>"}</div>`;
 }
 
-function renderAdminSettings(settings = {}) {
+function renderNetworkProxyDiagnostics(diagnostics) {
+  if (!diagnostics) return "";
+  const source = diagnostics.proxySource === "input" ? "当前输入地址" : diagnostics.proxySource === "settings" ? "已保存设置" : diagnostics.proxySource === "environment" ? "环境变量" : "当前直连配置";
+  const rows = (diagnostics.probes || []).map((probe) => {
+    const result = probe.reachable
+      ? (probe.latencyMs ?? "—") + " ms" + (probe.status ? " · HTTP " + probe.status : "")
+      : "检测失败（" + (probe.error || "请求失败") + "）";
+    return "<li><strong>" + escapeHtml(probe.label || probe.id) + "</strong><span>" + escapeHtml(result) + "</span></li>";
+  }).join("");
+  return "<div class=\"network-proxy-diagnostics\"><div class=\"section-heading\"><h3>网络检测结果</h3><span>来源：" + escapeHtml(source) + "</span></div><ul class=\"admin-list\"><li><strong>网络出口 IP</strong><span>" + escapeHtml(diagnostics.egressIp || "未获取") + "</span></li><li><strong>出口国家/地区</strong><span>" + escapeHtml(diagnostics.egressCountry || "未获取") + "</span></li>" + rows + "</ul><p>延迟为 Lux 服务端发起请求到收到响应的耗时。</p></div>";
+}
+
+function renderAdminSettings(settings = {}, diagnostics = null) {
   const networkProxy = settings.networkProxy || {};
   const proxySource = networkProxy.source === "environment" && !networkProxy.url
     ? "当前代理由环境变量提供。"
@@ -500,7 +514,7 @@ function renderAdminSettings(settings = {}) {
   const credentialNote = networkProxy.hasCredentials
     ? "代理认证信息已配置，页面不会显示密码；保存当前脱敏地址会保留现有认证信息。"
     : "如代理需要认证，可在地址中填写用户名；认证信息只保存在服务器配置文件中。";
-  return "<section class=\"section\"><div class=\"section-heading\"><h2>服务端播放设置</h2><span>播放完成度与继续观看阈值</span></div><form class=\"admin-form\" data-action=\"update-settings\"><label>标记已看百分比 <input name=\"resumePlayedPercent\" type=\"number\" min=\"1\" max=\"100\" value=\"" + escapeHtml(settings.resumePlayedPercent ?? 90) + "\" required></label><label>最短进度 (Ticks) <input name=\"resumeMinTicks\" type=\"number\" min=\"0\" value=\"" + escapeHtml(settings.resumeMinTicks ?? 1200000000) + "\" required></label><button class=\"button\" type=\"submit\">保存设置</button></form><p>注：1 秒等于 10,000,000 ticks。</p></section><section class=\"section\"><div class=\"section-heading\"><h2>网络代理设置</h2><span>供 Lux 发出的外部网络请求使用</span></div><form class=\"admin-form\" data-action=\"update-settings\"><label>代理地址 <input name=\"networkProxyUrl\" type=\"url\" aria-label=\"网络代理地址\" autocomplete=\"off\" placeholder=\"http://192.168.1.2:7890\" value=\"" + escapeHtml(networkProxy.url || "") + "\"></label><p>支持 HTTP、HTTPS、SOCKS4、SOCKS4A、SOCKS5 和 SOCKS5H。" + escapeHtml(credentialNote) + "</p>" + (proxySource ? "<p>" + escapeHtml(proxySource) + "</p>" : "") + "<button class=\"button\" type=\"submit\">保存网络代理</button></form><p>保存后需要重启 Lux 才会生效。</p></section>";
+  return "<section class=\"section\"><div class=\"section-heading\"><h2>服务端播放设置</h2><span>播放完成度与继续观看阈值</span></div><form class=\"admin-form\" data-action=\"update-settings\"><label>标记已看百分比 <input name=\"resumePlayedPercent\" type=\"number\" min=\"1\" max=\"100\" value=\"" + escapeHtml(settings.resumePlayedPercent ?? 90) + "\" required></label><label>最短进度 (Ticks) <input name=\"resumeMinTicks\" type=\"number\" min=\"0\" value=\"" + escapeHtml(settings.resumeMinTicks ?? 1200000000) + "\" required></label><button class=\"button\" type=\"submit\">保存设置</button></form><p>注：1 秒等于 10,000,000 ticks。</p></section><section class=\"section\"><div class=\"section-heading\"><h2>网络代理设置</h2><span>供 Lux 发出的外部网络请求使用</span></div><form class=\"admin-form\" data-action=\"update-settings\"><label>代理地址 <input name=\"networkProxyUrl\" type=\"url\" aria-label=\"网络代理地址\" autocomplete=\"off\" placeholder=\"http://192.168.1.2:7890\" value=\"" + escapeHtml(networkProxy.url || "") + "\"></label><p>支持 HTTP、HTTPS、SOCKS4、SOCKS4A、SOCKS5 和 SOCKS5H。" + escapeHtml(credentialNote) + "</p>" + (proxySource ? "<p>" + escapeHtml(proxySource) + "</p>" : "") + "<div class=\"form-actions\"><button class=\"button\" type=\"submit\">保存网络代理</button><button class=\"button secondary\" type=\"button\" data-network-proxy-test>检测延迟与出口</button></div></form><p>保存后需要重启 Lux 才会生效。</p>" + renderNetworkProxyDiagnostics(diagnostics) + "</section>";
 }
 
 function renderAdminLogs(logs) {
@@ -515,7 +529,7 @@ function renderAdmin() {
   if (section === "users") return renderAdminUsers(admin);
   if (section === "jobs") return renderAdminJobs(admin);
   if (section === "metadata") return renderAdminMetadata(admin);
-  if (section === "settings") return renderAdminSettings(admin.settings);
+  if (section === "settings") return renderAdminSettings(admin.settings, state.networkProxyDiagnostics);
   return renderAdminDashboard(admin);
 }
 
@@ -700,7 +714,10 @@ function bind() {
           if (playedField) update.resumePlayedPercent = Number(playedField.value);
           if (minimumField) update.resumeMinTicks = Number(minimumField.value);
           const networkProxyField = field(form, "networkProxyUrl");
-          if (networkProxyField) update.networkProxyUrl = networkProxyField.value.trim() || null;
+          if (networkProxyField) {
+            update.networkProxyUrl = networkProxyField.value.trim() || null;
+            state.networkProxyDiagnostics = null;
+          }
           await api.updateSettings(update);
           state.notice = field(form, "networkProxyUrl")
             ? "网络代理设置已保存，重启 Lux 后生效"
@@ -721,10 +738,23 @@ function bind() {
   });
 
   app.onclick = async (event) => {
-    const target = event.target.closest("button[data-route], button[data-library], button[data-item], button[data-action], button[data-season], button[data-delete-root], button[data-scan-library], button[data-disable-user], button[data-select-candidate], button[data-delete-image], input[data-user-library-access]");
+    const target = event.target.closest("button[data-route], button[data-library], button[data-item], button[data-action], button[data-season], button[data-delete-root], button[data-scan-library], button[data-disable-user], button[data-select-candidate], button[data-delete-image], button[data-network-proxy-test], input[data-user-library-access]");
     if (!target) return;
 
-    if (target.dataset.route) {
+    if (target.dataset.networkProxyTest !== undefined) {
+      target.disabled = true;
+      state.error = "";
+      try {
+        const input = app.querySelector("input[name=networkProxyUrl]");
+        state.networkProxyDiagnostics = await api.testNetworkProxy(input?.value.trim() || undefined);
+        const view = document.querySelector("#view");
+        if (view) view.innerHTML = renderAdminSettings(state.admin?.settings, state.networkProxyDiagnostics);
+        bind();
+      } catch (error) {
+        state.error = error.message;
+        render();
+      }
+    } else if (target.dataset.route) {
       state.route = target.dataset.route;
       state.drawerOpen = false;
       render();

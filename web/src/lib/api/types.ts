@@ -289,6 +289,22 @@ export type AdminNetworkProxySettings = {
   restartRequired: boolean;
 };
 
+export type NetworkProxyDiagnostics = {
+  proxySource: "settings" | "environment" | "none" | "input" | string;
+  probes: NetworkProxyProbe[];
+  egressIp: string | null;
+  egressCountry: string | null;
+};
+
+export type NetworkProxyProbe = {
+  id: string;
+  label: string;
+  latencyMs: number | null;
+  status: number | null;
+  reachable: boolean;
+  error: string | null;
+};
+
 export type AdminSettingsPatch = Partial<AdminSettings> & {
   networkProxyUrl?: string | null;
 };

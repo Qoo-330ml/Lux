@@ -186,6 +186,20 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     let cleared_proxy_body = clear_proxy.json::<Value>().await?;
     assert_eq!(cleared_proxy_body["networkProxy"]["configured"], false);
 
+    let invalid_proxy_test = client
+        .post(format!(
+            "{base_url}/api/v1/admin/settings/network-proxy/test"
+        ))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "networkProxyUrl": "ftp://proxy.invalid:7890" }))
+        .send()
+        .await?;
+    assert_eq!(
+        invalid_proxy_test.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
     let media_strategy = json!({
         "metadataLanguage": "en-US",
         "imageLanguage": "en",

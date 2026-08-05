@@ -53,6 +53,7 @@ use crate::{
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
         metadata::MetadataField,
+        network_diagnostics::{NetworkDiagnostics, NetworkProbeResult, test_network},
         nfo::{MetadataWriteRequest, MetadataWriteService, NfoWriteError},
         people::{PeopleError, PeopleService},
         plugins::{PluginPage, PluginService, PluginServiceError},
@@ -401,6 +402,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
+        )
+        .route(
+            "/api/v1/admin/settings/network-proxy/test",
+            post(admin_test_network_proxy),
         )
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/audit", get(admin_list_audit))
@@ -5155,6 +5160,131 @@ fn standard_environment_proxy_configured() -> bool {
             .ok()
             .is_some_and(|value| !value.trim().is_empty())
     })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NetworkProxyTestRequest {
+    network_proxy_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkProxyDiagnosticsResponse {
+    proxy_source: &'static str,
+    probes: Vec<NetworkProxyProbeResponse>,
+    egress_ip: Option<String>,
+    egress_country: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkProxyProbeResponse {
+    id: &'static str,
+    label: &'static str,
+    latency_ms: Option<u64>,
+    status: Option<u16>,
+    reachable: bool,
+    error: Option<&'static str>,
+}
+
+async fn admin_test_network_proxy(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<NetworkProxyTestRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let (proxy_url, proxy_source) =
+        match network_proxy_for_test(&state, request.network_proxy_url).await {
+            Ok(value) => value,
+            Err(()) => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "网络代理地址无效",
+                )
+                .into_response();
+            }
+        };
+    let diagnostics = test_network(proxy_url.as_deref()).await;
+    Json(network_proxy_diagnostics_response(
+        proxy_source,
+        diagnostics,
+    ))
+    .into_response()
+}
+
+async fn network_proxy_for_test(
+    state: &AppState,
+    requested_proxy: Option<String>,
+) -> Result<(Option<String>, &'static str), ()> {
+    let current = match state.config_dir.as_deref() {
+        Some(config_dir) => read_network_proxy_url_async(config_dir).await,
+        None => None,
+    };
+    if let Some(requested_proxy) = requested_proxy {
+        let normalized = normalize_proxy_url(&requested_proxy).map_err(|_| ())?;
+        let keep_current_credentials = current.as_deref().is_some_and(|current| {
+            !proxy_url_has_credentials(&normalized).unwrap_or(true)
+                && redact_proxy_url(current).ok() == redact_proxy_url(&normalized).ok()
+        });
+        return Ok((
+            Some(if keep_current_credentials {
+                current.unwrap_or(normalized)
+            } else {
+                normalized
+            }),
+            if keep_current_credentials {
+                "settings"
+            } else {
+                "input"
+            },
+        ));
+    }
+    if let Some(current) = current {
+        return Ok((Some(current), "settings"));
+    }
+    if let Ok(Some(proxy_url)) = proxy_url_from_env() {
+        return Ok((Some(proxy_url), "environment"));
+    }
+    Ok((
+        None,
+        if standard_environment_proxy_configured() {
+            "environment"
+        } else {
+            "none"
+        },
+    ))
+}
+
+fn network_proxy_diagnostics_response(
+    proxy_source: &'static str,
+    diagnostics: NetworkDiagnostics,
+) -> NetworkProxyDiagnosticsResponse {
+    NetworkProxyDiagnosticsResponse {
+        proxy_source,
+        probes: diagnostics
+            .probes
+            .into_iter()
+            .map(network_proxy_probe_response)
+            .collect(),
+        egress_ip: diagnostics.egress_ip,
+        egress_country: diagnostics.egress_country,
+    }
+}
+
+fn network_proxy_probe_response(result: NetworkProbeResult) -> NetworkProxyProbeResponse {
+    NetworkProxyProbeResponse {
+        id: result.id,
+        label: result.label,
+        latency_ms: result.latency_ms,
+        status: result.status,
+        reachable: result.reachable,
+        error: result.error,
+    }
 }
 
 #[derive(Deserialize)]

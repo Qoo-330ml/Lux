@@ -3,7 +3,11 @@ import { Check, Save, Settings2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminNetworkProxySettings } from "../../lib/api/types";
+import type {
+  AdminNetworkProxySettings,
+  NetworkProxyDiagnostics,
+  NetworkProxyProbe,
+} from "../../lib/api/types";
 
 const emptyNetworkProxy: AdminNetworkProxySettings = {
   configured: false,
@@ -21,6 +25,7 @@ export function AdminSettingsPage() {
   const [proxyUrl, setProxyUrl] = useState("");
   const [saved, setSaved] = useState(false);
   const [proxySaved, setProxySaved] = useState(false);
+  const [proxyDiagnostics, setProxyDiagnostics] = useState<NetworkProxyDiagnostics | null>(null);
 
   useEffect(() => {
     if (!settings.data) return;
@@ -47,10 +52,17 @@ export function AdminSettingsPage() {
     mutationFn: () => api.updateAdminSettings({ networkProxyUrl: proxyUrl.trim() || null }),
     onSuccess: (data) => {
       setProxyUrl(data.networkProxy?.url ?? "");
+      setProxyDiagnostics(null);
       setProxySaved(true);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminSettings });
     },
     onError: () => setProxySaved(false),
+  });
+
+  const testProxy = useMutation({
+    mutationFn: () => api.testAdminNetworkProxy(proxyUrl.trim() || undefined),
+    onSuccess: (data) => setProxyDiagnostics(data),
+    onError: () => setProxyDiagnostics(null),
   });
 
   if (settings.isPending) return <AdminSettingsState label="正在读取服务器设置…" />;
@@ -111,7 +123,11 @@ export function AdminSettingsPage() {
               autoComplete="off"
               placeholder="http://192.168.1.2:7890"
               value={proxyUrl}
-              onChange={(event) => { setProxySaved(false); setProxyUrl(event.target.value); }}
+              onChange={(event) => {
+                setProxySaved(false);
+                setProxyDiagnostics(null);
+                setProxyUrl(event.target.value);
+              }}
             />
           </label>
           <p className="lux-network-proxy-help">
@@ -120,12 +136,19 @@ export function AdminSettingsPage() {
               : "如代理需要认证，可在地址中填写用户名；认证信息只保存在服务器配置文件中，不会返回到前端。"}
           </p>
           {networkProxy.source === "environment" && !networkProxy.url ? <p className="lux-network-proxy-status">当前代理由环境变量提供。</p> : null}
-          <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={saveProxy.isPending} onClick={() => saveProxy.mutate()}>
-            <Save size={16} /> {saveProxy.isPending ? "保存中…" : "保存网络代理"}
-          </button>
+          <div className="lux-network-proxy-actions">
+            <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={saveProxy.isPending} onClick={() => saveProxy.mutate()}>
+              <Save size={16} /> {saveProxy.isPending ? "保存中…" : "保存网络代理"}
+            </button>
+            <button className="lux-button lux-button-secondary lux-settings-save" type="button" disabled={testProxy.isPending} onClick={() => testProxy.mutate()}>
+              {testProxy.isPending ? "检测中…" : "检测延迟与出口"}
+            </button>
+          </div>
         </div>
         {proxySaved ? <p className="lux-settings-saved"><Check size={15} /> 网络代理设置已保存，重启 Lux 后生效。</p> : null}
         {saveProxy.error ? <p className="lux-error-copy">{saveProxy.error.message}</p> : null}
+        {testProxy.error ? <p className="lux-error-copy">{testProxy.error.message}</p> : null}
+        {proxyDiagnostics ? <NetworkProxyDiagnosticsView diagnostics={proxyDiagnostics} /> : null}
       </section>
 
       <section className="lux-admin-panel lux-admin-settings-note">
@@ -134,6 +157,28 @@ export function AdminSettingsPage() {
       </section>
     </div>
   );
+}
+
+function NetworkProxyDiagnosticsView({ diagnostics }: { diagnostics: NetworkProxyDiagnostics }) {
+  return (
+    <div className="lux-network-proxy-diagnostics" role="status" aria-live="polite">
+      <div className="lux-network-proxy-egress">
+        <div><span>网络出口 IP</span><strong>{diagnostics.egressIp ?? "未获取"}</strong></div>
+        <div><span>出口国家/地区</span><strong>{diagnostics.egressCountry ?? "未获取"}</strong></div>
+      </div>
+      <p className="lux-network-proxy-help">检测来源：{diagnostics.proxySource === "input" ? "当前输入地址" : diagnostics.proxySource === "settings" ? "已保存设置" : diagnostics.proxySource === "environment" ? "环境变量" : "当前直连配置"}。延迟为 Lux 服务端发起请求到收到响应的耗时。</p>
+      <ul className="lux-network-proxy-probes" aria-label="网络代理延迟检测结果">
+        {diagnostics.probes.map((probe) => <NetworkProxyProbeRow key={probe.id} probe={probe} />)}
+      </ul>
+    </div>
+  );
+}
+
+function NetworkProxyProbeRow({ probe }: { probe: NetworkProxyProbe }) {
+  const result = probe.reachable
+    ? `${probe.latencyMs ?? "—"} ms${probe.status ? ` · HTTP ${probe.status}` : ""}`
+    : `检测失败（${probe.error ?? "请求失败"}）`;
+  return <li><span>{probe.label}</span><strong>{result}</strong></li>;
 }
 
 function AdminSettingsState({ label, error = false }: { label: string; error?: boolean }) {

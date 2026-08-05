@@ -47,6 +47,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
 - `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）、`resumeMinTicks`（非负）和 `mediaStrategy`。媒体策略的图像开关为 `poster`、`logo`、`thumbnail`、`banner`、`disc`、`artwork`、`wallpaper`，另有元数据/图片语言、地区、默认刮削器、`metadataRefreshMode`（`FILL_MISSING` 或 `FULL_REFRESH`）、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。旧策略 JSON 缺少新增字段时默认按 `FILL_MISSING` 处理。网络代理设置通过 `networkProxyUrl` 写入，支持 `http`、`https`、`socks4`、`socks4a`、`socks5` 和 `socks5h`；传 `null` 清除。响应中的 `networkProxy` 只返回脱敏地址、是否配置认证、来源和重启提示，不返回认证信息。写操作需要管理员 Web session 和 CSRF，响应不包含任何插件凭据。
+- `POST /api/v1/admin/settings/network-proxy/test`：管理员检测当前输入或已生效的网络代理；服务端只请求 TMDb、百度、Google 和 Cloudflare 四个固定目标，返回逐站延迟/HTTP 状态、网络出口 IP 和 Cloudflare 返回的两位国家/地区代码。需要管理员 Web session 和 CSRF；认证信息不会出现在响应或日志中。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、配置目录实际写入能力、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，支持 `page`、`pageSize`、`level` 和 `eventCode` 筛选。
 

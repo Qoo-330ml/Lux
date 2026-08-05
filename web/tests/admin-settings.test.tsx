@@ -99,4 +99,44 @@ describe("AdminSettingsPage network proxy", () => {
 
     expect(update).toHaveBeenCalledWith({ networkProxyUrl: "http://192.168.1.2:7890/" });
   });
+
+  it("tests the four network targets and shows egress details", async () => {
+    const diagnostics = vi.spyOn(api, "testAdminNetworkProxy").mockResolvedValue({
+      proxySource: "input",
+      egressIp: "203.0.113.10",
+      egressCountry: "CN",
+      probes: [
+        { id: "tmdb", label: "TMDb", latencyMs: 123, status: 401, reachable: true, error: null },
+        { id: "baidu", label: "百度", latencyMs: 88, status: 200, reachable: true, error: null },
+        { id: "google", label: "Google", latencyMs: 156, status: 204, reachable: true, error: null },
+        { id: "cloudflare", label: "Cloudflare", latencyMs: 77, status: 200, reachable: true, error: null },
+      ],
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminSettingsPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("检测延迟与出口"))
+        ?.click();
+    });
+
+    expect(diagnostics).toHaveBeenCalledWith("http://192.168.1.2:7890/");
+    expect(container.textContent).toContain("203.0.113.10");
+    expect(container.textContent).toContain("CN");
+    expect(container.textContent).toContain("TMDb");
+    expect(container.textContent).toContain("123 ms");
+  });
 });
