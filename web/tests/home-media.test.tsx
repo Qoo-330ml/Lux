@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
-import { ContinueWatchingRail, MediaRail } from "../src/features/home/media";
+import { ContinueWatchingRail, MediaCard, MediaRail } from "../src/features/home/media";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -77,6 +77,27 @@ describe("ContinueWatchingRail", () => {
     expect(badge?.classList.contains("is-compact")).toBe(true);
     expect(badge?.querySelector(".lux-rating-source")).toBeNull();
     expect(badge?.querySelector("svg")).toBeNull();
+  });
+
+  it("shows a series episode count on the opposite side of the poster rating", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaCard
+            item={{ id: "series-1", title: "示例剧集", itemType: "SERIES", rating: 8.1, episodeCount: 12 }}
+            compactRating
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector(".lux-card-rating")?.classList.contains("lux-rating")).toBe(true);
+    expect(container.querySelector(".lux-media-episode-count")?.textContent).toBe("12 集");
+    expect(container.querySelector(".lux-media-art")?.textContent).toContain("12 集");
   });
 
   it("hides the section when there are no resume items", () => {

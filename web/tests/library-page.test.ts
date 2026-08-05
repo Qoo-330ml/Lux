@@ -150,6 +150,44 @@ describe("LibraryPage infinite scroll", () => {
     expect(badge?.querySelector("svg")).toBeNull();
   });
 
+  it("renders the episode count on series posters", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电视剧", kind: "SERIES" }],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "series-1", title: "示例剧集", itemType: "SERIES", episodeCount: 24 }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector(".lux-media-episode-count")).toBeTruthy());
+    });
+
+    expect(container.querySelector(".lux-media-episode-count")?.textContent).toBe("24 集");
+  });
+
   it("reloads the first page with the selected release-date sort", async () => {
     vi.spyOn(api, "libraries").mockResolvedValue({
       libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
