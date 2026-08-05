@@ -1,5 +1,6 @@
 /target/
 /output/
+/dist/
 /.playwright-cli/
 /web/node_modules/
 /web/dist/
