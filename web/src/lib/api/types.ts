@@ -71,12 +71,15 @@ export type MediaItem = {
   overview?: string | null;
   itemType?: "MOVIE" | "SERIES" | "SEASON" | "EPISODE" | "BOX_SET" | string;
   productionYear?: number | null;
+  rating?: number | null;
+  ratingSource?: string | null;
   runtimeTicks?: number | null;
   imageTags?: ImageTags;
   userData?: UserData;
   mediaSources?: MediaSource[];
   actors?: MediaActor[];
   parentId?: string | null;
+  seriesId?: string | null;
   indexNumber?: number | null;
   parentIndexNumber?: number | null;
 };

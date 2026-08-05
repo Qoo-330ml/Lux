@@ -25,7 +25,7 @@ describe("MediaDetailPage series hierarchy", () => {
     vi.restoreAllMocks();
   });
 
-  it("shows seasons and episodes for a series instead of a movie-only detail", async () => {
+  it("shows portrait season cards on a series detail", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "series-1",
       title: "示例剧集",
@@ -35,7 +35,7 @@ describe("MediaDetailPage series hierarchy", () => {
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
       items: options?.itemType === "SEASON"
-        ? [{ id: "season-1", title: "第一季", itemType: "SEASON" }]
+        ? [{ id: "season-1", title: "第一季", itemType: "SEASON", imageTags: { poster: "season-poster" } }]
         : [{ id: "episode-1", title: "第一集", itemType: "EPISODE" }],
       total: 1,
       page: 1,
@@ -66,8 +66,130 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     expect(container.querySelector(".lux-detail-copy .lux-eyebrow")).toBeNull();
-    expect(container.querySelector(".lux-series-children")?.textContent).toContain("第一季");
-    expect(container.querySelector(".lux-episode-list")?.textContent).toContain("第一集");
+    expect(container.querySelector(".lux-season-rail")?.textContent).toContain("第一季");
+    expect(container.querySelector(".lux-season-card img")?.getAttribute("src"))
+      .toBe("/api/v1/items/season-1/images/poster");
+    expect(container.querySelector(".lux-season-tabs")).toBeNull();
+    expect(container.querySelector(".lux-episode-list")).toBeNull();
+  });
+
+  it("shows landscape episode rows on a season detail", async () => {
+    vi.spyOn(api, "item").mockImplementation(async (itemId) => itemId === "season-1"
+      ? {
+        id: "season-1",
+        title: "第三季",
+        itemType: "SEASON",
+        parentId: "series-1",
+        seriesId: "series-1",
+        parentIndexNumber: 3,
+        imageTags: { poster: "season-poster" },
+        mediaSources: [],
+      }
+      : { id: "series-1", title: "示例剧集", itemType: "SERIES", mediaSources: [] });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({
+      items: [
+        { id: "episode-1", title: "第一集", itemType: "EPISODE", indexNumber: 1, imageTags: { fanart: "episode-fanart" } },
+        { id: "episode-2", title: "第二集", itemType: "EPISODE", indexNumber: 2, imageTags: { fanart: "episode-fanart-2" } },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 60,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/season-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-detail-page-season")).not.toBeNull();
+    expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("示例剧集");
+    expect(container.querySelector(".lux-detail-subtitle")?.textContent).toContain("第 3 季");
+    expect(container.querySelectorAll(".lux-season-episode-row")).toHaveLength(2);
+    expect(container.querySelector(".lux-season-episode-row strong")?.textContent).toBe("1. 第一集");
+    expect(container.querySelector(".lux-season-episode-thumb img")?.getAttribute("src"))
+      .toBe("/api/v1/items/episode-1/images/fanart");
+  });
+
+  it("shows a landscape episode hero and more episodes from its season", async () => {
+    vi.spyOn(api, "item").mockImplementation(async (itemId) => {
+      if (itemId === "episode-3") {
+        return {
+          id: "episode-3",
+          title: "第三集标题",
+          itemType: "EPISODE",
+          parentId: "season-1",
+          seriesId: "series-1",
+          parentIndexNumber: 3,
+          indexNumber: 3,
+          imageTags: { fanart: "episode-fanart-3" },
+          mediaSources: [],
+        };
+      }
+      return { id: "series-1", title: "示例剧集", itemType: "SERIES", mediaSources: [] };
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({
+      items: [
+        { id: "episode-2", title: "第二集", itemType: "EPISODE", indexNumber: 2, imageTags: { fanart: "episode-fanart-2" } },
+        { id: "episode-3", title: "第三集标题", itemType: "EPISODE", indexNumber: 3, imageTags: { fanart: "episode-fanart-3" } },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 60,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/episode-3"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-detail-page-episode")).not.toBeNull();
+    expect(container.querySelector(".lux-detail-poster.is-landscape")).not.toBeNull();
+    expect(container.querySelector(".lux-detail-poster.is-landscape img")?.getAttribute("src"))
+      .toBe("/api/v1/items/episode-3/images/fanart");
+    expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("示例剧集");
+    expect(container.querySelector(".lux-detail-subtitle")?.textContent).toContain("S3.E3");
+    expect(container.querySelector(".lux-episode-rail")?.textContent).toContain("更多来自第 3 季");
+    expect(container.querySelectorAll(".lux-episode-card")).toHaveLength(1);
+    expect(container.querySelector(".lux-episode-card img")?.getAttribute("src"))
+      .toBe("/api/v1/items/episode-2/images/fanart");
   });
 
   it("uses the server playback state for the watched indicator", async () => {

@@ -8,7 +8,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
 import { MediaInfoPanel } from "./MediaInfoPanel";
 import { MediaCast } from "./MediaCast";
-import { imageUrl, mediaTitle, mediaTypeLabel, runtimeLabel } from "../home/media";
+import { Rating, imageUrl, mediaTitle, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
@@ -24,27 +24,43 @@ export function MediaDetailPage() {
   const itemImages = useQuery({ queryKey: queryKeys.itemImages(itemId), queryFn: () => api.itemImages(itemId), enabled: Boolean(itemId) });
   const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
   const [selectedSourceId, setSelectedSourceId] = useState<string>();
-  const [selectedSeasonId, setSelectedSeasonId] = useState<string>();
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const isSeries = item.data?.itemType === "SERIES";
+  const isSeason = item.data?.itemType === "SEASON";
+  const isEpisode = item.data?.itemType === "EPISODE";
   const seasons = useQuery({
     queryKey: queryKeys.children(itemId, "SEASON"),
     queryFn: () => api.children(itemId, { itemType: "SEASON" }),
     enabled: isSeries,
   });
-  const activeSeasonId = selectedSeasonId ?? seasons.data?.items?.[0]?.id;
+  const activeSeasonId = seasons.data?.items?.[0]?.id;
+  const hierarchySeriesId = item.data && !isSeries
+    ? item.data.seriesId ?? item.data.parentId ?? undefined
+    : undefined;
+  const seriesContext = useQuery({
+    queryKey: queryKeys.item(hierarchySeriesId ?? ""),
+    queryFn: () => api.item(hierarchySeriesId ?? ""),
+    enabled: Boolean(hierarchySeriesId),
+  });
+  const episodeSeriesId = isSeries ? itemId : hierarchySeriesId;
+  const episodeSeasonId = isSeries
+    ? activeSeasonId
+    : isSeason
+      ? item.data?.id
+      : isEpisode
+        ? item.data?.parentId ?? undefined
+        : undefined;
   const episodes = useQuery({
-    queryKey: queryKeys.children(itemId, "EPISODE", activeSeasonId),
-    queryFn: () => api.children(itemId, { itemType: "EPISODE", seasonId: activeSeasonId }),
-    enabled: isSeries && Boolean(activeSeasonId),
+    queryKey: queryKeys.children(episodeSeriesId ?? itemId, "EPISODE", episodeSeasonId),
+    queryFn: () => api.children(episodeSeriesId ?? itemId, { itemType: "EPISODE", seasonId: episodeSeasonId }),
+    enabled: Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode),
   });
 
   useEffect(() => {
     setSelectedSourceId(undefined);
-    setSelectedSeasonId(undefined);
   }, [itemId]);
 
   if (item.isPending) return <section className="lux-page-state"><p>正在加载媒体详情…</p></section>;
@@ -54,6 +70,15 @@ export function MediaDetailPage() {
   const logo = itemImages.data?.images?.find((image) => image.imageType.toUpperCase() === "LOGO");
   const backdrop = imageUrl(media, "fanart") ?? imageUrl(media);
   const poster = imageUrl(media);
+  const detailKind = isSeries ? "series" : isSeason ? "season" : isEpisode ? "episode" : "movie";
+  const detailTitle = isSeries || (!isSeason && !isEpisode)
+    ? mediaTitle(media)
+    : mediaTitle(seriesContext.data ?? media);
+  const detailSubtitle = isSeason
+    ? `第 ${media.parentIndexNumber ?? ""} 季`
+    : isEpisode
+      ? `S${media.parentIndexNumber ?? "?"}.E${media.indexNumber ?? "?"} · ${mediaTitle(media)}`
+      : undefined;
   const sources = media.mediaSources ?? [];
   const source = sources.find((entry) => entry.id === selectedSourceId)
     ?? sources.find((entry) => entry.isDefault)
@@ -96,16 +121,24 @@ export function MediaDetailPage() {
   }
 
   return (
-    <article className="lux-detail-page">
+    <article className={`lux-detail-page lux-detail-page-${detailKind}`}>
       {backdrop ? <img className="lux-detail-backdrop" src={backdrop} alt="" /> : null}
       <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
         <div className="lux-detail-grid">
-          <div className="lux-detail-poster">{poster ? <img src={poster} alt={`${mediaTitle(media)} 海报`} /> : <span><Sparkles size={32} />{mediaTitle(media)}</span>}</div>
+          <div className={`lux-detail-poster${isEpisode ? " is-landscape" : ""}`}>
+            {isEpisode && backdrop
+              ? <img src={backdrop} alt={`${mediaTitle(media)} 剧照`} />
+              : poster
+                ? <img src={poster} alt={`${mediaTitle(media)} 海报`} />
+                : <span><Sparkles size={32} />{mediaTitle(media)}</span>}
+            <Rating value={media.rating} source={media.ratingSource} />
+          </div>
           <div className="lux-detail-copy">
             <div className="lux-detail-title-row">
               {logo ? <img className="lux-detail-logo" src={logo.url} alt={`${mediaTitle(media)} 徽标`} /> : null}
-              <h1>{mediaTitle(media)}</h1>
+              <h1>{detailTitle}</h1>
+              {detailSubtitle ? <p className="lux-detail-subtitle">{detailSubtitle}</p> : null}
             </div>
             <div className="lux-detail-meta">
               {media.productionYear ? <span>{media.productionYear}</span> : null}
@@ -143,12 +176,10 @@ export function MediaDetailPage() {
         {isSeries ? (
           <SeriesChildren
             seasons={seasons.data?.items ?? []}
-            activeSeasonId={activeSeasonId}
-            onSelectSeason={setSelectedSeasonId}
-            episodes={episodes.data?.items ?? []}
-            episodesPending={episodes.isPending}
           />
         ) : null}
+        {isSeason ? <SeasonEpisodes episodes={episodes.data?.items ?? []} episodesPending={episodes.isPending} /> : null}
+        {isEpisode ? <EpisodeRail episodes={episodes.data?.items ?? []} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
       </div>
       {editor === "metadata" ? <MediaMetadataEditor item={media} onClose={() => setEditor(undefined)} /> : null}
       {editor === "images" ? <MediaImageEditor item={media} onClose={() => {
@@ -368,49 +399,103 @@ function uniqueSourceLabels(labels: Array<string | undefined>) {
 
 function SeriesChildren({
   seasons,
-  activeSeasonId,
-  onSelectSeason,
-  episodes,
-  episodesPending,
 }: {
   seasons: MediaItem[];
-  activeSeasonId?: string;
-  onSelectSeason: (seasonId: string) => void;
-  episodes: MediaItem[];
-  episodesPending: boolean;
 }) {
   return (
     <section className="lux-series-children" aria-labelledby="series-children-heading">
       <div className="lux-section-heading">
-        <h2 id="series-children-heading">季度与单集</h2>
+        <h2 id="series-children-heading">播出季</h2>
         <span>{seasons.length} 个季度</span>
       </div>
-      <div className="lux-season-tabs" role="tablist" aria-label="选择季度">
+      <div className="lux-season-rail" role="list" aria-label="播出季">
         {seasons.map((season) => (
-          <button
-            className={season.id === activeSeasonId ? "lux-season-tab is-active" : "lux-season-tab"}
+          <Link
+            className="lux-season-card"
             key={season.id}
-            type="button"
-            role="tab"
-            aria-selected={season.id === activeSeasonId}
-            onClick={() => onSelectSeason(season.id)}
+            role="listitem"
+            to={`/items/${season.id}`}
           >
-            {mediaTitle(season)}
-          </button>
+            <span className="lux-season-card-art">
+              {imageUrl(season) ? <img src={imageUrl(season)} alt={`${mediaTitle(season)} 海报`} loading="lazy" /> : <span>{mediaTitle(season)}</span>}
+              <Rating value={season.rating} source={season.ratingSource} />
+            </span>
+            <strong>{mediaTitle(season)}</strong>
+          </Link>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function SeasonEpisodes({ episodes, episodesPending }: { episodes: MediaItem[]; episodesPending: boolean }) {
+  return (
+    <section className="lux-season-episodes" aria-labelledby="season-episodes-heading">
+      <div className="lux-section-heading">
+        <h2 id="season-episodes-heading">单集</h2>
+        <span>{episodes.length} 集</span>
       </div>
       {episodesPending ? <p className="lux-muted-copy">正在加载单集…</p> : null}
       {!episodesPending && episodes.length ? (
-        <div className="lux-episode-list" role="list">
-          {episodes.map((episode) => (
-            <Link className="lux-episode-link" key={episode.id} role="listitem" to={`/items/${episode.id}`}>
-              <span><strong>{mediaTitle(episode)}</strong><small>{mediaTypeLabel(episode.itemType)}</small></span>
-              <span aria-hidden="true">查看详情 →</span>
-            </Link>
-          ))}
+        <div className="lux-season-episode-list" role="list">
+          {episodes.map((episode, index) => <SeasonEpisodeRow episode={episode} fallbackNumber={index + 1} key={episode.id} />)}
         </div>
       ) : null}
       {!episodesPending && !episodes.length ? <p className="lux-muted-copy">这个季度还没有可播放的单集。</p> : null}
+    </section>
+  );
+}
+
+function SeasonEpisodeRow({ episode, fallbackNumber }: { episode: MediaItem; fallbackNumber: number }) {
+  const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
+  const number = episode.indexNumber ?? fallbackNumber;
+  return (
+    <Link className="lux-season-episode-row" role="listitem" to={`/items/${episode.id}`}>
+      <span className="lux-season-episode-thumb">
+        {image ? <img src={image} alt="" loading="lazy" /> : <span>{mediaTitle(episode)}</span>}
+      </span>
+      <span className="lux-season-episode-copy">
+        <strong>{number}. {mediaTitle(episode)}</strong>
+        {episode.productionYear ? <small>{episode.productionYear}</small> : null}
+        {episode.overview ? <p>{episode.overview}</p> : null}
+      </span>
+      <span className="lux-season-episode-arrow" aria-hidden="true">查看详情 →</span>
+    </Link>
+  );
+}
+
+function EpisodeRail({
+  episodes,
+  currentEpisodeId,
+  seasonNumber,
+  episodesPending,
+}: {
+  episodes: MediaItem[];
+  currentEpisodeId: string;
+  seasonNumber?: number | null;
+  episodesPending: boolean;
+}) {
+  const otherEpisodes = episodes.filter((episode) => episode.id !== currentEpisodeId);
+  if (episodesPending || !otherEpisodes.length) return null;
+  return (
+    <section className="lux-episode-rail" aria-labelledby="episode-rail-heading">
+      <div className="lux-section-heading">
+        <h2 id="episode-rail-heading">更多来自第 {seasonNumber ?? ""} 季</h2>
+        <span>{otherEpisodes.length} 集</span>
+      </div>
+      <div className="lux-episode-card-rail" role="list">
+        {otherEpisodes.map((episode) => {
+          const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
+          return (
+            <Link className="lux-episode-card" role="listitem" key={episode.id} to={`/items/${episode.id}`}>
+              <span className="lux-episode-card-art">
+                {image ? <img src={image} alt="" loading="lazy" /> : <span>{mediaTitle(episode)}</span>}
+              </span>
+              <strong>{episode.indexNumber ? `${episode.indexNumber}. ` : ""}{mediaTitle(episode)}</strong>
+            </Link>
+          );
+        })}
+      </div>
     </section>
   );
 }

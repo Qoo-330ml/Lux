@@ -349,6 +349,15 @@ export function LibraryCard({ library }: { library: Library }) {
   );
 }
 
-export function Rating({ value }: { value?: number | null }) {
-  return value ? <span className="lux-rating"><Star size={15} fill="currentColor" /> {value.toFixed(1)}</span> : null;
+export function Rating({ value, source }: { value?: number | null; source?: string | null }) {
+  if (value == null || !Number.isFinite(value) || value < 0 || value > 10) return null;
+  const score = value.toFixed(1);
+  const label = source ? source + " 评分 " + score : "评分 " + score;
+  return (
+    <span className="lux-rating" aria-label={label} title={label}>
+      <Star size={14} fill="currentColor" aria-hidden="true" />
+      {source ? <span className="lux-rating-source">{source}</span> : null}
+      <strong>{score}</strong>
+    </span>
+  );
 }
