@@ -101,4 +101,46 @@ describe("LibraryPage infinite scroll", () => {
     expect(container.querySelectorAll(".lux-media-card")).toHaveLength(2);
     expect(container.textContent).toContain("电视剧 2");
   });
+
+  it("renders library ratings as compact numeric pills", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "movie-1", title: "示例电影", itemType: "MOVIE", rating: 6.7, ratingSource: "TMDb" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector(".lux-media-card .lux-rating")).toBeTruthy());
+    });
+
+    const badge = container.querySelector(".lux-media-card .lux-rating");
+    expect(badge?.classList.contains("is-compact")).toBe(true);
+    expect(badge?.textContent).toBe("6.7");
+    expect(badge?.querySelector(".lux-rating-source")).toBeNull();
+    expect(badge?.querySelector("svg")).toBeNull();
+  });
 });

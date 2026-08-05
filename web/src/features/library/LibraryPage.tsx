@@ -54,7 +54,7 @@ export function LibraryPage() {
     <section className="lux-page lux-page-narrow">
       <div className="lux-page-heading"><span className="lux-eyebrow">LIBRARY</span><h1>{library?.name || "媒体库"}</h1><p>{total} 项内容</p></div>
       <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} key={item.id} />)}
+        {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} />)}
       </div>
       {!loadedItems.length ? <div className="lux-empty-card"><span>这个媒体库还没有内容。</span><Link to="/libraries">返回媒体库</Link></div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />
