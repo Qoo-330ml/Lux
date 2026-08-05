@@ -179,7 +179,7 @@ impl MetadataState {
             MetadataField::Overview,
             MetadataField::ProductionYear,
         ] {
-            if self.locked_fields.contains(&field) || self.has_value(field) {
+            if self.locked_fields.contains(&field) {
                 continue;
             }
             self.apply_value(field, candidate, false);
@@ -205,7 +205,7 @@ impl MetadataState {
         match field {
             MetadataField::Title => {
                 if let Some(value) = non_empty(candidate.metadata.title.as_deref())
-                    && (force || !self.has_value(field))
+                    && (force || self.can_fill(field, source))
                 {
                     self.metadata.title = Some(value.to_owned());
                     self.provenance.insert(field, source);
@@ -213,7 +213,7 @@ impl MetadataState {
             }
             MetadataField::OriginalTitle => {
                 if let Some(value) = non_empty(candidate.metadata.original_title.as_deref())
-                    && (force || !self.has_value(field))
+                    && (force || self.can_fill(field, source))
                 {
                     self.metadata.original_title = Some(value.to_owned());
                     self.provenance.insert(field, source);
@@ -221,7 +221,7 @@ impl MetadataState {
             }
             MetadataField::Overview => {
                 if let Some(value) = non_empty(candidate.metadata.overview.as_deref())
-                    && (force || !self.has_value(field))
+                    && (force || self.can_fill(field, source))
                 {
                     self.metadata.overview = Some(value.to_owned());
                     self.provenance.insert(field, source);
@@ -229,7 +229,7 @@ impl MetadataState {
             }
             MetadataField::ProductionYear => {
                 if let Some(value) = candidate.metadata.production_year
-                    && (force || !self.has_value(field))
+                    && (force || self.can_fill(field, source))
                 {
                     self.metadata.production_year = Some(value);
                     self.provenance.insert(field, source);
@@ -274,6 +274,18 @@ impl MetadataState {
             .copied()
             .unwrap_or(MetadataSource::Fallback);
         !self.has_value(field) || source.priority() >= current.priority()
+    }
+
+    fn can_fill(&self, field: MetadataField, source: MetadataSource) -> bool {
+        if !self.has_value(field) {
+            return true;
+        }
+        let current = self
+            .provenance
+            .get(&field)
+            .copied()
+            .unwrap_or(MetadataSource::Fallback);
+        source.priority() > current.priority()
     }
 
     fn apply_text(&mut self, field: MetadataField, value: &str, source: MetadataSource) {

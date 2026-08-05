@@ -186,6 +186,10 @@ fn explicit_selection_modes_fill_or_refresh_only_unlocked_fields() {
         production_year: Some(2020),
         ..NfoMetadata::default()
     });
+    fill.provenance
+        .insert(MetadataField::Title, MetadataSource::LocalNfo);
+    fill.provenance
+        .insert(MetadataField::ProductionYear, MetadataSource::LocalNfo);
     fill.apply_fill_missing(&candidate);
     assert_eq!(fill.metadata.title.as_deref(), Some("本地标题"));
     assert_eq!(fill.metadata.overview.as_deref(), Some("在线简介"));
@@ -205,6 +209,28 @@ fn explicit_selection_modes_fill_or_refresh_only_unlocked_fields() {
         },
     });
     assert_eq!(refresh.metadata.title.as_deref(), Some("在线标题"));
+}
+
+#[test]
+fn fill_missing_replaces_scanner_fallback_with_online_episode_title() {
+    let mut state = MetadataState::from_metadata(NfoMetadata {
+        title: Some("暗夜与黎明".to_owned()),
+        ..NfoMetadata::default()
+    });
+
+    state.apply_fill_missing(&MetadataCandidate {
+        source: MetadataSource::ScraperLocalized,
+        metadata: NfoMetadata {
+            title: Some("第一集：暗夜与黎明".to_owned()),
+            ..NfoMetadata::default()
+        },
+    });
+
+    assert_eq!(state.metadata.title.as_deref(), Some("第一集：暗夜与黎明"));
+    assert_eq!(
+        state.provenance.get(&MetadataField::Title),
+        Some(&MetadataSource::ScraperLocalized)
+    );
 }
 
 #[test]
