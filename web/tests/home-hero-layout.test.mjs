@@ -11,6 +11,7 @@ test("hero carousel controls share a flexible row and stay at its right edge", (
   assert.match(actionRowRule, /display:\s*flex/);
   assert.match(actionRowRule, /align-items:\s*center/);
   assert.match(actionRowRule, /flex-wrap:\s*wrap/);
+  assert.match(actionRowRule, /width:\s*calc\(100vw\s*-\s*clamp\(24px,\s*7\.4vw,\s*150px\)\s*-\s*48px\)/);
   assert.match(carouselRule, /margin-left:\s*auto/);
   assert.match(carouselRule, /margin-top:\s*0/);
 });
@@ -19,6 +20,10 @@ test("hero keeps a shorter vertical footprint across responsive breakpoints", ()
   assert.match(stylesheet, /\.lux-hero\s*\{[^}]*min-height:\s*min\(82vh,\s*820px\)/);
   assert.match(stylesheet, /@media \(max-width: 900px\) \{[\s\S]*?\.lux-hero\s*\{\s*min-height:\s*680px/);
   assert.match(stylesheet, /@media \(max-width: 560px\) \{[\s\S]*?\.lux-hero\s*\{\s*min-height:\s*620px/);
+});
+
+test("hero action row returns to the copy width on small screens", () => {
+  assert.match(stylesheet, /@media \(max-width: 560px\) \{[\s\S]*?\.lux-hero-action-row\s*\{[^}]*width:\s*100%/);
 });
 
 test("hero logos fit inside the title area without distortion", () => {
