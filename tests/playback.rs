@@ -114,6 +114,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert_eq!(playback_info.status(), reqwest::StatusCode::OK);
     let playback_body = playback_info.json::<Value>().await?;
     assert_eq!(playback_body["MediaSources"][0]["Id"], source_id);
+    assert!(playback_body["PlaySessionId"].as_str().is_some());
     assert_eq!(
         playback_body["MediaSources"].as_array().map(Vec::len),
         Some(2)

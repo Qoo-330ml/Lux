@@ -27,6 +27,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use uuid::Uuid;
 
 use crate::{
     COMMIT, VERSION,
@@ -1775,6 +1776,7 @@ async fn emby_playback_info(
         sources.insert(0, source);
     }
     Json(json!({
+        "PlaySessionId": Uuid::now_v7().to_string(),
         "MediaSources": sources
             .into_iter()
             .map(|source| emby_media_source_json(&item.id, source))
