@@ -76,6 +76,56 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-episode-list")).toBeNull();
   });
 
+  it("shows the available series metadata in the detail hero", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "series-1",
+      title: "示例剧集",
+      originalTitle: "Rick and Morty",
+      itemType: "SERIES",
+      premiereDate: "2013-12-02",
+      rating: 8.68,
+      ratingSource: "TMDb",
+      providerIds: { tmdb: "60625" },
+      seasonCount: 7,
+      episodeCount: 91,
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 60 });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/series-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("示例剧集");
+    expect(container.querySelector(".lux-detail-original-title")?.textContent).toBe("Rick and Morty");
+    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("首播 2013-12-02");
+    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("7 季");
+    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("91 集");
+    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("TMDb 60625");
+    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("评分 8.7");
+    expect(container.querySelector(".lux-season-rail")).not.toBeNull();
+  });
+
   it("shows landscape episode rows on a season detail", async () => {
     vi.spyOn(api, "item").mockImplementation(async (itemId) => itemId === "season-1"
       ? {

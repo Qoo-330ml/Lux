@@ -74,6 +74,8 @@ export function MediaDetailPage() {
   const detailTitle = isSeries || (!isSeason && !isEpisode)
     ? mediaTitle(media)
     : mediaTitle(seriesContext.data ?? media);
+  const detailOriginalTitle = media.originalTitle?.trim();
+  const tmdbId = providerId(media.providerIds, "tmdb");
   const detailSubtitle = isSeason
     ? `第 ${media.parentIndexNumber ?? ""} 季`
     : isEpisode
@@ -137,10 +139,23 @@ export function MediaDetailPage() {
             <div className="lux-detail-title-row">
               {logo ? <img className="lux-detail-logo" src={logo.url} alt={`${mediaTitle(media)} 徽标`} /> : null}
               <h1>{detailTitle}</h1>
+              {detailOriginalTitle && detailOriginalTitle !== detailTitle
+                ? <p className="lux-detail-original-title">{detailOriginalTitle}</p>
+                : null}
               {detailSubtitle ? <p className="lux-detail-subtitle">{detailSubtitle}</p> : null}
             </div>
             <div className="lux-detail-meta">
-              {media.productionYear ? <span>{media.productionYear}</span> : null}
+              {media.premiereDate
+                ? <span>首播 {media.premiereDate}</span>
+                : media.productionYear
+                  ? <span>{media.productionYear}</span>
+                  : null}
+              {isSeries && media.seasonCount != null ? <span>{media.seasonCount} 季</span> : null}
+              {isSeries && media.episodeCount != null ? <span>{media.episodeCount} 集</span> : null}
+              {tmdbId ? <span>TMDb {tmdbId}</span> : null}
+              {media.rating != null && Number.isFinite(media.rating)
+                ? <span>{media.ratingSource ? `${media.ratingSource} 评分` : "评分"} {media.rating.toFixed(1)}</span>
+                : null}
               {runtimeLabel(media.runtimeTicks) ? <span>{runtimeLabel(media.runtimeTicks)}</span> : null}
               {source?.qualityLabel ? <span>{source.qualityLabel}</span> : null}
             </div>
@@ -394,6 +409,10 @@ function uniqueSourceLabels(labels: Array<string | undefined>) {
     seen.add(key);
     return true;
   });
+}
+
+function providerId(providerIds: Record<string, string> | null | undefined, provider: string) {
+  return Object.entries(providerIds ?? {}).find(([name]) => name.toLowerCase() === provider.toLowerCase())?.[1];
 }
 
 function SeriesChildren({
