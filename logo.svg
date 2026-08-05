@@ -1,4 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="213" height="240" viewBox="174.5 171.5 213 240">
+<svg xmlns="http://www.w3.org/2000/svg" width="215" height="242" viewBox="173.5 170.5 215 242">
+  <defs>
+    <filter id="logo-outline" filterUnits="userSpaceOnUse" primitiveUnits="userSpaceOnUse" x="170" y="167" width="222" height="249" color-interpolation-filters="sRGB">
+      <feMorphology in="SourceAlpha" operator="dilate" radius="6" result="outer" />
+      <feMorphology in="SourceAlpha" operator="dilate" radius="5" result="inner" />
+      <feComposite in="outer" in2="inner" operator="out" result="ring" />
+      <feFlood flood-color="#000000" result="ring-color" />
+      <feComposite in="ring-color" in2="ring" operator="in" result="outline" />
+      <feMerge>
+        <feMergeNode in="outline" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+  <g filter="url(#logo-outline)">
   <!-- 背景色块 -->
   <polygon points="216,177.233 300,177.233 274,367.233 190,367.233" fill="#222222" />
   <polygon points="278.705,218.817 364.705,218.817 334.705,405.817 252.705,405.817" fill="#B8B8B8" />
@@ -7,5 +21,5 @@
   <text x="211" y="315" font-family="Arial, sans-serif" font-size="115" font-weight="bold" font-style="italic" fill="#B8B8B8" text-anchor="middle" dominant-baseline="middle">L</text>
   <text x="272" y="320" font-family="Arial, sans-serif" font-size="85" font-weight="bold" font-style="italic" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">u</text>
   <text x="336" y="315" font-family="Arial, sans-serif" font-size="100" font-weight="bold" font-style="italic" fill="#222222" text-anchor="middle" dominant-baseline="middle">X</text>
-  <rect x="175" y="172" width="212" height="239" fill="none" stroke="#000000" stroke-width="1" />
+  </g>
 </svg>
