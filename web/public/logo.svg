@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="215" height="242" viewBox="173.5 170.5 215 242">
+<svg xmlns="http://www.w3.org/2000/svg" width="223" height="250" viewBox="169.5 166.5 223 250">
   <defs>
-    <filter id="logo-outline" filterUnits="userSpaceOnUse" primitiveUnits="userSpaceOnUse" x="170" y="167" width="222" height="249" color-interpolation-filters="sRGB">
-      <feMorphology in="SourceAlpha" operator="dilate" radius="6" result="outer" />
-      <feMorphology in="SourceAlpha" operator="dilate" radius="5" result="inner" />
+    <filter id="logo-outline" filterUnits="userSpaceOnUse" primitiveUnits="userSpaceOnUse" x="168" y="165" width="226" height="253" color-interpolation-filters="sRGB">
+      <feMorphology in="SourceAlpha" operator="dilate" radius="10" result="outer" />
+      <feMorphology in="SourceAlpha" operator="dilate" radius="8" result="inner" />
       <feFlood flood-color="#ffffff" result="halo-color" />
       <feComposite in="halo-color" in2="inner" operator="in" result="halo" />
       <feComposite in="outer" in2="inner" operator="out" result="ring" />
