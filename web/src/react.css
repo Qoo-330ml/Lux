@@ -52,7 +52,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-header-left, .lux-header-actions, .lux-brand, .lux-desktop-nav { display: flex; align-items: center; }
 .lux-header-left, .lux-header-actions { gap: 13px; }
 .lux-brand { gap: 10px; margin-left: 4px; }
-.lux-brand-mark { display: inline-grid; place-items: center; width: 34px; height: 34px; border: 1px solid rgba(255,255,255,.32); border-radius: 50%; color: #fff; background: rgba(0,0,0,.24); box-shadow: 0 5px 18px rgba(0,0,0,.28); }
+.lux-brand-logo { display: block; width: 34px; height: 34px; flex: 0 0 auto; object-fit: contain; filter: drop-shadow(0 5px 12px rgba(0,0,0,.28)); }
 .lux-brand-name { font-size: 1.15rem; font-weight: 650; letter-spacing: -.04em; }
 .lux-icon-button, .lux-user-button { display: inline-grid; place-items: center; min-width: 54px; height: 54px; border: 1px solid var(--lux-line); border-radius: 50%; color: var(--lux-text); background: rgba(5, 5, 6, .3); box-shadow: 0 6px 22px rgba(0,0,0,.18); transition: background .2s ease, border-color .2s ease, transform .2s var(--lux-ease); }
 .lux-icon-button:hover, .lux-user-button:hover { border-color: rgba(255,255,255,.36); background: rgba(255,255,255,.1); transform: translateY(-1px); }
@@ -1059,7 +1059,7 @@ html[data-lux-theme="light"] .lux-hero-dot.is-active { background: var(--lux-tex
 html[data-lux-theme="light"] .lux-button-glass { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.56); }
 html[data-lux-theme="light"] .lux-button-glass:hover { border-color: var(--lux-line); background: rgba(255,255,255,.88); }
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-header { background: linear-gradient(180deg, rgba(244,243,241,.94), rgba(244,243,241,0)); }
-html[data-lux-theme="light"] .lux-app.is-home-route .lux-brand-mark { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.58); }
+html[data-lux-theme="light"] .lux-app.is-home-route .lux-brand-logo { filter: drop-shadow(0 5px 12px rgba(0,0,0,.16)); }
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-brand-name,
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link,
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-icon-button,

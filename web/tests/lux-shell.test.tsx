@@ -43,6 +43,31 @@ describe("LuxShell user control", () => {
     expect(userButton?.textContent).toBe("T");
   });
 
+  it("renders the project logo in the brand link", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LuxShell
+            user={{
+              id: "user-1",
+              usernameNormalized: "test",
+              displayName: "test",
+            }}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const logo = container.querySelector<HTMLImageElement>(".lux-brand-logo");
+
+    expect(logo?.getAttribute("src")).toBe("/logo.svg");
+    expect(logo?.getAttribute("alt")).toBe("");
+  });
+
   it("does not render duplicate search or library actions in the header", () => {
     container = document.createElement("div");
     document.body.append(container);

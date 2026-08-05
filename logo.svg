@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="202" height="229" viewBox="180 177 202 229">
   <!-- 背景色块 -->
-  <polygon points="216,177.233 300,177.233 274,367.233 190,367.233" fill="#267A00" />
-  <polygon points="278.705,218.817 364.705,218.817 334.705,405.817 252.705,405.817" fill="#8EE000" />
+  <polygon points="216,177.233 300,177.233 274,367.233 190,367.233" fill="#222222" />
+  <polygon points="278.705,218.817 364.705,218.817 334.705,405.817 252.705,405.817" fill="#B8B8B8" />
 
   <!-- 字母（Arial 斜体加粗） -->
-  <text x="211" y="315" font-family="Arial, sans-serif" font-size="115" font-weight="bold" font-style="italic" fill="#8ee000" text-anchor="middle" dominant-baseline="middle">L</text>
+  <text x="211" y="315" font-family="Arial, sans-serif" font-size="115" font-weight="bold" font-style="italic" fill="#B8B8B8" text-anchor="middle" dominant-baseline="middle">L</text>
   <text x="272" y="320" font-family="Arial, sans-serif" font-size="85" font-weight="bold" font-style="italic" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">u</text>
-  <text x="336" y="315" font-family="Arial, sans-serif" font-size="100" font-weight="bold" font-style="italic" fill="#267a00" text-anchor="middle" dominant-baseline="middle">X</text>
+  <text x="336" y="315" font-family="Arial, sans-serif" font-size="100" font-weight="bold" font-style="italic" fill="#222222" text-anchor="middle" dominant-baseline="middle">X</text>
 </svg>

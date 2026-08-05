@@ -2,7 +2,6 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   Menu,
   Settings2,
-  Sparkles,
   UserRound,
   X,
 } from "lucide-react";
@@ -31,9 +30,7 @@ export function LuxShell({ user }: LuxShellProps) {
       <header className="lux-header">
         <div className="lux-header-left">
           <NavLink className="lux-brand" to="/" aria-label="Lux 首页">
-            <span className="lux-brand-mark" aria-hidden="true">
-              <Sparkles size={19} strokeWidth={1.6} />
-            </span>
+            <img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" />
             <span className="lux-brand-name">Lux</span>
           </NavLink>
           <nav className="lux-desktop-nav" aria-label="主导航">
