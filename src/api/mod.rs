@@ -1745,13 +1745,27 @@ async fn emby_playback_info(
 
 #[derive(Deserialize, Default)]
 struct PlaybackEventRequest {
-    #[serde(rename = "ItemId", alias = "itemId")]
+    #[serde(rename = "ItemId", alias = "itemId", alias = "mediaServerItemId")]
     item_id: String,
-    #[serde(rename = "MediaSourceId", alias = "mediaSourceId")]
+    #[serde(
+        rename = "MediaSourceId",
+        alias = "mediaSourceId",
+        alias = "mediaServerMediaSourceId"
+    )]
     media_source_id: Option<String>,
-    #[serde(rename = "PlaySessionId", alias = "playSessionId")]
+    #[serde(
+        rename = "PlaySessionId",
+        alias = "playSessionId",
+        alias = "mediaServerPlaySessionId"
+    )]
     play_session_id: Option<String>,
-    #[serde(rename = "PositionTicks", alias = "positionTicks", default)]
+    #[serde(
+        rename = "PositionTicks",
+        alias = "positionTicks",
+        alias = "PlaybackPositionTicks",
+        alias = "playbackPositionTicks",
+        default
+    )]
     position_ticks: i64,
     #[serde(rename = "RunTimeTicks", alias = "runTimeTicks")]
     duration_ticks: Option<i64>,

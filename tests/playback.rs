@@ -277,3 +277,136 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert_ne!(admin.id, viewer.id);
     Ok(())
 }
+
+#[tokio::test]
+async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("VidHub Playback Test 2024.mkv"), b"video").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await?;
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="VidHub", Device="Mac", DeviceId="vidhub-device", Version="2.1.8""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+    let playback_base = format!("{base_url}/Sessions/Playing");
+    let common_event = json!({
+        "mediaServerItemId": item_id,
+        "mediaServerMediaSourceId": source_id,
+        "mediaServerPlaySessionId": "vidhub-playback-session",
+        "RunTimeTicks": 1_000,
+        "deviceId": "vidhub-device",
+        "client": "VidHub",
+        "deviceName": "Mac",
+    });
+
+    let mut playing_event = common_event.clone();
+    playing_event["playbackPositionTicks"] = json!(100);
+    let playing = client
+        .post(&playback_base)
+        .header("X-Emby-Token", &token)
+        .json(&playing_event)
+        .send()
+        .await?;
+    assert_eq!(playing.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let sessions = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(sessions.status(), reqwest::StatusCode::OK);
+    let sessions_body = sessions.json::<Value>().await?;
+    assert_eq!(sessions_body.as_array().map(Vec::len), Some(1));
+    assert_eq!(sessions_body[0]["PlayState"]["PositionTicks"], 100);
+
+    let mut progress_event = common_event.clone();
+    progress_event["playbackPositionTicks"] = json!(200);
+    progress_event["isPaused"] = json!(true);
+    let progress = client
+        .post(format!("{playback_base}/Progress"))
+        .header("X-Emby-Token", &token)
+        .json(&progress_event)
+        .send()
+        .await?;
+    assert_eq!(progress.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let mut stopped_event = common_event;
+    stopped_event["playbackPositionTicks"] = json!(300);
+    let stopped = client
+        .post(format!("{playback_base}/Stopped"))
+        .header("X-Emby-Token", &token)
+        .json(&stopped_event)
+        .send()
+        .await?;
+    assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let session = sqlx::query_as::<_, (String, i64, Option<i64>, i64)>(
+        "SELECT state, position_ticks, duration_ticks, is_paused
+         FROM playback_sessions WHERE play_session_id = ?",
+    )
+    .bind("vidhub-playback-session")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(session, ("STOPPED".to_owned(), 300, Some(1_000), 0));
+    let item_state = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT position_ticks, is_played FROM user_item_state WHERE item_id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item_state, (300, 0));
+
+    server.abort();
+    assert!(!admin.id.to_string().is_empty());
+    Ok(())
+}
