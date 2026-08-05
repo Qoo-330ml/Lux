@@ -86,17 +86,26 @@ test("media cast has no separator line", () => {
   assert.doesNotMatch(castRule, /border-top/);
 });
 
+test("series seasons follow the cast without a separator line", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const seriesChildrenRule = stylesheet.match(/\.lux-series-children(?:,\s*\.lux-season-episodes,\s*\.lux-episode-rail)?\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.doesNotMatch(seriesChildrenRule, /border-top/);
+});
+
 test("detail lower sections use the full content width", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const castRule = stylesheet.match(/\.lux-media-cast\s*\{([^}]*)\}/)?.[1] ?? "";
   const infoRule = stylesheet.match(/\.lux-media-info\s*\{([^}]*)\}/)?.[1] ?? "";
   const infoExtraRule = stylesheet.match(/\.lux-media-info-extra\s*\{([^}]*)\}/)?.[1] ?? "";
   const sourceSelectorRule = stylesheet.match(/\.lux-source-selector\s*\{([^}]*)\}/)?.[1] ?? "";
-  const hierarchyRule = stylesheet.match(/\.lux-series-children, \.lux-season-episodes, \.lux-episode-rail\s*\{([^}]*)\}/)?.[1] ?? "";
+  const seriesChildrenRule = stylesheet.match(/\.lux-series-children\s*\{([^}]*)\}/)?.[1] ?? "";
+  const hierarchyRule = stylesheet.match(/\.lux-season-episodes, \.lux-episode-rail\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(castRule, /max-width:\s*none/);
   assert.match(infoRule, /max-width:\s*none/);
   assert.match(infoExtraRule, /max-width:\s*none/);
   assert.match(sourceSelectorRule, /max-width:\s*none/);
+  assert.match(seriesChildrenRule, /max-width:\s*none/);
   assert.match(hierarchyRule, /max-width:\s*none/);
 });
