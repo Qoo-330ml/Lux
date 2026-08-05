@@ -100,7 +100,6 @@ export function AccountPage({ user }: { user: LuxUser }) {
     <section className="lux-page lux-account-page">
       <div className="lux-account-page-heading">
         <div>
-          <span className="lux-eyebrow">YOUR LUX PROFILE</span>
           <h1>账户设置</h1>
           <p>管理你的观影偏好，让 Lux 更贴合你的使用习惯。</p>
         </div>

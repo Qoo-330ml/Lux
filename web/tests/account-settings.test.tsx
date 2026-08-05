@@ -95,6 +95,7 @@ describe("account settings", () => {
     });
 
     expect(container.querySelector("h1")?.textContent).toBe("账户设置");
+    expect(container.textContent).not.toContain("YOUR LUX PROFILE");
     expect(container.textContent).toContain("主题");
     expect(container.textContent).toContain("首页排版");
     expect(container.textContent).toContain("播放");
