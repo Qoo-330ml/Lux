@@ -1,57 +1,33 @@
-use std::{fmt, io, path::PathBuf};
+use std::{fmt, path::PathBuf};
 
 use tokio::fs;
-use uuid::Uuid;
-use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::storage::{Database, StorageError};
 
 #[derive(Clone)]
 pub struct DownloadService {
     database: Database,
-    temporary_directory: PathBuf,
 }
 
 #[derive(Debug)]
-pub enum DownloadArtifact {
-    File {
-        path: PathBuf,
-        file_name: String,
-    },
-    Archive {
-        path: PathBuf,
-        file_name: String,
-        size: u64,
-    },
+pub struct DownloadArtifact {
+    path: PathBuf,
+    file_name: String,
 }
 
 impl DownloadArtifact {
     pub fn path(&self) -> &PathBuf {
-        match self {
-            Self::File { path, .. } | Self::Archive { path, .. } => path,
-        }
+        &self.path
     }
 
     pub fn file_name(&self) -> &str {
-        match self {
-            Self::File { file_name, .. } | Self::Archive { file_name, .. } => file_name,
-        }
-    }
-
-    pub fn size(&self) -> Option<u64> {
-        match self {
-            Self::File { .. } => None,
-            Self::Archive { size, .. } => Some(*size),
-        }
+        &self.file_name
     }
 }
 
 impl DownloadService {
-    pub fn new(database: Database, temporary_directory: PathBuf) -> Self {
-        Self {
-            database,
-            temporary_directory,
-        }
+    pub fn new(database: Database) -> Self {
+        Self { database }
     }
 
     pub async fn prepare(
@@ -62,10 +38,10 @@ impl DownloadService {
         let source = match source_id {
             Some(source_id) => {
                 self.database
-                    .find_media_source_path_by_id(item_id, source_id)
+                    .find_download_source_path_by_id(item_id, source_id)
                     .await?
             }
-            None => self.database.find_media_source_path(item_id).await?,
+            None => self.database.find_download_source_path(item_id).await?,
         }
         .ok_or(DownloadError::ItemNotFound)?;
         let root = fs::canonicalize(&source.root_path).await?;
@@ -82,83 +58,11 @@ impl DownloadService {
             .and_then(|value| value.to_str())
             .ok_or_else(|| DownloadError::InvalidFileName(media_path.clone()))?
             .to_owned();
-        let parent = media_path
-            .parent()
-            .ok_or_else(|| DownloadError::PathOutsideRoot(media_path.clone()))?;
-        let mut files = vec![media_path.clone()];
-        let mut entries = fs::read_dir(parent).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let candidate = entry.path();
-            if candidate == media_path
-                || !is_matching_sidecar(&file_name, entry.file_name().to_string_lossy().as_ref())
-            {
-                continue;
-            }
-            let file_type = entry.file_type().await?;
-            if !file_type.is_file() {
-                continue;
-            }
-            let canonical = fs::canonicalize(&candidate).await?;
-            if canonical.starts_with(&root) && canonical != root {
-                files.push(canonical);
-            }
-        }
-        files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-        if files.len() == 1 {
-            return Ok(DownloadArtifact::File {
-                path: media_path,
-                file_name,
-            });
-        }
-
-        let temporary_directory = self.temporary_directory.clone();
-        let archive_path =
-            temporary_directory.join(format!(".lux-download-{}.zip", Uuid::now_v7()));
-        let archive_name = format!(
-            "{}.zip",
-            media_path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("media")
-        );
-        let entries = files
-            .into_iter()
-            .filter_map(|path| {
-                let name = path.file_name()?.to_str()?.to_owned();
-                Some((path, name))
-            })
-            .collect::<Vec<_>>();
-        let path_for_worker = archive_path.clone();
-        tokio::task::spawn_blocking(move || create_archive(&path_for_worker, entries))
-            .await
-            .map_err(|error| DownloadError::Archive(error.to_string()))??;
-        let size = fs::metadata(&archive_path).await?.len();
-        Ok(DownloadArtifact::Archive {
-            path: archive_path,
-            file_name: archive_name,
-            size,
+        Ok(DownloadArtifact {
+            path: media_path,
+            file_name,
         })
     }
-}
-
-fn create_archive(path: &PathBuf, entries: Vec<(PathBuf, String)>) -> Result<(), DownloadError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::File::create(path)?;
-    let mut writer = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    for (source, name) in entries {
-        writer
-            .start_file(name, options)
-            .map_err(|error| DownloadError::Archive(error.to_string()))?;
-        let mut input = std::fs::File::open(source)?;
-        io::copy(&mut input, &mut writer)?;
-    }
-    writer
-        .finish()
-        .map_err(|error| DownloadError::Archive(error.to_string()))?;
-    Ok(())
 }
 
 pub(crate) fn is_matching_sidecar(selected_name: &str, candidate_name: &str) -> bool {
@@ -203,7 +107,6 @@ pub enum DownloadError {
     ItemNotFound,
     InvalidFileName(PathBuf),
     PathOutsideRoot(PathBuf),
-    Archive(String),
     Io(std::io::Error),
     Storage(StorageError),
 }
@@ -220,7 +123,6 @@ impl fmt::Display for DownloadError {
                 "download path is outside root: {}",
                 path.display()
             ),
-            Self::Archive(error) => write!(formatter, "download archive failed: {error}"),
             Self::Io(error) => write!(formatter, "download file operation failed: {error}"),
             Self::Storage(error) => error.fmt(formatter),
         }
