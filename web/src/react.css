@@ -145,7 +145,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-copy strong { display: block; overflow: hidden; color: rgba(255,255,255,.9); font-size: .88rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .lux-media-copy span { display: block; margin-top: 4px; overflow: hidden; color: var(--lux-subtle); font-size: .74rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-media-actions { position: absolute; z-index: 6; top: 9px; right: 9px; }
-.lux-media-art-shell > .lux-media-actions { top: auto; right: 9px; bottom: 9px; opacity: 0; pointer-events: none; transform: translateY(3px); transition: opacity .2s ease, transform .2s var(--lux-ease); }
+.lux-media-art-shell > .lux-media-actions { top: 9px; right: 9px; bottom: auto; opacity: 0; pointer-events: none; transform: translateY(3px); transition: opacity .2s ease, transform .2s var(--lux-ease); }
 .lux-media-art-shell:hover > .lux-media-actions, .lux-media-art-shell:focus-within > .lux-media-actions { opacity: 1; pointer-events: auto; transform: translateY(0); }
 .lux-media-actions-trigger { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid rgba(255,255,255,.32); border-radius: 50%; color: #fff; background: rgba(8,8,10,.62); box-shadow: 0 8px 20px rgba(0,0,0,.28); backdrop-filter: blur(12px); transition: background .2s ease, border-color .2s ease, transform .2s var(--lux-ease); }
 .lux-media-actions-trigger:hover, .lux-media-actions-trigger[aria-expanded="true"] { border-color: rgba(255,255,255,.56); background: rgba(255,255,255,.16); transform: translateY(-1px); }
