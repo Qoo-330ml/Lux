@@ -30,6 +30,8 @@ describe("MediaDetailPage series hierarchy", () => {
       id: "series-1",
       title: "示例剧集",
       itemType: "SERIES",
+      rating: 7.6,
+      ratingSource: "TMDb",
       mediaSources: [],
     });
     vi.spyOn(api, "playback").mockResolvedValue({});
@@ -66,6 +68,7 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     expect(container.querySelector(".lux-detail-copy .lux-eyebrow")).toBeNull();
+    expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
     expect(container.querySelector(".lux-season-rail")?.textContent).toContain("第一季");
     expect(container.querySelector(".lux-season-card img")?.getAttribute("src"))
       .toBe("/api/v1/items/season-1/images/poster");
@@ -197,6 +200,8 @@ describe("MediaDetailPage series hierarchy", () => {
       id: "movie-1",
       title: "示例电影",
       itemType: "MOVIE",
+      rating: 8.2,
+      ratingSource: "TMDb",
       mediaSources: [],
     });
     vi.spyOn(api, "playback").mockResolvedValue({ isPlayed: true });
@@ -224,6 +229,7 @@ describe("MediaDetailPage series hierarchy", () => {
     const watched = container.querySelector(".lux-detail-watched-status");
     expect(watched?.classList.contains("is-played")).toBe(true);
     expect(watched?.getAttribute("aria-label")).toBe("已看");
+    expect(container.querySelector(".lux-detail-poster .lux-rating")?.textContent).toContain("8.2");
 
     const actionItems = [...(container.querySelector(".lux-hero-actions")?.children ?? [])];
     expect(actionItems[3]?.classList.contains("lux-media-actions")).toBe(true);
