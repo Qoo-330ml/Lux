@@ -587,6 +587,7 @@ impl ImageSelectionPolicy {
     fn enabled_types(self) -> impl Iterator<Item = &'static str> {
         [
             (self.poster, "POSTER"),
+            (true, "FANART"),
             (self.logo, "LOGO"),
             (self.thumbnail, "THUMB"),
             (self.banner, "BANNER"),
@@ -950,7 +951,16 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TmdbCastMember, tmdb_candidate_actors};
+    use super::{TmdbCastMember, default_image_selection_policy, tmdb_candidate_actors};
+
+    #[test]
+    fn metadata_refresh_keeps_backdrop_images_as_fanart() {
+        let enabled_types = default_image_selection_policy()
+            .enabled_types()
+            .collect::<Vec<_>>();
+
+        assert!(enabled_types.contains(&"FANART"));
+    }
 
     #[test]
     fn tmdb_cast_becomes_ordered_candidate_actor_data() {
