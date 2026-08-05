@@ -3,7 +3,7 @@ pub mod lux;
 use std::{
     collections::BTreeMap,
     path::{Component, Path as FsPath, PathBuf},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use axum::{
@@ -613,6 +613,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .with_state(state)
         .layer(middleware::from_fn(attach_peer_address))
+        .layer(middleware::from_fn(trace_emby_playback_callback))
         .layer(middleware::from_fn(normalize_empty_api_service_unavailable))
         .layer(
             tower::ServiceBuilder::new()
@@ -704,6 +705,45 @@ async fn attach_peer_address(mut request: Request<Body>, next: Next) -> Response
 
 fn safe_trace_path(uri: &axum::http::Uri) -> &str {
     uri.path()
+}
+
+fn is_emby_playback_callback_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/Sessions/Playing"
+            | "/Sessions/Playing/Progress"
+            | "/Sessions/Playing/Stopped"
+            | "/emby/Sessions/Playing"
+            | "/emby/Sessions/Playing/Progress"
+            | "/emby/Sessions/Playing/Stopped"
+    )
+}
+
+async fn trace_emby_playback_callback(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    if !is_emby_playback_callback_path(&path) {
+        return next.run(request).await;
+    }
+    let method = request.method().clone();
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_owned();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        event = "emby_playback_callback",
+        method = %method,
+        path = %path,
+        request_id = %request_id,
+        status_code = response.status().as_u16(),
+        duration_ms,
+        "processed emby playback callback"
+    );
+    response
 }
 
 fn web_root() -> PathBuf {
@@ -1820,15 +1860,43 @@ async fn handle_emby_playback_event(
 ) -> Response {
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
-        Err(status) => return status.into_response(),
+        Err(status) => {
+            tracing::warn!(
+                event = "emby_playback_callback_rejected",
+                stage = "authentication",
+                status_code = status.as_u16(),
+                playback_state = state_name,
+                "rejected emby playback callback"
+            );
+            return status.into_response();
+        }
     };
     if request.position_ticks < 0
         || request.duration_ticks.is_some_and(|duration| duration < 0)
         || request.item_id.is_empty()
     {
+        tracing::warn!(
+            event = "emby_playback_callback_rejected",
+            stage = "validation",
+            status_code = StatusCode::BAD_REQUEST.as_u16(),
+            playback_state = state_name,
+            item_id_present = !request.item_id.is_empty(),
+            position_ticks = request.position_ticks,
+            duration_ticks_present = request.duration_ticks.is_some(),
+            "rejected invalid emby playback callback"
+        );
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let item_id_prefix = playback_identifier_prefix(&request.item_id);
     let Some(access) = state.access.as_ref() else {
+        tracing::error!(
+            event = "emby_playback_callback_rejected",
+            stage = "access_service",
+            status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            playback_state = state_name,
+            item_id_prefix = %item_id_prefix,
+            "playback access service is unavailable"
+        );
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match access
@@ -1839,10 +1907,39 @@ async fn handle_emby_playback_event(
         .await
     {
         Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok(false) => {
+            tracing::warn!(
+                event = "emby_playback_callback_rejected",
+                stage = "item_access",
+                status_code = StatusCode::NOT_FOUND.as_u16(),
+                playback_state = state_name,
+                item_id_prefix = %item_id_prefix,
+                "playback item is not accessible"
+            );
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(error) => {
+            tracing::error!(
+                event = "emby_playback_callback_rejected",
+                stage = "item_access",
+                status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                playback_state = state_name,
+                item_id_prefix = %item_id_prefix,
+                error = %error,
+                "failed to check playback item access"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
     let Some(database) = state.database.as_ref() else {
+        tracing::error!(
+            event = "emby_playback_callback_rejected",
+            stage = "database",
+            status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            playback_state = state_name,
+            item_id_prefix = %item_id_prefix,
+            "playback database is unavailable"
+        );
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let media_source_id = request
@@ -1855,8 +1952,29 @@ async fn handle_emby_playback_event(
             .await
         {
             Ok(true) => {}
-            Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Ok(false) => {
+                tracing::warn!(
+                    event = "emby_playback_callback_rejected",
+                    stage = "media_source",
+                    status_code = StatusCode::NOT_FOUND.as_u16(),
+                    playback_state = state_name,
+                    item_id_prefix = %item_id_prefix,
+                    "playback media source does not belong to item"
+                );
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Err(error) => {
+                tracing::error!(
+                    event = "emby_playback_callback_rejected",
+                    stage = "media_source",
+                    status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    playback_state = state_name,
+                    item_id_prefix = %item_id_prefix,
+                    error = %error,
+                    "failed to check playback media source"
+                );
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
         }
     }
     let header_device = headers
@@ -1898,8 +2016,45 @@ async fn handle_emby_playback_event(
         })
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok(()) => {
+            tracing::info!(
+                event = "emby_playback_callback_recorded",
+                playback_state = state_name,
+                item_id_prefix = %item_id_prefix,
+                position_ticks = request.position_ticks,
+                duration_ticks_present = request.duration_ticks.is_some(),
+                is_paused = request.is_paused || state_name == "PAUSED",
+                client = playback_client_label(client),
+                "recorded emby playback callback"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::error!(
+                event = "emby_playback_callback_rejected",
+                stage = "storage",
+                status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                playback_state = state_name,
+                item_id_prefix = %item_id_prefix,
+                error = %error,
+                "failed to record emby playback callback"
+            );
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+fn playback_identifier_prefix(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+fn playback_client_label(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("vidhub") => "vidhub",
+        Some(value) if value.eq_ignore_ascii_case("senplayer") => "senplayer",
+        Some(value) if value.eq_ignore_ascii_case("infuse") => "infuse",
+        Some(_) => "other",
+        None => "unknown",
     }
 }
 
@@ -10024,8 +10179,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        build_cookie, emby_media_source_json, lux_catalog_source_json, safe_trace_path,
-        secure_cookie_for_request,
+        build_cookie, emby_media_source_json, is_emby_playback_callback_path,
+        lux_catalog_source_json, playback_client_label, playback_identifier_prefix,
+        safe_trace_path, secure_cookie_for_request,
     };
     use crate::application::catalog::{CatalogSource, CatalogStream};
     use crate::network::RemoteAccessPolicy;
@@ -10085,6 +10241,26 @@ mod tests {
         let uri: Uri = "/System/Info?api_key=do-not-log".parse().unwrap();
 
         assert_eq!(safe_trace_path(&uri), "/System/Info");
+    }
+
+    #[test]
+    fn playback_callback_trace_matches_root_and_emby_paths_only() {
+        assert!(is_emby_playback_callback_path("/Sessions/Playing"));
+        assert!(is_emby_playback_callback_path(
+            "/emby/Sessions/Playing/Progress"
+        ));
+        assert!(!is_emby_playback_callback_path("/Sessions"));
+        assert!(!is_emby_playback_callback_path(
+            "/Sessions/Playing?api_key=secret"
+        ));
+    }
+
+    #[test]
+    fn playback_log_fields_are_bounded_and_allowlisted() {
+        assert_eq!(playback_identifier_prefix("12345678-abcdef"), "12345678");
+        assert_eq!(playback_client_label(Some("VidHub")), "vidhub");
+        assert_eq!(playback_client_label(Some("unknown-client")), "other");
+        assert_eq!(playback_client_label(None), "unknown");
     }
 
     #[test]
