@@ -108,18 +108,22 @@ export function MediaCard({ item, landscape = false }: { item: MediaItem; landsc
   return (
     <>
       <article className={landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card"}>
+        <div className="lux-media-art-shell">
+          <Link className="lux-media-card-link" to={`/items/${item.id}`} aria-label={`查看 ${mediaTitle(item)} 详情`}>
+            <div className="lux-media-art">
+              {image ? <img src={image} alt="" loading="lazy" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
+              <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
+              {progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
+            </div>
+          </Link>
+          <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+        </div>
         <Link className="lux-media-card-link" to={`/items/${item.id}`}>
-          <div className="lux-media-art">
-            {image ? <img src={image} alt="" loading="lazy" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
-            <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
-            {progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
-          </div>
           <div className="lux-media-copy">
             <strong>{mediaTitle(item)}</strong>
             <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
           </div>
         </Link>
-        <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>

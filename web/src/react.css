@@ -122,6 +122,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-card { position: relative; display: block; flex: 0 0 174px; min-width: 0; }
 .lux-media-card-link { display: block; }
 .lux-media-card-landscape { flex-basis: 300px; }
+.lux-media-art-shell { position: relative; }
 .lux-media-art { position: relative; overflow: hidden; aspect-ratio: 2 / 3; border-radius: 10px; background: #1b1b20; box-shadow: 0 10px 25px rgba(0,0,0,.24); }
 .lux-media-card-landscape .lux-media-art { aspect-ratio: 16 / 9; }
 .lux-media-art img { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .45s var(--lux-ease), filter .3s ease; }
@@ -144,6 +145,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-copy strong { display: block; overflow: hidden; color: rgba(255,255,255,.9); font-size: .88rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .lux-media-copy span { display: block; margin-top: 4px; overflow: hidden; color: var(--lux-subtle); font-size: .74rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-media-actions { position: absolute; z-index: 6; top: 9px; right: 9px; }
+.lux-media-art-shell > .lux-media-actions { top: auto; right: 9px; bottom: 9px; opacity: 0; pointer-events: none; transform: translateY(3px); transition: opacity .2s ease, transform .2s var(--lux-ease); }
+.lux-media-art-shell:hover > .lux-media-actions, .lux-media-art-shell:focus-within > .lux-media-actions { opacity: 1; pointer-events: auto; transform: translateY(0); }
 .lux-media-actions-trigger { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid rgba(255,255,255,.32); border-radius: 50%; color: #fff; background: rgba(8,8,10,.62); box-shadow: 0 8px 20px rgba(0,0,0,.28); backdrop-filter: blur(12px); transition: background .2s ease, border-color .2s ease, transform .2s var(--lux-ease); }
 .lux-media-actions-trigger:hover, .lux-media-actions-trigger[aria-expanded="true"] { border-color: rgba(255,255,255,.56); background: rgba(255,255,255,.16); transform: translateY(-1px); }
 .lux-media-action-menu { position: absolute; top: 42px; right: 0; z-index: 20; width: min(246px, calc(100vw - 32px)); overflow: hidden; border: 1px solid rgba(255,255,255,.16); border-radius: 12px; color: var(--lux-text); background: linear-gradient(155deg, rgba(38,38,44,.98), rgba(20,20,24,.98)); box-shadow: 0 18px 42px rgba(0,0,0,.48); backdrop-filter: blur(18px); }
