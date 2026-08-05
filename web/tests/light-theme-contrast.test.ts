@@ -72,8 +72,8 @@ describe("light theme contrast", () => {
   });
 
   it("keeps detail versions and media cards readable in light mode", () => {
-    expect(lightThemeRule(".lux-source-option")).toContain("background: rgba(255,255,255");
-    expect(lightThemeRule(".lux-source-option.is-selected")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-select-trigger")).toContain("background: rgba(28,28,34");
+    expect(lightThemeRule('.lux-select-option[aria-selected="true"]')).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-info-row")).toContain("background: rgba(255,255,255");
     expect(lightThemeRule(".lux-media-info-row > strong")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-stream-card")).toContain("background: rgba(255,255,255");

@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Heart, Play, Radio, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource } from "../../lib/api/types";
@@ -261,29 +262,29 @@ function MediaSourceSelector({
   selectedSourceId?: string;
   onSelect: (sourceId: string) => void;
 }) {
+  const options = sources.map((source, index) => ({
+    value: source.id,
+    label: (
+      <span className="lux-source-option-content">
+        <span className="lux-source-option-label">{sourceLabel(source, index)}</span>
+        <span className="lux-source-option-detail">{source.editionName || source.container || "DIRECT PLAY"}</span>
+      </span>
+    ),
+  }));
+
   return (
     <section className="lux-source-selector" aria-labelledby="media-source-heading">
       <div className="lux-section-heading">
         <h2 id="media-source-heading">选择版本</h2>
         <span>{sources.length} 个视频文件</span>
       </div>
-      <div className="lux-source-options" role="radiogroup" aria-label="选择播放版本">
-        {sources.map((source, index) => {
-          const selected = source.id === selectedSourceId;
-          return (
-            <button
-              className={selected ? "lux-source-option is-selected" : "lux-source-option"}
-              key={source.id}
-              type="button"
-              role="radio"
-              aria-checked={selected}
-              onClick={() => onSelect(source.id)}
-            >
-              <span className="lux-source-option-label">{sourceLabel(source, index)}</span>
-              <span className="lux-source-option-detail">{source.editionName || source.container || "DIRECT PLAY"}</span>
-            </button>
-          );
-        })}
+      <div className="lux-source-select">
+        <LuxSelect
+          value={selectedSourceId ?? sources[0]?.id ?? ""}
+          options={options}
+          onChange={onSelect}
+          aria-labelledby="media-source-heading"
+        />
       </div>
     </section>
   );

@@ -228,13 +228,20 @@ describe("MediaDetailPage series hierarchy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector(".lux-source-selector")?.textContent).toContain("2160p HDR");
-    const hdrOption = [...container.querySelectorAll<HTMLButtonElement>(".lux-source-option")]
+    const sourceSelect = container.querySelector<HTMLButtonElement>(".lux-source-selector [role=\"combobox\"]");
+    expect(sourceSelect?.textContent).toContain("1080p SDR");
+    expect(sourceSelect?.getAttribute("aria-expanded")).toBe("false");
+
+    await act(async () => sourceSelect?.click());
+
+    expect(sourceSelect?.getAttribute("aria-expanded")).toBe("true");
+    const hdrOption = [...document.querySelectorAll<HTMLButtonElement>("[role=\"option\"]")]
       .find((button) => button.textContent?.includes("2160p HDR"));
     expect(hdrOption).toBeDefined();
     await act(async () => hdrOption?.click());
 
-    expect(hdrOption?.getAttribute("aria-checked")).toBe("true");
+    expect(sourceSelect?.textContent).toContain("2160p HDR");
+    expect(sourceSelect?.getAttribute("aria-expanded")).toBe("false");
     expect(container.querySelector<HTMLAnchorElement>("a.lux-button-primary")?.getAttribute("href"))
       .toBe("/watch/episode-1?sourceId=source-hdr");
   });
