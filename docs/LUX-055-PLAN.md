@@ -10,6 +10,7 @@
 - 仅接受无凭据的 `http`/`https` URL，以及 `image/jpeg`、`image/png`、`image/webp`。
 - 同时校验响应大小和图片内容签名：JPEG SOI/EOI、PNG 签名/IEND、WebP RIFF/WEBP。
 - 根据已有图片类型扩展名复用目标；缺失时使用响应类型对应的扩展名。识别写回支持 poster、logo、thumb、banner、disc、art、wallpaper。
+- 单集剧照使用与 Emby 兼容的同目录 `<episode-file-stem>-thumb.ext` 命名；不复用季度目录的 `fanart.jpg`，并让数据库索引按单集独立保存。
 - 媒体根路径 canonicalize，拒绝根外路径和符号链接目标。
 - 图片写回使用同目录唯一临时文件、`sync_all`、原子 rename、目录刷盘和失败清理。
 - 写回成功后通过唯一键 upsert `item_images`，刷新路径、大小、内容 SHA-256 标签和 `TMDB` 来源。

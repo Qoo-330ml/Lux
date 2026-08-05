@@ -225,7 +225,7 @@ impl MetadataCandidateService {
                         .or(result.original_language),
                     provider,
                     provider_id,
-                    images: generic_candidate_images(&images.images),
+                    images: generic_candidate_images(&images.images, item_type),
                     actors,
                     score: None,
                 },
@@ -350,7 +350,7 @@ impl MetadataCandidateService {
                     original_language: metadata.original_language,
                     provider: parent.provider,
                     provider_id,
-                    images: generic_candidate_images(&images.images),
+                    images: generic_candidate_images(&images.images, item_type),
                     actors: Vec::new(),
                     score: Some(parent.score),
                 },
@@ -647,13 +647,18 @@ impl From<StorageError> for MetadataCandidateError {
 
 fn generic_candidate_images(
     images: &[crate::application::scraper::ScraperImage],
+    item_type: ScraperItemType,
 ) -> BTreeMap<String, Vec<String>> {
     let mut result = BTreeMap::<String, Vec<String>>::new();
     for image in images {
         let image_types: &[&str] = match image.image_type.as_str() {
             "Primary" | "Poster" | "POSTER" => &["POSTER", "DISC"],
             "Logo" | "LOGO" => &["LOGO"],
+            "Backdrop" | "Fanart" | "FANART" if item_type == ScraperItemType::Episode => {
+                &["FANART"]
+            }
             "Backdrop" | "Fanart" | "FANART" => &["FANART", "THUMB", "BANNER", "ART", "WALLPAPER"],
+            "Thumb" | "THUMB" if item_type == ScraperItemType::Episode => &["FANART"],
             "Thumb" | "THUMB" => &["THUMB"],
             "Banner" | "BANNER" => &["BANNER"],
             "Disc" | "DISC" => &["DISC"],
@@ -1427,7 +1432,11 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TmdbCastMember, default_image_selection_policy, tmdb_candidate_actors};
+    use super::{
+        TmdbCastMember, default_image_selection_policy, generic_candidate_images,
+        tmdb_candidate_actors,
+    };
+    use crate::application::scraper::{ScraperImage, ScraperItemType};
 
     #[test]
     fn metadata_refresh_keeps_backdrop_images_as_fanart() {
@@ -1436,6 +1445,25 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(enabled_types.contains(&"FANART"));
+    }
+
+    #[test]
+    fn episode_stills_are_not_duplicated_into_other_backdrop_types() {
+        let images = generic_candidate_images(
+            &[ScraperImage {
+                image_type: "Backdrop".to_owned(),
+                url: "https://images.example/episode.jpg".to_owned(),
+                ..ScraperImage::default()
+            }],
+            ScraperItemType::Episode,
+        );
+
+        assert_eq!(
+            images.get("FANART"),
+            Some(&vec!["https://images.example/episode.jpg".to_owned()])
+        );
+        assert!(!images.contains_key("THUMB"));
+        assert!(!images.contains_key("BANNER"));
     }
 
     #[test]

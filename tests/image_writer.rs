@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use axum::extract::Path as AxumPath;
 use axum::{Router, body::Body, http::StatusCode, response::Response, routing::get};
 use luxd::{
     application::{
@@ -91,6 +92,81 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
 
     server.abort();
     let _ = root;
+    Ok(())
+}
+
+#[tokio::test]
+async fn episode_images_use_distinct_paths_and_ignore_season_artwork()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, episodes, season_dir) = prepared_episodes().await?;
+    tokio::fs::write(season_dir.join("fanart.jpg"), b"season-artwork").await?;
+    let mut second_image = PNG_1X1.to_vec();
+    second_image.extend_from_slice(b"episode-two");
+    let expected_second_image = second_image.clone();
+    let app = Router::new().route(
+        "/{name}",
+        get(move |AxumPath(name): AxumPath<String>| {
+            let body = if name == "episode-1" {
+                PNG_1X1.to_vec()
+            } else {
+                second_image.clone()
+            };
+            async move {
+                Response::builder()
+                    .header(CONTENT_TYPE, "image/png")
+                    .body(Body::from(body))
+                    .expect("test image response should be valid")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::new(database.clone())?;
+
+    let first = service
+        .download_item_image_if_missing(
+            &episodes[0],
+            "fanart",
+            &format!("http://{address}/episode-1"),
+        )
+        .await?
+        .ok_or("first episode image was incorrectly treated as present")?;
+    let second = service
+        .download_item_image_if_missing(
+            &episodes[1],
+            "fanart",
+            &format!("http://{address}/episode-2"),
+        )
+        .await?
+        .ok_or("second episode image was incorrectly treated as present")?;
+
+    assert_ne!(first.path, second.path);
+    assert!(
+        first
+            .path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("Example.Show.S01E01-thumb"))
+    );
+    assert!(
+        second
+            .path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("Example.Show.S01E02-thumb"))
+    );
+    assert_eq!(tokio::fs::read(&first.path).await?, PNG_1X1);
+    assert_eq!(tokio::fs::read(&second.path).await?, expected_second_image);
+
+    let indexed: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_id, local_path FROM item_images WHERE image_type = 'FANART' ORDER BY item_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(indexed.len(), 2);
+    assert_ne!(indexed[0].1, indexed[1].1);
+    assert!(indexed.iter().all(|(_, path)| path.contains("-thumb.png")));
+
+    server.abort();
     Ok(())
 }
 
@@ -207,4 +283,40 @@ async fn prepared_movie() -> Result<(Database, String, PathBuf, PathBuf), Box<dy
         .fetch_one(database.pool())
         .await?;
     Ok((database, item_id, root, movie_dir))
+}
+
+async fn prepared_episodes() -> Result<(Database, Vec<String>, PathBuf), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let root = temp_dir.keep().join("Shows");
+    let season_dir = root.join("Example Show (2024)").join("Season 01");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    for episode in [1, 2] {
+        tokio::fs::write(
+            season_dir.join(format!("Example.Show.S01E0{episode}.strm")),
+            "https://example.invalid/episode",
+        )
+        .await?;
+    }
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: root.join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let episodes: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'EPISODE' ORDER BY episode_number",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    Ok((database, episodes, season_dir))
 }

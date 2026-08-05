@@ -31,3 +31,12 @@ test("dashboard metrics and panels use separators instead of card chrome", () =>
   assert.match(panelRule, /background:\s*transparent/);
   assert.match(panelGridRule, /border-bottom:\s*1px\s+solid\s+var\(--lux-line-soft\)/);
 });
+
+test("light mode preserves the same flat admin surfaces", () => {
+  const lightAdminStyles = stylesheet.slice(stylesheet.indexOf("/* The admin console is a normal light surface"));
+
+  assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-layout \{[^}]*background:\s*var\(--lux-bg\)/);
+  assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-sidebar \{[^}]*background:\s*transparent/);
+  assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-stat \{[^}]*background:\s*transparent/);
+  assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-panel \{[^}]*background:\s*transparent/);
+});
