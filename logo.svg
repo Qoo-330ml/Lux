@@ -3,11 +3,14 @@
     <filter id="logo-outline" filterUnits="userSpaceOnUse" primitiveUnits="userSpaceOnUse" x="170" y="167" width="222" height="249" color-interpolation-filters="sRGB">
       <feMorphology in="SourceAlpha" operator="dilate" radius="6" result="outer" />
       <feMorphology in="SourceAlpha" operator="dilate" radius="5" result="inner" />
+      <feFlood flood-color="#ffffff" result="halo-color" />
+      <feComposite in="halo-color" in2="inner" operator="in" result="halo" />
       <feComposite in="outer" in2="inner" operator="out" result="ring" />
       <feFlood flood-color="#000000" result="ring-color" />
       <feComposite in="ring-color" in2="ring" operator="in" result="outline" />
       <feMerge>
         <feMergeNode in="outline" />
+        <feMergeNode in="halo" />
         <feMergeNode in="SourceGraphic" />
       </feMerge>
     </filter>
