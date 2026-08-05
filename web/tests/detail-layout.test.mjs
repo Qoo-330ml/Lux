@@ -68,6 +68,17 @@ test("media stream cards keep a compact width on wide detail pages", () => {
   assert.match(streamCardRule, /flex:\s*0\s*0\s*260px/);
 });
 
+test("shared horizontal scroll arrows show only the chevron", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const arrowRule = stylesheet.match(/\.lux-horizontal-scroll-arrow\s*\{([^}]*)\}/)?.[1] ?? "";
+  const hoverRule = stylesheet.match(/\.lux-horizontal-scroll-arrow:hover\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(arrowRule, /background:\s*transparent/);
+  assert.match(arrowRule, /box-shadow:\s*none/);
+  assert.doesNotMatch(arrowRule, /backdrop-filter/);
+  assert.match(hoverRule, /background:\s*transparent/);
+});
+
 test("media cast has no separator line", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const castRule = stylesheet.match(/\.lux-media-cast\s*\{([^}]*)\}/)?.[1] ?? "";
