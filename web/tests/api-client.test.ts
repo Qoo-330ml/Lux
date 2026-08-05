@@ -56,6 +56,21 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("sends the selected library sort and order to the server", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().libraryItems("movie-library", 1, "MOVIE", {
+      sortBy: "CommunityRating",
+      sortOrder: "Descending",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/libraries/movie-library/items?page=1&pageSize=24&itemType=MOVIE&sortBy=CommunityRating&sortOrder=Descending",
+    );
+  });
+
   it("requests the children for a series or a selected season", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
@@ -69,6 +84,35 @@ describe("LuxApiClient", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "/api/v1/items/series-1/children?page=1&pageSize=60&itemType=EPISODE&seasonId=season-1",
     );
+  });
+
+  it("reports a Web playback state with the shared progress endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(null, { status: 204 }),
+    );
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    await new LuxApiClient().progress(
+      "movie-1",
+      1_200_000_000,
+      7_200_000_000,
+      "PAUSED",
+      true,
+    );
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/items/movie-1/progress");
+    expect(options?.method).toBe("POST");
+    expect(options?.keepalive).toBe(true);
+    expect(JSON.parse(String(options?.body))).toEqual({
+      positionTicks: 1_200_000_000,
+      durationTicks: 7_200_000_000,
+      state: "PAUSED",
+    });
+    expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
   });
 
   it("supports administrator candidate search and selection for identification", async () => {
@@ -138,16 +182,16 @@ describe("LuxApiClient", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
       expect(init?.method).toBe("POST");
-      if (path === "/api/v1/admin/metadata/reidentify") {
-        expect(JSON.parse(String(init?.body))).toEqual({ itemIds: ["item-1"] });
-        return new Response(JSON.stringify({ job: { id: "metadata-job-1" } }), { status: 202 });
+      if (path === "/api/v1/admin/items/item-1/metadata/refresh") {
+        expect(JSON.parse(String(init?.body))).toEqual({ mode: "FILL_MISSING" });
+        return new Response(JSON.stringify({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } }), { status: 202 });
       }
       expect(path).toBe("/api/v1/admin/items/item-1/scan");
       return new Response(JSON.stringify({ job: { id: "scan-job-1" } }), { status: 202 });
     });
 
     const client = new LuxApiClient();
-    await expect(client.startItemMetadataRefresh("item-1")).resolves.toEqual({ job: { id: "metadata-job-1" } });
+    await expect(client.startItemMetadataRefresh("item-1")).resolves.toEqual({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } });
     await expect(client.startItemLibraryScan("item-1")).resolves.toEqual({ job: { id: "scan-job-1" } });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -156,17 +200,13 @@ describe("LuxApiClient", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({
         totalCount: 125,
-        jobCount: 2,
-        jobs: [
-          { id: "metadata-job-1", status: "QUEUED", totalCount: 100 },
-          { id: "metadata-job-2", status: "QUEUED", totalCount: 25 },
-        ],
+        job: { id: "metadata-job-1", status: "QUEUED", mode: "FILL_MISSING", totalCount: 125, processedCount: 0, createdAt: 0 },
       }), { status: 202 }),
     );
 
     await expect(new LuxApiClient().startLibraryMetadataReidentify("library/1")).resolves.toMatchObject({
       totalCount: 125,
-      jobCount: 2,
+      job: { id: "metadata-job-1" },
     });
 
     const [path, options] = fetchMock.mock.calls[0] ?? [];
@@ -174,13 +214,62 @@ describe("LuxApiClient", () => {
     expect(options?.method).toBe("POST");
   });
 
+  it("lists metadata jobs with a status filter", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ jobs: [{ id: "metadata-job-1", status: "RUNNING" }] }), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().adminMetadataReidentifyJobs("RUNNING")).resolves.toMatchObject({
+      jobs: [{ id: "metadata-job-1", status: "RUNNING" }],
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/metadata/reidentify?page=1&pageSize=50&status=RUNNING",
+    );
+  });
+
+  it("lists and updates scheduled task configurations with CSRF protection", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (!init?.method) {
+        expect(path).toBe("/api/v1/admin/scheduled-tasks?page=1&pageSize=100");
+        return new Response(JSON.stringify({ scheduledTasks: [], total: 0 }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/admin/scheduled-tasks");
+      expect(init.method).toBe("PUT");
+      expect(JSON.parse(String(init.body))).toEqual({
+        ownerType: "LIBRARY",
+        ownerId: "library-1",
+        taskType: "INCREMENTAL_SCAN",
+        schedule: "interval:1h",
+        isEnabled: true,
+      });
+      expect((init.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      return new Response(JSON.stringify({ scheduledTask: { ownerId: "library-1" } }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.adminScheduledTasks()).resolves.toEqual({ scheduledTasks: [], total: 0 });
+    await expect(client.updateAdminScheduledTask({
+      ownerType: "LIBRARY",
+      ownerId: "library-1",
+      taskType: "INCREMENTAL_SCAN",
+      schedule: "interval:1h",
+      isEnabled: true,
+    })).resolves.toEqual({ scheduledTask: { ownerId: "library-1" } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("starts a whole-library metadata refresh with the selected mode", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({
         totalCount: 125,
-        jobCount: 2,
         mode: "FULL_REFRESH",
-        jobs: [],
+        job: { id: "metadata-job-1", status: "QUEUED", mode: "FULL_REFRESH", totalCount: 125, processedCount: 0, createdAt: 0 },
       }), { status: 202 }),
     );
 
@@ -326,6 +415,32 @@ describe("LuxApiClient", () => {
     await expect(new LuxApiClient().login("admin", "password")).resolves.toEqual({
       id: "admin-1",
       canManageServer: true,
+    });
+  });
+
+  it("sends non-sensitive TMDb language and API address settings without requiring an API key", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ plugin: { id: "tmdb" } }), { status: 200 }),
+    );
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    await new LuxApiClient().updateAdminPluginConfig("tmdb", {
+      preferredLanguage: "zh-CN",
+      languageFallbackEnabled: false,
+      fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
+      alternateApiEnabled: true,
+      apiBaseUrl: "https://api.tmdb.org",
+    });
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      preferredLanguage: "zh-CN",
+      languageFallbackEnabled: false,
+      fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
+      alternateApiEnabled: true,
+      apiBaseUrl: "https://api.tmdb.org",
     });
   });
 

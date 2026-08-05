@@ -11,6 +11,7 @@ fn candidate(id: i64, title: &str, year: Option<&str>) -> TmdbMovieSummary {
         overview: Some("stub".to_owned()),
         release_date: year.map(str::to_owned),
         original_language: Some("en".to_owned()),
+        vote_average: None,
     }
 }
 

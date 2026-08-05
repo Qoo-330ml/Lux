@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::application::metadata::{
     MetadataField, MetadataSource, MetadataState, NfoError, NfoMetadata, find_nfo_path,
-    nfo_fingerprint, parse_nfo,
+    nfo_fingerprint, parse_nfo, series_directory,
 };
 use crate::storage::{Database, MediaMetadataUpdate, StorageError};
 
@@ -590,11 +590,6 @@ async fn find_season_nfo_target(directory: &Path, season_number: Option<i64>) ->
         }
     }
     directory.join(&names[0])
-}
-
-fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {
-    let first = Path::new(relative_path).components().next()?.as_os_str();
-    Some(root.join(first))
 }
 
 fn field_for_tag(tag: &[u8]) -> Option<MetadataField> {

@@ -125,6 +125,7 @@ async fn setup_does_not_store_tmdb_configuration_and_can_create_first_library()
     assert_eq!(body["initialized"], true);
     assert!(body.get("tmdbConfigured").is_none());
     assert_eq!(body["library"]["name"], "Movies");
+    assert!(body["scanJob"]["id"].is_string());
     assert!(!config_dir.join("tmdb_read_access_token").exists());
 
     server.abort();

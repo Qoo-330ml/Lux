@@ -1,0 +1,301 @@
+use std::path::Path;
+
+use axum::{
+    Router,
+    extract::Json,
+    http::StatusCode,
+    routing::{get, post},
+};
+use luxd::application::danmaku::{
+    DanmakuProviderClient, DanmakuService, DanmakuServiceError, MAX_DANMAKU_XML_BYTES,
+    atomic_write_danmaku_xml, danmaku_sidecar_path, validate_danmaku_xml,
+    validate_provider_base_url,
+};
+use luxd::application::settings::{read_danmaku_provider_url, write_danmaku_provider_url};
+use luxd::application::{libraries::LibraryService, scanner::LibraryScanner};
+use luxd::domain::ids::LibraryId;
+use luxd::library::LibraryKind;
+use luxd::{config::Config, storage::Database};
+
+#[test]
+fn derives_same_basename_xml_without_escaping_media_directory() {
+    let path = Path::new("Season 01/Episode 01.mkv");
+    assert_eq!(
+        danmaku_sidecar_path(path).expect("sidecar path"),
+        Path::new("Season 01/Episode 01.xml")
+    );
+    assert!(danmaku_sidecar_path(Path::new("../Episode.mkv")).is_err());
+}
+
+#[test]
+fn validates_dandanplay_base_and_redacts_token_path() {
+    let base = validate_provider_base_url(" https://danmu.example/secret-token/ ")
+        .expect("valid provider base");
+    assert_eq!(base.normalized(), "https://danmu.example/secret-token");
+    assert_ne!(base.redacted(), base.normalized());
+    assert!(validate_provider_base_url("file:///tmp/danmu").is_err());
+    assert!(validate_provider_base_url("https://user:pass@example.invalid/api").is_err());
+}
+
+#[test]
+fn accepts_bilibili_xml_and_rejects_html_or_oversized_payload() {
+    let valid = br#"<?xml version="1.0" encoding="UTF-8"?><i><chatserver>chat.bilibili.com</chatserver><chatid>1</chatid><mission>0</mission><maxlimit>1</maxlimit><state>0</state><real_name>0</real_name><source>k-v</source><d p="1,1,25,16777215,0,0,0,0">hello</d></i>"#;
+    assert!(validate_danmaku_xml(valid).is_ok());
+    assert!(validate_danmaku_xml(b"<html>not danmaku</html>").is_err());
+    assert!(validate_danmaku_xml(&vec![b'x'; MAX_DANMAKU_XML_BYTES + 1]).is_err());
+}
+
+#[tokio::test]
+async fn writes_xml_atomically_and_rejects_existing_file_by_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let target = directory.path().join("Episode 01.xml");
+    let xml = br#"<i><d p="1,1,25,16777215,0,0,0,0">hello</d></i>"#;
+
+    atomic_write_danmaku_xml(&target, xml, false).await?;
+    assert_eq!(tokio::fs::read(&target).await?, xml);
+    let error = atomic_write_danmaku_xml(&target, xml, false)
+        .await
+        .expect_err("overwrite must be explicit");
+    assert!(error.to_string().contains("already exists"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn database_migration_creates_danmaku_tables() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: directory.path().to_path_buf(),
+    })
+    .await?;
+
+    for table in [
+        "danmaku_tracks",
+        "danmaku_match_jobs",
+        "danmaku_match_job_items",
+    ] {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
+            )",
+        )
+        .bind(table)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(exists, 1, "missing migration table {table}");
+    }
+    assert_eq!(database.schema_version().await?, 37);
+    let active_job_index: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'index' AND name = 'idx_danmaku_match_jobs_one_active_library'
+        )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(active_job_index, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_url_is_persisted_as_a_secret_file() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    write_danmaku_provider_url(directory.path(), Some("https://danmu.example/secret-token"))
+        .await?;
+    assert_eq!(
+        read_danmaku_provider_url(directory.path()).as_deref(),
+        Some("https://danmu.example/secret-token")
+    );
+    write_danmaku_provider_url(directory.path(), None).await?;
+    assert_eq!(read_danmaku_provider_url(directory.path()), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_client_preserves_token_path_and_fetches_xml()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = Router::new()
+        .route(
+            "/token/api/v2/match",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["fileName"], "Demo.S01E01.mkv");
+                Json(serde_json::json!({
+                    "isMatched": true,
+                    "matches": [{
+                        "animeId": 12,
+                        "episodeId": 34,
+                        "animeTitle": "Demo",
+                        "episodeTitle": "S01E01"
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/token/api/v2/comment/34",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/xml")],
+                    "<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>",
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+    });
+
+    let client =
+        DanmakuProviderClient::new(&format!("http://127.0.0.1:{}/token", address.port()), None)?;
+    let matched = client
+        .match_filename("Demo.S01E01.mkv")
+        .await?
+        .expect("match result");
+    assert_eq!(matched.episode_id, "34");
+    assert_eq!(
+        client.fetch_episode_xml(&matched.episode_id).await?,
+        b"<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>"
+    );
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_client_falls_back_to_episode_search_when_match_is_unsupported()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = Router::new()
+        .route("/api/v2/match", post(|| async { StatusCode::NOT_FOUND }))
+        .route(
+            "/api/v2/search/episodes",
+            get(|| async {
+                Json(serde_json::json!({
+                    "animes": [{
+                        "animeId": 12,
+                        "animeTitle": "Demo",
+                        "episodes": [{
+                            "episodeId": 34,
+                            "episodeNumber": 1,
+                            "episodeTitle": "S01E01"
+                        }]
+                    }]
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+    });
+
+    let client = DanmakuProviderClient::new(&format!("http://{address}"), None)?;
+    let matched = client
+        .match_filename("Demo.S01E01.mkv")
+        .await?
+        .expect("fallback match result");
+    assert_eq!(matched.episode_id, "34");
+    assert_eq!(matched.anime_id.as_deref(), Some("12"));
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn danmaku_service_rejects_unsafe_concurrency() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: directory.path().to_path_buf(),
+    })
+    .await?;
+    let service = DanmakuService::new(database, directory.path().to_path_buf(), None);
+
+    let error = service
+        .create_job(LibraryId::new(), 65, false)
+        .await
+        .expect_err("concurrency above the limit must be rejected");
+    assert!(matches!(error, DanmakuServiceError::InvalidConcurrency));
+    Ok(())
+}
+
+#[tokio::test]
+async fn danmaku_service_matches_local_video_and_writes_sidecar()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let config_dir = directory.path().join("config");
+    let media_root = directory.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root).await?;
+    tokio::fs::write(media_root.join("Demo.Movie.2024.mkv"), b"video").await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    LibraryService::new(database.clone())
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 media root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    write_danmaku_provider_url(&config_dir, Some("http://127.0.0.1:1")).await?;
+
+    let app = Router::new()
+        .route(
+            "/api/v2/match",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["fileName"], "Demo.Movie.2024.mkv");
+                Json(serde_json::json!({
+                    "matches": [{"animeId": 12, "episodeId": 34}]
+                }))
+            }),
+        )
+        .route(
+            "/api/v2/comment/34",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/xml")],
+                    "<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>",
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+    });
+    write_danmaku_provider_url(
+        &config_dir,
+        Some(&format!("http://127.0.0.1:{}", address.port())),
+    )
+    .await?;
+
+    let service = DanmakuService::new(database.clone(), config_dir, None);
+    let job = service.create_job(library.id, 1, false).await?;
+    service.run(&job.id).await?;
+    let completed = service.get(&job.id).await?;
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.success_count, 1);
+    assert_eq!(
+        tokio::fs::read(media_root.join("Demo.Movie.2024.xml")).await?,
+        b"<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>"
+    );
+    let track_status: String = sqlx::query_scalar("SELECT status FROM danmaku_tracks LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(track_status, "READY");
+    server.abort();
+    Ok(())
+}

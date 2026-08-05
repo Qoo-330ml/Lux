@@ -122,6 +122,7 @@ impl MovieIdentifier {
                 overview: details.overview,
                 release_date: details.release_date,
                 original_language: details.original_language,
+                vote_average: details.vote_average,
             }]
         } else {
             self.client

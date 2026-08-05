@@ -1,13 +1,21 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
-use axum::{Json, Router, routing::any};
+use axum::{Json, Router, extract::State as AxumState, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
         libraries::LibraryService,
+        reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
+        tmdb_plugin::TmdbProvider,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -35,6 +43,29 @@ async fn tmdb_search_stub() -> Json<Value> {
     }))
 }
 
+#[derive(Clone)]
+struct ConcurrencyTracker {
+    active: Arc<AtomicUsize>,
+    maximum: Arc<AtomicUsize>,
+}
+
+async fn delayed_tmdb_stub(AxumState(tracker): AxumState<ConcurrencyTracker>) -> Json<Value> {
+    let active = tracker.active.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut maximum = tracker.maximum.load(Ordering::SeqCst);
+    while active > maximum {
+        match tracker
+            .maximum
+            .compare_exchange(maximum, active, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => break,
+            Err(observed) => maximum = observed,
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tracker.active.fetch_sub(1, Ordering::SeqCst);
+    tmdb_search_stub().await
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)
@@ -49,8 +80,7 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn admin_can_start_and_poll_batch_metadata_reidentify()
--> Result<(), Box<dyn std::error::Error>> {
+async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -187,6 +217,44 @@ async fn admin_can_start_and_poll_batch_metadata_reidentify()
             .await?;
     assert_eq!(candidate_count, 1);
 
+    let item_refresh_started = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{item_id}/metadata/refresh"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "FILL_MISSING" }))
+        .send()
+        .await?;
+    assert_eq!(item_refresh_started.status(), reqwest::StatusCode::ACCEPTED);
+    let item_refresh_body: Value = item_refresh_started.json().await?;
+    assert_eq!(item_refresh_body["mode"], "FILL_MISSING");
+    assert_eq!(item_refresh_body["totalCount"], 1);
+    assert_eq!(item_refresh_body["job"]["mode"], "FILL_MISSING");
+
+    let item_refresh_job_id = item_refresh_body["job"]["id"]
+        .as_str()
+        .ok_or("missing item metadata refresh job ID")?
+        .to_owned();
+    let mut item_refresh_job = Value::Null;
+    for _ in 0..80 {
+        let response = client
+            .get(format!(
+                "{base_url}/api/v1/admin/metadata/reidentify/{item_refresh_job_id}"
+            ))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        item_refresh_job = response.json().await?;
+        if item_refresh_job["job"]["status"] == "COMPLETED"
+            || item_refresh_job["job"]["status"] == "FAILED"
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(item_refresh_job["job"]["status"], "COMPLETED");
+
     sqlx::query("UPDATE media_items SET title = '', sort_title = '' WHERE id = ?")
         .bind(&item_id)
         .execute(database.pool())
@@ -276,7 +344,48 @@ async fn admin_can_start_and_poll_batch_metadata_reidentify()
     assert_eq!(library_started.status(), reqwest::StatusCode::ACCEPTED);
     let library_body: Value = library_started.json().await?;
     assert_eq!(library_body["totalCount"], 1);
-    assert_eq!(library_body["jobs"].as_array().map(Vec::len), Some(1));
+    assert!(library_body["job"].is_object());
+    assert!(library_body["jobs"].is_null());
+    let library_job_id = library_body["job"]["id"]
+        .as_str()
+        .ok_or("missing library metadata job ID")?
+        .to_owned();
+    let mut library_job = Value::Null;
+    for _ in 0..80 {
+        let response = client
+            .get(format!(
+                "{base_url}/api/v1/admin/metadata/reidentify/{library_job_id}"
+            ))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        library_job = response.json().await?;
+        if library_job["job"]["status"] == "COMPLETED" || library_job["job"]["status"] == "FAILED" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(library_job["job"]["mode"], "FILL_MISSING");
+    assert_eq!(library_job["job"]["status"], "COMPLETED");
+
+    let listed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/metadata/reidentify?page=1&pageSize=50"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let listed_body: Value = listed.json().await?;
+    assert_eq!(listed_body["page"], 1);
+    assert_eq!(listed_body["pageSize"], 50);
+    assert!(listed_body["jobs"].as_array().is_some_and(|jobs| {
+        jobs.iter().any(|job| {
+            job["mode"] == "REIDENTIFY"
+                && job["status"] == "COMPLETED"
+                && job["processedCount"] == 1
+        })
+    }));
 
     let refresh_started = client
         .post(format!(
@@ -292,8 +401,9 @@ async fn admin_can_start_and_poll_batch_metadata_reidentify()
     let refresh_body: Value = refresh_started.json().await?;
     assert_eq!(refresh_body["mode"], "FULL_REFRESH");
     assert_eq!(refresh_body["totalCount"], 1);
-    assert_eq!(refresh_body["jobs"][0]["mode"], "FULL_REFRESH");
-    let refresh_job_id = refresh_body["jobs"][0]["id"]
+    assert_eq!(refresh_body["job"]["mode"], "FULL_REFRESH");
+    assert!(refresh_body["jobs"].is_null());
+    let refresh_job_id = refresh_body["job"]["id"]
         .as_str()
         .ok_or("missing metadata refresh job ID")?
         .to_owned();
@@ -317,6 +427,143 @@ async fn admin_can_start_and_poll_batch_metadata_reidentify()
     assert_eq!(refresh_job["job"]["items"][0]["candidateCount"], 0);
 
     server.abort();
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_metadata_refresh_includes_series_children() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    tokio::fs::create_dir_all(root.join("Example Show/Season 01")).await?;
+    tokio::fs::write(
+        root.join("Example Show/Season 01/Example.Show.S01E01.mkv"),
+        b"fixture",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Example Show/Season 01/Example.Show.S01E02.mkv"),
+        b"fixture",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    luxd::application::scanner::LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let series_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'SERIES' AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: "http://127.0.0.1:1".to_owned(),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let job = metadata
+        .create_item_refresh_job(&series_id, MetadataRefreshMode::FillMissing)
+        .await?;
+
+    assert_eq!(job.total_count, 4);
+    let refreshed_types: Vec<String> = sqlx::query_scalar(
+        "SELECT mi.item_type
+         FROM metadata_reidentify_job_items ji
+         JOIN media_items mi ON mi.id = ji.item_id
+         WHERE ji.job_id = ?
+         ORDER BY CASE mi.item_type WHEN 'SERIES' THEN 0 WHEN 'SEASON' THEN 1 ELSE 2 END,
+                  mi.episode_number",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(refreshed_types, ["SERIES", "SEASON", "EPISODE", "EPISODE"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_metadata_job_processes_items_concurrently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8098".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for index in 0..24 {
+        let movie_dir = root.join(format!("Movie {index} (2024)"));
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Movie.{index}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let tracker = ConcurrencyTracker {
+        active: Arc::new(AtomicUsize::new(0)),
+        maximum: Arc::new(AtomicUsize::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(delayed_tmdb_stub))
+        .with_state(tracker.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let job = metadata.create_library_job(&library.id.to_string()).await?;
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert_eq!(completed.total_count, 24);
+    assert_eq!(completed.status, "COMPLETED");
+    assert!(tracker.maximum.load(Ordering::SeqCst) > 1);
     tmdb_server.abort();
     Ok(())
 }

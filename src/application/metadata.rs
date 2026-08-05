@@ -937,7 +937,7 @@ async fn read_directory_paths(directory: &Path) -> Result<Vec<PathBuf>, Metadata
     Ok(paths)
 }
 
-fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {
+pub(crate) fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {
     let mut series_dir = root.to_owned();
     let mut saw_series_component = false;
     for component in Path::new(relative_path).parent()?.components() {

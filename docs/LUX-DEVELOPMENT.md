@@ -49,6 +49,7 @@
 - SQLite 数据库位于 /config 的本机持久化卷，不位于 SMB/NFS。
 - 兼容性只承诺实施时真实测试并记录版本的 VidHub、SenPlayer 和 Infuse；“对标 Emby”不等于实现 Emby 全部端点。
 - 首版运行单个 Lux 实例，不做多节点、高可用或共享数据库。
+- 弹幕首版只面向支持弹幕接口的第三方客户端；不把 Emby 标准字幕端点当作弹幕协议，也不为其他客户端增加 ASS 或转码兜底。
 
 ---
 
@@ -67,7 +68,7 @@ Lux 的核心价值不是功能数量，而是：
 
 ### 2.1 主要用户
 
-- 管理员：完成初始化、创建用户、管理权限、创建媒体库、配置扫描和刮削、纠正识别、查看任务与健康状态。
+- 管理员：完成初始化、创建用户、管理权限、创建媒体库、配置扫描和刮削、纠正元数据匹配、查看任务与健康状态。
 - 普通用户：通过 VidHub、SenPlayer、Infuse 或 Lux Web 客户端浏览和播放自己有权访问的媒体库。
 
 ### 2.2 成功定义
@@ -78,8 +79,8 @@ Lux 的核心价值不是功能数量，而是：
 - Lux Web 客户端支持登录、继续观看、多个媒体库入口、搜索、筛选、详情、版本选择和浏览器原生直放。
 - 10,000 部电影和 50,000 集剧集的测试库中，常用查询达到第 5 节定义的性能目标。
 - 实时文件事件只触发局部增量扫描；定时全量校验在后台可暂停、可恢复，不锁住前台。
-- 本地 NFO 和图片优先，TMDb 仅补缺；低置信度匹配进入“待处理”。
-- 管理员能重新识别并将结果原子地回写到 NFO 和同目录图片。
+- 本地 NFO 和图片优先，所选刮削器仅补缺；低置信度匹配进入“待处理”。
+- 管理员能重新匹配元数据条目并将结果原子地回写到 NFO 和同目录图片。
 - Docker 容器重启后，任务、进度、用户、索引和扫描游标均保持一致。
 
 ---
@@ -108,7 +109,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - .strm 文件的第一个非空文本内容被视为外部播放地址。
-- .strm 地址直接交给客户端，不校验、不探测、不做代理、不访问 AList API。
+- .strm 地址在播放路径中直接交给客户端，不校验、不探测、不做代理、不访问 AList API；独立的管理员 STRM 探测任务可以在 URL 安全策略通过后将地址交给 `org.lux.media-info` 插件。
 - Lux 不负责保护 .strm URL 中可能包含的令牌；管理员应理解该 URL 会暴露给有播放权限的客户端。
 
 ### 3.3 播放
@@ -144,23 +145,28 @@ Lux 的核心价值不是功能数量，而是：
 - 本地 .nfo 和已有海报、背景图优先。
 - 常规自动处理和“仅补全”不覆盖本地已有标题、简介和图片；“完整刮削”只刷新未锁定的 NFO 字段并替换已有图片。
 - 锁定的 NFO 字段在任何刮削模式下都不覆盖；在线没有返回的图片不删除本地图片。
-- TMDb 语言优先简体中文 zh-CN，字段缺失时回退英文。
+- TMDb 插件提供可配置的首选语言，默认使用简体中文 `zh-CN`；可选语言按 `zh-CN`、`zh-SG`、`zh-HK`、`zh-TW`、其他 TMDb 主翻译语言的顺序展示。
+- TMDb 语言回退开关默认关闭；开启后，电影、剧集、季度和单集元数据按管理员选择的语言顺序逐字段补全，默认预选 `zh-SG`、`zh-HK`、`zh-TW`。
+- TMDb 插件提供默认关闭的替代 API 地址开关；开启后可选择默认官方地址 `https://api.themoviedb.org`、`https://api.tmdb.org` 或自定义 HTTP(S) 基础地址。自定义地址不得包含凭据、查询参数或片段，并持久化到 `/config/tmdb_settings.json`。
 - 图片优先本地；在线图片按 zh-CN、无语言、英文的顺序选择。
 - 电影、剧集、季度和单集 NFO 均应兼容常见 Emby/Kodi 旁挂形式。
 - 至少识别 movie.nfo、tvshow.nfo、与视频同名的 .nfo、poster、fanart/backdrop、seasonXX-poster 等常见命名。
 - 写回时使用稳定、公开记录的 Lux NFO 子集，同时尽量保留未知 XML 字段，避免破坏其他软件写入的信息。
 
-### 3.6 识别和重新识别
+### 3.6 元数据匹配和重新匹配
 
 - 有明确 provider ID 时直接确认身份。
-- 没有 provider ID 时，可用规范化标题、年份、媒体类型和季集号搜索 TMDb。
-- 自动识别必须达到高置信度阈值；候选接近或信息不足时进入“待处理”。
+- 没有 provider ID 时，可用规范化标题、年份、媒体类型和季集号通过媒体库所选刮削器搜索。
+- 匹配结果只保存当前媒体库所选刮削器对应的 provider ID；选择 TMDb 时保存 TMDb ID，选择其他刮削器时保存该刮削器返回的 ID。
+- 自动匹配必须达到高置信度阈值；候选接近或信息不足时进入“待处理”。
 - “待处理”条目保留原始文件名和可播放能力，不因缺少在线元数据从库中消失。
 - 管理员 Web 控制台提供待处理列表。
 - 管理员可搜索候选、查看差异、选择正确条目并确认。
-- 识别错误时支持“重新识别”。
-- 重新识别可选择仅补缺字段或刷新在线字段；无论哪种模式都不覆盖已锁定字段。
-- 成功编辑或识别后，将 NFO 和选中的图片回写到媒体目录。
+- 元数据匹配错误时支持“重新匹配”。
+- 重新匹配可选择仅补缺字段或刷新在线字段；无论哪种模式都不覆盖已锁定字段。
+- 成功编辑或匹配后，将 NFO 和选中的图片回写到媒体目录。
+- 新建媒体库首次添加可用根路径并完成扫描后，若媒体库配置了刮削器，自动按高置信度选择最佳候选，写回元数据并按该媒体库的图像策略下载所需图片；用户无需逐条进入管理后台确认。
+- 管理员从媒体库入口手动执行“整库元数据匹配”时，使用与新库首次处理相同的自动选择、NFO 写回和图片下载流程；低置信度或候选接近的条目仍进入待处理队列。
 - 回写使用临时文件、刷盘和原子重命名；失败时显示可重试状态，不谎报成功。
 
 建议的首版自动匹配门槛：
@@ -171,14 +177,23 @@ Lux 的核心价值不是功能数量，而是：
 
 具体分数只属于 Lux 内部实现，不作为 Emby 兼容 API 的公共契约。
 
-### 3.7 图片
+### 3.7 弹幕
+
+- 弹幕使用独立的 Lux 弹幕服务和 Emby 兼容弹幕路由，不伪装成普通字幕轨。
+- 管理员可以配置一个 Dandanplay 兼容 API 基地址，也可以配置 `huangxd-/danmu_api` 的 API 基地址；地址可包含部署 token 路径。
+- 后台匹配任务优先使用上游 `/api/v2/match`，不支持时回退到 Dandanplay 兼容的搜索、详情和弹幕接口。
+- 匹配成功的 XML 弹幕写回视频同目录、同 basename 的 `.xml` 旁车；使用临时文件、刷盘和原子重命名。
+- 只承诺支持弹幕接口的第三方客户端可以通过 Lux 的 Emby 接口读取；其他客户端是否识别 `.xml` 不属于 Lux 兼容承诺。
+- 首版不实现 Web 播放器弹幕、ASS 写回、弹幕转换、实时发送、代理播放或非弹幕客户端适配。
+
+### 3.8 图片
 
 首版必须：
 
 - 海报 poster。
 - 背景图 backdrop/fanart。
 - 本地图片发现、尺寸读取、缓存标签、HTTP 缓存和缩放接口兼容。
-- 缺失时从 TMDb 下载并回写媒体目录；识别选择时按所属媒体库启用的图片类型逐项取第一张可用图片，缺失类型跳过。
+- 缺失时从所选刮削器下载并回写媒体目录；匹配选择时按所属媒体库启用的图片类型逐项取第一张可用图片，缺失类型跳过。
 
 首版不阻塞但数据模型需预留：
 
@@ -187,7 +202,7 @@ Lux 的核心价值不是功能数量，而是：
 - 人物图。
 - 章节缩略图。
 
-### 3.8 合集
+### 3.9 合集
 
 - 支持电影合集。
 - 读取 TMDb collection 信息自动建立电影系列。
@@ -195,7 +210,7 @@ Lux 的核心价值不是功能数量，而是：
 - 合集成员仍受媒体库 ACL 约束。
 - 自定义合集不是首个可用版本的阻塞项。
 
-### 3.9 用户、会话和权限
+### 3.10 用户、会话和权限
 
 - 第一次启动进入初始化引导。
 - 第一个完成初始化的账户为管理员。
@@ -211,7 +226,7 @@ Lux 的核心价值不是功能数量，而是：
 - 内容分级和按标签控制属于后续阶段。
 - 管理控制台的权限必须由服务端校验；隐藏前端菜单不等于授权。
 
-### 3.10 首页、浏览和搜索
+### 3.11 首页、浏览和搜索
 
 普通用户首页：
 
@@ -228,6 +243,8 @@ Lux 的核心价值不是功能数量，而是：
 - 按收藏筛选。
 - 按名称排序。
 - 按最近添加排序。
+- 按发行日期排序。
+- 按评分排序。
 - 所有列表分页，禁止无界返回。
 
 后续能力：
@@ -235,7 +252,7 @@ Lux 的核心价值不是功能数量，而是：
 - 演员、导演、制作公司等深度浏览。
 - 全站排行榜和更复杂的内容相似度推荐。
 
-### 3.11 播放进度
+### 3.12 播放进度
 
 - 每个用户独立保存。
 - 进度时间使用 Emby 兼容的 ticks 表示时，1 秒等于 10,000,000 ticks。
@@ -245,7 +262,7 @@ Lux 的核心价值不是功能数量，而是：
 - 收到播放开始、进度和停止事件时采用幂等更新。
 - 客户端重复、乱序或延迟上报时，不允许进度无理由倒退；显式从头播放除外。
 
-### 3.12 外网访问
+### 3.13 外网访问
 
 - Lux 不实现公网穿透、UPnP 端口映射或自带证书签发。
 - 外网通过 Tailscale、反向代理或用户域名接入。
@@ -256,7 +273,7 @@ Lux 的核心价值不是功能数量，而是：
 - 只有受信代理来源的 X-Forwarded-For、X-Forwarded-Proto 等请求头可以影响远近端判断。
 - 反向代理场景必须使用 HTTPS；用户名和密码登录协议本身不能替代 TLS。
 
-### 3.13 管理与可观测性
+### 3.14 管理与可观测性
 
 管理员控制台至少显示：
 
@@ -265,16 +282,17 @@ Lux 的核心价值不是功能数量，而是：
 - 当前扫描进度、扫描游标和预计剩余项。
 - 最近一次增量扫描与全量校验时间。
 - 后台任务队列、运行中任务和失败重试。
-- 待处理、识别失败、NFO 回写失败和图片下载失败数量。
+- 待处理、元数据匹配失败、NFO 回写失败和图片下载失败数量。
 - 服务端版本、运行时间、数据库状态、磁盘可写状态。
 - 结构化日志查看和下载。
 
 首版不提供内置备份与恢复。配置和数据库通过 Docker 持久化卷由 NAS 自己备份。
 
-### 3.14 内置插件与刮削器
+### 3.15 内置插件与刮削器
 
 - Lux 提供安全的插件注册表；插件以标准 `.zip` 插件包放入 `/config/plugins`，服务重启时扫描并加载。插件代码运行在受监督的独立进程中，不直接注入 Lux Rust 主进程。
 - 首个独立插件为 `org.lux.tmdb`。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
+- SDK v1 同时支持 `media_probe` 插件类型。`org.lux.media-info` 只接收 Lux 宿主按单个任务提交的已校验 URL，调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
 - 只有已安装、已启用且有可用凭据的插件才能被媒体库选择。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用服务端内置的默认 API Key；任何凭据都不返回 API 或写入日志。
 - 媒体库的 `scraperId` 为空表示不进行在线刮削、只使用本地元数据；插件安装状态与媒体库选择均持久化，服务重启后保持不变。
 - 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
@@ -377,7 +395,7 @@ Lux 的核心价值不是功能数量，而是：
 - tracing / tracing-subscriber：结构化日志。
 - argon2：密码哈希，使用 Argon2id。
 - uuid：内部 ID，优先 UUIDv7；Emby DTO 只暴露字符串。
-- ffprobe：仅用于新增或变化的本地媒体文件的技术信息、时长、内嵌轨道和章节探测；不得用于 `.strm` 指向的外部媒体。
+- ffprobe：本地媒体由核心服务用于技术信息、时长、内嵌轨道和章节探测；`.strm` 远程媒体只能由管理员显式创建的后台任务通过受监督的 `media_probe` 插件探测，不得进入用户请求路径。
 
 依赖版本不在本文档写死。项目初始化时选择当前稳定版本并提交 Cargo.lock；升级必须单独执行、单独验证。
 
@@ -463,7 +481,7 @@ VidHub / SenPlayer / Infuse             Browser
 - domain：媒体、用户、权限、进度、任务等核心类型与规则。
 - storage：SQLx repository、事务和迁移。
 - library：目录分类、扫描、指纹、实时事件与调和。
-- metadata：NFO、TMDb、合并策略、识别和写回。
+- metadata：NFO、刮削器、合并策略、匹配和写回。
 - media：ffprobe、媒体源、字幕、版本分组。
 - playback：播放信息、Range、进度和会话。
 - jobs：持久任务、调度、重试、取消和资源配额。
@@ -477,7 +495,7 @@ HTTP handler 不写 SQL，不执行文件扫描，不直接调用 TMDb。handler
 - HTTP 请求、文件扫描、ffprobe、TMDb、图片下载和 NFO 回写使用不同并发配额。
 - 所有通道使用有界容量。
 - 同一路径事件以路径为键合并。
-- 同一媒体条目同一时刻最多有一个识别或写回任务。
+- 同一媒体条目同一时刻最多有一个元数据匹配或写回任务。
 - 前台读查询使用独立连接池配额。
 - 数据库写入通过短事务和必要的写协调器减少 SQLITE_BUSY。
 - 任何 CPU 或阻塞文件任务不得长时间占用 Tokio 核心 worker；使用 spawn_blocking 或专用线程池。
@@ -845,6 +863,49 @@ pub async fn get_item(
 - external_path
 - width、height、channels 等技术字段
 
+#### danmaku_tracks
+
+- id
+- media_source_id
+- relative_path：相对媒体库根路径的同名 `.xml` 旁车路径
+- format：首版固定 XML
+- provider
+- provider_anime_id，可空
+- provider_episode_id，可空
+- fingerprint
+- status：READY、MISSING、INVALID、FAILED
+- last_checked_at
+- created_at
+- updated_at
+
+#### danmaku_match_jobs
+
+- id
+- library_id
+- overwrite
+- concurrency
+- status：PENDING、RUNNING、COMPLETED、FAILED、CANCELLED
+- total_count
+- processed_count
+- success_count
+- skipped_count
+- failed_count
+- error
+- created_at、started_at、finished_at、updated_at
+
+#### danmaku_match_job_items
+
+- id
+- job_id
+- media_source_id
+- status：PENDING、RUNNING、MATCHED、WRITTEN、SKIPPED、FAILED、CANCELLED
+- provider_anime_id，可空
+- provider_episode_id，可空
+- error_code，可空
+- error_message，可空且必须脱敏
+- attempts
+- updated_at
+
 ### 11.4 元数据和图片
 
 #### item_aliases
@@ -948,7 +1009,7 @@ pub async fn get_item(
 
 - 新条目缺失字段时触发。
 - 管理员手动刷新缺失字段。
-- 管理员重新识别。
+- 管理员重新匹配元数据条目。
 - 与文件全量调和完全分离。
 
 ### 12.2 增量事件流程
@@ -1018,13 +1079,13 @@ Linux inotify 对 watch 数量有限制，且极大目录可能丢事件。因�
 
 ---
 
-## 13. NFO、TMDb 与图片流水线
+## 13. NFO、元数据与图片流水线
 
 ### 13.1 NFO 读取
 
 - 宽容 XML 解析，未知字段不导致整个条目失败。
 - 单个字段解析错误进入诊断，不丢弃其他字段。
-- 识别 provider ID、标题、原标题、sort title、年份、日期、简介、类型、标签、流派、评分、季集号、演员等常用字段。
+- 读取并匹配 provider ID、标题、原标题、sort title、年份、日期、简介、类型、标签、流派、评分、季集号、演员等常用字段。
 - 首版查询不需要的人物字段也可保留在 canonical metadata 中，以免写回丢失。
 - 所有 XML 外部实体禁用，防止 XXE。
 
@@ -1035,22 +1096,25 @@ Linux inotify 对 watch 数量有限制，且极大目录可能丢事件。因�
 ~~~text
 locked local value
   > existing NFO/local image
-  > confirmed TMDb localized value
+  > confirmed scraper localized value
   > filename/probe fallback
 ~~~
 
-空字符串不应覆盖有效值。在线中文字段为空时逐字段回退英文，而不是整条记录一次性切换语言。
+空字符串不应覆盖有效值。TMDb 语言回退按选定语言顺序逐字段补全，而不是整条记录一次性切换语言；回退请求失败时保留首选语言已获得的字段。
 
-### 13.3 TMDb 客户端
+### 13.3 刮削器客户端
 
 - TMDb 客户端同时兼容 v3 API Key 和历史 v4 Read Access Token。管理员通过 TMDb 插件详情配置自己的 API Key。
 - 服务端内置一个与 Emby 插件兼容的默认 TMDb API Key，因此首次引导不要求配置 TMDb；管理员填写的 API Key 优先于内置值。
 - 自定义 API Key 和历史 token 只保存在 /config 中的受限配置或 secrets 文件，不返回普通用户、插件 API 或日志。
-- 使用统一 HTTP client、超时、限流、重试和 User-Agent。
+- TMDb 插件配置还包括首选语言、语言回退开关和有序回退语言列表；这些非敏感值保存在 `/config/tmdb_settings.json`，可通过管理员插件配置 API 返回，凭据仍不可返回。
+- 主进程的元数据匹配、候选搜索、图片候选和合集请求统一通过媒体库所选刮削器协议；主进程不得直接访问第三方元数据 API。
+- 插件内部使用统一 HTTP client、超时、16 并发配额、每秒 32 次请求限流、重试和 User-Agent。
 - 404、429、5xx、网络超时分类处理。
 - 搜索候选短期缓存，详情较长时间缓存。
 - 响应 schema 验证后进入领域层。
-- 自动匹配和手动重新识别共用候选模型。
+- 自动匹配和手动重新匹配共用候选模型；候选的 provider ID 和 provider 名称必须与所选刮削器一致。
+- 电影和剧集候选同时携带 0-10 的来源评分；确认候选后保存评分及其刮削器来源，Lux Web 目录和详情海报在右上角显示“来源 + 评分”。
 
 ### 13.4 NFO 和图片写回
 
@@ -1066,12 +1130,12 @@ locked local value
 
 图片下载先写临时文件，并验证 MIME、文件签名和合理大小后再替换。
 
-### 13.5 重新识别
+### 13.5 重新匹配
 
 管理员流程：
 
 1. 打开待处理或错误条目。
-2. 输入标题、年份或 TMDb ID。
+2. 输入标题、年份或所选刮削器的 provider ID。
 3. 查看候选海报、标题、年份和简介。
 4. 选择候选。
 5. 选择“仅补缺”或“刷新未锁定在线字段”。
@@ -1079,11 +1143,13 @@ locked local value
 7. 确认。
 8. 写回 NFO/图片并重新索引该条目。
 
-批量重新识别使用持久化任务队列：管理员一次提交 1-100 个条目，服务端去重后以 `QUEUED` 创建任务并在后台逐条处理；每条记录 `PENDING/RUNNING/COMPLETED/FAILED`、候选数量和稳定错误代码，任务通过 `GET /api/v1/admin/metadata/reidentify/{jobId}` 查询。批量任务只负责重新搜索并生成 pending 候选，不自动选择或覆盖本地元数据；失败任务可通过 `POST /api/v1/admin/metadata/reidentify/{jobId}` 重新排队失败条目。
+指定条目的批量重新识别仍使用持久化任务队列：管理员一次提交 1-100 个条目，服务端去重后以 `QUEUED` 创建任务并在后台逐条处理；每条记录 `PENDING/RUNNING/COMPLETED/FAILED`、候选数量和稳定错误代码，任务通过 `GET /api/v1/admin/metadata/reidentify/{jobId}` 查询。该指定条目接口只负责重新搜索并生成 pending 候选，供管理员处理；失败任务可通过 `POST /api/v1/admin/metadata/reidentify/{jobId}` 重新排队失败条目。
+
+媒体库级“整库元数据匹配”使用同一持久化队列，但默认以 `FILL_MISSING` 自动处理：逐条使用所属媒体库的刮削器搜索候选，达到高置信度时自动选择最佳候选，按媒体库图像策略下载图片并原子写回 NFO/图片；低置信度条目只保留候选并进入待处理状态。新建媒体库首次扫描完成后也自动提交该队列。
 
 全局元数据刷新使用同一持久化队列，模式为 `FILL_MISSING` 或 `FULL_REFRESH`。仅补全只写入缺失的未锁定 NFO 字段和图片；完整刮削刷新未锁定 NFO 字段并替换已有图片，但不覆盖锁定字段。未配置刮削器的条目跳过在线请求并保留本地结果。
 
-管理员也可以从首页或媒体库入口对整个媒体库发起批量重新识别或元数据刷新；服务端按固定批次拆分任务并立即返回任务批次信息，前端不得等待识别完成。
+管理员也可以从首页或媒体库入口对整个媒体库发起批量元数据匹配或元数据刷新；服务端为一次操作创建一个持久化任务并立即返回。任务内部最多 16 路异步 worker 并行处理条目，条目状态、失败重试和短事务仍逐条记录，前端不得等待匹配完成。
 
 ---
 
@@ -1118,7 +1184,7 @@ locked local value
 - SupportsDirectPlay = true。
 - SupportsDirectStream/Transcoding 按首版实际实现返回 false。
 - MediaSources 包含版本、容器、码率、大小、时长、流列表和直放 URL。
-- `.strm` 的容器、时长和流列表只在存在受限旁车时返回；没有旁车时不主动读取外部源，首次播放由客户端直接访问外部地址并自行读取媒体信息。
+- `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放仍由客户端直接访问外部地址。
 - 不伪造客户端能播放的编码。
 - 选择默认版本使用稳定策略，并允许客户端显式选择 source ID。
 
@@ -1130,7 +1196,14 @@ locked local value
 - 外挂字幕可由受鉴权端点直接读取。
 - 内嵌字幕由客户端从媒体容器读取；若某目标客户端强制请求提取端点，再以兼容性探针决定是否用 ffmpeg 做无转换抽取。
 
-### 14.5 Web 播放
+### 14.5 弹幕兼容
+
+- Lux 提供独立的 `/api/danmu/{itemId}` 和 `/api/danmu/{itemId}/raw` 读取端点，使用 Emby token 和媒体库 ACL。
+- XML 来自已登记、已通过媒体根路径约束的同名旁车；请求不执行上游搜索、整库扫描或 XML 写回。
+- `option=Refresh` 只刷新已登记旁车的索引；`option=GetJsonById` 作为已知 Emby 弹幕插件兼容别名，不承诺把 XML 转成通用 JSON。
+- 支持弹幕接口的客户端以真实兼容性测试为准；不支持弹幕接口的客户端继续按自身能力处理或忽略该 XML。
+
+### 14.6 Web 播放
 
 - 使用原生 video 元素。
 - 先根据容器/编码做能力提示，但最终以浏览器实际播放事件为准。
@@ -1139,7 +1212,7 @@ locked local value
 - 页面关闭使用可靠的轻量上报机制。
 - 不实现 DRM、转码和自定义解码器。
 
-### 14.6 下载权限的限制
+### 14.7 下载权限的限制
 
 can_download 控制下载按钮和下载端点，但任何获准直放本地文件的用户理论上都能保存收到的字节。因此它是产品权限，不是 DRM 安全边界。文档和 UI 不得做虚假承诺。
 
@@ -1314,12 +1387,19 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - GET /api/v1/admin/metadata/reidentify/{jobId}
 - POST /api/v1/admin/metadata/reidentify/{jobId}
 - POST /api/v1/admin/libraries/{libraryId}/metadata/refresh
+- POST /api/v1/admin/libraries/{libraryId}/danmaku/match
+- GET /api/v1/admin/danmaku/match-jobs
+- GET /api/v1/admin/danmaku/match-jobs/{jobId}
+- POST /api/v1/admin/danmaku/match-jobs/{jobId}/cancel
+- POST /api/v1/admin/danmaku/match-jobs/{jobId}/retry
 - PATCH /api/v1/admin/items/{id}/metadata
-- DELETE /api/v1/admin/items/{id}
 - POST /api/v1/admin/items/{id}/metadata/refresh
+- DELETE /api/v1/admin/items/{id}
 - GET/PATCH /api/v1/admin/settings
 - GET /api/v1/admin/health
 - GET /api/v1/admin/logs
+
+`GET/PATCH /api/v1/admin/settings` 的 `danmaku` 配置只返回脱敏的地址和配置状态；地址中的 token、query secret 和完整外部 URL 不进入日志、审计事件或普通用户 API。
 
 所有管理端点均在服务端检查 can_manage_server。敏感操作写审计事件。删除媒体源时，即使媒体文件已被外部删除，也会清理 Lux 中的媒体源记录；没有其他媒体源时同时标记逻辑条目移除。
 
@@ -1341,9 +1421,10 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 
 - 登录。
 - 首页：继续观看、媒体库入口、搜索。
-- 媒体库列表：类型、年份、已看、收藏筛选；名称、最近添加排序。
+- 媒体库列表：类型、年份、已看、收藏筛选；名称、最近添加、发行日期、评分排序。
 - 搜索结果。
 - 电影详情：海报、背景、简介、年份、时长、版本、字幕信息、播放、收藏。
+- 电影和剧集详情显示所选刮削器匹配得到的主要演员；演员资料和头像缓存到 `/config/people`，无头像时显示姓名首字母占位。
 - 剧集详情：季度、单集、下一集、进度。
 - 合集详情。
 - Web 播放页。
@@ -1357,7 +1438,8 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 路径选择/输入、读写检测。
 - 扫描计划与元数据计划，明确分开。
 - 扫描/任务页。
-- 待处理识别页。
+- 任务与日志页集中查看所有已保存的计划配置，并可维护当前支持的媒体库增量扫描、全量校验和元数据计划。
+- 待处理匹配页。
 - 元数据编辑与锁定。
 - 图片管理。
 - 用户与权限。
@@ -1389,6 +1471,8 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - FETCH_TMDB
 - WRITE_NFO
 - DOWNLOAD_IMAGE
+- MATCH_DANMAKU
+- WRITE_DANMAKU_XML
 - REBUILD_SEARCH
 - PURGE_MISSING
 
@@ -1448,7 +1532,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 混合库判断。
 - 文件指纹和事件合并。
 - NFO 解析、字段合并、锁定与写回。
-- TMDb 候选评分。
+- 刮削器候选评分。
 - 版本聚合。
 - ACL 和远程访问判断。
 - Range 解析。
@@ -1595,10 +1679,10 @@ services:
 - 决定：不实现转码或 remux。
 - 后果：部分浏览器文件无法播放，明确提示。
 
-### ADR-005：本地元数据为权威
+### ADR-005：本地元数据为默认来源
 
 - 状态：已由需求确认。
-- 决定：本地 NFO/图片优先，TMDb 仅补缺，管理变更回写。
+- 决定：本地 NFO/图片始终读取；默认和“仅补全”只补缺失内容，显式“完整刮削”才刷新未锁定 NFO 字段并替换图片；锁定的 NFO 字段始终保留。
 - 后果：媒体目录必须读写，写回可靠性成为核心功能。
 
 ### ADR-006：React Web 客户端
@@ -1643,6 +1727,7 @@ services:
 | LUX-030 至 036 | src/domain/、src/library/、src/media/、src/api/、tests/fixtures/ |
 | LUX-040 至 045 | src/library/、src/jobs/、src/storage/、tools/catalog-fixture/、tests/performance/ |
 | LUX-050 至 056 | src/metadata/、src/jobs/、src/api/lux/、tests/fixtures/nfo/、tests/integration/ |
+| LUX-057 | src/application/media_matching.rs、src/application/scanner.rs、src/application/candidates.rs、src/application/reidentify.rs、src/bin/lux-plugin-tmdb.rs、tests/ |
 | LUX-060 至 064 | src/domain/、src/library/、src/metadata/、src/api/emby/、tests/fixtures/ |
 | LUX-070 至 075 | src/playback/、src/api/emby/、src/application/、tests/api/、tests/integration/ |
 | LUX-080 至 084 | src/storage/、src/application/、src/api/、migrations/、tests/performance/ |
@@ -1653,6 +1738,10 @@ services:
 | LUX-130 至 136 | migrations/、tests/performance/、Dockerfile、compose.yaml、docs/ |
 | LUX-140 | src/application/plugins.rs、src/storage/、src/api/、migrations/、web/src/features/admin/、tests/ |
 | LUX-142 | src/application/plugin_runtime.rs、src/application/plugin_protocol.rs、src/storage/、src/api/、migrations/、plugins/、docs/、tests/ |
+| LUX-144 | src/application/settings.rs、src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、src/bin/lux-plugin-tmdb.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
+| LUX-145 | src/application/thumbnails.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、tests/thumbnails.rs、docs/ |
+| LUX-146 | src/application/plugin_protocol.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/application/strm_probe.rs、src/application/strm_probe_policy.rs、src/application/probe.rs、src/storage/、src/api/mod.rs、src/bin/lux-plugin-media-info.rs、src/bin/lux-plugin-pack.rs、migrations/、scripts/、tests/、docs/ |
+| LUX-150 | src/application/danmaku.rs、src/storage/、src/api/mod.rs、migrations/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2042,7 +2131,7 @@ services:
 - 扫描可恢复。
 - 前台没有因扫描被长时间锁住。
 
-### 阶段 5：元数据、TMDb 和重新识别
+### 阶段 5：元数据、刮削器和重新匹配
 
 #### LUX-050：字段级来源和锁定规则
 
@@ -2074,7 +2163,7 @@ services:
 验收：
 
 - provider ID 精确确认。
-- 明确标题+年份可以高置信自动识别。
+- 明确标题+年份可以高置信自动匹配所选刮削器条目。
 - 候选接近时进入 PENDING。
 
 验证：中文、英文、同名翻拍、缺年份 fixtures。
@@ -2136,7 +2225,7 @@ services:
 
 - 一个无 NFO 电影可通过 TMDb 补齐并写回。
 - 一个同名歧义电影进入待处理。
-- 一个错误条目可重新识别。
+- 一个错误条目可重新匹配所选刮削器条目。
 
 ### 阶段 6：剧集、混合库和字幕
 
@@ -2162,6 +2251,28 @@ services:
 验证：多季剧集 fixture。
 
 依赖：LUX-060。
+
+#### LUX-057：统一媒体文件名解析与 Movie/TV 匹配
+
+范围：参考 qmby 的 `ParseMediaName` 和刮削器候选策略，在 Lux 应用层提供统一的文件名/目录名解析与标题清洗。解析结果至少包含清洗后的标题、年份、季号、集号、版本和清晰度；支持 `SxxEyy`、`x` 格式、中文“第 N 季/第 M 集”和年份紧贴标题的常见命名。去除分辨率、编码、音频、字幕、来源、发布组等技术噪声，但保留可用于媒体源聚合的版本和清晰度字段。
+
+元数据匹配和搜索必须使用媒体库所选刮削器，并按媒体类型分流；TMDb 刮削器的电影调用 `/search/movie`、剧集调用 `/search/tv`。带年份搜索无结果时允许回退无年份搜索，并对中文/英文标题候选逐项尝试。Lux 扫描、候选搜索、批量重新匹配和各刮削器插件使用同一解析语义；插件 RPC 公开字段保持兼容，不泄露凭据。
+
+验收：
+
+- [x] `暗夜与黎明2024` 清洗为标题“暗夜与黎明”、年份 2024；`暗夜与黎明 S01E01 H 265 AAC CHDWEB` 不把技术标签写入标题。
+- [x] 统一解析器覆盖电影、剧集、季度、单集的年份/季集号和常见技术标签，并保留版本/清晰度信息。
+- [x] MOVIE 候选和重新匹配请求只调用 `/search/movie`，SERIES 请求只调用 `/search/tv`；TV 搜索支持中文结果缺字段时的英文逐字段回退。
+- [x] `lux-plugin-tmdb` 的 `metadata.search` 对相同输入产生相同清洗标题和类型分流，协议响应字段不变。
+- [x] 解析和匹配错误只产生待处理/可重试结果，不在用户 HTTP 请求路径扫描文件或直接调用 TMDb。
+
+验证：
+
+- `cargo test --locked --test media_matching --test scanner --test series_scanner --test metadata_api --test tmdb --test tmdb_plugin`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-052、LUX-060、LUX-061、LUX-142 的现有 TMDb 插件协议边界。
 
 #### LUX-062：Emby Seasons/Episodes/NextUp
 
@@ -2303,7 +2414,7 @@ services:
 验收：
 
 - 类型、年份、已看、收藏筛选。
-- 名称、最近添加排序。
+- 名称、最近添加、发行日期、评分排序；评分为空的条目稳定排在有评分条目之后。
 - Lux 和 Emby 查询语义映射。
 
 验证：组合筛选测试。
@@ -2397,7 +2508,7 @@ services:
 验收：
 
 - 登录失败限流。
-- 审计记录用户管理、权限、媒体库和重新识别操作。
+- 审计记录用户管理、权限、媒体库和元数据重新匹配操作。
 - 日志脱敏。
 
 验证：限流时间测试和日志快照测试。
@@ -2470,7 +2581,7 @@ services:
 - 普通用户只能读取自己有权限访问的媒体库封面图。
 - 分开配置文件扫描与元数据计划。
 - 显示读写与监听状态。
-- 首页和媒体库入口支持右键打开 Lux 自定义操作菜单，可对整个媒体库发起识别或扫描，并显示任务提交结果。
+- 首页和媒体库入口支持右键打开 Lux 自定义操作菜单，可对整个媒体库发起元数据匹配或扫描，并显示任务提交结果。
 
 验证：媒体库 API 集成测试、Web 单测、Web 构建和 Playwright。
 
@@ -2494,12 +2605,13 @@ services:
 - 查看、取消、重试任务。
 - 过滤失败类型。
 - 日志脱敏。
+- 计划任务区分页查看其他管理页设置的计划，并可新增、修改、停用三种媒体库计划。
 
 验证：Playwright。
 
 依赖：LUX-102。
 
-#### LUX-106：待处理、重新识别和图片管理
+#### LUX-106：待处理、重新匹配和图片管理
 
 验收：
 
@@ -2508,7 +2620,7 @@ services:
 - 写回成功/失败状态。
 - poster/fanart 选择。
 
-验证：Playwright 完整重新识别流程。
+验证：Playwright 完整元数据重新匹配流程。
 
 依赖：LUX-056、LUX-100。
 
@@ -2536,7 +2648,7 @@ services:
 验收：
 
 - 类型、年份、已看、收藏筛选。
-- 名称、最近添加排序。
+- 名称、最近添加、发行日期、评分排序。
 - 游标分页或虚拟滚动。
 
 验证：大列表 Playwright。
@@ -2548,6 +2660,8 @@ services:
 验收：
 
 - 显示 poster、fanart、简介、季度/单集、合集和 UserData。
+- 元数据匹配确认时通过所选刮削器抓取主要演员及角色名；详情页以圆形头像卡片展示演员，头像使用 `/config/people` 中的本地缓存。
+- 详情页存在本地 logo/clearlogo 时显示在标题前；没有徽标时仅显示标题。
 - 多版本选择。
 
 验证：组件与 Playwright。
@@ -2559,7 +2673,8 @@ services:
 验收：
 
 - 浏览器支持的源可播放。
-- 上报进度。
+- 使用与 Emby 兼容层相同的播放状态模型，上报开始、定时进度、暂停、停止和页面离开事件。
+- 从服务端共享状态恢复播放位置；Web 与第三方播放器的进度和当前播放状态保持一致。
 - 不支持的编码清晰提示。
 - 不触发任何转码任务。
 
@@ -2722,7 +2837,7 @@ services:
 
 - Emby 播放进度、已看和收藏导入。
 - 自定义合集。
-- Logo、banner、人物图和章节缩略图完善。
+- banner、人物图和章节缩略图完善。
 - 内容分级和标签 ACL。
 - 局域网自动发现。
 - 内嵌字幕按需无转换抽取。
@@ -2730,12 +2845,12 @@ services:
 
 #### LUX-140：内置元数据插件与媒体库刮削器选择
 
-范围：增加只允许服务端内置实现的插件注册表。管理员可以查看插件目录并安装/启用内置 TMDb 插件；媒体库创建和编辑接口返回并持久化 `scraperId`，Web 管理页面提供可用刮削器选择。
+范围：增加插件注册表和通用刮削器选择。管理员可以查看插件目录并安装/启用刮削插件；媒体库创建和编辑接口返回并持久化 `scraperId`，Web 管理页面提供可用刮削器选择。
 
 验收：
 
 - [ ] 空数据库迁移后，插件目录分页返回 TMDb，且未安装时不能被媒体库选择。
-- [ ] 管理员安装 TMDb 后，插件状态显示为已安装并可作为媒体库刮削器；管理员可在插件详情页填写自定义 API Key。
+- [ ] 管理员安装任意合法刮削插件后，插件状态显示为已安装并可作为媒体库刮削器；TMDb 仍可在插件详情页填写自定义 API Key。
 - [ ] 创建和编辑媒体库可以选择或清空 `scraperId`，重启服务后选择保持；无效、未安装或未配置插件选择被拒绝。
 - [ ] 非管理员不能查看或修改插件安装状态，也不能修改媒体库刮削器配置。
 - [ ] Web 管理员可以完成安装 TMDb、创建媒体库并选择 TMDb、编辑已有媒体库并保存选择。
@@ -2754,7 +2869,7 @@ services:
 明确不做：
 
 - 不实现任意外部插件包下载、签名验证、动态加载或沙箱运行。
-- 不在本任务增加新的 TMDb API 能力；继续复用现有 `TmdbClient` 边界。
+- 不在本任务增加新的 TMDb API 能力；TMDb 通过通用刮削器 RPC 适配现有 `TmdbClient` 能力。
 
 #### LUX-141：内置插件配置与 TMDb 凭据
 
@@ -2780,11 +2895,11 @@ services:
 
 明确不做：
 
-- 不在本任务实现扫描流水线对 `scraperId` 的后台任务接线；继续沿用已有 TMDb application service 边界。
+- 不在本任务增加新的 TMDb 上游能力；插件配置字段的通用持久化仍按各插件后续任务扩展。
 
 #### LUX-142：动态插件包与独立 TMDb 插件
 
-范围：将插件库从仅内置注册项升级为可发现的 `.zip` 插件包注册表。插件包必须包含 `manifest.json`、平台运行时、文件哈希和签名信息；Lux 在服务重启时扫描 `/config/plugins`，验证后通过独立进程和稳定 RPC 协议调用插件。将现有 TMDb 客户端和已反编译确认的 Emby MovieDb 行为重写为独立 `org.lux.tmdb` 插件，不直接加载原始 `MovieDb.dll`。
+范围：将插件库从仅内置注册项升级为可发现的 `.zip` 插件包注册表。插件包必须包含 `manifest.json`、平台运行时和文件哈希；Lux 在服务重启时扫描 `/config/plugins`，验证后通过独立进程和稳定 RPC 协议调用插件。历史签名字段仅作兼容信息，新打包器始终生成普通包。将现有 TMDb 客户端和已反编译确认的 Emby MovieDb 行为重写为独立 `org.lux.tmdb` 插件，不直接加载原始 `MovieDb.dll`。
 
 插件协议保留 Emby 风格的公开类型名称和字段语义，包括 `BaseItem`、`Movie`、`Series`、`Season`、`Episode`、`Person`、`BoxSet`、`MetadataResult`、`RemoteSearchResult`、`RemoteImageInfo`、`ProviderIds`、`ImageType` 及元数据/图片 Provider 能力。Lux 内部领域模型仍与 Emby DTO 分离，由适配层完成映射。
 
@@ -2793,13 +2908,13 @@ services:
 - `manifest.json`：包格式、插件 ID、版本、协议版本、运行时、能力、配置和权限声明。
 - `binaries/`：按平台和架构组织的独立插件进程。
 - `assets/`：图标等非执行资源。
-- `signature.json`：签名算法、签发者和签名值。
+- `signature.json`：历史包可带的签名算法、签发者和签名值；新包不生成。
 
-插件进程通过 JSON-RPC over stdin/stdout 提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。插件不能直接访问 Lux SQLite、媒体根目录或内部任务对象；元数据写回、图片下载和 Emby API 输出由 Lux 负责。
+插件进程通过 JSON-RPC over stdin/stdout 提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.credits`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。所有刮削调用使用 provider-neutral 的 `itemType`、`providerId`、`ProviderIds` 与完整图片 URL；插件不能直接访问 Lux SQLite、媒体根目录或内部任务对象；元数据写回、图片下载和 Emby API 输出由 Lux 负责。
 
 验收：
 
-- [ ] 放入合法 `.zip` 插件包并重启 Lux 后，插件目录能发现、校验并展示插件；无 manifest、哈希错误、签名错误、协议不兼容或平台不匹配的包不会运行。
+- [ ] 放入合法 `.zip` 插件包并重启 Lux 后，插件目录能发现、校验并展示插件；无 manifest、哈希错误、协议不兼容或平台不匹配的包不会运行；无 Lux 签名的包可以运行。
 - [ ] 插件进程故障、超时或异常退出不会导致 Lux 主进程退出；状态和最后错误可由管理员查看。
 - [ ] 管理员启用动态插件后，媒体库可以选择稳定的 `scraperId`，重启后选择保持。
 - [ ] 独立 `org.lux.tmdb` 插件覆盖 MovieDb 的电影、剧集、季、集、人物、合集、图片、外部 ID、预告片、语言、缓存、限流和重试行为。
@@ -2824,7 +2939,143 @@ services:
 - 不直接运行或模拟完整 Emby 服务端以兼容原始 `MovieDb.dll`；原始 DLL 只作为行为参考。
 - 不自动从任意远程地址下载第三方插件包。
 
+#### LUX-144：TMDb 多语言首选与回退配置
+
+范围：为 `org.lux.tmdb` 插件增加首选语言、语言回退开关、有序回退语言列表和替代 API 地址配置。语言选项来自 TMDb 的主翻译语言列表，界面按简体中文、其他中文地区语言、其他语言排序；非敏感配置持久化到 `/config/tmdb_settings.json`。插件对电影、剧集、季度和单集详情按首选语言请求，并在回退开启时按选择顺序逐字段补全；替代 API 地址开启后使用管理员保存的地址。
+
+验收：
+
+- [ ] TMDb 插件配置返回语言下拉选项；首项为简体中文 `zh-CN`，其次为 `zh-SG`、`zh-HK`、`zh-TW`，之后为 TMDb 主翻译语言；默认首选为 `zh-CN`。
+- [ ] 管理员可以保存语言回退开关和多个有序回退语言；默认预选 `zh-SG`、`zh-HK`、`zh-TW`，配置重启后保持，API 不返回任何凭据。
+- [ ] 回退开启时，电影、剧集、季度、单集元数据只补全空字段，并严格遵循选择顺序；关闭时不发起回退请求。
+- [ ] 替代 API 地址默认关闭并使用官方地址；开启后可选择 `https://api.tmdb.org` 或自定义 HTTP(S) 地址，插件请求实际经过所选地址。
+
+验证：
+
+- `cargo test --locked --test plugin_protocol --test plugins --test tmdb_plugin`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-142。
+
+明确不做：
+
+- 不改变 TMDb Provider ID、Emby DTO 或插件 RPC 方法名称。
+- 不把 TMDb 凭据放入非敏感配置、API 响应、日志或插件 RPC。
+
+#### LUX-145：后台本地视频缩略图任务
+
+范围：将外部 `ffmpegthumb` 的视频首帧缩略图行为重写为 Lux 内置后台任务。媒体库扫描成功后，任务为缺少缩略图的本地视频来源生成 JPEG 并登记到 `item_images`；只处理 `LOCAL_FILE`，不读取、不探测、不访问 `.strm` 指向的远程视频。
+
+验收：
+
+- [x] 本地视频在扫描完成后的后台阶段生成缩略图，默认截取 `00:03:01`，并通过 `THUMB` 图片记录提供给现有图片接口。
+- [x] 同一逻辑媒体项优先使用默认本地来源；已有缩略图不被覆盖；缺少或失效的登记路径可以重建。
+- [x] `STRM_URL` 不进入候选查询或 ffmpeg 参数；纯 `.strm` 条目不会生成缩略图。
+- [x] ffmpeg 使用参数数组、路径根目录约束、原子输出和超时控制；单个文件失败不导致扫描任务失败。
+- [x] 扫描任务事件记录缩略图阶段的完成/失败计数，容器重启后仍可在下一次扫描重试缺失项。
+
+验证：
+
+- `cargo test --locked --test thumbnails`
+- `cargo test --locked --test scanning_jobs`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-033、LUX-040、LUX-080。
+
+明确不做：
+
+- 不实现独立缩略图 HTTP API、Web 配置页、转码、音频 WAV 提取、字幕抽取或 `.strm` 远程处理。
+
 ---
+
+#### LUX-146：STRM 远程媒体信息插件
+
+范围：将 MediaInfoKeeper 的 `.strm` 远程媒体信息提取能力改写为 Lux Plugin SDK v1 的独立
+`media_probe` 插件和 Lux 宿主后台任务。插件 ID 固定为 `org.lux.media-info`，能力为
+`media.probe`；插件只负责接收单个已校验 URL、调用 `ffprobe` 并返回受限的 format/stream
+结果。媒体库选择、任务、并发、URL 安全、数据库写入和兼容旁车写回均由 Lux 宿主负责。
+
+管理员通过 `POST /api/v1/admin/strm-probe-jobs` 提交 `libraryIds`、`concurrency`、
+`includeReady` 和 `writeSidecars`。服务为每个选定媒体库建立持久化任务，使用全局操作信号量
+和媒体库 `probeConcurrency` 的较小值限制并发；任务支持分页列表、详情、取消、重试，并在服务
+重启后恢复 PENDING/RUNNING 状态。探测结果保存到 `media_sources`/`media_streams`，旁车写回
+使用同目录 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。
+
+插件 manifest 必须声明 `type: "media_probe"`、`category: "MEDIA"` 和
+`capabilities: ["media.probe"]`。插件进程不能访问 Lux SQLite、媒体根目录或内部任务对象；
+插件错误、超时、异常退出和超限输出不能导致 Lux 主进程退出。RPC、任务事件、错误消息和旁车
+不得包含完整 URL、认证信息或原始 `ffprobe` JSON。
+
+当前 URL 策略只允许 HTTP/HTTPS，拒绝凭据、fragment、localhost、云实例元数据主机和字面量
+回环/私网/链路本地/未指定/多播/共享地址。DNS 解析后的私网 rebinding、ffprobe 重定向逐跳
+校验和管理员局域网 allowlist 属于后续生产化增强；未完成前不得声称支持任意 NAS/AList 内网地址。
+
+验收：
+
+- [ ] 管理员只能选择已有媒体库，未选媒体库不创建任务、不发起插件 RPC；空选择、无效 ID、并发超范围均被拒绝。
+- [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
+- [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
+- [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
+- [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
+- [ ] 插件包、manifest、RPC 结果、URL 策略、超时、输出上限和无真实 URL 的 fake ffprobe 测试覆盖；插件异常不退出主进程。
+- [ ] 从空数据库执行迁移成功，ARM64 本机验证记录 `uname -m`，并通过 Rust 格式化、测试和 Clippy 检查。
+
+验证：
+
+- `cargo test --locked --test plugin_protocol --test plugin_runtime --test plugin_package --test media_info_plugin --test strm_probe --test strm_probe_api`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-033、LUX-041、LUX-044、LUX-072、LUX-142。
+
+明确不做：
+
+- 不改变 `.strm` 播放直连语义，不做代理、转码、缓存或 AList API 访问。
+- 不在普通扫描或用户请求路径中探测远程 `.strm`，不把插件权限扩展为媒体库/数据库访问。
+- 第一版不提供 Web 管理页面和计划任务；继续使用管理员 API，待后续任务接入。
+
+---
+
+---
+
+#### LUX-150：Lux 弹幕兼容插件与后台匹配
+
+范围：将 Emby 弹幕插件的能力重写为 Lux 内置弹幕服务。管理员配置 Dandanplay 兼容 API 基地址，或配置 `huangxd-/danmu_api` 的 API 基地址；Lux 在后台匹配已索引的本地视频，将有效 Bilibili 标准 XML 原子写回视频同目录、同 basename 的 `.xml` 旁车，并通过独立 Emby 兼容弹幕端点提供给支持弹幕接口的第三方客户端。
+
+`danmu_api` 的 `POST /api/v2/match` 是可选的优先路径；不支持该接口时回退到 Dandanplay 兼容搜索、详情和评论接口。基地址可以包含部署 token 路径，必须保留路径但在配置响应、日志、审计和错误中脱敏。XML 旁车只登记相对路径，SQLite 保存索引和任务状态，不保存整份 XML。
+
+管理员通过 `POST /api/v1/admin/libraries/{libraryId}/danmaku/match` 创建持久化任务，支持分页列表、详情、取消、失败重试、服务重启恢复、并发上限和默认不覆盖已有 XML。任务只领取已索引的本地视频源；`.strm`、用户请求中的整库扫描、弹幕实时发送和上游任意 URL 均不进入范围。
+
+Emby 兼容层提供 `/api/danmu/{itemId}`、`/api/danmu/{itemId}/raw`，并保留 `option=Refresh` 和 `option=GetJsonById` 兼容别名。端点执行现有用户/媒体库 ACL；普通 Emby 字幕端点和不支持弹幕协议的客户端不属于本任务验收范围。
+
+验收：
+
+- [ ] 从空数据库执行迁移成功；扫描后的同名有效 XML 可以登记、读取，删除或损坏旁车会标记索引状态而不删除媒体。
+- [ ] 管理员可以保存、清除和查看脱敏的弹幕地址；HTTP/HTTPS、token 路径、控制字符、凭据和 fragment 校验符合安全策略。
+- [ ] `/api/v2/match` 成功响应可以得到 episode 并取得 XML；不支持 `match` 时搜索/详情回退可工作；无匹配、非 XML、超大响应、超时不会写旁车。
+- [ ] 成功结果写入视频同名 `.xml`；默认不覆盖已有 XML；中断或权限失败不会留下半个目标文件。
+- [ ] 后台任务支持分页、进度、取消、失败重试和重启恢复；取消不再领取新项，单项失败不终止任务。
+- [ ] Emby 弹幕读取端点返回正确 Content-Type/XML，执行 ACL，并覆盖至少一个真实支持弹幕接口的客户端请求序列。
+- [ ] 不实现 Web 播放器弹幕、ASS、转码、实时发送和其他非弹幕客户端适配；相关普通字幕能力不回归。
+- [ ] 通过 Rust 格式化、测试、Clippy、空数据库迁移和 ARM 本机 `uname -m` 记录。
+
+验证：
+
+- `cargo test --locked --test danmaku --test danmaku_api --test emby_danmaku`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-033、LUX-041、LUX-064、LUX-072、LUX-080、LUX-090。
+
+明确不做：
+
+- 不把弹幕 XML 当作普通字幕，不新增 Emby 标准字幕类型或强制客户端显示。
+- 不执行用户输入的上游 URL，不做代理播放，不保存完整 XML 到 SQLite，不在 Web 播放器中渲染弹幕。
+- 不生成 ASS、不做颜色/位置转换、不实现弹幕发送、实时推送或计划任务。
 
 ## 26. 风险与缓解
 
@@ -2837,7 +3088,7 @@ services:
 | SQLite 写竞争 | 中 | WAL、本机卷、短批量事务、有限写并发、后台 checkpoint |
 | NAS 媒体目录只读 | 高 | 初始化和每库可写检查；写回失败显式展示 |
 | TMDb 限流/不可用 | 中 | 本地优先、缓存、限流、退避、任务可重试 |
-| 错误自动匹配污染大库 | 高 | 高置信门、候选差距、待处理、重新识别、字段来源与锁定 |
+| 错误自动匹配污染大库 | 高 | 高置信门、候选差距、待处理、重新匹配、字段来源与锁定 |
 | .strm URL 泄露令牌 | 中 | 明确产品行为、日志脱敏、只向有权限客户端返回 |
 | 浏览器编码支持不足 | 已接受 | 明确不支持提示，推荐第三方客户端，不在首版转码 |
 | 下载权限无法形成 DRM | 已接受 | 文档说明权限边界，不做虚假安全承诺 |

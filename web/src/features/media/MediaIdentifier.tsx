@@ -70,7 +70,7 @@ export function MediaIdentifier({ item, onClose, onSaved }: MediaIdentifierProps
       onSaved?.();
       onClose();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "识别结果应用失败，请重试。");
+      setError(cause instanceof Error ? cause.message : "元数据匹配结果应用失败，请重试。");
     } finally {
       setSelecting(undefined);
     }
@@ -81,11 +81,11 @@ export function MediaIdentifier({ item, onClose, onSaved }: MediaIdentifierProps
       <section className="lux-media-editor lux-identifier-editor" role="dialog" aria-modal="true" aria-labelledby="lux-identifier-title">
         <header className="lux-media-editor-header">
           <div>
-            <span className="lux-eyebrow">IDENTIFY MEDIA</span>
-            <h2 id="lux-identifier-title">识别媒体</h2>
+            <span className="lux-eyebrow">METADATA MATCH</span>
+            <h2 id="lux-identifier-title">匹配元数据</h2>
             <p>{mediaTitle(item)} · 从刮削器候选中选择正确条目</p>
           </div>
-          <button ref={closeRef} className="lux-media-editor-close" type="button" aria-label="关闭识别" onClick={onClose}><X size={18} /></button>
+          <button ref={closeRef} className="lux-media-editor-close" type="button" aria-label="关闭元数据匹配" onClick={onClose}><X size={18} /></button>
         </header>
         <form className="lux-identifier-search" onSubmit={search}>
           <label htmlFor="identify-query">名称<input id="identify-query" value={query} onChange={(event) => setQuery(event.target.value)} /></label>

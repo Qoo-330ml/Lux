@@ -551,7 +551,13 @@ impl Database {
         sqlx::query_scalar(
             "SELECT id FROM media_items
              WHERE library_id = ? AND removed_at IS NULL
-             ORDER BY id LIMIT ? OFFSET ?",
+             ORDER BY CASE item_type
+                          WHEN 'SERIES' THEN 0
+                          WHEN 'SEASON' THEN 1
+                          WHEN 'EPISODE' THEN 2
+                          ELSE 3
+                      END, id
+             LIMIT ? OFFSET ?",
         )
         .bind(library_id)
         .bind(limit)
@@ -966,6 +972,66 @@ impl Database {
         Ok(true)
     }
 
+    pub(crate) async fn list_scheduled_task_configs(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredScheduledTaskConfig>, i64), StorageError> {
+        let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scheduled_task_configs")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = sqlx::query(
+            "SELECT s.owner_type, s.owner_id, s.task_type, s.cron_or_interval,
+                    s.is_enabled, s.resource_limit_json, s.created_at, s.updated_at,
+                    l.name AS library_name
+             FROM scheduled_task_configs s
+             LEFT JOIN libraries l
+               ON s.owner_type = 'LIBRARY' AND l.id = s.owner_id
+             ORDER BY s.updated_at DESC, s.owner_type, s.owner_id, s.task_type
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok((rows.into_iter().map(stored_scheduled_task).collect(), total))
+    }
+
+    pub(crate) async fn find_scheduled_task_config(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+        task_type: &str,
+    ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
+        sqlx::query(
+            "SELECT s.owner_type, s.owner_id, s.task_type, s.cron_or_interval,
+                    s.is_enabled, s.resource_limit_json, s.created_at, s.updated_at,
+                    l.name AS library_name
+             FROM scheduled_task_configs s
+             LEFT JOIN libraries l
+               ON s.owner_type = 'LIBRARY' AND l.id = s.owner_id
+             WHERE s.owner_type = ? AND s.owner_id = ? AND s.task_type = ?",
+        )
+        .bind(owner_type)
+        .bind(owner_id)
+        .bind(task_type)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_scheduled_task))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn library_exists(&self, library_id: &str) -> Result<bool, StorageError> {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM libraries WHERE id = ?)")
             .bind(library_id)
@@ -1373,30 +1439,36 @@ impl Database {
         statement
             .fetch_all(&self.pool)
             .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| StoredPlaybackSession {
-                        id: row.get("id"),
-                        user_id: row.get("user_id"),
-                        item_id: row.get("item_id"),
-                        media_source_id: row.get("media_source_id"),
-                        play_session_id: row.get("play_session_id"),
-                        device_id: row.get("device_id"),
-                        client: row.get("client"),
-                        device_name: row.get("device_name"),
-                        state: row.get("state"),
-                        position_ticks: row.get("position_ticks"),
-                        duration_ticks: row.get("duration_ticks"),
-                        is_paused: row.get::<i64, _>("is_paused") != 0,
-                        started_at: row.get("started_at"),
-                        last_event_at: row.get("last_event_at"),
-                    })
-                    .collect()
-            })
+            .map(|rows| rows.into_iter().map(stored_playback_session).collect())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn find_active_playback_session(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<Option<StoredPlaybackSession>, StorageError> {
+        sqlx::query(
+            "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                    device_id, client, device_name, state, position_ticks,
+                    duration_ticks, is_paused, started_at, last_event_at
+             FROM playback_sessions
+             WHERE user_id = ? AND item_id = ? AND state != 'STOPPED'
+             ORDER BY last_event_at DESC, id
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_playback_session))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn media_source_belongs_to_item(
@@ -1517,6 +1589,213 @@ impl Database {
         .bind(job_type)
         .bind(generation)
         .bind(total_count)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn create_strm_probe_job(
+        &self,
+        job: NewStrmProbeJob<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO strm_probe_jobs (
+                id, operation_id, library_id, status, concurrency,
+                include_ready, write_sidecars, total_count
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?)",
+        )
+        .bind(job.id)
+        .bind(job.operation_id)
+        .bind(job.library_id)
+        .bind(job.concurrency)
+        .bind(job.include_ready)
+        .bind(job.write_sidecars)
+        .bind(job.total_count)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn has_active_strm_probe_jobs(&self) -> Result<bool, StorageError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM strm_probe_jobs WHERE status IN ('PENDING', 'RUNNING')
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_strm_probe_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredStrmProbeJob>, StorageError> {
+        sqlx::query(
+            "SELECT id, operation_id, library_id, status, concurrency,
+                    include_ready, write_sidecars, cursor, processed_count,
+                    total_count, cancel_requested, error
+             FROM strm_probe_jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_strm_probe_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_strm_probe_jobs(
+        &self,
+        status: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredStrmProbeJob>, StorageError> {
+        let rows = if let Some(status) = status {
+            sqlx::query(
+                "SELECT id, operation_id, library_id, status, concurrency,
+                        include_ready, write_sidecars, cursor, processed_count,
+                        total_count, cancel_requested, error
+                 FROM strm_probe_jobs WHERE status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, operation_id, library_id, status, concurrency,
+                        include_ready, write_sidecars, cursor, processed_count,
+                        total_count, cancel_requested, error
+                 FROM strm_probe_jobs
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map(|rows| rows.into_iter().map(stored_strm_probe_job).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_active_strm_probe_job_ids(&self) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT id FROM strm_probe_jobs
+             WHERE status IN ('PENDING', 'RUNNING')
+             ORDER BY created_at, id LIMIT 10000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_strm_probe_job(&self, id: &str) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE strm_probe_jobs
+             SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'PENDING'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_strm_probe_job_progress(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+        processed_count: i64,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE strm_probe_jobs
+             SET cursor = ?, processed_count = ?, updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING'",
+        )
+        .bind(cursor)
+        .bind(processed_count)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn strm_probe_job_cancel_requested(
+        &self,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT cancel_requested FROM strm_probe_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value: i64| value != 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn request_strm_probe_job_cancel(&self, id: &str) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE strm_probe_jobs SET cancel_requested = 1, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_strm_probe_job(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE strm_probe_jobs
+             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(id)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -1723,19 +2002,130 @@ impl Database {
             })
     }
 
+    pub(crate) async fn create_metadata_reidentify_library_job(
+        &self,
+        job_id: &str,
+        item_ids: &[String],
+        mode: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode)
+             VALUES (?, 'CANCELLED', ?, ?)",
+        )
+        .bind(job_id)
+        .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
+        .bind(mode)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        for chunk in item_ids.chunks(500) {
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for item_id in chunk {
+                sqlx::query(
+                    "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+                     VALUES (?, ?, 'PENDING')",
+                )
+                .bind(job_id)
+                .bind(item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        sqlx::query(
+            "UPDATE metadata_reidentify_jobs
+             SET status = 'QUEUED', updated_at = unixepoch()
+             WHERE id = ? AND status = 'CANCELLED'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
     pub(crate) async fn find_metadata_reidentify_job(
         &self,
         job_id: &str,
     ) -> Result<Option<StoredMetadataReidentifyJob>, StorageError> {
         sqlx::query(
             "SELECT id, status, processed_count, total_count, error,
-                    created_at, updated_at, started_at, finished_at, mode
+                    created_at, updated_at, started_at, finished_at, mode,
+                    cancel_requested
              FROM metadata_reidentify_jobs WHERE id = ?",
         )
         .bind(job_id)
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_metadata_reidentify_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_metadata_reidentify_jobs(
+        &self,
+        status: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredMetadataReidentifyJob>, StorageError> {
+        let rows = if let Some(status) = status {
+            sqlx::query(
+                "SELECT id, status, processed_count, total_count, error,
+                        created_at, updated_at, started_at, finished_at, mode,
+                        cancel_requested
+                 FROM metadata_reidentify_jobs WHERE status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, status, processed_count, total_count, error,
+                        created_at, updated_at, started_at, finished_at, mode,
+                        cancel_requested
+                 FROM metadata_reidentify_jobs
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map(|rows| {
+            rows.into_iter()
+                .map(stored_metadata_reidentify_job)
+                .collect()
+        })
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -1750,7 +2140,7 @@ impl Database {
             "UPDATE metadata_reidentify_jobs
              SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
                  updated_at = unixepoch()
-             WHERE id = ? AND status = 'QUEUED'",
+             WHERE id = ? AND status = 'QUEUED' AND cancel_requested = 0",
         )
         .bind(job_id)
         .execute(&self.pool)
@@ -1767,9 +2157,28 @@ impl Database {
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
         sqlx::query_scalar(
-            "SELECT item_id FROM metadata_reidentify_job_items
-             WHERE job_id = ? AND status = 'PENDING'
-             ORDER BY item_id LIMIT 1",
+            "WITH prioritized AS (
+                 SELECT job_items.item_id, job_items.status,
+                        CASE
+                            WHEN items.item_type IN ('MOVIE', 'SERIES') THEN 0
+                            WHEN items.item_type = 'SEASON' THEN 1
+                            WHEN items.item_type = 'EPISODE' THEN 2
+                            ELSE 3
+                        END AS priority
+                 FROM metadata_reidentify_job_items job_items
+                 JOIN media_items items ON items.id = job_items.item_id
+                 WHERE job_items.job_id = ?
+             )
+             SELECT item_id
+             FROM prioritized
+             WHERE status = 'PENDING'
+               AND priority = (
+                   SELECT MIN(priority)
+                   FROM prioritized
+                   WHERE status IN ('PENDING', 'RUNNING')
+               )
+             ORDER BY item_id
+             LIMIT 1",
         )
         .bind(job_id)
         .fetch_optional(&self.pool)
@@ -1788,10 +2197,16 @@ impl Database {
         sqlx::query(
             "UPDATE metadata_reidentify_job_items
              SET status = 'RUNNING', updated_at = unixepoch()
-             WHERE job_id = ? AND item_id = ? AND status = 'PENDING'",
+             WHERE job_id = ? AND item_id = ? AND status = 'PENDING'
+               AND EXISTS (
+                   SELECT 1 FROM metadata_reidentify_jobs
+                   WHERE id = ? AND status IN ('QUEUED', 'RUNNING')
+                     AND cancel_requested = 0
+               )",
         )
         .bind(job_id)
         .bind(item_id)
+        .bind(job_id)
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
@@ -1862,7 +2277,9 @@ impl Database {
     ) -> Result<(), StorageError> {
         sqlx::query(
             "UPDATE metadata_reidentify_jobs
-             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('QUEUED', 'RUNNING')",
         )
         .bind(status)
@@ -1871,6 +2288,40 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn metadata_reidentify_job_cancel_requested(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT cancel_requested FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value: i64| value != 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn request_metadata_reidentify_job_cancel(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE metadata_reidentify_jobs
+             SET cancel_requested = 1, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('QUEUED', 'RUNNING')",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -1896,9 +2347,9 @@ impl Database {
                      SELECT COUNT(*) FROM metadata_reidentify_job_items
                      WHERE job_id = ? AND status = 'COMPLETED'
                  ),
-                 error = NULL, started_at = NULL, finished_at = NULL,
+                 cancel_requested = 0, error = NULL, started_at = NULL, finished_at = NULL,
                  updated_at = unixepoch()
-             WHERE id = ? AND status = 'FAILED'",
+             WHERE id = ? AND status IN ('FAILED', 'CANCELLED')",
         )
         .bind(job_id)
         .bind(job_id)
@@ -1913,7 +2364,7 @@ impl Database {
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'PENDING', candidate_count = 0, error = NULL,
                      updated_at = unixepoch()
-                 WHERE job_id = ? AND status = 'FAILED'",
+                 WHERE job_id = ? AND status IN ('FAILED', 'RUNNING', 'PENDING')",
             )
             .bind(job_id)
             .execute(&mut *transaction)
@@ -1936,12 +2387,17 @@ impl Database {
     pub(crate) async fn list_metadata_reidentify_items(
         &self,
         job_id: &str,
+        offset: i64,
+        limit: i64,
     ) -> Result<Vec<StoredMetadataReidentifyItem>, StorageError> {
         sqlx::query(
             "SELECT job_id, item_id, status, candidate_count, error, updated_at
-             FROM metadata_reidentify_job_items WHERE job_id = ? ORDER BY item_id",
+             FROM metadata_reidentify_job_items
+             WHERE job_id = ? ORDER BY item_id LIMIT ? OFFSET ?",
         )
         .bind(job_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
@@ -2009,6 +2465,25 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn metadata_reidentify_job_has_failed_items(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND status = 'FAILED'
+             )",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn list_active_metadata_reidentify_job_ids(
@@ -2788,28 +3263,97 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredMediaMetadata>, StorageError> {
         sqlx::query(
-            "SELECT item_type, title, original_title, overview, production_year,
-                    metadata_provenance_json, locked_fields_json
-             FROM media_items WHERE id = ?",
+            "SELECT mi.item_type, mi.title, mi.original_title, mi.overview, mi.production_year,
+                    mi.metadata_provenance_json, mi.locked_fields_json,
+                    mi.series_id, mi.season_number, mi.episode_number,
+                    series.title AS series_title,
+                    series.production_year AS series_production_year,
+                    series.provider_ids_json AS series_provider_ids_json,
+                    libraries.scraper_id AS scraper_id
+             FROM media_items mi
+             LEFT JOIN media_items series ON series.id = mi.series_id
+             LEFT JOIN libraries ON libraries.id = mi.library_id
+             WHERE mi.id = ?",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
         .map(|row| {
-            row.map(|row| StoredMediaMetadata {
-                item_type: row.get("item_type"),
-                title: row.get("title"),
-                original_title: row.get("original_title"),
-                overview: row.get("overview"),
-                production_year: row.get("production_year"),
-                provenance_json: row.get("metadata_provenance_json"),
-                locked_fields_json: row.get("locked_fields_json"),
+            row.map(|row| {
+                let scraper_id = row.get::<Option<String>, _>("scraper_id");
+                let series_provider = first_provider_id(
+                    row.get("series_provider_ids_json"),
+                    None,
+                    scraper_id.as_deref(),
+                );
+                StoredMediaMetadata {
+                    item_type: row.get("item_type"),
+                    title: row.get("title"),
+                    original_title: row.get("original_title"),
+                    overview: row.get("overview"),
+                    production_year: row.get("production_year"),
+                    provenance_json: row.get("metadata_provenance_json"),
+                    locked_fields_json: row.get("locked_fields_json"),
+                    series_item_id: row.get("series_id"),
+                    series_title: row.get("series_title"),
+                    series_production_year: row.get("series_production_year"),
+                    series_provider_name: series_provider.as_ref().map(|(name, _)| name.clone()),
+                    series_provider_id: series_provider.map(|(_, id)| id),
+                    season_number: row.get("season_number"),
+                    episode_number: row.get("episode_number"),
+                }
             })
         })
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_metadata_refresh_item_ids(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let item_type = sqlx::query_scalar::<_, String>(
+            "SELECT item_type FROM media_items
+             WHERE id = ? AND removed_at IS NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let Some(item_type) = item_type else {
+            return Ok(Vec::new());
+        };
+        let query = match item_type.as_str() {
+            "SERIES" => {
+                "SELECT id FROM media_items
+                 WHERE removed_at IS NULL AND (id = ? OR series_id = ?)
+                 ORDER BY CASE item_type WHEN 'SERIES' THEN 0 WHEN 'SEASON' THEN 1 ELSE 2 END,
+                          season_number, episode_number, id"
+            }
+            "SEASON" => {
+                "SELECT id FROM media_items
+                 WHERE removed_at IS NULL AND (id = ? OR parent_id = ?)
+                 ORDER BY CASE item_type WHEN 'SEASON' THEN 0 ELSE 1 END,
+                          episode_number, id"
+            }
+            _ => "SELECT id FROM media_items WHERE id = ? AND removed_at IS NULL",
+        };
+        let mut query = sqlx::query_scalar::<_, String>(query).bind(item_id);
+        if matches!(item_type.as_str(), "SERIES" | "SEASON") {
+            query = query.bind(item_id);
+        }
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn find_media_item_image_identity(
@@ -3273,6 +3817,12 @@ impl Database {
         sqlx::query(
             "UPDATE media_items
              SET title = ?, original_title = ?, overview = ?, production_year = ?,
+                 premiere_date = COALESCE(?, premiere_date),
+                 last_air_date = COALESCE(?, last_air_date),
+                 status = COALESCE(?, status),
+                 original_language = COALESCE(?, original_language),
+                 rating = COALESCE(?, rating),
+                 rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  provider_ids_json = ?, identification_status = 'ONLINE_CONFIRMED',
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?
              WHERE id = ? AND removed_at IS NULL",
@@ -3281,6 +3831,13 @@ impl Database {
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
+        .bind(update.premiere_date)
+        .bind(update.last_air_date)
+        .bind(update.status)
+        .bind(update.original_language)
+        .bind(update.rating)
+        .bind(update.rating_source)
+        .bind(update.rating_source)
         .bind(update.provider_ids_json)
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
@@ -3543,7 +4100,7 @@ impl Database {
              SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
-                    mi.production_year, mi.runtime_ticks,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -3617,7 +4174,7 @@ impl Database {
              SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
-                    mi.production_year, mi.runtime_ticks,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -3679,7 +4236,7 @@ impl Database {
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
-                    mi.production_year, mi.runtime_ticks,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -3762,7 +4319,7 @@ impl Database {
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
-                    mi.production_year, mi.runtime_ticks,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -3833,22 +4390,33 @@ impl Database {
                 source,
             })?;
 
-        let item_order = if filter.sort_by_date_created {
-            if filter.descending {
-                "mi.added_at DESC, mi.sort_title ASC, mi.id ASC"
-            } else {
-                "mi.added_at ASC, mi.sort_title ASC, mi.id ASC"
+        let item_order = match (filter.sort_by, filter.descending) {
+            (CatalogSort::DateCreated, true) => "mi.added_at DESC, mi.sort_title ASC, mi.id ASC",
+            (CatalogSort::DateCreated, false) => "mi.added_at ASC, mi.sort_title ASC, mi.id ASC",
+            (CatalogSort::PremiereDate, true) => {
+                "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL THEN 1 ELSE 0 END ASC,
+                 mi.premiere_date DESC, mi.sort_title ASC, mi.id ASC"
             }
-        } else if filter.descending {
-            "mi.sort_title DESC, mi.id DESC"
-        } else {
-            "mi.sort_title ASC, mi.id ASC"
+            (CatalogSort::PremiereDate, false) => {
+                "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL THEN 1 ELSE 0 END ASC,
+                 mi.premiere_date ASC, mi.sort_title ASC, mi.id ASC"
+            }
+            (CatalogSort::Rating, true) => {
+                "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
+                 mi.rating DESC, mi.sort_title ASC, mi.id ASC"
+            }
+            (CatalogSort::Rating, false) => {
+                "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
+                 mi.rating ASC, mi.sort_title ASC, mi.id ASC"
+            }
+            (CatalogSort::Name, true) => "mi.sort_title DESC, mi.id DESC",
+            (CatalogSort::Name, false) => "mi.sort_title ASC, mi.id ASC",
         };
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
-                    mi.production_year, mi.runtime_ticks,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -3895,7 +4463,7 @@ impl Database {
                 "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                         mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
-                        mi.production_year, mi.runtime_ticks,
+                        mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -3915,7 +4483,8 @@ impl Database {
                      SELECT mi.id, mi.library_id, mi.item_type,
                             mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                             mi.title, mi.sort_title,
-                            mi.original_title, mi.overview, mi.production_year, mi.runtime_ticks
+                            mi.original_title, mi.overview, mi.production_year,
+                            mi.rating, mi.rating_source, mi.runtime_ticks
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                      WHERE mi.library_id = ? AND mi.removed_at IS NULL
@@ -3935,7 +4504,7 @@ impl Database {
                 "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                         mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
-                        mi.production_year, mi.runtime_ticks,
+                        mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -3955,7 +4524,8 @@ impl Database {
                      SELECT mi.id, mi.library_id, mi.item_type,
                             mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                             mi.title, mi.sort_title,
-                            mi.original_title, mi.overview, mi.production_year, mi.runtime_ticks
+                            mi.original_title, mi.overview, mi.production_year,
+                            mi.rating, mi.rating_source, mi.runtime_ticks
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                      WHERE mi.removed_at IS NULL
@@ -3979,7 +4549,7 @@ impl Database {
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
-                    mi.production_year, mi.runtime_ticks,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -4073,6 +4643,8 @@ impl Database {
                         original_title: row.get("original_title"),
                         overview: row.get("overview"),
                         production_year: row.get("production_year"),
+                        rating: row.get("rating"),
+                        rating_source: row.get("rating_source"),
                         runtime_ticks: row.get("runtime_ticks"),
                         poster_image_tag: row.get("poster_image_tag"),
                         fanart_image_tag: row.get("fanart_image_tag"),
@@ -4198,6 +4770,565 @@ impl Database {
                 })
                 .collect()
         })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_local_danmaku_sources_for_library(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredDanmakuSource>, StorageError> {
+        sqlx::query(
+            "SELECT ms.id AS source_id, ms.item_id,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
+             ORDER BY ms.is_default DESC, ms.item_id, fe.relative_path",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredDanmakuSource {
+                    source_id: row.get("source_id"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_local_danmaku_source_for_item(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredDanmakuSource>, StorageError> {
+        sqlx::query(
+            "SELECT ms.id AS source_id, ms.item_id,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
+             ORDER BY ms.is_default DESC, fe.relative_path
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredDanmakuSource {
+                source_id: row.get("source_id"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn upsert_danmaku_track(
+        &self,
+        track: NewDanmakuTrack<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO danmaku_tracks (
+                id, media_source_id, relative_path, format, provider,
+                provider_anime_id, provider_episode_id, fingerprint,
+                status, error_code, last_checked_at
+             ) VALUES (?, ?, ?, 'XML', ?, ?, ?, ?, ?, ?, unixepoch())
+             ON CONFLICT(media_source_id) DO UPDATE SET
+                relative_path = excluded.relative_path,
+                provider = excluded.provider,
+                provider_anime_id = excluded.provider_anime_id,
+                provider_episode_id = excluded.provider_episode_id,
+                fingerprint = excluded.fingerprint,
+                status = excluded.status,
+                error_code = excluded.error_code,
+                last_checked_at = unixepoch(),
+                updated_at = unixepoch()",
+        )
+        .bind(track.id)
+        .bind(track.media_source_id)
+        .bind(track.relative_path)
+        .bind(track.provider)
+        .bind(track.provider_anime_id)
+        .bind(track.provider_episode_id)
+        .bind(track.fingerprint)
+        .bind(track.status)
+        .bind(track.error_code)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn create_danmaku_match_job(
+        &self,
+        job: NewDanmakuMatchJob<'_>,
+        source_ids: &[String],
+    ) -> Result<(), StorageError> {
+        let total_count = i64::try_from(source_ids.len()).unwrap_or(i64::MAX);
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(
+            "INSERT INTO danmaku_match_jobs (
+                id, library_id, status, overwrite, concurrency, total_count
+             ) VALUES (?, ?, 'PENDING', ?, ?, ?)",
+        )
+        .bind(job.id)
+        .bind(job.library_id)
+        .bind(job.overwrite)
+        .bind(job.concurrency)
+        .bind(total_count)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        for source_id in source_ids {
+            let item_id = Uuid::now_v7().to_string();
+            sqlx::query(
+                "INSERT INTO danmaku_match_job_items (
+                    id, job_id, media_source_id, status
+                 ) VALUES (?, ?, ?, 'PENDING')",
+            )
+            .bind(item_id)
+            .bind(job.id)
+            .bind(source_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn has_active_danmaku_match_jobs(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM danmaku_match_jobs
+                WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')
+            )",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_danmaku_match_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredDanmakuMatchJob>, StorageError> {
+        sqlx::query(
+            "SELECT id, library_id, status, overwrite, concurrency,
+                    total_count, processed_count, success_count,
+                    skipped_count, failed_count, cancel_requested, error
+             FROM danmaku_match_jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_danmaku_match_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_danmaku_match_jobs(
+        &self,
+        status: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredDanmakuMatchJob>, StorageError> {
+        let rows = if let Some(status) = status {
+            sqlx::query(
+                "SELECT id, library_id, status, overwrite, concurrency,
+                        total_count, processed_count, success_count,
+                        skipped_count, failed_count, cancel_requested, error
+                 FROM danmaku_match_jobs
+                 WHERE status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, library_id, status, overwrite, concurrency,
+                        total_count, processed_count, success_count,
+                        skipped_count, failed_count, cancel_requested, error
+                 FROM danmaku_match_jobs
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map(|rows| rows.into_iter().map(stored_danmaku_match_job).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_active_danmaku_match_job_ids(
+        &self,
+    ) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT id FROM danmaku_match_jobs
+             WHERE status IN ('PENDING', 'RUNNING')
+             ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_danmaku_match_job(&self, id: &str) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE danmaku_match_jobs
+             SET status = 'RUNNING',
+                 started_at = COALESCE(started_at, unixepoch()),
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'PENDING'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn reset_running_danmaku_match_items(
+        &self,
+        job_id: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE danmaku_match_job_items
+             SET status = 'PENDING', updated_at = unixepoch()
+             WHERE job_id = ? AND status = 'RUNNING'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn cancel_pending_danmaku_match_items(
+        &self,
+        job_id: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE danmaku_match_job_items
+             SET status = 'CANCELLED', updated_at = unixepoch()
+             WHERE job_id = ? AND status = 'PENDING'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_pending_danmaku_match_items(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
+        sqlx::query(
+            "SELECT id, media_source_id
+             FROM danmaku_match_job_items
+             WHERE job_id = ? AND status = 'PENDING'
+             ORDER BY id",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredDanmakuMatchItem {
+                    id: row.get("id"),
+                    media_source_id: row.get("media_source_id"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_danmaku_match_item(&self, id: &str) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE danmaku_match_job_items
+             SET status = 'RUNNING', attempts = attempts + 1, updated_at = unixepoch()
+             WHERE id = ? AND status = 'PENDING'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_danmaku_match_item(
+        &self,
+        id: &str,
+        status: &str,
+        provider_anime_id: Option<&str>,
+        provider_episode_id: Option<&str>,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE danmaku_match_job_items
+             SET status = ?, provider_anime_id = ?, provider_episode_id = ?,
+                 error_code = ?, error_message = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(provider_anime_id)
+        .bind(provider_episode_id)
+        .bind(error_code)
+        .bind(error_message)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn increment_danmaku_match_progress(
+        &self,
+        job_id: &str,
+        success: bool,
+        skipped: bool,
+        failed: bool,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE danmaku_match_jobs
+             SET processed_count = processed_count + 1,
+                 success_count = success_count + ?,
+                 skipped_count = skipped_count + ?,
+                 failed_count = failed_count + ?,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(i64::from(success))
+        .bind(i64::from(skipped))
+        .bind(i64::from(failed))
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn danmaku_match_job_cancel_requested(
+        &self,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT cancel_requested FROM danmaku_match_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value: i64| value != 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn request_danmaku_match_job_cancel(
+        &self,
+        id: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE danmaku_match_jobs
+             SET cancel_requested = 1, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_danmaku_match_job(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE danmaku_match_jobs
+             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_local_thumbnail_sources_for_library(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
+        sqlx::query(
+            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+                    ii.local_path AS thumbnail_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             LEFT JOIN item_images ii
+               ON ii.item_id = ms.item_id
+              AND ii.image_type = 'THUMB'
+              AND ii.image_index = 0
+             WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
+             ORDER BY ms.item_id, ms.is_default DESC, ms.id",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredThumbnailSource {
+                    item_id: row.get("item_id"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                    thumbnail_path: row.get("thumbnail_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_strm_media_sources_for_library(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
+        sqlx::query(
+            "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
+             ORDER BY ms.id, fe.relative_path",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredStrmMediaSource {
+                    source_id: row.get("source_id"),
+                    probe_status: row.get("probe_status"),
+                    external_url: row.get("external_url"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn count_strm_media_sources_for_library(
+        &self,
+        library_id: &str,
+    ) -> Result<i64, StorageError> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -4499,7 +5630,11 @@ impl Database {
             })?;
         sqlx::query(
             "UPDATE media_sources
-             SET container = COALESCE(?, container), size = COALESCE(?, size),
+             SET container = CASE
+                     WHEN source_kind = 'STRM_URL' THEN COALESCE(?, container)
+                     ELSE container
+                 END,
+                 size = COALESCE(?, size),
                  duration_ticks = ?, bitrate = ?,
                  probe_status = 'READY', probe_error = NULL,
                  updated_at = unixepoch()
@@ -4628,6 +5763,36 @@ impl Database {
         .bind(item.production_year)
         .bind(item.identification_status)
         .bind(item.identity_key)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_unconfirmed_hierarchy_item(
+        &self,
+        item_id: &str,
+        title: &str,
+        sort_title: &str,
+        original_title: Option<&str>,
+        production_year: Option<i64>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE media_items
+             SET title = ?, sort_title = ?, original_title = ?, production_year = ?
+             WHERE id = ?
+               AND identification_status IN ('LOCAL_CONFIRMED', 'PENDING')
+               AND metadata_provenance_json IS NULL
+               AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
+        )
+        .bind(title)
+        .bind(sort_title)
+        .bind(original_title)
+        .bind(production_year)
+        .bind(item_id)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -5220,6 +6385,19 @@ pub(crate) struct StoredLibrary {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredScheduledTaskConfig {
+    pub(crate) owner_type: String,
+    pub(crate) owner_id: String,
+    pub(crate) task_type: String,
+    pub(crate) cron_or_interval: Option<String>,
+    pub(crate) is_enabled: bool,
+    pub(crate) resource_limit_json: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) library_name: Option<String>,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredLibraryRoot {
     pub(crate) id: String,
     pub(crate) library_id: String,
@@ -5230,6 +6408,20 @@ pub(crate) struct StoredLibraryRoot {
     pub(crate) last_checked_at: i64,
     pub(crate) unavailable_since: Option<i64>,
     pub(crate) scan_cursor: Option<String>,
+}
+
+fn stored_scheduled_task(row: sqlx::sqlite::SqliteRow) -> StoredScheduledTaskConfig {
+    StoredScheduledTaskConfig {
+        owner_type: row.get("owner_type"),
+        owner_id: row.get("owner_id"),
+        task_type: row.get("task_type"),
+        cron_or_interval: row.get("cron_or_interval"),
+        is_enabled: row.get::<i64, _>("is_enabled") != 0,
+        resource_limit_json: row.get("resource_limit_json"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        library_name: row.get("library_name"),
+    }
 }
 
 #[derive(Debug)]
@@ -5244,6 +6436,32 @@ pub(crate) struct StoredScanJob {
     pub(crate) total_count: i64,
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredStrmProbeJob {
+    pub(crate) id: String,
+    pub(crate) operation_id: String,
+    pub(crate) library_id: String,
+    pub(crate) status: String,
+    pub(crate) concurrency: i64,
+    pub(crate) include_ready: bool,
+    pub(crate) write_sidecars: bool,
+    pub(crate) cursor: Option<String>,
+    pub(crate) processed_count: i64,
+    pub(crate) total_count: i64,
+    pub(crate) cancel_requested: bool,
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) struct NewStrmProbeJob<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) operation_id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) concurrency: i64,
+    pub(crate) include_ready: bool,
+    pub(crate) write_sidecars: bool,
+    pub(crate) total_count: i64,
 }
 
 #[derive(Debug)]
@@ -5273,6 +6491,23 @@ fn stored_scan_job(row: sqlx::sqlite::SqliteRow) -> StoredScanJob {
         job_type: row.get("job_type"),
         status: row.get("status"),
         generation: row.get("generation"),
+        cursor: row.get("cursor"),
+        processed_count: row.get("processed_count"),
+        total_count: row.get("total_count"),
+        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
+        error: row.get("error"),
+    }
+}
+
+fn stored_strm_probe_job(row: sqlx::sqlite::SqliteRow) -> StoredStrmProbeJob {
+    StoredStrmProbeJob {
+        id: row.get("id"),
+        operation_id: row.get("operation_id"),
+        library_id: row.get("library_id"),
+        status: row.get("status"),
+        concurrency: row.get("concurrency"),
+        include_ready: row.get::<i64, _>("include_ready") != 0,
+        write_sidecars: row.get::<i64, _>("write_sidecars") != 0,
         cursor: row.get("cursor"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),
@@ -5351,6 +6586,13 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) production_year: Option<i64>,
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
+    pub(crate) series_item_id: Option<String>,
+    pub(crate) series_title: Option<String>,
+    pub(crate) series_production_year: Option<i64>,
+    pub(crate) series_provider_name: Option<String>,
+    pub(crate) series_provider_id: Option<String>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -5388,6 +6630,7 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) started_at: Option<i64>,
     pub(crate) finished_at: Option<i64>,
     pub(crate) mode: String,
+    pub(crate) cancel_requested: bool,
 }
 
 #[derive(Debug)]
@@ -5412,6 +6655,7 @@ fn stored_metadata_reidentify_job(row: sqlx::sqlite::SqliteRow) -> StoredMetadat
         started_at: row.get("started_at"),
         finished_at: row.get("finished_at"),
         mode: row.get("mode"),
+        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
     }
 }
 
@@ -5458,6 +6702,8 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) original_title: Option<String>,
     pub(crate) overview: Option<String>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) rating: Option<f64>,
+    pub(crate) rating_source: Option<String>,
     pub(crate) runtime_ticks: Option<i64>,
     pub(crate) poster_image_tag: Option<String>,
     pub(crate) fanart_image_tag: Option<String>,
@@ -5536,6 +6782,25 @@ pub(crate) struct StoredPlaybackSession {
     pub(crate) is_paused: bool,
     pub(crate) started_at: i64,
     pub(crate) last_event_at: i64,
+}
+
+fn stored_playback_session(row: sqlx::sqlite::SqliteRow) -> StoredPlaybackSession {
+    StoredPlaybackSession {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        item_id: row.get("item_id"),
+        media_source_id: row.get("media_source_id"),
+        play_session_id: row.get("play_session_id"),
+        device_id: row.get("device_id"),
+        client: row.get("client"),
+        device_name: row.get("device_name"),
+        state: row.get("state"),
+        position_ticks: row.get("position_ticks"),
+        duration_ticks: row.get("duration_ticks"),
+        is_paused: row.get::<i64, _>("is_paused") != 0,
+        started_at: row.get("started_at"),
+        last_event_at: row.get("last_event_at"),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5663,10 +6928,18 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
-    pub(crate) sort_by_date_created: bool,
+    pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
     pub(crate) offset: i64,
     pub(crate) limit: i64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CatalogSort {
+    Name,
+    DateCreated,
+    PremiereDate,
+    Rating,
 }
 
 #[derive(Debug)]
@@ -5674,6 +6947,71 @@ pub(crate) struct StoredMediaSourcePath {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
     pub(crate) probe_status: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredDanmakuSource {
+    pub(crate) source_id: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+}
+
+pub(crate) struct NewDanmakuTrack<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) media_source_id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) provider: Option<&'a str>,
+    pub(crate) provider_anime_id: Option<&'a str>,
+    pub(crate) provider_episode_id: Option<&'a str>,
+    pub(crate) fingerprint: Option<&'a [u8]>,
+    pub(crate) status: &'a str,
+    pub(crate) error_code: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredDanmakuMatchJob {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) status: String,
+    pub(crate) overwrite: bool,
+    pub(crate) concurrency: i64,
+    pub(crate) total_count: i64,
+    pub(crate) processed_count: i64,
+    pub(crate) success_count: i64,
+    pub(crate) skipped_count: i64,
+    pub(crate) failed_count: i64,
+    pub(crate) cancel_requested: bool,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredDanmakuMatchItem {
+    pub(crate) id: String,
+    pub(crate) media_source_id: String,
+}
+
+pub(crate) struct NewDanmakuMatchJob<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) overwrite: bool,
+    pub(crate) concurrency: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredThumbnailSource {
+    pub(crate) item_id: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+    pub(crate) thumbnail_path: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredStrmMediaSource {
+    pub(crate) source_id: String,
+    pub(crate) probe_status: String,
+    pub(crate) external_url: Option<String>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
 }
@@ -5692,6 +7030,23 @@ pub(crate) struct StoredMovieIdentity {
     pub(crate) library_id: String,
     pub(crate) provider_name: String,
     pub(crate) provider_id: String,
+}
+
+fn stored_danmaku_match_job(row: sqlx::sqlite::SqliteRow) -> StoredDanmakuMatchJob {
+    StoredDanmakuMatchJob {
+        id: row.get("id"),
+        library_id: row.get("library_id"),
+        status: row.get("status"),
+        overwrite: row.get::<i64, _>("overwrite") != 0,
+        concurrency: row.get("concurrency"),
+        total_count: row.get("total_count"),
+        processed_count: row.get("processed_count"),
+        success_count: row.get("success_count"),
+        skipped_count: row.get("skipped_count"),
+        failed_count: row.get("failed_count"),
+        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
+        error: row.get("error"),
+    }
 }
 
 fn first_provider_id(
@@ -5714,14 +7069,20 @@ fn first_provider_id(
             (!name.trim().is_empty() && !id.trim().is_empty()).then_some((name, id))
         })
         .collect::<Vec<_>>();
-    preferred
-        .and_then(|preferred| {
-            providers
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(preferred))
-                .cloned()
-        })
-        .or_else(|| providers.into_iter().next())
+    if let Some(preferred) = preferred {
+        let short_preferred = preferred
+            .rsplit(['.', ':', '/'])
+            .next()
+            .unwrap_or(preferred);
+        providers
+            .iter()
+            .find(|(name, _)| {
+                name.eq_ignore_ascii_case(preferred) || name.eq_ignore_ascii_case(short_preferred)
+            })
+            .cloned()
+    } else {
+        providers.into_iter().next()
+    }
 }
 
 #[derive(Debug)]
@@ -5821,6 +7182,12 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
     pub(crate) original_title: Option<&'a str>,
     pub(crate) overview: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) premiere_date: Option<&'a str>,
+    pub(crate) last_air_date: Option<&'a str>,
+    pub(crate) status: Option<&'a str>,
+    pub(crate) original_language: Option<&'a str>,
+    pub(crate) rating: Option<f64>,
+    pub(crate) rating_source: Option<&'a str>,
     pub(crate) provider_ids_json: &'a str,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
@@ -6022,5 +7389,89 @@ mod tests {
         };
         assert!(database.probe_write().await.is_err());
         database.close().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_jobs_process_series_before_seasons_and_episodes() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(":memory:"))
+            .await
+            .expect("in-memory SQLite connection");
+        sqlx::query("CREATE TABLE media_items (id TEXT PRIMARY KEY, item_type TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create media items table");
+        sqlx::query(
+            "CREATE TABLE metadata_reidentify_job_items (
+                job_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (job_id, item_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata job items table");
+        for (item_id, item_type) in [
+            ("episode", "EPISODE"),
+            ("season", "SEASON"),
+            ("series", "SERIES"),
+        ] {
+            sqlx::query("INSERT INTO media_items (id, item_type) VALUES (?, ?)")
+                .bind(item_id)
+                .bind(item_type)
+                .execute(&pool)
+                .await
+                .expect("insert media item");
+            sqlx::query(
+                "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+                 VALUES ('job', ?, 'PENDING')",
+            )
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .expect("insert metadata job item");
+        }
+        let database = Database {
+            pool,
+            path: PathBuf::from("metadata-order-test.db"),
+            server_id: "test".to_owned(),
+        };
+
+        assert_eq!(
+            database.next_metadata_reidentify_item("job").await.unwrap(),
+            Some("series".to_owned())
+        );
+        sqlx::query(
+            "UPDATE metadata_reidentify_job_items
+             SET status = 'COMPLETED'
+             WHERE job_id = 'job' AND item_id = 'series'",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("complete series item");
+        assert_eq!(
+            database.next_metadata_reidentify_item("job").await.unwrap(),
+            Some("season".to_owned())
+        );
+        database.close().await;
+    }
+
+    #[test]
+    fn provider_identity_uses_the_selected_scraper_without_falling_back_to_another_id() {
+        let providers = Some(
+            serde_json::json!({
+                "Imdb": "tt123",
+                "Tvdb": "456"
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            first_provider_id(providers.clone(), None, Some("org.example.tvdb")),
+            Some(("Tvdb".to_owned(), "456".to_owned()))
+        );
+        assert_eq!(first_provider_id(providers, None, Some("tmdb")), None);
     }
 }

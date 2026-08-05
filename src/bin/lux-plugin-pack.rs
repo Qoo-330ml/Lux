@@ -5,17 +5,27 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use luxd::application::plugin_protocol::PluginManifest;
+use luxd::application::{
+    plugin_protocol::PluginManifest,
+    settings::{tmdb_api_base_url_options, tmdb_language_options},
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use zip::{ZipWriter, write::SimpleFileOptions};
 
 struct Arguments {
+    plugin: PluginKind,
     binary: PathBuf,
     output: PathBuf,
     version: String,
     platform: String,
     arch: String,
+}
+
+#[derive(Clone, Copy)]
+enum PluginKind {
+    Tmdb,
+    MediaInfo,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,49 +34,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if binary.is_empty() {
         return Err("plugin binary is empty".into());
     }
-    let binary_name = if arguments.platform == "windows" {
-        "lux-plugin-tmdb.exe"
-    } else {
-        "lux-plugin-tmdb"
+    let binary_name = match (arguments.plugin, arguments.platform.as_str()) {
+        (PluginKind::Tmdb, "windows") => "lux-plugin-tmdb.exe",
+        (PluginKind::Tmdb, _) => "lux-plugin-tmdb",
+        (PluginKind::MediaInfo, "windows") => "lux-plugin-media-info.exe",
+        (PluginKind::MediaInfo, _) => "lux-plugin-media-info",
     };
     let relative_binary = format!(
         "binaries/{}-{}/{}",
         arguments.platform, arguments.arch, binary_name
     );
     let file_hash = format!("{:x}", Sha256::digest(&binary));
-    let manifest = PluginManifest::from_value(json!({
-        "formatVersion": 1,
-        "id": "org.lux.tmdb",
-        "name": "TMDb 元数据插件",
-        "description": "从 TMDb 提供 Emby 风格电影、剧集和图片元数据。",
-        "version": arguments.version,
-        "apiVersion": 1,
-        "runtime": {"kind": "process", "entrypoint": relative_binary},
-        "type": "metadata",
-        "category": "SCRAPER",
-        "supportedItemTypes": ["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
-        "capabilities": [
-            "metadata.search",
-            "metadata.get",
-            "metadata.images",
-            "metadata.credits",
-            "metadata.externalIds",
-            "metadata.trailers"
-        ],
-        "configFields": [{
-            "key": "apiKey",
-            "label": "TMDb API Key",
-            "type": "password",
-            "required": false,
-            "sensitive": true,
-            "description": "可选。留空时使用 Lux 内置的 TMDb Key。"
-        }],
-        "permissions": {
-            "network": ["api.themoviedb.org", "image.tmdb.org"],
-            "filesystem": ["plugin-cache"]
-        },
-        "files": [{"path": relative_binary, "sha256": file_hash}]
-    }))?;
+    let manifest = PluginManifest::from_value(manifest_value(
+        arguments.plugin,
+        &arguments.version,
+        &relative_binary,
+        &file_hash,
+    ))?;
     write_archive(&arguments.output, &relative_binary, &binary, &manifest)?;
     Ok(())
 }
@@ -78,7 +62,20 @@ impl Arguments {
         let mut version = None;
         let mut platform = None;
         let mut arch = None;
+        let mut plugin = PluginKind::Tmdb;
         while let Some(flag) = values.next() {
+            if flag == "--plugin" {
+                plugin = match values
+                    .next()
+                    .ok_or_else(|| "missing value for --plugin".to_owned())?
+                    .as_str()
+                {
+                    "tmdb" => PluginKind::Tmdb,
+                    "media-info" => PluginKind::MediaInfo,
+                    value => return Err(format!("unsupported plugin: {value}").into()),
+                };
+                continue;
+            }
             let target = match flag.as_str() {
                 "--binary" => &mut binary,
                 "--output" => &mut output,
@@ -95,6 +92,7 @@ impl Arguments {
             );
         }
         Ok(Self {
+            plugin,
             binary: required(binary, "--binary")?.into(),
             output: required(output, "--output")?.into(),
             version: required(version, "--version")?,
@@ -109,7 +107,115 @@ fn required(value: Option<String>, name: &str) -> Result<String, Box<dyn std::er
 }
 
 fn usage() -> &'static str {
-    "usage: lux-plugin-pack --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME"
+    "usage: lux-plugin-pack [--plugin tmdb|media-info] --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME"
+}
+
+fn manifest_value(
+    plugin: PluginKind,
+    version: &str,
+    relative_binary: &str,
+    file_hash: &str,
+) -> serde_json::Value {
+    let language_options = tmdb_language_options()
+        .into_iter()
+        .map(|option| json!({"value": option.value, "label": option.label}))
+        .collect::<Vec<_>>();
+    let api_base_url_options = tmdb_api_base_url_options()
+        .into_iter()
+        .map(|option| json!({"value": option.value, "label": option.label}))
+        .collect::<Vec<_>>();
+    match plugin {
+        PluginKind::Tmdb => json!({
+            "formatVersion": 1,
+            "id": "org.lux.tmdb",
+            "name": "TMDb 元数据插件",
+            "description": "从 TMDb 提供 Emby 风格电影、剧集和图片元数据。",
+            "version": version,
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": relative_binary},
+            "type": "metadata",
+            "category": "SCRAPER",
+            "supportedItemTypes": ["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
+            "capabilities": [
+                "metadata.search",
+                "metadata.get",
+                "metadata.images",
+                "metadata.credits",
+                "metadata.externalIds",
+                "metadata.trailers"
+            ],
+            "configFields": [
+                {
+                    "key": "apiKey",
+                    "label": "TMDb API Key",
+                    "type": "password",
+                    "required": false,
+                    "sensitive": true,
+                    "description": "可选。留空时使用 Lux 内置的 TMDb Key。"
+                },
+                {
+                    "key": "preferredLanguage",
+                    "label": "首选语言",
+                    "type": "select",
+                    "required": true,
+                    "options": language_options.clone()
+                },
+                {
+                    "key": "languageFallbackEnabled",
+                    "label": "TMDb 语言回退",
+                    "type": "toggle",
+                    "required": false
+                },
+                {
+                    "key": "fallbackLanguages",
+                    "label": "备选语言顺序",
+                    "type": "select",
+                    "multiple": true,
+                    "required": false,
+                    "options": language_options
+                },
+                {
+                    "key": "alternateApiEnabled",
+                    "label": "替代 API 地址",
+                    "type": "toggle",
+                    "required": false,
+                    "description": "开启后使用下方地址访问 TMDb，默认使用官方地址。"
+                },
+                {
+                    "key": "apiBaseUrl",
+                    "label": "TMDb API 地址",
+                    "type": "select",
+                    "required": true,
+                    "description": "可选择官方地址、替代地址，或填写自定义地址。",
+                    "options": api_base_url_options
+                }
+            ],
+            "permissions": {
+                "network": ["api.themoviedb.org", "api.tmdb.org", "image.tmdb.org"],
+                "filesystem": ["plugin-cache"]
+            },
+            "files": [{"path": relative_binary, "sha256": file_hash}]
+        }),
+        PluginKind::MediaInfo => json!({
+            "formatVersion": 1,
+            "id": "org.lux.media-info",
+            "name": "strm媒体信息提取",
+            "description": "使用 ffprobe 提取 STRM 外部媒体的技术信息。",
+            "version": version,
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": relative_binary},
+            "type": "media_probe",
+            "category": "MEDIA",
+            "supportedItemTypes": [],
+            "capabilities": ["media.probe"],
+            "configFields": [],
+            "permissions": {
+                "network": ["media-source"],
+                "filesystem": []
+            },
+            "files": [{"path": relative_binary, "sha256": file_hash}]
+        }),
+    }
 }
 
 fn write_archive(

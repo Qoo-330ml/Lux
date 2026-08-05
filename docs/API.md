@@ -38,7 +38,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/libraries`：列出媒体库及其根路径。
 - `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false, "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；`scraperId` 可省略或为 `null`，表示不进行在线刮削，但仍读取本地 NFO 和图片。
 - `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时监听开关、增量/调和/元数据计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。`mediaStrategy` 的结构与全局策略相同，未设置时返回 `null` 并继承全局默认。例如 `{ "scraperId": "tmdb", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
-- `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`。
+- `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`；成功后自动创建异步扫描任务并返回 `scanJob`，扫描完成后若配置刮削器会继续自动匹配元数据。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
 - `POST /api/v1/admin/libraries/{libraryId}/reconcile`：按当前库配置创建并异步执行一次调和扫描；已停用或不存在的媒体库返回 404。
@@ -46,7 +46,17 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
 - `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
+- `GET /api/v1/admin/scheduled-tasks?page=1&pageSize=100`：分页查看所有已保存的计划配置，包含 `ownerType`、媒体库名称、`taskType`、`schedule`、启用状态、资源限制和更新时间；结果也包含已停用配置，便于发现其他管理页留下的设置。
+- `PUT /api/v1/admin/scheduled-tasks`：从任务页新增、修改或清空库级计划。请求体为 `{ "ownerType": "LIBRARY", "ownerId": "...", "taskType": "INCREMENTAL_SCAN|RECONCILIATION_SCAN|METADATA_PARSE", "schedule": "interval:1h", "isEnabled": true }`；`schedule: null` 或 `isEnabled: false` 会清空该库对应的计划。写操作需要管理员 Web session 和 CSRF，并与 `PATCH /api/v1/admin/libraries/{libraryId}` 保持同一份配置。当前端点只管理计划配置，不新增 cron 解析或后台调度执行器。
+- `POST /api/v1/admin/strm-probe-jobs`：管理员提交 `{ "libraryIds": ["..."], "concurrency": 2, "includeReady": false, "writeSidecars": false }`，按选定媒体库创建并异步执行 STRM 远程媒体信息任务，返回 202 和按库拆分的任务。只允许后台任务触发 `org.lux.media-info`，不返回 URL。
+- `GET /api/v1/admin/strm-probe-jobs?page=1&pageSize=50&status=FAILED`：分页查看 STRM 探测任务，状态支持 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 和 `FAILED`。
+- `GET /api/v1/admin/strm-probe-jobs/{jobId}`：查看单个 STRM 探测任务的状态、进度、并发、旁车开关和安全错误摘要。
+- `POST /api/v1/admin/strm-probe-jobs/{jobId}/cancel`：请求取消 STRM 探测任务，返回 202；worker 不再领取新媒体源。
+- `POST /api/v1/admin/strm-probe-jobs/{jobId}/retry`：重试失败或已取消的 STRM 探测任务，返回新的任务并异步执行 202。
+- `POST /api/v1/admin/libraries/{libraryId}/danmaku/match`：管理员提交 `{ "concurrency": 2, "overwrite": false }`，为已索引的本地视频创建异步弹幕匹配任务；成功返回 202，默认不覆盖已有同名 XML。
+- `GET /api/v1/admin/danmaku/match-jobs?page=1&pageSize=50&status=FAILED`：分页查看弹幕匹配任务；详情、取消和重试分别使用 `/api/v1/admin/danmaku/match-jobs/{jobId}`、`/cancel` 和 `/retry`。
 - `GET/PATCH /api/v1/admin/settings`：读取或调整 `resumePlayedPercent`（1-100）、`resumeMinTicks`（非负）和 `mediaStrategy`。媒体策略的图像开关为 `poster`、`logo`、`thumbnail`、`banner`、`disc`、`artwork`、`wallpaper`，另有元数据/图片语言、地区、默认刮削器、`metadataRefreshMode`（`FILL_MISSING` 或 `FULL_REFRESH`）、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。旧策略 JSON 缺少新增字段时默认按 `FILL_MISSING` 处理。网络代理设置通过 `networkProxyUrl` 写入，支持 `http`、`https`、`socks4`、`socks4a`、`socks5` 和 `socks5h`；传 `null` 清除。响应中的 `networkProxy` 只返回脱敏地址、是否配置认证、来源和重启提示，不返回认证信息。写操作需要管理员 Web session 和 CSRF，响应不包含任何插件凭据。
+- `GET/PATCH /api/v1/admin/settings` 的 `danmaku` 对象通过 `danmaku.providerBaseUrl` 保存或清除自定义 Dandanplay 兼容 API 基地址；响应只返回 `configured`、脱敏 `url`、来源和重启提示，不回显 token 路径。
 - `POST /api/v1/admin/settings/network-proxy/test`：管理员检测当前输入或已生效的网络代理；服务端只请求 TMDb、百度、Google 和 Cloudflare 四个固定目标，返回逐站延迟/HTTP 状态、网络出口 IP 和 Cloudflare 返回的两位国家/地区代码。需要管理员 Web session 和 CSRF；认证信息不会出现在响应或日志中。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、配置目录实际写入能力、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，支持 `page`、`pageSize`、`level` 和 `eventCode` 筛选。
@@ -55,11 +65,12 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 以下接口要求 `canManageServer`；写操作还要求 `X-CSRF-Token`：
 
-- `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回启动时从 `/config/plugins` 发现的插件包及 `installed`、`enabled`、`running`、`configured`、`available`、`configurable`、`configFields`、`configSource`、`version`、`runtime`、`capabilities`、`status` 和脱敏 `lastError` 状态。`configFields` 只包含非敏感 schema，不包含当前值。
+- `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回启动时从 `/config/plugins` 发现的插件包及 `installed`、`enabled`、`running`、`configured`、`available`、`configurable`、`configFields`、非敏感 `configValues`、`configSource`、`version`、`runtime`、`capabilities`、`status` 和脱敏 `lastError` 状态。`configFields` 包含输入类型、是否多选和选项；TMDb 的 `configValues` 返回 `preferredLanguage`、`languageFallbackEnabled`、`fallbackLanguages`、`alternateApiEnabled` 和 `apiBaseUrl`，不返回 API Key 或 Token。
 - `POST /api/v1/admin/plugins/{pluginId}/install`：启用已发现的插件包；它不会从网络下载代码。首次启用返回 201，重复请求返回 200。未知插件返回 404。
-- `PUT /api/v1/admin/plugins/{pluginId}/config`：替换插件配置。TMDb 请求体为 `{ "apiKey": "..." }`；空字符串清除自定义 Key 并恢复内置 fallback。成功返回不含明文凭据的插件状态。
+- `PUT /api/v1/admin/plugins/{pluginId}/config`：替换或更新插件配置。TMDb 请求体可包含 `{ "apiKey": "...", "preferredLanguage": "zh-CN", "languageFallbackEnabled": false, "fallbackLanguages": ["zh-SG", "zh-HK", "zh-TW"], "alternateApiEnabled": true, "apiBaseUrl": "https://api.tmdb.org" }`；未提供的字段保持现值，语言必须来自 TMDb 主翻译语言选项，API 地址必须是带主机的 HTTP(S) 地址且不得包含凭据、查询参数或片段。`apiKey` 空字符串清除自定义 Key 并恢复内置 fallback。成功返回不含明文凭据的插件状态。
 - 插件包必须是 `.zip` 或开发用解压目录，根目录包含 `manifest.json`。Lux 启动时校验包格式、协议版本、平台架构、文件哈希和签名；校验失败的包不会运行。
 - 插件通过独立进程和 JSON-RPC 风格协议提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。
+- `media_probe` 插件必须声明 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。`org.lux.media-info` 的 `media.probe` 只处理单个由宿主校验的 HTTP/HTTPS URL，返回受限 format/stream 字段；宿主负责并发、超时、取消、恢复、落库和可选旁车写回。播放和 PlaybackInfo 不触发该 RPC。
 - 未安装、未启用、无可用凭据、运行失败或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
 插件包不从任意远程 URL 自动下载。插件 API、媒体库 API 和日志不返回插件配置中的敏感值；TMDb API Key 和 Read Access Token 只存在受限配置或内置实现中。
@@ -67,13 +78,17 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 ## 元数据候选管理（LUX-053）
 
 - `GET /api/v1/admin/metadata/pending?page=1&pageSize=50`：管理员分页查看 pending 候选；页大小限制为 1-100。
-- `GET /api/v1/admin/items/{itemId}/identify/candidates?q=关键词&page=1&pageSize=50`：管理员按 provider ID 或候选 JSON 搜索指定条目的 pending 候选，并返回 `fieldDiffs` 预览。
-- `POST /api/v1/admin/items/{itemId}/identify/candidates`：管理员发送 `{ "query": "标题", "year": 2020 }`，通过条目所属媒体库的 `scraperId` 搜索；最多写入 20 个带 24 小时过期时间的 pending 候选，并返回当前条目的候选页。需要 `X-CSRF-Token`；刮削器不可用或请求失败不会改变本地条目。
-- `POST /api/v1/admin/items/{itemId}/identify/candidates/{candidateId}/select`：管理员选择候选并发送 `{ "mode": "fillMissing" }` 或 `{ "mode": "refreshUnlocked" }`，需要 `X-CSRF-Token`。前者只补空元数据字段和缺失图片，后者刷新未锁定字段和图片；候选中的每类图片只使用第一张，所属媒体库未启用的类型不写回，找不到的类型跳过；NFO/图片写回全部成功后才返回 `ONLINE_CONFIRMED`，失败返回可重试错误且候选保持 pending。
-- `POST /api/v1/admin/metadata/reidentify`：管理员发送 `{ "itemIds": ["..."] }` 创建批量重新识别任务；条目去重后限制为 1-100 个，任务持久化为 `QUEUED/RUNNING/COMPLETED/FAILED`，需要 `X-CSRF-Token`。
-- `GET /api/v1/admin/metadata/reidentify/{jobId}`：管理员读取批量重新识别任务及逐条状态、候选数量和稳定错误代码；前端可按任务 ID 轮询。
-- `POST /api/v1/admin/metadata/reidentify/{jobId}`：管理员对 `FAILED` 任务重新排队失败条目，保留已经成功的条目，需要 `X-CSRF-Token`；非失败任务返回冲突。
-- `POST /api/v1/admin/libraries/{libraryId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" }` 或 `{ "mode": "FULL_REFRESH" }`，按库拆分持久化后台任务并立即返回。前者只补缺失的未锁定 NFO 字段和图片，后者刷新未锁定 NFO 字段并替换已有图片；锁定的 NFO 字段始终保留。未配置刮削器时任务不发起在线请求并保留本地元数据。
+- `GET /api/v1/admin/items/{itemId}/identify/candidates?q=关键词&page=1&pageSize=50`：管理员按 provider ID 或候选 JSON 搜索指定条目的 pending 元数据匹配候选，并返回 `fieldDiffs` 预览。
+- `POST /api/v1/admin/items/{itemId}/identify/candidates`：管理员发送 `{ "query": "标题", "year": 2020 }`，通过条目所属媒体库的 `scraperId` 搜索元数据匹配候选；候选的 provider ID 必须来自当前选中的刮削器，最多写入 20 个带 24 小时过期时间的 pending 候选，并返回当前条目的候选页。需要 `X-CSRF-Token`；刮削器不可用或请求失败不会改变本地条目。
+- `POST /api/v1/admin/items/{itemId}/identify/candidates/{candidateId}/select`：管理员选择元数据匹配候选并发送 `{ "mode": "fillMissing" }` 或 `{ "mode": "refreshUnlocked" }`，需要 `X-CSRF-Token`。前者只补空元数据字段和缺失图片，后者刷新未锁定字段和图片；候选中的每类图片只使用第一张，所属媒体库未启用的类型不写回，找不到的类型跳过；NFO/图片写回全部成功后才返回 `ONLINE_CONFIRMED`，失败返回可重试错误且候选保持 pending。
+- `POST /api/v1/admin/metadata/reidentify`：管理员发送 `{ "itemIds": ["..."] }` 创建指定条目的候选搜索任务；条目去重后限制为 1-100 个，任务持久化为 `QUEUED/RUNNING/COMPLETED/FAILED`，需要 `X-CSRF-Token`。任务使用条目所属媒体库的刮削器获取对应 provider ID；路径中的 `reidentify` 为兼容标识，不自动确认候选。
+- `GET /api/v1/admin/metadata/reidentify?page=1&pageSize=50&status=RUNNING`：管理员分页查看元数据匹配和元数据刷新任务；支持 `QUEUED`、`RUNNING`、`COMPLETED`、`FAILED`、`CANCELLED` 过滤，返回模式、进度和稳定错误代码。
+- `GET /api/v1/admin/metadata/reidentify/{jobId}`：管理员读取批量元数据匹配任务及逐条状态、候选数量和稳定错误代码；前端可按任务 ID 轮询。
+- `POST /api/v1/admin/metadata/reidentify/{jobId}/cancel`：管理员请求取消 `QUEUED` 或 `RUNNING` 的元数据任务，需要 `X-CSRF-Token`，返回 202；worker 在当前批次完成后停止领取新条目并将任务标记为 `CANCELLED`。
+- `POST /api/v1/admin/metadata/reidentify/{jobId}`：管理员对 `FAILED` 或 `CANCELLED` 任务重新排队未完成条目，保留已经成功的条目，需要 `X-CSRF-Token`；其他状态返回冲突。
+- `POST /api/v1/admin/items/{itemId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" | "FULL_REFRESH" }` 刷新一个条目的元数据；创建一个持久化后台任务并立即返回。Web 端“刷新元数据”使用 `FILL_MISSING`：电影或单集刷新自身，季刷新该季及其单集，剧集刷新该剧、所有季和所有单集，因此会补写缺失的季海报和单集横向剧照，同时保留已有本地字段和图片。
+- `POST /api/v1/admin/libraries/{libraryId}/reidentify`：管理员从媒体库入口发起整库元数据匹配；服务端创建一个持久化后台任务并立即返回 `{ "totalCount": 125, "job": { ... } }`。任务使用条目所属媒体库的刮削器，以 `FILL_MISSING` 自动选择高置信度最佳候选，内部最多 16 路并行处理条目，按媒体库图像策略下载图片并写回 NFO/图片；低置信度条目保留 pending 候选供后台处理。
+- `POST /api/v1/admin/libraries/{libraryId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" }` 或 `{ "mode": "FULL_REFRESH" }`，每次媒体库操作创建一个持久化后台任务并立即返回。前者只补缺失的未锁定 NFO 字段和图片，后者刷新未锁定 NFO 字段并替换已有图片；锁定的 NFO 字段始终保留。任务内部最多 16 路并行处理条目，未配置刮削器时不发起在线请求并保留本地元数据。
 
 根路径会先 canonicalize，再检查目录存在且可读；`isWritable` 独立返回。只读目录可以保存，但返回 `LIBRARY_PATH_NOT_WRITABLE` 警告。同一库的重复/重叠路径分别返回冲突/不可处理实体错误，跨库重叠返回结构化警告。
 
@@ -97,12 +112,12 @@ Emby access token 与 Web session 完全分离。access token 是高熵随机值
 Lux 电影查询要求有效 Web session：
 
 - `GET /api/v1/libraries`：返回已启用媒体库的基本信息，不暴露服务器路径。
-- `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回条目；支持 `itemType`、`year`、`isPlayed`、`isFavorite`、`sortBy=DateCreated` 和 `sortOrder=Ascending|Descending`，筛选和分页在 SQLite 查询中完成。
+- `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回条目；支持 `itemType`、`year`、`isPlayed`、`isFavorite`、`sortBy=Name|DateCreated|PremiereDate|CommunityRating` 和 `sortOrder=Ascending|Descending`（同时兼容下划线参数名），筛选、排序和分页在 SQLite 查询中完成；评分排序将无评分条目稳定放在有评分条目之后。
 - `GET /api/v1/favorites?page=1&pageSize=50`：返回当前用户跨可见媒体库的收藏条目，按最近添加倒序分页；服务端执行用户状态和媒体库 ACL。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，结果执行媒体库 ACL。
 - `GET /api/v1/home`：返回当前用户继续观看、推荐和可见媒体库入口；每个媒体库入口包含最多 12 条该库最新资源，按 `media_items.added_at` 倒序。所有内容均执行媒体库 ACL；响应中的 `recentlyAdded` 字段保留用于旧客户端兼容，Lux Web 首页按媒体库分别展示最新资源。
-- `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看和收藏状态。
-- `POST /api/v1/items/{itemId}/progress`：写入播放进度，需要当前 Web session 和 CSRF。
+- `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看、收藏状态，以及该条目的活动播放状态（`state`、`isPaused`、`lastEventAt`）。
+- `POST /api/v1/items/{itemId}/progress`：写入播放事件，需要当前 Web session 和 CSRF。请求体为 `{ "positionTicks": 1200000000, "durationTicks": 7200000000, "state": "PLAYING" }`；`state` 可为 `PLAYING`、`PAUSED` 或 `STOPPED`，省略时兼容为 `PLAYING`。
 - `PUT /api/v1/items/{itemId}/favorite`：设置当前 Web 用户的收藏状态，需要当前 Web session 和 CSRF。
 - `PUT /api/v1/items/{itemId}/played`：设置当前 Web 用户的已看状态，请求体为 `{ "played": true }`，需要当前 Web session 和 CSRF。
 - `GET /api/v1/items/{itemId}`：返回电影详情、媒体源和已探测轨道。
@@ -128,6 +143,8 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET /Shows/{seriesId}/Episodes?SeasonId={seasonId}&StartIndex=0&Limit=50`：返回剧集，可省略 `SeasonId` 获取整部剧集，支持分页。
 - `GET /Users/{userId}/Items/NextUp`：按该用户的播放状态返回未看完单集。
 - `GET|HEAD /Items/{itemId}/Images/{Type}`、`/{Type}/{Index}`：读取与 Lux API 相同的本地图片记录，支持 `X-Emby-Token` 或 `api_key`。
+- `GET /api/danmu/{itemId}`：返回旁车 XML 的兼容信息和读取地址；支持 `option=Refresh`、`option=GetJsonById` 别名，但不会在客户端请求中访问上游。
+- `GET /api/danmu/{itemId}/raw`：读取同目录同 basename 的有效 `.xml` 旁车，返回 `application/xml; charset=utf-8`；需要 `X-Emby-Token` 或 `api_key`，并执行媒体库 ACL。
 - `GET /Users/{userId}/Items/Resume`：按用户播放位置、已看状态和服务器 Resume 阈值返回继续观看列表。
 - `GET /Users/{userId}/Items/Latest`：按最近添加顺序返回当前用户可见媒体。
 - `GET /Search/Hints?SearchTerm=关键词&StartIndex=0&Limit=50`：返回 Emby 搜索提示，结果执行当前用户 ACL。
@@ -140,15 +157,17 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Items/{itemId}/Download`：需要 `can_download` 和媒体库 ACL，返回所选单个媒体源的附件下载流；不打包同目录旁车文件。`mediaSourceId` 可选择源，`LOCAL_FILE` 直接读取库内文件，`STRM_URL` 读取 `.strm` 的首个非空 URL 后由 Lux 流式转发远程资源。
 - `GET|HEAD /api/v1/items/{itemId}/download`：Lux 下载端点，需要 Web session、`can_download` 和媒体库 ACL；返回所选单个媒体源，不打包 ZIP。`sourceId` 可选择源；本地源直接流式读取，`.strm` 读取首个非空远程 URL 并由 Lux 请求、流式转发该资源，不返回 `.strm` 文本。
 - `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流和 DirectPlay 能力；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。每个媒体源可带 `Edition`/`Quality` 版本标签。
+- 本地媒体源的 `MediaSources.Container` 使用实际文件扩展名（例如 `mkv`、`mp4`），不暴露 ffprobe 的复合 `format_name`。`DirectStreamUrl` 通过 `MediaSourceId` 定位源；`stream.{container}` 的后缀仅作兼容性后缀，服务端仍按媒体源记录读取文件。
 - `MediaSources.Path` 对 `.strm` 源返回旁车记录中的外部媒体地址；`MediaStreams` 除基础轨道字段外，还返回旁车中的分辨率、画面比例、码率、色深、帧率、Profile、像素格式、声道布局和采样率等已验证字段。
+- `MediaStreams` 不返回 Matroska/MP4 中标记为 `attached_pic` 的封面附加图轨，避免客户端将封面误认为可播放视频轨。
 - `GET /Items/{collectionId}/Children`：返回按当前用户媒体库权限过滤的合集成员。
 
 `.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 和原始 `DirectStreamUrl` 返回；服务端不请求、不验证、不代理该 URL。具有媒体库访问权限的客户端会直接获得该地址，因此 URL 中的令牌也会按产品设计暴露给客户端。
 
 - `GET /Sessions`：返回当前用户的活动播放会话；管理员可查看全部活动会话。
 - `POST /Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`：幂等记录播放事件，并将位置单调写入用户状态。
-- `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放状态。
-- `POST /api/v1/items/{itemId}/progress`：写入当前 Web 用户的播放位置。
+- `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放状态和该条目的活动会话状态。
+- `POST /api/v1/items/{itemId}/progress`：写入当前 Web 用户的播放开始、进度、暂停或停止事件；与 Emby 播放事件共用 `playback_sessions` 和 `user_item_state`。
 - `PUT /api/v1/items/{itemId}/favorite`：按请求体 `{ "favorite": true }` 设置当前 Web 用户的收藏状态。
 - `POST|DELETE /Users/{userId}/PlayedItems/{itemId}`、`/FavoriteItems/{itemId}`：幂等设置/清除已看和收藏状态。
 
@@ -158,7 +177,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 媒体 DTO 只返回客户端所需的标题、年份、简介、时长、容器、大小、码率和轨道信息，不返回服务器内部文件路径。图片内容端点属于 LUX-035。
 
-媒体探测仅对本地文件优先使用 ffprobe；`.strm` 源不主动读取外部媒体的容器信息或索引，只优先读取同名 `-mediainfo.json`，再读取同名 NFO 的 `<fileinfo><streamdetails>`。没有有效旁车时技术信息保持为空，首次播放由客户端直接访问外部地址。旁车内容只接受受限字段，不执行外部地址探测。
+媒体探测对本地文件使用 ffprobe；`.strm` 源优先读取同名 `-mediainfo.json` 和 NFO 的 `<fileinfo><streamdetails>`。管理员显式创建 STRM 探测任务后，宿主才会按 URL 安全策略调用 `org.lux.media-info`，成功结果写入媒体源/媒体流并可选写回兼容旁车。播放和 PlaybackInfo 请求本身不访问外部地址，首次播放仍由客户端直连。旁车内容和插件结果只接受受限字段，不写入原始 ffprobe JSON、完整 URL 或凭据。
 
 ## 媒体库 ACL（LUX-036）
 

@@ -3,6 +3,9 @@ import type {
   AdminHealth,
   AdminImage,
   AdminJob,
+  AdminScheduledTask,
+  AdminScheduledTaskPage,
+  AdminMetadataReidentifyJob,
   AdminLibrary,
   AdminRoot,
   AdminSettings,
@@ -10,7 +13,7 @@ import type {
   NetworkProxyDiagnostics,
   AdminUser,
   AdminMetadataCandidate,
-  AdminMetadataReidentifyBatch,
+  AdminMetadataReidentifyStart,
   AdminPlugin,
   ApiErrorBody,
   HomeResponse,
@@ -23,11 +26,19 @@ import type {
   MetadataFieldName,
   PageResponse,
   PlaybackState,
+  PlaybackEventState,
   SetupStatus,
   MetadataRefreshMode,
 } from "./types";
 
 const csrfCookie = "lux_csrf";
+
+export type LibrarySortBy = "Name" | "DateCreated" | "PremiereDate" | "CommunityRating";
+export type LibrarySortOrder = "Ascending" | "Descending";
+export type LibraryItemsOptions = {
+  sortBy?: LibrarySortBy;
+  sortOrder?: LibrarySortOrder;
+};
 
 export class ApiError extends Error {
   readonly code: string;
@@ -134,9 +145,16 @@ export class LuxApiClient {
     return this.request<{ libraries?: Library[] }>("/api/v1/libraries");
   }
 
-  libraryItems(libraryId: string, page = 1, itemTypes?: string) {
+  libraryItems(
+    libraryId: string,
+    page = 1,
+    itemTypes?: string,
+    options: LibraryItemsOptions = {},
+  ) {
     const params = new URLSearchParams({ page: String(page), pageSize: "24" });
     if (itemTypes) params.set("itemType", itemTypes);
+    if (options.sortBy) params.set("sortBy", options.sortBy);
+    if (options.sortOrder) params.set("sortOrder", options.sortOrder);
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
     );
@@ -183,10 +201,13 @@ export class LuxApiClient {
   }
 
   startItemMetadataRefresh(itemId: string) {
-    return this.request<{ job: AdminJob }>("/api/v1/admin/metadata/reidentify", {
+    return this.request<AdminMetadataReidentifyStart>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/metadata/refresh`,
+      {
       method: "POST",
-      body: JSON.stringify({ itemIds: [itemId] }),
-    });
+        body: JSON.stringify({ mode: "FILL_MISSING" }),
+      },
+    );
   }
 
   startItemLibraryScan(itemId: string) {
@@ -260,6 +281,20 @@ export class LuxApiClient {
     );
   }
 
+  progress(
+    itemId: string,
+    positionTicks: number,
+    durationTicks: number | null,
+    state: PlaybackEventState = "PLAYING",
+    keepalive = false,
+  ) {
+    return this.request<void>(`/api/v1/items/${encodeURIComponent(itemId)}/progress`, {
+      method: "POST",
+      keepalive,
+      body: JSON.stringify({ positionTicks, durationTicks, state }),
+    });
+  }
+
   adminHealth() {
     return this.request<AdminHealth>("/api/v1/admin/health");
   }
@@ -287,10 +322,23 @@ export class LuxApiClient {
     );
   }
 
-  updateAdminPluginConfig(pluginId: string, apiKey: string) {
+  updateAdminPluginConfig(
+    pluginId: string,
+    input:
+      | string
+      | {
+          apiKey?: string;
+          preferredLanguage?: string;
+          languageFallbackEnabled?: boolean;
+          fallbackLanguages?: string[];
+          alternateApiEnabled?: boolean;
+          apiBaseUrl?: string;
+        },
+  ) {
+    const body = typeof input === "string" ? { apiKey: input } : input;
     return this.request<{ plugin: AdminPlugin }>(
       `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/config`,
-      { method: "PUT", body: JSON.stringify({ apiKey }) },
+      { method: "PUT", body: JSON.stringify(body) },
     );
   }
 
@@ -326,7 +374,7 @@ export class LuxApiClient {
   }
 
   addAdminLibraryRoot(libraryId: string, path: string) {
-    return this.request<{ root: AdminRoot; warnings?: string[] }>(
+    return this.request<{ root: AdminRoot; warnings?: string[]; scanJob?: AdminJob }>(
       `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/roots`,
       { method: "POST", body: JSON.stringify({ path }) },
     );
@@ -347,14 +395,14 @@ export class LuxApiClient {
   }
 
   startLibraryMetadataReidentify(libraryId: string) {
-    return this.request<AdminMetadataReidentifyBatch>(
+    return this.request<AdminMetadataReidentifyStart>(
       `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/reidentify`,
       { method: "POST" },
     );
   }
 
   startLibraryMetadataRefresh(libraryId: string, mode: MetadataRefreshMode) {
-    return this.request<AdminMetadataReidentifyBatch>(
+    return this.request<AdminMetadataReidentifyStart>(
       `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/metadata/refresh`,
       { method: "POST", body: JSON.stringify({ mode }) },
     );
@@ -407,6 +455,47 @@ export class LuxApiClient {
     const params = new URLSearchParams({ page: "1", pageSize: "50" });
     if (status) params.set("status", status);
     return this.request<{ jobs?: AdminJob[] }>(`/api/v1/admin/jobs?${params}`);
+  }
+
+  adminScheduledTasks(page = 1) {
+    return this.request<AdminScheduledTaskPage>(
+      `/api/v1/admin/scheduled-tasks?page=${page}&pageSize=100`,
+    );
+  }
+
+  updateAdminScheduledTask(input: {
+    ownerType: "LIBRARY";
+    ownerId: string;
+    taskType: string;
+    schedule: string | null;
+    isEnabled?: boolean;
+  }) {
+    return this.request<{ scheduledTask: AdminScheduledTask }>(
+      "/api/v1/admin/scheduled-tasks",
+      { method: "PUT", body: JSON.stringify(input) },
+    );
+  }
+
+  adminMetadataReidentifyJobs(status?: string) {
+    const params = new URLSearchParams({ page: "1", pageSize: "50" });
+    if (status) params.set("status", status);
+    return this.request<{ jobs?: AdminMetadataReidentifyJob[] }>(
+      `/api/v1/admin/metadata/reidentify?${params}`,
+    );
+  }
+
+  retryMetadataReidentify(jobId: string) {
+    return this.request<{ job: AdminMetadataReidentifyJob }>(
+      `/api/v1/admin/metadata/reidentify/${encodeURIComponent(jobId)}`,
+      { method: "POST" },
+    );
+  }
+
+  cancelMetadataReidentify(jobId: string) {
+    return this.request<void>(
+      `/api/v1/admin/metadata/reidentify/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
+    );
   }
 
   cancelAdminJob(jobId: string) {

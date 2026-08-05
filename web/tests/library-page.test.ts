@@ -89,7 +89,10 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(1));
     });
 
-    expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "SERIES");
+    expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "SERIES", {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+    });
     expect(container.querySelectorAll(".lux-media-card")).toHaveLength(1);
 
     await act(async () => {
@@ -97,7 +100,10 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(2));
     });
 
-    expect(libraryItems).toHaveBeenCalledWith("library-1", 2, "SERIES");
+    expect(libraryItems).toHaveBeenCalledWith("library-1", 2, "SERIES", {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+    });
     expect(container.querySelectorAll(".lux-media-card")).toHaveLength(2);
     expect(container.textContent).toContain("电视剧 2");
   });
@@ -142,5 +148,64 @@ describe("LibraryPage infinite scroll", () => {
     expect(badge?.textContent).toBe("6.7");
     expect(badge?.querySelector(".lux-rating-source")).toBeNull();
     expect(badge?.querySelector("svg")).toBeNull();
+  });
+
+  it("reloads the first page with the selected release-date sort", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "movie-1", title: "电影", itemType: "MOVIE" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector("[role='combobox'][aria-label='排序方式']")).toBeTruthy());
+    });
+
+    const sortBy = container.querySelector<HTMLButtonElement>("[role='combobox'][aria-label='排序方式']");
+    expect(sortBy?.textContent).toContain("标题");
+    await act(async () => {
+      if (!sortBy) throw new Error("sort selector was not rendered");
+      sortBy.click();
+    });
+    for (let index = 0; index < 2; index += 1) {
+      await act(async () => {
+        if (!sortBy) throw new Error("sort selector was not rendered");
+        sortBy.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+      });
+    }
+    await act(async () => {
+      if (!sortBy) throw new Error("sort selector was not rendered");
+      sortBy.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+        sortBy: "PremiereDate",
+        sortOrder: "Descending",
+      }));
+    });
   });
 });

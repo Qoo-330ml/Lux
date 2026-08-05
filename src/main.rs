@@ -2,12 +2,7 @@
 
 use luxd::{
     api::{AppState, app_with_state},
-    application::{
-        probe::{FfprobeRunner, MediaProbeService},
-        scanner::ScanJobService,
-        settings::read_network_proxy_url,
-        setup::SetupService,
-    },
+    application::{settings::read_network_proxy_url, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     observability,
@@ -27,14 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    resume_scan_jobs(
-        ScanJobService::new(database.clone()),
-        Some(MediaProbeService::new(
-            database.clone(),
-            FfprobeRunner::default(),
-        )),
-    )
-    .await;
     let app_state = AppState::ready_with_proxy(
         config.clone(),
         database.clone(),
@@ -43,6 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         emby_auth,
         read_network_proxy_url(&config.config_dir),
     );
+    app_state.resume_scan_jobs().await;
+    app_state.resume_strm_probe_jobs().await;
+    app_state.resume_danmaku_match_jobs().await;
     app_state.resume_metadata_reidentify_jobs().await;
     let app = app_with_state(app_state);
 
@@ -58,22 +48,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     database.close().await;
     Ok(())
-}
-
-async fn resume_scan_jobs(service: ScanJobService, probe: Option<MediaProbeService>) {
-    let Ok(job_ids) = service.active_job_ids().await else {
-        error!("failed to discover active scan jobs during startup");
-        return;
-    };
-    for job_id in job_ids {
-        let worker = service.clone();
-        let worker_probe = probe.clone();
-        tokio::spawn(async move {
-            if let Err(error) = worker.run_to_completion(&job_id, 100, worker_probe).await {
-                tracing::error!(job_id = %job_id, %error, "resumed scan job stopped");
-            }
-        });
-    }
 }
 
 async fn shutdown_signal() {

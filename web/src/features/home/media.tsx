@@ -2,6 +2,7 @@ import { Database, MoreHorizontal, Play, ScanLine, ScanSearch, Star } from "luci
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
+import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
@@ -142,9 +143,11 @@ export function ContinueWatchingRail({ items }: { items: MediaItem[] }) {
   return (
     <section className="lux-section" aria-labelledby="continue-watching-heading">
       <div className="lux-section-heading"><h2 id="continue-watching-heading">继续观看</h2><span>{items.length} 项</span></div>
-      <div className="lux-media-rail lux-continue-rail">
-        {items.map((item) => <ContinueWatchingCard item={item} key={item.id} />)}
-      </div>
+      <HorizontalScrollRail className="lux-home-rail" ariaLabel="继续观看">
+        <div className="lux-media-rail lux-continue-rail">
+          {items.map((item) => <ContinueWatchingCard item={item} key={item.id} />)}
+        </div>
+      </HorizontalScrollRail>
     </section>
   );
 }
@@ -175,9 +178,11 @@ export function MediaRail({ title, items, landscape = false }: { title: string; 
   return (
     <section className="lux-section" aria-label={title}>
       <div className="lux-section-heading"><h2>{title}</h2><span>{items.length} 项</span></div>
-      <div className={landscape ? "lux-media-rail lux-media-rail-landscape" : "lux-media-rail"}>
-        {items.map((item) => <MediaCard item={item} landscape={landscape} compactRating key={item.id} />)}
-      </div>
+      <HorizontalScrollRail className="lux-home-rail" ariaLabel={title}>
+        <div className={landscape ? "lux-media-rail lux-media-rail-landscape" : "lux-media-rail"}>
+          {items.map((item) => <MediaCard item={item} landscape={landscape} compactRating key={item.id} />)}
+        </div>
+      </HorizontalScrollRail>
     </section>
   );
 }
@@ -288,8 +293,8 @@ export function LibraryCard({ library }: { library: Library }) {
     setMenuOpen(false);
     try {
       if (action === "reidentify") {
-        const batch = await api.startLibraryMetadataReidentify(library.id);
-        setActionNotice(`整库识别任务已提交 · ${batch.totalCount} 项，分为 ${batch.jobCount} 批`);
+        const task = await api.startLibraryMetadataReidentify(library.id);
+        setActionNotice(`整库元数据匹配任务已提交 · ${task.totalCount} 项，单个后台任务处理中`);
       } else {
         await api.startAdminScan(library.id);
         setActionNotice("扫描媒体库文件任务已提交");
@@ -322,7 +327,7 @@ export function LibraryCard({ library }: { library: Library }) {
       </button>
       {actionNotice ? <p className="lux-library-card-action-feedback" role="status">{actionNotice}</p> : null}
       {actionError ? <p className="lux-library-card-action-feedback is-error" role="alert">{actionError}</p> : null}
-      {pendingAction ? <span className="lux-visually-hidden" role="status">{pendingAction === "reidentify" ? "正在提交整库识别任务" : "正在提交扫描任务"}</span> : null}
+      {pendingAction ? <span className="lux-visually-hidden" role="status">{pendingAction === "reidentify" ? "正在提交整库元数据匹配任务" : "正在提交扫描任务"}</span> : null}
       {menuOpen ? createPortal(
         <div
           ref={menuRef}
@@ -338,7 +343,7 @@ export function LibraryCard({ library }: { library: Library }) {
           </div>
           <button type="button" role="menuitem" data-library-action="reidentify" disabled={Boolean(pendingAction)} onClick={() => void runAction("reidentify")}>
             <ScanSearch size={18} aria-hidden="true" />
-            <span>{pendingAction === "reidentify" ? "提交识别中…" : "识别"}</span>
+            <span>{pendingAction === "reidentify" ? "提交元数据匹配中…" : "元数据匹配"}</span>
           </button>
           <button type="button" role="menuitem" data-library-action="scan" disabled={Boolean(pendingAction)} onClick={() => void runAction("scan")}>
             <ScanLine size={18} aria-hidden="true" />

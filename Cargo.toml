@@ -27,7 +27,7 @@ notify = "8"
 sha2 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "sqlite", "migrate"] }
 subtle = "2"
-tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-std", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["fs", "request-id", "trace", "util"] }
@@ -50,6 +50,10 @@ path = "src/main.rs"
 [[bin]]
 name = "lux-plugin-tmdb"
 path = "src/bin/lux-plugin-tmdb.rs"
+
+[[bin]]
+name = "lux-plugin-media-info"
+path = "src/bin/lux-plugin-media-info.rs"
 
 [[bin]]
 name = "lux-plugin-pack"

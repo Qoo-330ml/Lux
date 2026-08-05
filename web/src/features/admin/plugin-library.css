@@ -249,6 +249,73 @@
   background: rgba(255, 255, 255, .05);
 }
 
+.lux-admin-plugin-dialog-form select {
+  width: 100%;
+  min-height: 44px;
+  padding: 9px 12px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 8px;
+  outline: 0;
+  color: #fff;
+  background: #282630;
+}
+
+.lux-admin-plugin-dialog-form select[multiple] {
+  min-height: 132px;
+}
+
+.lux-admin-plugin-dialog-form select:focus {
+  border-color: rgba(255, 255, 255, .46);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, .06);
+}
+
+.lux-admin-plugin-dialog-form input:disabled,
+.lux-admin-plugin-dialog-form select:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.lux-admin-plugin-dialog-form select option {
+  padding: 5px 7px;
+  color: #fff;
+  background: #282630;
+}
+
+.lux-admin-plugin-dialog-form small {
+  color: var(--lux-subtle);
+  font-size: .7rem;
+  line-height: 1.5;
+}
+
+.lux-admin-plugin-dialog-form .lux-admin-plugin-toggle {
+  display: flex;
+  grid-template-columns: auto 1fr;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .035);
+}
+
+.lux-admin-plugin-toggle input {
+  width: 17px;
+  min-height: 17px;
+  margin-top: 2px;
+  accent-color: #d247bf;
+}
+
+.lux-admin-plugin-toggle span {
+  display: grid;
+  gap: 3px;
+}
+
+.lux-admin-plugin-toggle strong {
+  color: #fff;
+  font-size: .8rem;
+  font-weight: 650;
+}
+
 .lux-admin-plugin-dialog-form input:focus {
   border-color: rgba(255, 255, 255, .46);
   box-shadow: 0 0 0 3px rgba(255, 255, 255, .06);

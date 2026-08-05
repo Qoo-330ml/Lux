@@ -6,7 +6,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -185,6 +185,113 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(position, 900);
+
+    let web_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(web_login.status(), reqwest::StatusCode::OK);
+    let web_session = cookie_value(web_login.headers(), "lux_session")?;
+    let web_csrf = cookie_value(web_login.headers(), "lux_csrf")?;
+    let web_cookie = format!("lux_session={web_session}; lux_csrf={web_csrf}");
+    let web_progress_url = format!("{base_url}/api/v1/items/{item_id}/progress");
+
+    let web_playing = client
+        .post(&web_progress_url)
+        .header(COOKIE, &web_cookie)
+        .header("X-CSRF-Token", &web_csrf)
+        .json(&json!({
+            "positionTicks": 1_000,
+            "durationTicks": 2_000,
+            "state": "PLAYING",
+        }))
+        .send()
+        .await?;
+    assert_eq!(web_playing.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let web_paused = client
+        .post(&web_progress_url)
+        .header(COOKIE, &web_cookie)
+        .header("X-CSRF-Token", &web_csrf)
+        .json(&json!({
+            "positionTicks": 1_200,
+            "durationTicks": 2_000,
+            "state": "PAUSED",
+        }))
+        .send()
+        .await?;
+    assert_eq!(web_paused.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let web_playback = client
+        .get(format!("{base_url}/api/v1/items/{item_id}/playback"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(web_playback.status(), reqwest::StatusCode::OK);
+    let web_playback_body = web_playback.json::<Value>().await?;
+    assert_eq!(web_playback_body["positionTicks"], 1_200);
+    assert_eq!(web_playback_body["state"], "PAUSED");
+    assert_eq!(web_playback_body["isPaused"], true);
+
+    let web_sessions = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    let web_session_body = web_sessions
+        .json::<Value>()
+        .await?
+        .as_array()
+        .and_then(|sessions| {
+            sessions.iter().find(|session| {
+                session["PlaySessionId"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("lux-web:"))
+            })
+        })
+        .cloned()
+        .ok_or("missing web playback session")?;
+    assert_eq!(web_session_body["PlayState"]["IsPaused"], true);
+
+    let web_stopped = client
+        .post(&web_progress_url)
+        .header(COOKIE, &web_cookie)
+        .header("X-CSRF-Token", &web_csrf)
+        .json(&json!({
+            "positionTicks": 1_200,
+            "durationTicks": 2_000,
+            "state": "STOPPED",
+        }))
+        .send()
+        .await?;
+    assert_eq!(web_stopped.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let web_playback_after_stop = client
+        .get(format!("{base_url}/api/v1/items/{item_id}/playback"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    let web_playback_after_stop_body = web_playback_after_stop.json::<Value>().await?;
+    assert_eq!(web_playback_after_stop_body["positionTicks"], 1_200);
+    assert_eq!(web_playback_after_stop_body["state"], Value::Null);
+
     server.abort();
     Ok(())
+}
+
+fn cookie_value(
+    headers: &reqwest::header::HeaderMap,
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            let (pair, _) = value.split_once(';')?;
+            let (cookie_name, cookie_value) = pair.split_once('=')?;
+            (cookie_name == name).then(|| cookie_value.to_owned())
+        })
+        .ok_or_else(|| format!("missing {name} cookie").into())
 }

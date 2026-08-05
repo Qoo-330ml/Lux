@@ -233,6 +233,41 @@ impl PluginSupervisor {
         result
     }
 
+    /// Runs one request in a fresh plugin process.
+    ///
+    /// Media probing is intentionally isolated per request so the host can
+    /// enforce a bounded ffprobe concurrency without serializing every probe
+    /// behind one long-lived stdin/stdout session.
+    pub async fn call_isolated(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, PluginRuntimeError> {
+        let plugin = self
+            .catalog
+            .get(plugin_id)
+            .ok_or_else(|| PluginRuntimeError::UnknownPlugin(plugin_id.to_owned()))?;
+        let mut process = match spawn_process(
+            plugin,
+            self.config_dir.as_deref(),
+            self.network_proxy_url.as_deref(),
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                self.record_error(plugin_id, &error).await;
+                return Err(error);
+            }
+        };
+        let result = process.call(method, params, self.call_timeout).await;
+        if let Err(error) = &result {
+            self.record_error(plugin_id, error).await;
+        } else {
+            self.last_errors.lock().await.remove(plugin_id);
+        }
+        result
+    }
+
     pub async fn status(&self, plugin_id: &str) -> PluginRuntimeStatus {
         let running = self.processes.lock().await.contains_key(plugin_id);
         let last_error = self.last_errors.lock().await.get(plugin_id).cloned();

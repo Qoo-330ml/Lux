@@ -290,6 +290,10 @@ function LibraryAdminCard({ library, plugins, globalStrategy }: { library: Admin
   const addRoot = useMutation({ mutationFn: () => api.addAdminLibraryRoot(library.id, rootPath.trim()), onSuccess: () => { setRootPath(""); setRootError(""); void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries }); }, onError: (error) => setRootError(error.message) });
   const removeRoot = useMutation({ mutationFn: (rootId: string) => api.deleteAdminLibraryRoot(library.id, rootId), onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries }) });
   const scan = useMutation({ mutationFn: () => api.startAdminScan(library.id), onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminHealth }); void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() }); } });
+  const refresh = useMutation({
+    mutationFn: () => api.startLibraryMetadataRefresh(library.id, library.mediaStrategy?.metadataRefreshMode ?? globalStrategy?.metadataRefreshMode ?? "FILL_MISSING"),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() }); },
+  });
   const remove = useMutation({ mutationFn: () => api.deleteAdminLibrary(library.id), onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries }) });
 
   useEffect(() => {
@@ -340,7 +344,7 @@ function LibraryAdminCard({ library, plugins, globalStrategy }: { library: Admin
         <button className="lux-admin-library-overflow" type="button" aria-label={`打开 ${library.name} 操作菜单`} aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}><MoreHorizontal size={20} /></button>
       </div>
       <div className="lux-admin-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span><small>{library.roots[0]?.displayPath ?? "尚未配置根路径"}</small></div>
-      {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
+      {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
       {editOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setEditOpen(false); }}>
         <div className="lux-library-dialog" role="dialog" aria-modal="true" aria-labelledby={`edit-library-title-${library.id}`}>
           <div className="lux-library-dialog-header"><div><span className="lux-eyebrow">MEDIA LIBRARY</span><h2 id={`edit-library-title-${library.id}`}>{library.name}</h2></div><button ref={dialogCloseRef} className="lux-library-dialog-close" type="button" aria-label={`关闭 ${library.name} 编辑弹窗`} onClick={() => setEditOpen(false)}><X size={20} /></button></div>
@@ -404,13 +408,13 @@ function cloneStrategy(strategy: MediaStrategySettings): MediaStrategySettings {
   return { ...strategy, images: { ...strategy.images }, subtitles: { ...strategy.subtitles, languages: [...strategy.subtitles.languages] } };
 }
 
-function LibraryActionMenu({ library, onEdit, onScan, onRemove }: { library: AdminLibrary; onEdit: () => void; onScan: () => void; onRemove: () => void }) {
+function LibraryActionMenu({ library, onEdit, onRefresh, refreshing, onScan, onRemove }: { library: AdminLibrary; onEdit: () => void; onRefresh: () => void; refreshing: boolean; onScan: () => void; onRemove: () => void }) {
   const actions: Array<{ label: string; icon: LucideIcon; onClick?: () => void; disabled?: boolean; title?: string }> = [
     { label: "添加到“合集”", icon: ListPlus, disabled: true, title: "合集功能将在后续版本提供" },
     { label: "更改内容类型", icon: Folder, onClick: onEdit },
     { label: "编辑", icon: Pencil, onClick: onEdit },
     { label: "编辑图像", icon: Image, onClick: onEdit },
-    { label: "刷新元数据", icon: RefreshCw, disabled: true, title: "请在元数据纠错页面执行" },
+    { label: "刷新元数据", icon: RefreshCw, onClick: onRefresh, disabled: refreshing, title: refreshing ? "元数据刷新任务提交中" : undefined },
     { label: "扫描媒体库文件", icon: RefreshCw, onClick: onScan },
     { label: "移除", icon: MinusCircle, onClick: onRemove },
     { label: "重命名", icon: Pencil, onClick: onEdit },
@@ -420,7 +424,7 @@ function LibraryActionMenu({ library, onEdit, onScan, onRemove }: { library: Adm
 }
 
 function ScraperSelect({ id, value, plugins, onChange }: { id: string; value: string; plugins: AdminPlugin[]; onChange: (value: string) => void }) {
-  const visiblePlugins = plugins.filter((plugin) => plugin.available || plugin.id === value);
+  const visiblePlugins = plugins.filter((plugin) => plugin.category.trim().toUpperCase() === "SCRAPER" && (plugin.available || plugin.id === value));
   const options = visiblePlugins.map((plugin) => ({
     value: plugin.id,
     label: `${plugin.name}${plugin.available ? "" : "（暂不可用）"}`,

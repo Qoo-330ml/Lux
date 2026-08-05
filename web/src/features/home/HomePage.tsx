@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useEffect, useState } from "react";
+import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
@@ -23,9 +24,11 @@ export function HomePage() {
       <div className="lux-home-content">
         <section className="lux-section lux-library-section" aria-label="我的媒体库">
           <div className="lux-section-heading"><h2>我的媒体库</h2><span>{data.libraries?.length ?? 0} 个库</span></div>
-          <div className="lux-library-rail">
-            {data.libraries?.length ? data.libraries.map((library) => <LibraryCard key={library.id} library={library} />) : <EmptyLibraries />}
-          </div>
+          <HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">
+            <div className="lux-library-rail">
+              {data.libraries?.length ? data.libraries.map((library) => <LibraryCard key={library.id} library={library} />) : <EmptyLibraries />}
+            </div>
+          </HorizontalScrollRail>
         </section>
         <ContinueWatchingRail items={data.continueWatching ?? []} />
         {data.libraries?.map((library) => <MediaRail key={`latest-${library.id}`} title={`最新${library.name}`} items={library.latest ?? []} />)}

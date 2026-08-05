@@ -91,6 +91,25 @@ fn duplicate_probe_stream_indexes_are_rejected() {
 }
 
 #[test]
+fn attached_picture_stream_is_not_exposed_as_video() {
+    let result = parse_probe_json(
+        br#"{
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "video", "codec_name": "png",
+                 "disposition": {"attached_pic": 1}}
+            ]
+        }"#,
+    )
+    .expect("valid probe with an attached picture");
+
+    assert_eq!(result.streams.len(), 2);
+    assert_eq!(result.streams[0].stream_index, 0);
+    assert_eq!(result.streams[1].stream_index, 1);
+}
+
+#[test]
 fn unavailable_optional_probe_values_do_not_discard_streams() {
     let result = parse_probe_json(
         br#"{"format":{"format_name":"mpeg4","duration":"N/A","bit_rate":"N/A"},"streams":[]}"#,
@@ -255,10 +274,7 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(
-        source,
-        ("matroska".to_owned(), 125_000_000, 500_000, 2, None)
-    );
+    assert_eq!(source, ("mkv".to_owned(), 125_000_000, 500_000, 2, None));
 
     let second = service.probe_movie_library(library.id).await?;
     assert_eq!(second.attempted, 0);

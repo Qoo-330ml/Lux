@@ -144,7 +144,25 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
     assert_eq!(root_body["root"]["isAvailable"], true);
     assert_eq!(root_body["root"]["isWritable"], true);
     assert_eq!(root_body["warnings"], json!([]));
+    assert!(root_body["scanJob"]["id"].is_string());
     let root_id = root_body["root"]["id"].as_str().ok_or("missing root ID")?;
+    for _ in 0..80 {
+        let jobs: Value = client
+            .get(format!("{base_url}/api/v1/admin/jobs?page=1&pageSize=50"))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let running = jobs["jobs"].as_array().is_some_and(|jobs| {
+            jobs.iter()
+                .any(|job| job["status"] == "PENDING" || job["status"] == "RUNNING")
+        });
+        if !running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let edited = client
         .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
@@ -615,6 +633,151 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(orphaned_tasks, 0);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_list_and_update_library_schedules_from_operations_page()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, _) = start_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "Movies", "kind": "MOVIE" }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let library_id = created.json::<Value>().await?["library"]["id"]
+        .as_str()
+        .ok_or("missing library ID")?
+        .to_owned();
+
+    let seeded = client
+        .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "incrementalSchedule": "interval:30s" }))
+        .send()
+        .await?;
+    assert_eq!(seeded.status(), reqwest::StatusCode::OK);
+
+    let listed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/scheduled-tasks?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let listed_body: Value = listed.json().await?;
+    assert_eq!(listed_body["total"], 3);
+    let tasks = listed_body["scheduledTasks"]
+        .as_array()
+        .ok_or("missing scheduled tasks")?;
+    let incremental = tasks
+        .iter()
+        .find(|task| task["taskType"] == "INCREMENTAL_SCAN")
+        .ok_or("missing incremental schedule")?;
+    assert_eq!(incremental["ownerType"], "LIBRARY");
+    assert_eq!(incremental["ownerName"], "Movies");
+    assert_eq!(incremental["schedule"], "interval:30s");
+    assert_eq!(incremental["isEnabled"], true);
+
+    let missing_csrf = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookies)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "METADATA_PARSE",
+            "schedule": "interval:2h"
+        }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let updated = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "METADATA_PARSE",
+            "schedule": "interval:2h"
+        }))
+        .send()
+        .await?;
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    let updated_body: Value = updated.json().await?;
+    assert_eq!(updated_body["scheduledTask"]["schedule"], "interval:2h");
+    assert_eq!(updated_body["scheduledTask"]["isEnabled"], true);
+
+    let invalid_task = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "REBUILD_SEARCH",
+            "schedule": "interval:2h"
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_task.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let cleared = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "METADATA_PARSE",
+            "schedule": null,
+            "isEnabled": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(cleared.status(), reqwest::StatusCode::OK);
+    let cleared_body: Value = cleared.json().await?;
+    assert_eq!(cleared_body["scheduledTask"]["schedule"], Value::Null);
+    assert_eq!(cleared_body["scheduledTask"]["isEnabled"], false);
+
+    let libraries = client
+        .get(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    let libraries_body: Value = libraries.json().await?;
+    let library = libraries_body["libraries"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == library_id))
+        .ok_or("missing library after schedule update")?;
+    assert_eq!(library["metadataSchedule"], Value::Null);
 
     server.abort();
     Ok(())

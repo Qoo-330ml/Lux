@@ -481,9 +481,9 @@ function renderAdminCandidates(item, candidates) {
     const data = candidate.candidate && typeof candidate.candidate === "object" ? candidate.candidate : {};
     const title = data.title || data.originalTitle || candidate.providerId || "未命名候选";
     const diffs = (candidate.fieldDiffs || []).map((diff) => `<li><strong>${escapeHtml(diff.field)}</strong><span>${escapeHtml(String(diff.current ?? "空"))} → ${escapeHtml(String(diff.candidate ?? "空"))}</span></li>`).join("");
-    return `<article class="candidate-card"><div class="section-heading"><div><h4>${escapeHtml(title)}</h4><span>${escapeHtml(candidate.provider || "TMDb")} · ID: ${escapeHtml(candidate.providerId || "")}</span></div><span class="badge badge-indigo">匹配度: ${escapeHtml(String(candidate.score ?? 0))}%</span></div><ul class="diff-list">${diffs || "<li><span>无差异</span></li>"}</ul><div class="form-actions"><button class="button secondary" data-select-candidate="${escapeHtml(candidate.itemId)}|${escapeHtml(candidate.id)}|fillMissing">仅补缺</button><button class="button" data-select-candidate="${escapeHtml(candidate.itemId)}|${escapeHtml(candidate.id)}|refreshUnlocked">刷新未锁定</button></div></article>`;
+    return `<article class="candidate-card"><div class="section-heading"><div><h4>${escapeHtml(title)}</h4><span>${escapeHtml(candidate.provider || "元数据刮削器")} · ID: ${escapeHtml(candidate.providerId || "")}</span></div><span class="badge badge-indigo">匹配度: ${escapeHtml(String(candidate.score ?? 0))}%</span></div><ul class="diff-list">${diffs || "<li><span>无差异</span></li>"}</ul><div class="form-actions"><button class="button secondary" data-select-candidate="${escapeHtml(candidate.itemId)}|${escapeHtml(candidate.id)}|fillMissing">仅补缺</button><button class="button" data-select-candidate="${escapeHtml(candidate.itemId)}|${escapeHtml(candidate.id)}|refreshUnlocked">刷新未锁定</button></div></article>`;
   }).join("");
-  return `<section class="admin-images"><div class="section-heading"><h3>🔍 TMDb 重新识别与刮削</h3><span>从网络查找候选并写回本地 NFO</span></div><form class="admin-form compact-form" data-action="search-candidates"><input name="query" value="${escapeHtml(item.title || "")}" placeholder="输入关键词搜索 TMDb" aria-label="TMDb 搜索关键词" required><input name="year" type="number" min="1800" max="2200" placeholder="年份" aria-label="年份"><button class="button secondary" type="submit">搜索候选</button></form><div class="candidate-list">${rows || "<div class=\"empty\"><p>未找到候选。请输入正确的影视名称搜索。</p></div>"}</div></section>`;
+  return `<section class="admin-images"><div class="section-heading"><h3>🔍 元数据匹配与刮削</h3><span>从当前刮削器查找候选并写回本地 NFO</span></div><form class="admin-form compact-form" data-action="search-candidates"><input name="query" value="${escapeHtml(item.title || "")}" placeholder="输入关键词搜索元数据" aria-label="元数据搜索关键词" required><input name="year" type="number" min="1800" max="2200" placeholder="年份" aria-label="年份"><button class="button secondary" type="submit">搜索候选</button></form><div class="candidate-list">${rows || "<div class=\"empty\"><p>未找到候选。请输入正确的影视名称搜索。</p></div>"}</div></section>`;
 }
 
 function renderChildrenPanel(item, result, showingEpisodes = false) {
@@ -636,7 +636,7 @@ function renderAdminMetadata({ pending = [] }) {
   </tr>`).join("");
 
   return `<section class="section"><div class="section-heading"><h2>待匹配元数据队列 (Pending Queue)</h2><span>搜刮置信度较低或缺乏 NFO 的条目</span></div>
-  <div class="table-wrap"><table><thead><tr><th>条目标题</th><th>匹配状态</th><th>操作</th></tr></thead><tbody>${pendingRows || '<tr><td colspan="3">🎉 待处理队列为空，所有影视条目均已成功识别！</td></tr>'}</tbody></table></div></section>`;
+  <div class="table-wrap"><table><thead><tr><th>条目标题</th><th>匹配状态</th><th>操作</th></tr></thead><tbody>${pendingRows || '<tr><td colspan="3">🎉 待处理队列为空，所有影视条目均已完成元数据匹配！</td></tr>'}</tbody></table></div></section>`;
 }
 
 function bind() {
@@ -813,7 +813,7 @@ function bind() {
     } else if (target.dataset.selectCandidate) {
       const [itemId, candId, mode] = target.dataset.selectCandidate.split("|");
       await api.selectCandidate(itemId, candId, mode);
-      state.notice = "识别候选已应用，元数据与 NFO 回写完成";
+      state.notice = "元数据匹配候选已应用，元数据与 NFO 回写完成";
       loadRoute();
     } else if (target.dataset.deleteImage) {
       await api.deleteAdminImage(state.itemId, target.dataset.deleteImage);

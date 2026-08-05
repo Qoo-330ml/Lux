@@ -203,7 +203,7 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
               }}
             >
               <ScanSearch size={17} aria-hidden="true" />
-              <span>识别</span>
+              <span>元数据匹配</span>
             </button>
           ) : null}
           {onRefreshMetadata ? (

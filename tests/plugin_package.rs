@@ -42,6 +42,23 @@ fn packages_an_unsigned_tmdb_zip_even_when_a_signing_key_is_configured()
     assert_eq!(catalog.plugins[0].manifest.id, "org.lux.tmdb");
     assert_eq!(catalog.plugins[0].manifest.version, "1.0.0");
     assert!(catalog.plugins[0].entrypoint.is_file());
+    assert_eq!(
+        catalog.plugins[0].manifest.config_fields[1].key,
+        "preferredLanguage"
+    );
+    assert_eq!(
+        catalog.plugins[0].manifest.config_fields[1].options[0].value,
+        "zh-CN"
+    );
+    assert!(catalog.plugins[0].manifest.config_fields[3].multiple);
+    assert_eq!(
+        catalog.plugins[0].manifest.config_fields[4].key,
+        "alternateApiEnabled"
+    );
+    assert_eq!(
+        catalog.plugins[0].manifest.config_fields[5].options[1].label,
+        "https://api.tmdb.org"
+    );
     Ok(())
 }
 
@@ -79,5 +96,46 @@ fn packages_an_unsigned_tmdb_zip_without_a_signing_key() -> Result<(), Box<dyn s
     assert!(catalog.failures.is_empty());
     assert_eq!(catalog.plugins.len(), 1);
     assert_eq!(catalog.plugins[0].manifest.id, "org.lux.tmdb");
+    Ok(())
+}
+
+#[test]
+fn packages_a_media_info_zip_with_the_media_probe_manifest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempdir()?;
+    let binary = root.path().join("lux-plugin-media-info");
+    let archive = root.path().join("org.lux.media-info-1.0.0.zip");
+    fs::write(&binary, b"standalone media info plugin binary")?;
+
+    let packer = std::env::var("CARGO_BIN_EXE_lux-plugin-pack")
+        .or_else(|_| std::env::var("CARGO_BIN_EXE_lux_plugin_pack"))?;
+    let status = Command::new(packer)
+        .env_remove("LUX_PLUGIN_SIGNING_KEY_HEX")
+        .args([
+            "--plugin",
+            "media-info",
+            "--binary",
+            binary.to_str().ok_or("binary path is not UTF-8")?,
+            "--output",
+            archive.to_str().ok_or("archive path is not UTF-8")?,
+            "--version",
+            "1.0.0",
+            "--platform",
+            "linux",
+            "--arch",
+            "x86_64",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let catalog = PluginCatalog::discover(root.path());
+    assert!(catalog.failures.is_empty());
+    assert_eq!(catalog.plugins.len(), 1);
+    let manifest = &catalog.plugins[0].manifest;
+    assert_eq!(manifest.id, "org.lux.media-info");
+    assert_eq!(manifest.name, "strm媒体信息提取");
+    assert_eq!(manifest.plugin_type, "media_probe");
+    assert_eq!(manifest.category, "MEDIA");
+    assert_eq!(manifest.capabilities, vec!["media.probe"]);
     Ok(())
 }

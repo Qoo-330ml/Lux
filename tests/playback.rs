@@ -200,6 +200,19 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert_eq!(source_route.status(), reqwest::StatusCode::OK);
     assert_eq!(source_route.bytes().await?.as_ref(), b"0123456789");
 
+    let legacy_container_route = client
+        .get(format!(
+            "{base_url}/Videos/{item_id}/{source_id}/stream.matroska,webm"
+        ))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(legacy_container_route.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        legacy_container_route.bytes().await?.as_ref(),
+        b"0123456789"
+    );
+
     let head = client
         .head(&stream_url)
         .query(&[("api_key", token.as_str())])

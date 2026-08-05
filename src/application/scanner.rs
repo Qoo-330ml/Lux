@@ -12,7 +12,13 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
-    application::{metadata::MetadataEnricher, probe::MediaProbeService},
+    application::{
+        media_matching::{MediaKind, clean_title, parse_media_name},
+        metadata::MetadataEnricher,
+        probe::MediaProbeService,
+        reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
+        thumbnails::ThumbnailService,
+    },
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     storage::{
         Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource,
@@ -536,6 +542,15 @@ impl LibraryScanner {
             .find_media_item_by_identity(item.identity_key)
             .await?
         {
+            self.database
+                .update_unconfirmed_hierarchy_item(
+                    &existing.id,
+                    item.title,
+                    item.sort_title,
+                    item.original_title,
+                    item.production_year,
+                )
+                .await?;
             return Ok((existing.id, false));
         }
         let id = item.id.to_owned();
@@ -566,8 +581,8 @@ impl LibraryScanner {
                 title: &hierarchy.series_title,
                 sort_title: &series_sort_title,
                 original_title: Some(&hierarchy.series_title),
-                production_year: None,
-                identification_status: "LOCAL_CONFIRMED",
+                production_year: hierarchy.production_year.map(i64::from),
+                identification_status: "PENDING",
                 identity_key: &series_identity,
             })
             .await?;
@@ -593,7 +608,7 @@ impl LibraryScanner {
                 sort_title: &season_sort_title,
                 original_title: Some(&season_title),
                 production_year: None,
-                identification_status: "LOCAL_CONFIRMED",
+                identification_status: "PENDING",
                 identity_key: &season_identity,
             })
             .await?;
@@ -623,7 +638,7 @@ impl LibraryScanner {
                 sort_title: &episode_sort_title,
                 original_title: Some(&episode_title),
                 production_year: None,
-                identification_status: "LOCAL_CONFIRMED",
+                identification_status: "PENDING",
                 identity_key: &episode_identity,
             })
             .await?;
@@ -1170,6 +1185,31 @@ impl ScanJobService {
         batch_size: usize,
         probe: Option<MediaProbeService>,
     ) -> Result<(), ScanJobError> {
+        self.run_to_completion_with_metadata_and_thumbnails(job_id, batch_size, probe, None, None)
+            .await
+    }
+
+    pub async fn run_to_completion_with_metadata(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        probe: Option<MediaProbeService>,
+        metadata: Option<MetadataReidentifyService>,
+    ) -> Result<(), ScanJobError> {
+        self.run_to_completion_with_metadata_and_thumbnails(
+            job_id, batch_size, probe, metadata, None,
+        )
+        .await
+    }
+
+    pub async fn run_to_completion_with_metadata_and_thumbnails(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        probe: Option<MediaProbeService>,
+        metadata: Option<MetadataReidentifyService>,
+        thumbnails: Option<ThumbnailService>,
+    ) -> Result<(), ScanJobError> {
         loop {
             let report = self.run_batch(job_id, batch_size).await?;
             if !report.completed {
@@ -1178,9 +1218,159 @@ impl ScanJobService {
             if report.status == "COMPLETED" {
                 self.run_probe_after_scan(job_id, probe).await?;
                 self.run_metadata_after_scan(job_id).await?;
+                self.run_thumbnails_after_scan(job_id, thumbnails).await?;
+                if let Some(metadata) = metadata {
+                    self.schedule_online_metadata_after_scan(job_id, metadata)
+                        .await;
+                }
             }
             return Ok(());
         }
+    }
+
+    async fn run_thumbnails_after_scan(
+        &self,
+        job_id: &str,
+        thumbnails: Option<ThumbnailService>,
+    ) -> Result<(), ScanJobError> {
+        let Some(thumbnails) = thumbnails else {
+            return Ok(());
+        };
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
+        let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
+            tracing::warn!(
+                job_id,
+                library_id = %job.library_id,
+                "scan thumbnails skipped for invalid library ID"
+            );
+            return Ok(());
+        };
+        match thumbnails.generate_library(library_id).await {
+            Ok(report) if report.failed == 0 => {
+                let details = format!(
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
+                    report.considered,
+                    report.generated,
+                    report.reused,
+                    report.failed,
+                    report.skipped_strm,
+                );
+                self.record_event(
+                    job_id,
+                    "INFO",
+                    "THUMBNAIL_COMPLETED",
+                    "视频缩略图任务完成",
+                    &details,
+                )
+                .await;
+            }
+            Ok(report) => {
+                let details = format!(
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
+                    report.considered,
+                    report.generated,
+                    report.reused,
+                    report.failed,
+                    report.skipped_strm,
+                );
+                self.record_event(
+                    job_id,
+                    "WARN",
+                    "THUMBNAIL_FAILED",
+                    "部分视频缩略图生成失败",
+                    &details,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(job_id, %error, "scan thumbnail task failed");
+                self.record_event(
+                    job_id,
+                    "ERROR",
+                    "THUMBNAIL_FAILED",
+                    "视频缩略图任务失败",
+                    "{}",
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn schedule_online_metadata_after_scan(
+        &self,
+        scan_job_id: &str,
+        metadata: MetadataReidentifyService,
+    ) {
+        let Some(scan_job) = self
+            .database
+            .find_scan_job(scan_job_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let Some(library) = self
+            .database
+            .find_library(&scan_job.library_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        if library.scraper_id.as_deref().is_none() {
+            return;
+        }
+        let Ok(library_id) = scan_job.library_id.parse::<LibraryId>() else {
+            tracing::warn!(
+                scan_job_id,
+                library_id = %scan_job.library_id,
+                "automatic metadata matching skipped for invalid library ID"
+            );
+            return;
+        };
+        let job = match metadata
+            .create_library_refresh_job(&library_id.to_string(), MetadataRefreshMode::FillMissing)
+            .await
+        {
+            Ok(job) => job,
+            Err(MetadataReidentifyError::InvalidItemCount) => return,
+            Err(_) => {
+                tracing::warn!(
+                    scan_job_id,
+                    "scan completed but automatic metadata matching could not be queued"
+                );
+                self.record_event(
+                    scan_job_id,
+                    "ERROR",
+                    "METADATA_AUTO_MATCH_QUEUE_FAILED",
+                    "自动元数据匹配任务创建失败",
+                    "{}",
+                )
+                .await;
+                return;
+            }
+        };
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            metadata.run(&job_id).await;
+        });
+        let details = format!(
+            r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
+            job.total_count, job.id
+        );
+        self.record_event(
+            scan_job_id,
+            "INFO",
+            "METADATA_AUTO_MATCH_QUEUED",
+            "已提交自动元数据匹配任务",
+            &details,
+        )
+        .await;
     }
 
     async fn run_metadata_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
@@ -1470,6 +1660,7 @@ pub struct ParsedMovieFilename {
 pub struct ParsedEpisodeFilename {
     pub title: String,
     pub sort_title: String,
+    pub production_year: Option<i32>,
     pub season: u32,
     pub episode: u32,
     pub absolute_number: Option<u32>,
@@ -1541,197 +1732,45 @@ async fn nfo_root_is(path: &Path, expected: &str) -> bool {
 }
 
 pub fn parse_movie_filename(filename: &str) -> Option<ParsedMovieFilename> {
-    let stem = Path::new(filename).file_stem()?.to_str()?;
-    let normalized = stem
-        .chars()
-        .map(|character| match character {
-            '.' | '_' | '(' | ')' | '[' | ']' => ' ',
-            character => character,
-        })
-        .collect::<String>();
-    let words: Vec<&str> = normalized.split_whitespace().collect();
-    if words.is_empty() {
-        return None;
-    }
-    let year_index = words.iter().position(|word| {
-        word.len() == 4
-            && word.chars().all(|character| character.is_ascii_digit())
-            && word
-                .parse::<i32>()
-                .is_ok_and(|year| (1900..=2099).contains(&year))
-    });
-    let (title_words, suffix_words, production_year) = match year_index {
-        Some(index) if index > 0 => (
-            &words[..index],
-            &words[index + 1..],
-            words[index].parse::<i32>().ok(),
-        ),
-        _ => (&words[..], &[][..], None),
-    };
-    let title = title_words.join(" ");
-    if title.is_empty() {
-        return None;
-    }
-    let edition_name = parse_edition_name(suffix_words);
-    let quality_label = parse_quality_label(suffix_words);
-    let display_title = edition_name
-        .as_ref()
-        .map(|edition| format!("{title} ({edition})"))
-        .unwrap_or(title);
-    Some(ParsedMovieFilename {
-        sort_title: display_title.to_lowercase(),
-        title: display_title,
-        production_year,
-        edition_name,
-        quality_label,
+    parse_media_name(filename, MediaKind::Movie).map(|parsed| ParsedMovieFilename {
+        title: parsed.title,
+        sort_title: parsed.sort_title,
+        production_year: parsed.production_year,
+        edition_name: parsed.edition_name,
+        quality_label: parsed.quality_label,
     })
-}
-
-fn parse_edition_name(words: &[&str]) -> Option<String> {
-    let lowered = words
-        .iter()
-        .map(|word| word.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    if lowered
-        .windows(2)
-        .any(|window| matches!(window, [first, second] if (first == "director" || first == "directors" || first == "director's") && *second == "cut"))
-    {
-        return Some("Director's Cut".to_owned());
-    }
-    if lowered
-        .windows(2)
-        .any(|window| matches!(window, [first, second] if *first == "extended" && *second == "cut"))
-    {
-        return Some("Extended Cut".to_owned());
-    }
-    [
-        ("unrated", "Unrated"),
-        ("theatrical", "Theatrical"),
-        ("ultimate", "Ultimate"),
-        ("final", "Final"),
-        ("special", "Special"),
-        ("remastered", "Remastered"),
-    ]
-    .iter()
-    .find_map(|(token, label)| {
-        lowered
-            .iter()
-            .any(|word| word == token)
-            .then_some((*label).to_owned())
-    })
-}
-
-fn parse_quality_label(words: &[&str]) -> Option<String> {
-    let resolution = words.iter().find_map(|word| {
-        let normalized = word.to_ascii_lowercase();
-        match normalized.as_str() {
-            "4k" | "uhd" => Some("4K".to_owned()),
-            "2160p" | "1080p" | "720p" | "576p" | "480p" => Some(normalized),
-            _ => None,
-        }
-    });
-    let dynamic_range = words.iter().find_map(|word| {
-        let normalized = word.to_ascii_lowercase();
-        match normalized.as_str() {
-            "hdr" | "hdr10" | "hdr10+" => Some("HDR"),
-            "sdr" => Some("SDR"),
-            _ => None,
-        }
-    });
-    match (resolution, dynamic_range) {
-        (Some(resolution), Some(dynamic_range)) => Some(format!("{resolution} {dynamic_range}")),
-        (Some(resolution), None) => Some(resolution),
-        (None, Some(dynamic_range)) => Some(dynamic_range.to_owned()),
-        (None, None) => None,
-    }
 }
 
 pub fn parse_episode_filename(filename: &str) -> Option<ParsedEpisodeFilename> {
-    let stem = Path::new(filename).file_stem()?.to_str()?;
-    let bytes = stem.as_bytes();
-    let mut marker = None;
-    for start in 0..bytes.len() {
-        if matches!(bytes[start], b's' | b'S') {
-            let (season_end, season) = ascii_number(bytes, start + 1);
-            if let Some(season) = season
-                && bytes
-                    .get(season_end)
-                    .is_some_and(|value| matches!(value, b'e' | b'E'))
-            {
-                let (episode_end, episode) = ascii_number(bytes, season_end + 1);
-                if let Some(episode) = episode {
-                    marker = Some((start, episode_end, season, episode));
-                    break;
-                }
-            }
-        }
-        if bytes[start].is_ascii_digit() {
-            let (season_end, season) = ascii_number(bytes, start);
-            if let Some(season) = season
-                && bytes
-                    .get(season_end)
-                    .is_some_and(|value| matches!(value, b'x' | b'X'))
-            {
-                let (episode_end, episode) = ascii_number(bytes, season_end + 1);
-                if let Some(episode) = episode {
-                    marker = Some((start, episode_end, season, episode));
-                    break;
-                }
-            }
-        }
-    }
-    let (start, end, season, episode) = marker?;
-    let suffix = remove_episode_version_markers(&stem[end..]);
-    let title = clean_hierarchy_title(&format!("{} {suffix}", &stem[..start]));
-    let title = if title.is_empty() {
+    let parsed = parse_media_name(filename, MediaKind::Episode)?;
+    let season = parsed.season?;
+    let episode = parsed.episode?;
+    let title = if parsed.title.is_empty() {
         format!("Episode {episode:02}")
     } else {
-        title
+        parsed.title
     };
-    let suffix_words = normalized_filename_words(&stem[end..]);
-    let suffix_word_refs = suffix_words.iter().map(String::as_str).collect::<Vec<_>>();
     Some(ParsedEpisodeFilename {
-        sort_title: title.to_lowercase(),
         title,
+        sort_title: parsed.sort_title,
+        production_year: parsed.production_year,
         season,
         episode,
-        absolute_number: None,
-        edition_name: parse_edition_name(&suffix_word_refs),
-        quality_label: parse_quality_label(&suffix_word_refs),
+        absolute_number: parsed.absolute_number,
+        edition_name: parsed.edition_name,
+        quality_label: parsed.quality_label,
     })
 }
 
-fn ascii_number(bytes: &[u8], start: usize) -> (usize, Option<u32>) {
-    let mut end = start;
-    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
-        end += 1;
-    }
-    if end == start {
-        return (start, None);
-    }
-    let value = std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok());
-    (end, value)
-}
-
 fn clean_hierarchy_title(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| match character {
-            '.' | '_' | '-' | '(' | ')' | '[' | ']' => ' ',
-            character => character,
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    clean_title(value)
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct EpisodeHierarchy {
     series_path: String,
     series_title: String,
+    production_year: Option<i32>,
     season_number: u32,
 }
 
@@ -1739,62 +1778,6 @@ struct EnsuredEpisodeHierarchy {
     episode_id: String,
     created_items: usize,
     episode_created: bool,
-}
-
-fn normalized_filename_words(value: &str) -> Vec<String> {
-    value
-        .chars()
-        .map(|character| match character {
-            '.' | '_' | '(' | ')' | '[' | ']' => ' ',
-            character => character,
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect()
-}
-
-fn remove_episode_version_markers(value: &str) -> String {
-    normalized_filename_words(value)
-        .into_iter()
-        .filter(|word| !is_episode_version_marker(word))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn is_episode_version_marker(word: &str) -> bool {
-    let normalized = word.to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "4k" | "uhd"
-            | "2160p"
-            | "1080p"
-            | "720p"
-            | "576p"
-            | "480p"
-            | "hdr"
-            | "hdr10"
-            | "hdr10+"
-            | "sdr"
-            | "dv"
-            | "dolbyvision"
-            | "web-dl"
-            | "webrip"
-            | "bluray"
-            | "bdrip"
-            | "hdtv"
-            | "remux"
-            | "proper"
-            | "repack"
-            | "x264"
-            | "x265"
-            | "h264"
-            | "h265"
-            | "hevc"
-            | "av1"
-            | "8bit"
-            | "10bit"
-    )
 }
 
 fn episode_hierarchy(relative_path: &str, parsed: &ParsedEpisodeFilename) -> EpisodeHierarchy {
@@ -1817,15 +1800,22 @@ fn episode_hierarchy(relative_path: &str, parsed: &ParsedEpisodeFilename) -> Epi
     } else {
         series_components.join("/")
     };
-    let series_title = series_components
+    let parsed_series = series_components
         .last()
-        .map(|value| clean_hierarchy_title(value))
+        .and_then(|value| parse_media_name(value, MediaKind::Series));
+    let series_title = parsed_series
+        .as_ref()
+        .map(|value| value.title.clone())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Series".to_owned());
+    let production_year = parsed_series
+        .and_then(|value| value.production_year)
+        .or(parsed.production_year);
     let season_number = season_directory_number(directories).unwrap_or(parsed.season);
     EpisodeHierarchy {
         series_path,
         series_title,
+        production_year,
         season_number,
     }
 }

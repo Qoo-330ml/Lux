@@ -78,11 +78,11 @@ export type MediaItem = {
   productionYear?: number | null;
   rating?: number | null;
   ratingSource?: string | null;
-  runtimeTicks?: number | null;
-  imageTags?: ImageTags;
   providerIds?: Record<string, string> | null;
   seasonCount?: number | null;
   episodeCount?: number | null;
+  runtimeTicks?: number | null;
+  imageTags?: ImageTags;
   userData?: UserData;
   mediaSources?: MediaSource[];
   actors?: MediaActor[];
@@ -144,7 +144,12 @@ export type PlaybackState = {
   isPlayed?: boolean;
   positionTicks?: number;
   durationTicks?: number;
+  state?: "PLAYING" | "PAUSED";
+  isPaused?: boolean;
+  lastEventAt?: number | null;
 };
+
+export type PlaybackEventState = "PLAYING" | "PAUSED" | "STOPPED";
 
 export type AdminRoot = {
   id: string;
@@ -190,16 +195,19 @@ export type AdminPlugin = {
   unavailableReason?: string | null;
   configurable: boolean;
   configFields: AdminPluginConfigField[];
+  configValues?: Record<string, unknown>;
   configSource: "BUILT_IN" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
 };
 
 export type AdminPluginConfigField = {
   key: string;
   label: string;
-  type: "password" | "text" | string;
+  type: "password" | "text" | "select" | "toggle" | string;
   required: boolean;
   sensitive: boolean;
-  description: string;
+  description?: string | null;
+  multiple?: boolean;
+  options?: Array<{ value: string; label: string }>;
 };
 
 export type AdminUser = LuxUser & {
@@ -240,13 +248,46 @@ export type AdminJob = {
   totalCount?: number | null;
   cancelRequested?: boolean;
   error?: string | null;
+  createdAt?: string | number;
 };
 
-export type AdminMetadataReidentifyBatch = {
+export type AdminScheduledTask = {
+  ownerType: "GLOBAL" | "LIBRARY" | string;
+  ownerId: string;
+  ownerName?: string | null;
+  taskType: string;
+  schedule?: string | null;
+  isEnabled: boolean;
+  resourceLimit?: Record<string, unknown>;
+  createdAt?: string | number;
+  updatedAt?: string | number;
+};
+
+export type AdminScheduledTaskPage = {
+  scheduledTasks?: AdminScheduledTask[];
+  total?: number;
+  page?: number;
+  pageSize?: number;
+};
+
+export type AdminMetadataReidentifyJob = {
+  id: string;
+  status: "QUEUED" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  cancelRequested?: boolean;
+  mode: "REIDENTIFY" | "FILL_MISSING" | "FULL_REFRESH" | string;
+  processedCount: number;
   totalCount: number;
-  jobCount: number;
+  error?: string | null;
+  createdAt: string | number;
+  updatedAt?: string | number;
+  startedAt?: string | number | null;
+  finishedAt?: string | number | null;
+};
+
+export type AdminMetadataReidentifyStart = {
+  totalCount: number;
   mode?: MetadataRefreshMode;
-  jobs: Array<Pick<AdminJob, "id" | "status" | "totalCount">>;
+  job: AdminMetadataReidentifyJob;
 };
 
 export type MetadataRefreshMode = "FILL_MISSING" | "FULL_REFRESH";
@@ -259,7 +300,7 @@ export type AdminAuditEvent = {
   targetType?: string | null;
   targetId?: string | null;
   metadata?: Record<string, unknown>;
-  createdAt: string;
+  createdAt: string | number;
 };
 
 export type AdminMetadataCandidate = {

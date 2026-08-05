@@ -328,6 +328,9 @@ describe("MediaDetailPage series hierarchy", () => {
 
     const cast = container.querySelector(".lux-media-cast");
     expect(cast?.querySelector("h2")?.textContent).toBe("演职人员");
+    expect(cast?.querySelector(".lux-eyebrow")).toBeNull();
+    expect(cast?.querySelector(".lux-media-cast-heading")?.textContent).toContain("2 位");
+    expect(cast?.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
     expect(cast?.querySelectorAll(".lux-media-cast-card")).toHaveLength(2);
     expect(cast?.querySelector<HTMLImageElement>(".lux-media-cast-avatar img")?.src)
       .toContain("/api/v1/people/9/image");
@@ -529,9 +532,10 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.textContent).toContain("H264");
     expect(details?.textContent).toContain("stereo");
     expect(details?.textContent).toContain("中文字幕");
+    expect(details?.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
   });
 
-  it("places the title on the line below an available media logo", async () => {
+  it("places an available media logo above the poster", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",
       title: "示例电影",
@@ -572,11 +576,15 @@ describe("MediaDetailPage series hierarchy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
+    const posterColumn = container.querySelector(".lux-detail-poster-column");
+    expect(posterColumn?.querySelector(".lux-detail-poster")).not.toBeNull();
     const titleRow = container.querySelector(".lux-detail-title-row");
     expect(titleRow?.querySelector<HTMLImageElement>(".lux-detail-logo")?.getAttribute("src"))
       .toBe("/api/v1/items/movie-1/images/logo");
-    expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
+    expect(titleRow?.children[0]?.className).toBe("lux-detail-logo");
     expect(titleRow?.children[1]?.tagName).toBe("H1");
+    expect(posterColumn?.querySelector(".lux-detail-logo")).toBeNull();
+    expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
   });
 
   it("plays the source selected in the detail URL", async () => {

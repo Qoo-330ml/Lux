@@ -52,7 +52,7 @@ async fn ready_and_version_report_migrated_state_without_paths()
     assert_eq!(ready.status(), reqwest::StatusCode::OK);
     let ready_body: serde_json::Value = ready.json().await?;
     assert_eq!(ready_body["status"], "ready");
-    assert_eq!(ready_body["schemaVersion"], 35);
+    assert_eq!(ready_body["schemaVersion"], 37);
     assert_eq!(ready_body["databaseWritable"], true);
 
     let version = client
@@ -63,7 +63,7 @@ async fn ready_and_version_report_migrated_state_without_paths()
     let version_text = version.text().await?;
     let version_body: serde_json::Value = serde_json::from_str(&version_text)?;
     assert_eq!(version_body["luxVersion"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(version_body["schemaVersion"], 35);
+    assert_eq!(version_body["schemaVersion"], 37);
     assert!(
         version_body["commit"]
             .as_str()

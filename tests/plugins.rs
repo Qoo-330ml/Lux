@@ -145,6 +145,42 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
         catalog_body["plugins"][0]["configFields"][0]["key"],
         "apiKey"
     );
+    assert_eq!(
+        catalog_body["plugins"][0]["configFields"][1]["key"],
+        "preferredLanguage"
+    );
+    assert_eq!(
+        catalog_body["plugins"][0]["configFields"][1]["options"][0]["value"],
+        "zh-CN"
+    );
+    assert_eq!(
+        catalog_body["plugins"][0]["configFields"][3]["multiple"],
+        true
+    );
+    assert_eq!(
+        catalog_body["plugins"][0]["configValues"]["preferredLanguage"],
+        "zh-CN"
+    );
+    assert_eq!(
+        catalog_body["plugins"][0]["configValues"]["fallbackLanguages"],
+        json!(["zh-SG", "zh-HK", "zh-TW"])
+    );
+    assert_eq!(
+        catalog_body["plugins"][0]["configValues"]["alternateApiEnabled"],
+        false
+    );
+    assert_eq!(
+        catalog_body["plugins"][0]["configValues"]["apiBaseUrl"],
+        "https://api.themoviedb.org"
+    );
+    assert_eq!(
+        catalog_body["plugins"][0]["configFields"][4]["key"],
+        "alternateApiEnabled"
+    );
+    assert_eq!(
+        catalog_body["plugins"][0]["configFields"][5]["options"][1]["label"],
+        "https://api.tmdb.org"
+    );
     assert!(catalog_body["plugins"][0].get("apiKey").is_none());
 
     let installed = client
@@ -231,12 +267,39 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_embedded_default()
         .put(format!("{base_url}/api/v1/admin/plugins/tmdb/config"))
         .header(COOKIE, &cookies)
         .header("x-csrf-token", &csrf)
-        .json(&json!({ "apiKey": custom_key }))
+        .json(&json!({
+            "apiKey": custom_key,
+            "preferredLanguage": "zh-SG",
+            "languageFallbackEnabled": true,
+            "fallbackLanguages": ["zh-HK", "zh-TW"],
+            "alternateApiEnabled": true,
+            "apiBaseUrl": "https://api.tmdb.org"
+        }))
         .send()
         .await?;
     assert_eq!(configured.status(), reqwest::StatusCode::OK);
     let configured_body: Value = configured.json().await?;
     assert_eq!(configured_body["plugin"]["configSource"], "CUSTOM");
+    assert_eq!(
+        configured_body["plugin"]["configValues"]["preferredLanguage"],
+        "zh-SG"
+    );
+    assert_eq!(
+        configured_body["plugin"]["configValues"]["languageFallbackEnabled"],
+        true
+    );
+    assert_eq!(
+        configured_body["plugin"]["configValues"]["fallbackLanguages"],
+        json!(["zh-HK", "zh-TW"])
+    );
+    assert_eq!(
+        configured_body["plugin"]["configValues"]["alternateApiEnabled"],
+        true
+    );
+    assert_eq!(
+        configured_body["plugin"]["configValues"]["apiBaseUrl"],
+        "https://api.tmdb.org"
+    );
     assert!(!configured_body.to_string().contains(custom_key));
     assert_eq!(
         tokio::fs::read_to_string(temp_dir.path().join("config/tmdb_api_key")).await?,
@@ -337,6 +400,69 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
     assert_eq!(
         installed.json::<Value>().await?["plugin"]["installed"],
         true
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_cannot_select_a_media_probe_plugin_as_a_library_scraper()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let plugin_dir = config_dir.join("plugins/org.lux.media-info");
+    fs::create_dir_all(plugin_dir.join("binaries"))?;
+    fs::write(plugin_dir.join("binaries/plugin"), b"plugin")?;
+    fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "formatVersion": 1,
+            "id": "org.lux.media-info",
+            "name": "strm媒体信息提取",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "media_probe",
+            "category": "MEDIA",
+            "capabilities": ["media.probe"],
+            "permissions": {"network": ["media-source"], "filesystem": []},
+            "files": []
+        }))?,
+    )?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir,
+    };
+    let (base_url, server) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = admin_session(&client, &base_url).await?;
+
+    let installed = client
+        .post(format!(
+            "{base_url}/api/v1/admin/plugins/org.lux.media-info/install"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+
+    let response = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "name": "STRM",
+            "kind": "MOVIE",
+            "scraperId": "org.lux.media-info"
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await?["error"]["code"],
+        "PLUGIN_UNAVAILABLE"
     );
 
     server.abort();

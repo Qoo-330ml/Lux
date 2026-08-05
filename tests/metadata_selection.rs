@@ -1,13 +1,24 @@
-use axum::{Router, body::Body, http::StatusCode, response::Response, routing::get};
+use std::time::Duration;
+
+use axum::{
+    Json, Router,
+    body::Body,
+    http::{Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{any, get},
+};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        candidates::{MetadataSelectionMode, MetadataSelectionService},
+        candidates::{MetadataCandidateService, MetadataSelectionMode, MetadataSelectionService},
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
+        reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
         setup::SetupService,
+        tmdb::{TmdbClient, TmdbClientConfig},
+        tmdb_plugin::TmdbProvider,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -40,6 +51,7 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
             "title": "Online Title",
             "overview": "Online Overview",
             "productionYear": 2025,
+            "rating": 8.6,
             "posterUrl": format!("{image_url}/poster"),
             "fanartUrl": format!("{image_url}/fanart")
         }),
@@ -76,6 +88,26 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
             .fetch_one(fixture.database.pool())
             .await?;
     assert_eq!(status, "ONLINE_CONFIRMED");
+    let rating: Option<f64> = sqlx::query_scalar("SELECT rating FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    assert_eq!(rating, Some(8.6));
+    let rating_source: Option<String> =
+        sqlx::query_scalar("SELECT rating_source FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(rating_source.as_deref(), Some("TMDB"));
+    let detail = client
+        .get(format!("{base_url}/api/v1/items/{item_id}"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail_body: Value = detail.json().await?;
+    assert_eq!(detail_body["rating"], 8.6);
+    assert_eq!(detail_body["ratingSource"], "TMDB");
     let candidate_status: String =
         sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
             .bind(&candidate_id)
@@ -337,6 +369,7 @@ async fn failed_selection_stays_pending_and_can_be_retried()
             .fetch_one(fixture.database.pool())
             .await?;
     assert_eq!(candidate_status, "PENDING");
+    assert!(!fixture.movie_dir.join("movie.nfo").exists());
 
     sqlx::query("UPDATE metadata_candidates SET candidate_json = ? WHERE id = ?")
         .bind(
@@ -375,6 +408,262 @@ async fn failed_selection_stays_pending_and_can_be_retried()
     Ok(())
 }
 
+#[tokio::test]
+async fn series_and_season_selection_writes_to_their_media_directories()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_series_fixture().await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let series_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.series_id,
+        json!({
+            "title": "Online Series",
+            "overview": "Online Series Overview",
+            "premiereDate": "2020-01-01",
+            "endDate": "2020-02-01",
+            "status": "Ended",
+            "originalLanguage": "en",
+            "posterUrl": format!("{image_url}/poster")
+        }),
+    )
+    .await?;
+    let season_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.season_id,
+        json!({
+            "title": "Online Season",
+            "overview": "Online Season Overview",
+            "posterUrl": format!("{image_url}/poster")
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+    );
+
+    selection
+        .select(
+            &fixture.series_id,
+            &series_candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("series selection failed: {error:?}"))?;
+    selection
+        .select(
+            &fixture.season_id,
+            &season_candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("season selection failed: {error:?}"))?;
+    let lifecycle: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT premiere_date, last_air_date, status, original_language
+             FROM media_items WHERE id = ?",
+    )
+    .bind(&fixture.series_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(lifecycle.0.as_deref(), Some("2020-01-01"));
+    assert_eq!(lifecycle.1.as_deref(), Some("2020-02-01"));
+    assert_eq!(lifecycle.2.as_deref(), Some("Ended"));
+    assert_eq!(lifecycle.3.as_deref(), Some("en"));
+    assert!(
+        tokio::fs::read_to_string(fixture.series_dir.join("tvshow.nfo"))
+            .await?
+            .contains("<plot>Online Series Overview</plot>")
+    );
+    assert!(fixture.series_dir.join("poster.png").exists());
+    assert!(!fixture.root.join("Drama").join("tvshow.nfo").exists());
+    assert!(
+        tokio::fs::read_to_string(fixture.season_dir.join("season01.nfo"))
+            .await?
+            .contains("<plot>Online Season Overview</plot>")
+    );
+    assert!(fixture.season_dir.join("poster.png").exists());
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_series_fixture().await?;
+    let tmdb_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = match request.uri().path() {
+            "/3/search/tv" => json!({
+                "page": 1,
+                "total_pages": 1,
+                "total_results": 1,
+                "results": [{
+                    "id": 8,
+                    "name": "Example Show",
+                    "original_name": "Example Show",
+                    "overview": "Series overview",
+                    "first_air_date": "2020-01-01",
+                    "original_language": "en",
+                    "vote_average": 8.0
+                }]
+            }),
+            "/3/tv/8" => json!({
+                "id": 8,
+                "name": "Example Show",
+                "original_name": "Example Show Original",
+                "overview": "Series overview",
+                "first_air_date": "2020-01-01",
+                "last_air_date": "2020-02-01",
+                "status": "Ended",
+                "original_language": "en",
+                "vote_average": 8.0
+            }),
+            "/3/tv/8/credits" => json!({
+                "cast": [{
+                    "id": 10,
+                    "name": "剧集演员",
+                    "character": "剧集角色",
+                    "profile_path": null,
+                    "order": 0
+                }]
+            }),
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        Json(body).into_response()
+    }));
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let candidates = MetadataCandidateService::new(fixture.database.clone());
+
+    let page = candidates
+        .search_and_store(
+            &fixture.series_id,
+            "Example Show",
+            Some(2020),
+            &TmdbProvider::from(tmdb),
+        )
+        .await?;
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].candidate["actors"][0]["name"], "剧集演员");
+    assert_eq!(
+        page.items[0].candidate["actors"][0]["character"],
+        "剧集角色"
+    );
+    assert_eq!(page.items[0].candidate["premiereDate"], "2020-01-01");
+    assert_eq!(page.items[0].candidate["endDate"], "2020-02-01");
+    assert_eq!(page.items[0].candidate["status"], "Ended");
+    assert_eq!(page.items[0].candidate["originalLanguage"], "en");
+
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_scan_automatically_matches_and_writes_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    sqlx::query("UPDATE libraries SET scraper_id = 'tmdb' WHERE id = ?")
+        .bind(&library_id)
+        .execute(fixture.database.pool())
+        .await?;
+
+    let tmdb_app = Router::new().fallback(any(|| async {
+        Json(json!({
+            "page": 1,
+            "total_pages": 1,
+            "total_results": 1,
+            "results": [{
+                "id": 999,
+                "title": "Example Movie",
+                "original_title": "Example Movie",
+                "overview": "Automatically matched overview.",
+                "release_date": "2020-04-01",
+                "original_language": "en"
+            }]
+        }))
+    }));
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+    );
+    let metadata = MetadataReidentifyService::with_selection(
+        fixture.database.clone(),
+        TmdbProvider::from(tmdb),
+        Some(selection),
+    );
+    let scan_jobs = luxd::application::scanner::ScanJobService::new(fixture.database.clone());
+    let scan_job = scan_jobs.create_movie_scan_job(library_id.parse()?).await?;
+    scan_jobs
+        .run_to_completion_with_metadata(&scan_job.id, 100, None, Some(metadata))
+        .await?;
+
+    for _ in 0..80 {
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM metadata_reidentify_jobs ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(fixture.database.pool())
+        .await?;
+        if status == "COMPLETED" || status == "FAILED" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let status: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&fixture.item_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(status, "ONLINE_CONFIRMED");
+    let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<plot>Automatically matched overview.</plot>"));
+    let mode: String = sqlx::query_scalar(
+        "SELECT mode FROM metadata_reidentify_jobs ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(mode, MetadataRefreshMode::FillMissing.as_str());
+
+    tmdb_server.abort();
+    Ok(())
+}
+
 struct Fixture {
     _temp_dir: TempDir,
     config: Config,
@@ -382,6 +671,16 @@ struct Fixture {
     setup: SetupService,
     item_id: String,
     movie_dir: std::path::PathBuf,
+}
+
+struct SeriesFixture {
+    _temp_dir: TempDir,
+    database: Database,
+    root: std::path::PathBuf,
+    series_dir: std::path::PathBuf,
+    season_dir: std::path::PathBuf,
+    series_id: String,
+    season_id: String,
 }
 
 async fn prepare_fixture(with_local_nfo: bool) -> Result<Fixture, Box<dyn std::error::Error>> {
@@ -429,6 +728,47 @@ async fn prepare_fixture(with_local_nfo: bool) -> Result<Fixture, Box<dyn std::e
         setup,
         item_id,
         movie_dir,
+    })
+}
+
+async fn prepare_series_fixture() -> Result<SeriesFixture, Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let root = temp_dir.path().join("Shows");
+    let series_dir = root.join("Drama").join("Example Show (2020)");
+    let season_dir = series_dir.join("Season 01");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    tokio::fs::write(season_dir.join("Example.Show.S01E01.mkv"), b"fixture").await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let series_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SERIES' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let season_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SEASON' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    Ok(SeriesFixture {
+        _temp_dir: temp_dir,
+        database,
+        root,
+        series_dir,
+        season_dir,
+        series_id,
+        season_id,
     })
 }
 

@@ -46,12 +46,34 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
+  const [apiKeyDirty, setApiKeyDirty] = useState(false);
+  const [preferredLanguage, setPreferredLanguage] = useState("zh-CN");
+  const [languageFallbackEnabled, setLanguageFallbackEnabled] = useState(false);
+  const [fallbackLanguages, setFallbackLanguages] = useState<string[]>(["zh-SG", "zh-HK", "zh-TW"]);
+  const [alternateApiEnabled, setAlternateApiEnabled] = useState(false);
+  const [apiBaseUrlChoice, setApiBaseUrlChoice] = useState("official");
+  const [customApiBaseUrl, setCustomApiBaseUrl] = useState("");
   const closeRef = useRef<HTMLButtonElement>(null);
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
-  const canConfigure = plugin.installed && plugin.configurable && configField !== undefined;
+  const preferredLanguageField = plugin.configFields.find((field) => field.key === "preferredLanguage");
+  const fallbackEnabledField = plugin.configFields.find((field) => field.key === "languageFallbackEnabled");
+  const fallbackLanguagesField = plugin.configFields.find((field) => field.key === "fallbackLanguages");
+  const alternateApiField = plugin.configFields.find((field) => field.key === "alternateApiEnabled");
+  const apiBaseUrlField = plugin.configFields.find((field) => field.key === "apiBaseUrl");
+  const customApiBaseUrlOption = apiBaseUrlField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
+  const canConfigure = plugin.installed && plugin.configurable && plugin.configFields.length > 0;
   const closeDialog = useCallback(() => setOpen(false), []);
   const save = useMutation({
-    mutationFn: () => api.updateAdminPluginConfig(plugin.id, apiKey),
+    mutationFn: () => api.updateAdminPluginConfig(plugin.id, {
+      ...(apiKeyDirty ? { apiKey } : {}),
+      preferredLanguage,
+      languageFallbackEnabled,
+      fallbackLanguages,
+      alternateApiEnabled,
+      apiBaseUrl: apiBaseUrlChoice === customApiBaseUrlOption
+        ? customApiBaseUrl.trim()
+        : apiBaseUrlField?.options?.find((option) => option.value === apiBaseUrlChoice)?.label ?? customApiBaseUrl.trim(),
+    }),
     onSuccess: () => {
       setApiKey("");
       closeDialog();
@@ -74,6 +96,31 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
     return () => document.removeEventListener("keydown", closeOnEscape);
   }, [closeDialog, open]);
 
+  useEffect(() => {
+    if (!open) return;
+    const values = plugin.configValues ?? {};
+    const preferred = typeof values.preferredLanguage === "string"
+      ? values.preferredLanguage
+      : preferredLanguageField?.options?.[0]?.value ?? "zh-CN";
+    const fallback = Array.isArray(values.fallbackLanguages)
+      ? values.fallbackLanguages.filter((value): value is string => typeof value === "string")
+      : ["zh-SG", "zh-HK", "zh-TW"];
+    const configuredApiBaseUrl = typeof values.apiBaseUrl === "string"
+      ? values.apiBaseUrl
+      : apiBaseUrlField?.options?.[0]?.label ?? "https://api.themoviedb.org";
+    const selectedApiOption = apiBaseUrlField?.options?.find(
+      (option) => option.value !== customApiBaseUrlOption && option.label === configuredApiBaseUrl,
+    );
+    setPreferredLanguage(preferred);
+    setLanguageFallbackEnabled(values.languageFallbackEnabled === true);
+    setFallbackLanguages(fallback);
+    setAlternateApiEnabled(values.alternateApiEnabled === true);
+    setApiBaseUrlChoice(selectedApiOption?.value ?? customApiBaseUrlOption);
+    setCustomApiBaseUrl(selectedApiOption ? "" : configuredApiBaseUrl);
+    setApiKey("");
+    setApiKeyDirty(false);
+  }, [apiBaseUrlField?.options, customApiBaseUrlOption, open, plugin.configValues, preferredLanguageField?.options]);
+
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
       <div className="lux-admin-plugin-icon" aria-hidden="true"><PackageOpen size={22} /></div>
@@ -95,7 +142,7 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
         )}
         {canConfigure ? <button className="lux-admin-plugin-config-button" type="button" aria-label={`配置 ${plugin.name}`} onClick={() => setOpen(true)}><Settings2 size={15} /> 配置</button> : null}
       </div>
-      {open && canConfigure && configField ? (
+      {open && canConfigure ? (
         <div className="lux-admin-plugin-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog(); }}>
           <section className="lux-admin-plugin-dialog" role="dialog" aria-modal="true" aria-labelledby={`plugin-config-title-${plugin.id}`}>
             <div className="lux-admin-plugin-dialog-heading">
@@ -103,8 +150,14 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
               <button ref={closeRef} className="lux-icon-button lux-admin-plugin-dialog-close" type="button" aria-label={`关闭 ${plugin.name}配置`} onClick={closeDialog}><X size={17} /></button>
             </div>
             <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
-              <label htmlFor={`plugin-config-${plugin.id}`}>{configField.label}<input id={`plugin-config-${plugin.id}`} type={configField.type} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="留空可恢复内置 Key" autoComplete="new-password" /></label>
-              <p>{configField.description} 当前：{availabilityLabel(plugin.configSource)}。</p>
+              {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空可恢复内置 Key" autoComplete="new-password" /></label> : null}
+              {preferredLanguageField ? <label htmlFor={"plugin-config-" + plugin.id + "-preferred-language"}>{preferredLanguageField.label}<select id={"plugin-config-" + plugin.id + "-preferred-language"} value={preferredLanguage} onChange={(event) => setPreferredLanguage(event.target.value)}>{(preferredLanguageField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label> : null}
+              {fallbackEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={languageFallbackEnabled} onChange={(event) => setLanguageFallbackEnabled(event.target.checked)} /> <span><strong>{fallbackEnabledField.label}</strong><small>{fallbackEnabledField.description}</small></span></label> : null}
+              {fallbackLanguagesField ? <label htmlFor={"plugin-config-" + plugin.id + "-fallback-languages"}>{fallbackLanguagesField.label}<select id={"plugin-config-" + plugin.id + "-fallback-languages"} multiple value={fallbackLanguages} onChange={(event) => setFallbackLanguages(Array.from(event.target.selectedOptions, (option) => option.value))}>{(fallbackLanguagesField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{fallbackLanguagesField.description}</small></label> : null}
+              {alternateApiField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={alternateApiEnabled} onChange={(event) => setAlternateApiEnabled(event.target.checked)} /> <span><strong>{alternateApiField.label}</strong><small>{alternateApiField.description}</small></span></label> : null}
+              {apiBaseUrlField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlField.label}<select id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} disabled={!alternateApiEnabled} onChange={(event) => setApiBaseUrlChoice(event.target.value)}>{(apiBaseUrlField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{apiBaseUrlField.description}</small></label> : null}
+              {apiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>自定义 API 地址<input id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>只填写 TMDb API 的基础地址，不要附带查询参数。</small></label> : null}
+              <p>{configField?.description ?? "插件配置"} 当前：{availabilityLabel(plugin.configSource)}。</p>
               <div className="lux-admin-plugin-dialog-actions">
                 <button className="lux-button lux-button-secondary" type="button" onClick={closeDialog}>取消</button>
                 <button className="lux-button lux-button-primary" type="submit" disabled={save.isPending}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</button>

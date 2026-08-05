@@ -50,6 +50,7 @@ describe("MediaIdentifier", () => {
     });
     await act(async () => await Promise.resolve());
 
+    expect(container.textContent).toContain("匹配元数据");
     expect(container.querySelector<HTMLInputElement>("#identify-query")?.value).toBe("示例电影");
     await act(async () => container.querySelector<HTMLButtonElement>("[data-action=identify-search]")?.click());
     expect(search).toHaveBeenCalledWith("item-1", "示例电影", 2020);

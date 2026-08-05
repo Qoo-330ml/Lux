@@ -58,8 +58,10 @@ describe("HomePage shelves", () => {
 
     expect(container.querySelector('[aria-label="我的媒体库"] .lux-library-card')?.textContent)
       .toContain("华语电影");
+    expect(container.querySelector('[aria-label="我的媒体库"] .lux-horizontal-scroll-viewport')).not.toBeNull();
     expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
       .toContain("最新华语片");
+    expect(container.querySelector('[aria-label="最新华语电影"] .lux-horizontal-scroll-viewport')).not.toBeNull();
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
 

@@ -155,16 +155,44 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
         }))
         .into_response();
     }
+    if request.uri().path().contains("/3/tv/8/credits") {
+        return axum::Json(json!({
+            "cast": [{
+                "id": 10,
+                "name": "Stub Series Person",
+                "character": "剧中角色",
+                "profile_path": "/series-profile.jpg",
+                "order": 0
+            }]
+        }))
+        .into_response();
+    }
     if request.uri().path().contains("/3/search/tv") {
+        let language = request
+            .uri()
+            .query()
+            .and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("language="))
+            })
+            .unwrap_or("en-US");
+        let (name, overview) = if state.localized && language == "zh-CN" {
+            ("中文剧名", "")
+        } else if state.localized {
+            ("English series", "English series overview")
+        } else {
+            ("Stub Series", "Series overview")
+        };
         return axum::Json(json!({
             "page": 1,
             "total_pages": 1,
             "total_results": 1,
             "results": [{
                 "id": 8,
-                "name": "Stub Series",
+                "name": name,
                 "original_name": "Original Series",
-                "overview": "Series overview",
+                "overview": overview,
                 "first_air_date": "2021-01-02",
                 "original_language": "en",
                 "poster_path": "/series-poster.jpg",
@@ -399,6 +427,23 @@ fn tmdb_client_requires_a_token_and_valid_http_base_url() {
 }
 
 #[tokio::test]
+async fn tmdb_client_can_use_an_explicit_base_url() -> Result<(), Box<dyn std::error::Error>> {
+    let (base_url, state, server) = start_stub(vec![StatusCode::OK], None, false, false).await;
+    let client = TmdbClient::from_env_or_config_with_base_url(
+        None,
+        Some("stub-token".to_owned()),
+        Some(base_url),
+    )?;
+
+    let response = client.search_movies("stub", Some(2020), "en-US").await?;
+
+    assert_eq!(response.results[0].id, 7);
+    assert_eq!(state.attempts.load(Ordering::Relaxed), 1);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn tmdb_client_sends_v3_api_key_as_a_query_parameter()
 -> Result<(), Box<dyn std::error::Error>> {
     let (base_url, state, server) = start_stub(vec![StatusCode::OK], None, false, false).await;
@@ -517,6 +562,27 @@ async fn tmdb_client_falls_back_from_zh_cn_per_missing_field()
 }
 
 #[tokio::test]
+async fn tmdb_client_falls_back_for_tv_per_missing_field() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (base_url, state, server) =
+        start_stub(vec![StatusCode::OK, StatusCode::OK], None, false, true).await;
+    let client = TmdbClient::new(client_config(base_url, Duration::from_secs(1), 0))?;
+
+    let response = client
+        .search_tv_with_english_fallback("stub", Some(2021))
+        .await?;
+
+    assert_eq!(response.results[0].name.as_deref(), Some("中文剧名"));
+    assert_eq!(
+        response.results[0].overview.as_deref(),
+        Some("English series overview")
+    );
+    assert_eq!(state.attempts.load(Ordering::Relaxed), 2);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn tmdb_client_reads_collection_details() -> Result<(), Box<dyn std::error::Error>> {
     let (base_url, _, server) =
         start_stub(vec![StatusCode::OK, StatusCode::OK], None, false, false).await;
@@ -561,6 +627,12 @@ async fn tmdb_client_reads_tv_people_images_external_ids_and_videos()
     let credits = client.movie_credits(7, "zh-CN").await?;
     assert_eq!(credits.cast[0].id, 9);
     assert_eq!(credits.cast[0].character.as_deref(), Some("主角"));
+    let series_credits = client.tv_credits(8, "zh-CN").await?;
+    assert_eq!(series_credits.cast[0].id, 10);
+    assert_eq!(
+        series_credits.cast[0].character.as_deref(),
+        Some("剧中角色")
+    );
     let videos = client.movie_videos(7, "zh-CN").await?;
     assert_eq!(videos.results[0].key.as_deref(), Some("abc123"));
 
@@ -569,7 +641,8 @@ async fn tmdb_client_reads_tv_people_images_external_ids_and_videos()
 }
 
 #[tokio::test]
-async fn tmdb_client_caps_upstream_concurrency_at_sixteen() -> Result<(), Box<dyn std::error::Error>> {
+async fn tmdb_client_caps_upstream_concurrency_at_sixteen() -> Result<(), Box<dyn std::error::Error>>
+{
     let (base_url, state, server) = start_stub(
         vec![StatusCode::OK; 40],
         Some(Duration::from_millis(80)),

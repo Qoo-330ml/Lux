@@ -7,13 +7,14 @@ use std::{
 };
 
 use luxd::application::{
+    media_matching::{MediaKind, parse_media_name, title_candidates},
     plugin_protocol::{PluginRequest, PluginResponse, PluginRpcError},
-    settings::{read_tmdb_api_key, read_tmdb_token},
+    settings::{TmdbSettings, read_tmdb_api_key, read_tmdb_settings, read_tmdb_token},
     tmdb::{
         TmdbClient, TmdbCollectionDetails, TmdbCollectionSearchResponse, TmdbEpisodeDetails,
         TmdbExternalIds, TmdbImagesResponse, TmdbMovieDetails, TmdbMovieSearchResponse,
         TmdbPersonDetails, TmdbPersonSearchResponse, TmdbSeasonDetails, TmdbSeriesDetails,
-        TmdbTvSearchResponse, TmdbVideosResponse,
+        TmdbTvSearchResponse, TmdbVideosResponse, fill_if_empty,
     },
 };
 use serde::Deserialize;
@@ -21,6 +22,7 @@ use serde_json::{Value, json};
 use tokio::sync::OnceCell;
 
 static CLIENT: OnceCell<Result<TmdbClient, String>> = OnceCell::const_new();
+static SETTINGS: OnceCell<TmdbSettings> = OnceCell::const_new();
 static RESPONSE_CACHE: OnceCell<tokio::sync::Mutex<HashMap<String, CachedResponse>>> =
     OnceCell::const_new();
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -42,15 +44,24 @@ struct MetadataRequest {
     #[serde(default)]
     year: Option<i32>,
     #[serde(default)]
-    language: Option<String>,
-    #[serde(default)]
     tmdb_id: Option<i64>,
+    #[serde(default)]
+    provider_id: Option<String>,
     #[serde(default)]
     collection_id: Option<i64>,
     #[serde(default)]
     season_number: Option<i32>,
     #[serde(default)]
     episode_number: Option<i32>,
+}
+
+impl MetadataRequest {
+    fn provider_id(&self) -> Option<i64> {
+        self.provider_id
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .or(self.tmdb_id)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,12 +123,13 @@ async fn handle_method(method: &str, params: Value) -> Result<Value, PluginRpcEr
             "apiVersion": 1,
             "capabilities": [
                 "metadata.search",
-                "metadata.details",
+                "metadata.get",
                 "metadata.images",
+                "metadata.credits",
                 "metadata.externalIds",
                 "metadata.trailers"
             ],
-            "supportedItemTypes": ["Movie", "BoxSet"]
+            "supportedItemTypes": ["Movie", "Series", "Season", "Episode", "BoxSet"]
         })),
         "plugin.health" => {
             let _ = client().await?;
@@ -125,6 +137,7 @@ async fn handle_method(method: &str, params: Value) -> Result<Value, PluginRpcEr
         }
         "metadata.search"
         | "metadata.get"
+        | "metadata.credits"
         | "metadata.externalIds"
         | "metadata.images"
         | "metadata.trailers" => cached_metadata_call(method, params).await,
@@ -179,6 +192,7 @@ async fn cached_metadata_call(method: &str, params: Value) -> Result<Value, Plug
     let value = match method {
         "metadata.search" => search(params).await?,
         "metadata.get" => metadata(params).await?,
+        "metadata.credits" => credits(params).await?,
         "metadata.externalIds" => external_ids(params).await?,
         "metadata.images" => images(params).await?,
         "metadata.trailers" => trailers(params).await?,
@@ -211,21 +225,20 @@ async fn cached_metadata_call(method: &str, params: Value) -> Result<Value, Plug
 
 async fn search(params: Value) -> Result<Value, PluginRpcError> {
     let request = parse_request(params)?;
+    let language = configured_language().await;
     match request.item_type.as_deref().unwrap_or("Movie") {
         "Movie" => {
-            let query = request.name.as_deref().unwrap_or_default();
-            let response = client()
-                .await?
-                .search_movies_with_english_fallback(query, request.year)
+            let (query, year) =
+                parsed_search_input(request.name.as_deref(), MediaKind::Movie, request.year)?;
+            let response = search_movies(&query, year, &language)
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"items": movie_search_results(response)}))
         }
         "Series" | "TvSeries" => {
-            let query = request.name.as_deref().unwrap_or_default();
-            let response = client()
-                .await?
-                .search_tv(query, request.year, language(&request))
+            let (query, year) =
+                parsed_search_input(request.name.as_deref(), MediaKind::Series, request.year)?;
+            let response = search_tv(&query, year, &language)
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"items": tv_search_results(response)}))
@@ -234,7 +247,7 @@ async fn search(params: Value) -> Result<Value, PluginRpcError> {
             let query = request.name.as_deref().unwrap_or_default();
             let response = client()
                 .await?
-                .search_people(query, language(&request))
+                .search_people(query, &language)
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"items": person_search_results(response)}))
@@ -243,7 +256,7 @@ async fn search(params: Value) -> Result<Value, PluginRpcError> {
             let query = request.name.as_deref().unwrap_or_default();
             let response = client()
                 .await?
-                .search_collections(query, language(&request))
+                .search_collections(query, &language)
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"items": collection_search_results(response)}))
@@ -255,70 +268,248 @@ async fn search(params: Value) -> Result<Value, PluginRpcError> {
     }
 }
 
+fn parsed_search_input(
+    name: Option<&str>,
+    kind: MediaKind,
+    year: Option<i32>,
+) -> Result<(String, Option<i32>), PluginRpcError> {
+    let name = name.unwrap_or_default();
+    let parsed = parse_media_name(name, kind);
+    let query = parsed
+        .as_ref()
+        .map(|value| value.title.clone())
+        .unwrap_or_else(|| name.trim().to_owned());
+    if query.is_empty() || query.chars().count() > 128 {
+        return Err(invalid("metadata search name is invalid"));
+    }
+    let year = year.or_else(|| parsed.and_then(|value| value.production_year));
+    if year.is_some_and(|value| !(1800..=2200).contains(&value)) {
+        return Err(invalid("metadata search year is invalid"));
+    }
+    Ok((query, year))
+}
+
+async fn search_movies(
+    query: &str,
+    year: Option<i32>,
+    language: &str,
+) -> Result<TmdbMovieSearchResponse, luxd::application::tmdb::TmdbError> {
+    let client = client()
+        .await
+        .map_err(|error| luxd::application::tmdb::TmdbError::Transport(error.message))?;
+    for search_year in search_years(year) {
+        for candidate in title_candidates(query) {
+            let response = client
+                .search_movies(&candidate, search_year, language)
+                .await?;
+            if !response.results.is_empty() {
+                return Ok(response);
+            }
+        }
+    }
+    Err(luxd::application::tmdb::TmdbError::NotFound)
+}
+
+async fn search_tv(
+    query: &str,
+    year: Option<i32>,
+    language: &str,
+) -> Result<TmdbTvSearchResponse, luxd::application::tmdb::TmdbError> {
+    let client = client()
+        .await
+        .map_err(|error| luxd::application::tmdb::TmdbError::Transport(error.message))?;
+    for search_year in search_years(year) {
+        for candidate in title_candidates(query) {
+            let response = client.search_tv(&candidate, search_year, language).await?;
+            if !response.results.is_empty() {
+                return Ok(response);
+            }
+        }
+    }
+    Err(luxd::application::tmdb::TmdbError::NotFound)
+}
+
+fn search_years(year: Option<i32>) -> Vec<Option<i32>> {
+    match year {
+        Some(year) => vec![Some(year), None],
+        None => vec![None],
+    }
+}
+
+async fn configured_language() -> String {
+    settings().await.preferred_language.clone()
+}
+
+async fn metadata_languages() -> Vec<String> {
+    let settings = settings().await;
+    let mut languages = vec![settings.preferred_language.clone()];
+    if settings.language_fallback_enabled {
+        for language in &settings.fallback_languages {
+            if !languages.iter().any(|selected| selected == language) {
+                languages.push(language.clone());
+            }
+        }
+    }
+    languages
+}
+
+async fn localized_movie_details(
+    movie_id: i64,
+    languages: &[String],
+) -> Result<TmdbMovieDetails, luxd::application::tmdb::TmdbError> {
+    let client = client()
+        .await
+        .map_err(|error| luxd::application::tmdb::TmdbError::Transport(error.message))?;
+    let mut details = client.movie_details(movie_id, &languages[0]).await?;
+    for language in languages.iter().skip(1) {
+        let Ok(fallback) = client.movie_details(movie_id, language).await else {
+            continue;
+        };
+        fill_if_empty(&mut details.title, &fallback.title);
+        fill_if_empty(&mut details.original_title, &fallback.original_title);
+        fill_if_empty(&mut details.overview, &fallback.overview);
+        fill_if_empty(&mut details.release_date, &fallback.release_date);
+        fill_if_empty(&mut details.original_language, &fallback.original_language);
+        if details.belongs_to_collection.is_none() {
+            details.belongs_to_collection = fallback.belongs_to_collection;
+        }
+    }
+    Ok(details)
+}
+
+async fn localized_series_details(
+    series_id: i64,
+    languages: &[String],
+) -> Result<TmdbSeriesDetails, luxd::application::tmdb::TmdbError> {
+    let client = client()
+        .await
+        .map_err(|error| luxd::application::tmdb::TmdbError::Transport(error.message))?;
+    let mut details = client.series_details(series_id, &languages[0]).await?;
+    for language in languages.iter().skip(1) {
+        let Ok(fallback) = client.series_details(series_id, language).await else {
+            continue;
+        };
+        fill_if_empty(&mut details.name, &fallback.name);
+        fill_if_empty(&mut details.original_name, &fallback.original_name);
+        fill_if_empty(&mut details.overview, &fallback.overview);
+        fill_if_empty(&mut details.first_air_date, &fallback.first_air_date);
+        fill_if_empty(&mut details.last_air_date, &fallback.last_air_date);
+        fill_if_empty(&mut details.original_language, &fallback.original_language);
+        fill_if_empty(&mut details.poster_path, &fallback.poster_path);
+        fill_if_empty(&mut details.backdrop_path, &fallback.backdrop_path);
+    }
+    Ok(details)
+}
+
+async fn localized_season_details(
+    series_id: i64,
+    season_number: i32,
+    languages: &[String],
+) -> Result<TmdbSeasonDetails, luxd::application::tmdb::TmdbError> {
+    let client = client()
+        .await
+        .map_err(|error| luxd::application::tmdb::TmdbError::Transport(error.message))?;
+    let mut details = client
+        .season_details(series_id, season_number, &languages[0])
+        .await?;
+    for language in languages.iter().skip(1) {
+        let Ok(fallback) = client
+            .season_details(series_id, season_number, language)
+            .await
+        else {
+            continue;
+        };
+        fill_if_empty(&mut details.name, &fallback.name);
+        fill_if_empty(&mut details.overview, &fallback.overview);
+        fill_if_empty(&mut details.air_date, &fallback.air_date);
+        fill_if_empty(&mut details.poster_path, &fallback.poster_path);
+    }
+    Ok(details)
+}
+
+async fn localized_episode_details(
+    series_id: i64,
+    season_number: i32,
+    episode_number: i32,
+    languages: &[String],
+) -> Result<TmdbEpisodeDetails, luxd::application::tmdb::TmdbError> {
+    let client = client()
+        .await
+        .map_err(|error| luxd::application::tmdb::TmdbError::Transport(error.message))?;
+    let mut details = client
+        .episode_details(series_id, season_number, episode_number, &languages[0])
+        .await?;
+    for language in languages.iter().skip(1) {
+        let Ok(fallback) = client
+            .episode_details(series_id, season_number, episode_number, language)
+            .await
+        else {
+            continue;
+        };
+        fill_if_empty(&mut details.name, &fallback.name);
+        fill_if_empty(&mut details.overview, &fallback.overview);
+        fill_if_empty(&mut details.air_date, &fallback.air_date);
+    }
+    Ok(details)
+}
+
 async fn metadata(params: Value) -> Result<Value, PluginRpcError> {
     let request = parse_request(params)?;
-    let language = request.language.as_deref().unwrap_or("zh-CN");
+    let languages = metadata_languages().await;
     match request.item_type.as_deref().unwrap_or("Movie") {
         "Movie" => {
             let movie_id = request
-                .tmdb_id
-                .ok_or_else(|| invalid("tmdbId is required"))?;
-            let details = client()
-                .await?
-                .movie_details(movie_id, language)
+                .provider_id()
+                .ok_or_else(|| invalid("providerId is required"))?;
+            let details = localized_movie_details(movie_id, &languages)
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"metadata": movie_details(details)}))
         }
         "Series" | "TvSeries" => {
             let series_id = request
-                .tmdb_id
-                .ok_or_else(|| invalid("tmdbId is required"))?;
-            let details = client()
-                .await?
-                .series_details(series_id, language)
+                .provider_id()
+                .ok_or_else(|| invalid("providerId is required"))?;
+            let details = localized_series_details(series_id, &languages)
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"metadata": series_details(details)}))
         }
         "Season" => {
             let series_id = request
-                .tmdb_id
-                .ok_or_else(|| invalid("tmdbId is required"))?;
+                .provider_id()
+                .ok_or_else(|| invalid("providerId is required"))?;
             let season_number = request
                 .season_number
                 .ok_or_else(|| invalid("seasonNumber is required"))?;
-            let details = client()
-                .await?
-                .season_details(series_id, season_number, language)
+            let details = localized_season_details(series_id, season_number, &languages)
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"metadata": season_details(details)}))
         }
         "Episode" => {
             let series_id = request
-                .tmdb_id
-                .ok_or_else(|| invalid("tmdbId is required"))?;
+                .provider_id()
+                .ok_or_else(|| invalid("providerId is required"))?;
             let season_number = request
                 .season_number
                 .ok_or_else(|| invalid("seasonNumber is required"))?;
             let episode_number = request
                 .episode_number
                 .ok_or_else(|| invalid("episodeNumber is required"))?;
-            let details = client()
-                .await?
-                .episode_details(series_id, season_number, episode_number, language)
-                .await
-                .map_err(tmdb_error)?;
+            let details =
+                localized_episode_details(series_id, season_number, episode_number, &languages)
+                    .await
+                    .map_err(tmdb_error)?;
             Ok(json!({"metadata": episode_details(details)}))
         }
         "Person" => {
             let person_id = request
-                .tmdb_id
-                .ok_or_else(|| invalid("tmdbId is required"))?;
+                .provider_id()
+                .ok_or_else(|| invalid("providerId is required"))?;
             let details = client()
                 .await?
-                .person_details(person_id, language)
+                .person_details(person_id, &languages[0])
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"metadata": person_details(details)}))
@@ -326,11 +517,11 @@ async fn metadata(params: Value) -> Result<Value, PluginRpcError> {
         "BoxSet" | "Collection" => {
             let collection_id = request
                 .collection_id
-                .or(request.tmdb_id)
-                .ok_or_else(|| invalid("collectionId is required"))?;
+                .or(request.provider_id())
+                .ok_or_else(|| invalid("providerId is required"))?;
             let details = client()
                 .await?
-                .collection_details(collection_id, language)
+                .collection_details(collection_id, &languages[0])
                 .await
                 .map_err(tmdb_error)?;
             Ok(json!({"metadata": collection_details(details)}))
@@ -344,8 +535,8 @@ async fn metadata(params: Value) -> Result<Value, PluginRpcError> {
 
 async fn external_ids(params: Value) -> Result<Value, PluginRpcError> {
     let request = parse_request(params)?;
-    let id = request.tmdb_id.or(request.collection_id);
-    let id = id.ok_or_else(|| invalid("tmdbId or collectionId is required"))?;
+    let id = request.provider_id().or(request.collection_id);
+    let id = id.ok_or_else(|| invalid("providerId or collectionId is required"))?;
     let mut provider_ids = serde_json::Map::new();
     provider_ids.insert("Tmdb".to_owned(), Value::String(id.to_string()));
     let external = match request.item_type.as_deref().unwrap_or("Movie") {
@@ -384,24 +575,24 @@ async fn external_ids(params: Value) -> Result<Value, PluginRpcError> {
 async fn images(params: Value) -> Result<Value, PluginRpcError> {
     let request = parse_request(params)?;
     let id = request
-        .tmdb_id
+        .provider_id()
         .or(request.collection_id)
-        .ok_or_else(|| invalid("tmdbId or collectionId is required"))?;
-    let language = language(&request);
+        .ok_or_else(|| invalid("providerId or collectionId is required"))?;
+    let language = configured_language().await;
     let images = match request.item_type.as_deref().unwrap_or("Movie") {
         "Movie" => client()
             .await?
-            .movie_images(id, language)
+            .movie_images(id, &language)
             .await
             .map_err(tmdb_error)?,
         "Series" | "TvSeries" => client()
             .await?
-            .tv_images(id, language)
+            .tv_images(id, &language)
             .await
             .map_err(tmdb_error)?,
         "Person" => client()
             .await?
-            .person_images(id, language)
+            .person_images(id, &language)
             .await
             .map_err(tmdb_error)?,
         "Season" => {
@@ -410,7 +601,7 @@ async fn images(params: Value) -> Result<Value, PluginRpcError> {
                 .ok_or_else(|| invalid("seasonNumber is required"))?;
             client()
                 .await?
-                .season_images(id, season_number, language)
+                .season_images(id, season_number, &language)
                 .await
                 .map_err(tmdb_error)?
         }
@@ -423,7 +614,7 @@ async fn images(params: Value) -> Result<Value, PluginRpcError> {
                 .ok_or_else(|| invalid("episodeNumber is required"))?;
             client()
                 .await?
-                .episode_images(id, season_number, episode_number, language)
+                .episode_images(id, season_number, episode_number, &language)
                 .await
                 .map_err(tmdb_error)?
         }
@@ -431,7 +622,7 @@ async fn images(params: Value) -> Result<Value, PluginRpcError> {
             let collection_id = request.collection_id.unwrap_or(id);
             let collection = client()
                 .await?
-                .collection_details(collection_id, language)
+                .collection_details(collection_id, &language)
                 .await
                 .map_err(tmdb_error)?;
             return Ok(json!({"images": collection_image_results(collection)}));
@@ -449,18 +640,18 @@ async fn images(params: Value) -> Result<Value, PluginRpcError> {
 async fn trailers(params: Value) -> Result<Value, PluginRpcError> {
     let request = parse_request(params)?;
     let id = request
-        .tmdb_id
-        .ok_or_else(|| invalid("tmdbId is required"))?;
-    let language = language(&request);
+        .provider_id()
+        .ok_or_else(|| invalid("providerId is required"))?;
+    let language = configured_language().await;
     let videos = match request.item_type.as_deref().unwrap_or("Movie") {
         "Movie" => client()
             .await?
-            .movie_videos(id, language)
+            .movie_videos(id, &language)
             .await
             .map_err(tmdb_error)?,
         "Series" | "TvSeries" => client()
             .await?
-            .tv_videos(id, language)
+            .tv_videos(id, &language)
             .await
             .map_err(tmdb_error)?,
         item_type => {
@@ -480,12 +671,15 @@ fn parse_request(params: Value) -> Result<MetadataRequest, PluginRpcError> {
 async fn client() -> Result<&'static TmdbClient, PluginRpcError> {
     let value = CLIENT
         .get_or_init(|| async {
-            let config_dir = env::var_os("LUX_CONFIG_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("./config"));
-            TmdbClient::from_env_or_config(
+            let config_dir = config_dir();
+            let settings = settings().await;
+            let configured_base_url = settings
+                .alternate_api_enabled
+                .then(|| settings.api_base_url.clone());
+            TmdbClient::from_env_or_config_with_base_url(
                 read_tmdb_api_key(&config_dir),
                 read_tmdb_token(&config_dir),
+                configured_base_url,
             )
             .map_err(|error| error.to_string())
         })
@@ -494,6 +688,19 @@ async fn client() -> Result<&'static TmdbClient, PluginRpcError> {
         code: "PLUGIN_AUTH_FAILED".to_owned(),
         message: error.clone(),
     })
+}
+
+async fn settings() -> &'static TmdbSettings {
+    let config_dir = config_dir();
+    SETTINGS
+        .get_or_init(|| async move { read_tmdb_settings(&config_dir).await })
+        .await
+}
+
+fn config_dir() -> PathBuf {
+    env::var_os("LUX_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./config"))
 }
 
 fn movie_search_results(response: TmdbMovieSearchResponse) -> Vec<Value> {
@@ -507,6 +714,7 @@ fn movie_search_results(response: TmdbMovieSearchResponse) -> Vec<Value> {
                 "OriginalTitle": result.original_title,
                 "Overview": result.overview,
                 "ProductionYear": result.release_date.as_deref().and_then(parse_year),
+                "Rating": result.vote_average,
                 "ProviderIds": {"Tmdb": result.id.to_string()},
                 "SearchProviderName": "Tmdb"
             })
@@ -521,8 +729,13 @@ fn movie_details(details: TmdbMovieDetails) -> Value {
         "OriginalTitle": details.original_title,
         "Overview": details.overview,
         "ProductionYear": details.release_date.as_deref().and_then(parse_year),
+        "Rating": details.vote_average,
         "ProviderIds": {"Tmdb": details.id.to_string()},
-        "OriginalLanguage": details.original_language
+        "OriginalLanguage": details.original_language,
+        "BelongsToCollection": details.belongs_to_collection.map(|collection| json!({
+            "Id": collection.id,
+            "Name": collection.name
+        }))
     })
 }
 
@@ -537,8 +750,11 @@ fn tv_search_results(response: TmdbTvSearchResponse) -> Vec<Value> {
                 "OriginalTitle": result.original_name,
                 "Overview": result.overview,
                 "ProductionYear": result.first_air_date.as_deref().and_then(parse_year),
+                "Rating": result.vote_average,
                 "ProviderIds": {"Tmdb": result.id.to_string()},
-                "SearchProviderName": "Tmdb"
+                "SearchProviderName": "Tmdb",
+                "ImageUrl": result.poster_path.as_deref().map(image_url),
+                "BackdropImageUrl": result.backdrop_path.as_deref().map(image_url)
             })
         })
         .collect()
@@ -582,8 +798,10 @@ fn series_details(details: TmdbSeriesDetails) -> Value {
         "OriginalTitle": details.original_name,
         "Overview": details.overview,
         "ProductionYear": details.first_air_date.as_deref().and_then(parse_year),
+        "Rating": details.vote_average,
         "PremiereDate": details.first_air_date,
         "EndDate": details.last_air_date,
+        "Status": details.status,
         "OriginalLanguage": details.original_language,
         "ChildCount": details.number_of_episodes,
         "ProviderIds": {"Tmdb": details.id.to_string()}
@@ -632,13 +850,52 @@ fn collection_details(details: TmdbCollectionDetails) -> Value {
         "Name": details.name,
         "Overview": details.overview,
         "ProviderIds": {"Tmdb": details.id.to_string()},
+        "ImageUrl": details.poster_path.as_deref().map(image_url),
+        "BackdropImageUrl": details.backdrop_path.as_deref().map(image_url),
         "Items": details.parts.into_iter().map(|part| json!({
             "Type": "Movie",
             "Name": part.title,
             "ProductionYear": part.release_date.as_deref().and_then(parse_year),
-            "ProviderIds": {"Tmdb": part.id.to_string()}
+            "ProviderIds": {"Tmdb": part.id.to_string()},
+            "ImageUrl": part.poster_path.as_deref().map(image_url)
         })).collect::<Vec<_>>()
     })
+}
+
+async fn credits(params: Value) -> Result<Value, PluginRpcError> {
+    let request = parse_request(params)?;
+    let item_type = request.item_type.as_deref().unwrap_or("Movie");
+    if !matches!(item_type, "Movie" | "Series") {
+        return Err(PluginRpcError {
+            code: "PLUGIN_PROVIDER_NOT_FOUND".to_owned(),
+            message: "credits are only available for movies and series".to_owned(),
+        });
+    }
+    let id = request
+        .provider_id()
+        .ok_or_else(|| invalid("providerId is required"))?;
+    let language = configured_language().await;
+    let client = client().await?;
+    let response = match item_type {
+        "Movie" => client.movie_credits(id, &language).await,
+        "Series" => client.tv_credits(id, &language).await,
+        _ => {
+            return Err(PluginRpcError {
+                code: "PLUGIN_PROVIDER_NOT_FOUND".to_owned(),
+                message: "credits are only available for movies and series".to_owned(),
+            });
+        }
+    }
+    .map_err(tmdb_error)?;
+    Ok(json!({
+        "cast": response.cast.into_iter().map(|actor| json!({
+            "Id": actor.id.to_string(),
+            "Name": actor.name,
+            "Character": actor.character,
+            "Order": actor.order,
+            "ProfileUrl": actor.profile_path.as_deref().map(image_url)
+        })).collect::<Vec<_>>()
+    }))
 }
 
 fn image_results(response: TmdbImagesResponse) -> Vec<Value> {
@@ -686,6 +943,19 @@ fn image_results(response: TmdbImagesResponse) -> Vec<Value> {
         image.file_path.map(|path| {
             json!({
                 "Type": "Primary",
+                "Url": image_url(&path),
+                "ThumbnailUrl": image_url(&path),
+                "Language": image.iso_639_1,
+                "Width": image.width,
+                "Height": image.height,
+                "ProviderName": "Tmdb"
+            })
+        })
+    }));
+    images.extend(response.logos.into_iter().filter_map(|image| {
+        image.file_path.map(|path| {
+            json!({
+                "Type": "Logo",
                 "Url": image_url(&path),
                 "ThumbnailUrl": image_url(&path),
                 "Language": image.iso_639_1,
@@ -754,10 +1024,6 @@ fn add_external_ids(provider_ids: &mut serde_json::Map<String, Value>, ids: Tmdb
     if let Some(value) = ids.wikidata_id {
         provider_ids.insert("Wikidata".to_owned(), Value::String(value));
     }
-}
-
-fn language(request: &MetadataRequest) -> &str {
-    request.language.as_deref().unwrap_or("zh-CN")
 }
 
 fn runtime_ticks(minutes: i32) -> i64 {

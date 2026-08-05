@@ -50,6 +50,27 @@ const configuredScraper: AdminPlugin = {
   configSource: "BUILT_IN",
 };
 
+const mediaProbePlugin: AdminPlugin = {
+  id: "org.lux.media-info",
+  name: "strm媒体信息提取",
+  description: "使用 ffprobe 提取 STRM 外部媒体的技术信息。",
+  category: "MEDIA",
+  version: "1.0.0",
+  runtime: "process",
+  capabilities: ["media.probe"],
+  status: "READY",
+  running: false,
+  lastError: null,
+  installed: true,
+  enabled: true,
+  configured: true,
+  available: true,
+  unavailableReason: null,
+  configurable: false,
+  configFields: [],
+  configSource: "NONE",
+};
+
 describe("AdminLibrariesPage library cards", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -134,6 +155,30 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector('[role="menu"]')?.textContent).toContain("扫描媒体库文件");
   });
 
+  it("starts metadata refresh from the library actions menu", async () => {
+    const refresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
+      totalCount: 1,
+      mode: "FILL_MISSING",
+      job: { id: "job-1", status: "QUEUED", mode: "FILL_MISSING", totalCount: 1, processedCount: 0, createdAt: 0 },
+    });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    const refreshAction = [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .find((button) => button.textContent?.includes("刷新元数据"));
+    expect(refreshAction).toBeTruthy();
+    expect(refreshAction?.disabled).toBe(false);
+
+    await act(async () => {
+      refreshAction?.click();
+      await Promise.resolve();
+    });
+
+    expect(refresh).toHaveBeenCalledWith("library-1", "FILL_MISSING");
+  });
+
   it("opens the edit dialog from the library actions menu", async () => {
     await renderPage();
 
@@ -170,6 +215,26 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(document.body.textContent).toContain("TMDb 元数据插件");
     expect(document.body.textContent).not.toContain("仅使用本地元数据");
+  });
+
+  it("does not list media probe plugins as library scrapers", async () => {
+    vi.mocked(api.adminPlugins).mockResolvedValue({ plugins: [configuredScraper, mediaProbePlugin] });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+    const scraperTrigger = container.querySelector<HTMLButtonElement>("[aria-label='刮削器']");
+    expect(scraperTrigger).toBeTruthy();
+
+    await act(async () => scraperTrigger?.click());
+
+    expect(document.body.textContent).not.toContain("strm媒体信息提取");
   });
 
   it("shows global image and subtitle defaults in the strategy view", async () => {
@@ -213,9 +278,8 @@ describe("AdminLibrariesPage library cards", () => {
   it("starts a global refresh using the selected mode", async () => {
     const refresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
       totalCount: 1,
-      jobCount: 1,
       mode: "FULL_REFRESH",
-      jobs: [],
+      job: { id: "job-1", status: "QUEUED", mode: "FULL_REFRESH", totalCount: 1, processedCount: 0, createdAt: 0 },
     });
     await renderPage();
 

@@ -4,7 +4,8 @@ use std::{
 };
 
 use reqwest::{Client, Url, header::CONTENT_TYPE};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
@@ -19,7 +20,8 @@ const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActorCredit {
-    pub id: i64,
+    #[serde(deserialize_with = "deserialize_person_id")]
+    pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character: Option<String>,
@@ -32,7 +34,8 @@ pub struct ActorCredit {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredActor {
-    id: i64,
+    #[serde(deserialize_with = "deserialize_person_id")]
+    id: String,
     name: String,
     character: Option<String>,
     order: Option<i32>,
@@ -94,18 +97,18 @@ impl PeopleService {
 
         let mut stored = Vec::new();
         for actor in actors.iter().take(MAX_ACTORS) {
-            if actor.id <= 0 || actor.name.trim().is_empty() {
+            if !is_valid_person_id(&actor.id) || actor.name.trim().is_empty() {
                 continue;
             }
             let image_file = if let Some(url) = actor.profile_url.as_deref() {
                 match self
-                    .ensure_profile_image(actor.id, url, &profiles_dir)
+                    .ensure_profile_image(&actor.id, url, &profiles_dir)
                     .await
                 {
                     Ok(image_file) => image_file,
                     Err(error) => {
                         tracing::warn!(
-                            person_id = actor.id,
+                            person_id = %actor.id,
                             %error,
                             "actor profile image was not cached"
                         );
@@ -116,7 +119,7 @@ impl PeopleService {
                 None
             };
             stored.push(StoredActor {
-                id: actor.id,
+                id: actor.id.clone(),
                 name: actor.name.trim().to_owned(),
                 character: actor
                     .character
@@ -166,9 +169,9 @@ impl PeopleService {
         for actor in actors
             .into_iter()
             .take(MAX_ACTORS)
-            .filter(|actor| actor.id > 0 && !actor.name.trim().is_empty())
+            .filter(|actor| is_valid_person_id(&actor.id) && !actor.name.trim().is_empty())
         {
-            let id = actor.id.to_string();
+            let id = actor.id;
             let image_url =
                 if actor.image_file.is_some() && self.profile_image(&id).await?.is_some() {
                     Some(format!("/api/v1/people/{id}/image"))
@@ -186,11 +189,7 @@ impl PeopleService {
     }
 
     pub async fn profile_image(&self, person_id: &str) -> Result<Option<PersonImage>, PeopleError> {
-        let person_id = person_id
-            .parse::<i64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| PeopleError::InvalidComponent(person_id.to_owned()))?;
+        validate_component(person_id)?;
         let profiles_dir = self.people_dir().join(PROFILES_DIR);
         for extension in PROFILE_EXTENSIONS {
             let path = profiles_dir.join(format!("{person_id}.{extension}"));
@@ -221,7 +220,7 @@ impl PeopleService {
 
     async fn ensure_profile_image(
         &self,
-        person_id: i64,
+        person_id: &str,
         image_url: &str,
         profiles_dir: &Path,
     ) -> Result<Option<String>, PeopleError> {
@@ -238,15 +237,16 @@ impl PeopleService {
         let url =
             Url::parse(image_url).map_err(|source| PeopleError::InvalidUrl(source.to_string()))?;
         if url.scheme() != "https"
-            || url.host_str() != Some("image.tmdb.org")
-            || !url.path().starts_with("/t/p/")
+            || url.host_str().is_none_or(str::is_empty)
+            || url.path().is_empty()
+            || url.port().is_some()
             || url.query().is_some()
             || url.fragment().is_some()
             || !url.username().is_empty()
             || url.password().is_some()
         {
             return Err(PeopleError::InvalidUrl(
-                "actor profile URL must be an HTTPS TMDb image path".to_owned(),
+                "actor profile URL must be a valid HTTPS scraper image URL".to_owned(),
             ));
         }
         let response = self
@@ -304,6 +304,28 @@ fn validate_component(value: &str) -> Result<(), PeopleError> {
         return Err(PeopleError::InvalidComponent(value.to_owned()));
     }
     Ok(())
+}
+
+fn is_valid_person_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn deserialize_person_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(value) => Ok(value),
+        Value::Number(value) => Ok(value.to_string()),
+        _ => Err(serde::de::Error::custom(
+            "person ID must be a string or number",
+        )),
+    }
 }
 
 async fn safe_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, PeopleError> {

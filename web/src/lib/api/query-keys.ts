@@ -3,8 +3,13 @@ export const queryKeys = {
   me: ["me"] as const,
   home: ["home"] as const,
   libraries: ["libraries"] as const,
-  library: (libraryId: string, page: number, itemTypes?: string) =>
-    ["library", libraryId, page, itemTypes ?? "root"] as const,
+  library: (
+    libraryId: string,
+    page: number,
+    itemTypes?: string,
+    sortBy = "Name",
+    sortOrder = "Ascending",
+  ) => ["library", libraryId, page, itemTypes ?? "root", sortBy, sortOrder] as const,
   item: (itemId: string) => ["item", itemId] as const,
   itemImages: (itemId: string) => ["item-images", itemId] as const,
   children: (itemId: string, itemType?: string, seasonId?: string) =>
@@ -16,6 +21,8 @@ export const queryKeys = {
   adminInstalledPlugins: ["admin", "plugins", "installed"] as const,
   adminUsers: ["admin", "users"] as const,
   adminJobs: (status?: string) => ["admin", "jobs", status ?? "all"] as const,
+  adminScheduledTasks: (page = 1) => ["admin", "scheduled-tasks", page] as const,
+  adminMetadataJobs: (status?: string) => ["admin", "metadata-jobs", status ?? "all"] as const,
   adminLogs: ["admin", "logs"] as const,
   adminSettings: ["admin", "settings"] as const,
   adminPendingMetadata: ["admin", "metadata", "pending"] as const,

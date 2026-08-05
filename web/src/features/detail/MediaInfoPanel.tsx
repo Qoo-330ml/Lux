@@ -1,4 +1,5 @@
 import type { MediaSource, MediaStream } from "../../lib/api/types";
+import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { mediaTypeLabel, runtimeLabel } from "../home/media";
 
 const LANGUAGE_NAMES: Record<string, string> = {
@@ -62,11 +63,13 @@ export function MediaInfoPanel({
         {runtimeLabel(source.durationTicks) ? <span>{runtimeLabel(source.durationTicks)}</span> : null}
       </div>
       {streamGroups.length ? (
-        <div className="lux-media-stream-grid">
-          {streamGroups.flatMap(({ type, streams: groupStreams }) => groupStreams.map((stream) => (
-            <MediaStreamCard key={`${type}-${stream.index}`} stream={stream} />
-          )))}
-        </div>
+        <HorizontalScrollRail className="lux-media-stream-rail" ariaLabel="视频轨道">
+          <div className="lux-media-stream-grid">
+            {streamGroups.flatMap(({ type, streams: groupStreams }) => groupStreams.map((stream) => (
+              <MediaStreamCard key={`${type}-${stream.index}`} stream={stream} />
+            )))}
+          </div>
+        </HorizontalScrollRail>
       ) : null}
     </section>
   );

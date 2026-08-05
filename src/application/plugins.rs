@@ -1,12 +1,20 @@
-use std::{env, fmt, io, path::PathBuf};
+use std::{collections::HashSet, env, fmt, io, path::PathBuf};
 
 use serde_json::Value;
 
 use crate::{
     application::{
-        plugin_protocol::{PLUGIN_CATEGORY_SCRAPER, PluginConfigField},
+        plugin_protocol::{
+            MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult, MediaProbeRpcStreamType,
+            PLUGIN_CATEGORY_SCRAPER, PluginConfigField, PluginConfigOption,
+        },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
-        settings::{TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, write_tmdb_api_key},
+        probe::{MediaProbeResult, MediaStreamResult, StreamType},
+        settings::{
+            TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, TmdbSettings, read_tmdb_settings,
+            tmdb_api_base_url_options, tmdb_language_options, write_tmdb_api_key,
+            write_tmdb_settings,
+        },
         tmdb::EMBEDDED_TMDB_API_KEY,
     },
     storage::{Database, StorageError},
@@ -14,6 +22,7 @@ use crate::{
 
 pub const TMDB_PLUGIN_ID: &str = "tmdb";
 pub const TMDB_DYNAMIC_PLUGIN_ID: &str = "org.lux.tmdb";
+pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.media-info";
 const TMDB_PLUGIN_NAME: &str = "TMDb 元数据插件";
 const TMDB_PLUGIN_DESCRIPTION: &str = "使用 TMDb 补全电影和剧集元数据、海报与背景图。";
 const TMDB_PLUGIN_VERSION: &str = "1.0.0";
@@ -23,15 +32,91 @@ const CONFIG_SOURCE_ENVIRONMENT: &str = "ENVIRONMENT";
 const CONFIG_SOURCE_READ_ACCESS_TOKEN: &str = "READ_ACCESS_TOKEN";
 const CONFIG_SOURCE_NONE: &str = "NONE";
 
+pub struct TmdbConfigUpdate<'a> {
+    pub api_key: Option<&'a str>,
+    pub preferred_language: Option<&'a str>,
+    pub language_fallback_enabled: Option<bool>,
+    pub fallback_languages: Option<Vec<String>>,
+    pub alternate_api_enabled: Option<bool>,
+    pub api_base_url: Option<&'a str>,
+}
+
 fn tmdb_config_fields() -> Vec<PluginConfigField> {
-    vec![PluginConfigField {
-        key: "apiKey".to_owned(),
-        label: "TMDb API Key".to_owned(),
-        input_type: "password".to_owned(),
-        required: false,
-        sensitive: true,
-        description: Some("可选。留空时使用 Lux 内置的 TMDb Key。".to_owned()),
-    }]
+    let options = tmdb_language_options()
+        .into_iter()
+        .map(|option| PluginConfigOption {
+            value: option.value,
+            label: option.label,
+        })
+        .collect::<Vec<_>>();
+    vec![
+        PluginConfigField {
+            key: "apiKey".to_owned(),
+            label: "TMDb API Key".to_owned(),
+            input_type: "password".to_owned(),
+            required: false,
+            sensitive: true,
+            description: Some("可选。留空时使用 Lux 内置的 TMDb Key。".to_owned()),
+            multiple: false,
+            options: Vec::new(),
+        },
+        PluginConfigField {
+            key: "preferredLanguage".to_owned(),
+            label: "首选语言".to_owned(),
+            input_type: "select".to_owned(),
+            required: true,
+            sensitive: false,
+            description: Some("TMDb 电影、剧集、季和集元数据的首选语言。".to_owned()),
+            multiple: false,
+            options: options.clone(),
+        },
+        PluginConfigField {
+            key: "languageFallbackEnabled".to_owned(),
+            label: "TMDb 语言回退".to_owned(),
+            input_type: "toggle".to_owned(),
+            required: false,
+            sensitive: false,
+            description: Some("按备选语言顺序逐字段补全缺失元数据。".to_owned()),
+            multiple: false,
+            options: Vec::new(),
+        },
+        PluginConfigField {
+            key: "fallbackLanguages".to_owned(),
+            label: "备选语言顺序".to_owned(),
+            input_type: "select".to_owned(),
+            required: false,
+            sensitive: false,
+            description: Some("开启语言回退后按此顺序请求 TMDb。".to_owned()),
+            multiple: true,
+            options,
+        },
+        PluginConfigField {
+            key: "alternateApiEnabled".to_owned(),
+            label: "替代 API 地址".to_owned(),
+            input_type: "toggle".to_owned(),
+            required: false,
+            sensitive: false,
+            description: Some("开启后使用下方地址访问 TMDb，默认使用官方地址。".to_owned()),
+            multiple: false,
+            options: Vec::new(),
+        },
+        PluginConfigField {
+            key: "apiBaseUrl".to_owned(),
+            label: "TMDb API 地址".to_owned(),
+            input_type: "select".to_owned(),
+            required: true,
+            sensitive: false,
+            description: Some("可选择官方地址、替代地址，或填写自定义地址。".to_owned()),
+            multiple: false,
+            options: tmdb_api_base_url_options()
+                .into_iter()
+                .map(|option| PluginConfigOption {
+                    value: option.value,
+                    label: option.label,
+                })
+                .collect(),
+        },
+    ]
 }
 
 #[derive(Clone)]
@@ -91,7 +176,10 @@ impl PluginService {
         if !has_tmdb_package {
             let installed = self.database.is_plugin_installed(TMDB_PLUGIN_ID).await?;
             if !installed_only || installed {
-                views.push(legacy_tmdb_view(installed, self.tmdb_config_source().await));
+                views.push(
+                    legacy_tmdb_view(installed, self.tmdb_config_source().await, &self.config_dir)
+                        .await,
+                );
             }
         }
         for plugin in &self.catalog.plugins {
@@ -128,19 +216,56 @@ impl PluginService {
     pub async fn update_config(
         &self,
         plugin_id: &str,
-        api_key: &str,
+        update: TmdbConfigUpdate<'_>,
     ) -> Result<PluginView, PluginServiceError> {
         self.ensure_known_plugin(plugin_id)?;
         if !is_tmdb_plugin_id(plugin_id) {
             return Err(PluginServiceError::InvalidConfig);
         }
-        let api_key = api_key.trim();
-        if api_key.chars().count() > 4096 {
+        if update
+            .api_key
+            .is_some_and(|value| value.trim().chars().count() > 4096)
+        {
             return Err(PluginServiceError::InvalidConfig);
         }
-        write_tmdb_api_key(&self.config_dir, (!api_key.is_empty()).then_some(api_key))
+        let current_settings = read_tmdb_settings(&self.config_dir).await;
+        let settings = TmdbSettings::new_with_api_config(
+            update
+                .preferred_language
+                .map(str::to_owned)
+                .unwrap_or(current_settings.preferred_language),
+            update
+                .language_fallback_enabled
+                .unwrap_or(current_settings.language_fallback_enabled),
+            update
+                .fallback_languages
+                .unwrap_or(current_settings.fallback_languages),
+            update
+                .alternate_api_enabled
+                .unwrap_or(current_settings.alternate_api_enabled),
+            update
+                .api_base_url
+                .map(str::to_owned)
+                .unwrap_or(current_settings.api_base_url),
+        )
+        .map_err(|_| PluginServiceError::InvalidConfig)?;
+        if let Some(api_key) = update.api_key {
+            let api_key = api_key.trim();
+            write_tmdb_api_key(&self.config_dir, (!api_key.is_empty()).then_some(api_key))
+                .await
+                .map_err(PluginServiceError::ConfigIo)?;
+        }
+        write_tmdb_settings(&self.config_dir, &settings)
             .await
-            .map_err(PluginServiceError::ConfigIo)?;
+            .map_err(|error| match error {
+                crate::application::settings::TmdbSettingsError::Io(error) => {
+                    PluginServiceError::ConfigIo(error)
+                }
+                crate::application::settings::TmdbSettingsError::Invalid(_)
+                | crate::application::settings::TmdbSettingsError::Serialization(_) => {
+                    PluginServiceError::InvalidConfig
+                }
+            })?;
         let installed = self.database.is_plugin_installed(plugin_id).await?;
         self.view_for_id(plugin_id, installed).await
     }
@@ -157,7 +282,7 @@ impl PluginService {
             return Err(PluginServiceError::Unavailable(scraper_id.to_owned()));
         }
         let view = self.view_for_id(scraper_id, true).await?;
-        if !view.available {
+        if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
             return Err(PluginServiceError::Unavailable(scraper_id.to_owned()));
         }
         Ok(())
@@ -189,6 +314,39 @@ impl PluginService {
         self.call(scraper_id, method, params).await
     }
 
+    pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult, PluginServiceError> {
+        let plugin = self
+            .catalog
+            .get(MEDIA_INFO_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(MEDIA_INFO_PLUGIN_ID.to_owned()))?;
+        if !plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == MEDIA_PROBE_CAPABILITY)
+            || !self
+                .database
+                .is_plugin_installed(MEDIA_INFO_PLUGIN_ID)
+                .await?
+        {
+            return Err(PluginServiceError::Unavailable(
+                MEDIA_INFO_PLUGIN_ID.to_owned(),
+            ));
+        }
+        let value = self
+            .supervisor
+            .call_isolated(
+                MEDIA_INFO_PLUGIN_ID,
+                "media.probe",
+                serde_json::json!({ "url": url }),
+            )
+            .await
+            .map_err(PluginServiceError::Runtime)?;
+        let response: MediaProbeRpcResult =
+            serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
+        media_probe_result(response).ok_or(PluginServiceError::InvalidResponse)
+    }
+
     pub async fn scraper_client(
         &self,
         scraper_id: &str,
@@ -200,7 +358,7 @@ impl PluginService {
         }
         let installed = self.database.is_plugin_installed(&plugin_id).await?;
         let view = self.view_for_id(&plugin_id, installed).await?;
-        if !view.available {
+        if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
             return Err(PluginServiceError::Unavailable(plugin_id));
         }
         Ok(crate::application::scraper::ScraperPluginClient::new(
@@ -224,7 +382,12 @@ impl PluginService {
         installed: bool,
     ) -> Result<PluginView, PluginServiceError> {
         if plugin_id == TMDB_PLUGIN_ID {
-            return Ok(legacy_tmdb_view(installed, self.tmdb_config_source().await));
+            return Ok(legacy_tmdb_view(
+                installed,
+                self.tmdb_config_source().await,
+                &self.config_dir,
+            )
+            .await);
         }
         let Some(plugin) = self.catalog.get(plugin_id) else {
             return Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()));
@@ -279,6 +442,11 @@ impl PluginService {
                 plugin.manifest.config_fields.clone()
             },
             config_source,
+            config_values: if is_tmdb_plugin_id(&plugin.manifest.id) {
+                tmdb_config_values(&self.config_dir).await
+            } else {
+                serde_json::Map::new()
+            },
         }
     }
 
@@ -366,6 +534,7 @@ pub struct PluginView {
     pub configurable: bool,
     pub config_fields: Vec<PluginConfigField>,
     pub config_source: String,
+    pub config_values: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug)]
@@ -373,6 +542,7 @@ pub enum PluginServiceError {
     UnknownPlugin(String),
     Unavailable(String),
     InvalidConfig,
+    InvalidResponse,
     ConfigIo(io::Error),
     Runtime(PluginRuntimeError),
     Storage(StorageError),
@@ -386,6 +556,7 @@ impl fmt::Display for PluginServiceError {
                 write!(formatter, "plugin is unavailable: {plugin_id}")
             }
             Self::InvalidConfig => formatter.write_str("invalid plugin configuration"),
+            Self::InvalidResponse => formatter.write_str("plugin returned an invalid response"),
             Self::ConfigIo(error) => write!(formatter, "plugin configuration IO error: {error}"),
             Self::Runtime(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
@@ -399,9 +570,69 @@ impl std::error::Error for PluginServiceError {
             Self::ConfigIo(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::Storage(error) => Some(error),
-            Self::UnknownPlugin(_) | Self::Unavailable(_) | Self::InvalidConfig => None,
+            Self::UnknownPlugin(_)
+            | Self::Unavailable(_)
+            | Self::InvalidConfig
+            | Self::InvalidResponse => None,
         }
     }
+}
+
+fn media_probe_result(response: MediaProbeRpcResult) -> Option<MediaProbeResult> {
+    if response
+        .container
+        .as_ref()
+        .is_some_and(|value| value.len() > 128)
+        || response.source_size.is_some_and(|value| value < 0)
+        || response.duration_ticks.is_some_and(|value| value < 0)
+        || response.bitrate.is_some_and(|value| value < 0)
+        || response.streams.len() > 128
+    {
+        return None;
+    }
+    let mut indexes = HashSet::new();
+    let streams = response
+        .streams
+        .into_iter()
+        .map(|stream| {
+            if stream.stream_index < 0
+                || !indexes.insert(stream.stream_index)
+                || stream.codec.as_ref().is_some_and(|value| value.len() > 256)
+                || stream
+                    .language
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 256)
+                || stream.title.as_ref().is_some_and(|value| value.len() > 512)
+                || serde_json::to_vec(&stream.details)
+                    .ok()
+                    .is_none_or(|value| value.len() > 512 * 1024)
+            {
+                return None;
+            }
+            let stream_type = match stream.stream_type {
+                MediaProbeRpcStreamType::Video => StreamType::Video,
+                MediaProbeRpcStreamType::Audio => StreamType::Audio,
+                MediaProbeRpcStreamType::Subtitle => StreamType::Subtitle,
+            };
+            Some(MediaStreamResult {
+                stream_index: stream.stream_index,
+                stream_type,
+                codec: stream.codec,
+                language: stream.language,
+                title: stream.title,
+                is_default: stream.is_default,
+                is_forced: stream.is_forced,
+                details: stream.details,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(MediaProbeResult {
+        container: response.container,
+        source_size: response.source_size,
+        duration_ticks: response.duration_ticks,
+        bitrate: response.bitrate,
+        streams,
+    })
 }
 
 impl From<StorageError> for PluginServiceError {
@@ -410,7 +641,11 @@ impl From<StorageError> for PluginServiceError {
     }
 }
 
-fn legacy_tmdb_view(installed: bool, config_source: &str) -> PluginView {
+async fn legacy_tmdb_view(
+    installed: bool,
+    config_source: &str,
+    config_dir: &std::path::Path,
+) -> PluginView {
     PluginView {
         id: TMDB_PLUGIN_ID.to_owned(),
         name: TMDB_PLUGIN_NAME.to_owned(),
@@ -443,5 +678,38 @@ fn legacy_tmdb_view(installed: bool, config_source: &str) -> PluginView {
         configurable: true,
         config_fields: tmdb_config_fields(),
         config_source: config_source.to_owned(),
+        config_values: tmdb_config_values(config_dir).await,
     }
+}
+
+async fn tmdb_config_values(config_dir: &std::path::Path) -> serde_json::Map<String, Value> {
+    let settings = read_tmdb_settings(config_dir).await;
+    serde_json::Map::from_iter([
+        (
+            "preferredLanguage".to_owned(),
+            Value::String(settings.preferred_language),
+        ),
+        (
+            "languageFallbackEnabled".to_owned(),
+            Value::Bool(settings.language_fallback_enabled),
+        ),
+        (
+            "fallbackLanguages".to_owned(),
+            Value::Array(
+                settings
+                    .fallback_languages
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        ),
+        (
+            "alternateApiEnabled".to_owned(),
+            Value::Bool(settings.alternate_api_enabled),
+        ),
+        (
+            "apiBaseUrl".to_owned(),
+            Value::String(settings.api_base_url),
+        ),
+    ])
 }

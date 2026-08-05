@@ -85,6 +85,35 @@ impl ScraperGetRequest {
             episode_number: None,
         }
     }
+
+    pub fn for_season(
+        provider_id: impl Into<String>,
+        season_number: i32,
+        language: impl Into<String>,
+    ) -> Self {
+        Self {
+            item_type: ScraperItemType::Season,
+            provider_id: provider_id.into(),
+            language: language.into(),
+            season_number: Some(season_number),
+            episode_number: None,
+        }
+    }
+
+    pub fn for_episode(
+        provider_id: impl Into<String>,
+        season_number: i32,
+        episode_number: i32,
+        language: impl Into<String>,
+    ) -> Self {
+        Self {
+            item_type: ScraperItemType::Episode,
+            provider_id: provider_id.into(),
+            language: language.into(),
+            season_number: Some(season_number),
+            episode_number: Some(episode_number),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -115,13 +144,13 @@ impl ScraperImageRequest {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct ScraperSearchResponse {
     #[serde(default)]
     pub items: Vec<ScraperSearchResult>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct ScraperSearchResult {
     #[serde(rename = "Type", alias = "type", default)]
     pub item_type: Option<String>,
@@ -133,6 +162,14 @@ pub struct ScraperSearchResult {
     pub overview: Option<String>,
     #[serde(rename = "ProductionYear", alias = "productionYear", default)]
     pub production_year: Option<i32>,
+    #[serde(
+        rename = "Rating",
+        alias = "rating",
+        alias = "VoteAverage",
+        alias = "voteAverage",
+        default
+    )]
+    pub rating: Option<f64>,
     #[serde(rename = "PremiereDate", alias = "premiereDate", default)]
     pub premiere_date: Option<String>,
     #[serde(rename = "OriginalLanguage", alias = "originalLanguage", default)]
@@ -147,7 +184,66 @@ pub struct ScraperSearchResult {
     pub backdrop_image_url: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::ScraperSearchResult;
+
+    #[test]
+    fn selects_the_id_for_the_configured_scraper() {
+        let result = ScraperSearchResult {
+            provider_ids: BTreeMap::from([
+                ("Imdb".to_owned(), "tt123".to_owned()),
+                ("Tvdb".to_owned(), "456".to_owned()),
+            ]),
+            ..ScraperSearchResult::default()
+        };
+
+        assert_eq!(
+            result.selected_provider_entry("tvdb"),
+            Some(("Tvdb", "456")),
+        );
+        assert_eq!(
+            result.selected_provider_entry("org.example.tvdb"),
+            Some(("Tvdb", "456")),
+        );
+        assert_eq!(result.selected_provider_entry("tmdb"), None);
+
+        let only_other_provider = ScraperSearchResult {
+            provider_ids: BTreeMap::from([("Imdb".to_owned(), "tt123".to_owned())]),
+            ..ScraperSearchResult::default()
+        };
+        assert_eq!(only_other_provider.selected_provider_entry("tmdb"), None);
+    }
+}
+
 impl ScraperSearchResult {
+    pub fn selected_provider_entry(&self, selected_provider: &str) -> Option<(&str, &str)> {
+        let selected_provider = selected_provider.trim();
+        if selected_provider.is_empty() {
+            return None;
+        }
+        let short_provider = selected_provider
+            .rsplit(['.', ':', '/'])
+            .next()
+            .unwrap_or(selected_provider);
+        let entry = self
+            .provider_ids
+            .iter()
+            .find(|(provider, _)| provider.eq_ignore_ascii_case(selected_provider));
+        let entry = entry.or_else(|| {
+            (short_provider != selected_provider)
+                .then(|| {
+                    self.provider_ids
+                        .iter()
+                        .find(|(provider, _)| provider.eq_ignore_ascii_case(short_provider))
+                })
+                .flatten()
+        });
+        entry.map(|(provider, id)| (provider.as_str(), id.as_str()))
+    }
+
     pub fn provider_id(&self, provider: &str) -> Option<&str> {
         self.provider_ids
             .iter()
@@ -160,7 +256,7 @@ impl ScraperSearchResult {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct ScraperMetadata {
     #[serde(rename = "Type", alias = "type", default)]
     pub item_type: Option<String>,
@@ -172,12 +268,22 @@ pub struct ScraperMetadata {
     pub overview: Option<String>,
     #[serde(rename = "ProductionYear", alias = "productionYear", default)]
     pub production_year: Option<i32>,
+    #[serde(
+        rename = "Rating",
+        alias = "rating",
+        alias = "VoteAverage",
+        alias = "voteAverage",
+        default
+    )]
+    pub rating: Option<f64>,
     #[serde(rename = "PremiereDate", alias = "premiereDate", default)]
     pub premiere_date: Option<String>,
     #[serde(rename = "OriginalLanguage", alias = "originalLanguage", default)]
     pub original_language: Option<String>,
     #[serde(rename = "EndDate", alias = "endDate", default)]
     pub end_date: Option<String>,
+    #[serde(rename = "Status", alias = "status", default)]
+    pub status: Option<String>,
     #[serde(rename = "ProviderIds", alias = "providerIds", default)]
     pub provider_ids: BTreeMap<String, String>,
     #[serde(rename = "BelongsToCollection", alias = "belongsToCollection", default)]

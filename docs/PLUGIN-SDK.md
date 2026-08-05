@@ -2,7 +2,7 @@
 
 ## 目标
 
-Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插件包。首版使用 `.zip` 包格式和独立进程运行时。插件不直接访问 Lux 数据库、媒体根目录或内部任务对象。
+Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插件包。首版使用 `.zip` 包格式和独立进程运行时。插件不直接访问 Lux 数据库、媒体根目录或内部任务对象。除元数据插件外，SDK v1 也支持由 Lux 宿主调度的媒体探测插件；任务、媒体库选择、结果持久化和旁车写入仍由宿主负责。
 
 ## 包格式
 
@@ -47,7 +47,28 @@ org.lux.tmdb-1.0.0.zip
     "metadata.externalIds",
     "metadata.trailers"
   ],
-  "configFields": [],
+  "configFields": [{
+    "key": "preferredLanguage",
+    "label": "首选语言",
+    "type": "select",
+    "required": true,
+    "options": [{"value": "zh-CN", "label": "简体中文"}]
+  }, {
+    "key": "alternateApiEnabled",
+    "label": "替代 API 地址",
+    "type": "toggle",
+    "required": false
+  }, {
+    "key": "apiBaseUrl",
+    "label": "TMDb API 地址",
+    "type": "select",
+    "required": true,
+    "options": [
+      {"value": "official", "label": "https://api.themoviedb.org"},
+      {"value": "alternate", "label": "https://api.tmdb.org"},
+      {"value": "custom", "label": "自定义"}
+    ]
+  }],
   "permissions": {
     "network": [],
     "filesystem": ["plugin-cache"]
@@ -57,6 +78,23 @@ org.lux.tmdb-1.0.0.zip
 ```
 
 `formatVersion` 是包格式；`apiVersion` 是 RPC 契约；`version` 是插件自身版本。三者不能混用。
+
+`type` 当前允许 `metadata` 和 `media_probe`。媒体探测插件必须同时声明
+`category: "MEDIA"` 和 `capabilities: ["media.probe"]`。例如内置的
+`org.lux.media-info` 使用以下 manifest 核心字段：
+
+```json
+{
+  "id": "org.lux.media-info",
+  "type": "media_probe",
+  "category": "MEDIA",
+  "capabilities": ["media.probe"],
+  "permissions": {
+    "network": ["media-source"],
+    "filesystem": []
+  }
+}
+```
 
 Lux 不再要求插件包使用 Lux Ed25519 签名。运行时仅兼容读取历史签名字段，签名不会作为插件发现
 或启动的阻断条件；当前打包器始终只生成普通包。插件仍必须通过 ZIP 大小、文件数量、路径、
@@ -85,7 +123,11 @@ manifest、格式版本、协议版本、平台入口和声明文件 SHA-256 校
 - `metadata.credits`：返回演员/人物的 provider-neutral cast 列表。
 - `metadata.externalIds`：返回 `ProviderIds`。
 - `metadata.trailers`：返回预告片候选。
+- `media.probe`：接收一个已由 Lux 宿主校验的远程媒体地址，返回受限的 format 和 stream 信息。
 - `plugin.shutdown`：请求插件优雅退出。
+
+配置字段支持 text、password、select 和 toggle；select 可通过 multiple: true 声明多选，选项使用
+{ "value": "...", "label": "..." }。管理 API 返回的 configValues 只允许包含非敏感当前值。
 
 请求和返回数据使用以下稳定名称：
 
@@ -123,6 +165,52 @@ ImageType
 值必须是字符串，键由插件定义（例如 `Tmdb`、`Douban`）；Lux 只把它当作不透明 ID 保存，不能
 假设是数字或 TMDb URL。图片必须返回完整 HTTPS `Url`，并声明 `Type`、语言和可选尺寸。
 插件缺少某种媒体类型或能力时，应返回 `PLUGIN_PROVIDER_NOT_FOUND`，不能伪造空的 TMDb 数据。
+
+TMDb 插件的首选语言由管理员配置覆盖请求中的默认语言。语言回退开关开启后，电影、剧集、
+季和集详情会按配置的备选语言顺序逐字段补全；默认首选语言为 zh-CN，默认备选语言为
+zh-SG、zh-HK、zh-TW，开关默认关闭。替代 API 地址开关默认关闭；开启后可选择官方地址、
+`https://api.tmdb.org` 或填写自定义 HTTP(S) 基础地址。地址由宿主校验，不得包含凭据、查询参数
+或片段。
+
+### 媒体探测调用约定
+
+媒体探测插件只处理单个请求，不拥有媒体库扫描权限。请求格式为：
+
+```json
+{
+  "url": "https://media.example.invalid/video.mkv"
+}
+```
+
+返回结果只包含 Lux 允许写入 `media_sources` 和 `media_streams` 的字段：
+
+```json
+{
+  "container": "matroska",
+  "sourceSize": 1234,
+  "durationTicks": 125000000,
+  "bitrate": 500000,
+  "streams": [
+    {
+      "streamIndex": 0,
+      "streamType": "VIDEO",
+      "codec": "h264",
+      "language": null,
+      "title": null,
+      "isDefault": false,
+      "isForced": false,
+      "details": {}
+    }
+  ]
+}
+```
+
+Lux 在发送请求前执行协议、主机和地址策略校验，并在收到结果后再次校验字段数量、大小、索引、枚举和数值范围。插件不得返回完整 URL、认证信息或原始 `ffprobe` JSON。插件错误使用稳定代码，例如
+`MEDIA_PROBE_INVALID_URL`、`MEDIA_PROBE_TIMEOUT`、`MEDIA_PROBE_PROCESS_FAILED` 和
+`MEDIA_PROBE_INVALID_OUTPUT`；错误消息不能包含完整 URL 或 stderr。
+
+媒体探测调用只能由后台 STRM 探测任务触发，不得从播放、PlaybackInfo 或普通用户请求路径触发。Lux 宿主负责并发、超时、取消、重启恢复、任务状态、数据库写入和可选的
+`*-mediainfo.json` 原子写入。`permissions.network` 是能力声明，不替代宿主的出站 URL 安全策略。
 
 ## 错误码
 

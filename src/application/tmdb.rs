@@ -141,6 +141,14 @@ impl TmdbClient {
         configured_api_key: Option<String>,
         configured_token: Option<String>,
     ) -> Result<Self, TmdbError> {
+        Self::from_env_or_config_with_base_url(configured_api_key, configured_token, None)
+    }
+
+    pub fn from_env_or_config_with_base_url(
+        configured_api_key: Option<String>,
+        configured_token: Option<String>,
+        configured_base_url: Option<String>,
+    ) -> Result<Self, TmdbError> {
         let environment_api_key = env::var("LUX_TMDB_API_KEY")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -162,7 +170,10 @@ impl TmdbClient {
             })
             .unwrap_or_else(|| TmdbCredential::ApiKey(EMBEDDED_TMDB_API_KEY.to_owned()));
         let config = TmdbClientConfig {
-            base_url: env::var("LUX_TMDB_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned()),
+            base_url: configured_base_url
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| env::var("LUX_TMDB_BASE_URL").ok())
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()),
             proxy_url: proxy_url_from_env()
                 .map_err(|error| TmdbError::InvalidProxyUrl(error.to_string()))?,
             api_key: configured_api_key.or(environment_api_key),
@@ -322,6 +333,8 @@ impl TmdbClient {
             fill_if_empty(&mut result.overview, &fallback.overview);
             fill_if_empty(&mut result.first_air_date, &fallback.first_air_date);
             fill_if_empty(&mut result.original_language, &fallback.original_language);
+            fill_if_empty(&mut result.poster_path, &fallback.poster_path);
+            fill_if_empty(&mut result.backdrop_path, &fallback.backdrop_path);
         }
         Ok(localized)
     }
@@ -483,6 +496,19 @@ impl TmdbClient {
     ) -> Result<TmdbCreditsResponse, TmdbError> {
         validate_id_language(movie_id, language, "movie")?;
         let endpoint = format!("3/movie/{movie_id}/credits");
+        let params = [("language", language.trim().to_owned())];
+        let credits: TmdbCreditsResponse = self.request_json(&endpoint, &params).await?;
+        validate_credits_response(&credits)?;
+        Ok(credits)
+    }
+
+    pub async fn tv_credits(
+        &self,
+        series_id: i64,
+        language: &str,
+    ) -> Result<TmdbCreditsResponse, TmdbError> {
+        validate_id_language(series_id, language, "series")?;
+        let endpoint = format!("3/tv/{series_id}/credits");
         let params = [("language", language.trim().to_owned())];
         let credits: TmdbCreditsResponse = self.request_json(&endpoint, &params).await?;
         validate_credits_response(&credits)?;
@@ -791,7 +817,7 @@ fn retry_after(response: &reqwest::Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TmdbMovieSearchResponse {
     pub page: i32,
     pub total_pages: i32,
@@ -799,7 +825,7 @@ pub struct TmdbMovieSearchResponse {
     pub results: Vec<TmdbMovieSummary>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TmdbMovieSummary {
     pub id: i64,
     pub title: Option<String>,
@@ -807,6 +833,7 @@ pub struct TmdbMovieSummary {
     pub overview: Option<String>,
     pub release_date: Option<String>,
     pub original_language: Option<String>,
+    pub vote_average: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -834,7 +861,7 @@ pub struct TmdbCollectionDetails {
     pub parts: Vec<TmdbCollectionPart>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TmdbMovieDetails {
     pub id: i64,
     pub title: Option<String>,
@@ -842,6 +869,7 @@ pub struct TmdbMovieDetails {
     pub overview: Option<String>,
     pub release_date: Option<String>,
     pub original_language: Option<String>,
+    pub vote_average: Option<f64>,
     pub belongs_to_collection: Option<TmdbCollectionReference>,
 }
 
@@ -860,7 +888,7 @@ pub struct TmdbCastMember {
     pub order: Option<i32>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TmdbTvSearchResponse {
     pub page: i32,
     pub total_pages: i32,
@@ -868,7 +896,7 @@ pub struct TmdbTvSearchResponse {
     pub results: Vec<TmdbTvSummary>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TmdbTvSummary {
     pub id: i64,
     pub name: Option<String>,
@@ -876,6 +904,7 @@ pub struct TmdbTvSummary {
     pub overview: Option<String>,
     pub first_air_date: Option<String>,
     pub original_language: Option<String>,
+    pub vote_average: Option<f64>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
 }
@@ -913,7 +942,7 @@ pub struct TmdbCollectionSearchResult {
     pub backdrop_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct TmdbSeriesDetails {
     pub id: i64,
     pub name: Option<String>,
@@ -921,7 +950,9 @@ pub struct TmdbSeriesDetails {
     pub overview: Option<String>,
     pub first_air_date: Option<String>,
     pub last_air_date: Option<String>,
+    pub status: Option<String>,
     pub original_language: Option<String>,
+    pub vote_average: Option<f64>,
     pub number_of_seasons: Option<i32>,
     pub number_of_episodes: Option<i32>,
     pub poster_path: Option<String>,
@@ -1144,7 +1175,7 @@ pub(crate) fn localized_tv_fields_complete(result: &TmdbTvSummary) -> bool {
         .all(|value| value.is_some_and(|value| !value.trim().is_empty()))
 }
 
-pub(crate) fn fill_if_empty(target: &mut Option<String>, fallback: &Option<String>) {
+pub fn fill_if_empty(target: &mut Option<String>, fallback: &Option<String>) {
     if target
         .as_deref()
         .and_then(|value| non_empty(Some(value)))

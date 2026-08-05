@@ -71,6 +71,18 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .bind(&beta_item_id)
         .execute(database.pool())
         .await?;
+    sqlx::query("UPDATE media_items SET premiere_date = ?, rating = ? WHERE id = ?")
+        .bind("2021-01-01")
+        .bind(8.2_f64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET premiere_date = ?, rating = ? WHERE id = ?")
+        .bind("2020-01-01")
+        .bind(6.5_f64)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
     sqlx::query(
         "INSERT INTO user_item_state (user_id, item_id, is_favorite)
          VALUES (?, ?, 1)
@@ -84,7 +96,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
-        config, database, setup, web_auth, emby_auth,
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -281,6 +297,47 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(recent_page.status(), reqwest::StatusCode::OK);
     let recent_page_body: Value = recent_page.json().await?;
     assert_eq!(recent_page_body["items"][0]["title"], "Alpha Movie");
+
+    let release_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=PremiereDate&sort_order=Descending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(release_page.status(), reqwest::StatusCode::OK);
+    let release_page_body: Value = release_page.json().await?;
+    assert_eq!(release_page_body["items"][0]["title"], "Alpha Movie");
+
+    let rating_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=CommunityRating&sort_order=Descending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(rating_page.status(), reqwest::StatusCode::OK);
+    let rating_page_body: Value = rating_page.json().await?;
+    assert_eq!(rating_page_body["items"][0]["title"], "Alpha Movie");
+
+    sqlx::query("UPDATE media_items SET rating = NULL WHERE id = ?")
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
+    let unrated_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=2&sort_by=CommunityRating&sort_order=Descending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(unrated_page.status(), reqwest::StatusCode::OK);
+    let unrated_page_body: Value = unrated_page.json().await?;
+    assert_eq!(unrated_page_body["items"][0]["title"], "Alpha Movie");
+    assert_eq!(unrated_page_body["items"][1]["title"], "Beta Movie");
 
     let favorite_page = client
         .get(format!(

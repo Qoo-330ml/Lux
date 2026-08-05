@@ -1,7 +1,8 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
-import { useEffect, useRef } from "react";
-import { api } from "../../lib/api/client";
+import { useEffect, useRef, useState } from "react";
+import { LuxSelect } from "../../components/LuxSelect";
+import { api, type LibrarySortBy, type LibrarySortOrder } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { Library } from "../../lib/api/types";
 import { MediaCard } from "../home/media";
@@ -15,12 +16,14 @@ export function libraryItemTypeFilter(kind?: Library["kind"]) {
 
 export function LibraryPage() {
   const { libraryId = "" } = useParams();
+  const [sortBy, setSortBy] = useState<LibrarySortBy>("Name");
+  const [sortOrder, setSortOrder] = useState<LibrarySortOrder>("Ascending");
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
   const itemTypes = libraryItemTypeFilter(library?.kind);
   const pages = useInfiniteQuery({
-    queryKey: queryKeys.library(libraryId, 1, itemTypes),
-    queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes),
+    queryKey: queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder),
+    queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, { sortBy, sortOrder }),
     initialPageParam: 1,
     enabled: Boolean(libraryId && library),
     getNextPageParam: (lastPage) => {
@@ -49,10 +52,32 @@ export function LibraryPage() {
 
   const loadedItems = pages.data?.pages.flatMap((page) => page.items ?? []) ?? [];
   const total = pages.data?.pages[0]?.total ?? 0;
+  const sortOptions = [
+    { value: "Name", label: "标题" },
+    { value: "DateCreated", label: "最近添加" },
+    { value: "PremiereDate", label: "发行日期" },
+    { value: "CommunityRating", label: "评分" },
+  ] as const;
+  const ascendingLabel = sortBy === "Name" ? "A → Z" : sortBy === "CommunityRating" ? "从低到高" : "从旧到新";
+  const descendingLabel = sortBy === "Name" ? "Z → A" : sortBy === "CommunityRating" ? "从高到低" : "从新到旧";
+  const orderOptions = [
+    { value: "Ascending", label: ascendingLabel },
+    { value: "Descending", label: descendingLabel },
+  ] as const;
+
+  function changeSortBy(value: string) {
+    const nextSortBy = value as LibrarySortBy;
+    setSortBy(nextSortBy);
+    setSortOrder(nextSortBy === "Name" ? "Ascending" : "Descending");
+  }
 
   return (
     <section className="lux-page lux-page-narrow">
       <div className="lux-page-heading"><span className="lux-eyebrow">LIBRARY</span><h1>{library?.name || "媒体库"}</h1><p>{total} 项内容</p></div>
+      <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
+        <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
+        <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={(value) => setSortOrder(value as LibrarySortOrder)} aria-label="排序顺序" /></div>
+      </div>
       <div className="lux-poster-grid">
         {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} />)}
       </div>

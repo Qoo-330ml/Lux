@@ -31,6 +31,29 @@ fn generic_scraper_requests_use_provider_neutral_fields() {
         })
     );
 
+    let season = ScraperGetRequest::for_season("tmdb-series-8", 1, "zh-CN");
+    assert_eq!(
+        serde_json::to_value(season).expect("season request should serialize"),
+        json!({
+            "itemType": "Season",
+            "providerId": "tmdb-series-8",
+            "language": "zh-CN",
+            "seasonNumber": 1
+        })
+    );
+
+    let episode = ScraperGetRequest::for_episode("tmdb-series-8", 1, 2, "zh-CN");
+    assert_eq!(
+        serde_json::to_value(episode).expect("episode request should serialize"),
+        json!({
+            "itemType": "Episode",
+            "providerId": "tmdb-series-8",
+            "language": "zh-CN",
+            "seasonNumber": 1,
+            "episodeNumber": 2
+        })
+    );
+
     let images = ScraperImageRequest::new(ScraperItemType::Movie, "douban-123", "zh-CN");
     assert_eq!(
         serde_json::to_value(images).expect("image request should serialize"),
@@ -50,6 +73,7 @@ fn generic_scraper_decodes_provider_neutral_responses() {
             "Name": "二毛",
             "OriginalTitle": "Er Mao",
             "ProductionYear": 2019,
+            "Rating": 8.6,
             "ProviderIds": {"Douban": "douban-123"},
             "SearchProviderName": "Douban"
         }]
@@ -57,16 +81,19 @@ fn generic_scraper_decodes_provider_neutral_responses() {
     .expect("search response should decode");
     assert_eq!(search.items[0].provider_id("Douban"), Some("douban-123"));
     assert_eq!(search.items[0].title.as_deref(), Some("二毛"));
+    assert_eq!(search.items[0].rating, Some(8.6));
 
     let metadata = decode_metadata_response(json!({
         "metadata": {
             "Type": "Movie",
             "Name": "二毛",
+            "Rating": 8.6,
             "ProviderIds": {"Douban": "douban-123"}
         }
     }))
     .expect("metadata response should decode");
     assert_eq!(metadata.provider_id("Douban"), Some("douban-123"));
+    assert_eq!(metadata.rating, Some(8.6));
 
     let images = decode_images_response(json!({
         "images": [{

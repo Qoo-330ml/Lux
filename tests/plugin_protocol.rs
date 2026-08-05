@@ -61,6 +61,66 @@ fn accepts_a_versioned_process_plugin_manifest_without_a_signature() {
 }
 
 #[test]
+fn accepts_a_media_probe_plugin_manifest() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.media-info",
+        "name": "Media information probe",
+        "description": "Probes STRM media sources with ffprobe",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {
+            "kind": "process",
+            "entrypoint": "binaries/${platform}-${arch}/lux-plugin-media-info"
+        },
+        "type": "media_probe",
+        "category": "MEDIA",
+        "supportedItemTypes": [],
+        "capabilities": ["media.probe"],
+        "configFields": [],
+        "permissions": {
+            "network": ["media-source"],
+            "filesystem": []
+        },
+        "files": []
+    }))
+    .expect("media probe manifest should validate");
+
+    assert_eq!(manifest.plugin_type, "media_probe");
+    assert_eq!(manifest.category, "MEDIA");
+    assert_eq!(manifest.capabilities, vec!["media.probe"]);
+}
+
+#[test]
+fn accepts_select_config_fields_with_options_and_multiple_selection() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.languages",
+        "name": "Language plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "configFields": [{
+            "key": "languages",
+            "label": "Languages",
+            "type": "select",
+            "multiple": true,
+            "options": [
+                {"value": "zh-CN", "label": "简体中文"},
+                {"value": "en-US", "label": "English"}
+            ]
+        }]
+    }))
+    .expect("select config field should validate");
+
+    let field = &manifest.config_fields[0];
+    assert_eq!(field.input_type, "select");
+    assert!(field.multiple);
+    assert_eq!(field.options[0].value, "zh-CN");
+}
+
+#[test]
 fn rejects_manifest_entrypoints_that_escape_the_package() {
     let error = PluginManifest::from_value(json!({
         "formatVersion": PLUGIN_FORMAT_VERSION,

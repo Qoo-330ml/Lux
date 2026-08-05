@@ -11,10 +11,11 @@ use crate::application::{
         ScraperSearchRequest, ScraperSearchResponse, ScraperSearchResult,
     },
     tmdb::{
-        TmdbClient, TmdbCollectionDetails, TmdbCreditsResponse, TmdbError, TmdbImagesResponse,
-        TmdbMovieDetails, TmdbMovieSearchResponse, TmdbTvSearchResponse, fill_if_empty,
-        localized_fields_complete, localized_tv_fields_complete, validate_id, validate_id_language,
-        validate_search_response, validate_tv_search_response,
+        TmdbClient, TmdbCollectionDetails, TmdbCreditsResponse, TmdbEpisodeDetails, TmdbError,
+        TmdbImagesResponse, TmdbMovieDetails, TmdbMovieSearchResponse, TmdbSeasonDetails,
+        TmdbSeriesDetails, TmdbTvSearchResponse, fill_if_empty, localized_fields_complete,
+        localized_tv_fields_complete, validate_id, validate_id_language, validate_search_response,
+        validate_tv_search_response,
     },
 };
 
@@ -376,6 +377,10 @@ fn generic_request(
             "metadata.credits",
             json!({"itemType": "Movie", "providerId": id, "language": language}),
         ),
+        ["3", "tv", id, "credits"] => (
+            "metadata.credits",
+            json!({"itemType": "Series", "providerId": id, "language": language}),
+        ),
         ["3", "movie", id, "images"] => (
             "metadata.images",
             json!({"itemType": "Movie", "providerId": id, "language": language}),
@@ -432,6 +437,7 @@ fn normalize_generic_response(endpoint: &str, value: Value) -> Result<Value, Tmd
         ["3", "search", "tv"] => normalize_search(value, "Series", "firstAirDate"),
         ["3", "movie", _] => normalize_metadata(value, "Movie"),
         ["3", "movie", _, "credits"] => normalize_credits(value),
+        ["3", "tv", _, "credits"] => normalize_credits(value),
         ["3", "collection", _] => normalize_collection(value),
         ["3", "movie", _, "images"]
         | ["3", "tv", _, "images"]
@@ -460,6 +466,7 @@ fn normalize_search(value: Value, item_type: &str, _date_field: &str) -> Result<
                 "overview": item.get("Overview").cloned().unwrap_or(Value::Null),
                 "release_date": date_from_year(&production_year),
                 "original_language": item.get("OriginalLanguage").cloned().unwrap_or(Value::Null),
+                "vote_average": item.get("Rating").cloned().unwrap_or(Value::Null),
             });
             if item_type == "Series" {
                 result["name"] = result["title"].clone();
@@ -480,6 +487,14 @@ fn normalize_metadata(value: Value, _item_type: &str) -> Result<Value, TmdbError
         .get("metadata")
         .ok_or_else(|| TmdbError::InvalidResponse("scraper metadata is missing".to_owned()))?;
     let provider_id = provider_id(metadata)?;
+    let premiere_date = metadata.get("PremiereDate").cloned().unwrap_or_else(|| {
+        date_from_year(
+            &metadata
+                .get("ProductionYear")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+    });
     let collection = metadata
         .get("BelongsToCollection")
         .and_then(Value::as_object)
@@ -495,8 +510,11 @@ fn normalize_metadata(value: Value, _item_type: &str) -> Result<Value, TmdbError
         "title": metadata.get("Name").cloned().unwrap_or(Value::Null),
         "original_title": metadata.get("OriginalTitle").cloned().unwrap_or(Value::Null),
         "overview": metadata.get("Overview").cloned().unwrap_or(Value::Null),
-        "release_date": date_from_year(&metadata.get("ProductionYear").cloned().unwrap_or(Value::Null)),
+        "premiere_date": premiere_date,
+        "last_air_date": metadata.get("EndDate").cloned().unwrap_or(Value::Null),
+        "status": metadata.get("Status").cloned().unwrap_or(Value::Null),
         "original_language": metadata.get("OriginalLanguage").cloned().unwrap_or(Value::Null),
+        "vote_average": metadata.get("Rating").cloned().unwrap_or(Value::Null),
         "belongs_to_collection": collection,
     }))
 }
@@ -665,6 +683,17 @@ impl ScraperProvider {
         } else {
             Self::Generic(client)
         }
+    }
+
+    pub fn selected_provider_entry<'a>(
+        &self,
+        result: &'a ScraperSearchResult,
+    ) -> Option<(&'a str, &'a str)> {
+        let provider = match self {
+            Self::Direct(_) | Self::Plugin(_) => "tmdb",
+            Self::Generic(client) => client.plugin_id(),
+        };
+        result.selected_provider_entry(provider)
     }
 }
 
@@ -935,6 +964,36 @@ async fn direct_get_generic(
             .await
             .map(movie_metadata_generic)
             .map_err(|error| ScraperError::Provider(error.to_string())),
+        ScraperItemType::Series => client
+            .series_details(id, &request.language)
+            .await
+            .map(series_metadata_generic)
+            .map_err(|error| ScraperError::Provider(error.to_string())),
+        ScraperItemType::Season => client
+            .season_details(
+                id,
+                request
+                    .season_number
+                    .ok_or_else(|| ScraperError::Provider("seasonNumber is required".to_owned()))?,
+                &request.language,
+            )
+            .await
+            .map(season_metadata_generic)
+            .map_err(|error| ScraperError::Provider(error.to_string())),
+        ScraperItemType::Episode => client
+            .episode_details(
+                id,
+                request
+                    .season_number
+                    .ok_or_else(|| ScraperError::Provider("seasonNumber is required".to_owned()))?,
+                request.episode_number.ok_or_else(|| {
+                    ScraperError::Provider("episodeNumber is required".to_owned())
+                })?,
+                &request.language,
+            )
+            .await
+            .map(episode_metadata_generic)
+            .map_err(|error| ScraperError::Provider(error.to_string())),
         ScraperItemType::BoxSet => client
             .collection_details(id, &request.language)
             .await
@@ -1002,10 +1061,17 @@ async fn direct_credits_generic(
         .provider_id
         .parse::<i64>()
         .map_err(|_| ScraperError::Provider("TMDb provider ID is invalid".to_owned()))?;
-    let response = client
-        .movie_credits(id, &request.language)
-        .await
-        .map_err(|error| ScraperError::Provider(error.to_string()))?;
+    let response = match request.item_type {
+        ScraperItemType::Movie => client.movie_credits(id, &request.language).await,
+        ScraperItemType::Series => client.tv_credits(id, &request.language).await,
+        item_type => {
+            return Err(ScraperError::Provider(format!(
+                "TMDb direct scraper does not support credits for {}",
+                item_type.as_str()
+            )));
+        }
+    }
+    .map_err(|error| ScraperError::Provider(error.to_string()))?;
     Ok(ScraperCreditsResponse {
         cast: response
             .cast
@@ -1034,6 +1100,7 @@ fn movie_search_generic(response: TmdbMovieSearchResponse) -> ScraperSearchRespo
                 production_year: result.release_date.as_deref().and_then(parse_year),
                 premiere_date: result.release_date,
                 original_language: result.original_language,
+                rating: result.vote_average,
                 provider_ids: BTreeMap::from([("Tmdb".to_owned(), result.id.to_string())]),
                 provider_name: Some("Tmdb".to_owned()),
                 image_url: None,
@@ -1056,6 +1123,7 @@ fn series_search_generic(response: TmdbTvSearchResponse) -> ScraperSearchRespons
                 production_year: result.first_air_date.as_deref().and_then(parse_year),
                 premiere_date: result.first_air_date,
                 original_language: result.original_language,
+                rating: result.vote_average,
                 provider_ids: BTreeMap::from([("Tmdb".to_owned(), result.id.to_string())]),
                 provider_name: Some("Tmdb".to_owned()),
                 image_url: result.poster_path.map(|path| tmdb_image_url(&path)),
@@ -1074,6 +1142,7 @@ fn movie_metadata_generic(details: TmdbMovieDetails) -> ScraperMetadata {
         production_year: details.release_date.as_deref().and_then(parse_year),
         premiere_date: details.release_date,
         original_language: details.original_language,
+        rating: details.vote_average,
         provider_ids: BTreeMap::from([("Tmdb".to_owned(), details.id.to_string())]),
         collection: details.belongs_to_collection.map(|collection| {
             crate::application::scraper::ScraperCollectionReference {
@@ -1081,6 +1150,45 @@ fn movie_metadata_generic(details: TmdbMovieDetails) -> ScraperMetadata {
                 name: collection.name,
             }
         }),
+        ..ScraperMetadata::default()
+    }
+}
+
+fn series_metadata_generic(details: TmdbSeriesDetails) -> ScraperMetadata {
+    ScraperMetadata {
+        item_type: Some("Series".to_owned()),
+        title: details.name,
+        original_title: details.original_name,
+        overview: details.overview,
+        production_year: details.first_air_date.as_deref().and_then(parse_year),
+        premiere_date: details.first_air_date,
+        end_date: details.last_air_date,
+        status: details.status,
+        original_language: details.original_language,
+        rating: details.vote_average,
+        provider_ids: BTreeMap::from([("Tmdb".to_owned(), details.id.to_string())]),
+        ..ScraperMetadata::default()
+    }
+}
+
+fn season_metadata_generic(details: TmdbSeasonDetails) -> ScraperMetadata {
+    ScraperMetadata {
+        item_type: Some("Season".to_owned()),
+        title: details.name,
+        overview: details.overview,
+        premiere_date: details.air_date,
+        provider_ids: BTreeMap::from([("Tmdb".to_owned(), details.id.to_string())]),
+        ..ScraperMetadata::default()
+    }
+}
+
+fn episode_metadata_generic(details: TmdbEpisodeDetails) -> ScraperMetadata {
+    ScraperMetadata {
+        item_type: Some("Episode".to_owned()),
+        title: details.name,
+        overview: details.overview,
+        premiere_date: details.air_date,
+        provider_ids: BTreeMap::from([("Tmdb".to_owned(), details.id.to_string())]),
         ..ScraperMetadata::default()
     }
 }

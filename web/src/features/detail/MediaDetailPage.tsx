@@ -128,12 +128,14 @@ export function MediaDetailPage() {
       <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
         <div className="lux-detail-grid">
-          <div className={`lux-detail-poster${isEpisode ? " is-landscape" : ""}`}>
-            {isEpisode && backdrop
-              ? <img src={backdrop} alt={`${mediaTitle(media)} 剧照`} />
-              : poster
-                ? <img src={poster} alt={`${mediaTitle(media)} 海报`} />
-                : <span><Sparkles size={32} />{mediaTitle(media)}</span>}
+          <div className="lux-detail-poster-column">
+            <div className={`lux-detail-poster${isEpisode ? " is-landscape" : ""}`}>
+              {isEpisode && backdrop
+                ? <img src={backdrop} alt={`${mediaTitle(media)} 剧照`} />
+                : poster
+                  ? <img src={poster} alt={`${mediaTitle(media)} 海报`} />
+                  : <span><Sparkles size={32} />{mediaTitle(media)}</span>}
+            </div>
           </div>
           <div className="lux-detail-copy">
             <div className="lux-detail-title-row">

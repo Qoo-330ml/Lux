@@ -50,11 +50,7 @@ describe("LibraryCard", () => {
   it("opens a custom context menu for whole-library operations", async () => {
     const reidentify = vi.spyOn(api, "startLibraryMetadataReidentify").mockResolvedValue({
       totalCount: 125,
-      jobCount: 2,
-      jobs: [
-        { id: "job-1", status: "QUEUED", totalCount: 100 },
-        { id: "job-2", status: "QUEUED", totalCount: 25 },
-      ],
+      job: { id: "job-1", status: "QUEUED", mode: "FILL_MISSING", totalCount: 125, processedCount: 0, createdAt: 0 },
     });
     const scan = vi.spyOn(api, "startAdminScan").mockResolvedValue({
       job: { id: "scan-job", libraryId: "library-1", jobType: "SCAN", status: "QUEUED" },
@@ -82,14 +78,14 @@ describe("LibraryCard", () => {
     });
 
     expect(contextMenuEvent.defaultPrevented).toBe(true);
-    expect(document.body.querySelector("[role=menu]")?.textContent).toContain("识别");
+    expect(document.body.querySelector("[role=menu]")?.textContent).toContain("元数据匹配");
     expect(document.body.querySelector("[role=menu]")?.textContent).toContain("扫描媒体库文件");
 
     await act(async () => {
       document.body.querySelector<HTMLButtonElement>("[data-library-action=reidentify]")?.click();
     });
     expect(reidentify).toHaveBeenCalledWith("library-1");
-    expect(container.querySelector("[role=status]")?.textContent).toContain("125");
+    expect(container.querySelector("[role=status]")?.textContent).toContain("元数据匹配");
 
     await act(async () => {
       container.querySelector<HTMLElement>(".lux-library-card")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 100, clientY: 120 }));

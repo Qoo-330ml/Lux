@@ -5,7 +5,10 @@ use crate::{
     application::recommendations::{
         RECOMMENDATION_CANDIDATE_POOL, current_day_bucket, daily_recommendation_items,
     },
-    storage::{CatalogFilterQuery, Database, StorageError, StoredCatalogRow},
+    storage::{
+        CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database, StorageError,
+        StoredCatalogRow,
+    },
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -18,11 +21,13 @@ pub struct CatalogFilter {
     pub descending: bool,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CatalogSort {
     #[default]
     Name,
     DateCreated,
+    PremiereDate,
+    Rating,
 }
 
 #[derive(Clone)]
@@ -91,7 +96,12 @@ impl CatalogService {
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
-            sort_by_date_created: matches!(filter.sort_by, CatalogSort::DateCreated),
+            sort_by: match filter.sort_by {
+                CatalogSort::Name => StorageCatalogSort::Name,
+                CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
+                CatalogSort::PremiereDate => StorageCatalogSort::PremiereDate,
+                CatalogSort::Rating => StorageCatalogSort::Rating,
+            },
             descending: filter.descending,
             offset,
             limit,
@@ -121,7 +131,12 @@ impl CatalogService {
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
-            sort_by_date_created: matches!(filter.sort_by, CatalogSort::DateCreated),
+            sort_by: match filter.sort_by {
+                CatalogSort::Name => StorageCatalogSort::Name,
+                CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
+                CatalogSort::PremiereDate => StorageCatalogSort::PremiereDate,
+                CatalogSort::Rating => StorageCatalogSort::Rating,
+            },
             descending: filter.descending,
             offset,
             limit,
@@ -482,7 +497,7 @@ pub fn normalize_search_like_query(value: &str) -> Option<String> {
     Some(format!("%{escaped}%"))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CatalogPage {
     pub items: Vec<CatalogItem>,
     pub total: i64,
@@ -490,7 +505,7 @@ pub struct CatalogPage {
     pub limit: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CatalogItem {
     pub id: String,
     pub library_id: String,
@@ -501,16 +516,18 @@ pub struct CatalogItem {
     pub episode_number: Option<i64>,
     pub title: String,
     pub sort_title: String,
-    pub last_air_date: Option<String>,
-    pub status: Option<String>,
-    pub original_language: Option<String>,
     pub original_title: Option<String>,
     pub overview: Option<String>,
     pub premiere_date: Option<String>,
+    pub last_air_date: Option<String>,
+    pub status: Option<String>,
+    pub original_language: Option<String>,
     pub provider_ids: BTreeMap<String, String>,
     pub season_count: Option<i64>,
     pub episode_count: Option<i64>,
     pub production_year: Option<i64>,
+    pub rating: Option<f64>,
+    pub rating_source: Option<String>,
     pub runtime_ticks: Option<i64>,
     pub poster_image_tag: Option<String>,
     pub fanart_image_tag: Option<String>,
@@ -563,19 +580,21 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     parent_id: row.parent_id.clone(),
                     series_id: row.series_id.clone(),
                     season_number: row.season_number,
-                    last_air_date: None,
-                    status: None,
-                    original_language: None,
                     episode_number: row.episode_number,
                     title: row.title.clone(),
                     sort_title: row.sort_title.clone(),
                     original_title: row.original_title.clone(),
                     overview: row.overview.clone(),
                     premiere_date: None,
+                    last_air_date: None,
+                    status: None,
+                    original_language: None,
                     provider_ids: BTreeMap::new(),
                     season_count: None,
                     episode_count: None,
                     production_year: row.production_year,
+                    rating: row.rating,
+                    rating_source: row.rating_source.clone(),
                     runtime_ticks: row.runtime_ticks,
                     poster_image_tag: row.poster_image_tag.clone(),
                     fanart_image_tag: row.fanart_image_tag.clone(),

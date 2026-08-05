@@ -8,6 +8,9 @@ use serde_json::Value;
 pub const PLUGIN_FORMAT_VERSION: u32 = 1;
 pub const PLUGIN_API_VERSION: u32 = 1;
 pub const PLUGIN_CATEGORY_SCRAPER: &str = "SCRAPER";
+pub const PLUGIN_CATEGORY_MEDIA: &str = "MEDIA";
+pub const PLUGIN_TYPE_MEDIA_PROBE: &str = "media_probe";
+pub const MEDIA_PROBE_CAPABILITY: &str = "media.probe";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,10 +66,30 @@ impl PluginManifest {
         validate_text("name", &self.name, 256)?;
         validate_semver(&self.version)?;
         validate_identifier("category", &self.category, 64)?;
-        if self.plugin_type != "metadata" {
-            return Err(PluginManifestError::Invalid(
-                "only metadata plugins are supported".to_owned(),
-            ));
+        match self.plugin_type.as_str() {
+            "metadata" => {}
+            PLUGIN_TYPE_MEDIA_PROBE => {
+                if self.category != PLUGIN_CATEGORY_MEDIA {
+                    return Err(PluginManifestError::Invalid(
+                        "media probe plugins must use the MEDIA category".to_owned(),
+                    ));
+                }
+                if !self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == MEDIA_PROBE_CAPABILITY)
+                {
+                    return Err(PluginManifestError::Invalid(
+                        "media probe plugins must declare media.probe".to_owned(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(PluginManifestError::Invalid(format!(
+                    "unsupported plugin type: {}",
+                    self.plugin_type
+                )));
+            }
         }
         self.runtime.validate()?;
         if self.supported_item_types.len() > 32 || self.capabilities.len() > 64 {
@@ -77,11 +100,29 @@ impl PluginManifest {
         for field in &self.config_fields {
             validate_identifier("config field key", &field.key, 64)?;
             validate_text("config field label", &field.label, 128)?;
-            if field.input_type != "text" && field.input_type != "password" {
+            if !matches!(
+                field.input_type.as_str(),
+                "text" | "password" | "select" | "toggle"
+            ) {
                 return Err(PluginManifestError::Invalid(format!(
                     "unsupported config field type: {}",
                     field.input_type
                 )));
+            }
+            if field.input_type == "select" {
+                if field.options.is_empty() || field.options.len() > 256 {
+                    return Err(PluginManifestError::Invalid(
+                        "select config field must declare 1 to 256 options".to_owned(),
+                    ));
+                }
+                for option in &field.options {
+                    validate_identifier("config option value", &option.value, 128)?;
+                    validate_text("config option label", &option.label, 128)?;
+                }
+            } else if field.multiple || !field.options.is_empty() {
+                return Err(PluginManifestError::Invalid(
+                    "only select config fields may declare options or multiple".to_owned(),
+                ));
             }
         }
         self.permissions.validate()?;
@@ -162,6 +203,17 @@ pub struct PluginConfigField {
     pub sensitive: bool,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub multiple: bool,
+    #[serde(default)]
+    pub options: Vec<PluginConfigOption>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginConfigOption {
+    pub value: String,
+    pub label: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -256,6 +308,37 @@ pub struct PluginResponse {
 pub struct PluginRpcError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaProbeRpcResult {
+    pub container: Option<String>,
+    pub source_size: Option<i64>,
+    pub duration_ticks: Option<i64>,
+    pub bitrate: Option<i64>,
+    pub streams: Vec<MediaProbeRpcStream>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaProbeRpcStream {
+    pub stream_index: i64,
+    pub stream_type: MediaProbeRpcStreamType,
+    pub codec: Option<String>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub is_default: bool,
+    pub is_forced: bool,
+    pub details: std::collections::BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MediaProbeRpcStreamType {
+    Video,
+    Audio,
+    Subtitle,
 }
 
 #[derive(Debug)]

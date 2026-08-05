@@ -30,6 +30,7 @@ use tower_http::{
 
 use crate::{
     COMMIT, VERSION,
+    application::danmaku::{DanmakuService, DanmakuServiceError, validate_provider_base_url},
     application::deletion::{MediaDeleteError, MediaDeleteService},
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
     application::playback::{ByteRange, RangeError, parse_single_range},
@@ -58,9 +59,14 @@ use crate::{
         people::{PeopleError, PeopleService},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
-        scanner::{ScanJobError, ScanJobService},
+        scanner::{ScanJob, ScanJobError, ScanJobService},
         scraper::ScraperResolver,
-        settings::{read_network_proxy_url_async, write_network_proxy_url},
+        settings::{
+            read_danmaku_provider_url_async, read_network_proxy_url_async,
+            write_danmaku_provider_url, write_network_proxy_url,
+        },
+        strm_probe::{StrmProbeError, StrmProbeService},
+        thumbnails::ThumbnailService,
         tmdb::{TmdbClient, TmdbError},
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
     },
@@ -105,7 +111,10 @@ pub struct AppState {
     metadata_reidentify: Option<MetadataReidentifyService>,
     deletion: Option<MediaDeleteService>,
     probe: Option<MediaProbeService>,
+    thumbnails: Option<ThumbnailService>,
     scan_jobs: Option<ScanJobService>,
+    strm_probe: Option<StrmProbeService>,
+    danmaku: Option<DanmakuService>,
     plugins: Option<PluginService>,
     scraper_resolver: Option<ScraperResolver>,
     tmdb: Option<TmdbProvider>,
@@ -194,7 +203,14 @@ impl AppState {
                 database.clone(),
                 FfprobeRunner::default(),
             )),
+            thumbnails: Some(ThumbnailService::new(database.clone())),
             scan_jobs: Some(ScanJobService::new(database.clone())),
+            strm_probe: Some(StrmProbeService::new(database.clone(), plugins.clone())),
+            danmaku: Some(DanmakuService::new(
+                database.clone(),
+                config_dir.clone(),
+                network_proxy_url.clone(),
+            )),
             plugins: Some(plugins),
             scraper_resolver: Some(scraper_resolver),
             tmdb: Some(tmdb),
@@ -251,6 +267,72 @@ impl AppState {
             let worker = service.clone();
             tokio::spawn(async move {
                 worker.run(&job_id).await;
+            });
+        }
+    }
+
+    pub async fn resume_scan_jobs(&self) {
+        let Some(service) = self.scan_jobs.clone() else {
+            return;
+        };
+        let Ok(job_ids) = service.active_job_ids().await else {
+            tracing::error!("failed to discover active scan jobs during startup");
+            return;
+        };
+        for job_id in job_ids {
+            let worker = service.clone();
+            let worker_probe = self.probe.clone();
+            let worker_metadata = self.metadata_reidentify.clone();
+            let worker_thumbnails = self.thumbnails.clone();
+            tokio::spawn(async move {
+                if let Err(error) = worker
+                    .run_to_completion_with_metadata_and_thumbnails(
+                        &job_id,
+                        100,
+                        worker_probe,
+                        worker_metadata,
+                        worker_thumbnails,
+                    )
+                    .await
+                {
+                    tracing::error!(job_id = %job_id, %error, "resumed scan job stopped");
+                }
+            });
+        }
+    }
+
+    pub async fn resume_strm_probe_jobs(&self) {
+        let Some(service) = self.strm_probe.clone() else {
+            return;
+        };
+        let Ok(job_ids) = service.active_job_ids().await else {
+            tracing::error!("failed to discover active STRM probe jobs during startup");
+            return;
+        };
+        for job_id in job_ids {
+            let worker = service.clone();
+            tokio::spawn(async move {
+                if let Err(error) = worker.run(&job_id).await {
+                    tracing::error!(job_id = %job_id, %error, "resumed STRM probe job stopped");
+                }
+            });
+        }
+    }
+
+    pub async fn resume_danmaku_match_jobs(&self) {
+        let Some(service) = self.danmaku.clone() else {
+            return;
+        };
+        let Ok(job_ids) = service.active_job_ids().await else {
+            tracing::error!("failed to discover active danmaku match jobs during startup");
+            return;
+        };
+        for job_id in job_ids {
+            let worker = service.clone();
+            tokio::spawn(async move {
+                if let Err(error) = worker.run(&job_id).await {
+                    tracing::error!(job_id = %job_id, %error, "resumed danmaku match job stopped");
+                }
             });
         }
     }
@@ -326,11 +408,15 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/api/v1/admin/metadata/reidentify",
-            post(admin_start_metadata_reidentify),
+            get(admin_list_metadata_reidentify).post(admin_start_metadata_reidentify),
         )
         .route(
             "/api/v1/admin/metadata/reidentify/{job_id}",
             get(admin_get_metadata_reidentify).post(admin_retry_metadata_reidentify),
+        )
+        .route(
+            "/api/v1/admin/metadata/reidentify/{job_id}/cancel",
+            post(admin_cancel_metadata_reidentify),
         )
         .route(
             "/api/v1/admin/items/{item_id}/identify/candidates",
@@ -351,6 +437,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/items/{item_id}/scan",
             post(admin_start_item_scan),
+        )
+        .route(
+            "/api/v1/admin/items/{item_id}/metadata/refresh",
+            post(admin_start_item_metadata_refresh),
         )
         .route(
             "/api/v1/admin/items/{item_id}/subtitles/{stream_index}",
@@ -396,10 +486,50 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/admin/jobs/{job_id}/retry", post(admin_retry_scan))
         .route("/api/v1/admin/jobs/{job_id}", get(admin_get_job))
         .route(
+            "/api/v1/admin/strm-probe-jobs",
+            get(admin_list_strm_probe_jobs).post(admin_start_strm_probe),
+        )
+        .route(
+            "/api/v1/admin/strm-probe-jobs/{job_id}",
+            get(admin_get_strm_probe_job),
+        )
+        .route(
+            "/api/v1/admin/strm-probe-jobs/{job_id}/cancel",
+            post(admin_cancel_strm_probe),
+        )
+        .route(
+            "/api/v1/admin/strm-probe-jobs/{job_id}/retry",
+            post(admin_retry_strm_probe),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}/danmaku/match",
+            post(admin_start_danmaku_match),
+        )
+        .route(
+            "/api/v1/admin/danmaku/match-jobs",
+            get(admin_list_danmaku_match_jobs),
+        )
+        .route(
+            "/api/v1/admin/danmaku/match-jobs/{job_id}",
+            get(admin_get_danmaku_match_job),
+        )
+        .route(
+            "/api/v1/admin/danmaku/match-jobs/{job_id}/cancel",
+            post(admin_cancel_danmaku_match),
+        )
+        .route(
+            "/api/v1/admin/danmaku/match-jobs/{job_id}/retry",
+            post(admin_retry_danmaku_match),
+        )
+        .route(
             "/api/v1/admin/jobs/{job_id}/events",
             get(admin_list_job_events),
         )
         .route("/api/v1/admin/jobs", get(admin_list_jobs))
+        .route(
+            "/api/v1/admin/scheduled-tasks",
+            get(admin_list_scheduled_tasks).put(admin_upsert_scheduled_task),
+        )
         .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
@@ -629,6 +759,8 @@ fn emby_routes() -> Router<AppState> {
         .route("/Search/Hints", get(emby_search_hints))
         .route("/Items/{item_id}", get(emby_item))
         .route("/Items/{item_id}/Children", get(emby_collection_children))
+        .route("/api/danmu/{item_id}", get(emby_danmaku_info))
+        .route("/api/danmu/{item_id}/raw", get(emby_danmaku_raw))
         .route(
             "/Items/{item_id}/Images/{image_type}",
             get(emby_image).head(emby_image),
@@ -682,6 +814,83 @@ fn emby_routes() -> Router<AppState> {
             post(emby_mark_favorite).delete(emby_unmark_favorite),
         )
         .route("/Sessions/Logout", post(emby_logout))
+}
+
+#[derive(Deserialize, Default)]
+struct DanmakuQuery {
+    #[serde(rename = "api_key")]
+    api_key: Option<String>,
+    option: Option<String>,
+}
+
+async fn emby_danmaku_info(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<DanmakuQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    match access.can_view_item(principal, &item_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(service) = state.danmaku.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.read_sidecar(&item_id).await {
+        Ok(Some(_)) => Json(json!({
+            "hasDanmaku": true,
+            "format": "xml",
+            "url": format!("/api/danmu/{item_id}/raw"),
+            "rawUrl": format!("/api/danmu/{item_id}/raw"),
+            "option": query.option,
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_danmaku_raw(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<DanmakuQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    match access.can_view_item(principal, &item_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(service) = state.danmaku.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.read_sidecar(&item_id).await {
+        Ok(Some(bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .header("Cache-Control", "private, no-cache")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn emby_public_system_info(State(state): State<AppState>) -> Json<Value> {
@@ -967,10 +1176,16 @@ fn catalog_filter_from_values(
         years,
         is_played,
         is_favorite,
-        sort_by: if sort_by.is_some_and(|value| value.eq_ignore_ascii_case("DateCreated")) {
-            CatalogSort::DateCreated
-        } else {
-            CatalogSort::Name
+        sort_by: match sort_by {
+            Some(value) if value.eq_ignore_ascii_case("DateCreated") => CatalogSort::DateCreated,
+            Some(value) if value.eq_ignore_ascii_case("PremiereDate") => CatalogSort::PremiereDate,
+            Some(value)
+                if value.eq_ignore_ascii_case("CommunityRating")
+                    || value.eq_ignore_ascii_case("Rating") =>
+            {
+                CatalogSort::Rating
+            }
+            _ => CatalogSort::Name,
         },
         descending: sort_order.is_some_and(|value| value.eq_ignore_ascii_case("Descending")),
     }
@@ -1738,16 +1953,46 @@ async fn lux_get_playback(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let user_id = user.id.to_string();
-    match database.find_user_item_state(&user_id, &item_id).await {
-        Ok(state) => Json(json!({
-            "itemId": item_id,
-            "positionTicks": state.as_ref().map(|value| value.position_ticks).unwrap_or_default(),
-            "isPlayed": state.as_ref().map(|value| value.is_played).unwrap_or(false),
-            "isFavorite": state.as_ref().map(|value| value.is_favorite).unwrap_or(false),
-            "playCount": state.as_ref().map(|value| value.play_count).unwrap_or_default(),
-        }))
-        .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let user_state = match database.find_user_item_state(&user_id, &item_id).await {
+        Ok(state) => state,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let active_session = match database
+        .find_active_playback_session(&user_id, &item_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(json!({
+        "itemId": item_id,
+        "positionTicks": user_state.as_ref().map(|value| value.position_ticks).unwrap_or_default(),
+        "isPlayed": user_state.as_ref().map(|value| value.is_played).unwrap_or(false),
+        "isFavorite": user_state.as_ref().map(|value| value.is_favorite).unwrap_or(false),
+        "playCount": user_state.as_ref().map(|value| value.play_count).unwrap_or_default(),
+        "state": active_session.as_ref().map(|value| value.state.as_str()),
+        "isPaused": active_session.as_ref().map(|value| value.is_paused).unwrap_or(false),
+        "lastEventAt": active_session.as_ref().map(|value| value.last_event_at),
+    }))
+    .into_response()
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum LuxPlaybackState {
+    #[default]
+    Playing,
+    Paused,
+    Stopped,
+}
+
+impl LuxPlaybackState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Playing => "PLAYING",
+            Self::Paused => "PAUSED",
+            Self::Stopped => "STOPPED",
+        }
     }
 }
 
@@ -1756,6 +2001,8 @@ async fn lux_get_playback(
 struct LuxProgressRequest {
     position_ticks: i64,
     duration_ticks: Option<i64>,
+    #[serde(default)]
+    state: LuxPlaybackState,
 }
 
 async fn lux_post_progress(
@@ -1790,6 +2037,7 @@ async fn lux_post_progress(
     };
     let user_id = user.id.to_string();
     let play_session_id = format!("lux-web:{user_id}:{item_id}");
+    let playback_state = request.state;
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -1799,10 +2047,10 @@ async fn lux_post_progress(
             device_id: "lux-web",
             client: Some("Lux"),
             device_name: Some("Web"),
-            state: "PLAYING",
+            state: playback_state.as_str(),
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
-            is_paused: false,
+            is_paused: matches!(playback_state, LuxPlaybackState::Paused),
         })
         .await
     {
@@ -2030,6 +2278,7 @@ fn emby_catalog_item_json_with_state(
         "ParentIndexNumber": item.season_number,
         "Index": item.episode_number,
         "ProductionYear": item.production_year,
+        "CommunityRating": item.rating,
         "Overview": item.overview,
         "RunTimeTicks": runtime_ticks,
         "Container": default_source.and_then(|source| source.container.clone()),
@@ -2252,7 +2501,7 @@ async fn version(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
 }
 
 async fn setup_status(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let Some(setup) = state.setup else {
+    let Some(setup) = state.setup.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -2300,7 +2549,7 @@ async fn setup_complete(
     State(state): State<AppState>,
     Json(request): Json<SetupCompleteRequest>,
 ) -> Response {
-    let Some(setup) = state.setup else {
+    let Some(setup) = state.setup.as_ref() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2379,9 +2628,17 @@ async fn setup_complete(
                         Err(error) => return library_error(&headers, error),
                     }
                 }
+                let scan_job = match spawn_library_scan(&state, library.id).await {
+                    Ok(job) => job,
+                    Err(error) => {
+                        tracing::warn!(library_id = %library.id, %error, "initial library scan could not be started");
+                        None
+                    }
+                };
                 library_json_value = Some(json!({
                     "library": library_json(&library, &roots),
                     "warnings": warnings,
+                    "scanJob": scan_job.as_ref().map(scan_job_json),
                 }));
             }
             let mut response = json!({
@@ -2391,6 +2648,7 @@ async fn setup_complete(
             if let Some(library) = library_json_value {
                 response["library"] = library["library"].clone();
                 response["warnings"] = library["warnings"].clone();
+                response["scanJob"] = library["scanJob"].clone();
             }
             (StatusCode::CREATED, Json(response)).into_response()
         }
@@ -2800,9 +3058,9 @@ struct LuxPageQuery {
     is_played: Option<bool>,
     #[serde(default)]
     is_favorite: Option<bool>,
-    #[serde(default)]
+    #[serde(rename = "sort_by", alias = "sortBy", default)]
     sort_by: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "sort_order", alias = "sortOrder", default)]
     sort_order: Option<String>,
 }
 
@@ -4405,7 +4663,7 @@ async fn serve_media_file(
     method: &Method,
     item_id: &str,
     media_source_id: Option<&str>,
-    requested_container: Option<&str>,
+    _requested_container: Option<&str>,
 ) -> Response {
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -4436,21 +4694,6 @@ async fn serve_media_file(
         Err(LocalPathError::Missing) => return StatusCode::NOT_FOUND.into_response(),
         Err(LocalPathError::Forbidden) => return StatusCode::FORBIDDEN.into_response(),
     };
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
-    if requested_container.is_some_and(|container| {
-        extension.as_deref()
-            != Some(
-                container
-                    .trim_start_matches('.')
-                    .to_ascii_lowercase()
-                    .as_str(),
-            )
-    }) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     serve_media_path(headers, method, &path).await
 }
 
@@ -4922,6 +5165,8 @@ fn lux_catalog_item_json(item: &CatalogItem) -> Value {
         "seasonCount": item.season_count,
         "episodeCount": item.episode_count,
         "productionYear": item.production_year,
+        "rating": item.rating,
+        "ratingSource": item.rating_source,
         "runtimeTicks": item.runtime_ticks,
         "imageTags": {
             "poster": item.poster_image_tag,
@@ -5107,6 +5352,14 @@ struct MetadataReidentifyRequest {
     item_ids: Vec<String>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MetadataReidentifyListQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    status: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum MetadataRefreshRequestMode {
@@ -5151,13 +5404,52 @@ async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Re
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let network_proxy = network_proxy_settings(&state).await;
+    let danmaku = danmaku_settings(&state).await;
     Json(json!({
         "resumePlayedPercent": played_percent,
         "resumeMinTicks": minimum_ticks,
         "mediaStrategy": media_strategy,
         "networkProxy": network_proxy,
+        "danmaku": danmaku,
     }))
     .into_response()
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DanmakuSettingsResponse {
+    configured: bool,
+    url: Option<String>,
+    source: &'static str,
+    restart_required: bool,
+}
+
+async fn danmaku_settings(state: &AppState) -> DanmakuSettingsResponse {
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return DanmakuSettingsResponse {
+            configured: false,
+            url: None,
+            source: "none",
+            restart_required: false,
+        };
+    };
+    if let Some(value) = read_danmaku_provider_url_async(config_dir).await {
+        let url = validate_provider_base_url(&value)
+            .ok()
+            .map(|value| value.redacted().to_owned());
+        return DanmakuSettingsResponse {
+            configured: url.is_some(),
+            url,
+            source: "settings",
+            restart_required: false,
+        };
+    }
+    DanmakuSettingsResponse {
+        configured: false,
+        url: None,
+        source: "none",
+        restart_required: false,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -5488,6 +5780,17 @@ async fn admin_update_settings(
         return response;
     }
     let requested_proxy = request.extra.get("networkProxyUrl").cloned();
+    let requested_danmaku = request
+        .extra
+        .get("danmakuProviderUrl")
+        .cloned()
+        .or_else(|| {
+            request
+                .extra
+                .get("danmaku")
+                .and_then(|value| value.get("providerBaseUrl"))
+                .cloned()
+        });
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -5565,6 +5868,45 @@ async fn admin_update_settings(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     }
+    if let Some(requested_danmaku) = requested_danmaku {
+        let Some(config_dir) = state.config_dir.as_deref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let provider_url = match requested_danmaku {
+            Value::Null => None,
+            Value::String(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    None
+                } else if validate_provider_base_url(value).is_err() {
+                    return api_error(
+                        &headers,
+                        StatusCode::BAD_REQUEST,
+                        lux::ApiErrorCode::InvalidRequest,
+                        "弹幕接口地址无效",
+                    )
+                    .into_response();
+                } else {
+                    Some(value.to_owned())
+                }
+            }
+            _ => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "弹幕接口地址无效",
+                )
+                .into_response();
+            }
+        };
+        if write_danmaku_provider_url(config_dir, provider_url.as_deref())
+            .await
+            .is_err()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
     match database
         .set_server_settings(percent, minimum_ticks, &media_strategy_json)
         .await
@@ -5584,6 +5926,7 @@ async fn admin_update_settings(
                 "resumeMinTicks": minimum_ticks,
                 "mediaStrategy": media_strategy,
                 "networkProxy": network_proxy_settings(&state).await,
+                "danmaku": danmaku_settings(&state).await,
             }))
             .into_response()
         }
@@ -5754,8 +6097,14 @@ async fn admin_start_scan(
     let worker = scan_jobs.clone();
     let job_id = job.id.clone();
     let probe = state.probe.clone();
+    let metadata = state.metadata_reidentify.clone();
+    let thumbnails = state.thumbnails.clone();
     tokio::spawn(async move {
-        let _ = worker.run_to_completion(&job_id, 100, probe).await;
+        let _ = worker
+            .run_to_completion_with_metadata_and_thumbnails(
+                &job_id, 100, probe, metadata, thumbnails,
+            )
+            .await;
     });
     let target_id = job.id.clone();
     record_audit_event(
@@ -5791,29 +6140,29 @@ async fn admin_start_library_reidentify(
         )
         .into_response();
     };
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+    let Some(reidentify) = state.metadata_reidentify.clone() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "刮削器重新识别服务尚未配置",
+            "元数据刮削器匹配服务尚未配置",
         )
         .into_response();
     };
-    let batch = match reidentify
-        .create_library_jobs(&library_id.to_string())
+    let job = match reidentify
+        .create_library_refresh_job(
+            &library_id.to_string(),
+            crate::application::reidentify::MetadataRefreshMode::FillMissing,
+        )
         .await
     {
-        Ok(batch) => batch,
+        Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    for job in &batch.jobs {
-        let worker = reidentify.clone();
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            worker.run(&job_id).await;
-        });
-    }
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        reidentify.run(&job_id).await;
+    });
     record_audit_event(
         &state,
         &headers,
@@ -5821,25 +6170,46 @@ async fn admin_start_library_reidentify(
         Some("library"),
         Some(&library_id.to_string()),
         &format!(
-            r#"{{"itemCount":{},"jobCount":{}}}"#,
-            batch.total_count,
-            batch.jobs.len()
+            r#"{{"itemCount":{},"jobId":"{}"}}"#,
+            job.total_count, job.id
         ),
     )
     .await;
     (
         StatusCode::ACCEPTED,
         Json(json!({
-            "totalCount": batch.total_count,
-            "jobCount": batch.jobs.len(),
-            "jobs": batch.jobs.iter().map(|job| json!({
-                "id": job.id,
-                "status": job.status,
-                "totalCount": job.total_count,
-            })).collect::<Vec<_>>(),
+            "totalCount": job.total_count,
+            "job": metadata_reidentify_job_json(&job),
         })),
     )
         .into_response()
+}
+
+async fn spawn_library_scan(
+    state: &AppState,
+    library_id: crate::domain::ids::LibraryId,
+) -> Result<Option<ScanJob>, ScanJobError> {
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return Ok(None);
+    };
+    let job = match scan_jobs.create_movie_scan_job(library_id).await {
+        Ok(job) => job,
+        Err(ScanJobError::AlreadyActive(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let worker = scan_jobs.clone();
+    let job_id = job.id.clone();
+    let probe = state.probe.clone();
+    let metadata = state.metadata_reidentify.clone();
+    let thumbnails = state.thumbnails.clone();
+    tokio::spawn(async move {
+        let _ = worker
+            .run_to_completion_with_metadata_and_thumbnails(
+                &job_id, 100, probe, metadata, thumbnails,
+            )
+            .await;
+    });
+    Ok(Some(job))
 }
 
 async fn admin_start_library_metadata_refresh(
@@ -5860,7 +6230,7 @@ async fn admin_start_library_metadata_refresh(
         )
         .into_response();
     };
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+    let Some(reidentify) = state.metadata_reidentify.clone() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5870,20 +6240,17 @@ async fn admin_start_library_metadata_refresh(
         .into_response();
     };
     let mode = request.mode.application_mode();
-    let batch = match reidentify
-        .create_library_refresh_jobs(&library_id.to_string(), mode)
+    let job = match reidentify
+        .create_library_refresh_job(&library_id.to_string(), mode)
         .await
     {
-        Ok(batch) => batch,
+        Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    for job in &batch.jobs {
-        let worker = reidentify.clone();
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            worker.run(&job_id).await;
-        });
-    }
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        reidentify.run(&job_id).await;
+    });
     record_audit_event(
         &state,
         &headers,
@@ -5891,9 +6258,9 @@ async fn admin_start_library_metadata_refresh(
         Some("library"),
         Some(&library_id.to_string()),
         &format!(
-            r#"{{"itemCount":{},"jobCount":{},"mode":"{}"}}"#,
-            batch.total_count,
-            batch.jobs.len(),
+            r#"{{"itemCount":{},"jobId":"{}","mode":"{}"}}"#,
+            job.total_count,
+            job.id,
             request.mode.as_str()
         ),
     )
@@ -5901,15 +6268,9 @@ async fn admin_start_library_metadata_refresh(
     (
         StatusCode::ACCEPTED,
         Json(json!({
-            "totalCount": batch.total_count,
-            "jobCount": batch.jobs.len(),
+            "totalCount": job.total_count,
             "mode": request.mode.as_str(),
-            "jobs": batch.jobs.iter().map(|job| json!({
-                "id": job.id,
-                "status": job.status,
-                "mode": job.mode,
-                "totalCount": job.total_count,
-            })).collect::<Vec<_>>(),
+            "job": metadata_reidentify_job_json(&job),
         })),
     )
         .into_response()
@@ -5949,6 +6310,69 @@ async fn admin_start_item_scan(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     admin_start_scan(headers, Path(library_id), State(state)).await
+}
+
+async fn admin_start_item_metadata_refresh(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MetadataRefreshRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(item_id) = item_id.parse::<crate::domain::ids::ItemId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(reidentify) = state.metadata_reidentify.clone() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据刷新服务尚未配置",
+        )
+        .into_response();
+    };
+    let mode = request.mode.application_mode();
+    let job = match reidentify
+        .create_item_refresh_job(&item_id.to_string(), mode)
+        .await
+    {
+        Ok(job) => job,
+        Err(error) => return metadata_reidentify_error(&headers, error),
+    };
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        reidentify.run(&job_id).await;
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "METADATA_REFRESH_STARTED",
+        Some("item"),
+        Some(&item_id.to_string()),
+        &format!(
+            r#"{{"jobId":"{}","mode":"{}"}}"#,
+            job.id,
+            request.mode.as_str()
+        ),
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "totalCount": job.total_count,
+            "mode": request.mode.as_str(),
+            "job": metadata_reidentify_job_json(&job),
+        })),
+    )
+        .into_response()
 }
 
 async fn admin_update_item_subtitle(
@@ -6217,6 +6641,414 @@ async fn admin_cancel_scan(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StrmProbeRequest {
+    #[serde(default)]
+    library_ids: Vec<String>,
+    #[serde(default = "default_strm_probe_concurrency")]
+    concurrency: i64,
+    #[serde(default)]
+    include_ready: bool,
+    #[serde(default)]
+    write_sidecars: bool,
+}
+
+const fn default_strm_probe_concurrency() -> i64 {
+    2
+}
+
+async fn admin_start_strm_probe(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<StrmProbeRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let library_ids = match request
+        .library_ids
+        .iter()
+        .map(|value| value.parse::<crate::domain::ids::LibraryId>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(ids) => ids,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.strm_probe.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let jobs = match service
+        .create_jobs(
+            &library_ids,
+            request.concurrency,
+            request.include_ready,
+            request.write_sidecars,
+        )
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(error) => return strm_probe_error(&headers, error),
+    };
+    for job in &jobs {
+        let worker = service.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = worker.run(&job_id).await {
+                tracing::error!(job_id = %job_id, %error, "STRM probe job stopped");
+            }
+        });
+    }
+    let operation_id = jobs
+        .first()
+        .map(|job| job.operation_id.clone())
+        .unwrap_or_default();
+    record_audit_event(
+        &state,
+        &headers,
+        "STRM_PROBE_STARTED",
+        Some("strm_probe_operation"),
+        Some(&operation_id),
+        &format!(r#"{{"jobCount":{}}}"#, jobs.len()),
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "operationId": operation_id,
+            "jobs": jobs,
+        })),
+    )
+        .into_response()
+}
+
+async fn admin_list_strm_probe_jobs(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let status = query.status.as_deref().map(str::to_ascii_uppercase);
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED"
+        )
+    }) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务状态无效",
+        )
+        .into_response();
+    }
+    let Some(service) = state.strm_probe.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.list(status.as_deref(), offset, limit).await {
+        Ok(jobs) => Json(json!({
+            "jobs": jobs,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => strm_probe_error(&headers, error),
+    }
+}
+
+async fn admin_get_strm_probe_job(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(service) = state.strm_probe.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.get(&job_id).await {
+        Ok(job) => Json(json!({ "job": job })).into_response(),
+        Err(error) => strm_probe_error(&headers, error),
+    }
+}
+
+async fn admin_cancel_strm_probe(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.strm_probe.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.cancel(&job_id).await {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "STRM_PROBE_CANCEL_REQUESTED",
+                Some("strm_probe_job"),
+                Some(&job_id),
+                "{}",
+            )
+            .await;
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(error) => strm_probe_error(&headers, error),
+    }
+}
+
+async fn admin_retry_strm_probe(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.strm_probe.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let job = match service.retry(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return strm_probe_error(&headers, error),
+    };
+    let worker = service.clone();
+    let new_job_id = job.id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = worker.run(&new_job_id).await {
+            tracing::error!(job_id = %new_job_id, %error, "retried STRM probe job stopped");
+        }
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "STRM_PROBE_RETRIED",
+        Some("strm_probe_job"),
+        Some(&job_id),
+        &format!(r#"{{"newJobId":"{}"}}"#, job.id),
+    )
+    .await;
+    (StatusCode::ACCEPTED, Json(json!({ "job": job }))).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DanmakuMatchRequest {
+    #[serde(default = "default_danmaku_concurrency")]
+    concurrency: i64,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+const fn default_danmaku_concurrency() -> i64 {
+    2
+}
+
+async fn admin_start_danmaku_match(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<DanmakuMatchRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(value) => value,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.danmaku.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let job = match service
+        .create_job(library_id, request.concurrency, request.overwrite)
+        .await
+    {
+        Ok(job) => job,
+        Err(error) => return danmaku_service_error(&headers, error),
+    };
+    let worker = service.clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = worker.run(&job_id).await {
+            tracing::error!(job_id = %job_id, %error, "danmaku match job stopped");
+        }
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "DANMAKU_MATCH_STARTED",
+        Some("danmaku_match_job"),
+        Some(&job.id),
+        "{}",
+    )
+    .await;
+    (StatusCode::ACCEPTED, Json(json!({ "job": job }))).into_response()
+}
+
+async fn admin_list_danmaku_match_jobs(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let status = query.status.as_deref().map(str::to_ascii_uppercase);
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED"
+        )
+    }) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务状态无效",
+        )
+        .into_response();
+    }
+    let Some(service) = state.danmaku.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.list(status.as_deref(), offset, limit).await {
+        Ok(jobs) => Json(json!({
+            "jobs": jobs,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => danmaku_service_error(&headers, error),
+    }
+}
+
+async fn admin_get_danmaku_match_job(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(service) = state.danmaku.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.get(&job_id).await {
+        Ok(job) => Json(json!({ "job": job })).into_response(),
+        Err(error) => danmaku_service_error(&headers, error),
+    }
+}
+
+async fn admin_cancel_danmaku_match(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.danmaku.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.cancel(&job_id).await {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "DANMAKU_MATCH_CANCEL_REQUESTED",
+                Some("danmaku_match_job"),
+                Some(&job_id),
+                "{}",
+            )
+            .await;
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(error) => danmaku_service_error(&headers, error),
+    }
+}
+
+async fn admin_retry_danmaku_match(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.danmaku.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let job = match service.retry(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return danmaku_service_error(&headers, error),
+    };
+    let worker = service.clone();
+    let new_job_id = job.id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = worker.run(&new_job_id).await {
+            tracing::error!(job_id = %new_job_id, %error, "retried danmaku match job stopped");
+        }
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "DANMAKU_MATCH_RETRIED",
+        Some("danmaku_match_job"),
+        Some(&job_id),
+        &format!(r#"{{"newJobId":"{}"}}"#, job.id),
+    )
+    .await;
+    (StatusCode::ACCEPTED, Json(json!({ "job": job }))).into_response()
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AdminJobsQuery {
@@ -6232,6 +7064,156 @@ struct AdminJobEventsQuery {
     page_size: Option<i64>,
     level: Option<String>,
     event_code: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AdminScheduledTasksQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminScheduledTaskRequest {
+    owner_type: String,
+    owner_id: String,
+    task_type: String,
+    schedule: Option<String>,
+    is_enabled: Option<bool>,
+}
+
+const LIBRARY_SCHEDULE_TASK_TYPES: [&str; 3] =
+    ["INCREMENTAL_SCAN", "RECONCILIATION_SCAN", "METADATA_PARSE"];
+
+async fn admin_list_scheduled_tasks(
+    headers: HeaderMap,
+    Query(query): Query<AdminScheduledTasksQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.list_scheduled_task_configs(offset, limit).await {
+        Ok((tasks, total)) => Json(json!({
+            "scheduledTasks": tasks.iter().map(scheduled_task_json).collect::<Vec<_>>(),
+            "total": total,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_upsert_scheduled_task(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<AdminScheduledTaskRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let owner_type = request.owner_type.trim().to_ascii_uppercase();
+    if owner_type != "LIBRARY" {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "当前只支持媒体库计划",
+        )
+        .into_response();
+    }
+    let task_type = request.task_type.trim().to_ascii_uppercase();
+    if !LIBRARY_SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务类型无效",
+        )
+        .into_response();
+    }
+    let library_id = match request
+        .owner_id
+        .trim()
+        .parse::<crate::domain::ids::LibraryId>()
+    {
+        Ok(id) => id,
+        Err(error) => {
+            return library_error(
+                &headers,
+                LibraryServiceError::InvalidLibraryId(error.to_string()),
+            );
+        }
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
+    let schedule = if enabled {
+        request.schedule.map(|value| value.trim().to_owned())
+    } else {
+        None
+    };
+    let mut settings = LibrarySettingsPatch::default();
+    match task_type.as_str() {
+        "INCREMENTAL_SCAN" => settings.incremental_schedule = Some(schedule),
+        "RECONCILIATION_SCAN" => settings.reconciliation_schedule = Some(schedule),
+        "METADATA_PARSE" => settings.metadata_schedule = Some(schedule),
+        _ => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "任务类型无效",
+            )
+            .into_response();
+        }
+    }
+    if let Err(error) = libraries.update_settings(library_id, settings).await {
+        return library_error(&headers, error);
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let task = match database
+        .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
+        .await
+    {
+        Ok(Some(task)) => task,
+        Ok(None) | Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let target_id = format!("{}:{}", library_id, task_type);
+    record_audit_event(
+        &state,
+        &headers,
+        "SCHEDULE_UPDATED",
+        Some("scheduled_task"),
+        Some(&target_id),
+        "{}",
+    )
+    .await;
+    (
+        StatusCode::OK,
+        Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
+    )
+        .into_response()
 }
 
 async fn admin_list_jobs(
@@ -6437,8 +7419,18 @@ async fn admin_retry_scan(
     let worker = scan_jobs.clone();
     let new_job_id = job.id.clone();
     let probe = state.probe.clone();
+    let metadata = state.metadata_reidentify.clone();
+    let thumbnails = state.thumbnails.clone();
     tokio::spawn(async move {
-        let _ = worker.run_to_completion(&new_job_id, 100, probe).await;
+        let _ = worker
+            .run_to_completion_with_metadata_and_thumbnails(
+                &new_job_id,
+                100,
+                probe,
+                metadata,
+                thumbnails,
+            )
+            .await;
     });
     record_audit_event(
         &state,
@@ -6468,6 +7460,26 @@ fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) -> Value {
         "totalCount": job.total_count,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
+    })
+}
+
+fn scheduled_task_json(task: &crate::storage::StoredScheduledTaskConfig) -> Value {
+    let resource_limit =
+        serde_json::from_str::<Value>(&task.resource_limit_json).unwrap_or_else(|_| json!({}));
+    let owner_name = task
+        .library_name
+        .clone()
+        .or_else(|| (task.owner_type == "GLOBAL").then(|| "全局".to_owned()));
+    json!({
+        "ownerType": task.owner_type,
+        "ownerId": task.owner_id,
+        "ownerName": owner_name,
+        "taskType": task.task_type,
+        "schedule": task.cron_or_interval,
+        "isEnabled": task.is_enabled,
+        "resourceLimit": resource_limit,
+        "createdAt": task.created_at,
+        "updatedAt": task.updated_at,
     })
 }
 
@@ -7082,6 +8094,58 @@ async fn admin_list_pending_metadata(
     }
 }
 
+async fn admin_list_metadata_reidentify(
+    headers: HeaderMap,
+    Query(query): Query<MetadataReidentifyListQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let status = query.status.as_deref().map(str::to_ascii_uppercase);
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "QUEUED" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED"
+        )
+    }) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "元数据任务状态无效",
+        )
+        .into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .list_metadata_reidentify_jobs(status.as_deref(), offset, limit)
+        .await
+    {
+        Ok(jobs) => Json(json!({
+            "jobs": jobs.iter().map(metadata_reidentify_job_summary_json).collect::<Vec<_>>(),
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn admin_start_metadata_reidentify(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -7108,7 +8172,7 @@ async fn admin_start_metadata_reidentify(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "刮削器重新识别服务尚未配置",
+            "元数据刮削器匹配服务尚未配置",
         )
         .into_response();
     };
@@ -7150,7 +8214,7 @@ async fn admin_get_metadata_reidentify(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "刮削器重新识别服务尚未配置",
+            "元数据刮削器匹配服务尚未配置",
         )
         .into_response();
     };
@@ -7173,7 +8237,7 @@ async fn admin_retry_metadata_reidentify(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "刮削器重新识别服务尚未配置",
+            "元数据刮削器匹配服务尚未配置",
         )
         .into_response();
     };
@@ -7200,6 +8264,40 @@ async fn admin_retry_metadata_reidentify(
         Json(json!({ "job": metadata_reidentify_job_json(&job) })),
     )
         .into_response()
+}
+
+async fn admin_cancel_metadata_reidentify(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据刮削器匹配服务尚未配置",
+        )
+        .into_response();
+    };
+    match reidentify.cancel(&job_id).await {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "METADATA_REIDENTIFY_CANCELLED",
+                Some("metadata_reidentify_job"),
+                Some(&job_id),
+                "{}",
+            )
+            .await;
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(error) => metadata_reidentify_error(&headers, error),
+    }
 }
 
 async fn admin_list_item_candidates(
@@ -7611,7 +8709,7 @@ fn image_candidate_error(headers: &HeaderMap, error: ImageCandidateError) -> Res
             headers,
             StatusCode::CONFLICT,
             lux::ApiErrorCode::InvalidRequest,
-            "媒体条目尚未识别，暂时无法搜索图片",
+            "媒体条目尚未完成元数据匹配，暂时无法搜索图片",
         )
         .into_response(),
         ImageCandidateError::InvalidItem
@@ -7730,6 +8828,7 @@ fn metadata_reidentify_job_json(
         "updatedAt": job.updated_at,
         "startedAt": job.started_at,
         "finishedAt": job.finished_at,
+        "cancelRequested": job.cancel_requested,
         "items": job.items.iter().map(|item| json!({
             "jobId": item.job_id,
             "itemId": item.item_id,
@@ -7738,6 +8837,24 @@ fn metadata_reidentify_job_json(
             "error": item.error,
             "updatedAt": item.updated_at,
         })).collect::<Vec<_>>(),
+    })
+}
+
+fn metadata_reidentify_job_summary_json(
+    job: &crate::storage::StoredMetadataReidentifyJob,
+) -> Value {
+    json!({
+        "id": job.id,
+        "status": job.status,
+        "mode": job.mode,
+        "processedCount": job.processed_count,
+        "totalCount": job.total_count,
+        "error": job.error,
+        "createdAt": job.created_at,
+        "updatedAt": job.updated_at,
+        "startedAt": job.started_at,
+        "finishedAt": job.finished_at,
+        "cancelRequested": job.cancel_requested,
     })
 }
 
@@ -7753,7 +8870,7 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
             headers,
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
-            "批量重新识别请求无效",
+            "批量元数据匹配请求无效",
         )
         .into_response(),
         MetadataReidentifyError::ItemNotFound(_)
@@ -7762,14 +8879,21 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
             headers,
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
-            "媒体条目或重新识别任务不存在",
+            "媒体条目或元数据匹配任务不存在",
         )
         .into_response(),
         MetadataReidentifyError::JobNotRetryable => api_error(
             headers,
             StatusCode::CONFLICT,
             lux::ApiErrorCode::InvalidRequest,
-            "该批量重新识别任务当前不可重试",
+            "该批量元数据匹配任务当前不可重试",
+        )
+        .into_response(),
+        MetadataReidentifyError::JobNotCancelable => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "该批量元数据匹配任务当前不可取消",
         )
         .into_response(),
         MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => {
@@ -7792,7 +8916,7 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "批量重新识别暂时不可用",
+            "批量元数据匹配暂时不可用",
         )
         .into_response(),
     }
@@ -7955,7 +9079,18 @@ async fn admin_install_plugin(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginConfigRequest {
-    api_key: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    preferred_language: Option<String>,
+    #[serde(default)]
+    language_fallback_enabled: Option<bool>,
+    #[serde(default)]
+    fallback_languages: Option<Vec<String>>,
+    #[serde(default)]
+    alternate_api_enabled: Option<bool>,
+    #[serde(default)]
+    api_base_url: Option<String>,
 }
 
 async fn admin_update_plugin_config(
@@ -7976,16 +9111,30 @@ async fn admin_update_plugin_config(
         )
         .into_response();
     };
-    let api_key = request.api_key.trim();
-    let result = plugins.update_config(&plugin_id, api_key).await;
+    let api_key = request.api_key.as_deref().map(str::trim);
+    let result = plugins
+        .update_config(
+            &plugin_id,
+            crate::application::plugins::TmdbConfigUpdate {
+                api_key,
+                preferred_language: request.preferred_language.as_deref(),
+                language_fallback_enabled: request.language_fallback_enabled,
+                fallback_languages: request.fallback_languages,
+                alternate_api_enabled: request.alternate_api_enabled,
+                api_base_url: request.api_base_url.as_deref(),
+            },
+        )
+        .await;
     match result {
         Ok(plugin) => {
             if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID
                 || plugin_id == crate::application::plugins::TMDB_DYNAMIC_PLUGIN_ID
             {
                 if let Some(tmdb) = state.tmdb.as_ref() {
-                    tmdb.set_api_key((!api_key.is_empty()).then_some(api_key))
-                        .await;
+                    if let Some(api_key) = api_key {
+                        tmdb.set_api_key((!api_key.is_empty()).then_some(api_key))
+                            .await;
+                    }
                 }
                 plugins.restart(&plugin_id).await;
             }
@@ -8388,11 +9537,19 @@ async fn admin_add_library_root(
                 "{}",
             )
             .await;
+            let scan_job = match spawn_library_scan(&state, library_id).await {
+                Ok(job) => job,
+                Err(error) => {
+                    tracing::warn!(library_id = %target_id, %error, "library root added but automatic scan could not be started");
+                    None
+                }
+            };
             (
                 StatusCode::CREATED,
                 Json(json!({
                     "root": root_json(&result.root),
-                    "warnings": result.warnings.iter().map(|warning| warning.as_str()).collect::<Vec<_>>()
+                    "warnings": result.warnings.iter().map(|warning| warning.as_str()).collect::<Vec<_>>(),
+                    "scanJob": scan_job.as_ref().map(scan_job_json),
                 })),
             )
                 .into_response()
@@ -8543,11 +9700,102 @@ fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
             "插件进程暂时不可用",
         )
         .into_response(),
+        PluginServiceError::InvalidResponse => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            "插件返回的数据无效",
+        )
+        .into_response(),
         PluginServiceError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
             "数据库暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+fn danmaku_service_error(headers: &HeaderMap, error: DanmakuServiceError) -> Response {
+    match error {
+        DanmakuServiceError::InvalidConcurrency
+        | DanmakuServiceError::InvalidProviderUrl(_)
+        | DanmakuServiceError::ProviderNotConfigured => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "弹幕匹配配置无效或尚未配置",
+        )
+        .into_response(),
+        DanmakuServiceError::AlreadyActive => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "已有弹幕匹配任务运行",
+        )
+        .into_response(),
+        DanmakuServiceError::LibraryNotFound
+        | DanmakuServiceError::SourceNotFound
+        | DanmakuServiceError::JobNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "弹幕匹配对象不存在",
+        )
+        .into_response(),
+        DanmakuServiceError::NotRetryable => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "弹幕匹配任务当前不可重试",
+        )
+        .into_response(),
+        DanmakuServiceError::WorkerFailed | DanmakuServiceError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "弹幕匹配服务暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+fn strm_probe_error(headers: &HeaderMap, error: StrmProbeError) -> Response {
+    match error {
+        StrmProbeError::InvalidLibraryCount | StrmProbeError::InvalidConcurrency => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "STRM 探测参数无效",
+        )
+        .into_response(),
+        StrmProbeError::AlreadyActive => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "已有 STRM 探测任务运行",
+        )
+        .into_response(),
+        StrmProbeError::NotRetryable => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务当前不可重试",
+        )
+        .into_response(),
+        StrmProbeError::LibraryNotFound | StrmProbeError::JobNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "STRM 探测对象不存在",
+        )
+        .into_response(),
+        StrmProbeError::WorkerFailed | StrmProbeError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "STRM 探测服务暂时不可用",
         )
         .into_response(),
     }
@@ -8587,7 +9835,13 @@ fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
             "required": field.required,
             "sensitive": field.sensitive,
             "description": field.description,
+            "multiple": field.multiple,
+            "options": field.options.iter().map(|option| json!({
+                "value": option.value,
+                "label": option.label,
+            })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
+        "configValues": plugin.config_values,
         "configSource": plugin.config_source,
     })
 }

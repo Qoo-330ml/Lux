@@ -44,6 +44,7 @@ describe("ContinueWatchingRail", () => {
     });
 
     expect(container.querySelector("h2")?.textContent).toBe("继续观看");
+    expect(container.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
     expect(container.querySelector<HTMLAnchorElement>(".lux-continue-card")?.getAttribute("href")).toBe(
       "/watch/episode-1",
     );
@@ -71,6 +72,7 @@ describe("ContinueWatchingRail", () => {
     });
 
     const badge = container.querySelector(".lux-media-card .lux-rating");
+    expect(container.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
     expect(badge?.textContent).toBe("7.6");
     expect(badge?.classList.contains("is-compact")).toBe(true);
     expect(badge?.querySelector(".lux-rating-source")).toBeNull();

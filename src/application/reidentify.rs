@@ -1,5 +1,6 @@
 use std::fmt;
 
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::{
@@ -13,6 +14,9 @@ use crate::{
     },
     storage::{Database, StorageError, StoredMetadataReidentifyItem},
 };
+
+pub const METADATA_MATCH_CONCURRENCY: usize = 16;
+const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataRefreshMode {
@@ -104,6 +108,24 @@ impl MetadataReidentifyService {
             .await
     }
 
+    pub async fn create_item_refresh_job(
+        &self,
+        item_id: &str,
+        mode: MetadataRefreshMode,
+    ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
+        if matches!(mode, MetadataRefreshMode::Reidentify) {
+            return Err(MetadataReidentifyError::InvalidRefreshMode);
+        }
+        let item_ids = self
+            .database
+            .list_metadata_refresh_item_ids(item_id)
+            .await?;
+        if item_ids.is_empty() {
+            return Err(MetadataReidentifyError::ItemNotFound(item_id.to_owned()));
+        }
+        self.create_job_with_mode(item_ids, mode).await
+    }
+
     async fn create_job_with_mode(
         &self,
         item_ids: Vec<String>,
@@ -135,55 +157,30 @@ impl MetadataReidentifyService {
         self.get_job(&job_id).await
     }
 
-    pub async fn create_library_jobs(
+    pub async fn create_library_job(
         &self,
         library_id: &str,
-    ) -> Result<MetadataReidentifyBatch, MetadataReidentifyError> {
-        let Some(library) = self.database.find_library(library_id).await? else {
-            return Err(MetadataReidentifyError::ItemNotFound(library_id.to_owned()));
-        };
-        if !library.is_enabled {
-            return Err(MetadataReidentifyError::ItemNotFound(library_id.to_owned()));
-        }
-        let mut item_ids = Vec::new();
-        let mut offset = 0_i64;
-        loop {
-            let page = self
-                .database
-                .list_media_item_ids_for_library(library_id, offset, 500)
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            let page_len = i64::try_from(page.len()).unwrap_or(500);
-            item_ids.extend(page);
-            offset = offset.saturating_add(page_len);
-            if page_len < 500 {
-                break;
-            }
-        }
-        if item_ids.is_empty() {
-            return Err(MetadataReidentifyError::InvalidItemCount);
-        }
-        let total_count = i64::try_from(item_ids.len()).unwrap_or(i64::MAX);
-        let mut jobs = Vec::new();
-        for chunk in item_ids.chunks(100) {
-            jobs.push(
-                self.create_job_with_mode(chunk.to_vec(), MetadataRefreshMode::Reidentify)
-                    .await?,
-            );
-        }
-        Ok(MetadataReidentifyBatch { jobs, total_count })
+    ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
+        self.create_library_job_with_mode(library_id, MetadataRefreshMode::Reidentify)
+            .await
     }
 
-    pub async fn create_library_refresh_jobs(
+    pub async fn create_library_refresh_job(
         &self,
         library_id: &str,
         mode: MetadataRefreshMode,
-    ) -> Result<MetadataReidentifyBatch, MetadataReidentifyError> {
+    ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         if matches!(mode, MetadataRefreshMode::Reidentify) {
             return Err(MetadataReidentifyError::InvalidRefreshMode);
         }
+        self.create_library_job_with_mode(library_id, mode).await
+    }
+
+    async fn create_library_job_with_mode(
+        &self,
+        library_id: &str,
+        mode: MetadataRefreshMode,
+    ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         let Some(library) = self.database.find_library(library_id).await? else {
             return Err(MetadataReidentifyError::ItemNotFound(library_id.to_owned()));
         };
@@ -210,12 +207,11 @@ impl MetadataReidentifyService {
         if item_ids.is_empty() {
             return Err(MetadataReidentifyError::InvalidItemCount);
         }
-        let total_count = i64::try_from(item_ids.len()).unwrap_or(i64::MAX);
-        let mut jobs = Vec::new();
-        for chunk in item_ids.chunks(100) {
-            jobs.push(self.create_job_with_mode(chunk.to_vec(), mode).await?);
-        }
-        Ok(MetadataReidentifyBatch { jobs, total_count })
+        let job_id = Uuid::now_v7().to_string();
+        self.database
+            .create_metadata_reidentify_library_job(&job_id, &item_ids, mode.as_str())
+            .await?;
+        self.get_job(&job_id).await
     }
 
     pub async fn run(&self, job_id: &str) {
@@ -225,6 +221,13 @@ impl MetadataReidentifyService {
         if matches!(job.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") {
             return;
         }
+        if job.cancel_requested {
+            let _ = self
+                .database
+                .finish_metadata_reidentify_job(job_id, "CANCELLED", None)
+                .await;
+            return;
+        }
         if job.status == "QUEUED"
             && !self
                 .database
@@ -232,9 +235,38 @@ impl MetadataReidentifyService {
                 .await
                 .unwrap_or(false)
         {
+            if self
+                .database
+                .metadata_reidentify_job_cancel_requested(job_id)
+                .await
+                .unwrap_or(true)
+            {
+                let _ = self
+                    .database
+                    .finish_metadata_reidentify_job(job_id, "CANCELLED", None)
+                    .await;
+            }
             return;
         }
-        while let Ok(Some(item_id)) = self.database.next_metadata_reidentify_item(job_id).await {
+        let mode = match job.mode.as_str() {
+            "FILL_MISSING" => MetadataRefreshMode::FillMissing,
+            "FULL_REFRESH" => MetadataRefreshMode::FullRefresh,
+            _ => MetadataRefreshMode::Reidentify,
+        };
+        let mut workers = JoinSet::new();
+        while workers.len() < METADATA_MATCH_CONCURRENCY {
+            if self
+                .database
+                .metadata_reidentify_job_cancel_requested(job_id)
+                .await
+                .unwrap_or(true)
+            {
+                break;
+            }
+            let Ok(Some(item_id)) = self.database.next_metadata_reidentify_item(job_id).await
+            else {
+                break;
+            };
             if !self
                 .database
                 .claim_metadata_reidentify_item(job_id, &item_id)
@@ -243,60 +275,58 @@ impl MetadataReidentifyService {
             {
                 continue;
             }
-            let result = match self.database.find_media_item_metadata(&item_id).await {
-                Ok(Some(item)) => {
-                    if item.title.trim().is_empty() {
-                        Err(MetadataReidentifyError::InvalidSearch)
-                    } else {
-                        let mode = match job.mode.as_str() {
-                            "FILL_MISSING" => MetadataRefreshMode::FillMissing,
-                            "FULL_REFRESH" => MetadataRefreshMode::FullRefresh,
-                            _ => MetadataRefreshMode::Reidentify,
-                        };
-                        match self
-                            .provider_for_item_with_requirement(
-                                &item_id,
-                                !matches!(mode, MetadataRefreshMode::Reidentify),
-                            )
-                            .await
-                        {
-                            Ok(Some(provider)) => {
-                                self.refresh_item(&item_id, &item, mode, &provider).await
-                            }
-                            Ok(None) => Ok(0),
-                            Err(error) => Err(MetadataReidentifyError::Scraper(error)),
-                        }
-                    }
+            let service = self.clone();
+            let job_id = job_id.to_owned();
+            workers.spawn(async move {
+                service.process_item(&job_id, &item_id, mode).await;
+            });
+        }
+        while workers.join_next().await.is_some() {
+            while workers.len() < METADATA_MATCH_CONCURRENCY {
+                if self
+                    .database
+                    .metadata_reidentify_job_cancel_requested(job_id)
+                    .await
+                    .unwrap_or(true)
+                {
+                    break;
                 }
-                Ok(None) => Err(MetadataReidentifyError::ItemNotFound(item_id.clone())),
-                Err(error) => Err(MetadataReidentifyError::Storage(error)),
-            };
-            match result {
-                Ok(candidate_count) => {
-                    let _ = self
-                        .database
-                        .finish_metadata_reidentify_item(
-                            job_id,
-                            &item_id,
-                            "COMPLETED",
-                            candidate_count,
-                            None,
-                        )
-                        .await;
+                let Ok(Some(item_id)) = self.database.next_metadata_reidentify_item(job_id).await
+                else {
+                    break;
+                };
+                if !self
+                    .database
+                    .claim_metadata_reidentify_item(job_id, &item_id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
                 }
-                Err(error) => {
-                    let code = error.code();
-                    let _ = self
-                        .database
-                        .finish_metadata_reidentify_item(job_id, &item_id, "FAILED", 0, Some(code))
-                        .await;
-                }
+                let service = self.clone();
+                let job_id = job_id.to_owned();
+                workers.spawn(async move {
+                    service.process_item(&job_id, &item_id, mode).await;
+                });
             }
         }
-        let status = match self.database.list_metadata_reidentify_items(job_id).await {
-            Ok(items) if items.iter().any(|item| item.status == "FAILED") => "FAILED",
-            Ok(_) => "COMPLETED",
-            Err(_) => "FAILED",
+        let status = if self
+            .database
+            .metadata_reidentify_job_cancel_requested(job_id)
+            .await
+            .unwrap_or(true)
+        {
+            "CANCELLED"
+        } else {
+            match self
+                .database
+                .metadata_reidentify_job_has_failed_items(job_id)
+                .await
+            {
+                Ok(true) => "FAILED",
+                Ok(false) => "COMPLETED",
+                Err(_) => "FAILED",
+            }
         };
         let _ = self
             .database
@@ -306,6 +336,53 @@ impl MetadataReidentifyService {
                 (status == "FAILED").then_some("ITEM_FAILED"),
             )
             .await;
+    }
+
+    async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
+        let result = match self.database.find_media_item_metadata(item_id).await {
+            Ok(Some(item)) => {
+                if item.title.trim().is_empty() {
+                    Err(MetadataReidentifyError::InvalidSearch)
+                } else {
+                    match self
+                        .provider_for_item_with_requirement(
+                            item_id,
+                            !matches!(mode, MetadataRefreshMode::Reidentify),
+                        )
+                        .await
+                    {
+                        Ok(Some(provider)) => {
+                            self.refresh_item(item_id, &item, mode, &provider).await
+                        }
+                        Ok(None) => Ok(0),
+                        Err(error) => Err(MetadataReidentifyError::Scraper(error)),
+                    }
+                }
+            }
+            Ok(None) => Err(MetadataReidentifyError::ItemNotFound(item_id.to_owned())),
+            Err(error) => Err(MetadataReidentifyError::Storage(error)),
+        };
+        match result {
+            Ok(candidate_count) => {
+                let _ = self
+                    .database
+                    .finish_metadata_reidentify_item(
+                        job_id,
+                        item_id,
+                        "COMPLETED",
+                        candidate_count,
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                let code = error.code();
+                let _ = self
+                    .database
+                    .finish_metadata_reidentify_item(job_id, item_id, "FAILED", 0, Some(code))
+                    .await;
+            }
+        }
     }
 
     async fn provider_for_item_with_requirement(
@@ -381,7 +458,10 @@ impl MetadataReidentifyService {
         let Some(job) = self.database.find_metadata_reidentify_job(job_id).await? else {
             return Err(MetadataReidentifyError::JobNotFound);
         };
-        let items = self.database.list_metadata_reidentify_items(job_id).await?;
+        let items = self
+            .database
+            .list_metadata_reidentify_items(job_id, 0, METADATA_JOB_ITEM_PAGE_SIZE)
+            .await?;
         Ok(MetadataReidentifyJob {
             id: job.id,
             status: job.status,
@@ -394,7 +474,25 @@ impl MetadataReidentifyService {
             started_at: job.started_at,
             finished_at: job.finished_at,
             items: items.into_iter().map(metadata_reidentify_item).collect(),
+            cancel_requested: job.cancel_requested,
         })
+    }
+
+    pub async fn cancel(&self, job_id: &str) -> Result<(), MetadataReidentifyError> {
+        let Some(job) = self.database.find_metadata_reidentify_job(job_id).await? else {
+            return Err(MetadataReidentifyError::JobNotFound);
+        };
+        if !matches!(job.status.as_str(), "QUEUED" | "RUNNING") {
+            return Err(MetadataReidentifyError::JobNotCancelable);
+        }
+        if !self
+            .database
+            .request_metadata_reidentify_job_cancel(job_id)
+            .await?
+        {
+            return Err(MetadataReidentifyError::JobNotCancelable);
+        }
+        Ok(())
     }
 
     pub async fn retry_job(
@@ -402,7 +500,9 @@ impl MetadataReidentifyService {
         job_id: &str,
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         let job = self.get_job(job_id).await?;
-        if job.status != "FAILED" || !self.database.retry_metadata_reidentify_job(job_id).await? {
+        if !matches!(job.status.as_str(), "FAILED" | "CANCELLED")
+            || !self.database.retry_metadata_reidentify_job(job_id).await?
+        {
             return Err(MetadataReidentifyError::JobNotRetryable);
         }
         self.get_job(job_id).await
@@ -413,12 +513,6 @@ impl MetadataReidentifyService {
             .list_active_metadata_reidentify_job_ids()
             .await
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetadataReidentifyBatch {
-    pub jobs: Vec<MetadataReidentifyJob>,
-    pub total_count: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -434,6 +528,7 @@ pub struct MetadataReidentifyJob {
     pub finished_at: Option<i64>,
     pub mode: String,
     pub items: Vec<MetadataReidentifyItem>,
+    pub cancel_requested: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -454,6 +549,7 @@ pub enum MetadataReidentifyError {
     ItemNotFound(String),
     JobNotFound,
     JobNotRetryable,
+    JobNotCancelable,
     Candidate(MetadataCandidateError),
     Scraper(ScraperError),
     Selection(MetadataSelectionError),
@@ -471,6 +567,7 @@ impl MetadataReidentifyError {
             Self::ItemNotFound(_) => "ITEM_NOT_FOUND",
             Self::JobNotFound => "JOB_NOT_FOUND",
             Self::JobNotRetryable => "JOB_NOT_RETRYABLE",
+            Self::JobNotCancelable => "JOB_NOT_CANCELABLE",
             Self::Candidate(MetadataCandidateError::Tmdb(_)) => "TMDB_UNAVAILABLE",
             Self::Candidate(MetadataCandidateError::InvalidSearch) => "INVALID_SEARCH",
             Self::Candidate(_) => "CANDIDATE_ERROR",
@@ -495,6 +592,9 @@ impl fmt::Display for MetadataReidentifyError {
             Self::JobNotFound => formatter.write_str("metadata reidentify job not found"),
             Self::JobNotRetryable => {
                 formatter.write_str("metadata reidentify job is not retryable")
+            }
+            Self::JobNotCancelable => {
+                formatter.write_str("metadata reidentify job is not cancelable")
             }
             Self::Candidate(error) => error.fmt(formatter),
             Self::Scraper(error) => error.fmt(formatter),

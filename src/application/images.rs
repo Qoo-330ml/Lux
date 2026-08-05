@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
     application::{
+        metadata::series_directory,
         scraper::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperResolver,
         },
@@ -270,15 +271,7 @@ impl ImageWriteService {
         }
         validate_image_payload(format, &body)?;
 
-        let directory = self.media_directory(item_id).await?;
-        let root = self
-            .database
-            .find_metadata_writeback_source_path(item_id)
-            .await?
-            .ok_or(ImageWriteError::ItemNotFound)?;
-        let root = fs::canonicalize(&root.root_path)
-            .await
-            .map_err(|error| image_io_error(Path::new(&root.root_path), error))?;
+        let (root, directory) = self.writeback_paths(item_id).await?;
         let target = image_target(&directory, image_type, format).await?;
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
@@ -376,11 +369,31 @@ impl ImageWriteService {
     }
 
     async fn media_directory(&self, item_id: &str) -> Result<PathBuf, ImageWriteError> {
-        let source = self
+        self.writeback_paths(item_id)
+            .await
+            .map(|(_, directory)| directory)
+    }
+
+    async fn writeback_paths(&self, item_id: &str) -> Result<(PathBuf, PathBuf), ImageWriteError> {
+        let kind = self
             .database
-            .find_metadata_writeback_source_path(item_id)
+            .find_media_item_kind(item_id)
             .await?
             .ok_or(ImageWriteError::ItemNotFound)?;
+        let item_type = kind.item_type;
+        let source = match item_type.as_str() {
+            "SERIES" | "SEASON" => {
+                self.database
+                    .find_first_episode_source_path(item_id)
+                    .await?
+            }
+            _ => {
+                self.database
+                    .find_metadata_writeback_source_path(item_id)
+                    .await?
+            }
+        }
+        .ok_or(ImageWriteError::ItemNotFound)?;
         let root = fs::canonicalize(&source.root_path)
             .await
             .map_err(|error| image_io_error(Path::new(&source.root_path), error))?;
@@ -391,16 +404,22 @@ impl ImageWriteService {
         if !media_path.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(media_path));
         }
-        let directory = media_path
-            .parent()
-            .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?;
-        let directory = fs::canonicalize(directory)
+        let directory = if item_type == "SERIES" {
+            series_directory(&root, &source.relative_path)
+                .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
+        } else {
+            media_path
+                .parent()
+                .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
+                .to_owned()
+        };
+        let directory = fs::canonicalize(&directory)
             .await
-            .map_err(|error| image_io_error(directory, error))?;
+            .map_err(|error| image_io_error(&directory, error))?;
         if !directory.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(directory));
         }
-        Ok(directory)
+        Ok((root, directory))
     }
 }
 

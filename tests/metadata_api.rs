@@ -40,6 +40,48 @@ async fn start_server(
 }
 
 async fn tmdb_search_stub(uri: axum::http::Uri) -> Json<Value> {
+    if uri.path().ends_with("/search/tv") {
+        return Json(json!({
+            "page": 1,
+            "total_pages": 1,
+            "total_results": 1,
+            "results": [{
+                "id": 998,
+                "name": "暗夜与黎明",
+                "original_name": "Dark Night and Dawn",
+                "overview": "A series stub.",
+                "first_air_date": "2024-09-20",
+                "original_language": "zh"
+            }]
+        }));
+    }
+    if uri.path().ends_with("/3/tv/998/season/1/episode/1") {
+        return Json(json!({
+            "id": 1999,
+            "name": "第一集",
+            "overview": "Episode stub.",
+            "air_date": "2024-09-21",
+            "episode_number": 1,
+            "season_number": 1,
+            "runtime": 45
+        }));
+    }
+    if uri.path().ends_with("/3/tv/998/season/1") {
+        return Json(json!({
+            "id": 1998,
+            "name": "第一季",
+            "overview": "Season stub.",
+            "air_date": "2024-09-20",
+            "season_number": 1,
+            "episodes": [{
+                "id": 1999,
+                "name": "第一集",
+                "air_date": "2024-09-21",
+                "episode_number": 1,
+                "season_number": 1
+            }]
+        }));
+    }
     if uri.path().ends_with("/images") {
         return Json(json!({
             "posters": [
@@ -367,6 +409,162 @@ async fn admin_can_read_and_edit_item_metadata_with_field_locks()
     assert!(nfo.contains("Edited overview"));
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn series_candidate_search_uses_tmdb_tv_endpoint_and_cleaned_year()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let episode =
+        root.join("暗夜与黎明 (2024)/Season 1/暗夜与黎明 S01E01 - 2160p H.265 AAC CHDWEB.strm");
+    if let Some(parent) = episode.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&episode, b"").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let series_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'SERIES' AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let series: (String, i64) =
+        sqlx::query_as("SELECT title, production_year FROM media_items WHERE id = ?")
+            .bind(&series_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(series, ("暗夜与黎明".to_owned(), 2024));
+
+    let (tmdb_url, tmdb_server) = start_tmdb_stub().await?;
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: tmdb_url,
+        read_access_token: Some("stub-token".to_owned()),
+        requests_per_second: 0,
+        max_retries: 0,
+        ..TmdbClientConfig::default()
+    })?;
+    let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
+    let client = reqwest::Client::new();
+    let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
+    let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
+    let response = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{series_id}/identify/candidates"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", csrf)
+        .json(&json!({ "query": "暗夜与黎明 S01E01 - 2160p H.265 AAC CHDWEB.strm" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["items"][0]["providerId"], "998");
+    assert_eq!(body["items"][0]["candidate"]["title"], "暗夜与黎明");
+
+    server.abort();
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn season_and_episode_candidate_search_uses_parent_series_details()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let episode =
+        root.join("暗夜与黎明 (2024)/Season 1/暗夜与黎明 S01E01 - 2160p H.265 AAC CHDWEB.strm");
+    if let Some(parent) = episode.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&episode, b"").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let season_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'SEASON' AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let episode_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'EPISODE' AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    let (tmdb_url, tmdb_server) = start_tmdb_stub().await?;
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: tmdb_url,
+        read_access_token: Some("stub-token".to_owned()),
+        requests_per_second: 0,
+        max_retries: 0,
+        ..TmdbClientConfig::default()
+    })?;
+    let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
+    let client = reqwest::Client::new();
+    let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
+    let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
+
+    let season = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{season_id}/identify/candidates"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "query": "暗夜与黎明" }))
+        .send()
+        .await?;
+    assert_eq!(season.status(), reqwest::StatusCode::OK);
+    let season_body: Value = season.json().await?;
+    assert_eq!(season_body["items"][0]["providerId"], "1998");
+    assert_eq!(season_body["items"][0]["candidate"]["title"], "第一季");
+
+    let episode = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{episode_id}/identify/candidates"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "query": "暗夜与黎明" }))
+        .send()
+        .await?;
+    assert_eq!(episode.status(), reqwest::StatusCode::OK);
+    let episode_body: Value = episode.json().await?;
+    assert_eq!(episode_body["items"][0]["providerId"], "1999");
+    assert_eq!(episode_body["items"][0]["candidate"]["title"], "第一集");
+
+    server.abort();
+    tmdb_server.abort();
     Ok(())
 }
 

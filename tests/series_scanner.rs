@@ -60,7 +60,7 @@ async fn series_scan_builds_stable_series_season_episode_hierarchy()
     assert_eq!(first.skipped_files, 0);
 
     let hierarchy: Vec<HierarchyRow> = sqlx::query_as(
-        "SELECT item_type, parent_id, series_id, season_number, episode_number, title, identity_key
+        "SELECT item_type, parent_id, series_id, season_number, episode_number, title, production_year, identity_key
              FROM media_items ORDER BY item_type, identity_key",
     )
     .fetch_all(database.pool())
@@ -92,11 +92,11 @@ async fn series_scan_builds_stable_series_season_episode_hierarchy()
             .iter()
             .any(|row| row.item_type == "SEASON" && row.season_number == Some(3))
     );
-    assert!(
-        hierarchy
-            .iter()
-            .any(|row| row.item_type == "SERIES" && row.title == "Grouped Show 2024")
-    );
+    assert!(hierarchy.iter().any(|row| {
+        row.item_type == "SERIES"
+            && row.title == "Grouped Show"
+            && row.production_year == Some(2024)
+    }));
     assert!(
         hierarchy
             .iter()
@@ -299,6 +299,7 @@ struct HierarchyRow {
     season_number: Option<i64>,
     episode_number: Option<i64>,
     title: String,
+    production_year: Option<i64>,
     identity_key: String,
 }
 

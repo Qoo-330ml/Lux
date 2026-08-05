@@ -1,4 +1,4 @@
-use std::{env, process::Stdio, time::Duration};
+use std::{env, fs, process::Stdio, time::Duration};
 
 use axum::{Router, body::Body, http::Request, response::Response, routing::any};
 use luxd::application::plugin_protocol::PluginResponse;
@@ -22,7 +22,8 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
                 "original_title": "Interstellar",
                 "overview": "A test overview",
                 "release_date": "2014-11-07",
-                "original_language": "en"
+                "original_language": "en",
+                "vote_average": 8.6
             }]
         }))
     } else if path == "/3/search/tv" {
@@ -38,7 +39,8 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
                 "first_air_date": "2021-01-02",
                 "original_language": "en",
                 "poster_path": "/series-poster.jpg",
-                "backdrop_path": "/series-backdrop.jpg"
+                "backdrop_path": "/series-backdrop.jpg",
+                "vote_average": 8.1
             }]
         }))
     } else if path == "/3/search/person" {
@@ -67,15 +69,21 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
             }]
         }))
     } else if path == "/3/movie/157336" {
+        let preferred_is_incomplete = request.uri().query().is_some_and(|query| {
+            query
+                .split('&')
+                .any(|parameter| parameter == "language=zh-SG")
+        });
         json_response(json!({
             "id": 157336,
-            "title": "Interstellar",
+            "title": if preferred_is_incomplete { Value::Null } else { json!("Interstellar") },
             "original_title": "Interstellar",
-            "overview": "A test overview",
+            "overview": if preferred_is_incomplete { Value::Null } else { json!("A test overview") },
             "release_date": "2014-11-07",
             "original_language": "en",
             "poster_path": "/movie-poster.jpg",
-            "backdrop_path": "/movie-backdrop.jpg"
+            "backdrop_path": "/movie-backdrop.jpg",
+            "vote_average": 8.6
         }))
     } else if path == "/3/tv/8" {
         json_response(json!({
@@ -85,11 +93,13 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
             "overview": "Series overview",
             "first_air_date": "2021-01-02",
             "last_air_date": "2021-02-03",
+            "status": "Ended",
             "original_language": "en",
             "number_of_seasons": 1,
             "number_of_episodes": 2,
             "poster_path": "/series-poster.jpg",
             "backdrop_path": "/series-backdrop.jpg",
+            "vote_average": 8.1,
             "seasons": [{
                 "id": 801,
                 "name": "Season 1",
@@ -98,6 +108,16 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
                 "season_number": 1,
                 "episode_count": 2,
                 "poster_path": "/season-poster.jpg"
+            }]
+        }))
+    } else if path == "/3/tv/8/credits" {
+        json_response(json!({
+            "cast": [{
+                "id": 10,
+                "name": "Series Person",
+                "character": "Series Character",
+                "profile_path": "/series-profile.jpg",
+                "order": 0
             }]
         }))
     } else if path == "/3/tv/8/season/1" {
@@ -274,6 +294,7 @@ async fn standalone_tmdb_plugin_uses_the_lux_rpc_contract() -> Result<(), Box<dy
     .await?;
     assert_eq!(result["items"][0]["Name"], "Interstellar");
     assert_eq!(result["items"][0]["ProviderIds"]["Tmdb"], "157336");
+    assert_eq!(result["items"][0]["Rating"], 8.6);
 
     let raw_response = rpc_call(
         &mut stdin,
@@ -309,6 +330,56 @@ async fn standalone_tmdb_plugin_uses_the_lux_rpc_contract() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn standalone_tmdb_plugin_fills_metadata_in_configured_language_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().fallback(any(tmdb_stub)))
+            .await
+            .expect("TMDb stub should run");
+    });
+    let config_dir = tempfile::tempdir()?;
+    fs::write(
+        config_dir.path().join("tmdb_settings.json"),
+        serde_json::to_vec(&json!({
+            "preferredLanguage": "zh-SG",
+            "languageFallbackEnabled": true,
+            "fallbackLanguages": ["zh-HK"],
+            "alternateApiEnabled": true,
+            "apiBaseUrl": format!("http://{address}")
+        }))?,
+    )?;
+    let binary = env::var("CARGO_BIN_EXE_lux-plugin-tmdb")
+        .or_else(|_| env::var("CARGO_BIN_EXE_lux_plugin_tmdb"))?;
+    let mut child = Command::new(binary)
+        .env("LUX_CONFIG_DIR", config_dir.path())
+        .env("LUX_TMDB_API_KEY", "test-only-key")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or("plugin stdin is missing")?;
+    let stdout = child.stdout.take().ok_or("plugin stdout is missing")?;
+    let mut stdout = BufReader::new(stdout).lines();
+
+    let result = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "fallback-movie",
+        "metadata.get",
+        json!({"itemType": "Movie", "tmdbId": 157336}),
+    )
+    .await?;
+    assert_eq!(result["metadata"]["Name"], "Interstellar");
+    assert_eq!(result["metadata"]["Overview"], "A test overview");
+
+    child.kill().await?;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn standalone_tmdb_plugin_maps_emby_media_types_and_provider_data()
 -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -336,11 +407,16 @@ async fn standalone_tmdb_plugin_maps_emby_media_types_and_provider_data()
         &mut stdout,
         "series-search",
         "metadata.search",
-        json!({"itemType": "Series", "name": "Test Series", "year": 2021}),
+        json!({
+            "itemType": "Series",
+            "name": "暗夜与黎明 S01E01 - 2160p H.265 AAC CHDWEB.strm",
+            "year": 2021
+        }),
     )
     .await?;
     assert_eq!(series_search["items"][0]["Type"], "Series");
     assert_eq!(series_search["items"][0]["ProviderIds"]["Tmdb"], "8");
+    assert_eq!(series_search["items"][0]["Rating"], 8.1);
 
     let series = rpc_call(
         &mut stdin,
@@ -352,6 +428,21 @@ async fn standalone_tmdb_plugin_maps_emby_media_types_and_provider_data()
     .await?;
     assert_eq!(series["metadata"]["Type"], "Series");
     assert_eq!(series["metadata"]["ProductionYear"], 2021);
+    assert_eq!(series["metadata"]["Rating"], 8.1);
+    assert_eq!(series["metadata"]["EndDate"], "2021-02-03");
+    assert_eq!(series["metadata"]["Status"], "Ended");
+    assert_eq!(series["metadata"]["OriginalLanguage"], "en");
+
+    let series_credits = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "series-credits",
+        "metadata.credits",
+        json!({"itemType": "Series", "providerId": "8"}),
+    )
+    .await?;
+    assert_eq!(series_credits["cast"][0]["Id"], "10");
+    assert_eq!(series_credits["cast"][0]["Character"], "Series Character");
 
     let season = rpc_call(
         &mut stdin,

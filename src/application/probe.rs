@@ -8,7 +8,7 @@ use std::{
 
 use quick_xml::{events::Event, reader::Reader};
 use serde_json::Value;
-use tokio::{fs, process::Command, time::timeout};
+use tokio::{fs, io::AsyncWriteExt, process::Command, time::timeout};
 
 use crate::{
     domain::{ids::LibraryId, time::duration_to_ticks},
@@ -102,6 +102,13 @@ pub fn parse_probe_json(bytes: &[u8]) -> Result<MediaProbeResult, ProbeError> {
             else {
                 continue;
             };
+            let disposition = stream.get("disposition").and_then(Value::as_object);
+            if disposition
+                .and_then(|value| integer_field(value, "attached_pic"))
+                .is_some_and(|value| value != 0)
+            {
+                continue;
+            }
             let stream_index = stream
                 .get("index")
                 .map(|value| parse_integer(value, "stream.index"))
@@ -115,7 +122,6 @@ pub fn parse_probe_json(bytes: &[u8]) -> Result<MediaProbeResult, ProbeError> {
                 ));
             }
             let tags = stream.get("tags").and_then(Value::as_object);
-            let disposition = stream.get("disposition").and_then(Value::as_object);
             streams.push(MediaStreamResult {
                 stream_index,
                 stream_type,
@@ -906,13 +912,81 @@ async fn read_media_info_sidecar(path: &Path) -> Option<MediaProbeResult> {
     parse_media_info_json(&bytes).ok()
 }
 
+pub(crate) fn serialize_media_info_sidecar(
+    result: &MediaProbeResult,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let streams = result
+        .streams
+        .iter()
+        .map(|stream| {
+            let mut value = serde_json::Map::new();
+            value.insert("Index".to_owned(), Value::from(stream.stream_index));
+            value.insert("Type".to_owned(), Value::from(stream.stream_type.as_str()));
+            if let Some(codec) = &stream.codec {
+                value.insert("Codec".to_owned(), Value::from(codec.clone()));
+            }
+            if let Some(language) = &stream.language {
+                value.insert("Language".to_owned(), Value::from(language.clone()));
+            }
+            if let Some(title) = &stream.title {
+                value.insert("DisplayTitle".to_owned(), Value::from(title.clone()));
+            }
+            value.insert("IsDefault".to_owned(), Value::from(stream.is_default));
+            value.insert("IsForced".to_owned(), Value::from(stream.is_forced));
+            for (key, detail) in &stream.details {
+                value.insert(key.clone(), detail.clone());
+            }
+            Value::Object(value)
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec_pretty(&serde_json::json!([{
+        "MediaSourceInfo": {
+            "Container": result.container,
+            "Size": result.source_size,
+            "RunTimeTicks": result.duration_ticks,
+            "Bitrate": result.bitrate,
+            "MediaStreams": streams,
+        }
+    }]))
+}
+
+pub(crate) async fn write_media_info_sidecar(
+    path: &Path,
+    result: &MediaProbeResult,
+) -> Result<(), ProbeError> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| ProbeError::InvalidOutput("media path has no valid file stem".to_owned()))?;
+    let target = path.with_file_name(format!("{stem}-mediainfo.json"));
+    let temporary =
+        target.with_file_name(format!(".{stem}-mediainfo.{}.tmp", uuid::Uuid::now_v7()));
+    let contents = serialize_media_info_sidecar(result)
+        .map_err(|error| ProbeError::InvalidOutput(error.to_string()))?;
+    let write_result = async {
+        let mut file = fs::File::create(&temporary).await?;
+        file.write_all(&contents).await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&temporary, &target).await
+    }
+    .await;
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    write_result.map_err(ProbeError::Io)
+}
+
 async fn read_nfo_streamdetails(path: &Path) -> Option<MediaProbeResult> {
     let nfo = path.with_extension("nfo");
     let bytes = fs::read(nfo).await.ok()?;
     parse_nfo_streamdetails(&bytes).ok().flatten()
 }
 
-fn safe_media_path(root_path: &str, relative_path: &str) -> Result<PathBuf, ProbeServiceError> {
+pub(crate) fn safe_media_path(
+    root_path: &str,
+    relative_path: &str,
+) -> Result<PathBuf, ProbeServiceError> {
     let relative = Path::new(relative_path);
     if relative.is_absolute()
         || relative
