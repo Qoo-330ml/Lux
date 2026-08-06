@@ -155,6 +155,19 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     assert_eq!(emby_image.headers().get(ETAG).unwrap(), etag.as_str());
     assert_eq!(emby_image.bytes().await?, "poster-bytes".as_bytes());
 
+    let emby_mobile_image = client
+        .get(format!(
+            "{base_url}/emby/Items/{item_id}/Images/Primary/0?apiKey={emby_token}&tag={image_id}&maxWidth=600&maxHeight=900&quality=90"
+        ))
+        .send()
+        .await?;
+    assert_eq!(emby_mobile_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        emby_mobile_image.headers().get(ETAG).unwrap(),
+        etag.as_str()
+    );
+    assert_eq!(emby_mobile_image.bytes().await?, "poster-bytes".as_bytes());
+
     let emby_logo = client
         .get(format!("{base_url}/Items/{item_id}/Images/Logo"))
         .header("X-Emby-Token", &emby_token)

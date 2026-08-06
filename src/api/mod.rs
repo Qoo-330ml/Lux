@@ -1081,7 +1081,7 @@ async fn emby_authenticate(
 
 #[derive(Deserialize, Default)]
 struct EmbyTokenQuery {
-    #[serde(rename = "api_key")]
+    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey")]
     api_key: Option<String>,
 }
 
@@ -1166,7 +1166,7 @@ async fn emby_logout(
 
 #[derive(Deserialize, Default)]
 struct EmbyItemsQuery {
-    #[serde(rename = "api_key", default)]
+    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey", default)]
     api_key: Option<String>,
     #[serde(rename = "UserId", default)]
     user_id: Option<String>,
@@ -3749,7 +3749,7 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
 
 #[derive(Deserialize, Default)]
 struct EmbySearchQuery {
-    #[serde(rename = "api_key")]
+    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey")]
     api_key: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
@@ -4856,7 +4856,7 @@ async fn emby_subtitle_without_source(
 
 #[derive(Deserialize, Default)]
 struct EmbyStreamQuery {
-    #[serde(rename = "api_key")]
+    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey")]
     api_key: Option<String>,
     #[serde(alias = "mediaSourceId", alias = "MediaSourceId")]
     media_source_id: Option<String>,
