@@ -2594,6 +2594,7 @@ impl Database {
                  JOIN library_roots lr ON lr.id = fe.library_root_id
                  WHERE ms.id = ? AND mi.id = ? AND mt.stream_index = ?
                    AND mt.stream_type = 'SUBTITLE' AND mt.external_path IS NOT NULL
+                   AND fe.is_missing = 0
                  LIMIT 1",
             )
             .bind(media_source_id)
@@ -2612,6 +2613,7 @@ impl Database {
                  JOIN library_roots lr ON lr.id = fe.library_root_id
                  WHERE mi.id = ? AND mt.stream_index = ?
                    AND mt.stream_type = 'SUBTITLE' AND mt.external_path IS NOT NULL
+                   AND fe.is_missing = 0
                  ORDER BY ms.is_default DESC, ms.id LIMIT 1",
             )
             .bind(item_id)
@@ -4118,7 +4120,12 @@ impl Database {
                     mt.is_forced AS stream_is_forced
              FROM ranked
              JOIN media_items mi ON mi.id = ranked.id
-             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              WHERE ranked.library_rank <= ?
              ORDER BY ranked.library_id, ranked.library_rank, ms.id, mt.stream_index"
@@ -4192,7 +4199,12 @@ impl Database {
                     mt.is_forced AS stream_is_forced
              FROM ranked
              JOIN media_items mi ON mi.id = ranked.id
-             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              ORDER BY ranked.recommendation_score DESC, mi.added_at DESC,
                       mi.sort_title, mi.id, ms.id, mt.stream_index"
@@ -4254,7 +4266,12 @@ impl Database {
                     mt.is_forced AS stream_is_forced
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              WHERE mi.parent_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL
              ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id,
@@ -4349,7 +4366,12 @@ impl Database {
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
-             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL
                AND us.is_played = 0 AND us.position_ticks > 0
@@ -4453,7 +4475,12 @@ impl Database {
                  LIMIT ? OFFSET ?
              ) selected
              JOIN media_items mi ON mi.id = selected.id
-             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              ORDER BY {item_order}, ms.id, mt.stream_index"
         );
@@ -4503,7 +4530,12 @@ impl Database {
                      ORDER BY mi.sort_title, mi.id
                      LIMIT ? OFFSET ?
                  ) mi
-                 LEFT JOIN media_sources ms ON ms.item_id = mi.id
+                 LEFT JOIN media_sources ms
+                   ON ms.item_id = mi.id
+                  AND EXISTS (
+                      SELECT 1 FROM filesystem_entries fe
+                      WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                  )
                  LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
                  ORDER BY mi.sort_title, mi.id, ms.id, mt.stream_index",
                 vec![
@@ -4544,7 +4576,12 @@ impl Database {
                      ORDER BY mi.sort_title, mi.id
                      LIMIT ? OFFSET ?
                  ) mi
-                 LEFT JOIN media_sources ms ON ms.item_id = mi.id
+                 LEFT JOIN media_sources ms
+                   ON ms.item_id = mi.id
+                  AND EXISTS (
+                      SELECT 1 FROM filesystem_entries fe
+                      WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                  )
                  LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
                  ORDER BY mi.sort_title, mi.id, ms.id, mt.stream_index",
                 vec![CatalogBind::Integer(limit), CatalogBind::Integer(offset)],
@@ -4579,7 +4616,12 @@ impl Database {
                     mt.is_forced AS stream_is_forced
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             LEFT JOIN media_sources ms ON ms.item_id = mi.id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              WHERE mi.id = ? AND mi.removed_at IS NULL
              ORDER BY mi.sort_title, mi.id, ms.id, mt.stream_index",
@@ -4766,6 +4808,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.library_id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
              ORDER BY ms.item_id, fe.relative_path",
         )
         .bind(library_id)
@@ -4800,6 +4843,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
+               AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.item_id, fe.relative_path",
         )
         .bind(library_id)
@@ -4832,6 +4876,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
+               AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, fe.relative_path
              LIMIT 1",
         )
@@ -5273,6 +5318,7 @@ impl Database {
               AND ii.image_type = 'THUMB'
               AND ii.image_index = 0
              WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
+               AND fe.is_missing = 0
              ORDER BY ms.item_id, ms.is_default DESC, ms.id",
         )
         .bind(library_id)
@@ -5306,6 +5352,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0
              ORDER BY ms.id, fe.relative_path",
         )
         .bind(library_id)
@@ -5336,7 +5383,9 @@ impl Database {
             "SELECT COUNT(*)
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
-             WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'",
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0",
         )
         .bind(library_id)
         .fetch_one(&self.pool)
@@ -5359,6 +5408,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
+               AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id LIMIT 1",
         )
         .bind(item_id)
@@ -5391,6 +5441,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id LIMIT 1",
         )
         .bind(item_id)
@@ -5421,6 +5472,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id LIMIT 1",
         )
         .bind(item_id)
@@ -5454,6 +5506,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE ms.id = ? AND mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
+               AND fe.is_missing = 0
              LIMIT 1",
         )
         .bind(source_id)
@@ -5488,6 +5541,7 @@ impl Database {
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE ms.id = ? AND mi.id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
              LIMIT 1",
         )
         .bind(source_id)
@@ -5607,6 +5661,7 @@ impl Database {
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE episode.item_type = 'EPISODE'
                AND (episode.series_id = ? OR episode.parent_id = ?)
+               AND fe.is_missing = 0
              ORDER BY episode.id, fe.relative_path LIMIT 1",
         )
         .bind(item_id)
@@ -5726,6 +5781,7 @@ impl Database {
                AND series.item_type = 'SERIES'
                AND episode.library_id = ?
                AND episode.removed_at IS NULL
+               AND fe.is_missing = 0
              ORDER BY series.id, season.season_number, episode.id, fe.relative_path",
         )
         .bind(library_id)

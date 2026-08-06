@@ -53,6 +53,16 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
+    let removed_version = first_dir.join("Alpha.Movie.2020.2160p.mkv");
+    tokio::fs::write(&removed_version, b"alpha-2160p").await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    tokio::fs::remove_file(&removed_version).await?;
+    let removal_scan = LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    assert_eq!(removal_scan.marked_missing, 1);
     let item_id: String =
         sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'alpha movie'")
             .fetch_one(database.pool())
