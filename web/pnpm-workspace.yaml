@@ -1,0 +1,3 @@
+# Vite uses esbuild's native binary during the production build.
+allowBuilds:
+  esbuild: true
