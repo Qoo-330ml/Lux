@@ -24,7 +24,7 @@ docker compose up --build
 
 ## Docker Hub 发布
 
-`.github/workflows/dockerhub.yml` 会在 Pull Request 中只构建验证，在 `main` 推送和 `v*.*.*` 版本标签时构建并发布 `linux/amd64`、`linux/arm64` 镜像。请在 GitHub 仓库的 Settings → Secrets and variables → Actions 中配置：
+`.github/workflows/dockerhub.yml` 会在 Pull Request 中只构建验证，在 `main` 推送和 `v*.*.*` 版本标签时分别使用 GitHub 原生 amd64/ARM64 runner 构建，再合并并发布 `linux/amd64`、`linux/arm64` manifest，不使用 QEMU。请在 GitHub 仓库的 Settings → Secrets and variables → Actions 中配置：
 
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名。
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token，不要使用账户密码。

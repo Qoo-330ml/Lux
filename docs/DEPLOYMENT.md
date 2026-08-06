@@ -17,7 +17,7 @@ LUX_MEDIA_DIR=/srv/media docker compose up -d --build
 
 ### Docker Hub 镜像
 
-`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送或 `v*.*.*` 标签推送时发布 `linux/amd64` 和 `linux/arm64` 镜像。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`。
+`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送或 `v*.*.*` 标签推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`。
 
 建议显式设置：
 
