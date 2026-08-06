@@ -40,3 +40,14 @@ test("light mode preserves the same flat admin surfaces", () => {
   assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-stat \{[^}]*background:\s*transparent/);
   assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-panel \{[^}]*background:\s*transparent/);
 });
+
+test("now-playing cards use theme tokens and compact proportions", () => {
+  const cardRule = stylesheet.match(/\.lux-now-playing-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const bodyRule = stylesheet.match(/\.lux-now-playing-body\s*\{([^}]*)\}/)?.[1] ?? "";
+  const lightRule = stylesheet.match(/html\[data-lux-theme="light"\] \.lux-now-playing-card\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(cardRule, /background:\s*var\(--lux-now-card-bg\)/);
+  assert.match(bodyRule, /padding:\s*24px\s+28px/);
+  assert.match(bodyRule, /minmax\(148px,\s*17%\)/);
+  assert.match(lightRule, /--lux-now-card-bg:\s*#fbfcfe/);
+});
