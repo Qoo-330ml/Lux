@@ -362,6 +362,20 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(favorites_body["total"], 1);
     assert_eq!(favorites_body["items"][0]["title"], "Beta Movie");
 
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ticks, last_played_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, item_id) DO UPDATE SET
+             position_ticks = excluded.position_ticks,
+             is_played = 0,
+             last_played_at = excluded.last_played_at",
+    )
+    .bind(admin.id.to_string())
+    .bind(&item_id)
+    .bind(1_800_000_000_i64)
+    .bind(400_i64)
+    .execute(database.pool())
+    .await?;
     let home = client
         .get(format!("{base_url}/api/v1/home"))
         .header(COOKIE, &cookies)
@@ -370,6 +384,13 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(home.status(), reqwest::StatusCode::OK);
     let home_body: Value = home.json().await?;
     assert_eq!(home_body["recentlyAddedTotal"], 2);
+    assert_eq!(home_body["continueWatchingTotal"], 1);
+    assert_eq!(home_body["continueWatching"][0]["id"], item_id);
+    assert_eq!(home_body["continueWatching"][0]["title"], "Alpha Movie");
+    assert_eq!(
+        home_body["continueWatching"][0]["userData"]["positionTicks"],
+        1_800_000_000_i64
+    );
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
     assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
     assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");

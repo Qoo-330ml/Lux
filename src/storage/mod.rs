@@ -4270,26 +4270,33 @@ impl Database {
         .await
     }
 
-    pub(crate) async fn count_next_up_items(
+    pub(crate) async fn count_progress_items(
         &self,
         user_id: &str,
         library_ids: &[String],
+        item_types: &[&str],
     ) -> Result<i64, StorageError> {
-        if library_ids.is_empty() {
+        if library_ids.is_empty() || item_types.is_empty() {
             return Ok(0);
         }
-        let placeholders = std::iter::repeat_n("?", library_ids.len())
+        let item_type_placeholders = std::iter::repeat_n("?", item_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let library_placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
             "SELECT COUNT(*) FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
-             WHERE mi.item_type = 'EPISODE' AND mi.removed_at IS NULL
+             WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL
                AND us.is_played = 0 AND us.position_ticks > 0
-               AND mi.library_id IN ({placeholders})"
+               AND mi.library_id IN ({library_placeholders})"
         );
         let mut statement = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(query)).bind(user_id);
+        for item_type in item_types {
+            statement = statement.bind(*item_type);
+        }
         for library_id in library_ids {
             statement = statement.bind(library_id);
         }
@@ -4302,17 +4309,21 @@ impl Database {
             })
     }
 
-    pub(crate) async fn list_next_up_items(
+    pub(crate) async fn list_progress_items(
         &self,
         user_id: &str,
         library_ids: &[String],
+        item_types: &[&str],
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
-        if library_ids.is_empty() {
+        if library_ids.is_empty() || item_types.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat_n("?", library_ids.len())
+        let item_type_placeholders = std::iter::repeat_n("?", item_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let library_placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
@@ -4340,15 +4351,16 @@ impl Database {
              JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
              LEFT JOIN media_sources ms ON ms.item_id = mi.id
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE mi.item_type = 'EPISODE' AND mi.removed_at IS NULL
+             WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL
                AND us.is_played = 0 AND us.position_ticks > 0
-               AND mi.library_id IN ({placeholders})
+               AND mi.library_id IN ({library_placeholders})
              ORDER BY us.last_played_at DESC, mi.series_id, mi.season_number,
                       mi.episode_number, mi.id
              LIMIT ? OFFSET ?"
         );
-        let mut binds = Vec::with_capacity(library_ids.len() + 3);
+        let mut binds = Vec::with_capacity(item_types.len() + library_ids.len() + 3);
         binds.push(CatalogBind::Text(user_id));
+        binds.extend(item_types.iter().copied().map(CatalogBind::Text));
         binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
         binds.push(CatalogBind::Integer(limit));
         binds.push(CatalogBind::Integer(offset));

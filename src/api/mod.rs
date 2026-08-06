@@ -3432,7 +3432,7 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let continue_watching = match catalog
-        .list_next_up(principal, &user.id.to_string(), 0, 10)
+        .list_continue_watching(principal, &user.id.to_string(), 0, 10)
         .await
     {
         Ok(page) => page,

@@ -10,6 +10,7 @@
 - [x] 首页每个可见媒体库入口返回最多 12 条按 `added_at` 倒序的 `latest` 资源，避免前端逐库请求。
 - [x] 新增 `GET /Users/{userId}/Items/Latest`，复用 ACL、筛选和稳定排序路径。
 - [x] Latest 使用 DateCreated/UUID v7 倒序作为当前稳定的最近添加排序。
+- [x] 首页继续观看同时包含有未完成进度的电影和剧集单集，并返回当前用户的播放位置。
 
 ## 验证
 

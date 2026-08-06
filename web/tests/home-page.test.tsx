@@ -34,7 +34,13 @@ describe("HomePage shelves", () => {
         latest: [{ id: "latest-1", title: "最新华语片", itemType: "MOVIE" }],
       }],
       recommended: [],
-      continueWatching: [],
+      continueWatching: [{
+        id: "resume-1",
+        title: "继续中的电影",
+        itemType: "MOVIE",
+        runtimeTicks: 3_600_000_000,
+        userData: { positionTicks: 1_800_000_000 },
+      }],
       recentlyAdded: [{ id: "recent-1", title: "最近电影", itemType: "MOVIE" }],
     });
 
@@ -62,6 +68,9 @@ describe("HomePage shelves", () => {
     expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
       .toContain("最新华语片");
     expect(container.querySelector('[aria-label="最新华语电影"] .lux-horizontal-scroll-viewport')).not.toBeNull();
+    expect([...container.querySelectorAll(".lux-home-content .lux-section h2")].map((heading) => heading.textContent))
+      .toEqual(["我的媒体库", "继续观看", "最新华语电影"]);
+    expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影");
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
 

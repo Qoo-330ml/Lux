@@ -284,14 +284,37 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        self.list_progress_items(principal, user_id, offset, limit, &["EPISODE"])
+            .await
+    }
+
+    pub async fn list_continue_watching(
+        &self,
+        principal: AccessPrincipal,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        self.list_progress_items(principal, user_id, offset, limit, &["MOVIE", "EPISODE"])
+            .await
+    }
+
+    async fn list_progress_items(
+        &self,
+        principal: AccessPrincipal,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+        item_types: &[&str],
+    ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
         let total = self
             .database
-            .count_next_up_items(user_id, &library_ids)
+            .count_progress_items(user_id, &library_ids, item_types)
             .await?;
         let rows = self
             .database
-            .list_next_up_items(user_id, &library_ids, offset, limit)
+            .list_progress_items(user_id, &library_ids, item_types, offset, limit)
             .await?;
         Ok(CatalogPage {
             items: assemble_items(rows),
