@@ -2432,6 +2432,13 @@ fn emby_catalog_item_json_with_state(
     let runtime_ticks = item
         .runtime_ticks
         .or_else(|| default_source.and_then(|source| source.duration_ticks));
+    let played_percentage = user_state.and_then(|state| {
+        if state.is_played {
+            return Some(100.0);
+        }
+        let runtime_ticks = runtime_ticks.filter(|value| *value > 0)?;
+        Some((state.position_ticks.max(0) as f64 * 100.0 / runtime_ticks as f64).clamp(0.0, 100.0))
+    });
     let mut image_tags = serde_json::Map::new();
     if let Some(tag) = item.poster_image_tag.as_ref() {
         image_tags.insert("Primary".to_owned(), json!(tag));
@@ -2472,6 +2479,7 @@ fn emby_catalog_item_json_with_state(
             .unwrap_or_else(|| json!([])),
         "UserData": {
             "PlaybackPositionTicks": user_state.map(|state| state.position_ticks).unwrap_or_default(),
+            "PlayedPercentage": played_percentage,
             "PlayCount": user_state.map(|state| state.play_count).unwrap_or_default(),
             "IsFavorite": user_state.map(|state| state.is_favorite).unwrap_or(false),
             "Played": user_state.map(|state| state.is_played).unwrap_or(false),

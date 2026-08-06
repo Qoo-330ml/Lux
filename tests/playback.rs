@@ -311,6 +311,10 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+    sqlx::query("UPDATE media_sources SET duration_ticks = 1000 WHERE id = ?")
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -390,6 +394,33 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
         .send()
         .await?;
     assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let item_response = client
+        .get(format!("{base_url}/Users/{}/Items/{item_id}", admin.id))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(item_response.status(), reqwest::StatusCode::OK);
+    let item_body = item_response.json::<Value>().await?;
+    assert_eq!(item_body["UserData"]["PlaybackPositionTicks"], 300);
+    assert_eq!(item_body["UserData"]["PlayedPercentage"], 30.0);
+    let library_id = library.id.to_string();
+    let items_response = client
+        .get(format!("{base_url}/Users/{}/Items", admin.id))
+        .header("X-Emby-Token", &token)
+        .query(&[
+            ("ParentId", library_id.as_str()),
+            ("IncludeItemTypes", "Movie"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(items_response.status(), reqwest::StatusCode::OK);
+    let items_body = items_response.json::<Value>().await?;
+    assert_eq!(
+        items_body["Items"][0]["UserData"]["PlaybackPositionTicks"],
+        300
+    );
+    assert_eq!(items_body["Items"][0]["UserData"]["PlayedPercentage"], 30.0);
 
     let session = sqlx::query_as::<_, (String, i64, Option<i64>, i64)>(
         "SELECT state, position_ticks, duration_ticks, is_paused
