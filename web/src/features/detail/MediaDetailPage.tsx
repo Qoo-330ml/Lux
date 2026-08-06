@@ -8,7 +8,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
 import { MediaInfoPanel } from "./MediaInfoPanel";
 import { MediaCast } from "./MediaCast";
-import { Rating, imageUrl, mediaTitle, runtimeLabel } from "../home/media";
+import { Rating, episodeTitle, imageUrl, mediaTitle, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
@@ -79,7 +79,7 @@ export function MediaDetailPage() {
   const detailSubtitle = isSeason
     ? `第 ${media.parentIndexNumber ?? ""} 季`
     : isEpisode
-      ? `S${media.parentIndexNumber ?? "?"}.E${media.indexNumber ?? "?"} · ${mediaTitle(media)}`
+      ? episodeTitle(media)
       : undefined;
   const sources = media.mediaSources ?? [];
   const source = sources.find((entry) => entry.id === selectedSourceId)
@@ -202,7 +202,7 @@ export function MediaDetailPage() {
             seasons={seasons.data?.items ?? []}
           />
         ) : null}
-        {isSeason ? <SeasonEpisodes episodes={episodes.data?.items ?? []} episodesPending={episodes.isPending} /> : null}
+        {isSeason ? <SeasonEpisodes episodes={episodes.data?.items ?? []} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
         {isEpisode ? <EpisodeRail episodes={episodes.data?.items ?? []} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
       </div>
       {editor === "metadata" ? <MediaMetadataEditor item={media} onClose={() => setEditor(undefined)} /> : null}
@@ -456,7 +456,7 @@ function SeriesChildren({
   );
 }
 
-function SeasonEpisodes({ episodes, episodesPending }: { episodes: MediaItem[]; episodesPending: boolean }) {
+function SeasonEpisodes({ episodes, seasonNumber, episodesPending }: { episodes: MediaItem[]; seasonNumber?: number | null; episodesPending: boolean }) {
   return (
     <section className="lux-season-episodes" aria-labelledby="season-episodes-heading">
       <div className="lux-section-heading">
@@ -466,7 +466,7 @@ function SeasonEpisodes({ episodes, episodesPending }: { episodes: MediaItem[]; 
       {episodesPending ? <p className="lux-muted-copy">正在加载单集…</p> : null}
       {!episodesPending && episodes.length ? (
         <div className="lux-season-episode-list" role="list">
-          {episodes.map((episode, index) => <SeasonEpisodeRow episode={episode} fallbackNumber={index + 1} key={episode.id} />)}
+          {episodes.map((episode, index) => <SeasonEpisodeRow episode={episode} seasonNumber={seasonNumber} fallbackNumber={index + 1} key={episode.id} />)}
         </div>
       ) : null}
       {!episodesPending && !episodes.length ? <p className="lux-muted-copy">这个季度还没有可播放的单集。</p> : null}
@@ -474,7 +474,7 @@ function SeasonEpisodes({ episodes, episodesPending }: { episodes: MediaItem[]; 
   );
 }
 
-function SeasonEpisodeRow({ episode, fallbackNumber }: { episode: MediaItem; fallbackNumber: number }) {
+function SeasonEpisodeRow({ episode, seasonNumber, fallbackNumber }: { episode: MediaItem; seasonNumber?: number | null; fallbackNumber: number }) {
   const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
   const number = episode.indexNumber ?? fallbackNumber;
   return (
@@ -483,7 +483,7 @@ function SeasonEpisodeRow({ episode, fallbackNumber }: { episode: MediaItem; fal
         {image ? <img src={image} alt="" loading="lazy" /> : <span>{mediaTitle(episode)}</span>}
       </span>
       <span className="lux-season-episode-copy">
-        <strong>{number}. {mediaTitle(episode)}</strong>
+        <strong>{episodeTitle(episode, seasonNumber, number)}</strong>
         {episode.productionYear ? <small>{episode.productionYear}</small> : null}
         {episode.overview ? <p>{episode.overview}</p> : null}
       </span>
@@ -519,7 +519,7 @@ function EpisodeRail({
               <span className="lux-episode-card-art">
                 {image ? <img src={image} alt="" loading="lazy" /> : <span>{mediaTitle(episode)}</span>}
               </span>
-              <strong>{episode.indexNumber ? `${episode.indexNumber}. ` : ""}{mediaTitle(episode)}</strong>
+              <strong>{episodeTitle(episode, seasonNumber)}</strong>
             </Link>
           );
         })}

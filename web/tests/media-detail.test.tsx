@@ -184,7 +184,7 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("示例剧集");
     expect(container.querySelector(".lux-detail-subtitle")?.textContent).toContain("第 3 季");
     expect(container.querySelectorAll(".lux-season-episode-row")).toHaveLength(2);
-    expect(container.querySelector(".lux-season-episode-row strong")?.textContent).toBe("1. 第一集");
+    expect(container.querySelector(".lux-season-episode-row strong")?.textContent).toBe("S03E01 · 第一集");
     expect(container.querySelector(".lux-season-episode-thumb img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-1/images/fanart");
   });
@@ -245,9 +245,10 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-poster.is-landscape img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-3/images/fanart");
     expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("示例剧集");
-    expect(container.querySelector(".lux-detail-subtitle")?.textContent).toContain("S3.E3");
+    expect(container.querySelector(".lux-detail-subtitle")?.textContent).toContain("S03E03 · 第三集标题");
     expect(container.querySelector(".lux-episode-rail")?.textContent).toContain("更多来自第 3 季");
     expect(container.querySelectorAll(".lux-episode-card")).toHaveLength(1);
+    expect(container.querySelector(".lux-episode-card strong")?.textContent).toBe("S03E02 · 第二集");
     expect(container.querySelector(".lux-episode-card img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-2/images/fanart");
   });
