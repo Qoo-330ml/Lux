@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
+import { queryKeys } from "../src/lib/api/query-keys";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -42,6 +43,7 @@ describe("PlayerPage playback synchronization", () => {
     document.body.append(container);
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
 
     await act(async () => {
       root?.render(
@@ -105,5 +107,6 @@ describe("PlayerPage playback synchronization", () => {
       "STOPPED",
       true,
     );
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.home });
   });
 });

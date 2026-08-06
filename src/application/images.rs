@@ -954,6 +954,30 @@ impl ImageService {
             .database
             .list_item_image_candidates(item_id, image_type, image_index)
             .await?;
+        self.resolve_candidates(candidates).await
+    }
+
+    pub async fn resolve_tagged(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+        tag: &str,
+    ) -> Result<Option<ResolvedImage>, ImageError> {
+        let candidates = self
+            .database
+            .list_item_image_candidates(item_id, image_type, image_index)
+            .await?
+            .into_iter()
+            .filter(|candidate| candidate.id == tag)
+            .collect();
+        self.resolve_candidates(candidates).await
+    }
+
+    async fn resolve_candidates(
+        &self,
+        candidates: Vec<crate::storage::StoredItemImageCandidate>,
+    ) -> Result<Option<ResolvedImage>, ImageError> {
         if candidates.is_empty() {
             return Ok(None);
         }

@@ -133,9 +133,9 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("TMDb 60625");
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("评分 8.7");
     expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
-    expect(container.querySelector(".lux-media-info-extra")?.textContent).toContain("最后播出2025-05-25");
-    expect(container.querySelector(".lux-media-info-extra")?.textContent).toContain("状态Ended");
-    expect(container.querySelector(".lux-media-info-extra")?.textContent).toContain("原始语言英语");
+    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("最后播出2025-05-25");
+    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("状态Ended");
+    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("原始语言英语");
     expect(container.querySelector(".lux-season-rail")).not.toBeNull();
   });
 
@@ -532,7 +532,6 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     const details = container.querySelector(".lux-media-info");
-    expect(details?.textContent).toContain("其它信息");
     expect(details?.textContent).toContain("媒体信息");
     expect(details?.textContent).toContain("https://example.invalid/video.mkv");
     expect(details?.textContent).toContain("1920 × 1080");
@@ -540,6 +539,8 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.textContent).toContain("stereo");
     expect(details?.textContent).toContain("中文字幕");
     expect(details?.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
+    expect(container.querySelector(".lux-detail-source")?.textContent).toContain("mkv");
+    expect(container.textContent).not.toContain("暂无可播放版本");
   });
 
   it("places an available media logo above the poster", async () => {

@@ -77,6 +77,42 @@ describe("HomePage shelves", () => {
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
 
+  it("renders every returned continue-watching item and shows the server total", async () => {
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [],
+      recommended: [],
+      continueWatching: [
+        { id: "resume-1", title: "第一条", itemType: "MOVIE" },
+        { id: "resume-2", title: "第二条", itemType: "MOVIE" },
+        { id: "resume-3", title: "第三条", itemType: "MOVIE" },
+      ],
+      continueWatchingTotal: 3,
+      recentlyAdded: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelectorAll(".lux-continue-card")).toHaveLength(3);
+    expect(container.querySelector("#continue-watching-heading")?.parentElement?.textContent)
+      .toContain("3 项");
+  });
+
   it("keeps carousel controls in the same row as the playback actions", async () => {
     vi.spyOn(api, "home").mockResolvedValue({
       libraries: [],

@@ -106,6 +106,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .bind(&item_id)
         .execute(database.pool())
         .await?;
+    sqlx::query("UPDATE media_sources SET duration_ticks = ? WHERE item_id = ?")
+        .bind(2_000_000_000_i64)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
     let alpha_poster_id: String = sqlx::query_scalar(
         "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
     )
@@ -224,6 +229,16 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_cover.headers()["content-type"], "image/png");
     assert_eq!(emby_cover.bytes().await?.as_ref(), PNG_1X1);
 
+    let emby_capability_cover = client
+        .get(format!(
+            "{base_url}/emby/Items/{}/Images/Primary?tag={cover_tag}",
+            library.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(emby_capability_cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(emby_capability_cover.bytes().await?.as_ref(), PNG_1X1);
+
     let emby_page = client
         .get(format!(
             "{base_url}/Users/{}/Items?ParentId={}&Limit=1",
@@ -255,6 +270,26 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(
         emby_page_body["Items"][0]["MediaSources"][0]["Container"],
         "mkv"
+    );
+
+    let emby_compact_page = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&Limit=1&Fields=BasicSyncInfo,Container",
+            admin.id, library.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_compact_page.status(), reqwest::StatusCode::OK);
+    let emby_compact_page_body: Value = emby_compact_page.json().await?;
+    assert_eq!(
+        emby_compact_page_body["Items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(
+        emby_compact_page_body["Items"][0]
+            .get("MediaSources")
+            .is_none()
     );
 
     let emby_latest = client
@@ -436,7 +471,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 
     sqlx::query(
         "INSERT INTO user_item_state (user_id, item_id, position_ticks, last_played_at)
-         VALUES (?, ?, ?, ?)
+         VALUES (?, ?, ?, ?), (?, ?, ?, ?)
          ON CONFLICT(user_id, item_id) DO UPDATE SET
              position_ticks = excluded.position_ticks,
              is_played = 0,
@@ -446,6 +481,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     .bind(&item_id)
     .bind(1_700_000_000_i64)
     .bind(400_i64)
+    .bind(admin.id.to_string())
+    .bind(&beta_item_id)
+    .bind(600_000_000_i64)
+    .bind(500_i64)
     .execute(database.pool())
     .await?;
     let home = client

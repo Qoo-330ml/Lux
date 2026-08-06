@@ -172,11 +172,12 @@ export function MediaCard({ item, landscape = false, compactRating = false }: { 
   );
 }
 
-export function ContinueWatchingRail({ items }: { items: MediaItem[] }) {
+export function ContinueWatchingRail({ items, total }: { items: MediaItem[]; total?: number }) {
   if (!items.length) return null;
+  const itemCount = total ?? items.length;
   return (
     <section className="lux-section" aria-labelledby="continue-watching-heading">
-      <div className="lux-section-heading"><h2 id="continue-watching-heading">继续观看</h2><span>{items.length} 项</span></div>
+      <div className="lux-section-heading"><h2 id="continue-watching-heading">继续观看</h2><span>{itemCount} 项</span></div>
       <HorizontalScrollRail className="lux-home-rail" ariaLabel="继续观看">
         <div className="lux-media-rail lux-continue-rail">
           {items.map((item) => <ContinueWatchingCard item={item} key={item.id} />)}

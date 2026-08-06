@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Maximize, Pause, Play, Settings2, Volume2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type SyntheticEvent } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
@@ -16,6 +16,7 @@ export function PlayerPage() {
   const [playing, setPlaying] = useState(false);
   const [failedStreamUrl, setFailedStreamUrl] = useState<string | null>(null);
   const requestedSourceId = searchParams.get("sourceId");
+  const queryClient = useQueryClient();
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
   const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -33,8 +34,15 @@ export function PlayerPage() {
       ? Math.round(video.duration * TICKS_PER_SECOND)
       : null;
     lastProgressReportRef.current = now;
-    void api.progress(itemId, positionTicks, durationTicks, state, keepalive).catch(() => undefined);
-  }, [itemId]);
+    const request = api.progress(itemId, positionTicks, durationTicks, state, keepalive);
+    if (state === "STOPPED") {
+      void request
+        .then(() => queryClient.invalidateQueries({ queryKey: queryKeys.home }))
+        .catch(() => undefined);
+    } else {
+      void request.catch(() => undefined);
+    }
+  }, [itemId, queryClient]);
 
   useEffect(() => {
     lastProgressReportRef.current = 0;

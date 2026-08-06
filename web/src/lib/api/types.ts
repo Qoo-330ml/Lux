@@ -129,6 +129,7 @@ export type HomeResponse = {
   libraries?: Library[];
   recommended?: MediaItem[];
   continueWatching?: MediaItem[];
+  continueWatchingTotal?: number;
   recentlyAdded?: MediaItem[];
 };
 

@@ -8,7 +8,7 @@
 |---|---|---|---|---|---|---|---|---|---|
 | Infuse | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 待 LUX-025 |
 | VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目详情通过 | 通过 | 通过 | 未测试 | 2026-08-05 本机 ARM64 真实 UI 播放本地 MKV，Playing/Progress/Stopped 回传和 Resume 读回通过；收藏/已观看状态另有 2026-08-03 证据 |
-| SenPlayer | 6.0.6 | macOS arm64 | 通过 | 已添加，客户端读取失败 | 未测试 | 未测试 | 未测试 | 未测试 | 认证 HTTP 200 后客户端报“未能读取数据，数据已丢失”；项目所有者接受该边界 |
+| SenPlayer | 6.0.6 | macOS arm64 | 通过 | 通过 | 首页、电影列表通过 | 未测试 | 未测试 | 未测试 | 2026-08-06 修复 `GET /emby/Users/:userId`、列表 `Fields` 语义，并让服务监听客户端实际访问的局域网地址；真实 UI 已显示电影条目 |
 | Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
 
 ## 记录格式
@@ -20,7 +20,8 @@
 - 媒体库实时监听默认开启。复制到已配置根路径中的新视频会进入局部 `INCREMENTAL_SCAN`，只处理该事件路径，通常在几秒内进入索引；旧版 `realtimeWatchEnabled` 请求字段不会关闭监听。
 - LUX-000 至 LUX-003：仅完成仓库工程检查，尚未连接任何真实客户端。
 - LUX-023：已完成根路径/`/emby` 前缀的 System/Ping 本地协议 shape 测试；`GET/POST /System/Ping` 按 Emby OpenAPI 兼容为无需认证的空 200，并完成 VidHub/SenPlayer 真实登录前置探针。
-- LUX-024：已完成 Users/Public、AuthenticateByName、Sessions/Logout 的本地协议 shape 和 token 脱敏测试；VidHub 真实登录通过；SenPlayer 认证响应解析失败的历史缺口已补充更完整的 `User`/`SessionInfo` shape，仍需真实 UI 复测。
+- LUX-024：已完成 Users/Public、AuthenticateByName、Sessions/Logout 的本地协议 shape 和 token 脱敏测试；VidHub 真实登录通过；SenPlayer 认证响应解析失败的历史缺口已补充更完整的 `User`/`SessionInfo` shape，并补齐认证后 `GET /Users/:userId` 用户详情路由；P0 真实 UI 复测已通过。
+- SenPlayer 列表兼容修复：当请求的 `Fields` 未包含 `MediaSources` 或 `MediaStreams` 时，Emby 列表响应不再携带这些字段；详情和 `PlaybackInfo` 仍返回完整媒体源。自动化回归已覆盖，真实客户端需要清理缓存或重新进入库后复测。
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
 - Web 的“已实现”仅表示代码路径和服务端静态集成已完成；当前 Chrome smoke 覆盖登录、筛选、播放、收藏、账户会话和管理流程，不等同于所有浏览器/编码格式兼容。
 - LUX-121 兼容补齐：Emby `Views` 返回媒体库类型、`ChildCount` 和标准 `ImageTags.Primary`；条目详情同时返回本地徽标的 `ImageTags.Logo`，并通过 `/Items/{itemId}/Images/Logo` 提供标准图片读取；媒体库封面支持 `/Items/{libraryId}/Images/Primary` 及带索引、HEAD、ETag 和 ACL。尚待 VidHub UI 重新实测确认。
@@ -32,7 +33,7 @@
 | 客户端 | 本机发现 | 已观察到的流程 | 当前结果 |
 |---|---|---|---|
 | VidHub 2.1.8 | 已安装并运行 | 已完成 Emby 添加服务器、登录并进入 Lux 空媒体库 | 添加服务器/登录通过；旧探针发生在 `Views/Resume` 实现前，当前服务端已有对应路径和自动化测试 |
-| SenPlayer 6.0.6 | 已安装 | 已添加 Emby 服务器并触发登录；客户端未进入 System/Info | HTTP 200 后客户端提示数据读取失败 |
+| SenPlayer 6.0.6 | 已安装 | 修复后已完成服务器加载、认证、`Users/:userId`、Views、Resume 和 Items 请求；电影页已显示 16 个条目（服务端总数 22） | P0 连接/登录和电影列表浏览通过；详情、播放、进度、收藏、字幕和多版本尚未实测 |
 | Infuse | 未发现已安装应用 | 无法开始本机 UI 探针 | 未测试，需安装后再测 |
 
 本次 VidHub 探针使用临时本机 ARM 服务 `127.0.0.1:18099`，未记录密码、token、Cookie、用户 ID 或真实媒体数据。
@@ -76,7 +77,7 @@ VidHub 2.1.8（macOS arm64）连接当前 Mac 地址 `http://192.168.50.108:8097
 
 最终数据库记录绑定到该本地 MKV 的 `media_source_id`，`user_item_state.position_ticks=861670000`；播放会话的 `state=STOPPED`。该实测证明 VidHub 播放、退出停止和继续观看进度回传链路已打通。文件名中的 `2160p` 只属于媒体源标签，本机 ffprobe 对该夹具实际识别为 1920x1080 H.264，属于现有测试媒体内容差异。
 
-SenPlayer 6.0.6 的历史实测结果：服务器已添加，但客户端重复请求 `POST /emby/Users/AuthenticateByName`，服务端均返回 `200`；客户端随后显示“未能读取数据，数据已丢失”，没有继续请求 `System/Info`。2026-08-06 代码侧定位到两个 P0 契约风险：`System/Ping` 曾错误要求鉴权，且认证响应的 `User`/`SessionInfo` shape 过瘦。源码已补齐自动化回归，仍需用 SenPlayer 真实 UI 复测后更新矩阵结果。
+SenPlayer 6.0.6 的历史实测结果：服务器已添加，但客户端重复请求 `POST /emby/Users/AuthenticateByName`，服务端均返回 `200`；客户端随后显示“未能读取数据，数据已丢失”，没有继续请求 `System/Info`。2026-08-06 真实 UI 重试捕获到认证后的 `GET /emby/Users/:userId`；该路由此前缺失，请求落入 Web 前端 fallback 并返回 HTML 200，正是客户端 JSON 解析失败的直接原因。补齐路由后，列表接口按请求的 `Fields` 省略未请求的 `MediaSources/MediaStreams`，并将服务监听到 SenPlayer 实际使用的 `192.168.50.108:8097`；真实 UI 已进入“我的媒体”，电影页显示 16 个条目，服务端总数为 22。
 
 ### 可重复的本地协议探针
 

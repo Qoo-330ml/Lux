@@ -35,20 +35,17 @@ export function MediaInfoPanel({
 
   return (
     <section className="lux-media-info" aria-labelledby="media-info-heading">
-      <div className="lux-media-info-extra">
-        <h2>其它信息</h2>
-        <div className="lux-media-info-extra-list">
-          <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
-          <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
-          <InfoRow label="状态" value={status ?? undefined} />
-          <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} />
-          <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} />
-          <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
-        </div>
-      </div>
       <div className="lux-media-info-heading">
         <h2 id="media-info-heading">媒体信息</h2>
         <span>{streams.length ? `${streams.length} 条媒体轨` : "暂无轨道信息"}</span>
+      </div>
+      <div className="lux-media-info-summary">
+        <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
+        <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
+        <InfoRow label="状态" value={status ?? undefined} />
+        <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} />
+        <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} />
+        <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
       </div>
       {source.externalUrl ? (
         <div className="lux-media-info-address">

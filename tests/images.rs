@@ -168,6 +168,66 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     );
     assert_eq!(emby_mobile_image.bytes().await?, "poster-bytes".as_bytes());
 
+    let emby_anonymous_without_tag = client
+        .get(format!("{base_url}/emby/Items/{item_id}/Images/Primary/0"))
+        .send()
+        .await?;
+    assert_eq!(
+        emby_anonymous_without_tag.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let emby_capability_image = client
+        .get(format!(
+            "{base_url}/emby/Items/{item_id}/Images/Primary/0?tag={image_id}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(emby_capability_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        emby_capability_image.bytes().await?,
+        "poster-bytes".as_bytes()
+    );
+
+    let emby_invalid_capability = client
+        .get(format!(
+            "{base_url}/emby/Items/{item_id}/Images/Primary/0?tag=not-the-image-tag"
+        ))
+        .send()
+        .await?;
+    assert_eq!(
+        emby_invalid_capability.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let emby_authorization_image = client
+        .get(format!("{base_url}/emby/Items/{item_id}/Images/Primary"))
+        .header(
+            "X-Emby-Authorization",
+            format!(
+                "MediaBrowser Client=\"VidHub\", Device=\"iPhone\", DeviceId=\"mobile-image-device\", Version=\"2.1.8\", Token=\"{emby_token}\""
+            ),
+        )
+        .send()
+        .await?;
+    assert_eq!(emby_authorization_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        emby_authorization_image.headers().get(ETAG).unwrap(),
+        etag.as_str()
+    );
+    assert_eq!(
+        emby_authorization_image.bytes().await?,
+        "poster-bytes".as_bytes()
+    );
+
+    let emby_bearer_image = client
+        .get(format!("{base_url}/emby/Items/{item_id}/Images/Primary"))
+        .header("Authorization", format!("Bearer {emby_token}"))
+        .send()
+        .await?;
+    assert_eq!(emby_bearer_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(emby_bearer_image.bytes().await?, "poster-bytes".as_bytes());
+
     let emby_logo = client
         .get(format!("{base_url}/Items/{item_id}/Images/Logo"))
         .header("X-Emby-Token", &emby_token)

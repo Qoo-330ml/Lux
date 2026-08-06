@@ -803,6 +803,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/System/Ping", get(emby_ping).post(emby_ping))
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
+        .route("/Users/{user_id}", get(emby_user))
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Resume", get(emby_user_resume))
         .route("/Users/{user_id}/Items/Latest", get(emby_user_latest))
@@ -1012,6 +1013,22 @@ async fn emby_public_users(State(state): State<AppState>) -> Json<Value> {
     ))
 }
 
+async fn emby_user(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    Json(emby_user_json(&user, &state.server_id)).into_response()
+}
+
 #[derive(Deserialize)]
 struct EmbyAuthenticateRequest {
     #[serde(rename = "Username")]
@@ -1083,6 +1100,8 @@ async fn emby_authenticate(
 struct EmbyTokenQuery {
     #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey")]
     api_key: Option<String>,
+    #[serde(rename = "tag", alias = "Tag")]
+    tag: Option<String>,
 }
 
 async fn require_emby_token(
@@ -1107,10 +1126,7 @@ async fn resolve_emby_user_with_auth(
     query: &EmbyTokenQuery,
     auth: &EmbyAuthService,
 ) -> Result<UserRecord, StatusCode> {
-    let token = headers
-        .get("X-Emby-Token")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
+    let token = emby_token_from_headers(headers)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
     match auth.resolve_token(&token).await {
@@ -1120,18 +1136,75 @@ async fn resolve_emby_user_with_auth(
     }
 }
 
+fn emby_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("X-Emby-Token")
+        .or_else(|| headers.get("X-MediaBrowser-Token"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(emby_token_header_value)
+        .or_else(|| {
+            headers
+                .get("X-Emby-Authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(emby_authorization_token)
+        })
+        .or_else(|| {
+            headers
+                .get("X-Emby-Authentication")
+                .and_then(|value| value.to_str().ok())
+                .and_then(emby_authorization_token)
+        })
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(emby_token_header_value)
+        })
+}
+
+fn emby_token_header_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(token) = value.strip_prefix("Bearer ") {
+        return (!token.is_empty()).then(|| token.to_owned());
+    }
+    emby_authorization_token(value).or_else(|| (!value.is_empty()).then(|| value.to_owned()))
+}
+
+fn emby_authorization_token(value: &str) -> Option<String> {
+    let parameters = value
+        .split_once(' ')
+        .map_or(value, |(_, parameters)| parameters);
+    parameters.split(',').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("Token") {
+            return None;
+        }
+        let token = value.trim().trim_matches('"');
+        (!token.is_empty()).then(|| token.to_owned())
+    })
+}
+
 async fn require_emby_user(
     headers: &HeaderMap,
     state: &AppState,
     api_key: Option<&str>,
 ) -> Result<UserRecord, StatusCode> {
+    let query = EmbyTokenQuery {
+        api_key: api_key.map(str::to_owned),
+        tag: None,
+    };
+    require_emby_user_with_query(headers, state, &query).await
+}
+
+async fn require_emby_user_with_query(
+    headers: &HeaderMap,
+    state: &AppState,
+    query: &EmbyTokenQuery,
+) -> Result<UserRecord, StatusCode> {
     let Some(auth) = state.emby_auth.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let query = EmbyTokenQuery {
-        api_key: api_key.map(str::to_owned),
-    };
-    let user = resolve_emby_user_with_auth(headers, &query, auth).await?;
+    let user = resolve_emby_user_with_auth(headers, query, auth).await?;
     if state.remote_access.is_remote(
         header_str(headers, "x-lux-peer-ip"),
         header_str(headers, "x-forwarded-for"),
@@ -1190,6 +1263,17 @@ struct EmbyItemsQuery {
     sort_by: Option<String>,
     #[serde(rename = "SortOrder", default)]
     sort_order: Option<String>,
+    #[serde(rename = "Fields", default)]
+    fields: Option<String>,
+}
+
+fn emby_fields_include(fields: Option<&str>, field: &str) -> bool {
+    fields.is_none_or(|fields| {
+        fields
+            .split(',')
+            .map(str::trim)
+            .any(|value| value.eq_ignore_ascii_case(field))
+    })
 }
 
 fn catalog_filter_from_values(
@@ -1405,7 +1489,12 @@ async fn emby_user_resume(
         .skip(usize::try_from(offset).unwrap_or(usize::MAX))
         .take(usize::try_from(limit).unwrap_or(0))
         .map(|(item, item_state)| {
-            emby_catalog_item_json_with_state(&item, &state.server_id, Some(&item_state))
+            emby_catalog_item_json_with_state(
+                &item,
+                &state.server_id,
+                Some(&item_state),
+                query.fields.as_deref(),
+            )
         })
         .collect::<Vec<_>>();
     Json(json!({
@@ -1436,7 +1525,7 @@ async fn emby_user_latest(
         Ok(page) => page,
         Err(status) => return status.into_response(),
     };
-    match emby_catalog_items_for_user(&state, &user_id, &page).await {
+    match emby_catalog_items_for_user(&state, &user_id, &page, query.fields.as_deref()).await {
         Ok(items) => Json(items).into_response(),
         Err(status) => status.into_response(),
     }
@@ -1471,7 +1560,10 @@ async fn emby_user_next_up(
         )
         .await
     {
-        Ok(page) => emby_catalog_page_for_user(&state, &user_id, &page).await,
+        Ok(page) => {
+            emby_catalog_page_for_user_with_fields(&state, &user_id, &page, query.fields.as_deref())
+                .await
+        }
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::FORBIDDEN.into_response()
         }
@@ -1506,7 +1598,15 @@ async fn emby_show_seasons(
         )
         .await
     {
-        Ok(page) => emby_catalog_page_for_user(&state, &user.id.to_string(), &page).await,
+        Ok(page) => {
+            emby_catalog_page_for_user_with_fields(
+                &state,
+                &user.id.to_string(),
+                &page,
+                query.fields.as_deref(),
+            )
+            .await
+        }
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::NOT_FOUND.into_response()
         }
@@ -1541,7 +1641,15 @@ async fn emby_show_episodes(
         )
         .await
     {
-        Ok(page) => emby_catalog_page_for_user(&state, &user.id.to_string(), &page).await,
+        Ok(page) => {
+            emby_catalog_page_for_user_with_fields(
+                &state,
+                &user.id.to_string(),
+                &page,
+                query.fields.as_deref(),
+            )
+            .await
+        }
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::NOT_FOUND.into_response()
         }
@@ -1575,7 +1683,15 @@ async fn emby_collection_children(
         )
         .await
     {
-        Ok(page) => emby_catalog_page_for_user(&state, &user.id.to_string(), &page).await,
+        Ok(page) => {
+            emby_catalog_page_for_user_with_fields(
+                &state,
+                &user.id.to_string(),
+                &page,
+                query.fields.as_deref(),
+            )
+            .await
+        }
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::NOT_FOUND.into_response()
         }
@@ -1583,12 +1699,13 @@ async fn emby_collection_children(
     }
 }
 
-async fn emby_catalog_page_for_user(
+async fn emby_catalog_page_for_user_with_fields(
     state: &AppState,
     user_id: &str,
     page: &CatalogPage,
+    fields: Option<&str>,
 ) -> Response {
-    match emby_catalog_items_for_user(state, user_id, page).await {
+    match emby_catalog_items_for_user(state, user_id, page, fields).await {
         Ok(items) => Json(json!({
             "Items": items,
             "TotalRecordCount": page.total,
@@ -1603,6 +1720,7 @@ async fn emby_catalog_items_for_user(
     state: &AppState,
     user_id: &str,
     page: &CatalogPage,
+    fields: Option<&str>,
 ) -> Result<Vec<Value>, StatusCode> {
     let Some(database) = state.database.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -1622,6 +1740,7 @@ async fn emby_catalog_items_for_user(
             item,
             &state.server_id,
             user_states.get(&item.id),
+            fields,
         ));
     }
     Ok(items)
@@ -1669,7 +1788,15 @@ async fn emby_list_items(
     query: &EmbyItemsQuery,
 ) -> Response {
     match emby_catalog_page_from_query(state, principal, query).await {
-        Ok(page) => emby_catalog_page_for_user(state, &principal.user_id.to_string(), &page).await,
+        Ok(page) => {
+            emby_catalog_page_for_user_with_fields(
+                state,
+                &principal.user_id.to_string(),
+                &page,
+                query.fields.as_deref(),
+            )
+            .await
+        }
         Err(status) => status.into_response(),
     }
 }
@@ -1769,6 +1896,7 @@ async fn emby_item_response(
                 &item,
                 &state.server_id,
                 user_state.as_ref(),
+                None,
             ))
             .into_response()
         }
@@ -1820,7 +1948,7 @@ async fn emby_playback_info(
         "PlaySessionId": Uuid::now_v7().to_string(),
         "MediaSources": sources
             .into_iter()
-            .map(|source| emby_media_source_json(&item.id, source))
+            .map(|source| emby_media_source_json(&item.id, source, true))
             .collect::<Vec<_>>(),
     }))
     .into_response()
@@ -2511,6 +2639,7 @@ fn emby_catalog_item_json_with_state(
     item: &CatalogItem,
     server_id: &str,
     user_state: Option<&crate::storage::StoredUserItemState>,
+    fields: Option<&str>,
 ) -> Value {
     let default_source = item
         .media_sources
@@ -2538,7 +2667,7 @@ fn emby_catalog_item_json_with_state(
         image_tags.insert("Thumb".to_owned(), json!(tag));
     }
     let parent_id = item.parent_id.as_deref().unwrap_or(&item.library_id);
-    json!({
+    let mut value = json!({
         "Name": item.title,
         "OriginalTitle": item.original_title,
         "Id": item.id,
@@ -2559,11 +2688,6 @@ fn emby_catalog_item_json_with_state(
         "Container": default_source.and_then(|source| source.container.clone()),
         "Size": default_source.and_then(|source| source.size),
         "Bitrate": default_source.and_then(|source| source.bitrate),
-        "MediaSources": item
-            .media_sources
-            .iter()
-            .map(|source| emby_media_source_json(&item.id, source))
-            .collect::<Vec<_>>(),
         "ImageTags": image_tags,
         "BackdropImageTags": item
             .fanart_image_tag
@@ -2577,12 +2701,33 @@ fn emby_catalog_item_json_with_state(
             "IsFavorite": user_state.map(|state| state.is_favorite).unwrap_or(false),
             "Played": user_state.map(|state| state.is_played).unwrap_or(false),
         },
-    })
+    });
+    if emby_fields_include(fields, "MediaSources")
+        && let Value::Object(object) = &mut value
+    {
+        object.insert(
+            "MediaSources".to_owned(),
+            Value::Array(
+                item.media_sources
+                    .iter()
+                    .map(|source| {
+                        emby_media_source_json(
+                            &item.id,
+                            source,
+                            emby_fields_include(fields, "MediaStreams"),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    value
 }
 
 fn emby_media_source_json(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
+    include_media_streams: bool,
 ) -> Value {
     let direct_stream_url = if source.source_kind == "LOCAL_FILE" {
         let suffix = source
@@ -2595,7 +2740,7 @@ fn emby_media_source_json(
         source.external_url.clone()
     };
     let is_remote = source.source_kind == "STRM_URL";
-    json!({
+    let mut value = json!({
         "Id": source.id,
         "Name": source.edition_name,
         "Edition": source.edition_name,
@@ -2614,12 +2759,14 @@ fn emby_media_source_json(
         "SupportsDirectStream": false,
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
-        "MediaStreams": source
-            .streams
-            .iter()
-            .map(emby_media_stream_json)
-            .collect::<Vec<_>>(),
-    })
+    });
+    if include_media_streams && let Value::Object(object) = &mut value {
+        object.insert(
+            "MediaStreams".to_owned(),
+            Value::Array(source.streams.iter().map(emby_media_stream_json).collect()),
+        );
+    }
+    value
 }
 
 fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
@@ -4741,30 +4888,57 @@ async fn emby_image(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let user = match require_emby_user_with_query(&headers, &state, &query).await {
+        Ok(user) => Some(user),
+        Err(StatusCode::UNAUTHORIZED) => None,
         Err(status) => return status.into_response(),
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let principal = user
+        .as_ref()
+        .map(|user| AccessPrincipal::new(user.id, user.is_admin));
     if normalize_image_type(&image_type) == Some("POSTER")
-        && let Some(response) =
-            serve_emby_library_cover(&state, principal, &headers, &method, &item_id, 0).await
+        && let Some(response) = serve_emby_library_cover(
+            &state,
+            principal,
+            query.tag.as_deref(),
+            &headers,
+            &method,
+            &item_id,
+            0,
+        )
+        .await
     {
         return response;
     }
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    serve_image(
-        images,
-        principal,
-        &headers,
-        &method,
-        &item_id,
-        &image_type,
-        0,
-    )
-    .await
+    match principal {
+        Some(principal) => {
+            serve_image(
+                images,
+                principal,
+                &headers,
+                &method,
+                &item_id,
+                &image_type,
+                0,
+            )
+            .await
+        }
+        None => {
+            serve_tagged_image(
+                images,
+                &headers,
+                &method,
+                &item_id,
+                &image_type,
+                0,
+                query.tag.as_deref(),
+            )
+            .await
+        }
+    }
 }
 
 async fn emby_image_at_index(
@@ -4774,34 +4948,60 @@ async fn emby_image_at_index(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let user = match require_emby_user_with_query(&headers, &state, &query).await {
+        Ok(user) => Some(user),
+        Err(StatusCode::UNAUTHORIZED) => None,
+        Err(status) => return status.into_response(),
+    };
+    let principal = user
+        .as_ref()
+        .map(|user| AccessPrincipal::new(user.id, user.is_admin));
     if normalize_image_type(&image_type) == Some("POSTER")
-        && let Some(response) =
-            serve_emby_library_cover(&state, principal, &headers, &method, &item_id, image_index)
-                .await
+        && let Some(response) = serve_emby_library_cover(
+            &state,
+            principal,
+            query.tag.as_deref(),
+            &headers,
+            &method,
+            &item_id,
+            image_index,
+        )
+        .await
     {
         return response;
     }
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    serve_image(
-        images,
-        principal,
-        &headers,
-        &method,
-        &item_id,
-        &image_type,
-        image_index,
-    )
-    .await
+    match principal {
+        Some(principal) => {
+            serve_image(
+                images,
+                principal,
+                &headers,
+                &method,
+                &item_id,
+                &image_type,
+                image_index,
+            )
+            .await
+        }
+        None => {
+            serve_tagged_image(
+                images,
+                &headers,
+                &method,
+                &item_id,
+                &image_type,
+                image_index,
+                query.tag.as_deref(),
+            )
+            .await
+        }
+    }
 }
 
 async fn emby_subtitle_with_source(
@@ -5393,9 +5593,48 @@ async fn serve_image(
     .await
 }
 
+async fn serve_tagged_image(
+    images: &ImageService,
+    headers: &HeaderMap,
+    method: &Method,
+    item_id: &str,
+    image_type: &str,
+    image_index: i64,
+    tag: Option<&str>,
+) -> Response {
+    let Some(tag) = tag.filter(|tag| !tag.is_empty()) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(image_type) = normalize_image_type(image_type) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let image = match images
+        .resolve_tagged(item_id, image_type, image_index, tag)
+        .await
+    {
+        Ok(Some(image)) => image,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+        Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    serve_image_file(
+        &image.path,
+        image.content_type,
+        image.content_length,
+        &image.etag,
+        headers,
+        method,
+    )
+    .await
+}
+
 async fn serve_emby_library_cover(
     state: &AppState,
-    principal: AccessPrincipal,
+    principal: Option<AccessPrincipal>,
+    capability_tag: Option<&str>,
     headers: &HeaderMap,
     method: &Method,
     library_id: &str,
@@ -5414,16 +5653,25 @@ async fn serve_emby_library_cover(
     if image_index != 0 {
         return Some(StatusCode::NOT_FOUND.into_response());
     }
-    let Some(access) = state.access.as_ref() else {
-        return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    };
-    match access
-        .can_view_library(principal, &library_id.to_string())
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return Some(StatusCode::NOT_FOUND.into_response()),
-        Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    if let Some(capability_tag) = capability_tag {
+        if cover.etag.trim_matches('"') != capability_tag {
+            return None;
+        }
+    } else {
+        let Some(principal) = principal else {
+            return None;
+        };
+        let Some(access) = state.access.as_ref() else {
+            return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        };
+        match access
+            .can_view_library(principal, &library_id.to_string())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Some(StatusCode::NOT_FOUND.into_response()),
+            Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        }
     }
     Some(
         serve_image_file(
@@ -10762,7 +11010,7 @@ mod tests {
             }],
         };
 
-        let body = emby_media_source_json("item-1", &source);
+        let body = emby_media_source_json("item-1", &source, true);
         assert_eq!(body["Path"], "https://example.invalid/media.mkv");
         assert_eq!(body["Size"], 1_234_567);
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);

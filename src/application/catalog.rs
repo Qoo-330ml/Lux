@@ -303,8 +303,37 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
-        self.list_progress_items(principal, user_id, offset, limit, &["MOVIE", "EPISODE"])
-            .await
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let (played_percent, minimum_ticks) = self.database.resume_settings().await?;
+        let item_types = ["MOVIE", "EPISODE"];
+        let total = self
+            .database
+            .count_resume_items(
+                user_id,
+                &library_ids,
+                &item_types,
+                played_percent,
+                minimum_ticks,
+            )
+            .await?;
+        let rows = self
+            .database
+            .list_resume_items(
+                user_id,
+                &library_ids,
+                &item_types,
+                played_percent,
+                minimum_ticks,
+                offset,
+                limit,
+            )
+            .await?;
+        Ok(CatalogPage {
+            items: assemble_items(rows),
+            total,
+            offset,
+            limit,
+        })
     }
 
     async fn list_progress_items(

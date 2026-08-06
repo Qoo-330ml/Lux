@@ -103,6 +103,18 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
             .is_some_and(|id| !id.is_empty())
     );
 
+    let current_user = client
+        .get(format!("http://{address}/emby/Users/{}", admin.id))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(current_user.status(), reqwest::StatusCode::OK);
+    let current_user_body: serde_json::Value = current_user.json().await?;
+    assert_eq!(current_user_body["Id"], admin.id.to_string());
+    assert_eq!(current_user_body["Name"], "Administrator");
+    assert_eq!(current_user_body["ServerId"], database.server_id());
+    assert_eq!(current_user_body["Policy"]["IsAdministrator"], true);
+
     let raw_token_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM access_tokens WHERE token_hash = ?")
             .bind(token.as_bytes())

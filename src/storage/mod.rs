@@ -4588,6 +4588,143 @@ impl Database {
         .await
     }
 
+    pub(crate) async fn count_resume_items(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+        item_types: &[&str],
+        played_percent: i64,
+        minimum_ticks: i64,
+    ) -> Result<i64, StorageError> {
+        if library_ids.is_empty() || item_types.is_empty() {
+            return Ok(0);
+        }
+        let item_type_placeholders = std::iter::repeat_n("?", item_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let library_placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let runtime_ticks = resume_runtime_ticks_sql();
+        let statement_sql = format!(
+            "WITH candidates AS (
+                 SELECT us.position_ticks,
+                        {runtime_ticks} AS resume_runtime_ticks
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL
+                   AND us.is_played = 0 AND us.position_ticks >= ?
+                   AND mi.library_id IN ({library_placeholders})
+             )
+             SELECT COUNT(*) FROM candidates
+             WHERE resume_runtime_ticks > 0
+               AND position_ticks * 100 < resume_runtime_ticks * ?"
+        );
+        let mut statement =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(statement_sql)).bind(user_id);
+        for item_type in item_types {
+            statement = statement.bind(*item_type);
+        }
+        statement = statement.bind(minimum_ticks);
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        statement
+            .bind(played_percent)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_resume_items(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+        item_types: &[&str],
+        played_percent: i64,
+        minimum_ticks: i64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        if library_ids.is_empty() || item_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let item_type_placeholders = std::iter::repeat_n("?", item_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let library_placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let runtime_ticks = resume_runtime_ticks_sql();
+        let statement_sql = format!(
+            "WITH candidates AS (
+                 SELECT mi.id, mi.series_id, mi.season_number, mi.episode_number,
+                        us.position_ticks, us.last_played_at,
+                        {runtime_ticks} AS resume_runtime_ticks
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL
+                   AND us.is_played = 0 AND us.position_ticks >= ?
+                   AND mi.library_id IN ({library_placeholders})
+             ),
+             ranked AS (
+                 SELECT id, series_id, season_number, episode_number, last_played_at
+                 FROM candidates
+                 WHERE resume_runtime_ticks > 0
+                   AND position_ticks * 100 < resume_runtime_ticks * ?
+                 ORDER BY last_played_at DESC, series_id, season_number, episode_number, id
+                 LIMIT ? OFFSET ?
+             )
+             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    mi.title, mi.sort_title, mi.original_title, mi.overview,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
+                     ORDER BY image_index LIMIT 1) AS thumb_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
+                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
+             FROM ranked
+             JOIN media_items mi ON mi.id = ranked.id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             ORDER BY ranked.last_played_at DESC, ranked.series_id,
+                      ranked.season_number, ranked.episode_number, ranked.id,
+                      ms.id, mt.stream_index"
+        );
+        let mut binds = Vec::with_capacity(item_types.len() + library_ids.len() + 5);
+        binds.push(CatalogBind::Text(user_id));
+        binds.extend(item_types.iter().copied().map(CatalogBind::Text));
+        binds.push(CatalogBind::Integer(minimum_ticks));
+        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
+        binds.push(CatalogBind::Integer(played_percent));
+        binds.push(CatalogBind::Integer(limit));
+        binds.push(CatalogBind::Integer(offset));
+        self.fetch_catalog_rows(&statement_sql, &binds).await
+    }
+
     pub(crate) async fn count_progress_items(
         &self,
         user_id: &str,
@@ -7330,6 +7467,35 @@ fn catalog_filter_where_clause<'a>(
         binds.push(CatalogBind::Integer(i64::from(is_favorite)));
     }
     (where_clause, binds)
+}
+
+fn resume_runtime_ticks_sql() -> &'static str {
+    "COALESCE(
+        NULLIF(mi.runtime_ticks, 0),
+        (
+            SELECT ms_default.duration_ticks
+            FROM media_sources ms_default
+            JOIN filesystem_entries fe_default
+              ON fe_default.id = ms_default.filesystem_entry_id
+             AND fe_default.is_missing = 0
+            WHERE ms_default.item_id = mi.id
+              AND ms_default.is_default = 1
+              AND ms_default.duration_ticks > 0
+            ORDER BY ms_default.id
+            LIMIT 1
+        ),
+        (
+            SELECT ms_first.duration_ticks
+            FROM media_sources ms_first
+            JOIN filesystem_entries fe_first
+              ON fe_first.id = ms_first.filesystem_entry_id
+             AND fe_first.is_missing = 0
+            WHERE ms_first.item_id = mi.id
+              AND ms_first.duration_ticks > 0
+            ORDER BY ms_first.id
+            LIMIT 1
+        )
+    )"
 }
 
 #[derive(Clone, Copy)]
