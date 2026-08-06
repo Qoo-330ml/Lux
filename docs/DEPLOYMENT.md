@@ -8,7 +8,8 @@
 
 ```bash
 mkdir -p config media
-LUX_MEDIA_DIR=/srv/media docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 镜像以非 root 的 UID 10001 运行。Linux/NAS 上应在启动前给 `config` 目录授予 UID 10001 的读写权限，并让该 UID 对媒体目录拥有读写权限（推荐使用 NAS 共享文件夹 ACL；不要为了绕过权限问题把容器改成 root）。
@@ -22,7 +23,6 @@ LUX_MEDIA_DIR=/srv/media docker compose up -d --build
 建议显式设置：
 
 ```dotenv
-LUX_MEDIA_DIR=/srv/media
 LUX_PROXY_URL=http://192.168.1.2:7890
 LUX_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 LUX_TMDB_READ_ACCESS_TOKEN=***
