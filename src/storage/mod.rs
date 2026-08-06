@@ -1665,6 +1665,27 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_enabled_library_roots(
+        &self,
+    ) -> Result<Vec<StoredLibraryRoot>, StorageError> {
+        sqlx::query(
+            "SELECT lr.id, lr.library_id, lr.canonical_path, lr.display_path,
+                    lr.is_available, lr.is_writable, lr.last_checked_at,
+                    lr.unavailable_since, lr.scan_cursor
+             FROM library_roots lr
+             JOIN libraries l ON l.id = lr.library_id
+             WHERE l.is_enabled = 1
+             ORDER BY lr.canonical_path, lr.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_library_root).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn create_scan_job(
         &self,
         id: &str,
@@ -1682,6 +1703,140 @@ impl Database {
         .bind(job_type)
         .bind(generation)
         .bind(total_count)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn enqueue_incremental_scan_path(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        relative_path: &str,
+        change_kind: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO scan_job_paths (
+                job_id, library_root_id, relative_path, change_kind
+             ) VALUES (?, ?, ?, ?)
+             ON CONFLICT(job_id, library_root_id, relative_path) DO UPDATE SET
+                change_kind = excluded.change_kind,
+                processed_at = NULL,
+                updated_at = unixepoch()",
+        )
+        .bind(job_id)
+        .bind(library_root_id)
+        .bind(relative_path)
+        .bind(change_kind)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        sqlx::query(
+            "UPDATE scan_jobs
+             SET total_count = (
+                 SELECT COUNT(*) FROM scan_job_paths
+                 WHERE job_id = ?
+             ), updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(job_id)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_pending_scan_job_paths(
+        &self,
+        job_id: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredScanJobPath>, StorageError> {
+        sqlx::query(
+            "SELECT job_id, library_root_id, relative_path, change_kind
+             FROM scan_job_paths
+             WHERE job_id = ? AND processed_at IS NULL
+             ORDER BY created_at, relative_path
+             LIMIT ?",
+        )
+        .bind(job_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_scan_job_path).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_scan_job_path_processed(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        relative_path: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE scan_job_paths
+             SET processed_at = unixepoch(), updated_at = unixepoch()
+             WHERE job_id = ? AND library_root_id = ? AND relative_path = ?",
+        )
+        .bind(job_id)
+        .bind(library_root_id)
+        .bind(relative_path)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_scan_job_if_idle(&self, id: &str) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "UPDATE scan_jobs
+             SET status = 'COMPLETED', finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_job_paths
+                   WHERE job_id = ? AND processed_at IS NULL
+               )",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn mark_filesystem_entry_missing_by_path(
+        &self,
+        library_root_id: &str,
+        relative_path: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET is_missing = 1, updated_at = unixepoch()
+             WHERE library_root_id = ? AND relative_path = ?",
+        )
+        .bind(library_root_id)
+        .bind(relative_path)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -4345,7 +4500,13 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "SELECT parent.id, COUNT(child.id) AS episode_count
+            "SELECT parent.id,
+                    COUNT(DISTINCT CASE
+                        WHEN parent.item_type = 'SERIES' THEN
+                            COALESCE(CAST(child.season_number AS TEXT), '') || ':' ||
+                            COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                        ELSE COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                    END) AS episode_count
              FROM media_items parent
              JOIN libraries l ON l.id = parent.library_id AND l.is_enabled = 1
              LEFT JOIN media_items child
@@ -4790,7 +4951,13 @@ impl Database {
                     (SELECT COUNT(*) FROM media_items child
                      WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
                        AND child.removed_at IS NULL) AS season_count,
-                    (SELECT COUNT(*) FROM media_items child
+                    (SELECT COUNT(DISTINCT CASE
+                                WHEN mi.item_type = 'SERIES' THEN
+                                    COALESCE(CAST(child.season_number AS TEXT), '') || ':' ||
+                                    COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                                ELSE COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                            END)
+                     FROM media_items child
                      WHERE child.item_type = 'EPISODE'
                        AND child.removed_at IS NULL
                        AND ((mi.item_type = 'SERIES' AND child.series_id = mi.id)
@@ -6673,6 +6840,13 @@ pub(crate) struct StoredScanJob {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredScanJobPath {
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) change_kind: String,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredStrmProbeJob {
     pub(crate) id: String,
     pub(crate) operation_id: String,
@@ -6730,6 +6904,14 @@ fn stored_scan_job(row: sqlx::sqlite::SqliteRow) -> StoredScanJob {
         total_count: row.get("total_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
+    }
+}
+
+fn stored_scan_job_path(row: sqlx::sqlite::SqliteRow) -> StoredScanJobPath {
+    StoredScanJobPath {
+        library_root_id: row.get("library_root_id"),
+        relative_path: row.get("relative_path"),
+        change_kind: row.get("change_kind"),
     }
 }
 

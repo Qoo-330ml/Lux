@@ -70,6 +70,7 @@ use crate::{
         thumbnails::ThumbnailService,
         tmdb::{TmdbClient, TmdbError},
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
+        watch::LibraryWatchService,
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
@@ -302,6 +303,13 @@ impl AppState {
                 }
             });
         }
+    }
+
+    pub async fn start_realtime_watchers(&self) {
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+        LibraryWatchService::new(database).spawn();
     }
 
     pub async fn resume_strm_probe_jobs(&self) {
@@ -983,25 +991,25 @@ async fn emby_system_info(
 }
 
 async fn emby_ping(
-    headers: HeaderMap,
-    Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    _headers: HeaderMap,
+    Query(_query): Query<EmbyTokenQuery>,
+    State(_state): State<AppState>,
 ) -> Response {
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    match require_emby_token(&headers, &query, auth, &state).await {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(status) => status.into_response(),
-    }
+    StatusCode::OK.into_response()
 }
 
 async fn emby_public_users(State(state): State<AppState>) -> Json<Value> {
+    let server_id = state.server_id.clone();
     let Some(auth) = state.emby_auth else {
         return Json(json!([]));
     };
     let users = auth.public_users().await.unwrap_or_default();
-    Json(Value::Array(users.iter().map(emby_user_json).collect()))
+    Json(Value::Array(
+        users
+            .iter()
+            .map(|user| emby_user_json(user, &server_id))
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1056,14 +1064,8 @@ async fn emby_authenticate(
             )
             .await;
             Json(json!({
-                "User": emby_user_json(&result.user),
-                "SessionInfo": {
-                    "Client": result.device.client,
-                    "DeviceId": result.device.device_id,
-                    "DeviceName": result.device.device,
-                    "ApplicationVersion": result.device.version,
-                    "UserId": result.user.id.to_string()
-                },
+                "User": emby_user_json(&result.user, &state.server_id),
+                "SessionInfo": emby_login_session_json(&result, &state.server_id),
                 "AccessToken": result.token,
                 "ServerId": state.server_id
             }))
@@ -1429,13 +1431,15 @@ async fn emby_user_latest(
     }
     query.sort_by = Some("DateCreated".to_owned());
     query.sort_order = Some("Descending".to_owned());
-    emby_list_items(
-        &headers,
-        &state,
-        AccessPrincipal::new(user.id, user.is_admin),
-        &query,
-    )
-    .await
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let page = match emby_catalog_page_from_query(&state, principal, &query).await {
+        Ok(page) => page,
+        Err(status) => return status.into_response(),
+    };
+    match emby_catalog_items_for_user(&state, &user_id, &page).await {
+        Ok(items) => Json(items).into_response(),
+        Err(status) => status.into_response(),
+    }
 }
 
 async fn emby_user_next_up(
@@ -1584,8 +1588,24 @@ async fn emby_catalog_page_for_user(
     user_id: &str,
     page: &CatalogPage,
 ) -> Response {
+    match emby_catalog_items_for_user(state, user_id, page).await {
+        Ok(items) => Json(json!({
+            "Items": items,
+            "TotalRecordCount": page.total,
+            "StartIndex": page.offset,
+        }))
+        .into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn emby_catalog_items_for_user(
+    state: &AppState,
+    user_id: &str,
+    page: &CatalogPage,
+) -> Result<Vec<Value>, StatusCode> {
     let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let item_ids = page
         .items
@@ -1594,7 +1614,7 @@ async fn emby_catalog_page_for_user(
         .collect::<Vec<_>>();
     let user_states = match database.list_user_item_states(user_id, &item_ids).await {
         Ok(states) => states,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
     let mut items = Vec::with_capacity(page.items.len());
     for item in &page.items {
@@ -1604,12 +1624,7 @@ async fn emby_catalog_page_for_user(
             user_states.get(&item.id),
         ));
     }
-    Json(json!({
-        "Items": items,
-        "TotalRecordCount": page.total,
-        "StartIndex": page.offset,
-    }))
-    .into_response()
+    Ok(items)
 }
 
 async fn emby_user_items(
@@ -1653,18 +1668,29 @@ async fn emby_list_items(
     principal: AccessPrincipal,
     query: &EmbyItemsQuery,
 ) -> Response {
+    match emby_catalog_page_from_query(state, principal, query).await {
+        Ok(page) => emby_catalog_page_for_user(state, &principal.user_id.to_string(), &page).await,
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn emby_catalog_page_from_query(
+    state: &AppState,
+    principal: AccessPrincipal,
+    query: &EmbyItemsQuery,
+) -> Result<CatalogPage, StatusCode> {
     let (offset, limit) = match emby_page_params(query) {
         Ok(params) => params,
-        Err(status) => return status.into_response(),
+        Err(status) => return Err(status),
     };
     let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let filter = catalog_filter_from_emby(query);
     let page = match query.parent_id.as_deref() {
         Some(parent_id) => {
             let Ok(parent_id) = parent_id.parse::<crate::domain::ids::LibraryId>() else {
-                return StatusCode::BAD_REQUEST.into_response();
+                return Err(StatusCode::BAD_REQUEST);
             };
             catalog
                 .list_library_items_filtered(
@@ -1683,10 +1709,10 @@ async fn emby_list_items(
         }
     };
     match page {
-        Ok(page) => emby_catalog_page_for_user(state, &principal.user_id.to_string(), &page).await,
-        Err(CatalogError::LibraryNotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(CatalogError::AccessDenied) => StatusCode::FORBIDDEN.into_response(),
-        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok(page) => Ok(page),
+        Err(CatalogError::LibraryNotFound) => Err(StatusCode::NOT_FOUND),
+        Err(CatalogError::AccessDenied) => Err(StatusCode::FORBIDDEN),
+        Err(CatalogError::Storage(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 
@@ -2511,6 +2537,7 @@ fn emby_catalog_item_json_with_state(
     if let Some(tag) = item.thumb_image_tag.as_ref() {
         image_tags.insert("Thumb".to_owned(), json!(tag));
     }
+    let parent_id = item.parent_id.as_deref().unwrap_or(&item.library_id);
     json!({
         "Name": item.title,
         "OriginalTitle": item.original_title,
@@ -2520,7 +2547,8 @@ fn emby_catalog_item_json_with_state(
         "MediaType": "Video",
         "IsFolder": matches!(item.item_type.as_str(), "SERIES" | "SEASON" | "BOX_SET"),
         "CollectionType": (item.item_type == "BOX_SET").then_some("movies"),
-        "ParentId": item.parent_id,
+        "ParentId": parent_id,
+        "PrimaryImageItemId": item.poster_image_tag.as_ref().map(|_| item.id.clone()),
         "SeriesId": item.series_id,
         "ParentIndexNumber": item.season_number,
         "Index": item.episode_number,
@@ -2622,6 +2650,7 @@ fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count:
         "IsFolder": true,
         "CollectionType": emby_collection_type(library.kind),
         "ChildCount": child_count,
+        "PrimaryImageItemId": library.cover_image_tag.as_ref().map(|_| library.id.to_string()),
         "ImageTags": library
             .cover_image_tag
             .as_ref()
@@ -2659,12 +2688,107 @@ fn emby_stream_type(stream_type: &str) -> &'static str {
     }
 }
 
-fn emby_user_json(user: &UserRecord) -> Value {
+fn emby_user_json(user: &UserRecord, server_id: &str) -> Value {
     json!({
         "Id": user.id.to_string(),
+        "ServerId": server_id,
+        "ServerName": "Lux",
         "Name": user.display_name,
         "HasPassword": true,
-        "Policy": { "IsAdministrator": user.is_admin }
+        "HasConfiguredPassword": true,
+        "HasConfiguredEasyPassword": false,
+        "EnableAutoLogin": false,
+        "LastLoginDate": "1970-01-01T00:00:00.0000000Z",
+        "LastActivityDate": "1970-01-01T00:00:00.0000000Z",
+        "Configuration": emby_user_configuration_json(),
+        "Policy": emby_user_policy_json(user),
+    })
+}
+
+fn emby_user_configuration_json() -> Value {
+    json!({
+        "AudioLanguagePreference": "",
+        "PlayDefaultAudioTrack": true,
+        "SubtitleLanguagePreference": "",
+        "DisplayMissingEpisodes": false,
+        "GroupedFolders": [],
+        "SubtitleMode": "Default",
+        "DisplayCollectionsView": true,
+        "EnableLocalPassword": false,
+        "OrderedViews": [],
+        "LatestItemsExcludes": [],
+        "MyMediaExcludes": [],
+        "HidePlayedInLatest": false,
+        "RememberAudioSelections": true,
+        "RememberSubtitleSelections": true,
+        "EnableNextEpisodeAutoPlay": true,
+    })
+}
+
+fn emby_user_policy_json(user: &UserRecord) -> Value {
+    json!({
+        "IsAdministrator": user.is_admin,
+        "IsHidden": false,
+        "IsHiddenRemotely": false,
+        "IsDisabled": user.is_disabled,
+        "BlockedTags": [],
+        "EnableUserPreferenceAccess": true,
+        "AccessSchedules": [],
+        "BlockUnratedItems": [],
+        "EnableRemoteControlOfOtherUsers": user.can_manage_server,
+        "EnableSharedDeviceControl": true,
+        "EnableRemoteAccess": user.can_remote_access,
+        "EnableLiveTvManagement": false,
+        "EnableLiveTvAccess": false,
+        "EnableMediaPlayback": true,
+        "EnableAudioPlaybackTranscoding": false,
+        "EnableVideoPlaybackTranscoding": false,
+        "EnablePlaybackRemuxing": false,
+        "EnableContentDeletion": false,
+        "EnableContentDeletionFromFolders": [],
+        "EnableContentDownloading": user.can_download,
+        "EnableSubtitleDownloading": false,
+        "EnableSubtitleManagement": user.can_manage_server,
+        "EnableSyncTranscoding": false,
+        "EnableMediaConversion": false,
+        "EnabledDevices": [],
+        "EnableAllDevices": true,
+        "EnabledChannels": [],
+        "EnableAllChannels": false,
+        "EnabledFolders": [],
+        "EnableAllFolders": true,
+        "InvalidLoginAttemptCount": 0,
+        "EnablePublicSharing": false,
+        "BlockedMediaFolders": [],
+        "BlockedChannels": [],
+        "RemoteClientBitrateLimit": 0,
+        "AuthenticationProviderId": "Lux",
+        "ExcludedSubFolders": [],
+        "DisablePremiumFeatures": true,
+    })
+}
+
+fn emby_login_session_json(result: &crate::auth::emby::EmbyAuthResult, server_id: &str) -> Value {
+    json!({
+        "Id": result.session_id,
+        "ServerId": server_id,
+        "UserId": result.user.id.to_string(),
+        "UserName": result.user.display_name,
+        "Client": result.device.client,
+        "DeviceId": result.device.device_id,
+        "DeviceName": result.device.device,
+        "DeviceType": result.device.device,
+        "ApplicationVersion": result.device.version,
+        "AdditionalUsers": [],
+        "PlayableMediaTypes": ["Audio", "Video"],
+        "SupportedCommands": [],
+        "SupportsRemoteControl": false,
+        "RemoteEndPoint": "",
+        "UserPrimaryImageTag": serde_json::Value::Null,
+        "AppIconUrl": serde_json::Value::Null,
+        "PlaylistItemId": serde_json::Value::Null,
+        "PlayState": {},
+        "Capabilities": {},
     })
 }
 
@@ -5516,9 +5640,13 @@ fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) 
 struct CreateLibraryRequest {
     name: String,
     kind: String,
-    #[serde(default)]
+    #[serde(default = "default_realtime_watch_enabled")]
     realtime_watch_enabled: bool,
     scraper_id: Option<String>,
+}
+
+fn default_realtime_watch_enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize)]

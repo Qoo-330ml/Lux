@@ -65,13 +65,30 @@ async fn library_migration_creates_libraries_and_roots_tables()
     let database = Database::connect(&config).await?;
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master
-         WHERE type = 'table' AND name IN ('libraries', 'library_roots')
+         WHERE type = 'table' AND name IN ('libraries', 'library_roots', 'scan_job_paths')
          ORDER BY name",
     )
     .fetch_all(database.pool())
     .await?;
 
-    assert_eq!(tables, ["libraries", "library_roots"]);
+    assert_eq!(tables, ["libraries", "library_roots", "scan_job_paths"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_libraries_enable_realtime_indexing_by_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database)
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+
+    assert!(library.realtime_watch_enabled);
     Ok(())
 }
 

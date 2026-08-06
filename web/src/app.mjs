@@ -565,7 +565,6 @@ function renderAdminLibraries({ libraries = [] }) {
   <form class="admin-form" data-action="create-library">
     <input name="name" placeholder="媒体库名称 (如: 电影)" aria-label="媒体库名称" required>
     <select name="kind" aria-label="媒体库类型"><option value="MOVIE">电影库</option><option value="SERIES">电视剧库</option><option value="MIXED">混合类型库</option></select>
-    <label class="check"><input name="realtimeWatchEnabled" type="checkbox" checked> 开启 Inotify 实时监听</label>
     <button class="button" type="submit">创建库</button>
   </form></section>
   <section class="section"><div class="section-heading"><h2>已配置媒体库</h2><span>支持增量扫描与挂载路径管理</span></div>
@@ -683,7 +682,6 @@ function bind() {
           await api.createLibrary({
             name: field(form, "name").value,
             kind: field(form, "kind").value,
-            realtimeWatchEnabled: field(form, "realtimeWatchEnabled").checked,
           });
           loadRoute();
         } else if (action === "add-library-root") {

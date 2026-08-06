@@ -62,8 +62,10 @@ impl CatalogService {
             .database
             .list_catalog_rows(Some(library_id), offset, limit)
             .await?;
+        let mut items = assemble_items(rows);
+        self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
-            items: assemble_items(rows),
+            items,
             total,
             offset,
             limit,
@@ -107,8 +109,10 @@ impl CatalogService {
             limit,
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
+        let mut items = assemble_items(rows);
+        self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
-            items: assemble_items(rows),
+            items,
             total,
             offset,
             limit,
@@ -142,8 +146,10 @@ impl CatalogService {
             limit,
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
+        let mut items = assemble_items(rows);
+        self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
-            items: assemble_items(rows),
+            items,
             total,
             offset,
             limit,
@@ -169,8 +175,10 @@ impl CatalogService {
             .database
             .list_catalog_children(parent_id, item_type, offset, limit)
             .await?;
+        let mut items = assemble_items(rows);
+        self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
-            items: assemble_items(rows),
+            items,
             total,
             offset,
             limit,
@@ -359,8 +367,10 @@ impl CatalogService {
             .database
             .list_recent_catalog_rows_by_library(&library_ids, limit)
             .await?;
+        let mut items = assemble_items(rows);
+        self.populate_episode_counts(&mut items).await?;
         let mut grouped = BTreeMap::<String, Vec<CatalogItem>>::new();
-        for item in assemble_items(rows) {
+        for item in items {
             grouped
                 .entry(item.library_id.clone())
                 .or_default()
@@ -380,13 +390,27 @@ impl CatalogService {
             .database
             .list_recommended_catalog_rows(user_id, &library_ids, 0, RECOMMENDATION_CANDIDATE_POOL)
             .await?;
-        let items = assemble_items(rows);
+        let mut items = assemble_items(rows);
+        self.populate_episode_counts(&mut items).await?;
         Ok(daily_recommendation_items(
             items,
             user_id,
             current_day_bucket(),
             usize::try_from(limit).unwrap_or(0),
         ))
+    }
+
+    async fn populate_episode_counts(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {
+        let item_ids = items
+            .iter()
+            .filter(|item| item.item_type == "SERIES" || item.item_type == "SEASON")
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let counts = self.database.list_episode_counts(&item_ids).await?;
+        for item in items {
+            item.episode_count = counts.get(&item.id).copied();
+        }
+        Ok(())
     }
 
     pub async fn find_item(
@@ -407,7 +431,7 @@ impl CatalogService {
             item.status = detail.status;
             item.original_language = detail.original_language;
             item.provider_ids = provider_ids_from_json(detail.provider_ids_json.as_deref());
-            if item.item_type == "SERIES" {
+            if item.item_type == "SERIES" || item.item_type == "SEASON" {
                 item.season_count = Some(detail.season_count);
                 item.episode_count = Some(detail.episode_count);
             }

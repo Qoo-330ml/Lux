@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HomePage } from "../src/features/home/HomePage";
 import { api } from "../src/lib/api/client";
+import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -70,6 +71,8 @@ describe("HomePage shelves", () => {
     expect(container.querySelector('[aria-label="最新华语电影"] .lux-horizontal-scroll-viewport')).not.toBeNull();
     expect([...container.querySelectorAll(".lux-home-content .lux-section h2")].map((heading) => heading.textContent))
       .toEqual(["我的媒体库", "继续观看", "最新华语电影"]);
+    expect(queryClient.getQueryCache().find({ queryKey: queryKeys.home })?.options.refetchInterval)
+      .toBe(queryRefreshIntervals.mediaSurface);
     expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影");
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });

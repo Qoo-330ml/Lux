@@ -90,7 +90,8 @@ export function remainingRuntimeLabel(item: MediaItem) {
 }
 
 export function EpisodeCount({ item }: { item: MediaItem }) {
-  if (item.itemType !== "SERIES" || item.episodeCount == null || !Number.isFinite(item.episodeCount) || item.episodeCount < 0) return null;
+  if (item.itemType !== "SERIES" && item.itemType !== "SEASON") return null;
+  if (item.episodeCount == null || !Number.isFinite(item.episodeCount) || item.episodeCount < 0) return null;
   const label = `${item.episodeCount} 集`;
   return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
 }

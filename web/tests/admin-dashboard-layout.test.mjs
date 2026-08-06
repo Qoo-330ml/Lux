@@ -18,14 +18,10 @@ test("admin console uses the account settings page rhythm", () => {
   assert.match(headingRule, /margin-bottom:\s*42px/);
 });
 
-test("dashboard metrics and panels use separators instead of card chrome", () => {
-  const statsRule = stylesheet.match(/\.lux-admin-stat\s*\{([^}]*)\}/)?.[1] ?? "";
+test("dashboard panels use separators instead of card chrome", () => {
   const panelRule = stylesheet.match(/\.lux-admin-panel\s*\{([^}]*)\}/)?.[1] ?? "";
   const panelGridRule = stylesheet.match(/\.lux-admin-dashboard-grid\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(statsRule, /border:\s*0/);
-  assert.match(statsRule, /border-left:\s*1px\s+solid\s+var\(--lux-line-soft\)/);
-  assert.match(statsRule, /background:\s*transparent/);
   assert.match(panelRule, /border:\s*0/);
   assert.match(panelRule, /border-radius:\s*0/);
   assert.match(panelRule, /background:\s*transparent/);
@@ -37,7 +33,6 @@ test("light mode preserves the same flat admin surfaces", () => {
 
   assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-layout \{[^}]*background:\s*var\(--lux-bg\)/);
   assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-sidebar \{[^}]*background:\s*transparent/);
-  assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-stat \{[^}]*background:\s*transparent/);
   assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-panel \{[^}]*background:\s*transparent/);
 });
 

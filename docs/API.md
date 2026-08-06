@@ -36,8 +36,8 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 以下接口要求有效 Web session；写操作还要求 `X-CSRF-Token`，并检查当前用户的 `canManageServer` 权限：
 
 - `GET /api/v1/admin/libraries`：列出媒体库及其根路径。
-- `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false, "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；`scraperId` 可省略或为 `null`，表示不进行在线刮削，但仍读取本地 NFO 和图片。
-- `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时监听开关、增量/调和/元数据计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。`mediaStrategy` 的结构与全局策略相同，未设置时返回 `null` 并继承全局默认。例如 `{ "scraperId": "tmdb", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
+- `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；实时监听默认开启，不再提供关闭选项。历史客户端发送的 `realtimeWatchEnabled` 字段会被兼容接受但不会关闭监听。`scraperId` 可省略或为 `null`，表示不进行在线刮削，但仍读取本地 NFO 和图片。
+- `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新增量/调和/元数据计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。历史 `realtimeWatchEnabled` 字段会被兼容接受但始终按 `true` 处理。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。`mediaStrategy` 的结构与全局策略相同，未设置时返回 `null` 并继承全局默认。例如 `{ "scraperId": "tmdb", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`；成功后自动创建异步扫描任务并返回 `scanJob`，扫描完成后若配置刮削器会继续自动匹配元数据。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
@@ -97,9 +97,9 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 ## Emby 认证（LUX-024）
 
 - `GET /Users/Public`：返回未禁用用户的公开登录信息。
-- `POST /Users/AuthenticateByName`：读取 `Username`/`Pw`，解析 `Authorization: Emby Client=..., Device=..., DeviceId=..., Version=...`，返回 `AccessToken`、`User`、`SessionInfo` 和 `ServerId`。
+- `POST /Users/AuthenticateByName`：读取 `Username`/`Pw`，解析 `Authorization: Emby Client=..., Device=..., DeviceId=..., Version=...`，返回 `AccessToken`、`ServerId`，以及包含 `ServerId`、`Configuration`、`Policy` 等兼容字段的 `User` 和 `SessionInfo`。
 - `POST /Sessions/Logout`：接受 `X-Emby-Token` 或 `api_key`，撤销对应 token，成功返回 204。
-- `System/Info` 和 `System/Ping`：需要有效的 `X-Emby-Token` 或 `api_key`；`System/Info/Public` 不要求认证。
+- `System/Info`：需要有效的 `X-Emby-Token` 或 `api_key`；`System/Info/Public` 和 `System/Ping` 不要求认证。
 
 Emby access token 与 Web session 完全分离。access token 是高熵随机值，只在认证响应中返回；数据库只保存 SHA-256 哈希以及设备元数据。认证失败响应不区分“用户不存在”和“密码错误”。
 

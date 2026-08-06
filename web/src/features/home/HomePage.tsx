@@ -5,13 +5,17 @@ import { Link } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
-import { queryKeys } from "../../lib/api/query-keys";
+import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
 import { HERO_CAROUSEL_INTERVAL_MS, heroSlides } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 
 export function HomePage() {
-  const home = useQuery({ queryKey: queryKeys.home, queryFn: () => api.home() });
+  const home = useQuery({
+    queryKey: queryKeys.home,
+    queryFn: () => api.home(),
+    refetchInterval: queryRefreshIntervals.mediaSurface,
+  });
 
   if (home.isPending) return <HomeSkeleton />;
   if (home.error) return <section className="lux-page-state"><h1>首页加载失败</h1><p>{home.error.message}</p></section>;
@@ -59,6 +63,7 @@ function HeroCarousel({ items }: { items: MediaItem[] }) {
     queryKey: queryKeys.itemImages(itemId),
     queryFn: () => api.itemImages(itemId),
     enabled: Boolean(itemId),
+    refetchInterval: queryRefreshIntervals.mediaSurface,
   });
   const logo = itemImages.data?.images?.find((image) => image.imageType.toUpperCase() === "LOGO");
   const image = item ? imageUrl(item, "fanart") ?? imageUrl(item) : undefined;

@@ -56,6 +56,7 @@ impl EmbyAuthService {
             .await?;
         Ok(Some(EmbyAuthResult {
             token,
+            session_id: token_id,
             user: user.clone(),
             device: device.clone(),
         }))
@@ -143,6 +144,7 @@ impl EmbyDeviceInfo {
 #[derive(Clone, Debug)]
 pub struct EmbyAuthResult {
     pub token: String,
+    pub session_id: String,
     pub user: UserRecord,
     pub device: EmbyDeviceInfo,
 }

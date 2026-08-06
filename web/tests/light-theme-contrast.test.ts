@@ -31,8 +31,6 @@ describe("light theme contrast", () => {
   it("uses light surfaces and dark text throughout the admin dashboard", () => {
     expect(lightThemeRule(".lux-admin-sidebar")).toContain("background:");
     expect(lightThemeRule(".lux-admin-page-heading h1")).toContain("color: var(--lux-text)");
-    expect(lightThemeRule(".lux-admin-stat")).toContain("background:");
-    expect(lightThemeRule(".lux-admin-stat strong")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-admin-panel")).toContain("background:");
     expect(lightThemeRule(".lux-admin-panel-heading h2")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-admin-check")).toContain("color: var(--lux-text)");

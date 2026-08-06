@@ -31,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         read_network_proxy_url(&config.config_dir),
     );
     app_state.resume_scan_jobs().await;
+    app_state.start_realtime_watchers().await;
     app_state.resume_strm_probe_jobs().await;
     app_state.resume_danmaku_match_jobs().await;
     app_state.resume_metadata_reidentify_jobs().await;

@@ -5,7 +5,7 @@ import { Link } from "react-router-dom";
 import { AdminDashboardActivity } from "./AdminDashboardActivity";
 import { AdminDashboardNowPlaying } from "./AdminDashboardNowPlaying";
 import { api } from "../../lib/api/client";
-import { queryKeys } from "../../lib/api/query-keys";
+import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { AdminDashboard } from "../../lib/api/types";
 
 export function AdminDashboardPage() {
@@ -13,7 +13,7 @@ export function AdminDashboardPage() {
   const dashboard = useQuery({
     queryKey: queryKeys.adminDashboard,
     queryFn: () => api.adminDashboard(),
-    refetchInterval: 30_000,
+    refetchInterval: queryRefreshIntervals.liveDashboard,
   });
   const [serverName, setServerName] = useState("");
   const [saved, setSaved] = useState(false);
@@ -40,7 +40,9 @@ export function AdminDashboardPage() {
 
   const { health, server, nowPlaying, activity } = dashboard.data;
   const status = health.status === "ok";
-  const libraryCount = health.libraries.length;
+  const recentPlaybackActivity = activity
+    .filter((event) => event.eventType !== "AUTH_LOGIN")
+    .slice(0, 10);
   const checks = [
     { label: "数据库", ok: health.database.writable, detail: health.database.writable ? "可读写" : "不可写" },
     { label: "配置目录", ok: health.config.available && health.config.writable, detail: health.config.writable ? "可读写" : "不可写或不可用" },
@@ -69,21 +71,14 @@ export function AdminDashboardPage() {
       </section>
       {saveServerName.error ? <p className="lux-error-copy lux-dashboard-inline-error">{saveServerName.error.message}</p> : null}
 
-      <section className="lux-admin-stat-grid" aria-label="服务器概览">
-        <AdminStat icon={Server} label="服务状态" value={status ? "运行正常" : "需要关注"} tone={status ? "ok" : "warn"} />
-        <AdminStat icon={Database} label="媒体库" value={`${libraryCount} 个`} />
-        <AdminStat icon={ListChecks} label="运行中任务" value={`${health.jobs.scanRunning + health.jobs.metadataReidentifyRunning} 个`} />
-        <AdminStat icon={AlertTriangle} label="失败扫描" value={`${health.jobs.scanFailed} 个`} tone={health.jobs.scanFailed ? "warn" : "ok"} />
-      </section>
-
       <section className="lux-admin-dashboard-monitor-section" aria-labelledby="now-playing-heading">
         <div className="lux-admin-monitor-heading"><div><span className="lux-eyebrow">LIVE SESSIONS</span><h2 id="now-playing-heading">正在播放</h2><p>实时查看每个账户的播放状态与直放链路。</p></div><span className="lux-admin-monitor-count">{nowPlaying.length} 个会话</span></div>
         <AdminDashboardNowPlaying sessions={nowPlaying} />
       </section>
 
       <section className="lux-admin-dashboard-monitor-section lux-admin-activity-section" aria-labelledby="activity-heading">
-        <div className="lux-admin-monitor-heading"><div><span className="lux-eyebrow">ACCOUNT ACTIVITY</span><h2 id="activity-heading">活跃状况</h2><p>登录、开始播放、暂停和停止播放会按时间更新。</p></div><span className="lux-admin-monitor-count">最近 {activity.length} 条</span></div>
-        <AdminDashboardActivity events={activity} />
+        <div className="lux-admin-monitor-heading"><div><span className="lux-eyebrow">ACCOUNT ACTIVITY</span><h2 id="activity-heading">活跃状况</h2><p>开始播放、暂停和停止播放会按时间更新。</p></div><span className="lux-admin-monitor-count">最近 {recentPlaybackActivity.length} 条</span></div>
+        <AdminDashboardActivity events={recentPlaybackActivity} />
       </section>
 
       <div className="lux-admin-dashboard-grid">
@@ -106,10 +101,6 @@ export function AdminDashboardPage() {
 }
 
 function SettingsIcon() { return <span className="lux-quick-icon"><Settings2 size={17} /></span>; }
-
-function AdminStat({ icon: Icon, label, value, tone }: { icon: typeof Server; label: string; value: string; tone?: "ok" | "warn" }) {
-  return <article className="lux-admin-stat"><span className={tone === "warn" ? "lux-admin-stat-icon is-warn" : "lux-admin-stat-icon"}><Icon size={19} /></span><div><small>{label}</small><strong>{value}</strong></div></article>;
-}
 
 function AdminState({ label, error = false }: { label: string; error?: boolean }) {
   return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><span className="lux-eyebrow">LUX ADMIN</span><h1>{error ? "控制台暂时不可用" : "正在加载控制台"}</h1><p>{label}</p></section>;

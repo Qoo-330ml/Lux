@@ -41,7 +41,7 @@ impl LibraryService {
         &self,
         name: &str,
         kind: LibraryKind,
-        realtime_watch_enabled: bool,
+        _realtime_watch_enabled: bool,
         scraper_id: Option<&str>,
     ) -> Result<LibraryRecord, LibraryServiceError> {
         let name = name.trim();
@@ -56,7 +56,7 @@ impl LibraryService {
                 name,
                 kind: kind.as_str(),
                 scraper_id: scraper_id.as_deref(),
-                realtime_watch_enabled,
+                realtime_watch_enabled: true,
                 incremental_schedule: None,
                 reconciliation_schedule: None,
                 metadata_schedule: None,
@@ -116,7 +116,7 @@ impl LibraryService {
                     name: name.as_deref(),
                     kind,
                     is_enabled: settings.is_enabled,
-                    realtime_watch_enabled: settings.realtime_watch_enabled,
+                    realtime_watch_enabled: settings.realtime_watch_enabled.map(|_| true),
                     incremental_schedule: incremental_schedule
                         .as_ref()
                         .map(|value| value.as_deref()),

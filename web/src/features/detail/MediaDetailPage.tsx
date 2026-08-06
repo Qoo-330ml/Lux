@@ -4,11 +4,11 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
-import { queryKeys } from "../../lib/api/query-keys";
+import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
 import { MediaInfoPanel } from "./MediaInfoPanel";
 import { MediaCast } from "./MediaCast";
-import { Rating, episodeTitle, imageUrl, mediaTitle, runtimeLabel } from "../home/media";
+import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
@@ -20,9 +20,24 @@ export function MediaDetailPage() {
   const { itemId = "" } = useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
-  const itemImages = useQuery({ queryKey: queryKeys.itemImages(itemId), queryFn: () => api.itemImages(itemId), enabled: Boolean(itemId) });
-  const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
+  const item = useQuery({
+    queryKey: queryKeys.item(itemId),
+    queryFn: () => api.item(itemId),
+    enabled: Boolean(itemId),
+    refetchInterval: queryRefreshIntervals.mediaSurface,
+  });
+  const itemImages = useQuery({
+    queryKey: queryKeys.itemImages(itemId),
+    queryFn: () => api.itemImages(itemId),
+    enabled: Boolean(itemId),
+    refetchInterval: queryRefreshIntervals.mediaSurface,
+  });
+  const playback = useQuery({
+    queryKey: queryKeys.playback(itemId),
+    queryFn: () => api.playback(itemId),
+    enabled: Boolean(itemId),
+    refetchInterval: queryRefreshIntervals.mediaSurface,
+  });
   const [selectedSourceId, setSelectedSourceId] = useState<string>();
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
@@ -35,6 +50,7 @@ export function MediaDetailPage() {
     queryKey: queryKeys.children(itemId, "SEASON"),
     queryFn: () => api.children(itemId, { itemType: "SEASON" }),
     enabled: isSeries,
+    refetchInterval: queryRefreshIntervals.mediaSurface,
   });
   const activeSeasonId = seasons.data?.items?.[0]?.id;
   const hierarchySeriesId = item.data && !isSeries
@@ -44,6 +60,7 @@ export function MediaDetailPage() {
     queryKey: queryKeys.item(hierarchySeriesId ?? ""),
     queryFn: () => api.item(hierarchySeriesId ?? ""),
     enabled: Boolean(hierarchySeriesId),
+    refetchInterval: queryRefreshIntervals.mediaSurface,
   });
   const episodeSeriesId = isSeries ? itemId : hierarchySeriesId;
   const episodeSeasonId = isSeries
@@ -57,6 +74,7 @@ export function MediaDetailPage() {
     queryKey: queryKeys.children(episodeSeriesId ?? itemId, "EPISODE", episodeSeasonId),
     queryFn: () => api.children(episodeSeriesId ?? itemId, { itemType: "EPISODE", seasonId: episodeSeasonId }),
     enabled: Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode),
+    refetchInterval: queryRefreshIntervals.mediaSurface,
   });
 
   useEffect(() => {
@@ -446,7 +464,8 @@ function SeriesChildren({
           >
             <span className="lux-season-card-art">
               {imageUrl(season) ? <img src={imageUrl(season)} alt={`${mediaTitle(season)} 海报`} loading="lazy" /> : <span className="lux-season-card-placeholder">{mediaTitle(season)}</span>}
-              <Rating value={season.rating} source={season.ratingSource} />
+              <Rating value={season.rating} source={season.ratingSource} placement="card" />
+              <EpisodeCount item={season} />
             </span>
             <strong>{mediaTitle(season)}</strong>
           </Link>

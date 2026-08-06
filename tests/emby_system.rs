@@ -7,6 +7,14 @@ use luxd::{
 };
 use tokio::net::TcpListener;
 
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[tokio::test]
 async fn emby_system_routes_work_with_both_prefixes_without_paths()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -31,8 +39,24 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
     let client = reqwest::Client::new();
+
+    for path in ["/System/Ping", "/emby/System/Ping"] {
+        let response = client.get(format!("http://{address}{path}")).send().await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.text().await?.is_empty());
+    }
+    for path in ["/System/Ping", "/emby/System/Ping"] {
+        let response = client
+            .post(format!("http://{address}{path}"))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.text().await?.is_empty());
+    }
 
     let login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -107,7 +131,6 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
         assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 
-    server.abort();
     Ok(())
 }
 

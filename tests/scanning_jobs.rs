@@ -4,7 +4,8 @@ use luxd::{
     application::{
         libraries::LibraryService,
         probe::{FfprobeRunner, MediaProbeService},
-        scanner::{ScanJobError, ScanJobService},
+        scanner::{IncrementalScanChange, ScanJobError, ScanJobService},
+        watch::ChangeKind,
     },
     config::Config,
     library::LibraryKind,
@@ -125,6 +126,56 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
         cancel_event,
         ("INFO".to_owned(), "JOB_CANCELLED".to_owned())
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_scan_processes_only_queued_file() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let relative_path = "New.Movie.2024.mkv";
+    tokio::fs::write(root.join(relative_path), b"fixture").await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: relative_path.to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    assert_eq!(job.job_type, "INCREMENTAL_SCAN");
+
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(item_count, 1);
+    let queued_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_paths WHERE job_id = ? AND processed_at IS NULL",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(queued_count, 0);
     Ok(())
 }
 

@@ -207,6 +207,17 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(web_series_body["providerIds"]["tmdb"], "60625");
     assert_eq!(web_series_body["seasonCount"], 1);
     assert_eq!(web_series_body["episodeCount"], 3);
+    let web_library_items = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?itemType=SERIES&pageSize=24",
+            library.id
+        ))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(web_library_items.status(), reqwest::StatusCode::OK);
+    let web_library_items_body = web_library_items.json::<Value>().await?;
+    assert_eq!(web_library_items_body["items"][0]["episodeCount"], 3);
     let web_seasons = client
         .get(format!(
             "{base_url}/api/v1/items/{series_id}/children?itemType=SEASON"
@@ -220,6 +231,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(web_seasons_body["items"][0]["parentId"], series_id);
     assert_eq!(web_seasons_body["items"][0]["seriesId"], series_id);
     assert_eq!(web_seasons_body["items"][0]["parentIndexNumber"], 1);
+    assert_eq!(web_seasons_body["items"][0]["episodeCount"], 3);
     let web_episodes = client
         .get(format!(
             "{base_url}/api/v1/items/{series_id}/children?itemType=EPISODE&seasonId={season_id}"
@@ -245,6 +257,47 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(web_episodes_body["items"][0]["userData"]["isPlayed"], false);
     assert_eq!(web_episodes_body["items"][1]["userData"]["isPlayed"], true);
+
+    sqlx::query(
+        "INSERT INTO media_items
+         (id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+          title, sort_title, original_title, identification_status, identity_key)
+         SELECT ?, library_id, item_type, parent_id, series_id, season_number, episode_number,
+                title, sort_title || ' [4K]', original_title, identification_status,
+                identity_key || ':4k'
+         FROM media_items
+         WHERE id = ?",
+    )
+    .bind("episode-1-4k")
+    .bind(&episode_id)
+    .execute(database.pool())
+    .await?;
+
+    let web_seasons_after_variant = client
+        .get(format!(
+            "{base_url}/api/v1/items/{series_id}/children?itemType=SEASON"
+        ))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(web_seasons_after_variant.status(), reqwest::StatusCode::OK);
+    let web_seasons_after_variant_body = web_seasons_after_variant.json::<Value>().await?;
+    assert_eq!(
+        web_seasons_after_variant_body["items"][0]["episodeCount"],
+        3
+    );
+
+    let web_home = client
+        .get(format!("{base_url}/api/v1/home"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(web_home.status(), reqwest::StatusCode::OK);
+    let web_home_body = web_home.json::<Value>().await?;
+    assert_eq!(
+        web_home_body["libraries"][0]["latest"][0]["episodeCount"],
+        3
+    );
 
     let csrf = request_cookie(&web_cookie, "lux_csrf");
     let missing_csrf = client

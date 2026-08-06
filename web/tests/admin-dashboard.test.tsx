@@ -53,9 +53,19 @@ const dashboard: AdminDashboard = {
     },
   }],
   activity: [
+    { id: "activity-login", userName: "admin", eventType: "AUTH_LOGIN", createdAt: 1_700_000_500 },
     { id: "activity-1", userName: "pdz", eventType: "PLAYBACK_STARTED", targetId: "item-1", metadata: { deviceName: "iPhone" }, createdAt: 1_700_000_000 },
-    { id: "activity-2", userName: "admin", eventType: "AUTH_LOGIN", createdAt: 1_699_999_000 },
-    { id: "activity-3", userName: "n anzi", eventType: "PLAYBACK_STOPPED", targetId: "item-2", createdAt: 1_699_998_000 },
+    { id: "activity-2", userName: "n anzi", eventType: "PLAYBACK_PAUSED", targetId: "item-2", createdAt: 1_699_999_000 },
+    { id: "activity-3", userName: "n anzi", eventType: "PLAYBACK_STOPPED", targetId: "item-3", createdAt: 1_699_998_000 },
+    { id: "activity-4", userName: "viewer 4", eventType: "PLAYBACK_STARTED", targetId: "item-4", createdAt: 1_699_997_000 },
+    { id: "activity-5", userName: "viewer 5", eventType: "PLAYBACK_STARTED", targetId: "item-5", createdAt: 1_699_996_000 },
+    { id: "activity-6", userName: "viewer 6", eventType: "PLAYBACK_STARTED", targetId: "item-6", createdAt: 1_699_995_000 },
+    { id: "activity-7", userName: "viewer 7", eventType: "PLAYBACK_STARTED", targetId: "item-7", createdAt: 1_699_994_000 },
+    { id: "activity-8", userName: "viewer 8", eventType: "PLAYBACK_STARTED", targetId: "item-8", createdAt: 1_699_993_000 },
+    { id: "activity-9", userName: "viewer 9", eventType: "PLAYBACK_STARTED", targetId: "item-9", createdAt: 1_699_992_000 },
+    { id: "activity-10", userName: "viewer 10", eventType: "PLAYBACK_STARTED", targetId: "item-10", createdAt: 1_699_991_000 },
+    { id: "activity-11", userName: "viewer 11", eventType: "PLAYBACK_STARTED", targetId: "item-11", createdAt: 1_699_990_000 },
+    { id: "activity-12", userName: "viewer 12", eventType: "PLAYBACK_STARTED", targetId: "item-12", createdAt: 1_699_989_000 },
   ],
 };
 
@@ -114,6 +124,8 @@ describe("AdminDashboardPage", () => {
       .toBe(queryRefreshIntervals.liveDashboard);
     expect(load).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("v0.1.0");
+    expect(container.querySelector(".lux-admin-stat-grid")).toBeNull();
+    expect(container.querySelectorAll(".lux-admin-stat")).toHaveLength(0);
     expect(container.textContent).toContain("爱情情节顶红");
     expect(container.textContent).toContain("S1 · E9");
     expect(container.textContent).toContain("VidHub 3.0.2");
@@ -132,8 +144,12 @@ describe("AdminDashboardPage", () => {
     expect(container.querySelectorAll(".lux-now-playing-fact")).toHaveLength(3);
     expect(container.querySelectorAll(".lux-now-playing-placeholder")).toHaveLength(2);
     expect(container.textContent).toContain("开始播放");
-    expect(container.textContent).toContain("登录");
+    expect(container.textContent).toContain("暂停播放");
     expect(container.textContent).toContain("停止播放");
+    expect(container.textContent).toContain("最近 10 条");
+    expect(container.textContent).not.toContain("登录");
+    expect(container.textContent).not.toContain("viewer 11");
+    expect(container.querySelectorAll(".lux-admin-activity-row")).toHaveLength(10);
 
     const input = container.querySelector<HTMLInputElement>("input[name='serverName']");
     expect(input?.value).toBe("客厅 Lux");

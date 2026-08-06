@@ -1,6 +1,12 @@
 use std::{path::PathBuf, time::Duration};
 
 use luxd::application::watch::{ChangeKind, EventCoalescer, FileChange, LibraryWatcher};
+use luxd::{
+    application::{libraries::LibraryService, watch::LibraryWatchService},
+    config::Config,
+    library::LibraryKind,
+    storage::Database,
+};
 
 #[test]
 fn coalescer_merges_same_path_and_keeps_distinct_paths() {
@@ -76,5 +82,50 @@ async fn watcher_receives_temp_directory_changes() -> Result<(), Box<dyn std::er
             .iter()
             .any(|change| change.path == canonical_renamed)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_service_indexes_only_the_file_that_changed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Existing.Movie.2023.mkv"), b"existing").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let watch_task = LibraryWatchService::new(database.clone()).spawn();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::fs::write(root.join("New.Movie.2024.mkv"), b"new").await?;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+                .fetch_one(database.pool())
+                .await?;
+            if count == 1 {
+                break Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    let title: String = sqlx::query_scalar("SELECT title FROM media_items")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(title, "New Movie");
+    watch_task.abort();
+    let _ = watch_task.await;
     Ok(())
 }

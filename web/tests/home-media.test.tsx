@@ -102,6 +102,25 @@ describe("ContinueWatchingRail", () => {
     expect(container.querySelector(".lux-media-art")?.textContent).toContain("12 集");
   });
 
+  it("shows a season episode count on the poster", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaCard
+            item={{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8 }}
+            compactRating
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector(".lux-media-episode-count")?.textContent).toBe("8 集");
+  });
+
   it("hides the section when there are no resume items", () => {
     container = document.createElement("div");
     document.body.append(container);

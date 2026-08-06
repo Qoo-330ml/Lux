@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -14,6 +14,13 @@ use notify::{
     event::{ModifyKind, RenameMode},
 };
 use tokio::sync::mpsc;
+use tokio::{sync::Mutex, task::JoinSet, time::sleep};
+
+use crate::{
+    application::scanner::{IncrementalScanChange, ScanJobService},
+    domain::ids::LibraryId,
+    storage::{Database, StoredLibraryRoot},
+};
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -108,6 +115,142 @@ impl LibraryWatcher {
     pub fn watcher_alive(&self) -> bool {
         let _ = &self.watcher;
         true
+    }
+}
+
+#[derive(Clone)]
+pub struct LibraryWatchService {
+    database: Database,
+    scan_jobs: ScanJobService,
+}
+
+impl LibraryWatchService {
+    pub fn new(database: Database) -> Self {
+        Self {
+            scan_jobs: ScanJobService::new(database.clone()),
+            database,
+        }
+    }
+
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            self.run().await;
+        })
+    }
+
+    async fn run(self) {
+        let mut active_roots = HashSet::<String>::new();
+        let mut watcher_tasks = JoinSet::new();
+        let running_jobs = Arc::new(Mutex::new(HashSet::<String>::new()));
+        self.refresh_roots(&mut active_roots, &mut watcher_tasks, &running_jobs)
+            .await;
+        loop {
+            tokio::select! {
+                _ = sleep(Duration::from_secs(1)) => {
+                    self.refresh_roots(&mut active_roots, &mut watcher_tasks, &running_jobs)
+                        .await;
+                }
+                Some(result) = watcher_tasks.join_next(), if !active_roots.is_empty() => {
+                    if let Ok(root_id) = result {
+                        active_roots.remove(&root_id);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn refresh_roots(
+        &self,
+        active_roots: &mut HashSet<String>,
+        watcher_tasks: &mut JoinSet<String>,
+        running_jobs: &Arc<Mutex<HashSet<String>>>,
+    ) {
+        match self.database.list_enabled_library_roots().await {
+            Ok(roots) => {
+                for root in roots {
+                    if !active_roots.insert(root.id.clone()) {
+                        continue;
+                    }
+                    let service = self.clone();
+                    let running_jobs = Arc::clone(running_jobs);
+                    watcher_tasks.spawn(async move {
+                        let root_id = root.id.clone();
+                        service.watch_root(root, running_jobs).await;
+                        root_id
+                    });
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to refresh library watch roots");
+            }
+        }
+    }
+
+    async fn watch_root(&self, root: StoredLibraryRoot, running_jobs: Arc<Mutex<HashSet<String>>>) {
+        let root_path = root.canonical_path.clone();
+        let mut watcher = match tokio::task::spawn_blocking(move || LibraryWatcher::new(root_path))
+            .await
+        {
+            Ok(Ok(watcher)) => watcher,
+            Ok(Err(error)) => {
+                tracing::warn!(root_id = %root.id, %error, "library root realtime watch unavailable");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(root_id = %root.id, %error, "library root realtime watch worker stopped");
+                return;
+            }
+        };
+        while let Some(batch) = watcher.next_batch().await {
+            let changes = batch
+                .into_iter()
+                .filter_map(|change| {
+                    let relative_path = change
+                        .path
+                        .strip_prefix(&root.canonical_path)
+                        .ok()?
+                        .to_str()?
+                        .to_owned();
+                    (!relative_path.is_empty()).then_some(IncrementalScanChange {
+                        root_id: root.id.clone(),
+                        relative_path,
+                        kind: change.kind,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if changes.is_empty() {
+                continue;
+            }
+            let Ok(library_id) = root.library_id.parse::<LibraryId>() else {
+                tracing::warn!(root_id = %root.id, "realtime watch skipped invalid library ID");
+                continue;
+            };
+            match self
+                .scan_jobs
+                .enqueue_incremental_changes(library_id, changes)
+                .await
+            {
+                Ok(job) => {
+                    let mut running = running_jobs.lock().await;
+                    if !running.insert(job.id.clone()) {
+                        continue;
+                    }
+                    drop(running);
+                    let scan_jobs = self.scan_jobs.clone();
+                    let running_jobs = Arc::clone(&running_jobs);
+                    let job_id = job.id.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = scan_jobs.run_to_completion(&job_id, 100, None).await {
+                            tracing::error!(job_id = %job_id, %error, "realtime incremental scan stopped");
+                        }
+                        running_jobs.lock().await.remove(&job_id);
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(library_id = %library_id, %error, "realtime incremental scan was not queued");
+                }
+            }
+        }
     }
 }
 

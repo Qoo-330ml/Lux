@@ -345,7 +345,7 @@ export class LuxApiClient {
     );
   }
 
-  createAdminLibrary(input: { name: string; kind: string; realtimeWatchEnabled: boolean; scraperId?: string | null }) {
+  createAdminLibrary(input: { name: string; kind: string; scraperId?: string | null }) {
     return this.request<{ library: AdminLibrary }>("/api/v1/admin/libraries", {
       method: "POST",
       body: JSON.stringify(input),

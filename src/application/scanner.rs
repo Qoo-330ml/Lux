@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
@@ -18,11 +18,12 @@ use crate::{
         probe::MediaProbeService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
         thumbnails::ThumbnailService,
+        watch::ChangeKind,
     },
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     storage::{
         Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource,
-        NewScanJobEvent, StorageError, StoredLibraryRoot, StoredScanJob,
+        NewScanJobEvent, StorageError, StoredLibraryRoot, StoredScanJob, StoredScanJobPath,
     },
 };
 
@@ -873,12 +874,83 @@ pub struct ScanJobService {
     database: Database,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncrementalScanChange {
+    pub root_id: String,
+    pub relative_path: String,
+    pub kind: ChangeKind,
+}
+
 impl ScanJobService {
     pub fn new(database: Database) -> Self {
         Self {
             scanner: LibraryScanner::new(database.clone()),
             database,
         }
+    }
+
+    pub async fn enqueue_incremental_changes(
+        &self,
+        library_id: LibraryId,
+        changes: Vec<IncrementalScanChange>,
+    ) -> Result<ScanJob, ScanJobError> {
+        let library_id_text = library_id.to_string();
+        let Some(library) = self.database.find_library(&library_id_text).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if !library.is_enabled {
+            return Err(ScanJobError::LibraryNotFound);
+        }
+        let roots = self.database.list_library_roots(&library_id_text).await?;
+        let mut valid_changes = Vec::new();
+        for change in changes {
+            let Some(root) = roots.iter().find(|root| root.id == change.root_id) else {
+                continue;
+            };
+            let relative_path = normalize_incremental_path(&change.relative_path)?;
+            if !relative_path.is_empty() {
+                valid_changes.push((root.id.clone(), relative_path, change.kind));
+            }
+        }
+        if valid_changes.is_empty() {
+            return Err(ScanJobError::NoChanges);
+        }
+        let job = if let Some(active) = self
+            .database
+            .find_active_scan_job(&library_id_text, "INCREMENTAL_SCAN")
+            .await?
+        {
+            active
+        } else {
+            let id = Uuid::now_v7().to_string();
+            let generation = Uuid::now_v7().to_string();
+            self.database
+                .create_scan_job(&id, &library_id_text, "INCREMENTAL_SCAN", &generation, 0)
+                .await?;
+            self.database
+                .find_scan_job(&id)
+                .await?
+                .ok_or(ScanJobError::JobNotFound)?
+        };
+        for (root_id, relative_path, kind) in valid_changes {
+            self.database
+                .enqueue_incremental_scan_path(
+                    &job.id,
+                    &root_id,
+                    &relative_path,
+                    change_kind_name(kind),
+                )
+                .await?;
+        }
+        self.record_event(
+            &job.id,
+            "INFO",
+            "PATHS_QUEUED",
+            "已加入局部增量扫描路径",
+            "{}",
+        )
+        .await;
+        self.get_job(&job.id).await
     }
 
     pub async fn create_movie_scan_job(
@@ -963,6 +1035,9 @@ impl ScanJobService {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Err(ScanJobError::JobNotFound);
         };
+        if job.job_type == "INCREMENTAL_SCAN" {
+            return self.run_incremental_batch(job_id, batch_size).await;
+        }
         if matches!(job.status.as_str(), "COMPLETED" | "CANCELLED" | "FAILED") {
             return Ok(ScanBatchReport {
                 status: job.status,
@@ -1179,6 +1254,182 @@ impl ScanJobService {
         })
     }
 
+    async fn run_incremental_batch(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
+        if matches!(job.status.as_str(), "COMPLETED" | "CANCELLED" | "FAILED") {
+            return Ok(ScanBatchReport {
+                status: job.status,
+                processed: 0,
+                completed: true,
+            });
+        }
+        if job.status == "PENDING" {
+            if !self.database.claim_scan_job(job_id).await? {
+                return Err(ScanJobError::AlreadyActive(job_id.to_owned()));
+            }
+            self.record_event(job_id, "INFO", "JOB_STARTED", "局部扫描任务开始执行", "{}")
+                .await;
+        }
+        if self.database.scan_job_cancel_requested(job_id).await? {
+            self.database
+                .finish_scan_job(job_id, "CANCELLED", None)
+                .await?;
+            self.record_event(job_id, "INFO", "JOB_CANCELLED", "扫描任务已取消", "{}")
+                .await;
+            return Ok(ScanBatchReport {
+                status: "CANCELLED".to_owned(),
+                processed: 0,
+                completed: true,
+            });
+        }
+        let paths = self
+            .database
+            .list_pending_scan_job_paths(job_id, i64::try_from(batch_size).unwrap_or(i64::MAX))
+            .await?;
+        if paths.is_empty() {
+            if self.database.finish_scan_job_if_idle(job_id).await? {
+                self.database
+                    .update_library_last_scan(&job.library_id)
+                    .await?;
+                self.record_event(job_id, "INFO", "JOB_COMPLETED", "局部扫描任务已完成", "{}")
+                    .await;
+                return Ok(ScanBatchReport {
+                    status: "COMPLETED".to_owned(),
+                    processed: 0,
+                    completed: true,
+                });
+            }
+            return Ok(ScanBatchReport {
+                status: "RUNNING".to_owned(),
+                processed: 0,
+                completed: false,
+            });
+        }
+        let library = self
+            .database
+            .find_library(&job.library_id)
+            .await?
+            .ok_or(ScanJobError::LibraryNotFound)?;
+        for path in &paths {
+            if let Err(error) = self
+                .process_incremental_path(&library.kind, &job, path)
+                .await
+            {
+                self.database
+                    .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
+                    .await?;
+                self.record_event(job_id, "ERROR", error.code(), "局部扫描任务失败", "{}")
+                    .await;
+                return Err(error.into());
+            }
+            self.database
+                .mark_scan_job_path_processed(job_id, &path.library_root_id, &path.relative_path)
+                .await?;
+        }
+        let processed = paths.len();
+        let next_count = job
+            .processed_count
+            .saturating_add(i64::try_from(processed).unwrap_or(i64::MAX));
+        self.database
+            .update_scan_job_progress(
+                job_id,
+                paths.last().map(|path| path.relative_path.as_str()),
+                next_count,
+            )
+            .await?;
+        self.record_event(job_id, "INFO", "BATCH_COMPLETED", "局部扫描批次完成", "{}")
+            .await;
+        Ok(ScanBatchReport {
+            status: "RUNNING".to_owned(),
+            processed,
+            completed: false,
+        })
+    }
+
+    async fn process_incremental_path(
+        &self,
+        library_kind: &str,
+        job: &StoredScanJob,
+        path: &StoredScanJobPath,
+    ) -> Result<(), ScannerError> {
+        let root = self
+            .database
+            .find_library_root(&path.library_root_id)
+            .await?
+            .ok_or(ScannerError::LibraryNotFound)?;
+        let root_path = Path::new(&root.canonical_path);
+        let media_path = root_path.join(&path.relative_path);
+        if path.change_kind == "REMOVE" || fs::metadata(&media_path).await.is_err() {
+            self.database
+                .mark_filesystem_entry_missing_by_path(&root.id, &path.relative_path)
+                .await?;
+            return Ok(());
+        }
+        let metadata = fs::metadata(&media_path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: media_path.clone(),
+                source,
+            })?;
+        let generation = &job.generation;
+        let files = if metadata.is_dir() {
+            if library_kind == "SERIES" {
+                collect_series_files(&media_path).await?
+            } else {
+                collect_movie_files(&media_path).await?
+            }
+        } else if is_supported_movie_file(&media_path) {
+            vec![media_path]
+        } else {
+            Vec::new()
+        };
+        for file in files {
+            match library_kind {
+                "MOVIE" => {
+                    self.scanner
+                        .scan_movie_file(&job.library_id, &root, root_path, &file, generation)
+                        .await?;
+                }
+                "SERIES" => {
+                    self.scanner
+                        .scan_episode_file(&job.library_id, &root, root_path, &file, generation)
+                        .await?;
+                }
+                "MIXED" => match classify_mixed_file(root_path, &file).await {
+                    MixedClassification::Movie => {
+                        self.scanner
+                            .scan_movie_file(&job.library_id, &root, root_path, &file, generation)
+                            .await?;
+                    }
+                    MixedClassification::Episode => {
+                        self.scanner
+                            .scan_episode_file(&job.library_id, &root, root_path, &file, generation)
+                            .await?;
+                    }
+                    MixedClassification::Unresolved => {
+                        self.scanner
+                            .scan_unresolved_file(
+                                &job.library_id,
+                                &root,
+                                root_path,
+                                &file,
+                                generation,
+                            )
+                            .await?;
+                    }
+                },
+                _ => return Err(ScannerError::LibraryNotFound),
+            }
+        }
+        Ok(())
+    }
+
     pub async fn run_to_completion(
         &self,
         job_id: &str,
@@ -1216,6 +1467,14 @@ impl ScanJobService {
                 continue;
             }
             if report.status == "COMPLETED" {
+                let incremental = self
+                    .database
+                    .find_scan_job(job_id)
+                    .await?
+                    .is_some_and(|job| job.job_type == "INCREMENTAL_SCAN");
+                if incremental {
+                    return Ok(());
+                }
                 self.run_probe_after_scan(job_id, probe).await?;
                 self.run_metadata_after_scan(job_id).await?;
                 self.run_thumbnails_after_scan(job_id, thumbnails).await?;
@@ -1561,6 +1820,7 @@ pub struct ScanBatchReport {
 pub enum ScanJobError {
     LibraryNotFound,
     JobNotFound,
+    NoChanges,
     AlreadyActive(String),
     InvalidBatchSize,
     Scanner(ScannerError),
@@ -1572,11 +1832,39 @@ impl std::fmt::Display for ScanJobError {
         match self {
             Self::LibraryNotFound => formatter.write_str("library not found"),
             Self::JobNotFound => formatter.write_str("scan job not found"),
+            Self::NoChanges => formatter.write_str("incremental scan has no valid changes"),
             Self::AlreadyActive(id) => write!(formatter, "scan job already active: {id}"),
             Self::InvalidBatchSize => formatter.write_str("scan batch size must be positive"),
             Self::Scanner(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
+    }
+}
+
+fn normalize_incremental_path(value: &str) -> Result<String, ScanJobError> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ScanJobError::Scanner(ScannerError::InvalidRelativePath(
+            value.to_owned(),
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn change_kind_name(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Create => "CREATE",
+        ChangeKind::Modify => "MODIFY",
+        ChangeKind::Rename => "RENAME",
+        ChangeKind::Remove => "REMOVE",
     }
 }
 

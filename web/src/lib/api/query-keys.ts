@@ -29,3 +29,8 @@ export const queryKeys = {
   adminPendingMetadata: ["admin", "metadata", "pending"] as const,
   adminItemImages: (itemId: string) => ["admin", "item-images", itemId] as const,
 };
+
+export const queryRefreshIntervals = {
+  liveDashboard: 15_000,
+  mediaSurface: 15_000,
+} as const;

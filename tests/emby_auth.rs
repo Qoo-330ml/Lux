@@ -13,6 +13,14 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[tokio::test]
 async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +45,9 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
     let client = reqwest::Client::new();
 
     let public = client
@@ -66,9 +76,32 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
         .ok_or("missing access token")?
         .to_owned();
     assert_eq!(login_body["User"]["Id"], admin.id.to_string());
+    assert_eq!(login_body["User"]["ServerId"], database.server_id());
+    assert_eq!(login_body["User"]["HasConfiguredPassword"], true);
+    assert_eq!(login_body["User"]["HasConfiguredEasyPassword"], false);
+    assert_eq!(login_body["User"]["EnableAutoLogin"], false);
+    assert_eq!(
+        login_body["User"]["Configuration"]["PlayDefaultAudioTrack"],
+        true
+    );
+    assert_eq!(login_body["User"]["Policy"]["IsAdministrator"], true);
+    assert_eq!(login_body["User"]["Policy"]["IsDisabled"], false);
+    assert_eq!(
+        login_body["User"]["Policy"]["EnableRemoteAccess"],
+        admin.can_remote_access
+    );
+    assert_eq!(login_body["User"]["Policy"]["EnableMediaPlayback"], true);
     assert_eq!(login_body["ServerId"], database.server_id());
     assert_eq!(login_body["SessionInfo"]["Client"], "Infuse");
     assert_eq!(login_body["SessionInfo"]["DeviceId"], "device-1");
+    assert_eq!(login_body["SessionInfo"]["ServerId"], database.server_id());
+    assert_eq!(login_body["SessionInfo"]["UserId"], admin.id.to_string());
+    assert_eq!(login_body["SessionInfo"]["UserName"], "Administrator");
+    assert!(
+        login_body["SessionInfo"]["Id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
 
     let raw_token_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM access_tokens WHERE token_hash = ?")
@@ -105,7 +138,6 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
         .await?;
     assert_eq!(after_logout.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    server.abort();
     Ok(())
 }
 
