@@ -47,7 +47,7 @@ test("now-playing cards use theme tokens and compact proportions", () => {
   const lightRule = stylesheet.match(/html\[data-lux-theme="light"\] \.lux-now-playing-card\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(cardRule, /background:\s*var\(--lux-now-card-bg\)/);
-  assert.match(bodyRule, /padding:\s*24px\s+28px/);
-  assert.match(bodyRule, /minmax\(148px,\s*17%\)/);
+  assert.match(bodyRule, /padding:\s*16px\s+20px/);
+  assert.match(bodyRule, /minmax\(84px,\s*9%\)/);
   assert.match(lightRule, /--lux-now-card-bg:\s*#fbfcfe/);
 });

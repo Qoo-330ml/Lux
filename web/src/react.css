@@ -499,51 +499,51 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   --lux-now-card-placeholder: var(--lux-subtle);
   overflow: hidden;
   border: 1px solid var(--lux-now-card-border);
-  border-radius: 14px;
+  border-radius: 10px;
   color: var(--lux-now-card-title);
   background: var(--lux-now-card-bg);
-  box-shadow: 0 12px 30px rgba(0,0,0,.13);
+  box-shadow: 0 8px 20px rgba(0,0,0,.11);
 }
-.lux-now-playing-body { display: grid; grid-template-columns: minmax(148px, 17%) minmax(0, 1fr); gap: 32px; padding: 24px 28px; }
-.lux-now-playing-poster { position: relative; aspect-ratio: 5 / 8; overflow: hidden; border-radius: 10px; background: var(--lux-now-card-poster-bg); box-shadow: 0 8px 20px rgba(0,0,0,.16); }
+.lux-now-playing-body { display: grid; grid-template-columns: minmax(84px, 9%) minmax(0, 1fr); gap: 18px; padding: 16px 20px; }
+.lux-now-playing-poster { position: relative; aspect-ratio: 2 / 3; overflow: hidden; border-radius: 8px; background: var(--lux-now-card-poster-bg); box-shadow: 0 5px 14px rgba(0,0,0,.14); }
 .lux-now-playing-poster img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .lux-now-playing-poster > span:first-child { display: grid; place-items: center; width: 100%; height: 100%; color: var(--lux-now-card-secondary); }
-.lux-now-playing-poster-status { position: absolute; right: 12px; bottom: 12px; left: 12px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 29px; border: 1px solid rgba(255,255,255,.68); border-radius: 999px; color: #fff; background: rgba(28,48,73,.72); font-size: .67rem; font-weight: 650; backdrop-filter: blur(10px); }
+.lux-now-playing-poster-status { position: absolute; right: 6px; bottom: 6px; left: 6px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 22px; border: 1px solid rgba(255,255,255,.68); border-radius: 999px; color: #fff; background: rgba(28,48,73,.72); font-size: .56rem; font-weight: 650; backdrop-filter: blur(10px); }
 .lux-now-playing-poster-status.is-paused { color: #6c4d1d; background: rgba(255,237,197,.9); }
 .lux-now-playing-content { display: flex; min-width: 0; flex-direction: column; justify-content: space-between; padding: 2px 0; }
-.lux-now-playing-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; }
+.lux-now-playing-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .lux-now-playing-heading-copy { min-width: 0; }
-.lux-now-playing-kicker { display: block; color: var(--lux-now-card-secondary); font-size: .56rem; font-weight: 750; letter-spacing: .17em; }
-.lux-now-playing-title { display: block; margin-top: 6px; overflow: hidden; color: var(--lux-now-card-title); font-size: 1.25rem; font-weight: 700; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; }
+.lux-now-playing-kicker { display: block; color: var(--lux-now-card-secondary); font-size: .46rem; font-weight: 750; letter-spacing: .17em; }
+.lux-now-playing-title { display: block; margin-top: 4px; overflow: hidden; color: var(--lux-now-card-title); font-size: 1rem; font-weight: 700; letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap; }
 .lux-now-playing-title:hover { color: var(--lux-now-card-accent); }
-.lux-now-playing-subtitle { min-height: 17px; margin-top: 4px; overflow: hidden; color: var(--lux-now-card-secondary); font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
-.lux-now-playing-year { flex: 0 0 auto; color: var(--lux-now-card-meta); font-size: .82rem; font-weight: 700; }
-.lux-now-playing-meta { display: flex; align-items: center; gap: 8px; margin-top: 18px; color: var(--lux-now-card-meta); font-size: .68rem; font-weight: 650; }
+.lux-now-playing-subtitle { min-height: 14px; margin-top: 3px; overflow: hidden; color: var(--lux-now-card-secondary); font-size: .58rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-now-playing-year { flex: 0 0 auto; color: var(--lux-now-card-meta); font-size: .7rem; font-weight: 700; }
+.lux-now-playing-meta { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: var(--lux-now-card-meta); font-size: .58rem; font-weight: 650; }
 .lux-now-playing-episode { color: var(--lux-now-card-title); }
 .lux-now-playing-separator, .lux-now-playing-account-separator { color: var(--lux-now-card-secondary); }
-.lux-now-playing-account { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 19px; color: var(--lux-now-card-meta); font-size: .68rem; }
+.lux-now-playing-account { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 11px; color: var(--lux-now-card-meta); font-size: .58rem; }
 .lux-now-playing-account strong { color: var(--lux-now-card-title); font-weight: 700; }
 .lux-now-playing-account > svg { color: var(--lux-now-card-icon); }
-.lux-now-playing-account-avatar { display: inline-grid; place-items: center; width: 23px; height: 23px; border: 1px solid var(--lux-now-card-divider); border-radius: 50%; color: var(--lux-now-card-icon); background: var(--lux-now-card-facts-bg); }
-.lux-now-playing-client { margin-left: 3px; padding-left: 9px; border-left: 1px solid var(--lux-now-card-divider); color: var(--lux-now-card-secondary); }
-.lux-now-playing-progress-block { margin-top: 24px; }
-.lux-now-playing-progress-label { display: flex; justify-content: space-between; gap: 12px; color: var(--lux-now-card-meta); font-size: .63rem; font-variant-numeric: tabular-nums; }
+.lux-now-playing-account-avatar { display: inline-grid; place-items: center; width: 19px; height: 19px; border: 1px solid var(--lux-now-card-divider); border-radius: 50%; color: var(--lux-now-card-icon); background: var(--lux-now-card-facts-bg); }
+.lux-now-playing-client { margin-left: 2px; padding-left: 6px; border-left: 1px solid var(--lux-now-card-divider); color: var(--lux-now-card-secondary); }
+.lux-now-playing-progress-block { margin-top: 13px; }
+.lux-now-playing-progress-label { display: flex; justify-content: space-between; gap: 12px; color: var(--lux-now-card-meta); font-size: .54rem; font-variant-numeric: tabular-nums; }
 .lux-now-playing-progress-label strong { color: var(--lux-now-card-title); font-weight: 750; }
-.lux-now-playing-progress { height: 5px; margin-top: 7px; overflow: hidden; border-radius: 999px; background: var(--lux-now-card-track); }
+.lux-now-playing-progress { height: 4px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: var(--lux-now-card-track); }
 .lux-now-playing-progress > span { display: block; width: var(--lux-progress); height: 100%; border-radius: inherit; background: var(--lux-now-card-accent); }
 .lux-now-playing-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--lux-now-card-divider); background: var(--lux-now-card-facts-bg); }
-.lux-now-playing-fact { display: flex; min-width: 0; gap: 8px; padding: 13px 22px; }
+.lux-now-playing-fact { display: flex; min-width: 0; gap: 6px; padding: 8px 14px; }
 .lux-now-playing-fact + .lux-now-playing-fact { border-left: 1px solid var(--lux-now-card-divider); }
 .lux-now-playing-fact-icon { flex: 0 0 auto; color: var(--lux-now-card-icon); }
 .lux-now-playing-fact > div, .lux-now-playing-network-field > div { display: grid; min-width: 0; gap: 4px; }
-.lux-now-playing-fact small, .lux-now-playing-network-field small { color: var(--lux-now-card-secondary); font-size: .56rem; font-weight: 650; }
-.lux-now-playing-fact strong, .lux-now-playing-fact span:last-child { overflow: hidden; color: var(--lux-now-card-title); font-size: .68rem; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.lux-now-playing-fact span:last-child { color: var(--lux-now-card-secondary); font-size: .59rem; font-weight: 500; }
+.lux-now-playing-fact small, .lux-now-playing-network-field small { color: var(--lux-now-card-secondary); font-size: .48rem; font-weight: 650; }
+.lux-now-playing-fact strong, .lux-now-playing-fact span:last-child { overflow: hidden; color: var(--lux-now-card-title); font-size: .56rem; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.lux-now-playing-fact span:last-child { color: var(--lux-now-card-secondary); font-size: .5rem; font-weight: 500; }
 .lux-now-playing-network { display: grid; grid-template-columns: minmax(0, .72fr) minmax(0, 1.28fr); border-top: 1px solid var(--lux-now-card-divider); background: var(--lux-now-card-network-bg); }
-.lux-now-playing-network-field { display: flex; min-width: 0; align-items: center; gap: 8px; padding: 12px 22px; }
+.lux-now-playing-network-field { display: flex; min-width: 0; align-items: center; gap: 6px; padding: 7px 14px; }
 .lux-now-playing-network-field + .lux-now-playing-network-field { border-left: 1px solid var(--lux-now-card-divider); }
 .lux-now-playing-network-icon { flex: 0 0 auto; color: var(--lux-now-card-secondary); }
-.lux-now-playing-network-field strong { overflow: hidden; color: var(--lux-now-card-meta); font-size: .63rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.lux-now-playing-network-field strong { overflow: hidden; color: var(--lux-now-card-meta); font-size: .54rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .lux-now-playing-placeholder { color: var(--lux-now-card-placeholder) !important; font-weight: 500 !important; }
 .lux-admin-dashboard-empty { display: flex; align-items: center; gap: 12px; min-height: 108px; padding: 20px; border: 1px dashed var(--lux-line-soft); border-radius: 14px; color: var(--lux-subtle); }
 .lux-admin-dashboard-empty > div { display: grid; gap: 4px; }
@@ -807,20 +807,20 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-server-identity { grid-template-columns: 1fr; gap: 14px; padding: 18px; }
   .lux-admin-server-form { grid-column: auto; align-items: stretch; flex-direction: column; }
   .lux-admin-server-form .lux-button { width: 100%; }
-  .lux-now-playing-body { grid-template-columns: 92px minmax(0, 1fr); gap: 15px; padding: 18px; }
-  .lux-now-playing-title { display: -webkit-box; font-size: 1rem; line-height: 1.25; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
-  .lux-now-playing-kicker { font-size: .57rem; }
-  .lux-now-playing-meta { margin-top: 17px; font-size: .7rem; }
-  .lux-now-playing-account { margin-top: 17px; font-size: .68rem; }
-  .lux-now-playing-account-avatar { width: 24px; height: 24px; }
+  .lux-now-playing-body { grid-template-columns: 66px minmax(0, 1fr); gap: 10px; padding: 12px; }
+  .lux-now-playing-title { display: -webkit-box; font-size: .85rem; line-height: 1.2; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
+  .lux-now-playing-kicker { font-size: .4rem; }
+  .lux-now-playing-meta { margin-top: 8px; font-size: .52rem; }
+  .lux-now-playing-account { margin-top: 9px; font-size: .52rem; }
+  .lux-now-playing-account-avatar { width: 17px; height: 17px; }
   .lux-now-playing-client { width: 100%; margin: 0 0 0 32px; padding: 0; border-left: 0; }
-  .lux-now-playing-progress-block { margin-top: 22px; }
-  .lux-now-playing-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .lux-now-playing-fact { padding: 10px 14px; }
+  .lux-now-playing-progress-block { margin-top: 11px; }
+  .lux-now-playing-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .lux-now-playing-fact { gap: 4px; padding: 7px 8px; }
   .lux-now-playing-fact + .lux-now-playing-fact { border-top: 0; border-left: 1px solid var(--lux-now-card-divider); }
-  .lux-now-playing-fact:nth-child(3) { grid-column: 1 / -1; border-top: 1px solid var(--lux-now-card-divider); border-left: 0; }
+  .lux-now-playing-fact:nth-child(3) { grid-column: auto; border-top: 0; border-left: 1px solid var(--lux-now-card-divider); }
   .lux-now-playing-network { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .lux-now-playing-network-field { padding: 10px 14px; }
+  .lux-now-playing-network-field { padding: 7px 8px; }
   .lux-now-playing-network-field + .lux-now-playing-network-field { border-top: 0; border-left: 1px solid var(--lux-now-card-divider); }
   .lux-admin-activity-copy p em { max-width: 22ch; }
   .lux-admin-create-form, .lux-admin-schedule-form, .lux-admin-library-body { grid-template-columns: 1fr; }
