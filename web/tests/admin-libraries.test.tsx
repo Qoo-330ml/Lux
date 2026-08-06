@@ -217,9 +217,10 @@ describe("AdminLibrariesPage library cards", () => {
         ?.click();
     });
 
-    const browseButton = [...container.querySelectorAll<HTMLButtonElement>("button")]
-      .find((button) => button.textContent?.includes("浏览服务器目录"));
+    const browseButton = container.querySelector<HTMLButtonElement>('[aria-label="浏览服务器目录"]');
     expect(browseButton).toBeTruthy();
+    expect(browseButton?.textContent).toBe("");
+    expect(browseButton?.querySelector("svg")).toBeTruthy();
     await act(async () => {
       browseButton?.click();
       await new Promise((resolve) => setTimeout(resolve, 0));
