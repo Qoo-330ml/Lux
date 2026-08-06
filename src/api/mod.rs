@@ -45,7 +45,7 @@ use crate::{
         },
         catalog::{
             CatalogError, CatalogFilter, CatalogItem, CatalogPage, CatalogService, CatalogSort,
-            normalize_search_like_query, normalize_search_query,
+            CatalogSource, normalize_search_like_query, normalize_search_query,
         },
         collections::{CollectionError, CollectionService},
         images::{
@@ -83,7 +83,9 @@ use crate::{
         redact_proxy_url,
     },
     security::LoginRateLimiter,
-    storage::{Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError},
+    storage::{
+        Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError, StoredPlaybackSession,
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
@@ -544,6 +546,7 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_test_network_proxy),
         )
         .route("/api/v1/admin/health", get(admin_health))
+        .route("/api/v1/admin/dashboard", get(admin_dashboard))
         .route("/api/v1/admin/audit", get(admin_list_audit))
         .route("/api/v1/admin/logs", get(admin_list_logs))
         .route("/api/v1/libraries", get(lux_list_libraries))
@@ -1040,6 +1043,18 @@ async fn emby_authenticate(
                 return StatusCode::FORBIDDEN.into_response();
             }
             state.login_rate_limiter.record_success(&login_key).await;
+            let user_id = result.user.id.to_string();
+            record_activity_event(
+                state.database.as_ref(),
+                &user_id,
+                "AUTH_LOGIN",
+                None,
+                json!({
+                    "client": result.device.client,
+                    "deviceName": result.device.device,
+                }),
+            )
+            .await;
             Json(json!({
                 "User": emby_user_json(&result.user),
                 "SessionInfo": {
@@ -2002,6 +2017,14 @@ async fn handle_emby_playback_event(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("{}:{device_id}", request.item_id));
     let user_id = user.id.to_string();
+    let previous_session = match database
+        .find_playback_session(&user_id, &play_session_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -2019,6 +2042,20 @@ async fn handle_emby_playback_event(
         .await
     {
         Ok(()) => {
+            if let Some(event_type) = activity_event {
+                record_activity_event(
+                    Some(database),
+                    &user_id,
+                    event_type,
+                    Some(&request.item_id),
+                    json!({
+                        "client": client,
+                        "deviceName": device_name,
+                        "state": state_name,
+                    }),
+                )
+                .await;
+            }
             tracing::info!(
                 event = "emby_playback_callback_recorded",
                 playback_state = state_name,
@@ -2213,6 +2250,15 @@ async fn lux_post_progress(
     let user_id = user.id.to_string();
     let play_session_id = format!("lux-web:{user_id}:{item_id}");
     let playback_state = request.state;
+    let previous_session = match database
+        .find_playback_session(&user_id, &play_session_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let activity_event =
+        playback_activity_event_type(previous_session.as_ref(), playback_state.as_str());
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -2229,7 +2275,23 @@ async fn lux_post_progress(
         })
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if let Some(event_type) = activity_event {
+                record_activity_event(
+                    Some(database),
+                    &user_id,
+                    event_type,
+                    Some(&item_id),
+                    json!({
+                        "client": "Lux",
+                        "deviceName": "Web",
+                        "state": playback_state.as_str(),
+                    }),
+                )
+                .await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -2931,6 +2993,16 @@ async fn auth_login(
         )
         .into_response();
     }
+
+    let user_id = session.user.id.to_string();
+    record_activity_event(
+        state.database.as_ref(),
+        &user_id,
+        "AUTH_LOGIN",
+        None,
+        json!({}),
+    )
+    .await;
 
     let mut response_headers = HeaderMap::new();
     let secure_cookie = secure_cookie_for_request(&headers, &state.remote_access);
@@ -5586,9 +5658,15 @@ async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Re
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let server_name = match database.server_name().await {
+        Ok(Some(name)) if !name.trim().is_empty() => name,
+        Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let network_proxy = network_proxy_settings(&state).await;
     let danmaku = danmaku_settings(&state).await;
     Json(json!({
+        "serverName": server_name,
         "resumePlayedPercent": played_percent,
         "resumeMinTicks": minimum_ticks,
         "mediaStrategy": media_strategy,
@@ -5831,6 +5909,7 @@ fn network_proxy_probe_response(result: NetworkProbeResult) -> NetworkProxyProbe
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdatePlaybackSettingsRequest {
+    server_name: Option<String>,
     resume_played_percent: Option<i64>,
     resume_min_ticks: Option<i64>,
     media_strategy: Option<MediaStrategySettings>,
@@ -5927,6 +6006,14 @@ fn valid_strategy_code(value: &str, max_length: usize) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
+fn normalize_server_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 80 || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 fn validate_media_strategy(settings: &MediaStrategySettings) -> bool {
     valid_strategy_code(&settings.metadata_language, 32)
         && valid_strategy_code(&settings.image_language, 32)
@@ -5985,9 +6072,21 @@ async fn admin_update_settings(
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let current_server_name = match database.server_name().await {
+        Ok(Some(name)) if !name.trim().is_empty() => name,
+        Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let percent = request.resume_played_percent.unwrap_or(current_percent);
     let minimum_ticks = request.resume_min_ticks.unwrap_or(current_ticks);
     let media_strategy = request.media_strategy.unwrap_or(current_media_strategy);
+    let server_name = match request.server_name {
+        Some(name) => match normalize_server_name(&name) {
+            Some(name) => name,
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => current_server_name,
+    };
     if !(1..=100).contains(&percent)
         || minimum_ticks < 0
         || !validate_media_strategy(&media_strategy)
@@ -6095,6 +6194,9 @@ async fn admin_update_settings(
         .await
     {
         Ok(()) => {
+            if database.set_server_name(&server_name).await.is_err() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             record_audit_event(
                 &state,
                 &headers,
@@ -6105,6 +6207,7 @@ async fn admin_update_settings(
             )
             .await;
             Json(json!({
+                "serverName": server_name,
                 "resumePlayedPercent": percent,
                 "resumeMinTicks": minimum_ticks,
                 "mediaStrategy": media_strategy,
@@ -7758,6 +7861,48 @@ async fn record_audit_event(
         .await;
 }
 
+async fn record_activity_event(
+    database: Option<&Database>,
+    user_id: &str,
+    event_type: &str,
+    target_id: Option<&str>,
+    metadata: Value,
+) {
+    let Some(database) = database else {
+        return;
+    };
+    let metadata_json = match serde_json::to_string(&metadata) {
+        Ok(metadata_json) => metadata_json,
+        Err(_) => return,
+    };
+    let _ = database
+        .insert_audit_event(crate::storage::NewAuditEvent {
+            actor_user_id: Some(user_id),
+            event_type,
+            target_type: target_id.map(|_| "media_item"),
+            target_id,
+            metadata_json: &metadata_json,
+        })
+        .await;
+}
+
+fn playback_activity_event_type(
+    previous: Option<&StoredPlaybackSession>,
+    state_name: &str,
+) -> Option<&'static str> {
+    if previous.is_some_and(|session| session.state == state_name)
+        || (previous.is_none() && state_name == "STOPPED")
+    {
+        return None;
+    }
+    match state_name {
+        "PLAYING" => Some("PLAYBACK_STARTED"),
+        "PAUSED" => Some("PLAYBACK_PAUSED"),
+        "STOPPED" => Some("PLAYBACK_STOPPED"),
+        _ => None,
+    }
+}
+
 async fn admin_list_libraries(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -7905,12 +8050,19 @@ async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Resp
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
+    match admin_health_payload(&state).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
     let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let schema_version = match database.schema_version().await {
         Ok(version) => version,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
     let database_writable = database.probe_write().await.is_ok();
     let config_available = match state.config_dir.as_deref() {
@@ -7944,7 +8096,7 @@ async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Resp
                     })
                 })
                 .collect::<Vec<_>>(),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
         },
         None => Vec::new(),
     };
@@ -7953,19 +8105,19 @@ async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Resp
             "scanRunning": jobs.iter().filter(|job| matches!(job.status.as_str(), "PENDING" | "RUNNING")).count(),
             "scanFailed": jobs.iter().filter(|job| job.status == "FAILED").count(),
         }),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
     let metadata_reidentify_running = match database.list_active_metadata_reidentify_job_ids().await
     {
         Ok(ids) => ids.len(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
     let status = if database_writable && config_available && config_writable && ffprobe_available {
         "ok"
     } else {
         "degraded"
     };
-    Json(json!({
+    Ok(json!({
         "status": status,
         "schemaVersion": schema_version,
         "database": {
@@ -7983,7 +8135,180 @@ async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Resp
         },
         "libraries": libraries,
     }))
+}
+
+const DEFAULT_SERVER_NAME: &str = "Lux Server";
+const DASHBOARD_ACTIVITY_LIMIT: i64 = 24;
+const DASHBOARD_PLAYBACK_LIMIT: usize = 24;
+
+async fn admin_dashboard(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let health = match admin_health_payload(&state).await {
+        Ok(health) => health,
+        Err(status) => return status.into_response(),
+    };
+    let server_name = match database.server_name().await {
+        Ok(Some(name)) if !name.trim().is_empty() => name,
+        Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let sessions = match database.list_playback_sessions(None).await {
+        Ok(sessions) => sessions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => match users.list_users().await {
+            Ok(users) => users,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let activity = match database
+        .list_activity_events(DASHBOARD_ACTIVITY_LIMIT)
+        .await
+    {
+        Ok(events) => events
+            .iter()
+            .map(dashboard_activity_json)
+            .collect::<Vec<_>>(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let now_playing = match dashboard_playback_json(&state, &sessions, &users).await {
+        Ok(sessions) => sessions,
+        Err(status) => return status.into_response(),
+    };
+    Json(json!({
+        "server": {
+            "name": server_name,
+            "version": VERSION,
+            "commit": COMMIT,
+            "schemaVersion": health["schemaVersion"],
+        },
+        "health": health,
+        "nowPlaying": now_playing,
+        "activity": activity,
+    }))
     .into_response()
+}
+
+async fn dashboard_playback_json(
+    state: &AppState,
+    sessions: &[StoredPlaybackSession],
+    users: &[UserRecord],
+) -> Result<Vec<Value>, StatusCode> {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let user_names = users
+        .iter()
+        .map(|user| (user.id.to_string(), user.display_name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let principal = AccessPrincipal::new(crate::domain::ids::UserId::new(), true);
+    let mut values = Vec::new();
+    for session in sessions.iter().take(DASHBOARD_PLAYBACK_LIMIT) {
+        let item = match catalog.find_item(principal, &session.item_id).await {
+            Ok(Some(item)) => item,
+            Ok(None) => continue,
+            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        values.push(dashboard_playback_item_json(
+            session,
+            &item,
+            user_names
+                .get(&session.user_id)
+                .map(String::as_str)
+                .unwrap_or("未知账户"),
+        ));
+    }
+    Ok(values)
+}
+
+fn dashboard_playback_item_json(
+    session: &StoredPlaybackSession,
+    item: &CatalogItem,
+    user_name: &str,
+) -> Value {
+    let source = session
+        .media_source_id
+        .as_deref()
+        .and_then(|source_id| {
+            item.media_sources
+                .iter()
+                .find(|source| source.id == source_id)
+        })
+        .or_else(|| item.media_sources.iter().find(|source| source.is_default))
+        .or_else(|| item.media_sources.first());
+    json!({
+        "id": session.id,
+        "userId": session.user_id,
+        "userName": user_name,
+        "itemId": item.id,
+        "title": item.title,
+        "originalTitle": item.original_title,
+        "itemType": item.item_type,
+        "productionYear": item.production_year,
+        "parentIndexNumber": item.season_number,
+        "indexNumber": item.episode_number,
+        "posterAvailable": item.poster_image_tag.is_some(),
+        "positionTicks": session.position_ticks,
+        "durationTicks": session.duration_ticks.or(item.runtime_ticks),
+        "state": session.state,
+        "isPaused": session.is_paused,
+        "lastEventAt": session.last_event_at,
+        "client": session.client,
+        "deviceId": session.device_id,
+        "deviceName": session.device_name,
+        "playSessionId": session.play_session_id,
+        "source": source.map(dashboard_source_json),
+    })
+}
+
+fn dashboard_source_json(source: &CatalogSource) -> Value {
+    let video = source
+        .streams
+        .iter()
+        .find(|stream| stream.stream_type == "VIDEO");
+    let audio = source
+        .streams
+        .iter()
+        .find(|stream| stream.stream_type == "AUDIO");
+    json!({
+        "id": source.id,
+        "qualityLabel": source.quality_label,
+        "editionName": source.edition_name,
+        "container": source.container,
+        "bitrate": source.bitrate,
+        "durationTicks": source.duration_ticks,
+        "video": video.map(|stream| json!({
+            "codec": stream.codec,
+            "title": stream.title,
+            "details": stream.details,
+        })),
+        "audio": audio.map(|stream| json!({
+            "codec": stream.codec,
+            "language": stream.language,
+            "title": stream.title,
+        })),
+    })
+}
+
+fn dashboard_activity_json(event: &crate::storage::StoredAuditEvent) -> Value {
+    json!({
+        "id": event.id,
+        "userId": event.actor_user_id,
+        "userName": event.actor_username,
+        "eventType": event.event_type,
+        "targetType": event.target_type,
+        "targetId": event.target_id,
+        "metadata": serde_json::from_str::<Value>(&event.metadata_json)
+            .unwrap_or_else(|_| json!({})),
+        "createdAt": event.created_at,
+    })
 }
 
 #[derive(Deserialize)]

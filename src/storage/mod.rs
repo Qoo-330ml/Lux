@@ -393,6 +393,45 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_activity_events(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StoredAuditEvent>, StorageError> {
+        sqlx::query(
+            "SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
+                    ae.event_type, ae.target_type, ae.target_id,
+                    ae.metadata_json, ae.created_at
+             FROM audit_events ae
+             LEFT JOIN users u ON u.id = ae.actor_user_id
+             WHERE ae.event_type IN (
+                 'AUTH_LOGIN', 'PLAYBACK_STARTED', 'PLAYBACK_PAUSED', 'PLAYBACK_STOPPED'
+             )
+             ORDER BY ae.created_at DESC, ae.id DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredAuditEvent {
+                    id: row.get("id"),
+                    actor_user_id: row.get("actor_user_id"),
+                    actor_username: row.get("actor_username"),
+                    event_type: row.get("event_type"),
+                    target_type: row.get("target_type"),
+                    target_id: row.get("target_id"),
+                    metadata_json: row.get("metadata_json"),
+                    created_at: row.get("created_at"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_user_by_access_token(
         &self,
         token_hash: &[u8],
@@ -1254,6 +1293,35 @@ impl Database {
             })
     }
 
+    pub(crate) async fn server_name(&self) -> Result<Option<String>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT value FROM server_settings
+             WHERE key = 'server_name'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_server_name(&self, name: &str) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO server_settings (key, value)
+             VALUES ('server_name', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
+        )
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn media_strategy_settings(&self) -> Result<Option<String>, StorageError> {
         sqlx::query_scalar(
             "SELECT value FROM server_settings
@@ -1444,6 +1512,29 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn find_playback_session(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<Option<StoredPlaybackSession>, StorageError> {
+        sqlx::query(
+            "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                    device_id, client, device_name, state, position_ticks,
+                    duration_ticks, is_paused, started_at, last_event_at
+             FROM playback_sessions
+             WHERE user_id = ? AND play_session_id = ?",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_playback_session))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn find_active_playback_session(
@@ -4237,6 +4328,47 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_episode_counts(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, i64>, StorageError> {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT parent.id, COUNT(child.id) AS episode_count
+             FROM media_items parent
+             JOIN libraries l ON l.id = parent.library_id AND l.is_enabled = 1
+             LEFT JOIN media_items child
+               ON child.item_type = 'EPISODE' AND child.removed_at IS NULL
+              AND ((parent.item_type = 'SERIES' AND child.series_id = parent.id)
+                OR (parent.item_type = 'SEASON' AND child.parent_id = parent.id))
+             WHERE parent.id IN ({placeholders})
+               AND parent.item_type IN ('SERIES', 'SEASON')
+               AND parent.removed_at IS NULL
+             GROUP BY parent.id"
+        );
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+        for item_id in item_ids {
+            statement = statement.bind(item_id);
+        }
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.get("id"), row.get("episode_count")))
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn list_catalog_children(
         &self,
         parent_id: &str,
@@ -4641,8 +4773,10 @@ impl Database {
                      WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
                        AND child.removed_at IS NULL) AS season_count,
                     (SELECT COUNT(*) FROM media_items child
-                     WHERE child.series_id = mi.id AND child.item_type = 'EPISODE'
-                       AND child.removed_at IS NULL) AS episode_count
+                     WHERE child.item_type = 'EPISODE'
+                       AND child.removed_at IS NULL
+                       AND ((mi.item_type = 'SERIES' AND child.series_id = mi.id)
+                         OR (mi.item_type = 'SEASON' AND child.parent_id = mi.id))) AS episode_count
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE mi.id = ? AND mi.removed_at IS NULL",
