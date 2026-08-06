@@ -9,7 +9,7 @@ services:
       - "8097:8097"
     environment:
       LUX_HTTP_ADDR: 0.0.0.0:8097
-      LUX_CONFIG_DIR: /data/config
+      LUX_CONFIG_DIR: /config
       LUX_PROXY_URL: ${LUX_PROXY_URL:-}
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
@@ -20,7 +20,7 @@ services:
       RUST_LOG: ${RUST_LOG:-luxd=info,tower_http=info}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      - lux-data:/data
+      - ./config:/config:rw
       - ${LUX_MEDIA_DIR:-./media}:/media:rw
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8097/health/live"]
@@ -28,6 +28,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
-volumes:
-  lux-data:

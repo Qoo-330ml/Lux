@@ -15,7 +15,7 @@ Lux 是面向 NAS 的个人媒体服务端，核心服务使用 Rust，Web 客�
 docker compose up --build
 ```
 
-首次启动后访问 `http://localhost:8097/` 完成初始化。媒体目录默认挂载为 `./media`，数据和迁移数据库持久化在 `lux-data` 卷中；生产环境应在反代 HTTPS 后使用，并谨慎配置 `LUX_TRUSTED_PROXY_CIDRS`。
+首次启动后访问 `http://localhost:8097/` 完成初始化。Compose 默认把仓库旁的 `./config` 映射到容器 `/config`，把 `./media` 映射到 `/media`；这两个目录均为本地运行数据，不会提交到 Git。生产环境可通过 `LUX_MEDIA_DIR` 将媒体挂载切换到 NAS 路径，并应在反代 HTTPS 后使用，谨慎配置 `LUX_TRUSTED_PROXY_CIDRS`。
 
 生产部署、HTTPS 反代、Tailscale 和升级说明见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 

@@ -34,21 +34,21 @@ LABEL org.opencontainers.image.title="Lux" \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
     && groupadd --system --gid 10001 lux \
-    && useradd --system --uid 10001 --gid lux --home-dir /data --no-create-home lux \
-    && mkdir -p /data/config /media \
-    && chown -R lux:lux /data \
+    && useradd --system --uid 10001 --gid lux --home-dir /config --no-create-home lux \
+    && mkdir -p /config /media \
+    && chown -R lux:lux /config /media \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
 COPY --from=web-builder /src/web/dist /usr/local/share/lux/web
 
 ENV LUX_HTTP_ADDR=0.0.0.0:8097 \
-    LUX_CONFIG_DIR=/data/config \
+    LUX_CONFIG_DIR=/config \
     LUX_WEB_DIR=/usr/local/share/lux/web \
     RUST_LOG=luxd=info,tower_http=info \
     TZ=UTC
 
-VOLUME ["/data", "/media"]
+VOLUME ["/config", "/media"]
 EXPOSE 8097
 USER lux
 

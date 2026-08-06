@@ -4,7 +4,7 @@
 
 ## Docker Compose
 
-生产环境至少持久化 `/data`，并把媒体目录以读写方式挂载到 `/media`，因为 NFO 和图片写回需要写权限：
+生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放 SQLite、插件和服务配置；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
 
 ```bash
 LUX_MEDIA_DIR=/srv/media docker compose up -d --build
@@ -82,7 +82,7 @@ docker build --build-arg LUX_VERSION=0.1.0 -t lux:0.1.0 .
 docker compose up -d
 ```
 
-启动时会自动执行 SQLite migrations；升级前应停止写入并保留 `/data` 卷。当前版本不提供应用内备份/恢复或跨数据库迁移工具，正式 NAS 发布前必须由运维侧完成卷快照和恢复演练。
+启动时会自动执行 SQLite migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。当前版本不提供应用内备份/恢复或跨数据库迁移工具，正式 NAS 发布前必须由运维侧完成两个目录的快照和恢复演练。
 
 升级后的验收最少包括：
 
@@ -96,7 +96,7 @@ docker compose ps
 
 ## 本机故障注入
 
-可以在本机 ARM64 Docker 环境用受限 tmpfs 演练 SQLite 写失败和恢复；脚本会创建临时管理员、填满 `/data`，验证 ready/管理员健康/新媒体库写入错误，再删除填充文件验证恢复：
+可以在本机 ARM64 Docker 环境用受限 tmpfs 演练 SQLite 写失败和恢复；脚本会创建临时管理员、填满 `/config`，验证 ready/管理员健康/新媒体库写入错误，再删除填充文件验证恢复：
 
 ```bash
 LUX_IMAGE=lux:arm64-local ./scripts/disk-write-fault-smoke.sh

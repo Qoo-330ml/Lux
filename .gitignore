@@ -8,7 +8,13 @@
 /.env.local
 /config/
 /media/
+/logs/
+/compose.override.yaml
+/compose.local.yaml
 *.db
 *.db-shm
 *.db-wal
+*.log
+*.pem
+*.key
 .DS_Store
