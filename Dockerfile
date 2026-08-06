@@ -19,6 +19,7 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src ./src
 COPY migrations ./migrations
+COPY logo.svg ./logo.svg
 COPY web ./web
 COPY --from=web-builder /src/web/dist ./web/dist
 
