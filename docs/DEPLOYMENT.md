@@ -12,7 +12,7 @@ docker compose pull
 docker compose up -d
 ```
 
-镜像入口以 root 修复 `/config` 的 bind mount 权限后立即降权为 UID 10001 运行 Lux，不会以 root 提供服务。媒体目录仍需给 UID 10001 读写权限（推荐使用 NAS 共享文件夹 ACL；不要递归修改整个媒体库所有权）。
+镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本只确保 `/config` 存在，不递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。
 
 首次部署只在内网访问 `http://127.0.0.1:8097/` 完成初始化。初始化完成后再开放反向代理入口；不要把未初始化的 setup 页面直接暴露到公网。
 

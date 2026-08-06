@@ -2,6 +2,7 @@ services:
   lux:
     image: pdzhou/lux:latest
     container_name: lux
+    user: "0:0"
     ports:
       - "8097:8097"
     volumes:
