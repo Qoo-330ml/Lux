@@ -5,12 +5,16 @@
 /web/node_modules/
 /web/dist/
 /.env
-/.env.local
+/.env.*
+!/.env.example
 /config/
 /media/
+/data/
 /logs/
 /compose.override.yaml
+/compose.override.yml
 /compose.local.yaml
+/compose.local.yml
 *.db
 *.db-shm
 *.db-wal
