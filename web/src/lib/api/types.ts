@@ -241,6 +241,64 @@ export type AdminHealth = {
   }>;
 };
 
+export type AdminDashboard = {
+  server: {
+    name: string;
+    version: string;
+    commit: string;
+    schemaVersion: number;
+  };
+  health: AdminHealth;
+  nowPlaying: AdminPlaybackSession[];
+  activity: AdminActivityEvent[];
+};
+
+export type AdminPlaybackSession = {
+  id: string;
+  userId: string;
+  userName: string;
+  itemId: string;
+  title: string;
+  originalTitle?: string | null;
+  itemType: string;
+  productionYear?: number | null;
+  parentIndexNumber?: number | null;
+  indexNumber?: number | null;
+  posterAvailable: boolean;
+  positionTicks: number;
+  durationTicks?: number | null;
+  state: "PLAYING" | "PAUSED" | string;
+  isPaused: boolean;
+  lastEventAt: number;
+  client?: string | null;
+  deviceId: string;
+  deviceName?: string | null;
+  playSessionId: string;
+  source?: AdminPlaybackSource | null;
+};
+
+export type AdminPlaybackSource = {
+  id: string;
+  qualityLabel?: string | null;
+  editionName?: string | null;
+  container?: string | null;
+  bitrate?: number | null;
+  durationTicks?: number | null;
+  video?: { codec?: string | null; title?: string | null; details?: Record<string, unknown> } | null;
+  audio?: { codec?: string | null; language?: string | null; title?: string | null } | null;
+};
+
+export type AdminActivityEvent = {
+  id: string;
+  userId?: string | null;
+  userName?: string | null;
+  eventType: "AUTH_LOGIN" | "PLAYBACK_STARTED" | "PLAYBACK_PAUSED" | "PLAYBACK_STOPPED" | string;
+  targetType?: string | null;
+  targetId?: string | null;
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+};
+
 export type AdminJob = {
   id: string;
   libraryId: string;
@@ -331,6 +389,7 @@ export type AdminImage = {
 };
 
 export type AdminSettings = {
+  serverName?: string;
   resumePlayedPercent: number;
   resumeMinTicks: number;
   mediaStrategy: MediaStrategySettings;

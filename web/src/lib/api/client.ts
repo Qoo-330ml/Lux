@@ -1,5 +1,6 @@
 import type {
   AdminAuditEvent,
+  AdminDashboard,
   AdminHealth,
   AdminImage,
   AdminJob,
@@ -297,6 +298,10 @@ export class LuxApiClient {
 
   adminHealth() {
     return this.request<AdminHealth>("/api/v1/admin/health");
+  }
+
+  adminDashboard() {
+    return this.request<AdminDashboard>("/api/v1/admin/dashboard");
   }
 
   adminLibraries() {

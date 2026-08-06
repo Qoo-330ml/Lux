@@ -351,6 +351,33 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("loads the dashboard aggregate and persists a server name", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/admin/dashboard") {
+        return new Response(JSON.stringify({ server: { name: "Lux", version: "0.1.0" }, health: {}, nowPlaying: [], activity: [] }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/admin/settings");
+      expect(init?.method).toBe("PATCH");
+      expect(JSON.parse(String(init?.body))).toEqual({ serverName: "客厅 Lux" });
+      expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      return new Response(JSON.stringify({ serverName: "客厅 Lux" }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.adminDashboard()).resolves.toMatchObject({
+      server: { name: "Lux", version: "0.1.0" },
+      nowPlaying: [],
+      activity: [],
+    });
+    await expect(client.updateAdminSettings({ serverName: "客厅 Lux" })).resolves.toEqual({ serverName: "客厅 Lux" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("tests the fixed network proxy targets with the configured CSRF token", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       expect(String(input)).toBe("/api/v1/admin/settings/network-proxy/test");

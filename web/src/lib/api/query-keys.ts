@@ -15,6 +15,7 @@ export const queryKeys = {
   children: (itemId: string, itemType?: string, seasonId?: string) =>
     ["children", itemId, itemType ?? "default", seasonId ?? "all"] as const,
   playback: (itemId: string) => ["playback", itemId] as const,
+  adminDashboard: ["admin", "dashboard"] as const,
   adminHealth: ["admin", "health"] as const,
   adminLibraries: ["admin", "libraries"] as const,
   adminPlugins: ["admin", "plugins"] as const,
