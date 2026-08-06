@@ -62,4 +62,41 @@ describe("MediaIdentifier", () => {
     expect(onSaved).toHaveBeenCalledOnce();
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  it("presents refresh unlocked metadata as a full replacement with an explanation", async () => {
+    vi.spyOn(api, "adminItemCandidates").mockResolvedValue({
+      items: [{
+        id: "candidate-1",
+        itemId: "item-1",
+        itemTitle: "示例电影",
+        provider: "TMDB",
+        providerId: "123",
+        candidate: { title: "候选电影", productionYear: 2020 },
+        score: 86,
+        status: "PENDING",
+        fieldDiffs: [],
+      }],
+      total: 1,
+    });
+    const select = vi.spyOn(api, "selectAdminMetadata").mockResolvedValue({
+      itemId: "item-1",
+      candidateId: "candidate-1",
+      status: "ONLINE_CONFIRMED",
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(<MediaIdentifier item={{ id: "item-1", title: "示例电影" }} onClose={vi.fn()} />);
+    });
+    await act(async () => await Promise.resolve());
+
+    const replaceButton = container.querySelector<HTMLButtonElement>("[data-action=identify-refresh]");
+    expect(replaceButton?.textContent).toContain("全量替换");
+    expect(replaceButton?.title).toBe("会替换当前媒体所有未锁定的元数据及图片");
+
+    await act(async () => replaceButton?.click());
+    expect(select).toHaveBeenCalledWith("item-1", "candidate-1", "refreshUnlocked");
+  });
 });

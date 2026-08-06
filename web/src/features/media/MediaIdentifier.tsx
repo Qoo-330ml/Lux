@@ -129,7 +129,7 @@ function CandidateCard({
       {candidate.fieldDiffs.length ? <div className="lux-identifier-diffs">{candidate.fieldDiffs.map((diff) => <div key={diff.field}><span>{diff.field}</span><small>{displayValue(diff.current)} → {displayValue(diff.candidate)}</small></div>)}</div> : <small className="lux-identifier-no-diff">没有字段差异</small>}
       <div className="lux-identifier-actions">
         <button className="lux-button lux-button-primary" data-action="identify-fill" type="button" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "fillMissing")}><Check size={15} /> {selecting === `${candidate.id}:fillMissing` ? "应用中…" : "仅补缺"}</button>
-        <button className="lux-button lux-button-secondary" data-action="identify-refresh" type="button" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "refreshUnlocked")}><Search size={15} /> {selecting === `${candidate.id}:refreshUnlocked` ? "应用中…" : "刷新未锁定"}</button>
+        <button className="lux-button lux-button-secondary" data-action="identify-refresh" type="button" title="会替换当前媒体所有未锁定的元数据及图片" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "refreshUnlocked")}><Search size={15} /> {selecting === `${candidate.id}:refreshUnlocked` ? "应用中…" : "全量替换"}</button>
       </div>
     </article>
   );
