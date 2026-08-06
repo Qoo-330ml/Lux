@@ -196,7 +196,15 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 媒体库名称"]')?.value).toBe("01每日更新");
   });
 
-  it("fills the root path from the server directory tree", async () => {
+  it("adds a selected server directory as a library root", async () => {
+    const addRoot = vi.spyOn(api, "addAdminLibraryRoot").mockResolvedValue({
+      root: {
+        ...library.roots[0],
+        id: "root-2",
+        canonicalPath: "/media",
+        displayPath: "/media",
+      },
+    });
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       path: "/",
       parentPath: null,
@@ -235,11 +243,68 @@ describe("AdminLibrariesPage library cards", () => {
     await act(async () => mediaDirectory?.click());
     await act(async () => {
       [...container.querySelectorAll<HTMLButtonElement>("button")]
-        .find((button) => button.textContent?.includes("使用此目录"))
+        .find((button) => button.textContent?.includes("使用此路径"))
+        ?.click();
+      await vi.waitFor(() => expect(addRoot).toHaveBeenCalledWith("library-1", "/media"));
+    });
+
+    expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 新根路径"]')?.value).toBe("");
+    expect(container.querySelector("#lux-directory-picker-title")).toBeNull();
+    expect([...container.querySelectorAll<HTMLButtonElement>("button")]
+      .some((button) => button.textContent?.includes("添加路径"))).toBe(false);
+  });
+
+  it("adds a manually entered path from the directory picker", async () => {
+    const addRoot = vi.spyOn(api, "addAdminLibraryRoot").mockResolvedValue({
+      root: {
+        ...library.roots[0],
+        id: "root-3",
+        canonicalPath: "/manual/media",
+        displayPath: "/manual/media",
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      path: "/",
+      parentPath: null,
+      directories: [],
+      page: 1,
+      pageSize: 50,
+      hasMore: false,
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
         ?.click();
     });
 
-    expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 新根路径"]')?.value).toBe("/media");
+    const pathInput = container.querySelector<HTMLInputElement>('[aria-label="01每日更新 新根路径"]');
+    expect(pathInput).toBeTruthy();
+    await act(async () => {
+      if (!pathInput) throw new Error("library root path input missing");
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(pathInput, "/manual/media");
+      pathInput.dispatchEvent(new Event("input", { bubbles: true }));
+      pathInput.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="浏览服务器目录"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector(".lux-directory-picker-selected")?.textContent).toContain("/manual/media");
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("使用此路径"))
+        ?.click();
+      await vi.waitFor(() => expect(addRoot).toHaveBeenCalledWith("library-1", "/manual/media"));
+    });
+
+    expect(pathInput?.value).toBe("");
+    expect(container.querySelector("#lux-directory-picker-title")).toBeNull();
   });
 
   it("lists only configured scrapers without a local-only scraper option", async () => {

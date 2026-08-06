@@ -27,10 +27,12 @@ function createNode(entry: AdminDirectoryEntry, expanded = false): DirectoryNode
 
 export function DirectoryPicker({
   initialPath,
+  isSubmitting,
   onSelect,
   onClose,
 }: {
   initialPath?: string;
+  isSubmitting: boolean;
   onSelect: (path: string) => void;
   onClose: () => void;
 }) {
@@ -121,8 +123,8 @@ export function DirectoryPicker({
         </ul>
       </div>
       <footer className="lux-directory-picker-actions">
-        <span>{selectedPath === "/" ? "请选择具体的媒体目录" : "选择后仍需点击“添加路径”保存"}</span>
-        <button className="lux-library-toolbar-button is-primary" type="button" disabled={selectedPath === "/"} onClick={() => onSelect(selectedPath)}>使用此目录</button>
+        <span>{selectedPath === "/" ? "请选择具体的媒体目录" : isSubmitting ? "正在添加此路径…" : "点击“使用此路径”后将直接添加到媒体库"}</span>
+        <button className="lux-library-toolbar-button is-primary" type="button" disabled={selectedPath === "/" || isSubmitting} onClick={() => onSelect(selectedPath)}>{isSubmitting ? "添加中…" : "使用此路径"}</button>
       </footer>
     </section>
   );
