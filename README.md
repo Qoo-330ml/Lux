@@ -18,7 +18,7 @@ docker compose up -d
 
 首次启动后访问 `http://localhost:8097/` 完成初始化。Compose 默认把仓库旁的 `./config` 映射到容器 `/config`，把 `./media` 映射到 `/media`；这两个目录均为本地运行数据，不会提交到 Git。生产环境可直接修改 `compose.yaml` 中媒体挂载的宿主机路径，并应在反代 HTTPS 后使用。
 
-镜像以非 root 的 UID 10001 运行。Linux/NAS 部署前请确保宿主机 `config` 可由 UID 10001 写入，`media` 可由该 UID 读写（可用 NAS 的共享文件夹权限或 ACL 完成），否则数据库初始化和 NFO/图片回写会失败。
+镜像启动时会自动把 `/config` 交给 UID 10001 后再运行 Lux，因此首次 bind mount 不需要手动 `chown`。`media` 仍需由该 UID 读写，才能回写 NFO/图片（可用 NAS 的共享文件夹权限或 ACL 完成）。
 
 生产部署、HTTPS 反代、Tailscale 和升级说明见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
