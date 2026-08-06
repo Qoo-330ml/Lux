@@ -15,6 +15,10 @@ LUX_MEDIA_DIR=/srv/media docker compose up -d --build
 
 首次部署只在内网访问 `http://127.0.0.1:8097/` 完成初始化。初始化完成后再开放反向代理入口；不要把未初始化的 setup 页面直接暴露到公网。
 
+### Docker Hub 镜像
+
+`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送或 `v*.*.*` 标签推送时发布 `linux/amd64` 和 `linux/arm64` 镜像。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`。
+
 建议显式设置：
 
 ```dotenv

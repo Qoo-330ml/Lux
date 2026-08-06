@@ -22,6 +22,20 @@ docker compose up --build
 
 生产部署、HTTPS 反代、Tailscale 和升级说明见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
+## Docker Hub 发布
+
+`.github/workflows/dockerhub.yml` 会在 Pull Request 中只构建验证，在 `main` 推送和 `v*.*.*` 版本标签时构建并发布 `linux/amd64`、`linux/arm64` 镜像。请在 GitHub 仓库的 Settings → Secrets and variables → Actions 中配置：
+
+- `DOCKERHUB_USERNAME`：Docker Hub 用户名。
+- `DOCKERHUB_TOKEN`：Docker Hub Access Token，不要使用账户密码。
+
+镜像名为 `docker.io/<DOCKERHUB_USERNAME>/lux`。例如发布版本：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## 常用命令
 
 ```bash
