@@ -8297,7 +8297,7 @@ fn dashboard_source_json(source: &CatalogSource) -> Value {
     })
 }
 
-fn dashboard_activity_json(event: &crate::storage::StoredAuditEvent) -> Value {
+fn dashboard_activity_json(event: &crate::storage::StoredActivityEvent) -> Value {
     json!({
         "id": event.id,
         "userId": event.actor_user_id,
@@ -8305,6 +8305,7 @@ fn dashboard_activity_json(event: &crate::storage::StoredAuditEvent) -> Value {
         "eventType": event.event_type,
         "targetType": event.target_type,
         "targetId": event.target_id,
+        "targetTitle": event.target_title,
         "metadata": serde_json::from_str::<Value>(&event.metadata_json)
             .unwrap_or_else(|_| json!({})),
         "createdAt": event.created_at,

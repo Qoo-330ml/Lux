@@ -295,6 +295,7 @@ export type AdminActivityEvent = {
   eventType: "AUTH_LOGIN" | "PLAYBACK_STARTED" | "PLAYBACK_PAUSED" | "PLAYBACK_STOPPED" | string;
   targetType?: string | null;
   targetId?: string | null;
+  targetTitle?: string | null;
   metadata?: Record<string, unknown>;
   createdAt: number;
 };

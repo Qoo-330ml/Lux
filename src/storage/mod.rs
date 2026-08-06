@@ -396,13 +396,14 @@ impl Database {
     pub(crate) async fn list_activity_events(
         &self,
         limit: i64,
-    ) -> Result<Vec<StoredAuditEvent>, StorageError> {
+    ) -> Result<Vec<StoredActivityEvent>, StorageError> {
         sqlx::query(
             "SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
                     ae.event_type, ae.target_type, ae.target_id,
-                    ae.metadata_json, ae.created_at
+                    mi.title AS target_title, ae.metadata_json, ae.created_at
              FROM audit_events ae
              LEFT JOIN users u ON u.id = ae.actor_user_id
+             LEFT JOIN media_items mi ON mi.id = ae.target_id
              WHERE ae.event_type IN (
                  'AUTH_LOGIN', 'PLAYBACK_STARTED', 'PLAYBACK_PAUSED', 'PLAYBACK_STOPPED'
              )
@@ -414,13 +415,14 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredAuditEvent {
+                .map(|row| StoredActivityEvent {
                     id: row.get("id"),
                     actor_user_id: row.get("actor_user_id"),
                     actor_username: row.get("actor_username"),
                     event_type: row.get("event_type"),
                     target_type: row.get("target_type"),
                     target_id: row.get("target_id"),
+                    target_title: row.get("target_title"),
                     metadata_json: row.get("metadata_json"),
                     created_at: row.get("created_at"),
                 })
@@ -6561,6 +6563,19 @@ pub(crate) struct StoredAuditEvent {
     pub(crate) event_type: String,
     pub(crate) target_type: Option<String>,
     pub(crate) target_id: Option<String>,
+    pub(crate) metadata_json: String,
+    pub(crate) created_at: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredActivityEvent {
+    pub(crate) id: String,
+    pub(crate) actor_user_id: Option<String>,
+    pub(crate) actor_username: Option<String>,
+    pub(crate) event_type: String,
+    pub(crate) target_type: Option<String>,
+    pub(crate) target_id: Option<String>,
+    pub(crate) target_title: Option<String>,
     pub(crate) metadata_json: String,
     pub(crate) created_at: i64,
 }
