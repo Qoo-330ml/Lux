@@ -843,6 +843,25 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
     assert_eq!(updated_body["scheduledTask"]["schedule"], "interval:2h");
     assert_eq!(updated_body["scheduledTask"]["isEnabled"], true);
 
+    let global_schedule = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "GLOBAL",
+            "ownerId": "global",
+            "taskType": "RECONCILIATION_SCAN",
+            "schedule": "interval:6h"
+        }))
+        .send()
+        .await?;
+    assert_eq!(global_schedule.status(), reqwest::StatusCode::OK);
+    let global_body: Value = global_schedule.json().await?;
+    assert_eq!(global_body["scheduledTask"]["ownerType"], "GLOBAL");
+    assert_eq!(global_body["scheduledTask"]["ownerId"], "global");
+    assert_eq!(global_body["scheduledTask"]["ownerName"], "全局");
+    assert_eq!(global_body["scheduledTask"]["schedule"], "interval:6h");
+
     let invalid_task = client
         .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
         .header(COOKIE, &cookies)

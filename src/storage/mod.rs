@@ -1046,6 +1046,39 @@ impl Database {
         Ok((rows.into_iter().map(stored_scheduled_task).collect(), total))
     }
 
+    pub(crate) async fn upsert_scheduled_task_config(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+        task_type: &str,
+        schedule: Option<&str>,
+        is_enabled: bool,
+    ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
+        sqlx::query(
+            "INSERT INTO scheduled_task_configs (
+                owner_type, owner_id, task_type, cron_or_interval,
+                is_enabled, resource_limit_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, '{}', unixepoch())
+            ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                cron_or_interval = excluded.cron_or_interval,
+                is_enabled = excluded.is_enabled,
+                updated_at = unixepoch()",
+        )
+        .bind(owner_type)
+        .bind(owner_id)
+        .bind(task_type)
+        .bind(schedule)
+        .bind(is_enabled)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.find_scheduled_task_config(owner_type, owner_id, task_type)
+            .await
+    }
+
     pub(crate) async fn find_scheduled_task_config(
         &self,
         owner_type: &str,

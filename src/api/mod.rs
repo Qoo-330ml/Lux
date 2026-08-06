@@ -7715,7 +7715,7 @@ struct AdminScheduledTaskRequest {
     is_enabled: Option<bool>,
 }
 
-const LIBRARY_SCHEDULE_TASK_TYPES: [&str; 3] =
+const SCHEDULE_TASK_TYPES: [&str; 3] =
     ["INCREMENTAL_SCAN", "RECONCILIATION_SCAN", "METADATA_PARSE"];
 
 async fn admin_list_scheduled_tasks(
@@ -7762,17 +7762,17 @@ async fn admin_upsert_scheduled_task(
         return response;
     }
     let owner_type = request.owner_type.trim().to_ascii_uppercase();
-    if owner_type != "LIBRARY" {
+    if owner_type != "GLOBAL" && owner_type != "LIBRARY" {
         return api_error(
             &headers,
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
-            "当前只支持媒体库计划",
+            "计划归属必须是全局或媒体库",
         )
         .into_response();
     }
     let task_type = request.task_type.trim().to_ascii_uppercase();
-    if !LIBRARY_SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) {
+    if !SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) {
         return api_error(
             &headers,
             StatusCode::BAD_REQUEST,
@@ -7780,6 +7780,48 @@ async fn admin_upsert_scheduled_task(
             "任务类型无效",
         )
         .into_response();
+    }
+    if owner_type == "GLOBAL" {
+        if !request.owner_id.trim().eq_ignore_ascii_case("global") {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "全局计划的 ownerId 必须是 global",
+            )
+            .into_response();
+        }
+        let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
+        let schedule = if enabled {
+            request.schedule.as_deref().map(str::trim)
+        } else {
+            None
+        };
+        let Some(database) = state.database.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let task = match database
+            .upsert_scheduled_task_config("GLOBAL", "global", &task_type, schedule, enabled)
+            .await
+        {
+            Ok(Some(task)) => task,
+            Ok(None) | Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        let target_id = format!("global:{task_type}");
+        record_audit_event(
+            &state,
+            &headers,
+            "SCHEDULE_UPDATED",
+            Some("scheduled_task"),
+            Some(&target_id),
+            "{}",
+        )
+        .await;
+        return (
+            StatusCode::OK,
+            Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
+        )
+            .into_response();
     }
     let library_id = match request
         .owner_id
