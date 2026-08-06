@@ -43,11 +43,16 @@ test("light mode preserves the same flat admin surfaces", () => {
 
 test("now-playing cards use theme tokens and compact proportions", () => {
   const cardRule = stylesheet.match(/\.lux-now-playing-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const gridRule = stylesheet.match(/\.lux-now-playing-grid\s*\{([^}]*)\}/)?.[1] ?? "";
   const bodyRule = stylesheet.match(/\.lux-now-playing-body\s*\{([^}]*)\}/)?.[1] ?? "";
+  const networkFieldRule = stylesheet.match(/\.lux-now-playing-network-field\s*\{([^}]*)\}/)?.[1] ?? "";
   const lightRule = stylesheet.match(/html\[data-lux-theme="light"\] \.lux-now-playing-card\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(cardRule, /background:\s*var\(--lux-now-card-bg\)/);
-  assert.match(bodyRule, /padding:\s*16px\s+20px/);
+  assert.match(gridRule, /width:\s*min\(100%,\s*960px\)/);
+  assert.match(bodyRule, /gap:\s*14px/);
+  assert.match(bodyRule, /padding:\s*12px\s+16px/);
   assert.match(bodyRule, /minmax\(84px,\s*9%\)/);
+  assert.match(networkFieldRule, /padding:\s*5px\s+12px/);
   assert.match(lightRule, /--lux-now-card-bg:\s*#fbfcfe/);
 });

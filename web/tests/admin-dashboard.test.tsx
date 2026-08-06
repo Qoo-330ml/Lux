@@ -120,7 +120,13 @@ describe("AdminDashboardPage", () => {
     expect(container.textContent).toContain("4K HEVC");
     expect(container.textContent).toContain("HEVC");
     expect(container.textContent).toContain("AAC · zh-CN");
+    expect(container.textContent).not.toContain("NOW PLAYING");
+    expect(container.textContent).not.toContain("IP 地址");
+    expect(container.textContent).not.toContain("IP 归属地");
+    expect(container.querySelector(".lux-now-playing-kicker")).toBeNull();
     expect(container.querySelector(".lux-now-playing-network")).not.toBeNull();
+    expect(container.querySelector('[role="group"][aria-label="IP 地址"]')).not.toBeNull();
+    expect(container.querySelector('[role="group"][aria-label="IP 归属地"]')).not.toBeNull();
     expect(container.querySelector(".lux-now-playing-account")).not.toBeNull();
     expect(container.querySelector(".lux-now-playing-facts")).not.toBeNull();
     expect(container.querySelectorAll(".lux-now-playing-fact")).toHaveLength(3);

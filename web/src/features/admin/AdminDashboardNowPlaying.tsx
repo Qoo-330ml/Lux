@@ -33,7 +33,6 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
         <div className="lux-now-playing-content">
           <div className="lux-now-playing-heading">
             <div className="lux-now-playing-heading-copy">
-              <span className="lux-now-playing-kicker">NOW PLAYING</span>
               <Link className="lux-now-playing-title" to={`/items/${encodeURIComponent(session.itemId)}`}>{session.title}</Link>
               <div className="lux-now-playing-subtitle">
                 {episodeLabel(session)}{session.originalTitle && session.originalTitle !== session.title ? ` · ${session.originalTitle}` : ""}
@@ -88,7 +87,7 @@ function Fact({ icon, label, value, detail }: { icon: ReactNode; label: string; 
 }
 
 function NetworkField({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {
-  return <div className="lux-now-playing-network-field"><span className="lux-now-playing-network-icon">{icon}</span><div><small>{label}</small><strong className={value === "—" ? "lux-now-playing-placeholder" : undefined}>{value}</strong></div></div>;
+  return <div className="lux-now-playing-network-field" role="group" aria-label={label}><span className="lux-now-playing-network-icon">{icon}</span><div><strong className={value === "—" ? "lux-now-playing-placeholder" : undefined}>{value}</strong></div></div>;
 }
 
 function episodeLabel(session: AdminPlaybackSession) {
