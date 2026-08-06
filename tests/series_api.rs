@@ -1,6 +1,9 @@
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    application::{
+        libraries::LibraryService, metadata::MetadataEnricher, scanner::LibraryScanner,
+        setup::SetupService,
+    },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
     library::LibraryKind,
@@ -38,11 +41,19 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         )
         .await?;
     }
+    tokio::fs::write(
+        season_dir.join("Example.Show.S01E01-thumb.jpg"),
+        b"episode-thumbnail",
+    )
+    .await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
         .await?;
     LibraryScanner::new(database.clone())
         .scan_series_library(library.id)
+        .await?;
+    MetadataEnricher::new(database.clone())
+        .enrich_series_library(library.id)
         .await?;
     let series_id: String =
         sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SERIES'")
@@ -57,6 +68,11 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     )
     .fetch_one(database.pool())
     .await?;
+    let episode_thumb_id: String =
+        sqlx::query_scalar("SELECT id FROM item_images WHERE item_id = ? AND image_type = 'THUMB'")
+            .bind(&episode_id)
+            .fetch_one(database.pool())
+            .await?;
     let played_episode_id: String = sqlx::query_scalar(
         "SELECT id FROM media_items WHERE item_type = 'EPISODE' AND episode_number = 2",
     )
@@ -219,6 +235,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(web_episodes_body["items"][0]["seriesId"], series_id);
     assert_eq!(web_episodes_body["items"][0]["parentIndexNumber"], 1);
     assert_eq!(web_episodes_body["items"][0]["indexNumber"], 1);
+    assert_eq!(
+        web_episodes_body["items"][0]["imageTags"]["thumb"],
+        episode_thumb_id
+    );
     assert_eq!(
         web_episodes_body["items"][0]["userData"]["isFavorite"],
         true

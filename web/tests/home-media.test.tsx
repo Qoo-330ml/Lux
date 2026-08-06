@@ -34,7 +34,7 @@ describe("ContinueWatchingRail", () => {
                 rating: 8.4,
                 ratingSource: "TMDb",
                 runtimeTicks: 3_600_000_000,
-                imageTags: { fanart: "fanart-tag" },
+                imageTags: { thumb: "episode-thumb-tag" },
                 userData: { positionTicks: 1_200_000_000 },
               },
             ]}
@@ -51,6 +51,8 @@ describe("ContinueWatchingRail", () => {
     expect(container.querySelector(".lux-continue-card .lux-rating")?.textContent).toBe("8.4");
     expect(container.querySelector(".lux-continue-card .lux-rating-source")).toBeNull();
     expect(container.querySelector(".lux-continue-card .lux-rating svg")).toBeNull();
+    expect(container.querySelector(".lux-continue-card img")?.getAttribute("src"))
+      .toBe("/api/v1/items/episode-1/images/thumb?tag=episode-thumb-tag");
     expect(container.querySelector(".lux-progress span")?.getAttribute("style")).toContain("width: 33%");
     expect(container.querySelector(".lux-continue-remaining")?.textContent).toBe("还剩 4m");
   });

@@ -46,9 +46,16 @@ export function mediaTypeLabel(itemType?: string | null) {
   }
 }
 
-export function imageUrl(item: MediaItem, type: "poster" | "fanart" = "poster") {
-  if (!item.imageTags?.[type]) return undefined;
-  return `/api/v1/items/${encodeURIComponent(item.id)}/images/${type}`;
+export function imageUrl(item: MediaItem, type: "poster" | "fanart" | "thumb" = "poster") {
+  const resolvedType = item.imageTags?.[type]
+    ? type
+    : type === "fanart" && item.imageTags?.thumb
+      ? "thumb"
+      : undefined;
+  if (!resolvedType) return undefined;
+  const tag = item.imageTags?.[resolvedType];
+  const path = `/api/v1/items/${encodeURIComponent(item.id)}/images/${resolvedType}`;
+  return tag ? `${path}?tag=${encodeURIComponent(tag)}` : path;
 }
 
 export function runtimeLabel(ticks?: number | null) {

@@ -2508,6 +2508,9 @@ fn emby_catalog_item_json_with_state(
     if let Some(tag) = item.logo_image_tag.as_ref() {
         image_tags.insert("Logo".to_owned(), json!(tag));
     }
+    if let Some(tag) = item.thumb_image_tag.as_ref() {
+        image_tags.insert("Thumb".to_owned(), json!(tag));
+    }
     json!({
         "Name": item.title,
         "OriginalTitle": item.original_title,
@@ -5426,6 +5429,7 @@ fn lux_catalog_item_json(item: &CatalogItem) -> Value {
         "imageTags": {
             "poster": item.poster_image_tag,
             "fanart": item.fanart_image_tag,
+            "thumb": item.thumb_image_tag,
         },
         "mediaSources": item.media_sources.iter().map(lux_catalog_source_json).collect::<Vec<_>>(),
     })

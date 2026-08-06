@@ -554,6 +554,7 @@ pub struct CatalogItem {
     pub runtime_ticks: Option<i64>,
     pub poster_image_tag: Option<String>,
     pub fanart_image_tag: Option<String>,
+    pub thumb_image_tag: Option<String>,
     pub logo_image_tag: Option<String>,
     pub media_sources: Vec<CatalogSource>,
 }
@@ -621,6 +622,7 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     runtime_ticks: row.runtime_ticks,
                     poster_image_tag: row.poster_image_tag.clone(),
                     fanart_image_tag: row.fanart_image_tag.clone(),
+                    thumb_image_tag: row.thumb_image_tag.clone(),
                     logo_image_tag: row.logo_image_tag.clone(),
                     media_sources: Vec::new(),
                 });

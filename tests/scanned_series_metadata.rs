@@ -32,6 +32,11 @@ async fn completed_series_scan_indexes_local_nfo_and_images()
     tokio::fs::write(season_dir.join("poster.jpg"), b"season-poster").await?;
     tokio::fs::write(season_dir.join("fanart.jpg"), b"season-fanart").await?;
     tokio::fs::write(
+        season_dir.join("Example.Show.S01E01-thumb.jpg"),
+        b"episode-thumb",
+    )
+    .await?;
+    tokio::fs::write(
         season_dir.join("Example.Show.S01E01.strm"),
         "https://example.invalid/series/episode",
     )
@@ -63,13 +68,14 @@ async fn completed_series_scan_indexes_local_nfo_and_images()
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(image_rows.len(), 4);
+    assert_eq!(image_rows.len(), 5);
     assert_eq!(
         image_rows
             .iter()
             .map(|row| (row.0.as_str(), row.1.as_str()))
             .collect::<Vec<_>>(),
         vec![
+            ("EPISODE", "THUMB"),
             ("SEASON", "FANART"),
             ("SEASON", "POSTER"),
             ("SERIES", "FANART"),

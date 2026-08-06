@@ -700,6 +700,7 @@ impl MetadataEnricher {
         let mut series_seen = HashSet::new();
         let mut seasons_seen = HashSet::new();
         let mut episodes_seen = HashSet::new();
+        let mut season_image_paths = BTreeMap::<String, Vec<PathBuf>>::new();
         for source in sources {
             let root = PathBuf::from(&source.root_path);
             let media_path = root.join(&source.relative_path);
@@ -720,6 +721,22 @@ impl MetadataEnricher {
             let season_number = source.season_number.unwrap_or_default();
             let season_key = format!("{}:{season_number}", source.season_id);
             let season_dir = media_path.parent().unwrap_or(&series_dir);
+            if !season_image_paths.contains_key(&source.season_id) {
+                let mut paths = series_paths.clone();
+                if season_dir != series_dir {
+                    let mut directory_paths = read_directory_paths(season_dir).await?;
+                    paths = series_paths
+                        .iter()
+                        .filter(|path| is_prefixed_season_image(path, season_number))
+                        .cloned()
+                        .collect();
+                    paths.append(&mut directory_paths);
+                }
+                season_image_paths.insert(source.season_id.clone(), paths);
+            }
+            let Some(season_paths) = season_image_paths.get(&source.season_id) else {
+                continue;
+            };
             if seasons_seen.insert(season_key) {
                 if let Some(nfo_path) =
                     find_season_nfo(&series_dir, season_dir, season_number).await
@@ -727,20 +744,10 @@ impl MetadataEnricher {
                     self.enrich_nfo_item_best_effort(&mut report, &source.season_id, &nfo_path)
                         .await;
                 }
-                let mut season_paths = series_paths.clone();
-                if season_dir != series_dir {
-                    let mut directory_paths = read_directory_paths(season_dir).await?;
-                    season_paths = series_paths
-                        .iter()
-                        .filter(|path| is_prefixed_season_image(path, season_number))
-                        .cloned()
-                        .collect();
-                    season_paths.append(&mut directory_paths);
-                }
                 report.images_found += self
                     .index_images(
                         &source.season_id,
-                        find_series_images(&season_paths, Some(season_number)),
+                        find_series_images(season_paths, Some(season_number)),
                     )
                     .await?;
             }
@@ -750,6 +757,12 @@ impl MetadataEnricher {
                     self.enrich_nfo_item_best_effort(&mut report, &source.episode_id, &nfo_path)
                         .await;
                 }
+                report.images_found += self
+                    .index_images(
+                        &source.episode_id,
+                        find_episode_images(season_paths, &media_path),
+                    )
+                    .await?;
             }
         }
         Ok(report)
@@ -1075,6 +1088,54 @@ fn find_series_images(paths: &[PathBuf], season_number: Option<i64>) -> Vec<Loca
                     continue;
                 }
             }
+        };
+        if images
+            .iter()
+            .any(|image: &LocalImage| image.image_type == image_type)
+        {
+            continue;
+        }
+        images.push(LocalImage {
+            image_type,
+            path: path.clone(),
+        });
+    }
+    images
+}
+
+fn find_episode_images(paths: &[PathBuf], media_path: &Path) -> Vec<LocalImage> {
+    let Some(episode_stem) = media_path.file_stem().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}-", episode_stem.to_ascii_lowercase());
+    let mut images = Vec::new();
+    for path in paths {
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "webp"
+        ) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let stem = stem.to_ascii_lowercase();
+        let Some(suffix) = stem.strip_prefix(&prefix) else {
+            continue;
+        };
+        let image_type = match suffix {
+            "poster" => ImageType::Poster,
+            "fanart" | "backdrop" => ImageType::Fanart,
+            "thumb" | "thumbnail" => ImageType::Thumb,
+            "logo" | "clearlogo" => ImageType::Logo,
+            "banner" => ImageType::Banner,
+            "disc" | "discart" => ImageType::Disc,
+            "art" | "artwork" => ImageType::Art,
+            "wallpaper" => ImageType::Wallpaper,
+            _ => continue,
         };
         if images
             .iter()
