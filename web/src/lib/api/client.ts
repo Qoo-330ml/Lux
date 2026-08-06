@@ -41,6 +41,20 @@ export type LibraryItemsOptions = {
   sortOrder?: LibrarySortOrder;
 };
 
+export type AdminDirectoryEntry = {
+  name: string;
+  path: string;
+};
+
+export type AdminDirectoryPage = {
+  path: string;
+  parentPath: string | null;
+  directories: AdminDirectoryEntry[];
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+};
+
 export class ApiError extends Error {
   readonly code: string;
   readonly requestId?: string;
@@ -381,6 +395,11 @@ export class LuxApiClient {
       `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/roots`,
       { method: "POST", body: JSON.stringify({ path }) },
     );
+  }
+
+  adminDirectories(path = "/", page = 1, pageSize = 50) {
+    const params = new URLSearchParams({ path, page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminDirectoryPage>(`/api/v1/admin/directories?${params}`);
   }
 
   deleteAdminLibraryRoot(libraryId: string, rootId: string) {

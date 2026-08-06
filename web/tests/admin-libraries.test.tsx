@@ -115,6 +115,7 @@ describe("AdminLibrariesPage library cards", () => {
     act(() => root.unmount());
     container.remove();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   async function renderPage() {
@@ -193,6 +194,51 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(container.querySelector('[role="dialog"]')?.textContent).toContain("01每日更新");
     expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 媒体库名称"]')?.value).toBe("01每日更新");
+  });
+
+  it("fills the root path from the server directory tree", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      path: "/",
+      parentPath: null,
+      directories: [{ name: "media", path: "/media" }],
+      page: 1,
+      pageSize: 50,
+      hasMore: false,
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+
+    const browseButton = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("浏览服务器目录"));
+    expect(browseButton).toBeTruthy();
+    await act(async () => {
+      browseButton?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/admin/directories?path=%2F&page=1&pageSize=50",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    const mediaDirectory = container.querySelector<HTMLButtonElement>('[aria-label="选择目录 /media"]');
+    expect(mediaDirectory).toBeTruthy();
+    await act(async () => mediaDirectory?.click());
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("使用此目录"))
+        ?.click();
+    });
+
+    expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 新根路径"]')?.value).toBe("/media");
   });
 
   it("lists only configured scrapers without a local-only scraper option", async () => {

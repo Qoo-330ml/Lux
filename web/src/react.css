@@ -972,8 +972,32 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-dialog-icon { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; color: var(--lux-muted); background: transparent; }
 .lux-library-dialog-icon:hover:not(:disabled) { color: #fff; background: rgba(255,255,255,.08); }
 .lux-library-dialog-icon:disabled { color: var(--lux-subtle); }
-.lux-library-root-form { display: flex; gap: 8px; margin-top: 14px; }
-.lux-library-root-form input { flex: 1; min-width: 0; }
+.lux-library-root-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.lux-library-root-form input { flex: 1 1 250px; min-width: 0; }
+.lux-directory-picker { display: grid; gap: 12px; margin-top: 12px; padding: 14px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: rgba(255,255,255,.025); }
+.lux-directory-picker-header, .lux-directory-picker-actions, .lux-directory-picker-selected { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.lux-directory-picker-header h4 { margin: 5px 0 0; color: var(--lux-text); font-size: .9rem; }
+.lux-directory-picker-help { margin: 0; color: var(--lux-subtle); font-size: .7rem; line-height: 1.5; }
+.lux-directory-picker-selected { min-width: 0; padding: 9px 11px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-directory-picker-selected strong { min-width: 0; overflow: hidden; color: var(--lux-text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .72rem; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.lux-directory-tree-scroll { max-height: 280px; overflow: auto; border-top: 1px solid var(--lux-line-soft); border-bottom: 1px solid var(--lux-line-soft); }
+.lux-directory-tree, .lux-directory-tree ul { margin: 0; padding: 4px 0; list-style: none; }
+.lux-directory-tree ul { padding-left: 18px; }
+.lux-directory-tree-row { display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; min-height: 34px; border-radius: 7px; color: var(--lux-muted); }
+.lux-directory-tree-row:hover, .lux-directory-tree-row.is-selected { color: var(--lux-text); background: rgba(255,255,255,.065); }
+.lux-directory-tree-row.is-selected { box-shadow: inset 2px 0 var(--lux-accent); }
+.lux-directory-tree-toggle, .lux-directory-tree-name { border: 0; color: inherit; background: transparent; }
+.lux-directory-tree-toggle { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; }
+.lux-directory-tree-toggle svg { transition: transform .16s var(--lux-ease); }
+.lux-directory-tree-toggle[aria-expanded="true"] svg:not(.is-loading) { transform: rotate(90deg); }
+.lux-directory-tree-toggle .is-loading { animation: lux-spin 1s linear infinite; }
+.lux-directory-tree-name { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 30px; padding: 0 8px 0 2px; text-align: left; }
+.lux-directory-tree-name svg { flex: 0 0 auto; color: var(--lux-subtle); }
+.lux-directory-tree-name span { overflow: hidden; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-directory-tree-state { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 4px 8px 4px 38px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-directory-tree-state.is-error { color: #f3a6a6; }
+.lux-directory-tree-state button { padding: 0; border: 0; color: var(--lux-text); background: transparent; font-size: inherit; text-decoration: underline; text-underline-offset: 3px; }
+.lux-directory-picker-actions { color: var(--lux-subtle); font-size: .68rem; }
 .lux-library-settings-form { display: grid; gap: 14px; }
 .lux-library-settings-form h3 { margin-bottom: 0; }
 .lux-library-settings-form label, .lux-library-dialog-form label { display: grid; gap: 7px; color: var(--lux-muted); font-size: .75rem; }
@@ -1015,6 +1039,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-library-grid { grid-template-columns: 1fr; }
   .lux-library-toolbar-button { padding: 0 13px; }
   .lux-library-dialog-root-row { grid-template-columns: minmax(0, 1fr) 32px 32px; }
+  .lux-library-root-form .lux-library-toolbar-button { flex: 1; }
+  .lux-directory-picker-actions { align-items: stretch; flex-direction: column; }
   .lux-library-strategy-grid { grid-template-columns: 1fr; }
   .lux-library-strategy-card-wide { grid-column: auto; }
   .lux-library-strategy-form-grid, .lux-library-strategy-image-limits, .lux-library-strategy-toggle-grid { grid-template-columns: 1fr; }
