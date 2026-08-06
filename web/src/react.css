@@ -482,7 +482,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-monitor-heading h2 { margin: 8px 0 6px; color: #fff; font-size: clamp(1.35rem, 2.5vw, 1.8rem); letter-spacing: -.045em; }
 .lux-admin-monitor-heading p { margin: 0; color: var(--lux-muted); font-size: .8rem; }
 .lux-admin-monitor-count { flex: 0 0 auto; color: var(--lux-subtle); font-size: .72rem; }
-.lux-now-playing-grid { display: grid; grid-template-columns: minmax(0, 1fr); width: min(100%, 960px); gap: 14px; }
+.lux-now-playing-grid { display: grid; grid-template-columns: minmax(0, 1fr); width: min(100%, 480px); gap: 14px; }
 .lux-now-playing-card {
   --lux-now-card-bg: #151519;
   --lux-now-card-border: var(--lux-line-soft);
