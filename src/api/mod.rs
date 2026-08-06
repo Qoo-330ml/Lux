@@ -48,6 +48,7 @@ use crate::{
             CatalogSource, normalize_search_like_query, normalize_search_query,
         },
         collections::{CollectionError, CollectionService},
+        directory_browser::{DirectoryBrowserError, list_directories},
         images::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
             ImageWriteService, normalize_image_type,
@@ -379,6 +380,7 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/libraries",
             get(admin_list_libraries).post(admin_create_library),
         )
+        .route("/api/v1/admin/directories", get(admin_list_directories))
         .route(
             "/api/v1/admin/libraries/{library_id}",
             patch(admin_update_library).delete(admin_delete_library),
@@ -3591,6 +3593,16 @@ struct LuxPageQuery {
     sort_by: Option<String>,
     #[serde(rename = "sort_order", alias = "sortOrder", default)]
     sort_order: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct DirectoryBrowseQuery {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(rename = "pageSize", default)]
+    page_size: Option<i64>,
 }
 
 async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserRecord, Response> {
@@ -8305,6 +8317,59 @@ async fn admin_list_libraries(headers: HeaderMap, State(state): State<AppState>)
         }))
         .into_response(),
         Err(error) => library_error(&headers, error),
+    }
+}
+
+async fn admin_list_directories(
+    headers: HeaderMap,
+    Query(query): Query<DirectoryBrowseQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) if params.0 <= 10_000 => params,
+        Ok(_) | Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "分页参数无效",
+            )
+            .into_response();
+        }
+    };
+    let path = query.path.as_deref().unwrap_or("/");
+    let page = query.page.unwrap_or(1);
+    let page_size = query.page_size.unwrap_or(50);
+    match list_directories(FsPath::new(path), offset as usize, limit as usize).await {
+        Ok(result) => Json(json!({
+            "path": result.path,
+            "parentPath": result.parent_path,
+            "directories": result.directories.iter().map(|entry| json!({
+                "name": entry.name,
+                "path": entry.path,
+            })).collect::<Vec<_>>(),
+            "page": page,
+            "pageSize": page_size,
+            "hasMore": result.has_more,
+        }))
+        .into_response(),
+        Err(DirectoryBrowserError::InvalidPath | DirectoryBrowserError::NotDirectory) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "目录路径无效",
+        )
+        .into_response(),
+        Err(DirectoryBrowserError::Unavailable) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "目录不可访问",
+        )
+        .into_response(),
     }
 }
 

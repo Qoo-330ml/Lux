@@ -297,6 +297,114 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
 }
 
 #[tokio::test]
+async fn admin_can_browse_server_directories_with_bounded_pagination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let browse_root = temp_dir.path().join("browse-root");
+    tokio::fs::create_dir_all(browse_root.join("Alpha")).await?;
+    tokio::fs::create_dir_all(browse_root.join("Beta")).await?;
+    tokio::fs::write(browse_root.join("not-a-directory.mkv"), b"media").await?;
+
+    let (base_url, server, _) = start_server(config).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(
+            &json!({ "username": "Admin", "displayName": "Admin", "password": "correct password" }),
+        )
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, _) = login(&client, &base_url, "admin", "correct password").await?;
+    let browse_path = browse_root.to_string_lossy().into_owned();
+
+    let unauthenticated = client
+        .get(format!("{base_url}/api/v1/admin/directories"))
+        .query(&[("path", browse_path.as_str())])
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let first_page = client
+        .get(format!("{base_url}/api/v1/admin/directories"))
+        .header(COOKIE, &cookies)
+        .query(&[
+            ("path", browse_path.as_str()),
+            ("page", "1"),
+            ("pageSize", "1"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(first_page.status(), reqwest::StatusCode::OK);
+    let first_body = first_page.json::<Value>().await?;
+    assert_eq!(
+        first_body["path"],
+        std::fs::canonicalize(&browse_root)?
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(first_body["directories"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first_body["page"], 1);
+    assert_eq!(first_body["pageSize"], 1);
+    assert_eq!(first_body["hasMore"], true);
+    assert!(first_body["parentPath"].is_string());
+
+    let second_page = client
+        .get(format!("{base_url}/api/v1/admin/directories"))
+        .header(COOKIE, &cookies)
+        .query(&[
+            ("path", browse_path.as_str()),
+            ("page", "2"),
+            ("pageSize", "1"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(second_page.status(), reqwest::StatusCode::OK);
+    let second_body = second_page.json::<Value>().await?;
+    assert_eq!(second_body["directories"].as_array().map(Vec::len), Some(1));
+    assert_eq!(second_body["hasMore"], false);
+    assert_ne!(
+        first_body["directories"][0]["path"],
+        second_body["directories"][0]["path"]
+    );
+    assert!(
+        first_body["directories"][0]["name"] == "Alpha"
+            || first_body["directories"][0]["name"] == "Beta"
+    );
+    assert!(
+        second_body["directories"][0]["name"] == "Alpha"
+            || second_body["directories"][0]["name"] == "Beta"
+    );
+
+    let relative_path = client
+        .get(format!("{base_url}/api/v1/admin/directories"))
+        .header(COOKIE, &cookies)
+        .query(&[("path", "relative/path")])
+        .send()
+        .await?;
+    assert_eq!(relative_path.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let file_path = browse_root.join("not-a-directory.mkv");
+    let file_path = file_path.to_string_lossy().into_owned();
+    let file_request = client
+        .get(format!("{base_url}/api/v1/admin/directories"))
+        .header(COOKIE, &cookies)
+        .query(&[("path", file_path.as_str())])
+        .send()
+        .await?;
+    assert_eq!(file_request.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn library_cover_survives_server_restart() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
