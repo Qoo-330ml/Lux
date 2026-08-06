@@ -16,6 +16,25 @@ export function mediaTitle(item: MediaItem) {
   return item.title || item.name || "未命名媒体";
 }
 
+export function episodeTitle(
+  item: MediaItem,
+  seasonNumber?: number | null,
+  fallbackEpisodeNumber?: number,
+) {
+  const season = paddedEpisodeNumber(seasonNumber ?? item.parentIndexNumber);
+  const episode = paddedEpisodeNumber(item.indexNumber ?? fallbackEpisodeNumber);
+  if (item.itemType !== "EPISODE" || season == null || episode == null) {
+    return mediaTitle(item);
+  }
+  return `S${season}E${episode} · ${mediaTitle(item)}`;
+}
+
+function paddedEpisodeNumber(value?: number | null) {
+  return value != null && Number.isInteger(value) && value >= 0
+    ? String(value).padStart(2, "0")
+    : undefined;
+}
+
 export function mediaTypeLabel(itemType?: string | null) {
   switch (itemType) {
     case "MOVIE": return "电影";
