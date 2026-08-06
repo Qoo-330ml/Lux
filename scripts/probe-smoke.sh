@@ -47,7 +47,7 @@ docker run --rm --platform linux/arm64 --user 0 --entrypoint ffmpeg \
 docker run -d --rm --platform linux/arm64 \
     --name "$NAME" \
     -p "$PORT:8097" \
-    -v "$VOLUME:/data" \
+    -v "$VOLUME:/config" \
     -v "$MEDIA_DIR:/media:rw" \
     "$IMAGE" >"$WORK_DIR/container.id"
 

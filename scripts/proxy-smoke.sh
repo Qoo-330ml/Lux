@@ -56,7 +56,7 @@ docker run -d --rm \
     --network "$NETWORK" \
     --network-alias lux-proxy-upstream \
     -e "LUX_TRUSTED_PROXY_CIDRS=$SUBNET" \
-    -v "$VOLUME:/data" \
+    -v "$VOLUME:/config" \
     -v "$MEDIA_DIR:/media:rw" \
     "$IMAGE" >"$WORK_DIR/upstream.id"
 
@@ -203,4 +203,3 @@ jq -n \
       trustedForwardedPublicLoginStatus: $remoteLoginStatus,
       localLoginStatus: $localLoginStatus, rangeStatus: $rangeStatus,
       contentRange: "bytes 2-5/10", responseBody: "2345"}'
-

@@ -39,7 +39,7 @@ docker volume create "$VOLUME" >/dev/null
 docker run -d --rm \
     --name "$NAME" \
     -p "$PORT:8097" \
-    -v "$VOLUME:/data" \
+    -v "$VOLUME:/config" \
     -v "$MEDIA_DIR:/media:rw" \
     "$IMAGE" >"$WORK_DIR/container-id"
 

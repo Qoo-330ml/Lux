@@ -28,7 +28,7 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --rm \
     --name "$NAME" \
     -p "$PORT:8097" \
-    --tmpfs "/data:rw,size=$TMPFS_SIZE,uid=10001,gid=10001,mode=755" \
+    --tmpfs "/config:rw,size=$TMPFS_SIZE,uid=10001,gid=10001,mode=755" \
     "$IMAGE" >"$WORK_DIR/container-id"
 
 started=0
@@ -66,7 +66,7 @@ csrf_value="${csrf_cookie#lux_csrf=}"
 cookies="$session_cookie; $csrf_cookie"
 
 docker exec --user 0 "$NAME" sh -c \
-    'dd if=/dev/zero of=/data/fill bs=1M 2>/tmp/fill.err || true; df -h /data; cat /tmp/fill.err' \
+    'dd if=/dev/zero of=/config/fill bs=1M 2>/tmp/fill.err || true; df -h /config; cat /tmp/fill.err' \
     >"$WORK_DIR/fill.txt"
 
 ready_status="$(curl -sS -o "$WORK_DIR/ready.json" -w '%{http_code}' \
@@ -90,7 +90,7 @@ jq -e '.status == "degraded" and .database.status == "degraded" and .database.wr
 jq -e '.error.code == "DATABASE_UNAVAILABLE" and (.error.requestId | type == "string")' \
     "$WORK_DIR/write.json" >/dev/null
 
-docker exec --user 0 "$NAME" sh -c 'rm -f /data/fill'
+docker exec --user 0 "$NAME" sh -c 'rm -f /config/fill'
 recovery_ready_status="$(curl -sS -o "$WORK_DIR/recovery-ready.json" -w '%{http_code}' \
     "http://127.0.0.1:$PORT/health/ready")"
 recovery_health_status="$(curl -sS -o "$WORK_DIR/recovery-health.json" -w '%{http_code}' \
