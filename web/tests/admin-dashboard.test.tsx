@@ -6,6 +6,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AdminDashboardPage } from "../src/features/admin/AdminDashboardPage";
 import { api } from "../src/lib/api/client";
+import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 import type { AdminDashboard, AdminSettings } from "../src/lib/api/types";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -109,6 +110,8 @@ describe("AdminDashboardPage", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("客厅 Lux"));
     });
+    expect(queryClient.getQueryCache().find({ queryKey: queryKeys.adminDashboard })?.options.refetchInterval)
+      .toBe(queryRefreshIntervals.liveDashboard);
     expect(load).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("v0.1.0");
     expect(container.textContent).toContain("爱情情节顶红");
@@ -117,6 +120,11 @@ describe("AdminDashboardPage", () => {
     expect(container.textContent).toContain("4K HEVC");
     expect(container.textContent).toContain("HEVC");
     expect(container.textContent).toContain("AAC · zh-CN");
+    expect(container.querySelector(".lux-now-playing-network")).not.toBeNull();
+    expect(container.querySelector(".lux-now-playing-account")).not.toBeNull();
+    expect(container.querySelector(".lux-now-playing-facts")).not.toBeNull();
+    expect(container.querySelectorAll(".lux-now-playing-fact")).toHaveLength(3);
+    expect(container.querySelectorAll(".lux-now-playing-placeholder")).toHaveLength(2);
     expect(container.textContent).toContain("开始播放");
     expect(container.textContent).toContain("登录");
     expect(container.textContent).toContain("停止播放");
