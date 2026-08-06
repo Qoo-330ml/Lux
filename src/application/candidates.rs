@@ -265,11 +265,12 @@ impl MetadataCandidateService {
             ScraperItemType::Season => None,
             _ => None,
         };
-        let raw_series_query = if query.trim().eq_ignore_ascii_case(current.title.trim()) {
-            current.series_title.as_deref().unwrap_or(query)
-        } else {
-            query
-        };
+        let raw_series_query = current
+            .series_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(query.trim());
         let parsed = parse_media_name(raw_series_query, MediaKind::Series);
         let series_query = parsed
             .as_ref()

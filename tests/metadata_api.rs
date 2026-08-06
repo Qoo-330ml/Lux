@@ -41,6 +41,17 @@ async fn start_server(
 
 async fn tmdb_search_stub(uri: axum::http::Uri) -> Json<Value> {
     if uri.path().ends_with("/search/tv") {
+        if !uri
+            .query()
+            .is_some_and(|query| query.contains("query=%E6%9A%97"))
+        {
+            return Json(json!({
+                "page": 1,
+                "total_pages": 1,
+                "total_results": 0,
+                "results": []
+            }));
+        }
         return Json(json!({
             "page": 1,
             "total_pages": 1,
@@ -541,13 +552,18 @@ async fn season_and_episode_candidate_search_uses_parent_series_details()
         ))
         .header(COOKIE, &admin_cookie)
         .header("x-csrf-token", &csrf)
-        .json(&json!({ "query": "暗夜与黎明" }))
+        .json(&json!({ "query": "第一季" }))
         .send()
         .await?;
     assert_eq!(season.status(), reqwest::StatusCode::OK);
     let season_body: Value = season.json().await?;
     assert_eq!(season_body["items"][0]["providerId"], "1998");
     assert_eq!(season_body["items"][0]["candidate"]["title"], "第一季");
+    assert!(
+        season_body["items"][0]["candidate"]["images"]["POSTER"]
+            .as_array()
+            .is_some_and(|images| !images.is_empty())
+    );
 
     let episode = client
         .post(format!(
@@ -555,13 +571,18 @@ async fn season_and_episode_candidate_search_uses_parent_series_details()
         ))
         .header(COOKIE, &admin_cookie)
         .header("x-csrf-token", &csrf)
-        .json(&json!({ "query": "暗夜与黎明" }))
+        .json(&json!({ "query": "第一集" }))
         .send()
         .await?;
     assert_eq!(episode.status(), reqwest::StatusCode::OK);
     let episode_body: Value = episode.json().await?;
     assert_eq!(episode_body["items"][0]["providerId"], "1999");
     assert_eq!(episode_body["items"][0]["candidate"]["title"], "第一集");
+    assert!(
+        episode_body["items"][0]["candidate"]["images"]["POSTER"]
+            .as_array()
+            .is_some_and(|images| !images.is_empty())
+    );
 
     server.abort();
     tmdb_server.abort();
