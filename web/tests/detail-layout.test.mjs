@@ -93,6 +93,15 @@ test("series seasons follow the cast without a separator line", () => {
   assert.doesNotMatch(seriesChildrenRule, /border-top/);
 });
 
+test("season poster placeholder styles do not stretch rating or episode badges", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+
+  assert.match(stylesheet, /\.lux-season-card-art\s*>\s*\.lux-season-card-placeholder\s*\{/);
+  assert.doesNotMatch(stylesheet, /\.lux-season-card-art\s*>\s*span\s*\{/);
+  assert.match(source, /className="lux-season-card-placeholder"/);
+});
+
 test("detail lower sections use the full content width", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const castRule = stylesheet.match(/\.lux-media-cast\s*\{([^}]*)\}/)?.[1] ?? "";

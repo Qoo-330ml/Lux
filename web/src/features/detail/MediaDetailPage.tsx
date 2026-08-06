@@ -445,7 +445,7 @@ function SeriesChildren({
             to={`/items/${season.id}`}
           >
             <span className="lux-season-card-art">
-              {imageUrl(season) ? <img src={imageUrl(season)} alt={`${mediaTitle(season)} 海报`} loading="lazy" /> : <span>{mediaTitle(season)}</span>}
+              {imageUrl(season) ? <img src={imageUrl(season)} alt={`${mediaTitle(season)} 海报`} loading="lazy" /> : <span className="lux-season-card-placeholder">{mediaTitle(season)}</span>}
               <Rating value={season.rating} source={season.ratingSource} />
             </span>
             <strong>{mediaTitle(season)}</strong>
