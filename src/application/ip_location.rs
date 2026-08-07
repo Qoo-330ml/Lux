@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -65,6 +65,7 @@ pub struct IpLocationService {
 #[derive(Default)]
 struct CacheState {
     entries: HashMap<IpAddr, CacheEntry>,
+    in_flight_ips: HashSet<IpAddr>,
     in_flight: usize,
 }
 
@@ -96,9 +97,10 @@ impl IpLocationService {
                 }
             }
             state.entries.remove(&ip);
-            if state.in_flight >= MAX_IN_FLIGHT {
+            if state.in_flight_ips.contains(&ip) || state.in_flight >= MAX_IN_FLIGHT {
                 false
             } else {
+                state.in_flight_ips.insert(ip);
                 state.in_flight += 1;
                 true
             }
@@ -134,6 +136,7 @@ impl IpLocationService {
         let Ok(mut state) = self.cache.lock() else {
             return;
         };
+        state.in_flight_ips.remove(&ip);
         state.in_flight = state.in_flight.saturating_sub(1);
         if state.entries.len() >= MAX_CACHE_ENTRIES && !state.entries.contains_key(&ip) {
             if let Some(oldest) = state
@@ -217,5 +220,26 @@ mod tests {
 
         assert_eq!(service.cached_or_schedule("8.8.8.8"), Some(result));
         assert_eq!(SUCCESS_CACHE_TTL, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn does_not_schedule_the_same_ip_twice_while_the_first_lookup_is_running() {
+        let service = IpLocationService::new_for_test();
+        let ip = "8.8.8.8".parse().expect("valid IP");
+        {
+            let mut state = service.cache.lock().expect("cache should not be poisoned");
+            state.in_flight = 1;
+            state.in_flight_ips.insert(ip);
+        }
+
+        assert_eq!(service.cached_or_schedule("8.8.8.8"), None);
+        assert_eq!(
+            service
+                .cache
+                .lock()
+                .expect("cache should not be poisoned")
+                .in_flight,
+            1
+        );
     }
 }
