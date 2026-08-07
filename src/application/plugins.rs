@@ -213,6 +213,7 @@ impl PluginService {
         limit: i64,
         installed_only: bool,
     ) -> Result<PluginPage, PluginServiceError> {
+        self.ensure_builtin_plugins_installed().await?;
         let mut views = Vec::with_capacity(self.catalog.plugins.len() + 1);
         let has_tmdb_package = self
             .catalog
@@ -326,6 +327,7 @@ impl PluginService {
         };
         let scraper_id = self.canonical_plugin_id(scraper_id);
         self.ensure_known_plugin(&scraper_id)?;
+        self.ensure_builtin_plugins_installed().await?;
         if !self.database.is_plugin_installed(&scraper_id).await? {
             return Err(PluginServiceError::Unavailable(scraper_id));
         }
@@ -579,6 +581,7 @@ impl PluginService {
     ) -> Result<crate::application::scraper::ScraperPluginClient, PluginServiceError> {
         let plugin_id = self.canonical_plugin_id(scraper_id);
         self.ensure_known_plugin(&plugin_id)?;
+        self.ensure_builtin_plugins_installed().await?;
         if plugin_id == TMDB_PLUGIN_ID {
             return Err(PluginServiceError::Unavailable(plugin_id));
         }
@@ -619,6 +622,18 @@ impl PluginService {
             return Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()));
         };
         self.dynamic_view(plugin, installed).await
+    }
+
+    async fn ensure_builtin_plugins_installed(&self) -> Result<(), PluginServiceError> {
+        if self.catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some()
+            && !self
+                .database
+                .is_plugin_installed(TMDB_DYNAMIC_PLUGIN_ID)
+                .await?
+        {
+            self.database.install_plugin(TMDB_DYNAMIC_PLUGIN_ID).await?;
+        }
+        Ok(())
     }
 
     async fn dynamic_view(

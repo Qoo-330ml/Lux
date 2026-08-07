@@ -387,6 +387,9 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
     assert_eq!(catalog["plugins"][0]["category"], "SCRAPER");
     assert_eq!(catalog["plugins"][0]["version"], "1.0.0");
     assert_eq!(catalog["plugins"][0]["runtime"], "process");
+    assert_eq!(catalog["plugins"][0]["installed"], true);
+    assert_eq!(catalog["plugins"][0]["enabled"], true);
+    assert_eq!(catalog["plugins"][0]["available"], true);
 
     let installed = client
         .post(format!(
@@ -396,7 +399,7 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
         .header("x-csrf-token", &csrf)
         .send()
         .await?;
-    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(installed.status(), reqwest::StatusCode::OK);
     assert_eq!(
         installed.json::<Value>().await?["plugin"]["installed"],
         true
