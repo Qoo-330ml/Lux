@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, Clock3, Database, HardDrive, ListChecks, Pencil, RefreshCw, Settings2, Tag } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock3, Database, HardDrive, ListChecks, Pencil, RefreshCw, Settings2, ShieldCheck, Tag } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
@@ -54,19 +54,21 @@ export function AdminDashboardPage() {
   return (
     <div className="lux-admin-page lux-admin-dashboard-page">
       <header className="lux-admin-page-heading">
-        <div><h1>控制台</h1></div>
+        <div><h1>控制台</h1><p>实时了解服务器健康、播放会话和账户活动。</p></div>
         <button className="lux-button lux-button-secondary lux-admin-refresh" type="button" onClick={() => void dashboard.refetch()}><RefreshCw size={16} /> 刷新</button>
       </header>
 
       <section className="lux-admin-overview-card" aria-labelledby="server-overview-heading">
         <h2 className="lux-sr-only" id="server-overview-heading">服务器概况</h2>
         <div className="lux-admin-overview-top">
-          <div className="lux-admin-overview-device" role="img" aria-label="服务器图片未提供" />
-          <form className="lux-admin-overview-name-form" onSubmit={(event) => { event.preventDefault(); setSaved(false); if ((serverName ?? server.name).trim()) saveServerName.mutate(); }}>
-            <label className="lux-sr-only" htmlFor="server-name">服务器名称</label>
-            <input id="server-name" name="serverName" value={serverName ?? server.name} maxLength={80} aria-describedby="server-overview-heading" onChange={(event) => { setSaved(false); setServerName(event.target.value); }} />
-            <button type="submit" aria-label={saved ? "服务器名称已保存" : "保存服务器名称"} disabled={saveServerName.isPending || !(serverName ?? server.name).trim()}><Pencil size={25} /></button>
-          </form>
+          <div className="lux-admin-overview-identity">
+            <div className="lux-admin-overview-device" aria-hidden="true"><ShieldCheck size={18} strokeWidth={1.8} /></div>
+            <form className="lux-admin-overview-name-form" onSubmit={(event) => { event.preventDefault(); setSaved(false); if ((serverName ?? server.name).trim()) saveServerName.mutate(); }}>
+              <label className="lux-sr-only" htmlFor="server-name">服务器名称</label>
+              <input id="server-name" name="serverName" value={serverName ?? server.name} maxLength={80} aria-describedby="server-overview-heading" onChange={(event) => { setSaved(false); setServerName(event.target.value); }} />
+              <button type="submit" aria-label={saved ? "服务器名称已保存" : "保存服务器名称"} disabled={saveServerName.isPending || !(serverName ?? server.name).trim()}><Pencil size={18} /></button>
+            </form>
+          </div>
           <div className={`lux-admin-overview-status${status ? " is-online" : " is-alert"}`}>
             {overviewStatus(health.status) ? <><i />{overviewStatus(health.status)}</> : null}
           </div>
