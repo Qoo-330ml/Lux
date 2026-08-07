@@ -123,12 +123,20 @@ describe("AdminDashboardPage", () => {
     });
 
     await act(async () => {
-      await vi.waitFor(() => expect(container.textContent).toContain("客厅 Lux"));
+      await vi.waitFor(() => expect(container.querySelector<HTMLInputElement>("input[name='serverName']")?.value).toBe("客厅 Lux"));
     });
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.adminDashboard })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.liveDashboard);
     expect(load).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("v0.1.0");
+    const overview = container.querySelector(".lux-admin-overview-card");
+    expect(overview).not.toBeNull();
+    expect(overview?.querySelector(".lux-admin-overview-status")?.textContent).toContain("在线");
+    expect(overview?.querySelector('[data-overview-value="版本"] strong')?.textContent).toBe("v0.1.0");
+    expect(overview?.querySelector('[data-overview-value="运行时长"] strong')?.textContent).toBe("");
+    expect(overview?.querySelectorAll(".lux-admin-overview-metric-value")).toHaveLength(6);
+    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["", "", "", "", "", ""]);
+    expect(overview?.querySelector(".lux-admin-overview-device")?.textContent).toBe("");
     expect(container.querySelector(".lux-admin-stat-grid")).toBeNull();
     expect(container.querySelectorAll(".lux-admin-stat")).toHaveLength(0);
     expect(container.textContent).toContain("爱情情节顶红");

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, Database, HardDrive, ListChecks, RefreshCw, Server, Settings2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clapperboard, Clock3, Cpu, Database, Film, HardDrive, ListChecks, MemoryStick, Pencil, RefreshCw, Settings2, Tag, UsersRound } from "lucide-react";
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { AdminDashboardActivity } from "./AdminDashboardActivity";
 import { AdminDashboardNowPlaying } from "./AdminDashboardNowPlaying";
@@ -15,7 +16,7 @@ export function AdminDashboardPage() {
     queryFn: () => api.adminDashboard(),
     refetchInterval: queryRefreshIntervals.liveDashboard,
   });
-  const [serverName, setServerName] = useState("");
+  const [serverName, setServerName] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
@@ -23,9 +24,9 @@ export function AdminDashboardPage() {
   }, [dashboard.data]);
 
   const saveServerName = useMutation({
-    mutationFn: () => api.updateAdminSettings({ serverName: serverName.trim() }),
+    mutationFn: () => api.updateAdminSettings({ serverName: (serverName ?? server.name).trim() }),
     onSuccess: (settings) => {
-      const nextName = settings.serverName?.trim() || serverName.trim();
+      const nextName = settings.serverName?.trim() || (serverName ?? server.name).trim();
       setServerName(nextName);
       setSaved(true);
       queryClient.setQueryData<AdminDashboard>(queryKeys.adminDashboard, (current) => current
@@ -53,20 +54,34 @@ export function AdminDashboardPage() {
   return (
     <div className="lux-admin-page lux-admin-dashboard-page">
       <header className="lux-admin-page-heading">
-        <div><h1>仪表盘</h1><p>服务器状态、实时播放和账户活动，都在这里快速掌握。</p></div>
+        <div><h1>控制台</h1></div>
         <button className="lux-button lux-button-secondary lux-admin-refresh" type="button" onClick={() => void dashboard.refetch()}><RefreshCw size={16} /> 刷新</button>
       </header>
 
-      <section className="lux-admin-server-identity" aria-labelledby="server-identity-heading">
-        <div className="lux-admin-server-mark"><Server size={22} /></div>
-        <div className="lux-admin-server-copy">
-          <h2 id="server-identity-heading">{server.name}</h2>
-          <div className="lux-admin-server-meta"><span>Lux Server</span><span>v{server.version}</span><span>Schema {server.schemaVersion}</span><span className="lux-admin-server-status"><i />{status ? "运行正常" : "需要关注"}</span></div>
+      <section className="lux-admin-overview-card" aria-labelledby="server-overview-heading">
+        <h2 className="lux-sr-only" id="server-overview-heading">服务器概况</h2>
+        <div className="lux-admin-overview-top">
+          <div className="lux-admin-overview-device" role="img" aria-label="服务器图片未提供" />
+          <form className="lux-admin-overview-name-form" onSubmit={(event) => { event.preventDefault(); setSaved(false); if ((serverName ?? server.name).trim()) saveServerName.mutate(); }}>
+            <label className="lux-sr-only" htmlFor="server-name">服务器名称</label>
+            <input id="server-name" name="serverName" value={serverName ?? server.name} maxLength={80} aria-describedby="server-overview-heading" onChange={(event) => { setSaved(false); setServerName(event.target.value); }} />
+            <button type="submit" aria-label={saved ? "服务器名称已保存" : "保存服务器名称"} disabled={saveServerName.isPending || !(serverName ?? server.name).trim()}><Pencil size={25} /></button>
+          </form>
+          <div className={`lux-admin-overview-status${status ? " is-online" : " is-alert"}`}>
+            {overviewStatus(health.status) ? <><i />{overviewStatus(health.status)}</> : null}
+          </div>
+          <OverviewInfo icon={<Tag size={38} />} label="版本" value={`v${server.version}`} />
+          <OverviewInfo icon={<Clock3 size={38} />} label="运行时长" />
+          <div className="lux-admin-overview-action-slot" aria-hidden="true" />
         </div>
-        <form className="lux-admin-server-form" onSubmit={(event) => { event.preventDefault(); setSaved(false); if (serverName.trim()) saveServerName.mutate(); }}>
-          <label htmlFor="server-name"><span>服务器名称</span><input id="server-name" name="serverName" value={serverName} maxLength={80} onChange={(event) => { setSaved(false); setServerName(event.target.value); }} /></label>
-          <button className="lux-button lux-button-secondary" type="submit" disabled={saveServerName.isPending || !serverName.trim()}>{saveServerName.isPending ? "保存中…" : saved ? "已保存" : "保存名称"}</button>
-        </form>
+        <div className="lux-admin-overview-metrics" aria-label="服务器概况指标">
+          <OverviewMetric icon={<Film size={38} />} label="电影数量" />
+          <OverviewMetric icon={<Clapperboard size={38} />} label="剧集数量" />
+          <OverviewMetric icon={<UsersRound size={38} />} label="用户数量" />
+          <OverviewMetric icon={<Cpu size={38} />} label="CPU 占用" />
+          <OverviewMetric icon={<MemoryStick size={38} />} label="内存占用" />
+          <OverviewMetric icon={<HardDrive size={38} />} label="存储信息" />
+        </div>
       </section>
       {saveServerName.error ? <p className="lux-error-copy lux-dashboard-inline-error">{saveServerName.error.message}</p> : null}
 
@@ -100,6 +115,20 @@ export function AdminDashboardPage() {
 }
 
 function SettingsIcon() { return <span className="lux-quick-icon"><Settings2 size={17} /></span>; }
+
+function OverviewInfo({ icon, label, value }: { icon: ReactNode; label: string; value?: string }) {
+  return <div className="lux-admin-overview-info" data-overview-value={label}><span className="lux-admin-overview-info-icon" aria-hidden="true">{icon}</span><span><small>{label}</small><strong aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;
+}
+
+function OverviewMetric({ icon, label, value }: { icon: ReactNode; label: string; value?: string }) {
+  return <div className="lux-admin-overview-metric"><span className="lux-admin-overview-metric-icon" aria-hidden="true">{icon}</span><span><small>{label}</small><strong className="lux-admin-overview-metric-value" aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;
+}
+
+function overviewStatus(status: string) {
+  if (status === "ok") return "在线";
+  if (status === "degraded") return "异常";
+  return "";
+}
 
 function AdminState({ label, error = false }: { label: string; error?: boolean }) {
   return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "控制台暂时不可用" : "正在加载控制台"}</h1><p>{label}</p></section>;

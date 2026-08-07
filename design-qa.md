@@ -39,3 +39,46 @@ No actionable P0/P1/P2 visual findings remain.
 ## Final Result
 
 final result: passed
+
+---
+
+# Dashboard overview card design QA
+
+## Source and implementation
+
+- Source visual truth: `/Users/Qoo/Downloads/ChatGPT Image 2026年8月7日 10_49_00.png`
+- Source pixels: `1672 × 941`
+- Implementation screenshot: `/Users/Qoo/Desktop/mywork/Lux/.playwright-cli/page-2026-08-07T03-31-33-201Z.png`
+- Implementation pixels: `1672 × 941`
+- CSS viewport: `1672 × 941`
+- Device scale factor: `1`
+- Density normalization: none required; source and implementation are compared at the same pixel dimensions.
+- State: authenticated visual test state with light theme, `/admin`, empty now-playing/activity collections, and mocked read-only dashboard data (`客厅 Lux`, `v0.1.0`, `在线`).
+
+## Comparison evidence
+
+- Full view: the source and implementation were opened together at the same viewport. The implementation preserves the requested control-console heading, white rounded overview surface, subtle border/shadow, green online state, editable server name, version block, divider, and six separated metric slots.
+- Focused region: the overview card was inspected at full width and at 390 × 844 and 320 × 720 responsive viewports. The card has no horizontal overflow at 320px (`body.scrollWidth === 320`), and the mobile grid stacks the name/status and metric rows without clipping.
+- Runtime checks: Playwright snapshot confirmed the overview region exposes the server name textbox, save button, status, version, runtime label, all six metric labels, and blank values for unavailable data. Console error check returned zero errors after read-only API routes were mocked.
+
+## Findings
+
+- No actionable P0/P1/P2 visual findings.
+- Expected P3 differences: the source includes a server product image and power control, but the current dashboard contract has no image or shutdown action. Those slots remain visually empty by design, per the request not to fabricate unavailable data. The existing Lux navigation shell and the sections below the overview card also remain, since this task changes the overview card only.
+
+## Comparison history
+
+- Initial implementation: no P0/P1/P2 findings after comparing the same light-theme desktop state.
+- Responsive pass: no P0/P1/P2 findings at 390px or 320px; no fix required.
+
+## Implementation checklist
+
+- [x] Typography and hierarchy reviewed.
+- [x] Spacing, dividers, radius, and shadow reviewed.
+- [x] Light-theme colors and green status token reviewed.
+- [x] Icons use the existing project icon library; no fabricated raster assets were added.
+- [x] Copy and empty-value behavior reviewed against the available API fields.
+- [x] Desktop and mobile runtime screenshots captured.
+- [x] Console errors checked.
+
+final result: passed
