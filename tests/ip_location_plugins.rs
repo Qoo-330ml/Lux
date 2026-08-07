@@ -46,8 +46,6 @@ async fn ip_location_query_falls_back_to_the_next_installed_plugin()
     };
     let database = Database::connect(&config).await?;
     let plugins = PluginService::new(database, config_dir);
-    plugins.install("org.lux.ip-hiofd").await?;
-    plugins.install("org.lux.qoo-ip138").await?;
 
     let result = plugins
         .lookup_ip_location("8.8.8.8".parse::<IpAddr>()?)

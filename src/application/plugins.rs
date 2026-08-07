@@ -365,6 +365,7 @@ impl PluginService {
         if !is_public_address(ip) {
             return Err(PluginServiceError::Unavailable("ip_location".to_owned()));
         }
+        self.ensure_builtin_plugins_installed().await?;
         let query_ip = ip.to_string();
         for plugin_id in IP_LOCATION_PLUGIN_IDS {
             let Some(plugin) = self.catalog.get(plugin_id) else {
@@ -685,13 +686,16 @@ impl PluginService {
     }
 
     async fn ensure_builtin_plugins_installed(&self) -> Result<(), PluginServiceError> {
-        if self.catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some()
-            && !self
-                .database
-                .is_plugin_installed(TMDB_DYNAMIC_PLUGIN_ID)
-                .await?
-        {
-            self.database.install_plugin(TMDB_DYNAMIC_PLUGIN_ID).await?;
+        for plugin_id in [
+            TMDB_DYNAMIC_PLUGIN_ID,
+            IP_HIOFD_PLUGIN_ID,
+            QOO_IP138_PLUGIN_ID,
+        ] {
+            if self.catalog.get(plugin_id).is_some()
+                && !self.database.is_plugin_installed(plugin_id).await?
+            {
+                self.database.install_plugin(plugin_id).await?;
+            }
         }
         Ok(())
     }
