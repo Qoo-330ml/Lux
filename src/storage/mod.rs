@@ -468,6 +468,32 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_access_token_device(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<Option<StoredAccessTokenDevice>, StorageError> {
+        sqlx::query(
+            "SELECT device_id, client_name, device_name, client_version
+             FROM access_tokens
+             WHERE token_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredAccessTokenDevice {
+                device_id: row.get("device_id"),
+                client_name: row.get("client_name"),
+                device_name: row.get("device_name"),
+                client_version: row.get("client_version"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn set_user_library_access(
         &self,
         user_id: &str,
@@ -1446,9 +1472,10 @@ impl Database {
         sqlx::query(
             "INSERT INTO playback_sessions (
                 id, user_id, item_id, media_source_id, play_session_id,
-                device_id, client, device_name, state, position_ticks,
-                duration_ticks, is_paused
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                device_id, client, device_name, client_version, device_type,
+                remote_ip, state,
+                position_ticks, duration_ticks, is_paused
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, play_session_id) DO UPDATE SET
                 item_id = excluded.item_id,
                 media_source_id = excluded.media_source_id,
@@ -1457,6 +1484,9 @@ impl Database {
                     ELSE excluded.device_id END,
                 client = COALESCE(excluded.client, playback_sessions.client),
                 device_name = COALESCE(excluded.device_name, playback_sessions.device_name),
+                client_version = COALESCE(excluded.client_version, playback_sessions.client_version),
+                device_type = COALESCE(excluded.device_type, playback_sessions.device_type),
+                remote_ip = COALESCE(excluded.remote_ip, playback_sessions.remote_ip),
                 state = excluded.state,
                 position_ticks = MAX(playback_sessions.position_ticks, excluded.position_ticks),
                 duration_ticks = COALESCE(excluded.duration_ticks, playback_sessions.duration_ticks),
@@ -1471,6 +1501,9 @@ impl Database {
         .bind(event.device_id)
         .bind(event.client)
         .bind(event.device_name)
+        .bind(event.client_version)
+        .bind(event.device_type)
+        .bind(event.remote_ip)
         .bind(event.state)
         .bind(event.position_ticks)
         .bind(event.duration_ticks)
@@ -1517,8 +1550,10 @@ impl Database {
         let (query, bind) = if user_id.is_some() {
             (
                 "SELECT id, user_id, item_id, media_source_id, play_session_id,
-                        device_id, client, device_name, state, position_ticks,
-                        duration_ticks, is_paused, started_at, last_event_at
+                        device_id, client, device_name, client_version, device_type,
+                        remote_ip, state,
+                        position_ticks, duration_ticks, is_paused, started_at,
+                        last_event_at
                  FROM playback_sessions
                  WHERE user_id = ? AND state != 'STOPPED'
                  ORDER BY last_event_at DESC, id",
@@ -1527,8 +1562,10 @@ impl Database {
         } else {
             (
                 "SELECT id, user_id, item_id, media_source_id, play_session_id,
-                        device_id, client, device_name, state, position_ticks,
-                        duration_ticks, is_paused, started_at, last_event_at
+                        device_id, client, device_name, client_version, device_type,
+                        remote_ip, state,
+                        position_ticks, duration_ticks, is_paused, started_at,
+                        last_event_at
                  FROM playback_sessions
                  WHERE state != 'STOPPED'
                  ORDER BY last_event_at DESC, id",
@@ -1556,8 +1593,10 @@ impl Database {
     ) -> Result<Option<StoredPlaybackSession>, StorageError> {
         sqlx::query(
             "SELECT id, user_id, item_id, media_source_id, play_session_id,
-                    device_id, client, device_name, state, position_ticks,
-                    duration_ticks, is_paused, started_at, last_event_at
+                    device_id, client, device_name, client_version, device_type,
+                    remote_ip, state,
+                    position_ticks, duration_ticks, is_paused, started_at,
+                    last_event_at
              FROM playback_sessions
              WHERE user_id = ? AND play_session_id = ?",
         )
@@ -1579,8 +1618,10 @@ impl Database {
     ) -> Result<Option<StoredPlaybackSession>, StorageError> {
         sqlx::query(
             "SELECT id, user_id, item_id, media_source_id, play_session_id,
-                    device_id, client, device_name, state, position_ticks,
-                    duration_ticks, is_paused, started_at, last_event_at
+                    device_id, client, device_name, client_version, device_type,
+                    remote_ip, state,
+                    position_ticks, duration_ticks, is_paused, started_at,
+                    last_event_at
              FROM playback_sessions
              WHERE user_id = ? AND item_id = ? AND state != 'STOPPED'
              ORDER BY last_event_at DESC, id
@@ -6877,6 +6918,14 @@ pub(crate) struct StoredUser {
     pub(crate) can_download: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredAccessTokenDevice {
+    pub(crate) device_id: String,
+    pub(crate) client_name: String,
+    pub(crate) device_name: String,
+    pub(crate) client_version: String,
+}
+
 fn stored_user(row: sqlx::sqlite::SqliteRow) -> StoredUser {
     StoredUser {
         id: row.get("id"),
@@ -7347,6 +7396,9 @@ pub(crate) struct NewPlaybackEvent<'a> {
     pub(crate) device_id: &'a str,
     pub(crate) client: Option<&'a str>,
     pub(crate) device_name: Option<&'a str>,
+    pub(crate) client_version: Option<&'a str>,
+    pub(crate) device_type: Option<&'a str>,
+    pub(crate) remote_ip: Option<&'a str>,
     pub(crate) state: &'a str,
     pub(crate) position_ticks: i64,
     pub(crate) duration_ticks: Option<i64>,
@@ -7363,6 +7415,9 @@ pub(crate) struct StoredPlaybackSession {
     pub(crate) device_id: String,
     pub(crate) client: Option<String>,
     pub(crate) device_name: Option<String>,
+    pub(crate) client_version: Option<String>,
+    pub(crate) device_type: Option<String>,
+    pub(crate) remote_ip: Option<String>,
     pub(crate) state: String,
     pub(crate) position_ticks: i64,
     pub(crate) duration_ticks: Option<i64>,
@@ -7381,6 +7436,9 @@ fn stored_playback_session(row: sqlx::sqlite::SqliteRow) -> StoredPlaybackSessio
         device_id: row.get("device_id"),
         client: row.get("client"),
         device_name: row.get("device_name"),
+        client_version: row.get("client_version"),
+        device_type: row.get("device_type"),
+        remote_ip: row.get("remote_ip"),
         state: row.get("state"),
         position_ticks: row.get("position_ticks"),
         duration_ticks: row.get("duration_ticks"),

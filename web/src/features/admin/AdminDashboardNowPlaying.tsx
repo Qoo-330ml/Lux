@@ -51,9 +51,18 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
             <span className="lux-now-playing-account-avatar"><UserRound size={15} /></span>
             <strong>{session.userName || "未知账户"}</strong>
             <span className="lux-now-playing-account-separator" aria-hidden="true">•</span>
-            <Monitor size={15} />
-            <span>{session.deviceName || session.deviceId || "—"}</span>
-            <span className="lux-now-playing-client">{session.client || "—"}</span>
+            <DeviceField
+              icon={<Monitor size={15} />}
+              label="设备"
+              value={session.deviceName || session.deviceId || "—"}
+              detail={deviceDetail(session)}
+            />
+            <DeviceField
+              icon={<Radio size={15} />}
+              label="客户端"
+              value={session.client || "—"}
+              detail={session.clientVersion ? `v${session.clientVersion}` : undefined}
+            />
           </div>
 
           <div className="lux-now-playing-progress-block">
@@ -75,7 +84,7 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
       </div>
 
       <div className="lux-now-playing-network">
-        <NetworkField icon={<CircleAlert size={15} />} label="IP 地址" value="—" />
+        <NetworkField icon={<CircleAlert size={15} />} label="IP 地址" value={session.remoteIp || "—"} />
         <NetworkField icon={<MapPin size={15} />} label="IP 归属地" value="—" />
       </div>
     </article>
@@ -84,6 +93,17 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
 
 function Fact({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail: string }) {
   return <div className="lux-now-playing-fact"><span className="lux-now-playing-fact-icon">{icon}</span><div><small>{label}</small><strong>{value}</strong><span>{detail}</span></div></div>;
+}
+
+function DeviceField({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail?: string | null }) {
+  return <span className="lux-now-playing-account-entry"><span className="lux-now-playing-account-entry-icon">{icon}</span><span><small>{label}</small><strong>{value}</strong>{detail ? <em>{detail}</em> : null}</span></span>;
+}
+
+function deviceDetail(session: AdminPlaybackSession) {
+  return [
+    session.deviceType,
+    session.deviceId && session.deviceId !== session.deviceName ? `ID ${session.deviceId}` : undefined,
+  ].filter(Boolean).join(" · ") || undefined;
 }
 
 function NetworkField({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {

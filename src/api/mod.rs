@@ -12,7 +12,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode,
-        header::{AUTHORIZATION, COOKIE, SET_COOKIE},
+        header::{COOKIE, SET_COOKIE},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -1051,11 +1051,7 @@ async fn emby_authenticate(
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let device = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .map(EmbyDeviceInfo::parse)
-        .unwrap_or_default();
+    let device = emby_device_info_from_headers(&headers);
     match auth
         .authenticate(&request.username, &request.password, &device)
         .await
@@ -1078,7 +1074,9 @@ async fn emby_authenticate(
                 None,
                 json!({
                     "client": result.device.client,
+                    "clientVersion": result.device.version,
                     "deviceName": result.device.device,
+                    "deviceType": result.device.device,
                 }),
             )
             .await;
@@ -1162,6 +1160,43 @@ fn emby_token_from_headers(headers: &HeaderMap) -> Option<String> {
                 .and_then(|value| value.to_str().ok())
                 .and_then(emby_token_header_value)
         })
+}
+
+fn emby_device_info_from_headers(headers: &HeaderMap) -> EmbyDeviceInfo {
+    let mut info = EmbyDeviceInfo::default();
+    for name in [
+        "X-Emby-Authorization",
+        "X-Emby-Authentication",
+        "Authorization",
+    ] {
+        let Some(candidate) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(EmbyDeviceInfo::parse)
+        else {
+            continue;
+        };
+        merge_emby_device_info(&mut info, candidate);
+    }
+    info
+}
+
+fn merge_emby_device_info(target: &mut EmbyDeviceInfo, fallback: EmbyDeviceInfo) {
+    if target.client.is_empty() {
+        target.client = fallback.client;
+    }
+    if target.device.is_empty() {
+        target.device = fallback.device;
+    }
+    if target.device_id.is_empty() {
+        target.device_id = fallback.device_id;
+    }
+    if target.version.is_empty() {
+        target.version = fallback.version;
+    }
+    if target.user_id.is_none() {
+        target.user_id = fallback.user_id;
+    }
 }
 
 fn emby_token_header_value(value: &str) -> Option<String> {
@@ -1990,6 +2025,16 @@ struct PlaybackEventRequest {
     client: Option<String>,
     #[serde(rename = "DeviceName", alias = "deviceName", alias = "Device")]
     device_name: Option<String>,
+    #[serde(
+        rename = "ApplicationVersion",
+        alias = "applicationVersion",
+        alias = "ClientVersion",
+        alias = "clientVersion",
+        alias = "Version"
+    )]
+    client_version: Option<String>,
+    #[serde(rename = "DeviceType", alias = "deviceType")]
+    device_type: Option<String>,
 }
 
 async fn emby_playing(
@@ -2150,11 +2195,21 @@ async fn handle_emby_playback_event(
             }
         }
     }
-    let header_device = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .map(EmbyDeviceInfo::parse)
-        .unwrap_or_default();
+    let mut header_device = emby_device_info_from_headers(&headers);
+    if header_device.client.is_empty()
+        || header_device.device.is_empty()
+        || header_device.device_id.is_empty()
+        || header_device.version.is_empty()
+    {
+        let token = emby_token_from_headers(&headers).or_else(|| query.api_key.clone());
+        if let (Some(auth), Some(token)) = (state.emby_auth.as_ref(), token) {
+            match auth.device_info(&token).await {
+                Ok(Some(device)) => merge_emby_device_info(&mut header_device, device),
+                Ok(None) => {}
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+    }
     let device_id = request
         .device_id
         .filter(|value| !value.is_empty())
@@ -2166,6 +2221,14 @@ async fn handle_emby_playback_event(
         .or_else(|| (!header_device.client.is_empty()).then_some(header_device.client.as_str()));
     let device_name = request
         .device_name
+        .as_deref()
+        .or_else(|| (!header_device.device.is_empty()).then_some(header_device.device.as_str()));
+    let client_version = request
+        .client_version
+        .as_deref()
+        .or_else(|| (!header_device.version.is_empty()).then_some(header_device.version.as_str()));
+    let device_type = request
+        .device_type
         .as_deref()
         .or_else(|| (!header_device.device.is_empty()).then_some(header_device.device.as_str()));
     let play_session_id = request
@@ -2190,6 +2253,9 @@ async fn handle_emby_playback_event(
             device_id: &device_id,
             client,
             device_name,
+            client_version,
+            device_type,
+            remote_ip: header_str(&headers, "x-lux-peer-ip"),
             state: state_name,
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -2206,7 +2272,9 @@ async fn handle_emby_playback_event(
                     Some(&request.item_id),
                     json!({
                         "client": client,
+                        "clientVersion": client_version,
                         "deviceName": device_name,
+                        "deviceType": device_type,
                         "state": state_name,
                     }),
                 )
@@ -2286,6 +2354,9 @@ fn emby_session_json(session: &crate::storage::StoredPlaybackSession) -> Value {
         "Client": session.client,
         "DeviceId": session.device_id,
         "DeviceName": session.device_name,
+        "DeviceType": session.device_type,
+        "ApplicationVersion": session.client_version,
+        "RemoteEndPoint": session.remote_ip,
         "PlayState": {
             "PositionTicks": session.position_ticks,
             "IsPaused": session.is_paused,
@@ -2424,6 +2495,9 @@ async fn lux_post_progress(
             device_id: "lux-web",
             client: Some("Lux"),
             device_name: Some("Web"),
+            client_version: None,
+            device_type: Some("Web"),
+            remote_ip: header_str(&headers, "x-lux-peer-ip"),
             state: playback_state.as_str(),
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -2440,6 +2514,7 @@ async fn lux_post_progress(
                     Some(&item_id),
                     json!({
                         "client": "Lux",
+                        "deviceType": "Web",
                         "deviceName": "Web",
                         "state": playback_state.as_str(),
                     }),
@@ -8748,8 +8823,11 @@ fn dashboard_playback_item_json(
         "isPaused": session.is_paused,
         "lastEventAt": session.last_event_at,
         "client": session.client,
+        "clientVersion": session.client_version,
         "deviceId": session.device_id,
         "deviceName": session.device_name,
+        "deviceType": session.device_type,
+        "remoteIp": session.remote_ip,
         "playSessionId": session.play_session_id,
         "source": source.map(dashboard_source_json),
     })

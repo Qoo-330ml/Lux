@@ -8,6 +8,7 @@ use luxd::{
 };
 use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -54,7 +55,13 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::new();
     let login = client
@@ -77,13 +84,11 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         "PlaySessionId": "session-1",
         "PositionTicks": 100,
         "RunTimeTicks": 1000,
-        "DeviceId": "session-device",
-        "Client": "SessionTest",
-        "DeviceName": "Mac",
     });
     let playing = client
         .post(&event_url)
         .header("X-Emby-Token", &token)
+        .header("x-lux-peer-ip", "203.0.113.9")
         .json(&event)
         .send()
         .await?;
@@ -139,6 +144,11 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(sessions_body.as_array().map(Vec::len), Some(1));
     assert_eq!(sessions_body[0]["PlayState"]["PositionTicks"], 900);
     assert_eq!(sessions_body[0]["DeviceId"], "session-device");
+    assert_eq!(sessions_body[0]["Client"], "SessionTest");
+    assert_eq!(sessions_body[0]["DeviceName"], "Mac");
+    assert_eq!(sessions_body[0]["DeviceType"], "Mac");
+    assert_eq!(sessions_body[0]["ApplicationVersion"], "1");
+    assert_eq!(sessions_body[0]["RemoteEndPoint"], "127.0.0.1");
 
     let stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
@@ -275,6 +285,43 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let web_playback_after_stop_body = web_playback_after_stop.json::<Value>().await?;
     assert_eq!(web_playback_after_stop_body["positionTicks"], 1_200);
     assert_eq!(web_playback_after_stop_body["state"], Value::Null);
+
+    let header_playing = client
+        .post(&event_url)
+        .header(
+            "X-Emby-Authorization",
+            format!(
+                r##"MediaBrowser Client="HeaderClient", Device="AppleTV", DeviceId="header-device", Version="2", Token="{token}""##
+            ),
+        )
+        .json(&json!({
+            "ItemId": event["ItemId"],
+            "PlaySessionId": "header-session",
+            "PositionTicks": 100,
+        }))
+        .send()
+        .await?;
+    assert_eq!(header_playing.status(), reqwest::StatusCode::NO_CONTENT);
+    let header_sessions = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let header_session = header_sessions
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["PlaySessionId"].as_str() == Some("header-session"))
+        })
+        .ok_or("missing header playback session")?;
+    assert_eq!(header_session["Client"], "HeaderClient");
+    assert_eq!(header_session["DeviceName"], "AppleTV");
+    assert_eq!(header_session["DeviceId"], "header-device");
+    assert_eq!(header_session["DeviceType"], "AppleTV");
+    assert_eq!(header_session["ApplicationVersion"], "2");
 
     server.abort();
     Ok(())

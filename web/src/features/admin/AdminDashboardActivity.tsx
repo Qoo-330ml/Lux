@@ -10,7 +10,7 @@ export function AdminDashboardActivity({ events }: { events: AdminActivityEvent[
 }
 
 function ActivityRow({ event }: { event: AdminActivityEvent }) {
-  const detail = event.metadata?.deviceName || event.metadata?.client;
+  const detail = activityDetail(event.metadata);
   return (
     <li className="lux-admin-activity-row">
       <span className={`lux-admin-activity-icon is-${activityTone(event.eventType)}`} aria-hidden="true">{activityIcon(event.eventType)}</span>
@@ -20,6 +20,15 @@ function ActivityRow({ event }: { event: AdminActivityEvent }) {
       </div>
     </li>
   );
+}
+
+function activityDetail(metadata?: Record<string, unknown>) {
+  if (!metadata) return undefined;
+  const device = typeof metadata.deviceName === "string" ? metadata.deviceName : undefined;
+  const client = typeof metadata.client === "string" ? metadata.client : undefined;
+  const version = typeof metadata.clientVersion === "string" ? metadata.clientVersion : undefined;
+  const clientLabel = client && version ? `${client} v${version}` : client;
+  return [device, clientLabel].filter(Boolean).join(" · ") || undefined;
 }
 
 function activityIcon(eventType: string) {

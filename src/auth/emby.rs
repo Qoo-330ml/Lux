@@ -76,6 +76,20 @@ impl EmbyAuthService {
             .await?)
     }
 
+    pub async fn device_info(&self, token: &str) -> Result<Option<EmbyDeviceInfo>, EmbyAuthError> {
+        Ok(self
+            .database
+            .find_access_token_device(&hash_token(token))
+            .await?
+            .map(|device| EmbyDeviceInfo {
+                client: device.client_name,
+                device: device.device_name,
+                device_id: device.device_id,
+                version: device.client_version,
+                user_id: None,
+            }))
+    }
+
     pub async fn resolve_token(&self, token: &str) -> Result<Option<UserRecord>, EmbyAuthError> {
         let Some(stored) = self
             .database

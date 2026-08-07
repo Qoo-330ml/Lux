@@ -39,9 +39,12 @@ const dashboard: AdminDashboard = {
     state: "PLAYING",
     isPaused: false,
     lastEventAt: 1_700_000_000,
-    client: "VidHub 3.0.2",
+    client: "VidHub",
+    clientVersion: "3.0.2",
     deviceId: "iphone",
     deviceName: "iPhone",
+    deviceType: "Phone",
+    remoteIp: "192.0.2.10",
     playSessionId: "session-1",
     source: {
       id: "source-1",
@@ -128,10 +131,14 @@ describe("AdminDashboardPage", () => {
     expect(container.querySelectorAll(".lux-admin-stat")).toHaveLength(0);
     expect(container.textContent).toContain("爱情情节顶红");
     expect(container.textContent).toContain("S1 · E9");
-    expect(container.textContent).toContain("VidHub 3.0.2");
+    expect(container.textContent).toContain("VidHub");
+    expect(container.textContent).toContain("v3.0.2");
+    expect(container.textContent).toContain("Phone");
+    expect(container.textContent).toContain("ID iphone");
     expect(container.textContent).toContain("4K HEVC");
     expect(container.textContent).toContain("HEVC");
     expect(container.textContent).toContain("AAC · zh-CN");
+    expect(container.textContent).toContain("192.0.2.10");
     expect(container.textContent).not.toContain("NOW PLAYING");
     expect(container.textContent).not.toContain("IP 地址");
     expect(container.textContent).not.toContain("IP 归属地");
@@ -142,7 +149,7 @@ describe("AdminDashboardPage", () => {
     expect(container.querySelector(".lux-now-playing-account")).not.toBeNull();
     expect(container.querySelector(".lux-now-playing-facts")).not.toBeNull();
     expect(container.querySelectorAll(".lux-now-playing-fact")).toHaveLength(3);
-    expect(container.querySelectorAll(".lux-now-playing-placeholder")).toHaveLength(2);
+    expect(container.querySelectorAll(".lux-now-playing-placeholder")).toHaveLength(1);
     expect(container.textContent).toContain("开始播放");
     expect(container.textContent).toContain("暂停播放");
     expect(container.textContent).toContain("停止播放");

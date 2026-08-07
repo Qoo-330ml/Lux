@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use luxd::{
     api::{AppState, app_with_state},
@@ -61,7 +61,13 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -96,6 +102,8 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             "DeviceId": "dashboard-device",
             "Client": "DashboardTest",
             "DeviceName": "Mac",
+            "DeviceType": "Desktop",
+            "ApplicationVersion": "4.2.1",
         }))
         .send()
         .await?;
@@ -130,6 +138,11 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(body["nowPlaying"][0]["userName"], "Admin");
     assert_eq!(body["nowPlaying"][0]["title"], "Session Movie");
     assert_eq!(body["nowPlaying"][0]["client"], "DashboardTest");
+    assert_eq!(body["nowPlaying"][0]["clientVersion"], "4.2.1");
+    assert_eq!(body["nowPlaying"][0]["deviceName"], "Mac");
+    assert_eq!(body["nowPlaying"][0]["deviceType"], "Desktop");
+    assert_eq!(body["nowPlaying"][0]["deviceId"], "dashboard-device");
+    assert_eq!(body["nowPlaying"][0]["remoteIp"], "127.0.0.1");
     let events = body["activity"].as_array().ok_or("missing activity")?;
     assert!(
         events

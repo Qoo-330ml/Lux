@@ -272,8 +272,11 @@ export type AdminPlaybackSession = {
   isPaused: boolean;
   lastEventAt: number;
   client?: string | null;
+  clientVersion?: string | null;
   deviceId: string;
   deviceName?: string | null;
+  deviceType?: string | null;
+  remoteIp?: string | null;
   playSessionId: string;
   source?: AdminPlaybackSource | null;
 };
