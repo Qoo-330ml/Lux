@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     env, fmt, io,
+    net::IpAddr,
     path::{Path, PathBuf},
 };
 
@@ -8,12 +9,14 @@ use serde_json::{Map, Value, json};
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
+use crate::network::is_public_address;
 use crate::{
     application::{
         plugin_protocol::{
-            CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
-            MediaProbeRpcStreamType, PLUGIN_CATEGORY_SCRAPER, PluginConfigField,
-            PluginConfigOption,
+            CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, IP_LOCATION_CAPABILITY, IpLocationRpcRequest,
+            IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
+            MediaProbeRpcStreamType, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_SCRAPER,
+            PLUGIN_TYPE_IP_LOCATION, PluginConfigField, PluginConfigOption,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
@@ -32,6 +35,9 @@ pub const TMDB_PLUGIN_ID: &str = "tmdb";
 pub const TMDB_DYNAMIC_PLUGIN_ID: &str = "org.lux.tmdb";
 pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.strm-media-info";
 pub const MEDIA_INFO_LEGACY_PLUGIN_ID: &str = "org.lux.media-info";
+pub const IP_HIOFD_PLUGIN_ID: &str = "org.lux.ip-hiofd";
+pub const QOO_IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
+const IP_LOCATION_PLUGIN_IDS: &[&str] = &[IP_HIOFD_PLUGIN_ID, QOO_IP138_PLUGIN_ID];
 const TMDB_PLUGIN_NAME: &str = "TMDb 元数据插件";
 const TMDB_PLUGIN_DESCRIPTION: &str = "使用 TMDb 补全电影和剧集元数据、海报与背景图。";
 const TMDB_PLUGIN_VERSION: &str = "1.0.0";
@@ -350,6 +356,60 @@ impl PluginService {
             .call(&plugin_id, method, params)
             .await
             .map_err(PluginServiceError::Runtime)
+    }
+
+    pub async fn lookup_ip_location(
+        &self,
+        ip: IpAddr,
+    ) -> Result<IpLocationRpcResult, PluginServiceError> {
+        if !is_public_address(ip) {
+            return Err(PluginServiceError::Unavailable("ip_location".to_owned()));
+        }
+        let query_ip = ip.to_string();
+        for plugin_id in IP_LOCATION_PLUGIN_IDS {
+            let Some(plugin) = self.catalog.get(plugin_id) else {
+                continue;
+            };
+            if plugin.manifest.plugin_type != PLUGIN_TYPE_IP_LOCATION
+                || plugin.manifest.category != PLUGIN_CATEGORY_NETWORK
+                || !plugin
+                    .manifest
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == IP_LOCATION_CAPABILITY)
+                || !self.database.is_plugin_installed(plugin_id).await?
+            {
+                continue;
+            }
+            let value = match self
+                .supervisor
+                .call(
+                    plugin_id,
+                    "ip.location",
+                    serde_json::to_value(IpLocationRpcRequest {
+                        ip: query_ip.clone(),
+                    })
+                    .map_err(|_| PluginServiceError::InvalidResponse)?,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if serde_json::to_vec(&value)
+                .ok()
+                .is_none_or(|bytes| bytes.len() > 64 * 1024)
+            {
+                continue;
+            }
+            let Ok(result) = serde_json::from_value::<IpLocationRpcResult>(value) else {
+                continue;
+            };
+            if let Some(result) = normalize_ip_location_result(result, ip) {
+                return Ok(result);
+            }
+        }
+        Err(PluginServiceError::Unavailable("ip_location".to_owned()))
     }
 
     /// Calls a scraper by its persisted ID. The method is intentionally
@@ -1023,6 +1083,35 @@ fn media_probe_result(response: MediaProbeRpcResult) -> Option<MediaProbeResult>
         bitrate: response.bitrate,
         streams,
     })
+}
+
+const MAX_IP_LOCATION_FIELD_CHARS: usize = 256;
+
+fn normalize_ip_location_result(
+    mut result: IpLocationRpcResult,
+    query_ip: IpAddr,
+) -> Option<IpLocationRpcResult> {
+    if result.ip.trim().parse::<IpAddr>().ok() != Some(query_ip) {
+        return None;
+    }
+    result.ip = query_ip.to_string();
+    result.country = normalize_ip_location_field(result.country);
+    result.province = normalize_ip_location_field(result.province);
+    result.city = normalize_ip_location_field(result.city);
+    result.district = normalize_ip_location_field(result.district);
+    result.street = normalize_ip_location_field(result.street);
+    result.isp = normalize_ip_location_field(result.isp);
+    result.latitude = normalize_ip_location_field(result.latitude);
+    result.longitude = normalize_ip_location_field(result.longitude);
+    Some(result)
+}
+
+fn normalize_ip_location_field(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_owned();
+    (!value.is_empty()
+        && value.chars().count() <= MAX_IP_LOCATION_FIELD_CHARS
+        && !value.chars().any(char::is_control))
+    .then_some(value)
 }
 
 impl From<StorageError> for PluginServiceError {
