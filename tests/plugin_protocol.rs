@@ -1,7 +1,6 @@
 use luxd::application::plugin_protocol::{
-    IP_LOCATION_CAPABILITY, PLUGIN_API_VERSION, PLUGIN_CATEGORY_NETWORK,
-    PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_IP_LOCATION, IpLocationRpcResult, PluginManifest,
-    PluginRequest,
+    IP_LOCATION_CAPABILITY, IpLocationRpcResult, PLUGIN_API_VERSION, PLUGIN_CATEGORY_NETWORK,
+    PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_IP_LOCATION, PluginManifest, PluginRequest,
 };
 use serde_json::json;
 

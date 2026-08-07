@@ -15,7 +15,7 @@ test("admin console uses the account settings page rhythm", () => {
   assert.match(sidebarRule, /background:\s*transparent/);
   assert.match(sidebarRule, /border-right:\s*0/);
   assert.match(contentRule, /padding:\s*0\s+0\s+90px\s+clamp\(28px,\s*5vw,\s*84px\)/);
-  assert.match(headingRule, /margin-bottom:\s*42px/);
+  assert.match(headingRule, /margin-bottom:\s*28px/);
 });
 
 test("dashboard panels use separators instead of card chrome", () => {
