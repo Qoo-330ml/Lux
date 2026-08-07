@@ -53,6 +53,7 @@ use crate::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
             ImageWriteService, normalize_image_type,
         },
+        ip_location::{IpLocation, IpLocationService},
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
         metadata::MetadataField,
@@ -125,6 +126,7 @@ pub struct AppState {
     tmdb: Option<TmdbProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
+    ip_location: Option<IpLocationService>,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
 }
@@ -221,6 +223,7 @@ impl AppState {
             tmdb: Some(tmdb),
             collections,
             people: Some(PeopleService::new_with_proxy(config_dir, network_proxy_url)),
+            ip_location: IpLocationService::new_with_proxy(network_proxy_url.as_deref()).ok(),
             remote_access: RemoteAccessPolicy::from_env(),
             login_rate_limiter: LoginRateLimiter::default(),
         }
@@ -8789,6 +8792,12 @@ async fn dashboard_playback_json(
         } else {
             None
         };
+        let remote_ip_location = session.remote_ip.as_deref().and_then(|remote_ip| {
+            state
+                .ip_location
+                .as_ref()
+                .and_then(|service| service.cached_or_schedule(remote_ip))
+        });
         values.push(dashboard_playback_item_json(
             session,
             &item,
@@ -8797,6 +8806,7 @@ async fn dashboard_playback_json(
                 .get(&session.user_id)
                 .map(String::as_str)
                 .unwrap_or("未知账户"),
+            remote_ip_location.as_ref(),
         ));
     }
     Ok(values)
@@ -8807,6 +8817,7 @@ fn dashboard_playback_item_json(
     item: &CatalogItem,
     series: Option<&CatalogItem>,
     user_name: &str,
+    remote_ip_location: Option<&IpLocation>,
 ) -> Value {
     let source = session
         .media_source_id
@@ -8842,9 +8853,19 @@ fn dashboard_playback_item_json(
         "deviceId": session.device_id,
         "deviceName": session.device_name,
         "deviceType": session.device_type,
+        "remoteIpLocation": remote_ip_location.map(dashboard_ip_location_json),
         "remoteIp": session.remote_ip,
         "playSessionId": session.play_session_id,
         "source": source.map(dashboard_source_json),
+    })
+}
+
+fn dashboard_ip_location_json(location: &IpLocation) -> Value {
+    json!({
+        "location": location.formatted_location(),
+        "district": location.district,
+        "street": location.street,
+        "isp": location.isp,
     })
 }
 

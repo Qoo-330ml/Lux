@@ -151,6 +151,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(body["nowPlaying"][0]["deviceType"], "Desktop");
     assert_eq!(body["nowPlaying"][0]["deviceId"], "dashboard-device");
     assert_eq!(body["nowPlaying"][0]["remoteIp"], "127.0.0.1");
+    assert!(body["nowPlaying"][0]["remoteIpLocation"].is_null());
     let events = body["activity"].as_array().ok_or("missing activity")?;
     assert!(
         events

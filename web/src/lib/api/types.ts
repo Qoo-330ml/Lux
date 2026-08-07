@@ -279,9 +279,17 @@ export type AdminPlaybackSession = {
   deviceName?: string | null;
   deviceType?: string | null;
   remoteIp?: string | null;
+  remoteIpLocation?: AdminIpLocation | null;
   playSessionId: string;
   source?: AdminPlaybackSource | null;
 };
+export type AdminIpLocation = {
+  location?: string | null;
+  district?: string | null;
+  street?: string | null;
+  isp?: string | null;
+};
+
 
 export type AdminPlaybackSource = {
   id: string;

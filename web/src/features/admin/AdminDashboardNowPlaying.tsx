@@ -85,7 +85,12 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
 
       <div className="lux-now-playing-network">
         <NetworkField icon={<CircleAlert size={15} />} label="IP 地址" value={session.remoteIp || "—"} />
-        <NetworkField icon={<MapPin size={15} />} label="IP 归属地" value="—" />
+        <NetworkField
+          icon={<MapPin size={15} />}
+          label="IP 归属地"
+          value={session.remoteIpLocation?.location || "—"}
+          detail={locationDetail(session.remoteIpLocation)}
+        />
       </div>
     </article>
   );
@@ -99,8 +104,13 @@ function DeviceField({ icon, label, value, detail }: { icon: ReactNode; label: s
   return <span className="lux-now-playing-account-entry"><span className="lux-now-playing-account-entry-icon">{icon}</span><span><small>{label}</small><strong>{value}</strong>{detail ? <em>{detail}</em> : null}</span></span>;
 }
 
-function NetworkField({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {
-  return <div className="lux-now-playing-network-field" role="group" aria-label={label}><span className="lux-now-playing-network-icon">{icon}</span><div><strong className={value === "—" ? "lux-now-playing-placeholder" : undefined}>{value}</strong></div></div>;
+function NetworkField({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail?: string }) {
+  return <div className="lux-now-playing-network-field" role="group" aria-label={label}><span className="lux-now-playing-network-icon">{icon}</span><div><strong className={value === "—" ? "lux-now-playing-placeholder" : undefined}>{value}</strong>{detail ? <small>{detail}</small> : null}</div></div>;
+}
+
+function locationDetail(location: AdminPlaybackSession["remoteIpLocation"]) {
+  if (!location) return undefined;
+  return [location.district, location.street, location.isp].filter(Boolean).join(" · ") || undefined;
 }
 
 function episodeLabel(session: AdminPlaybackSession) {
