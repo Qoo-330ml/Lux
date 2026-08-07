@@ -33,6 +33,7 @@ test("dashboard overview follows account settings section rhythm", () => {
   const topRule = stylesheet.match(/\.lux-admin-overview-top\s*\{([^}]*)\}/)?.[1] ?? "";
   const identityRule = stylesheet.match(/\.lux-admin-overview-identity\s*\{([^}]*)\}/)?.[1] ?? "";
   const nameRule = stylesheet.match(/\.lux-admin-overview-name-form input\s*\{([^}]*)\}/)?.[1] ?? "";
+  const infoCopyRule = stylesheet.match(/\.lux-admin-overview-info\s*>\s*span:last-child\s*\{([^}]*)\}/)?.[1] ?? "";
   const metricsRule = stylesheet.match(/\.lux-admin-overview-metrics\s*\{([^}]*)\}/)?.[1] ?? "";
   const metricDividerRule = stylesheet.match(/\.lux-admin-overview-metric\s*\+\s*\.lux-admin-overview-metric\s*\{([^}]*)\}/)?.[1] ?? "";
 
@@ -45,11 +46,14 @@ test("dashboard overview follows account settings section rhythm", () => {
   assert.match(topRule, /align-items:\s*center/);
   assert.match(topRule, /padding:\s*20px\s+22px/);
   assert.match(topRule, /border-bottom:\s*1px\s+solid\s+var\(--lux-overview-line\)/);
-  assert.match(identityRule, /display:\s*grid/);
-  assert.match(identityRule, /grid-template-columns:\s*auto\s+minmax\(0,\s*1fr\)/);
+  assert.match(identityRule, /display:\s*block/);
+  assert.match(infoCopyRule, /display:\s*flex/);
+  assert.match(infoCopyRule, /align-items:\s*baseline/);
   assert.match(nameRule, /min-height:\s*42px/);
   assert.match(nameRule, /border:\s*0/);
   assert.match(nameRule, /background:\s*transparent/);
+  assert.doesNotMatch(stylesheet, /\.lux-admin-overview-device\s*\{/);
+  assert.doesNotMatch(stylesheet, /\.lux-admin-overview-info-icon/);
   assert.match(metricsRule, /display:\s*grid/);
   assert.match(metricsRule, /padding:\s*22px\s+22px\s+0/);
   assert.doesNotMatch(metricsRule, /border-top:/);

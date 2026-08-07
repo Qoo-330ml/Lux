@@ -473,8 +473,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   box-shadow: none;
 }
 .lux-admin-overview-top { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(125px, .45fr) minmax(150px, .65fr); align-items: center; gap: 20px; padding: 20px 22px; border-bottom: 1px solid var(--lux-overview-line); }
-.lux-admin-overview-identity { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 12px; min-width: 0; }
-.lux-admin-overview-device { display: grid; place-items: center; width: 38px; height: 38px; min-height: 38px; border: 1px solid var(--lux-overview-line); border-radius: 9px; color: var(--lux-overview-icon); background: var(--lux-overview-input-bg); }
+.lux-admin-overview-identity { display: block; min-width: 0; }
 .lux-admin-overview-name-form { position: relative; min-width: 0; }
 .lux-admin-overview-name-form input { width: 100%; min-height: 42px; padding: 0 40px 0 0; overflow: hidden; border: 0; border-radius: 0; outline: 0; color: var(--lux-overview-text); background: transparent; font-size: 1.05rem; letter-spacing: -.025em; text-overflow: ellipsis; }
 .lux-admin-overview-name-form input:focus { border-color: transparent; box-shadow: 0 2px 0 color-mix(in srgb, var(--lux-overview-accent) 48%, transparent); }
@@ -484,10 +483,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-overview-status { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 34px; padding: 0 11px; border: 1px solid color-mix(in srgb, var(--lux-overview-accent) 28%, var(--lux-overview-line)); border-radius: 999px; color: var(--lux-overview-accent); background: var(--lux-overview-status-bg); font-size: .72rem; font-weight: 650; white-space: nowrap; }
 .lux-admin-overview-status i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, var(--lux-overview-accent) 12%, transparent); }
 .lux-admin-overview-status.is-alert { --lux-overview-accent: #d49a4d; --lux-overview-status-bg: rgba(212, 154, 77, .13); }
-.lux-admin-overview-info { display: flex; align-items: center; min-width: 0; gap: 11px; color: var(--lux-overview-icon); }
-.lux-admin-overview-info-icon { display: inline-flex; flex: 0 0 auto; }
-.lux-admin-overview-info-icon svg { width: 26px; height: 26px; }
-.lux-admin-overview-info > span:last-child { display: grid; min-width: 0; gap: 5px; }
+.lux-admin-overview-info { display: flex; align-items: baseline; min-width: 0; color: var(--lux-overview-icon); }
+.lux-admin-overview-info > span:last-child { display: flex; min-width: 0; align-items: baseline; gap: 4px; }
 .lux-admin-overview-info small, .lux-admin-overview-metric small { color: var(--lux-overview-muted); font-size: .72rem; }
 .lux-admin-overview-info strong, .lux-admin-overview-metric strong { min-height: 1.2em; overflow: hidden; color: var(--lux-overview-accent); font-size: .88rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-overview-info strong[aria-label$="未提供"], .lux-admin-overview-metric strong[aria-label$="未提供"] { color: transparent; }
@@ -843,8 +840,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-overview-top { grid-template-columns: minmax(0, 1fr) auto; gap: 14px; }
   .lux-admin-overview-identity { grid-column: 1 / -1; }
   .lux-admin-overview-name-form input { min-height: 40px; padding-left: 11px; font-size: .96rem; }
-  .lux-admin-overview-info { gap: 10px; }
-  .lux-admin-overview-info-icon svg { width: 29px; height: 29px; }
   .lux-admin-overview-status { justify-self: start; }
   .lux-admin-overview-info:last-child { grid-column: 1 / -1; padding-top: 14px; border-top: 1px solid var(--lux-overview-line); }
   .lux-admin-overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 20px; padding: 18px 17px 0; }
