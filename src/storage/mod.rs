@@ -5164,21 +5164,15 @@ impl Database {
 
     pub(crate) async fn list_resume_items(
         &self,
-        user_id: &str,
-        library_ids: &[String],
-        item_types: &[&str],
-        played_percent: i64,
-        minimum_ticks: i64,
-        offset: i64,
-        limit: i64,
+        query: &ResumeItemsQuery<'_>,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
-        if library_ids.is_empty() || item_types.is_empty() {
+        if query.library_ids.is_empty() || query.item_types.is_empty() {
             return Ok(Vec::new());
         }
-        let item_type_placeholders = std::iter::repeat_n("?", item_types.len())
+        let item_type_placeholders = std::iter::repeat_n("?", query.item_types.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let library_placeholders = std::iter::repeat_n("?", library_ids.len())
+        let library_placeholders = std::iter::repeat_n("?", query.library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let runtime_ticks = resume_runtime_ticks_sql();
@@ -5236,14 +5230,19 @@ impl Database {
                       ranked.season_number, ranked.episode_number, ranked.id,
                       ms.id, mt.stream_index"
         );
-        let mut binds = Vec::with_capacity(item_types.len() + library_ids.len() + 5);
-        binds.push(CatalogBind::Text(user_id));
-        binds.extend(item_types.iter().copied().map(CatalogBind::Text));
-        binds.push(CatalogBind::Integer(minimum_ticks));
-        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
-        binds.push(CatalogBind::Integer(played_percent));
-        binds.push(CatalogBind::Integer(limit));
-        binds.push(CatalogBind::Integer(offset));
+        let mut binds = Vec::with_capacity(query.item_types.len() + query.library_ids.len() + 5);
+        binds.push(CatalogBind::Text(query.user_id));
+        binds.extend(query.item_types.iter().copied().map(CatalogBind::Text));
+        binds.push(CatalogBind::Integer(query.minimum_ticks));
+        binds.extend(
+            query
+                .library_ids
+                .iter()
+                .map(|value| CatalogBind::Text(value)),
+        );
+        binds.push(CatalogBind::Integer(query.played_percent));
+        binds.push(CatalogBind::Integer(query.limit));
+        binds.push(CatalogBind::Integer(query.offset));
         self.fetch_catalog_rows(&statement_sql, &binds).await
     }
 
@@ -8052,6 +8051,16 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) is_favorite: Option<bool>,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
+pub(crate) struct ResumeItemsQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) library_ids: &'a [String],
+    pub(crate) item_types: &'a [&'a str],
+    pub(crate) played_percent: i64,
+    pub(crate) minimum_ticks: i64,
     pub(crate) offset: i64,
     pub(crate) limit: i64,
 }

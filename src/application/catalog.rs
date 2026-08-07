@@ -6,8 +6,8 @@ use crate::{
         RECOMMENDATION_CANDIDATE_POOL, current_day_bucket, daily_recommendation_items,
     },
     storage::{
-        CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database, StorageError,
-        StoredCatalogRow,
+        CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database, ResumeItemsQuery,
+        StorageError, StoredCatalogRow,
     },
 };
 
@@ -318,15 +318,15 @@ impl CatalogService {
             .await?;
         let rows = self
             .database
-            .list_resume_items(
+            .list_resume_items(&ResumeItemsQuery {
                 user_id,
-                &library_ids,
-                &item_types,
+                library_ids: &library_ids,
+                item_types: &item_types,
                 played_percent,
                 minimum_ticks,
                 offset,
                 limit,
-            )
+            })
             .await?;
         Ok(CatalogPage {
             items: assemble_items(rows),
