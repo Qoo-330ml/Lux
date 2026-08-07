@@ -54,7 +54,7 @@ export function AdminDashboardPage() {
   return (
     <div className="lux-admin-page lux-admin-dashboard-page">
       <header className="lux-admin-page-heading">
-        <div><h1>控制台</h1><p>实时了解服务器健康、播放会话和账户活动。</p></div>
+        <div><h1>控制台</h1></div>
         <button className="lux-button lux-button-secondary lux-admin-refresh" type="button" onClick={() => void dashboard.refetch()}><RefreshCw size={16} /> 刷新</button>
       </header>
 
