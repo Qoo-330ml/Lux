@@ -126,7 +126,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
         </aside>
 
         <div className="lux-account-settings-content">
-          <SettingsSection id="appearance" icon={<Palette size={18} />} eyebrow="APPEARANCE" title="主题">
+          <SettingsSection id="appearance" icon={<Palette size={18} />} title="主题">
             <div className="lux-setting-row lux-theme-row">
               <div>
                 <strong>界面主题</strong>
@@ -167,7 +167,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
             </div>
           </SettingsSection>
 
-          <SettingsSection id="home-layout" icon={<Monitor size={18} />} eyebrow="HOME LAYOUT" title="首页排版">
+          <SettingsSection id="home-layout" icon={<Monitor size={18} />} title="首页排版">
             <div className="lux-setting-block">
               <div className="lux-setting-block-heading">
                 <div>
@@ -215,7 +215,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
             <ToggleRow title="显示继续观看区块" description="在首页保留最近播放但尚未看完的内容。" checked={settings.showContinueWatching} onChange={(checked) => updateSettings({ showContinueWatching: checked })} />
           </SettingsSection>
 
-          <SettingsSection id="playback" icon={<PlayCircle size={18} />} eyebrow="PLAYBACK" title="播放">
+          <SettingsSection id="playback" icon={<PlayCircle size={18} />} title="播放">
             <div className="lux-setting-form-grid">
               <label className="lux-setting-field">
                 <span>默认音轨语言</span>
@@ -242,7 +242,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
             <ToggleRow title="自动播放下一集" description="一集结束后自动开始播放下一集。" checked={settings.autoPlayNextEpisode} onChange={(checked) => updateSettings({ autoPlayNextEpisode: checked })} />
           </SettingsSection>
 
-          <SettingsSection id="account" icon={<UserRound size={18} />} eyebrow="ACCOUNT" title="账户">
+          <SettingsSection id="account" icon={<UserRound size={18} />} title="账户">
             <div className="lux-account-profile-editor">
               <div className="lux-settings-avatar lux-settings-avatar-large">
                 {avatarUrl ? <img src={avatarUrl} alt={`${displayName} 的头像`} /> : <UserRound size={27} />}
@@ -293,10 +293,10 @@ export function AccountPage({ user }: { user: LuxUser }) {
   );
 }
 
-function SettingsSection({ id, icon, eyebrow, title, children }: { id: string; icon: React.ReactNode; eyebrow: string; title: string; children: React.ReactNode }) {
+function SettingsSection({ id, icon, title, children }: { id: string; icon: React.ReactNode; title: string; children: React.ReactNode }) {
   return (
     <section id={id} className="lux-account-settings-section">
-      <div className="lux-account-settings-section-heading"><span className="lux-account-section-icon">{icon}</span><div><span className="lux-eyebrow">{eyebrow}</span><h2>{title}</h2></div></div>
+      <div className="lux-account-settings-section-heading"><span className="lux-account-section-icon">{icon}</span><h2>{title}</h2></div>
       <div className="lux-account-settings-section-body">{children}</div>
     </section>
   );

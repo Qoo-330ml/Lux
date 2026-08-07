@@ -102,7 +102,6 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
       <section className="lux-media-editor lux-image-editor" role="dialog" aria-modal="true" aria-labelledby="lux-image-editor-title">
         <header className="lux-media-editor-header">
           <div>
-            <span className="lux-eyebrow">EDIT IMAGES</span>
             <h2 id="lux-image-editor-title">编辑图像</h2>
             <p>{mediaTitle(item)} · {selectedLabel}</p>
           </div>

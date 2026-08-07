@@ -122,7 +122,7 @@ export function AdminLibrariesPage() {
 
       {createOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreateOpen(false); }}>
         <div className="lux-library-dialog lux-library-create-dialog" role="dialog" aria-modal="true" aria-labelledby="new-library-title">
-          <div className="lux-library-dialog-header"><div><span className="lux-eyebrow">NEW LIBRARY</span><h2 id="new-library-title">新增媒体库</h2></div><button className="lux-library-dialog-close" type="button" aria-label="关闭新增媒体库弹窗" onClick={() => setCreateOpen(false)}><X size={20} /></button></div>
+          <div className="lux-library-dialog-header"><div><h2 id="new-library-title">新增媒体库</h2></div><button className="lux-library-dialog-close" type="button" aria-label="关闭新增媒体库弹窗" onClick={() => setCreateOpen(false)}><X size={20} /></button></div>
           <form className="lux-admin-form lux-library-dialog-form" onSubmit={submit}>
             <label htmlFor="new-library-name">名称<input id="new-library-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：电影" /></label>
             <label htmlFor="new-library-kind">类型<LuxSelect id="new-library-kind" value={kind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setKind} aria-label="媒体库类型" /></label>
@@ -171,7 +171,6 @@ function GlobalStrategyPanel({
     <section className="lux-library-strategy-panel">
       <header className="lux-library-strategy-heading">
         <div>
-          <span className="lux-eyebrow">SERVER POLICY</span>
           <h2>全局策略</h2>
           <p>给所有未单独覆盖的媒体库提供默认规则，单库可以在编辑窗口里改成自己的策略。</p>
         </div>
@@ -185,7 +184,7 @@ function GlobalStrategyPanel({
 
       <div className="lux-library-strategy-grid">
         <section className="lux-library-strategy-card lux-library-strategy-card-wide">
-          <div className="lux-library-strategy-card-heading"><div><span className="lux-eyebrow">METADATA</span><h3>元数据默认值</h3></div><Languages size={19} aria-hidden="true" /></div>
+          <div className="lux-library-strategy-card-heading"><div><h3>元数据默认值</h3></div><Languages size={19} aria-hidden="true" /></div>
           <div className="lux-library-strategy-form-grid">
             <StrategySelect label="元数据语言" value={strategy.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"]]} onChange={(value) => onChange({ ...strategy, metadataLanguage: value })} />
             <StrategySelect label="图片语言" value={strategy.imageLanguage} options={[["zh-CN", "简体中文"], ["en", "English"], ["", "无语言偏好"]]} onChange={(value) => onChange({ ...strategy, imageLanguage: value })} />
@@ -197,7 +196,7 @@ function GlobalStrategyPanel({
         </section>
 
         <section className="lux-library-strategy-card lux-library-strategy-card-wide">
-          <div className="lux-library-strategy-card-heading"><div><span className="lux-eyebrow">IMAGE FETCHING</span><h3>图像抓取</h3></div><Image size={19} aria-hidden="true" /></div>
+          <div className="lux-library-strategy-card-heading"><div><h3>图像抓取</h3></div><Image size={19} aria-hidden="true" /></div>
           <div className="lux-library-strategy-toggle-grid">
             <StrategyToggle label="海报" description="详情页和媒体库封面" checked={strategy.images.poster} onChange={(checked) => updateImages("poster", checked)} />
             <StrategyToggle label="艺术图" description="背景和横向构图" checked={strategy.images.artwork} onChange={(checked) => updateImages("artwork", checked)} />
@@ -214,7 +213,7 @@ function GlobalStrategyPanel({
         </section>
 
         <section className="lux-library-strategy-card">
-          <div className="lux-library-strategy-card-heading"><div><span className="lux-eyebrow">SUBTITLES</span><h3>字幕默认值</h3></div><Languages size={19} aria-hidden="true" /></div>
+          <div className="lux-library-strategy-card-heading"><div><h3>字幕默认值</h3></div><Languages size={19} aria-hidden="true" /></div>
           <div className="lux-library-strategy-toggle-list">
             <StrategyToggle label="自动下载字幕" checked={strategy.subtitles.autoDownload} onChange={(checked) => updateSubtitles("autoDownload", checked)} />
             <StrategyToggle label="仅下载强制字幕" checked={strategy.subtitles.forcedOnly} onChange={(checked) => updateSubtitles("forcedOnly", checked)} />
@@ -224,7 +223,7 @@ function GlobalStrategyPanel({
         </section>
 
         <section className="lux-library-strategy-card">
-          <div className="lux-library-strategy-card-heading"><div><span className="lux-eyebrow">IMPACT PREVIEW</span><h3>存储预估</h3></div><HardDrive size={19} aria-hidden="true" /></div>
+          <div className="lux-library-strategy-card-heading"><div><h3>存储预估</h3></div><HardDrive size={19} aria-hidden="true" /></div>
           <div className="lux-library-strategy-estimate"><strong>{estimate.storage}</strong><span>每 10,000 个条目</span><small>约 {estimate.imagesPerItem} 张图片 / 条目，实际大小取决于来源和格式。</small></div>
           <label className="lux-library-strategy-scope">应用范围<LuxSelect value={strategy.applyScope} options={[{ value: "NEW_CONTENT", label: "仅新内容" }, { value: "SELECTED_CONTENT", label: "刷新选中内容" }, { value: "ALL_CONTENT", label: "后台刷新全部内容" }]} onChange={(applyScope) => onChange({ ...strategy, applyScope })} aria-label="策略应用范围" /><small>{scopeDescription(strategy.applyScope)}</small></label>
         </section>
@@ -345,7 +344,7 @@ function LibraryAdminCard({ library, plugins, globalStrategy }: { library: Admin
       {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
       {editOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setEditOpen(false); }}>
         <div className="lux-library-dialog" role="dialog" aria-modal="true" aria-labelledby={`edit-library-title-${library.id}`}>
-          <div className="lux-library-dialog-header"><div><span className="lux-eyebrow">MEDIA LIBRARY</span><h2 id={`edit-library-title-${library.id}`}>{library.name}</h2></div><button ref={dialogCloseRef} className="lux-library-dialog-close" type="button" aria-label={`关闭 ${library.name} 编辑弹窗`} onClick={() => setEditOpen(false)}><X size={20} /></button></div>
+          <div className="lux-library-dialog-header"><div><h2 id={`edit-library-title-${library.id}`}>{library.name}</h2></div><button ref={dialogCloseRef} className="lux-library-dialog-close" type="button" aria-label={`关闭 ${library.name} 编辑弹窗`} onClick={() => setEditOpen(false)}><X size={20} /></button></div>
           <div className="lux-library-dialog-scroll">
             <p className="lux-library-warning">如果更改了元数据或媒体图片下载的设置，只适用于之后添加到媒体库的新内容。要将更改应用于现有项目，您需要手动刷新其元数据。</p>
             <section className="lux-library-dialog-section"><div className="lux-library-dialog-section-heading"><h3>文件夹</h3><button className="lux-library-toolbar-button" type="button" onClick={() => document.getElementById(`library-root-path-${library.id}`)?.focus()}><Plus size={16} /> 添加</button></div>{library.roots.length === 0 ? <p className="lux-admin-muted">尚未配置根路径。</p> : <div className="lux-library-dialog-root-list">{library.roots.map((root) => <div className="lux-library-dialog-root-row" key={root.id}><span title={root.displayPath}>{root.displayPath}</span><button className="lux-library-dialog-icon" type="button" aria-label={`编辑路径 ${root.displayPath}`} disabled><Pencil size={17} /></button><button className="lux-library-dialog-icon" type="button" aria-label={`删除路径 ${root.displayPath}`} onClick={() => removeRoot.mutate(root.id)} disabled={removeRoot.isPending}><MinusCircle size={18} /></button></div>)}</div>}<div className="lux-library-root-form"><input id={`library-root-path-${library.id}`} value={rootPath} onChange={(event) => setRootPath(event.target.value)} placeholder="输入 Docker 内的媒体路径" aria-label={`${library.name} 新根路径`} /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setDirectoryPickerOpen(true)}><Folder size={17} /></button></div>{directoryPickerOpen ? <DirectoryPicker initialPath={rootPath.trim()} isSubmitting={addRoot.isPending} onClose={() => setDirectoryPickerOpen(false)} onSelect={(path) => { setRootPath(path); setRootError(""); addRoot.mutate(path); }} /> : null}{rootError ? <p className="lux-error-copy">{rootError}</p> : null}</section>
@@ -442,5 +441,5 @@ function libraryKindLabel(kind: string) {
 }
 
 function AdminLibraryState({ label, error = false }: { label: string; error?: boolean }) {
-  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><span className="lux-eyebrow">LUX ADMIN</span><h1>{error ? "媒体库加载失败" : "正在加载媒体库"}</h1><p>{label}</p></section>;
+  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "媒体库加载失败" : "正在加载媒体库"}</h1><p>{label}</p></section>;
 }

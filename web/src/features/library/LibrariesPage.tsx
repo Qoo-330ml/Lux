@@ -13,7 +13,7 @@ export function LibrariesPage() {
   const items = libraries.data.libraries ?? [];
   return (
     <section className="lux-page lux-page-narrow">
-      <div className="lux-page-heading"><span className="lux-eyebrow">YOUR COLLECTION</span><h1>媒体库</h1></div>
+      <div className="lux-page-heading"><h1>媒体库</h1></div>
       <div className="lux-library-grid">
         {items.length ? items.map((library) => <LibraryCard key={library.id} library={library} />) : <div className="lux-empty-card"><span>当前账号没有可访问的媒体库。</span><Link to="/">返回首页</Link></div>}
       </div>

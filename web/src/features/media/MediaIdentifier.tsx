@@ -81,7 +81,6 @@ export function MediaIdentifier({ item, onClose, onSaved }: MediaIdentifierProps
       <section className="lux-media-editor lux-identifier-editor" role="dialog" aria-modal="true" aria-labelledby="lux-identifier-title">
         <header className="lux-media-editor-header">
           <div>
-            <span className="lux-eyebrow">METADATA MATCH</span>
             <h2 id="lux-identifier-title">匹配元数据</h2>
             <p>{mediaTitle(item)} · 从刮削器候选中选择正确条目</p>
           </div>

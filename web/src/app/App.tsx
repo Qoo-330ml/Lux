@@ -98,7 +98,6 @@ function ErrorScreen({ error }: { error: Error }) {
   const queryClient = useQueryClient();
   return (
     <main className="lux-state-screen" role="alert">
-      <span className="lux-eyebrow">Lux</span>
       <h1>暂时无法连接服务器</h1>
       <p>{error.message}</p>
       <button

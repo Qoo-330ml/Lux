@@ -55,7 +55,7 @@ export function AdminScheduledTasksPanel() {
   return (
     <section className="lux-admin-panel lux-admin-operations-section" aria-labelledby="scheduled-tasks-heading">
       <div className="lux-admin-panel-heading">
-        <div><span className="lux-eyebrow">SCHEDULED TASKS</span><h2 id="scheduled-tasks-heading">计划任务</h2></div>
+        <div><h2 id="scheduled-tasks-heading">计划任务</h2></div>
         <CalendarClock size={20} className="lux-admin-panel-icon" aria-hidden="true" />
       </div>
       <p className="lux-admin-muted">集中管理增量扫描、全量校验和元数据任务，可分别作用于全局或指定媒体库。</p>

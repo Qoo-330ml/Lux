@@ -23,7 +23,7 @@ export function SearchPage() {
 
   return (
     <section className="lux-page lux-page-narrow">
-      <div className="lux-page-heading"><span className="lux-eyebrow">SEARCH YOUR LIBRARY</span><h1>搜索</h1></div>
+      <div className="lux-page-heading"><h1>搜索</h1></div>
       <form className="lux-search-panel" onSubmit={submit}>
         <Search size={20} aria-hidden="true" />
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集或别名" aria-label="搜索媒体" />

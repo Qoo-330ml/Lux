@@ -97,7 +97,6 @@ export function MediaMetadataEditor({ item, onClose, onSaved }: MediaMetadataEdi
       <section className="lux-media-editor lux-metadata-editor" role="dialog" aria-modal="true" aria-labelledby="lux-metadata-editor-title">
         <header className="lux-media-editor-header">
           <div>
-            <span className="lux-eyebrow">EDIT METADATA</span>
             <h2 id="lux-metadata-editor-title">编辑元数据</h2>
             <p>{mediaTitle(item)}</p>
           </div>

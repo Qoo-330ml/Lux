@@ -171,12 +171,12 @@ function render() {
   const error = state.error ? "<div class=\"notice error\" role=\"alert\">" + escapeHtml(state.error) + "</div>" : "";
   const notice = state.notice ? "<div class=\"notice\" role=\"status\">" + escapeHtml(state.notice) + "</div>" : "";
   const drawerClass = state.drawerOpen ? " drawer-is-open" : "";
-  app.innerHTML = "<div class=\"shell" + drawerClass + "\"><aside class=\"sidebar\">" + brand() + nav() + account() + "</aside><button class=\"drawer-scrim\" type=\"button\" data-action=\"close-drawer\" aria-label=\"关闭导航\"></button><div class=\"app-frame\"><header class=\"app-toolbar\"><button class=\"toolbar-menu\" type=\"button\" data-action=\"toggle-drawer\" aria-label=\"打开导航\">☰</button><button class=\"toolbar-brand\" type=\"button\" data-route=\"home\">" + brandLogo("brand-logo") + "<span>Lux</span></button><div class=\"toolbar-title\"><span class=\"eyebrow\">Personal Media</span><h1>" + titleForRoute() + "</h1></div><form class=\"search-form\" data-action=\"search\"><input class=\"search-box\" name=\"q\" type=\"search\" placeholder=\"🔍 搜索电影、剧集、演职人员...\" aria-label=\"搜索\"></form><button class=\"toolbar-user\" type=\"button\" data-route=\"account\" aria-label=\"打开账户\"><span class=\"user-avatar\">" + escapeHtml((state.user.displayName || state.user.usernameNormalized || "L").slice(0, 1).toUpperCase()) + "</span><span class=\"toolbar-user-name\">" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</span></button></header><main id=\"main-content\" class=\"content\">" + error + notice + "<section id=\"view\">" + loading() + "</section></main></div></div>";
+  app.innerHTML = "<div class=\"shell" + drawerClass + "\"><aside class=\"sidebar\">" + brand() + nav() + account() + "</aside><button class=\"drawer-scrim\" type=\"button\" data-action=\"close-drawer\" aria-label=\"关闭导航\"></button><div class=\"app-frame\"><header class=\"app-toolbar\"><button class=\"toolbar-menu\" type=\"button\" data-action=\"toggle-drawer\" aria-label=\"打开导航\">☰</button><button class=\"toolbar-brand\" type=\"button\" data-route=\"home\">" + brandLogo("brand-logo") + "<span>Lux</span></button><div class=\"toolbar-title\"><h1>" + titleForRoute() + "</h1></div><form class=\"search-form\" data-action=\"search\"><input class=\"search-box\" name=\"q\" type=\"search\" placeholder=\"🔍 搜索电影、剧集、演职人员...\" aria-label=\"搜索\"></form><button class=\"toolbar-user\" type=\"button\" data-route=\"account\" aria-label=\"打开账户\"><span class=\"user-avatar\">" + escapeHtml((state.user.displayName || state.user.usernameNormalized || "L").slice(0, 1).toUpperCase()) + "</span><span class=\"toolbar-user-name\">" + escapeHtml(state.user.displayName || state.user.usernameNormalized) + "</span></button></header><main id=\"main-content\" class=\"content\">" + error + notice + "<section id=\"view\">" + loading() + "</section></main></div></div>";
   bind();
   loadRoute();
 }
 
-function brand() { return "<div class=\"brand\"><button class=\"brand-home\" type=\"button\" data-route=\"home\">" + brandLogo("brand-logo") + "<span><strong>Lux Server</strong><small>Personal Media System</small></span></button><button class=\"drawer-close\" type=\"button\" data-action=\"close-drawer\" aria-label=\"关闭导航\">×</button></div>"; }
+function brand() { return "<div class=\"brand\"><button class=\"brand-home\" type=\"button\" data-route=\"home\">" + brandLogo("brand-logo") + "<span><strong>Lux</strong></span></button><button class=\"drawer-close\" type=\"button\" data-action=\"close-drawer\" aria-label=\"关闭导航\">×</button></div>"; }
 
 function nav() {
   const homeCurrent = state.route === "home" ? "page" : "false";
@@ -196,7 +196,7 @@ function account() {
 function renderAuth() {
   const error = state.error ? "<div class=\"notice error\" role=\"alert\">" + escapeHtml(state.error) + "</div>" : "";
   const notice = state.setupNotice ? "<div class=\"notice\" role=\"status\">" + escapeHtml(state.setupNotice) + "</div>" : "";
-  app.innerHTML = "<div class=\"auth-layout\"><section class=\"auth-card\"><div class=\"auth-brand\">" + brandLogo("auth-logo", "Lux Media Server") + "</div><span class=\"eyebrow\">Lux Media Center</span><h1 style=\"margin-top:.7rem\">欢迎使用 Lux</h1><p>连接并享受你的私人高画质影院库。</p>" + notice + error + "<form data-action=\"login\"><div class=\"field\"><label for=\"username\">用户名</label><input id=\"username\" name=\"username\" autocomplete=\"username\" placeholder=\"输入用户名\" required></div><div class=\"field\"><label for=\"password\">密码</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" placeholder=\"输入密码\" required></div><div class=\"form-actions\"><button class=\"button\" type=\"submit\">登 录</button></div></form></section></div>";
+  app.innerHTML = "<div class=\"auth-layout\"><section class=\"auth-card\"><div class=\"auth-brand\">" + brandLogo("auth-logo", "Lux") + "</div><h1 style=\"margin-top:.7rem\">欢迎使用 Lux</h1><p>连接并享受你的私人高画质影院库。</p>" + notice + error + "<form data-action=\"login\"><div class=\"field\"><label for=\"username\">用户名</label><input id=\"username\" name=\"username\" autocomplete=\"username\" placeholder=\"输入用户名\" required></div><div class=\"field\"><label for=\"password\">密码</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" placeholder=\"输入密码\" required></div><div class=\"form-actions\"><button class=\"button\" type=\"submit\">登 录</button></div></form></section></div>";
   bind();
 }
 
@@ -207,7 +207,7 @@ function renderAccount(sessions) {
 
 function renderSetup() {
   const error = state.error ? "<div class=\"notice error\" role=\"alert\">" + escapeHtml(state.error) + "</div>" : "";
-  app.innerHTML = "<div class=\"auth-layout\"><section class=\"auth-card\"><div class=\"auth-brand\">" + brandLogo("auth-logo", "Lux Server Setup") + "</div><span class=\"eyebrow\">Initialization</span><h1 style=\"margin-top:.7rem\">初始化 Lux 媒体服务器</h1><p>创建首个服务器超级管理员。媒体库和刮削配置可在稍后配置。</p>" + error + "<form data-action=\"setup\"><div class=\"field\"><label for=\"setup-username\">管理员用户名</label><input id=\"setup-username\" name=\"username\" autocomplete=\"username\" required></div><div class=\"field\"><label for=\"setup-display-name\">显示名称</label><input id=\"setup-display-name\" name=\"displayName\" autocomplete=\"name\"></div><div class=\"field\"><label for=\"setup-password\">管理员密码</label><input id=\"setup-password\" name=\"password\" type=\"password\" autocomplete=\"new-password\" minlength=\"8\" required></div><fieldset class=\"setup-options\"><legend>可选配置</legend><div class=\"field\"><label for=\"setup-library-name\">首个媒体库名称</label><input id=\"setup-library-name\" name=\"libraryName\" placeholder=\"例: 电影库\"></div><div class=\"field\"><label for=\"setup-library-kind\">媒体库类型</label><select id=\"setup-library-kind\" name=\"libraryKind\"><option value=\"MIXED\">混合</option><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option></select></div><div class=\"field\"><label for=\"setup-library-root\">媒体库路径 (NAS / 挂载点)</label><input id=\"setup-library-root\" name=\"libraryRoot\" placeholder=\"例如 /media/movies\"><small>服务端将自动扫描改目录下所有的视频文件与 NFO。</small></div></fieldset><div class=\"form-actions\"><button class=\"button\" type=\"submit\">完成配置</button></div></form></section></div>";
+  app.innerHTML = "<div class=\"auth-layout\"><section class=\"auth-card\"><div class=\"auth-brand\">" + brandLogo("auth-logo", "Lux") + "</div><h1 style=\"margin-top:.7rem\">初始化 Lux 媒体服务器</h1><p>创建首个服务器超级管理员。媒体库和刮削配置可在稍后配置。</p>" + error + "<form data-action=\"setup\"><div class=\"field\"><label for=\"setup-username\">管理员用户名</label><input id=\"setup-username\" name=\"username\" autocomplete=\"username\" required></div><div class=\"field\"><label for=\"setup-display-name\">显示名称</label><input id=\"setup-display-name\" name=\"displayName\" autocomplete=\"name\"></div><div class=\"field\"><label for=\"setup-password\">管理员密码</label><input id=\"setup-password\" name=\"password\" type=\"password\" autocomplete=\"new-password\" minlength=\"8\" required></div><fieldset class=\"setup-options\"><legend>可选配置</legend><div class=\"field\"><label for=\"setup-library-name\">首个媒体库名称</label><input id=\"setup-library-name\" name=\"libraryName\" placeholder=\"例: 电影库\"></div><div class=\"field\"><label for=\"setup-library-kind\">媒体库类型</label><select id=\"setup-library-kind\" name=\"libraryKind\"><option value=\"MIXED\">混合</option><option value=\"MOVIE\">电影</option><option value=\"SERIES\">剧集</option></select></div><div class=\"field\"><label for=\"setup-library-root\">媒体库路径 (NAS / 挂载点)</label><input id=\"setup-library-root\" name=\"libraryRoot\" placeholder=\"例如 /media/movies\"><small>服务端将自动扫描改目录下所有的视频文件与 NFO。</small></div></fieldset><div class=\"form-actions\"><button class=\"button\" type=\"submit\">完成配置</button></div></form></section></div>";
   bind();
 }
 
@@ -288,7 +288,6 @@ function renderHome() {
         </div>
       </div></article>`
     : `<article class="home-hero home-hero-empty"><div class="home-hero-content">
-        <span class="eyebrow">Lux Media Server</span>
         <h2>你的私人高清影院</h2>
         <p>支持 4K 原盘直放、本地 NFO 元数据刮削与多设备同步。</p>
         <div class="hero-actions"><button class="button" type="button" data-route="libraries">浏览我的媒体库</button></div>
@@ -301,7 +300,7 @@ function renderHome() {
   const myLibrariesSection = `<section class="section home-section"><div class="section-heading"><h2>🍿 我的媒体库</h2><span>${libraries.length} 个本地存储卷</span></div><div class="library-rail">${libCards}</div></section>`;
   
   const progress = continueWatching.length
-    ? `<section class="section home-section"><div class="section-heading"><h2>▶ 继续观看 (Next Up)</h2><span>${continueWatching.length} 个未完结项</span></div>${renderRail(continueWatching, true)}</section>`
+    ? `<section class="section home-section"><div class="section-heading"><h2>▶ 继续观看</h2><span>${continueWatching.length} 个未完结项</span></div>${renderRail(continueWatching, true)}</section>`
     : "";
 
   const latestShelves = libraries
@@ -335,7 +334,7 @@ function renderLibraries() {
 }
 
 function renderFavorites(result) {
-  return "<section class=\"section\"><div class=\"library-header\"><div><span class=\"eyebrow\">Personal Collection</span><h2>我的收藏</h2></div><span>共 " + (result.total || 0) + " 项</span></div>" + renderGrid(result.items || []) + renderPagination(result, "favorites-page", "收藏翻页") + "</section>";
+  return "<section class=\"section\"><div class=\"library-header\"><div><h2>我的收藏</h2></div><span>共 " + (result.total || 0) + " 项</span></div>" + renderGrid(result.items || []) + renderPagination(result, "favorites-page", "收藏翻页") + "</section>";
 }
 
 function renderLibraryItems(result, library) {
@@ -351,7 +350,7 @@ function renderLibraryItems(result, library) {
     <button class="button" type="submit">筛选</button>
     <button class="button secondary" type="button" data-action="clear-library-filter">重置</button>
   </form>`;
-  return "<section class=\"section\"><div class=\"library-header\"><div><span class=\"eyebrow\">Library</span><h2>" + escapeHtml(library?.name || "媒体库") + "</h2></div><span>共 " + (result.total || 0) + " 项</span></div><div class=\"library-toolbar\">" + form + "</div>" + renderGrid(result.items || []) + renderPagination(result, "library-page", "媒体库翻页") + "</section>";
+  return "<section class=\"section\"><div class=\"library-header\"><div><h2>" + escapeHtml(library?.name || "媒体库") + "</h2></div><span>共 " + (result.total || 0) + " 项</span></div><div class=\"library-toolbar\">" + form + "</div>" + renderGrid(result.items || []) + renderPagination(result, "library-page", "媒体库翻页") + "</section>";
 }
 
 function renderGrid(items, heading = "") {
@@ -490,7 +489,7 @@ function renderChildrenPanel(item, result, showingEpisodes = false) {
   const items = result.items || [];
   if (item.itemType === "BOX_SET") return `<div class="section-heading"><h3>合集影片</h3><span>${result.total || items.length} 部</span></div>${renderGrid(items)}`;
   if (showingEpisodes) return `<div class="section-heading"><h3>单集列表</h3><button class="button secondary" type="button" data-show-seasons>返回季度</button></div>${renderGrid(items)}`;
-  const seasons = items.map((season) => `<button class="library-card" data-season="${escapeHtml(season.id)}"><span class="eyebrow">Season</span><strong>${escapeHtml(season.title || season.name)}</strong><span class="media-meta">查看单集 →</span></button>`).join("");
+  const seasons = items.map((season) => `<button class="library-card" data-season="${escapeHtml(season.id)}"><strong>${escapeHtml(season.title || season.name)}</strong><span class="media-meta">查看单集 →</span></button>`).join("");
   return `<div class="section-heading"><h3>季度列表</h3><span>${result.total || items.length} 个季度</span></div><div class="library-grid">${seasons || "<div class=\"empty\"><span>暂无季度</span></div>"}</div>`;
 }
 
@@ -552,9 +551,9 @@ function renderAdminDashboard({ ready = {}, health: reportedHealth, libraries = 
 
   return `<section class="section">
     <div class="admin-cards">
-      <div class="admin-card"><span class="eyebrow">Server Health</span><strong>${escapeHtml(health.status || "OK")}</strong><span>Schema v${escapeHtml(health.schemaVersion || "1")}</span></div>
-      <div class="admin-card"><span class="eyebrow">Libraries</span><strong>${libraries.length}</strong><span>已挂载媒体库</span></div>
-      <div class="admin-card"><span class="eyebrow">Users</span><strong>${users.length}</strong><span>活跃账号</span></div>
+      <div class="admin-card"><span class="eyebrow">服务器健康</span><strong>${escapeHtml(health.status || "OK")}</strong><span>架构 v${escapeHtml(health.schemaVersion || "1")}</span></div>
+      <div class="admin-card"><span class="eyebrow">媒体库</span><strong>${libraries.length}</strong><span>已挂载媒体库</span></div>
+      <div class="admin-card"><span class="eyebrow">用户</span><strong>${users.length}</strong><span>活跃账号</span></div>
     </div>
   </section>${healthDetails}`;
 }
@@ -634,7 +633,7 @@ function renderAdminMetadata({ pending = [] }) {
     <td><button class="button secondary" type="button" data-route="item" data-item="${escapeHtml(item.id)}">搜刮并确认</button></td>
   </tr>`).join("");
 
-  return `<section class="section"><div class="section-heading"><h2>待匹配元数据队列 (Pending Queue)</h2><span>搜刮置信度较低或缺乏 NFO 的条目</span></div>
+  return `<section class="section"><div class="section-heading"><h2>待匹配元数据队列</h2><span>搜刮置信度较低或缺乏 NFO 的条目</span></div>
   <div class="table-wrap"><table><thead><tr><th>条目标题</th><th>匹配状态</th><th>操作</th></tr></thead><tbody>${pendingRows || '<tr><td colspan="3">🎉 待处理队列为空，所有影视条目均已完成元数据匹配！</td></tr>'}</tbody></table></div></section>`;
 }
 

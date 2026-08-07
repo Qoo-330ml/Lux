@@ -53,14 +53,13 @@ export function AdminDashboardPage() {
   return (
     <div className="lux-admin-page lux-admin-dashboard-page">
       <header className="lux-admin-page-heading">
-        <div><span className="lux-eyebrow">SERVER OVERVIEW</span><h1>仪表盘</h1><p>服务器状态、实时播放和账户活动，都在这里快速掌握。</p></div>
+        <div><h1>仪表盘</h1><p>服务器状态、实时播放和账户活动，都在这里快速掌握。</p></div>
         <button className="lux-button lux-button-secondary lux-admin-refresh" type="button" onClick={() => void dashboard.refetch()}><RefreshCw size={16} /> 刷新</button>
       </header>
 
       <section className="lux-admin-server-identity" aria-labelledby="server-identity-heading">
         <div className="lux-admin-server-mark"><Server size={22} /></div>
         <div className="lux-admin-server-copy">
-          <span className="lux-eyebrow">SERVER IDENTITY</span>
           <h2 id="server-identity-heading">{server.name}</h2>
           <div className="lux-admin-server-meta"><span>Lux Server</span><span>v{server.version}</span><span>Schema {server.schemaVersion}</span><span className="lux-admin-server-status"><i />{status ? "运行正常" : "需要关注"}</span></div>
         </div>
@@ -72,23 +71,23 @@ export function AdminDashboardPage() {
       {saveServerName.error ? <p className="lux-error-copy lux-dashboard-inline-error">{saveServerName.error.message}</p> : null}
 
       <section className="lux-admin-dashboard-monitor-section" aria-labelledby="now-playing-heading">
-        <div className="lux-admin-monitor-heading"><div><span className="lux-eyebrow">LIVE SESSIONS</span><h2 id="now-playing-heading">正在播放</h2><p>实时查看每个账户的播放状态与直放链路。</p></div><span className="lux-admin-monitor-count">{nowPlaying.length} 个会话</span></div>
+        <div className="lux-admin-monitor-heading"><div><h2 id="now-playing-heading">正在播放</h2><p>实时查看每个账户的播放状态与直放链路。</p></div><span className="lux-admin-monitor-count">{nowPlaying.length} 个会话</span></div>
         <AdminDashboardNowPlaying sessions={nowPlaying} />
       </section>
 
       <section className="lux-admin-dashboard-monitor-section lux-admin-activity-section" aria-labelledby="activity-heading">
-        <div className="lux-admin-monitor-heading"><div><span className="lux-eyebrow">ACCOUNT ACTIVITY</span><h2 id="activity-heading">活跃状况</h2><p>开始播放、暂停和停止播放会按时间更新。</p></div><span className="lux-admin-monitor-count">最近 {recentPlaybackActivity.length} 条</span></div>
+        <div className="lux-admin-monitor-heading"><div><h2 id="activity-heading">活跃状况</h2><p>开始播放、暂停和停止播放会按时间更新。</p></div><span className="lux-admin-monitor-count">最近 {recentPlaybackActivity.length} 条</span></div>
         <AdminDashboardActivity events={recentPlaybackActivity} />
       </section>
 
       <div className="lux-admin-dashboard-grid">
         <section className="lux-admin-panel">
-          <div className="lux-admin-panel-heading"><div><span className="lux-eyebrow">RUNTIME</span><h2>运行状态</h2></div><span className={status ? "lux-status-pill is-ok" : "lux-status-pill is-warn"}>{status ? "正常" : "降级"}</span></div>
+          <div className="lux-admin-panel-heading"><div><h2>运行状态</h2></div><span className={status ? "lux-status-pill is-ok" : "lux-status-pill is-warn"}>{status ? "正常" : "降级"}</span></div>
           <div className="lux-admin-check-list">{checks.map((check) => <div className="lux-admin-check" key={check.label}><span className={check.ok ? "lux-check-icon is-ok" : "lux-check-icon is-warn"}>{check.ok ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}</span><span>{check.label}</span><small>{check.detail}</small></div>)}</div>
           <div className="lux-admin-meta-row"><span>Schema {health.schemaVersion}</span><span>SQLite {health.database.journalMode.toUpperCase()}</span></div>
         </section>
         <section className="lux-admin-panel">
-          <div className="lux-admin-panel-heading"><div><span className="lux-eyebrow">QUICK ACCESS</span><h2>管理入口</h2></div><HardDrive size={20} className="lux-admin-panel-icon" /></div>
+          <div className="lux-admin-panel-heading"><div><h2>管理入口</h2></div><HardDrive size={20} className="lux-admin-panel-icon" /></div>
           <div className="lux-admin-quick-links">
             <Link to="/admin/libraries"><Database size={17} /><span><strong>媒体库管理</strong><small>路径、扫描与计划</small></span></Link>
             <Link to="/admin/users"><ListChecks size={17} /><span><strong>用户与权限</strong><small>访问权限和设备策略</small></span></Link>
@@ -103,5 +102,5 @@ export function AdminDashboardPage() {
 function SettingsIcon() { return <span className="lux-quick-icon"><Settings2 size={17} /></span>; }
 
 function AdminState({ label, error = false }: { label: string; error?: boolean }) {
-  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><span className="lux-eyebrow">LUX ADMIN</span><h1>{error ? "控制台暂时不可用" : "正在加载控制台"}</h1><p>{label}</p></section>;
+  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "控制台暂时不可用" : "正在加载控制台"}</h1><p>{label}</p></section>;
 }

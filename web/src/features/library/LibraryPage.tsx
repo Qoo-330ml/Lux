@@ -73,7 +73,7 @@ export function LibraryPage() {
 
   return (
     <section className="lux-page lux-page-narrow">
-      <div className="lux-page-heading"><span className="lux-eyebrow">LIBRARY</span><h1>{library?.name || "媒体库"}</h1><p>{total} 项内容</p></div>
+      <div className="lux-page-heading"><h1>{library?.name || "媒体库"}</h1><p>{total} 项内容</p></div>
       <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={(value) => setSortOrder(value as LibrarySortOrder)} aria-label="排序顺序" /></div>

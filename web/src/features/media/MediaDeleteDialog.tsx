@@ -49,7 +49,6 @@ export function MediaDeleteDialog({ item, onClose, onConfirm, onDeleted }: Media
       <section className="lux-media-editor lux-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="lux-delete-title" aria-describedby="lux-delete-description">
         <header className="lux-media-editor-header">
           <div>
-            <span className="lux-eyebrow">DELETE MEDIA</span>
             <h2 id="lux-delete-title">删除媒体</h2>
           </div>
           <button ref={closeRef} className="lux-media-editor-close" type="button" aria-label="关闭删除确认" disabled={deleting} onClick={onClose}><X size={18} /></button>

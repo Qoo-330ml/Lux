@@ -25,7 +25,6 @@ export function LoginPage() {
       <div className="lux-auth-backdrop" />
       <motion.section className="lux-auth-card" initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.35 }}>
         <div className="lux-auth-brand"><img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" /><strong>Lux</strong></div>
-        <span className="lux-eyebrow">PERSONAL MEDIA SYSTEM</span>
         <h1>欢迎回到 Lux</h1>
         <p>进入你的私人电影空间。</p>
         <form className="lux-auth-form" onSubmit={submit}>

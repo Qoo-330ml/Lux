@@ -309,7 +309,6 @@ function ExpandableOverview({ overview }: { overview: string }) {
           <section className="lux-detail-overview-dialog" role="dialog" aria-modal="true" aria-labelledby="detail-overview-heading">
             <header className="lux-detail-overview-dialog-header">
               <div>
-                <span className="lux-eyebrow">DETAIL</span>
                 <h2 id="detail-overview-heading">详细简介</h2>
               </div>
               <button ref={closeButtonRef} className="lux-detail-overview-dialog-close" type="button" aria-label="关闭详细信息" onClick={() => setIsOpen(false)}>

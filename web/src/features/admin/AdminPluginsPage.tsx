@@ -27,7 +27,7 @@ export function AdminPluginsPage() {
   return (
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading">
-        <div><span className="lux-eyebrow">PLUGIN LIBRARY</span><h1>插件库</h1><p>安装已内置并经过验证的元数据插件，再为媒体库选择刮削器。</p></div>
+        <div><h1>插件库</h1><p>安装已内置并经过验证的元数据插件，再为媒体库选择刮削器。</p></div>
         <button className="lux-button lux-button-secondary lux-admin-refresh" type="button" onClick={() => { void plugins.refetch(); void installedPlugins.refetch(); }}><RefreshCw size={16} /> 刷新</button>
       </header>
       <nav className="lux-admin-plugin-tabs" aria-label="插件库视图">
@@ -172,7 +172,7 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
         <div className="lux-admin-plugin-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog(); }}>
           <section className="lux-admin-plugin-dialog" role="dialog" aria-modal="true" aria-labelledby={`plugin-config-title-${plugin.id}`}>
             <div className="lux-admin-plugin-dialog-heading">
-              <div><span className="lux-eyebrow">PLUGIN CONFIGURATION</span><h2 id={`plugin-config-title-${plugin.id}`}>{plugin.name}</h2></div>
+              <div><h2 id={`plugin-config-title-${plugin.id}`}>{plugin.name}</h2></div>
               <button ref={closeRef} className="lux-icon-button lux-admin-plugin-dialog-close" type="button" aria-label={`关闭 ${plugin.name}配置`} onClick={closeDialog}><X size={17} /></button>
             </div>
             <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
@@ -222,5 +222,5 @@ function availabilityLabel(source: AdminPlugin["configSource"]) {
 }
 
 function AdminPluginsState({ label, error = false }: { label: string; error?: boolean }) {
-  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><span className="lux-eyebrow">PLUGIN LIBRARY</span><h1>{error ? "插件库加载失败" : "正在加载插件库"}</h1><p>{label}</p></section>;
+  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "插件库加载失败" : "正在加载插件库"}</h1><p>{label}</p></section>;
 }

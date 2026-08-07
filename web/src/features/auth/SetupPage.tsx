@@ -26,7 +26,6 @@ export function SetupPage() {
     <main className="lux-auth-screen">
       <section className="lux-auth-card lux-setup-card">
         <div className="lux-auth-brand"><img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" /><strong>Lux</strong></div>
-        <span className="lux-eyebrow">INITIALIZE YOUR SERVER</span>
         <h1>开始使用 Lux</h1>
         <p>创建首个服务器管理员，稍后可以继续配置媒体库。</p>
         <form className="lux-auth-form" onSubmit={submit}>

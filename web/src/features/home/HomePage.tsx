@@ -77,7 +77,6 @@ function HeroCarousel({ items }: { items: MediaItem[] }) {
       <div className="lux-hero-overlay" />
       <AnimatePresence initial={false} mode="wait">
         <motion.div key={item?.id ?? "empty"} className="lux-hero-copy" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.38 }}>
-          <span className="lux-eyebrow">{items.length > 1 ? "LUX DAILY SELECTION" : "LUX ORIGINAL MEDIA SYSTEM"}</span>
           <h1 className="lux-hero-title">
             {logo ? <img className="lux-hero-logo" src={logo.url} alt={item ? mediaTitle(item) : "Lux 精选内容"} /> : item ? mediaTitle(item) : "你的私人影院"}
           </h1>

@@ -105,7 +105,7 @@ export function DirectoryPicker({
       onKeyDown={(event) => { if (event.key === "Escape") onClose(); }}
     >
       <header className="lux-directory-picker-header">
-        <div><span className="lux-eyebrow">SERVER FILESYSTEM</span><h4 id="lux-directory-picker-title">选择服务器目录</h4></div>
+        <div><h4 id="lux-directory-picker-title">选择服务器目录</h4></div>
         <button ref={closeRef} className="lux-library-dialog-icon" type="button" aria-label="关闭目录选择器" onClick={onClose}><X size={17} /></button>
       </header>
       <p className="lux-directory-picker-help">这里显示 Lux 服务可访问的目录；Docker 部署时请选择已经挂载到容器内的媒体目录。</p>

@@ -73,7 +73,6 @@ export function AdminSettingsPage() {
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading">
         <div>
-          <span className="lux-eyebrow">SERVER SETTINGS</span>
           <h1>服务器设置</h1>
           <p>调整播放状态、网络访问和用户体验相关的全局策略。</p>
         </div>
@@ -81,7 +80,7 @@ export function AdminSettingsPage() {
 
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="playback-settings-heading">
         <div className="lux-admin-panel-heading">
-          <div><span className="lux-eyebrow">PLAYBACK</span><h2 id="playback-settings-heading">播放行为</h2></div>
+          <div><h2 id="playback-settings-heading">播放行为</h2></div>
           <Settings2 size={20} className="lux-admin-panel-icon" />
         </div>
         <div className="lux-admin-settings-form">
@@ -111,7 +110,7 @@ export function AdminSettingsPage() {
 
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="network-proxy-heading">
         <div className="lux-admin-panel-heading">
-          <div><span className="lux-eyebrow">NETWORK</span><h2 id="network-proxy-heading">网络代理设置</h2></div>
+          <div><h2 id="network-proxy-heading">网络代理设置</h2></div>
         </div>
         <div className="lux-admin-settings-form">
           <label>
@@ -152,7 +151,7 @@ export function AdminSettingsPage() {
       </section>
 
       <section className="lux-admin-panel lux-admin-settings-note">
-        <div className="lux-admin-panel-heading"><div><span className="lux-eyebrow">ABOUT THIS SERVER</span><h2>服务信息</h2></div></div>
+        <div className="lux-admin-panel-heading"><div><h2>服务信息</h2></div></div>
         <p>媒体扫描、元数据任务和数据库健康状态可在控制台的对应页面查看。Lux Web 与管理 API 使用同源会话和 CSRF 保护。</p>
       </section>
     </div>
@@ -182,5 +181,5 @@ function NetworkProxyProbeRow({ probe }: { probe: NetworkProxyProbe }) {
 }
 
 function AdminSettingsState({ label, error = false }: { label: string; error?: boolean }) {
-  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><span className="lux-eyebrow">LUX ADMIN</span><h1>{error ? "设置加载失败" : "正在加载设置"}</h1><p>{label}</p></section>;
+  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "设置加载失败" : "正在加载设置"}</h1><p>{label}</p></section>;
 }

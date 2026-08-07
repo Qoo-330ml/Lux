@@ -84,7 +84,6 @@ export function MediaSubtitleEditor({ item, sourceId, onClose, onSaved }: MediaS
       <section className="lux-media-editor lux-subtitle-editor" role="dialog" aria-modal="true" aria-labelledby="lux-subtitle-editor-title">
         <header className="lux-media-editor-header">
           <div>
-            <span className="lux-eyebrow">EDIT SUBTITLES</span>
             <h2 id="lux-subtitle-editor-title">编辑字幕</h2>
             <p>{mediaTitle(item)} · 仅编辑已索引的外挂字幕属性</p>
           </div>

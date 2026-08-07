@@ -106,7 +106,7 @@ export function AdminOperationsPage() {
   return (
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading">
-        <div><span className="lux-eyebrow">LUX ADMIN</span><h1>任务与日志</h1><p>查看扫描、元数据匹配、元数据刷新和管理员操作记录。</p></div>
+        <div><h1>任务与日志</h1><p>查看扫描、元数据匹配、元数据刷新和管理员操作记录。</p></div>
         <button className="lux-button lux-button-secondary" type="button" onClick={refresh}><RefreshCw size={16} /> 刷新</button>
       </header>
       <AdminScheduledTasksPanel />
@@ -171,4 +171,4 @@ function JobRow({ job, onCancel, onRetry, busy }: { job: OperationsJob; onCancel
   return <article className="lux-admin-job-row"><div className={active ? "lux-job-icon is-active" : "lux-job-icon"}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div><div className="lux-admin-job-main"><div className="lux-admin-job-heading"><strong>{formatJobType(job.jobType)}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{formatJobStatus(job.status)}</span></div><small>{job.kind === "metadata" ? "后台元数据任务" : "扫描任务"}{job.libraryId ? ` · 媒体库 ${job.libraryId}` : ""} · {job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}{error ? ` · ${error}` : ""}</small>{progress !== null ? <div className="lux-job-progress"><span style={{ width: `${progress}%` }} /></div> : null}</div><div className="lux-admin-job-actions">{active ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消任务" onClick={onCancel} disabled={busy}><StopCircle size={15} /></button> : null}{retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}</div></article>;
 }
 
-function AdminOperationsState({ label, error = false }: { label: string; error?: boolean }) { return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><span className="lux-eyebrow">LUX ADMIN</span><h1>{error ? "任务数据加载失败" : "正在加载任务"}</h1><p>{label}</p></section>; }
+function AdminOperationsState({ label, error = false }: { label: string; error?: boolean }) { return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "任务数据加载失败" : "正在加载任务"}</h1><p>{label}</p></section>; }
