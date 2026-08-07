@@ -8,7 +8,7 @@
 |---|---|---|---|---|---|---|---|---|---|
 | Infuse | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 待 LUX-025 |
 | VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目详情通过 | 通过 | 通过 | 未测试 | 2026-08-05 本机 ARM64 真实 UI 播放本地 MKV，Playing/Progress/Stopped 回传和 Resume 读回通过；收藏/已观看状态另有 2026-08-03 证据 |
-| SenPlayer | 6.0.6 | macOS arm64 | 通过 | 通过 | 首页、电影列表通过 | 未测试 | 未测试 | 未测试 | 2026-08-06 修复 `GET /emby/Users/:userId`、列表 `Fields` 语义，并让服务监听客户端实际访问的局域网地址；真实 UI 已显示电影条目 |
+| SenPlayer | 6.0.6 | macOS arm64 | 通过 | 通过 | 首页、电影列表通过 | 通过 | 未测试 | 未测试 | 2026-08-07 本机 ARM64 真实 UI 播放 `.strm` 电影通过；服务端兼容客户端生成的小写 `/emby/videos` 和路径内编码查询参数，并对远程源返回 307 直连重定向 |
 | Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
 
 ## 记录格式
@@ -79,6 +79,8 @@ VidHub 2.1.8（macOS arm64）连接当前 Mac 地址 `http://192.168.50.108:8097
 最终数据库记录绑定到该本地 MKV 的 `media_source_id`，`user_item_state.position_ticks=861670000`；播放会话的 `state=STOPPED`。该实测证明 VidHub 播放、退出停止和继续观看进度回传链路已打通。文件名中的 `2160p` 只属于媒体源标签，本机 ffprobe 对该夹具实际识别为 1920x1080 H.264，属于现有测试媒体内容差异。
 
 SenPlayer 6.0.6 的历史实测结果：服务器已添加，但客户端重复请求 `POST /emby/Users/AuthenticateByName`，服务端均返回 `200`；客户端随后显示“未能读取数据，数据已丢失”，没有继续请求 `System/Info`。2026-08-06 真实 UI 重试捕获到认证后的 `GET /emby/Users/:userId`；该路由此前缺失，请求落入 Web 前端 fallback 并返回 HTML 200，正是客户端 JSON 解析失败的直接原因。补齐路由后，列表接口按请求的 `Fields` 省略未请求的 `MediaSources/MediaStreams`，并将服务监听到 SenPlayer 实际使用的 `192.168.50.108:8097`；真实 UI 已进入“我的媒体”，电影页显示 16 个条目，服务端总数为 22。
+
+2026-08-07 SenPlayer 6.0.6 播放复测：客户端请求的脱敏路径为 `/emby/videos/:itemId/stream.mkv%3F...`，Lux 返回 `307` 并将 `.strm` 的外部地址放入 `Location`，不代理媒体字节；SenPlayer 播放器显示真实画面并以约 2.3 MB/s 读取，SQLite 播放会话记录为 `PLAYING`。未记录 token、Cookie、真实 `.strm` URL 或用户数据。
 
 ### 可重复的本地协议探针
 

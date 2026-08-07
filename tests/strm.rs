@@ -59,6 +59,11 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         sqlx::query_scalar("SELECT mi.id FROM media_items mi WHERE mi.title = 'Remote Movie'")
             .fetch_one(database.pool())
             .await?;
+    let remote_source_id: String =
+        sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+            .bind(&remote_item_id)
+            .fetch_one(database.pool())
+            .await?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
@@ -93,6 +98,24 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(
         body["MediaSources"][0]["DirectStreamUrl"],
+        "https://media.example.test/video?id=7&token=secret"
+    );
+
+    let no_redirect_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let senplayer_stream = no_redirect_client
+        .get(format!(
+            "http://{address}/emby/videos/{remote_item_id}/stream.mkv%3FMediaSourceId={remote_source_id}&X-Emby-Token={token}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(
+        senplayer_stream.status(),
+        reqwest::StatusCode::TEMPORARY_REDIRECT
+    );
+    assert_eq!(
+        senplayer_stream.headers()[reqwest::header::LOCATION],
         "https://media.example.test/video?id=7&token=secret"
     );
     server.abort();

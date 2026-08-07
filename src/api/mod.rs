@@ -856,6 +856,22 @@ fn emby_routes() -> Router<AppState> {
             get(emby_stream_with_source_and_container).head(emby_stream_with_source_and_container),
         )
         .route(
+            "/videos/{item_id}/stream",
+            get(emby_stream).head(emby_stream),
+        )
+        .route(
+            "/videos/{item_id}/stream.{container}",
+            get(emby_stream_with_container).head(emby_stream_with_container),
+        )
+        .route(
+            "/videos/{item_id}/{media_source_id}/stream",
+            get(emby_stream_with_source).head(emby_stream_with_source),
+        )
+        .route(
+            "/videos/{item_id}/{media_source_id}/stream.{container}",
+            get(emby_stream_with_source_and_container).head(emby_stream_with_source_and_container),
+        )
+        .route(
             "/Items/{item_id}/PlaybackInfo",
             get(emby_playback_info).post(emby_playback_info),
         )
@@ -5152,6 +5168,32 @@ struct EmbyStreamQuery {
     media_source_id: Option<String>,
 }
 
+fn emby_stream_query_from_path(
+    mut query: EmbyStreamQuery,
+    container: &str,
+) -> (String, EmbyStreamQuery) {
+    let Some((container, embedded_query)) = container.split_once('?') else {
+        return (container.to_owned(), query);
+    };
+    for pair in embedded_query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if query.media_source_id.is_none() && key.eq_ignore_ascii_case("mediaSourceId") {
+            query.media_source_id = Some(value.to_owned());
+        }
+        if query.api_key.is_none()
+            && (key.eq_ignore_ascii_case("api_key")
+                || key.eq_ignore_ascii_case("apiKey")
+                || key.eq_ignore_ascii_case("X-Emby-Token")
+                || key.eq_ignore_ascii_case("X-MediaBrowser-Token"))
+        {
+            query.api_key = Some(value.to_owned());
+        }
+    }
+    (container.to_owned(), query)
+}
+
 async fn emby_stream(
     headers: HeaderMap,
     method: Method,
@@ -5182,6 +5224,7 @@ async fn emby_stream_with_container(
     Query(query): Query<EmbyStreamQuery>,
     State(state): State<AppState>,
 ) -> Response {
+    let (container, query) = emby_stream_query_from_path(query, &container);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -5228,6 +5271,7 @@ async fn emby_stream_with_source_and_container(
     Query(query): Query<EmbyStreamQuery>,
     State(state): State<AppState>,
 ) -> Response {
+    let (container, query) = emby_stream_query_from_path(query, &container);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -5348,19 +5392,30 @@ async fn serve_media_file(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let source = match media_source_id {
-        Some(source_id) => {
-            database
-                .find_media_source_path_by_id(item_id, source_id)
-                .await
-        }
-        None => database.find_media_source_path(item_id).await,
-    };
+    let source = database
+        .find_playback_source(item_id, media_source_id)
+        .await;
     let source = match source {
         Ok(Some(source)) => source,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    if source.source_kind == "STRM_URL" {
+        let Some(external_url) = source.external_url else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let Ok(location) = HeaderValue::from_str(&external_url) else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        return match Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header("Location", location)
+            .body(Body::empty())
+        {
+            Ok(response) => response,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
     let path = match canonical_local_media_path(&source.root_path, &source.relative_path).await {
         Ok(path) => path,
         Err(LocalPathError::Missing) => return StatusCode::NOT_FOUND.into_response(),
