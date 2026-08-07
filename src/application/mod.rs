@@ -8,6 +8,7 @@ pub mod directory_browser;
 pub mod downloads;
 pub mod identification;
 pub mod images;
+pub mod ip_location;
 pub mod libraries;
 pub mod library_covers;
 pub mod media_matching;

@@ -212,7 +212,7 @@ fn first_forwarded_proto(value: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn is_public_address(address: IpAddr) -> bool {
+pub fn is_public_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let value = u32::from(address);
