@@ -486,7 +486,7 @@ export class LuxApiClient {
   }
 
   updateAdminScheduledTask(input: {
-    ownerType: "LIBRARY";
+    ownerType: "GLOBAL" | "LIBRARY";
     ownerId: string;
     taskType: string;
     schedule: string | null;

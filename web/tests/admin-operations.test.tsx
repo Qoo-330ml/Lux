@@ -76,7 +76,7 @@ describe("AdminOperationsPage", () => {
     });
   });
 
-  it("shows all saved schedules and a library schedule form", async () => {
+  it("shows all saved schedules and lets the form target a global schedule", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
@@ -127,13 +127,14 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).toContain("电影库");
     expect(container.textContent).toContain("增量扫描");
     expect(container.textContent).toContain("interval:30s");
-    expect(container.querySelector("select[name='schedule-library']")).not.toBeNull();
+    expect(container.querySelector("select[name='schedule-owner']")).not.toBeNull();
+    expect(container.querySelector("select[name='schedule-owner'] option[value='GLOBAL:global']")?.textContent).toBe("全局");
 
-    const librarySelect = container.querySelector("select[name='schedule-library']") as HTMLSelectElement;
+    const ownerSelect = container.querySelector("select[name='schedule-owner']") as HTMLSelectElement;
     const scheduleInput = container.querySelector("input[name='schedule-expression']") as HTMLInputElement;
     act(() => {
-      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(librarySelect, "library-1");
-      librarySelect.dispatchEvent(new Event("change", { bubbles: true }));
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(ownerSelect, "GLOBAL:global");
+      ownerSelect.dispatchEvent(new Event("change", { bubbles: true }));
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(scheduleInput, "interval:1h");
       scheduleInput.dispatchEvent(new Event("input", { bubbles: true }));
       scheduleInput.dispatchEvent(new Event("change", { bubbles: true }));
@@ -141,8 +142,8 @@ describe("AdminOperationsPage", () => {
     await act(async () => {
       (container.querySelector(".lux-admin-schedule-form button[type='submit']") as HTMLButtonElement).click();
       await vi.waitFor(() => expect(updateSchedule).toHaveBeenCalledWith({
-        ownerType: "LIBRARY",
-        ownerId: "library-1",
+        ownerType: "GLOBAL",
+        ownerId: "global",
         taskType: "INCREMENTAL_SCAN",
         schedule: "interval:1h",
         isEnabled: true,
