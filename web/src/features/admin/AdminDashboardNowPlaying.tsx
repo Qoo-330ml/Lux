@@ -41,12 +41,6 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
             <span className="lux-now-playing-year">{session.productionYear ?? "—"}</span>
           </div>
 
-          <div className="lux-now-playing-meta">
-            <span className="lux-now-playing-episode">{episodeLabel(session)}</span>
-            <span className="lux-now-playing-separator" aria-hidden="true">•</span>
-            <span>{session.itemType === "MOVIE" ? "电影" : "媒体"}</span>
-          </div>
-
           <div className="lux-now-playing-account">
             <span className="lux-now-playing-account-avatar"><UserRound size={15} /></span>
             <strong>{session.userName || "未知账户"}</strong>

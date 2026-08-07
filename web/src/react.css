@@ -508,9 +508,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-now-playing-title:hover { color: var(--lux-now-card-accent); }
 .lux-now-playing-subtitle { min-height: 12px; margin-top: 2px; overflow: hidden; color: var(--lux-now-card-secondary); font-size: .58rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-now-playing-year { flex: 0 0 auto; color: var(--lux-now-card-meta); font-size: .7rem; font-weight: 700; }
-.lux-now-playing-meta { display: flex; align-items: center; gap: 6px; margin-top: 7px; color: var(--lux-now-card-meta); font-size: .58rem; font-weight: 650; }
-.lux-now-playing-episode { color: var(--lux-now-card-title); }
-.lux-now-playing-separator, .lux-now-playing-account-separator { color: var(--lux-now-card-secondary); }
+.lux-now-playing-account-separator { color: var(--lux-now-card-secondary); }
 .lux-now-playing-account { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 8px; color: var(--lux-now-card-meta); font-size: .58rem; }
 .lux-now-playing-account strong { color: var(--lux-now-card-title); font-weight: 700; }
 .lux-now-playing-account > svg { color: var(--lux-now-card-icon); }
@@ -800,7 +798,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-server-form .lux-button { width: 100%; }
   .lux-now-playing-body { grid-template-columns: 66px minmax(0, 1fr); gap: 9px; padding: 10px; }
   .lux-now-playing-title { display: -webkit-box; font-size: .85rem; line-height: 1.2; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
-  .lux-now-playing-meta { margin-top: 6px; font-size: .52rem; }
   .lux-now-playing-account { margin-top: 7px; font-size: .52rem; }
   .lux-now-playing-account-avatar { width: 17px; height: 17px; }
   .lux-now-playing-account-entry { max-width: calc(50% - 8px); }

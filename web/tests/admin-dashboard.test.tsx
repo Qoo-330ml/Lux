@@ -131,6 +131,9 @@ describe("AdminDashboardPage", () => {
     expect(container.querySelectorAll(".lux-admin-stat")).toHaveLength(0);
     expect(container.textContent).toContain("爱情情节顶红");
     expect(container.textContent).toContain("S1 · E9");
+    const playbackCard = container.querySelector(".lux-now-playing-card");
+    expect(playbackCard?.querySelector(".lux-now-playing-meta")).toBeNull();
+    expect(playbackCard?.textContent?.match(/S1 · E9/g)).toHaveLength(1);
     expect(container.textContent).toContain("VidHub");
     expect(container.textContent).toContain("v3.0.2");
     const deviceEntry = container.querySelectorAll(".lux-now-playing-account-entry")[0];
@@ -168,5 +171,44 @@ describe("AdminDashboardPage", () => {
       container.querySelector<HTMLButtonElement>("button[type='submit']")?.click();
       await vi.waitFor(() => expect(update).toHaveBeenCalledWith({ serverName: "书房 Lux" }));
     });
+  });
+
+  it("shows a movie kind once instead of repeating it across card metadata", async () => {
+    const movieDashboard: AdminDashboard = {
+      ...dashboard,
+      nowPlaying: [{
+        ...dashboard.nowPlaying[0],
+        id: "playback-movie",
+        title: "一毛",
+        originalTitle: null,
+        itemType: "MOVIE",
+        productionYear: 2019,
+        parentIndexNumber: null,
+        indexNumber: null,
+      }],
+    };
+    vi.spyOn(api, "adminDashboard").mockResolvedValue(movieDashboard);
+    vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
+    vi.spyOn(api, "adminHealth").mockResolvedValue(movieDashboard.health);
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminDashboardPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("一毛"));
+    });
+
+    const movieCard = container.querySelector(".lux-now-playing-card");
+    expect(movieCard?.textContent?.match(/电影/g)).toHaveLength(1);
+    expect(movieCard?.querySelector(".lux-now-playing-meta")).toBeNull();
   });
 });
