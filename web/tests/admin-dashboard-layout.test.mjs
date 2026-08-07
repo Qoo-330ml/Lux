@@ -52,6 +52,8 @@ test("now-playing cards use theme tokens and compact proportions", () => {
   assert.match(bodyRule, /gap:\s*14px/);
   assert.match(bodyRule, /padding:\s*12px\s+16px/);
   assert.match(bodyRule, /minmax\(84px,\s*9%\)/);
+  assert.match(factsRule, /display:\s*flex/);
+  assert.match(factsRule, /flex-direction:\s*column/);
   assert.match(factsRule, /background:\s*transparent/);
   assert.match(networkRule, /background:\s*transparent/);
   assert.match(clientRule, /border-left:\s*0/);
