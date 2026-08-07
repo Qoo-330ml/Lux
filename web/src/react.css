@@ -461,7 +461,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   --lux-overview-text: #f5f5f5;
   --lux-overview-muted: rgba(245, 245, 245, .58);
   --lux-overview-icon: rgba(245, 245, 245, .78);
-  --lux-overview-input-bg: rgba(255,255,255,.035);
   --lux-overview-accent: #75d78b;
   --lux-overview-status-bg: rgba(102, 210, 122, .13);
   display: grid;
@@ -474,12 +473,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 }
 .lux-admin-overview-top { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(125px, .45fr) minmax(150px, .65fr); align-items: center; gap: 20px; padding: 20px 22px; border-bottom: 1px solid var(--lux-overview-line); }
 .lux-admin-overview-identity { display: block; min-width: 0; }
-.lux-admin-overview-name-form { position: relative; min-width: 0; }
-.lux-admin-overview-name-form input { width: 100%; min-height: 42px; padding: 0 40px 0 0; overflow: hidden; border: 0; border-radius: 0; outline: 0; color: var(--lux-overview-text); background: transparent; font-size: 1.05rem; letter-spacing: -.025em; text-overflow: ellipsis; }
-.lux-admin-overview-name-form input:focus { border-color: transparent; box-shadow: 0 2px 0 color-mix(in srgb, var(--lux-overview-accent) 48%, transparent); }
-.lux-admin-overview-name-form button { position: absolute; top: 50%; right: 8px; display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; color: var(--lux-overview-icon); background: transparent; transform: translateY(-50%); }
-.lux-admin-overview-name-form button:hover:not(:disabled) { color: var(--lux-overview-accent); }
-.lux-admin-overview-name-form button:disabled { opacity: .55; }
+.lux-admin-overview-server-name-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.lux-admin-overview-server-name { min-width: 0; overflow: hidden; color: var(--lux-overview-text); font-size: 1.05rem; font-weight: 550; letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-overview-name-edit { display: grid; place-items: center; flex: 0 0 auto; width: 32px; height: 32px; padding: 0; border: 0; color: var(--lux-overview-icon); background: transparent; }
+.lux-admin-overview-name-edit:hover, .lux-admin-overview-name-edit:focus-visible { color: var(--lux-overview-accent); }
 .lux-admin-overview-status { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 34px; padding: 0 11px; border: 1px solid color-mix(in srgb, var(--lux-overview-accent) 28%, var(--lux-overview-line)); border-radius: 999px; color: var(--lux-overview-accent); background: var(--lux-overview-status-bg); font-size: .72rem; font-weight: 650; white-space: nowrap; }
 .lux-admin-overview-status i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, var(--lux-overview-accent) 12%, transparent); }
 .lux-admin-overview-status.is-alert { --lux-overview-accent: #d49a4d; --lux-overview-status-bg: rgba(212, 154, 77, .13); }
@@ -493,6 +490,19 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-overview-metric:first-child { padding-left: 0; }
 .lux-admin-overview-metric:last-child { padding-right: 0; }
 .lux-admin-overview-metric > span:last-child { display: grid; min-width: 0; gap: 5px; }
+
+.lux-server-name-dialog-backdrop { position: fixed; z-index: 60; inset: 0; display: grid; align-items: start; justify-items: center; padding: 3px 10px 20px; background: rgba(0,0,0,.58); }
+.lux-server-name-dialog { display: flex; width: min(568px, calc(100vw - 20px)); min-height: 316px; flex-direction: column; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 13px; color: var(--lux-text); background: var(--lux-surface-strong); box-shadow: 0 18px 50px rgba(0,0,0,.35); }
+.lux-server-name-dialog-close { display: grid; place-items: center; align-self: flex-start; width: 34px; height: 34px; margin: 13px 0 0 13px; padding: 0; border: 0; color: var(--lux-text); background: transparent; }
+.lux-server-name-dialog-close:hover { color: var(--lux-muted); }
+.lux-server-name-dialog-form { display: flex; min-height: 265px; flex-direction: column; padding: 18px 31px 16px; }
+.lux-server-name-dialog-form label { color: var(--lux-text); font-size: .72rem; }
+.lux-server-name-dialog-form input { width: 100%; min-height: 34px; margin-top: 4px; padding: 0 10px; border: 2px solid #70c96d; border-radius: 6px; outline: 0; color: var(--lux-text); background: transparent; font-size: .78rem; }
+.lux-server-name-dialog-form input:focus { border-color: var(--lux-overview-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--lux-overview-accent) 16%, transparent); }
+.lux-server-name-dialog-form p { margin: 4px 0 0; color: var(--lux-muted); font-size: .65rem; line-height: 1.45; }
+.lux-server-name-dialog-form .lux-server-name-dialog-error { color: #e58e98; }
+.lux-server-name-dialog-save { min-height: 34px; margin-top: auto; border: 0; border-radius: 999px; color: #fff; background: #4fb64b; font-size: .72rem; font-weight: 650; }
+.lux-server-name-dialog-save:hover:not(:disabled) { background: #5bc456; }
 .lux-admin-server-identity { display: grid; grid-template-columns: auto minmax(0, 1fr) minmax(280px, .82fr); align-items: center; gap: 20px; padding: 22px 24px; border: 1px solid var(--lux-line-soft); border-radius: 17px; background: linear-gradient(105deg, rgba(255,255,255,.055), rgba(255,255,255,.018)); }
 .lux-admin-server-mark { display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid rgba(210,71,191,.38); border-radius: 15px; color: #f5a7e5; background: rgba(210,71,191,.11); box-shadow: 0 10px 28px rgba(210,71,191,.1); }
 .lux-admin-server-copy { min-width: 0; }
@@ -839,7 +849,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-overview-card { margin: 0 -2px; }
   .lux-admin-overview-top { grid-template-columns: minmax(0, 1fr) auto; gap: 14px; }
   .lux-admin-overview-identity { grid-column: 1 / -1; }
-  .lux-admin-overview-name-form input { min-height: 40px; padding-left: 11px; font-size: .96rem; }
+  .lux-admin-overview-server-name { font-size: .96rem; }
   .lux-admin-overview-status { justify-self: start; }
   .lux-admin-overview-info:last-child { grid-column: 1 / -1; padding-top: 14px; border-top: 1px solid var(--lux-overview-line); }
   .lux-admin-overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 20px; padding: 18px 17px 0; }
@@ -1354,7 +1364,6 @@ html[data-lux-theme="light"] .lux-admin-overview-card {
   --lux-overview-text: #172337;
   --lux-overview-muted: #60738c;
   --lux-overview-icon: #30445a;
-  --lux-overview-input-bg: rgba(28,28,34,.035);
   --lux-overview-accent: #18a832;
   --lux-overview-status-bg: #edf9ef;
 }
