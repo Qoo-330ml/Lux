@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -15,8 +14,8 @@ use crate::network::{client_builder_from_env_or, is_public_address};
 
 const HIOFD_API_URL: &str = "https://toola.hiofd.com/router/rest";
 const HIOFD_SERVICE_ID: &str = "IpQuery";
-const HIOFD_KEY_ENV: &str = "LUX_HIOFD_KEY";
-const HIOFD_PWD_ENV: &str = "LUX_HIOFD_PWD";
+const HIOFD_KEY: &str = "key11";
+const HIOFD_PWD: &str = "pwd11";
 const HIOFD_REFERER: &str = "https://tool.hiofd.com/ip/";
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -53,7 +52,6 @@ impl IpLocation {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum IpLocationError {
-    CredentialsUnavailable,
     ClientBuild,
     EntropyUnavailable,
     ClockUnavailable,
@@ -69,7 +67,6 @@ pub enum IpLocationError {
 impl std::fmt::Display for IpLocationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::CredentialsUnavailable => "ip location credentials unavailable",
             Self::ClientBuild => "ip location client unavailable",
             Self::EntropyUnavailable => "ip location request entropy unavailable",
             Self::ClockUnavailable => "ip location request clock unavailable",
@@ -107,14 +104,6 @@ struct CacheEntry {
 
 impl IpLocationService {
     pub fn new_with_proxy(proxy_url: Option<&str>) -> Result<Self, IpLocationError> {
-        let key = env::var(HIOFD_KEY_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(IpLocationError::CredentialsUnavailable)?;
-        let pwd = env::var(HIOFD_PWD_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(IpLocationError::CredentialsUnavailable)?;
         let builder =
             client_builder_from_env_or(proxy_url).map_err(|_| IpLocationError::ClientBuild)?;
         let client = builder
@@ -124,8 +113,8 @@ impl IpLocationService {
             .map_err(|_| IpLocationError::ClientBuild)?;
         Ok(Self {
             client,
-            key,
-            pwd,
+            key: HIOFD_KEY.to_owned(),
+            pwd: HIOFD_PWD.to_owned(),
             cache: Arc::new(Mutex::new(CacheState::default())),
         })
     }
@@ -223,8 +212,8 @@ impl IpLocationService {
     fn new_for_test() -> Self {
         Self {
             client: Client::new(),
-            key: "test-key".to_owned(),
-            pwd: "test-pwd".to_owned(),
+            key: HIOFD_KEY.to_owned(),
+            pwd: HIOFD_PWD.to_owned(),
             cache: Arc::new(Mutex::new(CacheState::default())),
         }
     }
@@ -382,8 +371,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        IpLocationService, SUCCESS_CACHE_TTL, build_security_fields, is_public_lookup_address,
-        parse_hiofd_response,
+        HIOFD_KEY, HIOFD_PWD, IpLocationService, SUCCESS_CACHE_TTL, build_security_fields,
+        is_public_lookup_address, parse_hiofd_response,
     };
 
     #[test]
@@ -470,5 +459,12 @@ mod tests {
 
         assert_eq!(service.cached_or_schedule("8.8.8.8"), Some(result));
         assert_eq!(SUCCESS_CACHE_TTL, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn uses_the_builtin_hiofd_protocol_fields() {
+        assert_eq!(HIOFD_KEY, "key11");
+        assert_eq!(HIOFD_PWD, "pwd11");
+        assert_eq!(IpLocationService::new_for_test().key, HIOFD_KEY);
     }
 }

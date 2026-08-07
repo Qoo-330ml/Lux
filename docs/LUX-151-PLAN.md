@@ -7,7 +7,7 @@
 ## 接口与边界
 
 - Hiofd 请求只使用固定的 `https://toola.hiofd.com/router/rest` 地址和固定服务标识；不接受用户提交的上游 URL。
-- Hiofd 的协议字段通过 `LUX_HIOFD_KEY` 和 `LUX_HIOFD_PWD` 注入；Lux 不在仓库中内置或记录第三方协议凭据，缺少配置时归属地功能保持关闭。
+- Hiofd 的公开协议字段按参考项目内置为 `key11` 和 `pwd11`；它们不会返回 API、写入日志或持久化到数据库。
 - 查询输入只来自 Lux 已按可信代理规则确定的播放会话 `remoteIp`。
 - 只查询公网 IPv4/IPv6；私网、回环、链路本地、未指定和多播地址直接跳过。
 - `GET /api/v1/admin/dashboard` 的每个 `nowPlaying` 项增加可空 `remoteIpLocation`：`location`、`district`、`street`、`isp`。解析未完成或失败时为 `null`。

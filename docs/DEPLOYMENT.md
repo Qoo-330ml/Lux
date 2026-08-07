@@ -30,7 +30,7 @@ LUX_TMDB_READ_ACCESS_TOKEN=***
 
 `LUX_PROXY_URL` 可选，用于 Lux 的出站网络请求，例如元数据、图片和人物头像下载。支持 `http://`、`https://`、`socks4://`、`socks4a://`、`socks5://` 和 `socks5h://` 代理地址；代理 URL 可包含用户名认证信息。留空时使用标准系统代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`）；这些变量也可使用小写形式。代理地址不参与入站反向代理，也不改变 `.strm` 直交行为。包含认证信息的代理 URL 应只通过受保护的环境变量或 secrets 注入，不能写入日志。
 
-IP 归属地解析是可选能力。需要使用 Hiofd 时，通过受保护的环境变量注入 `LUX_HIOFD_KEY` 和 `LUX_HIOFD_PWD`；Lux 不提供默认值，也不会把这两个字段写入日志、数据库或 API。未配置时管理员仪表盘仍显示客户端 IP，但归属地为空。
+IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
 
 `LUX_TRUSTED_PROXY_CIDRS` 只能填写实际代理节点或网关的地址范围，不能使用 `0.0.0.0/0`。Lux 只信任来自这些地址的 `X-Forwarded-For`。
 
