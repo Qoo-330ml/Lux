@@ -92,7 +92,7 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
 }
 
 function Fact({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail: string }) {
-  return <div className="lux-now-playing-fact"><span className="lux-now-playing-fact-icon">{icon}</span><div><small>{label}</small><strong>{value}</strong><span>{detail}</span></div></div>;
+  return <div className="lux-now-playing-fact"><span className="lux-now-playing-fact-icon">{icon}</span><div className="lux-now-playing-fact-copy"><small>{label}：</small><strong>{value}</strong>{detail !== "—" ? <span> · {detail}</span> : null}</div></div>;
 }
 
 function DeviceField({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail?: string | null }) {

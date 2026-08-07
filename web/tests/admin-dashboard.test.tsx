@@ -155,6 +155,9 @@ describe("AdminDashboardPage", () => {
     expect(container.querySelector(".lux-now-playing-account")).not.toBeNull();
     expect(container.querySelector(".lux-now-playing-facts")).not.toBeNull();
     expect(container.querySelectorAll(".lux-now-playing-fact")).toHaveLength(3);
+    expect(container.querySelectorAll(".lux-now-playing-fact")[0]?.textContent).toBe("来源：4K HEVC · MKV · 4.0 Mbps");
+    expect(container.querySelectorAll(".lux-now-playing-fact")[1]?.textContent).toBe("视频：HEVC · 4K HDR");
+    expect(container.querySelectorAll(".lux-now-playing-fact")[2]?.textContent).toBe("音频：AAC · zh-CN · 立体声");
     expect(container.querySelectorAll(".lux-now-playing-placeholder")).toHaveLength(1);
     expect(container.textContent).toContain("开始播放");
     expect(container.textContent).toContain("暂停播放");

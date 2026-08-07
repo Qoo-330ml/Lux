@@ -45,6 +45,7 @@ test("now-playing cards use theme tokens and compact proportions", () => {
   const clientRule = stylesheet.match(/\.lux-now-playing-client\s*\{([^}]*)\}/)?.[1] ?? "";
   const networkFieldRule = stylesheet.match(/\.lux-now-playing-network-field\s*\{([^}]*)\}/)?.[1] ?? "";
   const accountRule = stylesheet.match(/\.lux-now-playing-account\s*\{([^}]*)\}/)?.[1] ?? "";
+  const factCopyRule = stylesheet.match(/\.lux-now-playing-fact-copy\s*\{([^}]*)\}/)?.[1] ?? "";
   const lightRule = stylesheet.match(/html\[data-lux-theme="light"\] \.lux-now-playing-card\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(cardRule, /background:\s*var\(--lux-now-card-bg\)/);
@@ -54,6 +55,8 @@ test("now-playing cards use theme tokens and compact proportions", () => {
   assert.match(bodyRule, /minmax\(84px,\s*9%\)/);
   assert.match(factsRule, /display:\s*flex/);
   assert.match(factsRule, /flex-direction:\s*column/);
+  assert.match(factCopyRule, /display:\s*flex/);
+  assert.match(factCopyRule, /align-items:\s*baseline/);
   assert.match(factsRule, /background:\s*transparent/);
   assert.match(networkRule, /background:\s*transparent/);
   assert.match(clientRule, /border-left:\s*0/);
