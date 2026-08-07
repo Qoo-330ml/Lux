@@ -2,7 +2,7 @@
 
 ## 目标
 
-Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插件包。首版使用 `.zip` 包格式和独立进程运行时。插件不直接访问 Lux 数据库、媒体根目录或内部任务对象。除元数据插件外，SDK v1 也支持由 Lux 宿主调度的媒体探测插件；任务、媒体库选择、结果持久化和旁车写入仍由宿主负责。
+Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插件包。首版使用 `.zip` 包格式和独立进程运行时。插件不直接访问 Lux 数据库、媒体根目录或内部任务对象。除元数据插件外，SDK v1 也支持由 Lux 宿主调度的媒体探测插件和 IP 归属地插件；任务、媒体库选择、结果持久化和旁车写入仍由宿主负责。
 
 ## 包格式
 
@@ -79,7 +79,7 @@ org.lux.tmdb-1.0.0.zip
 
 `formatVersion` 是包格式；`apiVersion` 是 RPC 契约；`version` 是插件自身版本。三者不能混用。
 
-`type` 当前允许 `metadata` 和 `media_probe`。媒体探测插件必须同时声明
+`type` 当前允许 `metadata`、`media_probe` 和 `ip_location`。媒体探测插件必须同时声明
 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。例如内置的
 `org.lux.strm-media-info` 使用以下 manifest 核心字段：
 
@@ -153,6 +153,7 @@ manifest、格式版本、协议版本、平台入口和声明文件 SHA-256 校
 - `metadata.externalIds`：返回 `ProviderIds`。
 - `metadata.trailers`：返回预告片候选。
 - `media.probe`：接收一个已由 Lux 宿主校验的远程媒体地址，返回受限的 format 和 stream 信息。
+- `ip.location`：接收一个已由 Lux 宿主校验的公网 IP，返回统一的归属地字段；第三方供应商协议只存在于插件进程。
 - `plugin.shutdown`：请求插件优雅退出。
 
 配置字段支持 text、password、select、toggle 和 number；select 可通过 multiple: true 声明多选，选项使用
@@ -207,6 +208,18 @@ TMDb 插件的首选语言由管理员配置覆盖请求中的默认语言。语
 zh-SG、zh-HK、zh-TW，开关默认关闭。替代 API 地址开关默认关闭；开启后可选择官方地址、
 `https://api.tmdb.org` 或填写自定义 HTTP(S) 基础地址。地址由宿主校验，不得包含凭据、查询参数
 或片段。
+
+### IP 归属地调用约定
+
+IP 归属地插件必须声明 `type: "ip_location"`、`category: "NETWORK"` 和
+`capabilities: ["ip.location"]`。请求格式为 `{"ip":"8.8.8.8"}`，返回格式为：
+
+`{"ip":"8.8.8.8","country":"美国","province":null,"city":null,"district":null,"street":null,"isp":"示例运营商","latitude":null,"longitude":null}`
+
+`ip` 必须与查询地址相同；Lux 会再次校验 IP、字段长度和响应大小，并把无效结果视为插件失败。
+Lux 依次尝试已安装的 `org.lux.ip-hiofd` 和 `org.lux.qoo-ip138`，前者显示名称为“IP归属地查询增强”。
+成功结果只放在进程内 24 小时缓存，失败结果只放 5 分钟；不写入 SQLite、不提供公开查询接口。
+插件负责第三方 HTTP/HTML/JSON 解析，不得返回凭据、完整第三方响应、签名字段或完整上游 URL。
 
 ### 媒体探测调用约定
 
