@@ -6,7 +6,9 @@ use std::{
 };
 
 use luxd::application::{
-    plugin_protocol::PluginManifest,
+    plugin_protocol::{
+        IP_LOCATION_CAPABILITY, PLUGIN_CATEGORY_NETWORK, PLUGIN_TYPE_IP_LOCATION, PluginManifest,
+    },
     settings::{tmdb_api_base_url_options, tmdb_language_options},
 };
 use serde_json::json;
@@ -26,6 +28,8 @@ struct Arguments {
 enum PluginKind {
     Tmdb,
     MediaInfo,
+    IpHiofd,
+    QooIp138,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,6 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (PluginKind::Tmdb, _) => "lux-plugin-tmdb",
         (PluginKind::MediaInfo, "windows") => "lux-plugin-strm-media-info.exe",
         (PluginKind::MediaInfo, _) => "lux-plugin-strm-media-info",
+        (PluginKind::IpHiofd, "windows") => "lux-plugin-ip-hiofd.exe",
+        (PluginKind::IpHiofd, _) => "lux-plugin-ip-hiofd",
+        (PluginKind::QooIp138, "windows") => "lux-plugin-qoo-ip138.exe",
+        (PluginKind::QooIp138, _) => "lux-plugin-qoo-ip138",
     };
     let relative_binary = format!(
         "binaries/{}-{}/{}",
@@ -72,6 +80,8 @@ impl Arguments {
                 {
                     "tmdb" => PluginKind::Tmdb,
                     "strm-media-info" | "media-info" => PluginKind::MediaInfo,
+                    "ip-hiofd" => PluginKind::IpHiofd,
+                    "qoo-ip138" => PluginKind::QooIp138,
                     value => return Err(format!("unsupported plugin: {value}").into()),
                 };
                 continue;
@@ -107,7 +117,7 @@ fn required(value: Option<String>, name: &str) -> Result<String, Box<dyn std::er
 }
 
 fn usage() -> &'static str {
-    "usage: lux-plugin-pack [--plugin tmdb|strm-media-info] --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME"
+    "usage: lux-plugin-pack [--plugin tmdb|strm-media-info|ip-hiofd|qoo-ip138] --binary PATH --output PATH --version SEMVER --platform NAME --arch NAME"
 }
 
 fn manifest_value(
@@ -248,6 +258,44 @@ fn manifest_value(
             ],
             "permissions": {
                 "network": ["media-source"],
+                "filesystem": []
+            },
+            "files": [{"path": relative_binary, "sha256": file_hash}]
+        }),
+        PluginKind::IpHiofd => json!({
+            "formatVersion": 1,
+            "id": "org.lux.ip-hiofd",
+            "name": "IP归属地查询增强",
+            "description": "通过 Hiofd 查询公网 IP 的归属地信息。",
+            "version": version,
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": relative_binary},
+            "type": PLUGIN_TYPE_IP_LOCATION,
+            "category": PLUGIN_CATEGORY_NETWORK,
+            "supportedItemTypes": [],
+            "capabilities": [IP_LOCATION_CAPABILITY],
+            "configFields": [],
+            "permissions": {
+                "network": ["toola.hiofd.com"],
+                "filesystem": []
+            },
+            "files": [{"path": relative_binary, "sha256": file_hash}]
+        }),
+        PluginKind::QooIp138 => json!({
+            "formatVersion": 1,
+            "id": "org.lux.qoo-ip138",
+            "name": "qoo-ip138 IP归属地查询",
+            "description": "通过 ipshudi.com 查询公网 IP 的归属地信息。",
+            "version": version,
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": relative_binary},
+            "type": PLUGIN_TYPE_IP_LOCATION,
+            "category": PLUGIN_CATEGORY_NETWORK,
+            "supportedItemTypes": [],
+            "capabilities": [IP_LOCATION_CAPABILITY],
+            "configFields": [],
+            "permissions": {
+                "network": ["www.ipshudi.com"],
                 "filesystem": []
             },
             "files": [{"path": relative_binary, "sha256": file_hash}]

@@ -169,3 +169,60 @@ fn packages_a_media_info_zip_with_the_media_probe_manifest()
     );
     Ok(())
 }
+
+#[test]
+fn packages_both_ip_location_plugin_zips_with_network_manifests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempdir()?;
+    let packer = std::env::var("CARGO_BIN_EXE_lux-plugin-pack")
+        .or_else(|_| std::env::var("CARGO_BIN_EXE_lux_plugin_pack"))?;
+    for (plugin, expected_id, expected_name, expected_host) in [
+        (
+            "ip-hiofd",
+            "org.lux.ip-hiofd",
+            "IP归属地查询增强",
+            "toola.hiofd.com",
+        ),
+        (
+            "qoo-ip138",
+            "org.lux.qoo-ip138",
+            "qoo-ip138 IP归属地查询",
+            "www.ipshudi.com",
+        ),
+    ] {
+        let binary = root.path().join(format!("lux-plugin-{plugin}"));
+        let archive = root.path().join(format!("{expected_id}-1.0.0.zip"));
+        fs::write(&binary, b"standalone IP location plugin binary")?;
+        let status = Command::new(&packer)
+            .env_remove("LUX_PLUGIN_SIGNING_KEY_HEX")
+            .args([
+                "--plugin",
+                plugin,
+                "--binary",
+                binary.to_str().ok_or("binary path is not UTF-8")?,
+                "--output",
+                archive.to_str().ok_or("archive path is not UTF-8")?,
+                "--version",
+                "1.0.0",
+                "--platform",
+                "linux",
+                "--arch",
+                "x86_64",
+            ])
+            .status()?;
+        assert!(status.success());
+
+        let catalog = PluginCatalog::discover(root.path());
+        let manifest = catalog
+            .plugins
+            .iter()
+            .find(|plugin| plugin.manifest.id == expected_id)
+            .ok_or("IP location plugin was not discovered")?;
+        assert_eq!(manifest.manifest.name, expected_name);
+        assert_eq!(manifest.manifest.plugin_type, "ip_location");
+        assert_eq!(manifest.manifest.category, "NETWORK");
+        assert_eq!(manifest.manifest.capabilities, vec!["ip.location"]);
+        assert_eq!(manifest.manifest.permissions.network, vec![expected_host]);
+    }
+    Ok(())
+}
