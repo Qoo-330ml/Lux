@@ -11,6 +11,7 @@ test("admin page headers hide title copy visually while keeping page names acces
   const titleRule = styles.match(/\.lux-admin-page-heading\s*>\s*div\s*\{([^}]*)\}/)?.[1] ?? "";
   const headingRule = styles.match(/\.lux-admin-page-heading\s*\{([^}]*)\}/)?.[1] ?? "";
   const emptyHeadingRule = styles.match(/\.lux-admin-page-heading:not\(:has\(> \.lux-button\)\)\s*\{([^}]*)\}/)?.[1] ?? "";
+  const operationsTitleRule = styles.match(/\.lux-operations-heading\s*>\s*div\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(titleRule, /position:\s*absolute/);
   assert.match(titleRule, /width:\s*1px/);
@@ -18,4 +19,8 @@ test("admin page headers hide title copy visually while keeping page names acces
   assert.match(headingRule, /justify-content:\s*flex-end/);
   assert.match(emptyHeadingRule, /height:\s*0/);
   assert.match(emptyHeadingRule, /margin-bottom:\s*0/);
+  if (operationsTitleRule) {
+    assert.match(operationsTitleRule, /position:\s*absolute/);
+    assert.match(operationsTitleRule, /width:\s*1px/);
+  }
 });

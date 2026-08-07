@@ -728,7 +728,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-log-row time { color: var(--lux-subtle); font-size: .68rem; white-space: nowrap; }
 .lux-admin-operations-page { max-width: 1040px; }
 .lux-operations-heading { align-items: flex-end; justify-content: space-between; }
-.lux-operations-heading > div { position: static; width: auto; height: auto; overflow: visible; clip: auto; clip-path: none; white-space: normal; }
 .lux-operations-heading h1 { margin: 9px 0 7px; }
 .lux-operations-heading p { margin: 0; color: var(--lux-muted); font-size: .8rem; }
 .lux-operations-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--lux-line-soft); border-bottom: 1px solid var(--lux-line-soft); }
