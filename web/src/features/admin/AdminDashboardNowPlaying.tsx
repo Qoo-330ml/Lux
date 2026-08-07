@@ -75,7 +75,7 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
       </div>
 
       <div className="lux-now-playing-network">
-        <NetworkField icon={<CircleAlert size={15} />} label="IP 地址" value="—" />
+        <NetworkField icon={<CircleAlert size={15} />} label="IP 地址" value={session.remoteIp || "—"} />
         <NetworkField icon={<MapPin size={15} />} label="IP 归属地" value="—" />
       </div>
     </article>

@@ -274,6 +274,7 @@ export type AdminPlaybackSession = {
   client?: string | null;
   deviceId: string;
   deviceName?: string | null;
+  remoteIp?: string | null;
   playSessionId: string;
   source?: AdminPlaybackSource | null;
 };

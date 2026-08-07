@@ -8,6 +8,7 @@ use luxd::{
 };
 use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -54,7 +55,13 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::new();
     let login = client
@@ -84,6 +91,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let playing = client
         .post(&event_url)
         .header("X-Emby-Token", &token)
+        .header("x-lux-peer-ip", "203.0.113.9")
         .json(&event)
         .send()
         .await?;
@@ -139,6 +147,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(sessions_body.as_array().map(Vec::len), Some(1));
     assert_eq!(sessions_body[0]["PlayState"]["PositionTicks"], 900);
     assert_eq!(sessions_body[0]["DeviceId"], "session-device");
+    assert_eq!(sessions_body[0]["RemoteEndPoint"], "127.0.0.1");
 
     let stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))

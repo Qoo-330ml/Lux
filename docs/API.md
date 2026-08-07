@@ -59,7 +59,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET/PATCH /api/v1/admin/settings` 的 `danmaku` 对象通过 `danmaku.providerBaseUrl` 保存或清除自定义 Dandanplay 兼容 API 基地址；响应只返回 `configured`、脱敏 `url`、来源和重启提示，不回显 token 路径。
 - `POST /api/v1/admin/settings/network-proxy/test`：管理员检测当前输入或已生效的网络代理；服务端只请求 TMDb、百度、Google 和 Cloudflare 四个固定目标，返回逐站延迟/HTTP 状态、网络出口 IP 和 Cloudflare 返回的两位国家/地区代码。需要管理员 Web session 和 CSRF；认证信息不会出现在响应或日志中。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、配置目录实际写入能力、ffprobe、TMDb、媒体库根路径和后台任务计数；不返回本地路径或密钥。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
-- `GET /api/v1/admin/dashboard`：返回仪表盘聚合数据，包括 `server`（名称、Lux 版本、commit 和 schema）、`health`、最多 24 个 `nowPlaying` 会话和最多 24 条 `activity`。正在播放数据只返回安全的媒体/轨道摘要，不返回服务器路径、外部播放 URL 或认证信息；接口要求管理员 Web session。
+- `GET /api/v1/admin/dashboard`：返回仪表盘聚合数据，包括 `server`（名称、Lux 版本、commit 和 schema）、`health`、最多 24 个 `nowPlaying` 会话和最多 24 条 `activity`。正在播放数据只返回安全的媒体/轨道摘要及可空的 `remoteIp` 客户端来源 IP，不返回服务器路径、外部播放 URL 或认证信息；接口要求管理员 Web session。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，支持 `page`、`pageSize`、`level` 和 `eventCode` 筛选。
 
 ## 插件与刮削器（LUX-142）
@@ -166,7 +166,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 `.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 和原始 `DirectStreamUrl` 返回；服务端不请求、不验证、不代理该 URL。具有媒体库访问权限的客户端会直接获得该地址，因此 URL 中的令牌也会按产品设计暴露给客户端。
 
-- `GET /Sessions`：返回当前用户的活动播放会话；管理员可查看全部活动会话。
+- `GET /Sessions`：返回当前用户的活动播放会话；管理员可查看全部活动会话。每个会话按 Emby 兼容字段 `RemoteEndPoint` 返回客户端来源 IP，无法获得时为 `null`。
 - `POST /Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`：幂等记录播放事件，并将位置单调写入用户状态。
 - `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放状态和该条目的活动会话状态。
 - `POST /api/v1/items/{itemId}/progress`：写入当前 Web 用户的播放开始、进度、暂停或停止事件；与 Emby 播放事件共用 `playback_sessions` 和 `user_item_state`。

@@ -9,7 +9,7 @@
 - [x] 新增 `POST /Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`。
 - [x] 新增 `GET /Sessions`，普通用户只能看到自己的活动会话，管理员可看到全部活动会话。
 - [x] 会话记录保存用户、条目、媒体源、PlaySessionId、设备、客户端、暂停状态和位置。
-- [ ] 会话记录保存真实对端 IP；Emby `GET /Sessions` 暴露 `RemoteEndPoint`，管理仪表盘暴露可空的 `remoteIp`。
+- [x] 会话记录保存真实对端 IP；Emby `GET /Sessions` 暴露 `RemoteEndPoint`，管理仪表盘暴露可空的 `remoteIp`。
 - [x] 会话 upsert 与 `user_item_state` 进度写入处于同一事务，重复事件不重复递增版本，乱序位置不回退。
 - [x] 新增 Lux `GET /api/v1/items/{itemId}/playback` 和 `POST /api/v1/items/{itemId}/progress`。
 

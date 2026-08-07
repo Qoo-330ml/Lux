@@ -2190,6 +2190,7 @@ async fn handle_emby_playback_event(
             device_id: &device_id,
             client,
             device_name,
+            remote_ip: header_str(&headers, "x-lux-peer-ip"),
             state: state_name,
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -2286,6 +2287,7 @@ fn emby_session_json(session: &crate::storage::StoredPlaybackSession) -> Value {
         "Client": session.client,
         "DeviceId": session.device_id,
         "DeviceName": session.device_name,
+        "RemoteEndPoint": session.remote_ip,
         "PlayState": {
             "PositionTicks": session.position_ticks,
             "IsPaused": session.is_paused,
@@ -2424,6 +2426,7 @@ async fn lux_post_progress(
             device_id: "lux-web",
             client: Some("Lux"),
             device_name: Some("Web"),
+            remote_ip: header_str(&headers, "x-lux-peer-ip"),
             state: playback_state.as_str(),
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -8750,6 +8753,7 @@ fn dashboard_playback_item_json(
         "client": session.client,
         "deviceId": session.device_id,
         "deviceName": session.device_name,
+        "remoteIp": session.remote_ip,
         "playSessionId": session.play_session_id,
         "source": source.map(dashboard_source_json),
     })

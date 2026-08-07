@@ -42,6 +42,7 @@ const dashboard: AdminDashboard = {
     client: "VidHub 3.0.2",
     deviceId: "iphone",
     deviceName: "iPhone",
+    remoteIp: "192.0.2.10",
     playSessionId: "session-1",
     source: {
       id: "source-1",
@@ -132,6 +133,7 @@ describe("AdminDashboardPage", () => {
     expect(container.textContent).toContain("4K HEVC");
     expect(container.textContent).toContain("HEVC");
     expect(container.textContent).toContain("AAC · zh-CN");
+    expect(container.textContent).toContain("192.0.2.10");
     expect(container.textContent).not.toContain("NOW PLAYING");
     expect(container.textContent).not.toContain("IP 地址");
     expect(container.textContent).not.toContain("IP 归属地");
@@ -142,7 +144,7 @@ describe("AdminDashboardPage", () => {
     expect(container.querySelector(".lux-now-playing-account")).not.toBeNull();
     expect(container.querySelector(".lux-now-playing-facts")).not.toBeNull();
     expect(container.querySelectorAll(".lux-now-playing-fact")).toHaveLength(3);
-    expect(container.querySelectorAll(".lux-now-playing-placeholder")).toHaveLength(2);
+    expect(container.querySelectorAll(".lux-now-playing-placeholder")).toHaveLength(1);
     expect(container.textContent).toContain("开始播放");
     expect(container.textContent).toContain("暂停播放");
     expect(container.textContent).toContain("停止播放");
