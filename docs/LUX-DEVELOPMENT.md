@@ -1754,6 +1754,7 @@ services:
 | LUX-150 | src/application/danmaku.rs、src/storage/、src/api/mod.rs、migrations/、tests/、docs/ |
 | LUX-151 | src/application/ip_location.rs、src/api/mod.rs、tests/、web/src/features/admin/、web/src/lib/api/、docs/ |
 | LUX-153 | src/application/admin_events.rs、src/api/mod.rs、tests/admin_events.rs、web/src/features/admin/、web/tests/、docs/ |
+| LUX-154 | src/application/scanner.rs、src/storage/mod.rs、migrations/、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3224,6 +3225,39 @@ ip138，不再把它作为回退。Hiofd 插件显示名称为“IP归属地查�
 
 - 不向普通用户或 Emby 兼容 API 提供 SSE，不传输业务数据或敏感信息。
 - 不用 SSE 替代资源指标的低频采样，不增加页面级轮询。
+
+#### LUX-154：全量调和单次发现与持久工作队列
+
+全量调和任务不再以文件游标为依据在每个处理批次前重新遍历所有媒体库根路径。管理员 API
+只持久化任务和根目录工作项并立即返回；后台 worker 先通过持久化目录队列完成一次有界目录
+发现，把媒体文件保存为任务工作项，再按既有批次大小处理。目录展开与当前目录完成必须在同一
+短事务中提交；服务重启后只允许重复尚未提交的当前目录或尚未提交的文件批次，已经提交的目录
+不再遍历。任务取消、失败或完成时清理临时工作项，不让工作队列无限增长。
+
+验收：
+
+- [ ] 创建全量任务不访问媒体文件系统；后台发现阶段对未中断任务中的每个目录只读取一次。
+- [ ] 发现的文件路径持久化后按批处理；处理批次不重新遍历媒体库，重启后从剩余目录或文件工作项继续。
+- [ ] 只有所有可用根路径完成发现后才执行 generation missing 判定；不可用或扫描中失效的根路径不批量标记缺失。
+- [ ] 任务进度在发现完成后具有稳定 `totalCount`，取消、失败和完成会清理临时工作项，现有增量扫描行为不变。
+- [ ] 自动化测试覆盖单次发现快照、分批恢复、发现期间取消、根路径不可用和工作项清理。
+
+验证：
+
+- `cargo test --locked --test scanning_jobs`
+- `cargo build --locked`
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `uname -m`
+
+依赖：LUX-041、LUX-043、LUX-045。
+
+明确不做：
+
+- 不实现 cron 解析、计划任务调度循环或跨库全局 worker pool。
+- 不改变 Lux/Emby 公共 API，不增加核心依赖。
+- 不在本任务拆分 ffprobe、NFO、缩略图或在线元数据后处理；这些资源队列另行实施和验证。
 
 ## 26. 风险与缓解
 
