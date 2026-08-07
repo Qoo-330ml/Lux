@@ -24,7 +24,12 @@ COPY logo.svg ./logo.svg
 COPY web ./web
 COPY --from=web-builder /src/web/dist ./web/dist
 
-RUN cargo build --release --locked --bin luxd --bin lux-plugin-tmdb --bin lux-plugin-pack \
+RUN cargo build --release --locked \
+        --bin luxd \
+        --bin lux-plugin-tmdb \
+        --bin lux-plugin-ip-hiofd \
+        --bin lux-plugin-qoo-ip138 \
+        --bin lux-plugin-pack \
     && plugin_arch="$(uname -m)" \
     && case "$plugin_arch" in \
          x86_64) plugin_arch="x86_64" ;; \
@@ -36,6 +41,20 @@ RUN cargo build --release --locked --bin luxd --bin lux-plugin-tmdb --bin lux-pl
          --plugin tmdb \
          --binary /src/target/release/lux-plugin-tmdb \
          --output /src/dist/org.lux.tmdb.zip \
+         --version "$LUX_PLUGIN_VERSION" \
+         --platform linux \
+         --arch "$plugin_arch" \
+    && cargo run --release --locked --bin lux-plugin-pack -- \
+         --plugin ip-hiofd \
+         --binary /src/target/release/lux-plugin-ip-hiofd \
+         --output /src/dist/org.lux.ip-hiofd.zip \
+         --version "$LUX_PLUGIN_VERSION" \
+         --platform linux \
+         --arch "$plugin_arch" \
+    && cargo run --release --locked --bin lux-plugin-pack -- \
+         --plugin qoo-ip138 \
+         --binary /src/target/release/lux-plugin-qoo-ip138 \
+         --output /src/dist/org.lux.qoo-ip138.zip \
          --version "$LUX_PLUGIN_VERSION" \
          --platform linux \
          --arch "$plugin_arch"
@@ -55,6 +74,8 @@ RUN apt-get update \
 
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
 COPY --from=builder /src/dist/org.lux.tmdb.zip /usr/local/share/lux/plugins/org.lux.tmdb.zip
+COPY --from=builder /src/dist/org.lux.ip-hiofd.zip /usr/local/share/lux/plugins/org.lux.ip-hiofd.zip
+COPY --from=builder /src/dist/org.lux.qoo-ip138.zip /usr/local/share/lux/plugins/org.lux.qoo-ip138.zip
 COPY --from=web-builder /src/web/dist /usr/local/share/lux/web
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
