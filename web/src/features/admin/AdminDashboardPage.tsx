@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, Clapperboard, Clock3, Cpu, Database, Film, HardDrive, ListChecks, MemoryStick, Pencil, RefreshCw, Settings2, Tag, UsersRound } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock3, Database, HardDrive, ListChecks, Pencil, RefreshCw, Settings2, Tag } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
@@ -75,12 +75,12 @@ export function AdminDashboardPage() {
           <div className="lux-admin-overview-action-slot" aria-hidden="true" />
         </div>
         <div className="lux-admin-overview-metrics" aria-label="服务器概况指标">
-          <OverviewMetric icon={<Film size={38} />} label="电影数量" />
-          <OverviewMetric icon={<Clapperboard size={38} />} label="剧集数量" />
-          <OverviewMetric icon={<UsersRound size={38} />} label="用户数量" />
-          <OverviewMetric icon={<Cpu size={38} />} label="CPU 占用" />
-          <OverviewMetric icon={<MemoryStick size={38} />} label="内存占用" />
-          <OverviewMetric icon={<HardDrive size={38} />} label="存储信息" />
+          <OverviewMetric label="电影数量" />
+          <OverviewMetric label="剧集数量" />
+          <OverviewMetric label="用户数量" />
+          <OverviewMetric label="CPU 占用" />
+          <OverviewMetric label="内存占用" />
+          <OverviewMetric label="存储信息" />
         </div>
       </section>
       {saveServerName.error ? <p className="lux-error-copy lux-dashboard-inline-error">{saveServerName.error.message}</p> : null}
@@ -120,8 +120,8 @@ function OverviewInfo({ icon, label, value }: { icon: ReactNode; label: string; 
   return <div className="lux-admin-overview-info" data-overview-value={label}><span className="lux-admin-overview-info-icon" aria-hidden="true">{icon}</span><span><small>{label}</small><strong aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;
 }
 
-function OverviewMetric({ icon, label, value }: { icon: ReactNode; label: string; value?: string }) {
-  return <div className="lux-admin-overview-metric"><span className="lux-admin-overview-metric-icon" aria-hidden="true">{icon}</span><span><small>{label}</small><strong className="lux-admin-overview-metric-value" aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;
+function OverviewMetric({ label, value }: { label: string; value?: string }) {
+  return <div className="lux-admin-overview-metric"><span><small>{label}</small><strong className="lux-admin-overview-metric-value" aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;
 }
 
 function overviewStatus(status: string) {

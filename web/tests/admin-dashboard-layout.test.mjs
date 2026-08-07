@@ -28,21 +28,22 @@ test("dashboard panels use separators instead of card chrome", () => {
   assert.match(panelGridRule, /border-bottom:\s*1px\s+solid\s+var\(--lux-line-soft\)/);
 });
 
-test("dashboard overview card follows the supplied light reference structure", () => {
+test("dashboard overview stays flat with only one content divider", () => {
   const cardRule = stylesheet.match(/\.lux-admin-overview-card\s*\{([^}]*)\}/)?.[1] ?? "";
   const topRule = stylesheet.match(/\.lux-admin-overview-top\s*\{([^}]*)\}/)?.[1] ?? "";
   const metricsRule = stylesheet.match(/\.lux-admin-overview-metrics\s*\{([^}]*)\}/)?.[1] ?? "";
-  const metricRule = stylesheet.match(/\.lux-admin-overview-metric\s*\{([^}]*)\}/)?.[1] ?? "";
   const metricDividerRule = stylesheet.match(/\.lux-admin-overview-metric\s*\+\s*\.lux-admin-overview-metric\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(cardRule, /border-radius:\s*18px/);
-  assert.match(cardRule, /background:\s*var\(--lux-overview-bg\)/);
-  assert.match(cardRule, /box-shadow:/);
+  assert.match(cardRule, /border:\s*0/);
+  assert.match(cardRule, /border-radius:\s*0/);
+  assert.match(cardRule, /background:\s*transparent/);
+  assert.match(cardRule, /box-shadow:\s*none/);
   assert.match(topRule, /display:\s*grid/);
   assert.match(topRule, /align-items:\s*center/);
   assert.match(metricsRule, /display:\s*grid/);
   assert.match(metricsRule, /border-top:\s*1px\s+solid\s+var\(--lux-overview-line\)/);
-  assert.match(metricDividerRule, /border-left:\s*1px\s+solid\s+var\(--lux-overview-line\)/);
+  assert.doesNotMatch(stylesheet, /\.lux-admin-overview-info\s*\+\s*\.lux-admin-overview-info\s*\{[^}]*border-left:/);
+  assert.doesNotMatch(metricDividerRule, /border-left:/);
 });
 
 test("light mode preserves the same flat admin surfaces", () => {

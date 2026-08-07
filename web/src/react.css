@@ -455,7 +455,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .lux-admin-dashboard-page { padding-bottom: 30px; }
 .lux-admin-overview-card {
-  --lux-overview-bg: rgba(22, 22, 25, .72);
   --lux-overview-line: var(--lux-line-soft);
   --lux-overview-text: #f5f5f5;
   --lux-overview-muted: rgba(245, 245, 245, .58);
@@ -464,11 +463,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   --lux-overview-status-bg: rgba(102, 210, 122, .13);
   display: grid;
   gap: 0;
-  padding: 26px 28px 24px;
-  border: 1px solid var(--lux-overview-line);
-  border-radius: 18px;
-  background: var(--lux-overview-bg);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, .12);
+  padding: 26px 0 24px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 .lux-admin-overview-top { display: grid; grid-template-columns: 112px minmax(230px, 1.25fr) auto minmax(135px, .8fr) minmax(135px, .8fr) 72px; align-items: center; gap: 24px; min-height: 82px; }
 .lux-admin-overview-device { min-height: 76px; }
@@ -482,7 +481,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-overview-status i { width: 12px; height: 12px; border-radius: 50%; background: currentColor; }
 .lux-admin-overview-status.is-alert { --lux-overview-accent: #d49a4d; --lux-overview-status-bg: rgba(212, 154, 77, .13); }
 .lux-admin-overview-info { display: flex; align-items: center; min-width: 0; gap: 17px; color: var(--lux-overview-icon); }
-.lux-admin-overview-info + .lux-admin-overview-info { padding-left: 24px; border-left: 1px solid var(--lux-overview-line); }
 .lux-admin-overview-info-icon { display: inline-flex; flex: 0 0 auto; }
 .lux-admin-overview-info > span:last-child { display: grid; min-width: 0; gap: 7px; }
 .lux-admin-overview-info small, .lux-admin-overview-metric small { color: var(--lux-overview-muted); font-size: .82rem; }
@@ -493,8 +491,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-overview-metric { display: flex; min-width: 0; align-items: center; gap: 14px; padding: 0 18px; color: var(--lux-overview-icon); }
 .lux-admin-overview-metric:first-child { padding-left: 0; }
 .lux-admin-overview-metric:last-child { padding-right: 0; }
-.lux-admin-overview-metric + .lux-admin-overview-metric { border-left: 1px solid var(--lux-overview-line); }
-.lux-admin-overview-metric-icon { display: inline-flex; flex: 0 0 auto; }
 .lux-admin-overview-metric > span:last-child { display: grid; min-width: 0; gap: 7px; }
 .lux-admin-server-identity { display: grid; grid-template-columns: auto minmax(0, 1fr) minmax(280px, .82fr); align-items: center; gap: 20px; padding: 22px 24px; border: 1px solid var(--lux-line-soft); border-radius: 17px; background: linear-gradient(105deg, rgba(255,255,255,.055), rgba(255,255,255,.018)); }
 .lux-admin-server-mark { display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid rgba(210,71,191,.38); border-radius: 15px; color: #f5a7e5; background: rgba(210,71,191,.11); box-shadow: 0 10px 28px rgba(210,71,191,.1); }
@@ -785,9 +781,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-content { padding: 24px 20px 64px; }
   .lux-admin-dashboard-grid { grid-template-columns: 1fr; }
   .lux-admin-overview-top { grid-template-columns: 88px minmax(0, 1fr) auto; gap: 16px; }
-  .lux-admin-overview-info + .lux-admin-overview-info { padding-left: 16px; }
   .lux-admin-overview-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 24px; }
-  .lux-admin-overview-metric:nth-child(4) { padding-left: 0; border-left: 0; }
+  .lux-admin-overview-metric:nth-child(4) { padding-left: 0; }
   .lux-admin-server-identity { grid-template-columns: auto minmax(0, 1fr); }
   .lux-admin-server-form { grid-column: 1 / -1; }
 }
@@ -846,15 +841,12 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-overview-name-form input { min-height: 62px; padding-left: 18px; font-size: 1.25rem; }
   .lux-admin-overview-info { gap: 10px; }
   .lux-admin-overview-info-icon svg { width: 29px; height: 29px; }
-  .lux-admin-overview-info + .lux-admin-overview-info { padding-left: 14px; }
   .lux-admin-overview-status { min-height: 42px; padding: 0 12px; font-size: .82rem; }
   .lux-admin-overview-status i { width: 9px; height: 9px; }
   .lux-admin-overview-action-slot { display: none; }
   .lux-admin-overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 20px; margin-top: 20px; padding-top: 20px; }
   .lux-admin-overview-metric, .lux-admin-overview-metric:first-child, .lux-admin-overview-metric:last-child { padding: 0; }
-  .lux-admin-overview-metric:nth-child(odd) { border-left: 0; }
   .lux-admin-overview-metric:nth-child(n + 3) { padding-top: 20px; border-top: 1px solid var(--lux-overview-line); }
-  .lux-admin-overview-metric-icon svg { width: 31px; height: 31px; }
   .lux-admin-server-identity { grid-template-columns: 1fr; gap: 14px; padding: 18px; }
   .lux-admin-server-form { grid-column: auto; align-items: stretch; flex-direction: column; }
   .lux-admin-server-form .lux-button { width: 100%; }
@@ -1360,15 +1352,12 @@ html[data-lux-theme="light"] .lux-admin-quick-links a > svg, html[data-lux-theme
 html[data-lux-theme="light"] .lux-admin-quick-links small { color: var(--lux-subtle); }
 html[data-lux-theme="light"] .lux-admin-page-state h1 { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-admin-overview-card {
-  --lux-overview-bg: #fff;
   --lux-overview-line: #e1e7f0;
   --lux-overview-text: #172337;
   --lux-overview-muted: #60738c;
   --lux-overview-icon: #30445a;
   --lux-overview-accent: #18a832;
   --lux-overview-status-bg: #edf9ef;
-  border-color: #e1e7f0;
-  box-shadow: 0 10px 24px rgba(30, 48, 72, .08);
 }
 html[data-lux-theme="light"] .lux-admin-server-identity { border-color: var(--lux-line-soft); background: rgba(255,255,255,.78); box-shadow: 0 12px 30px rgba(30,30,38,.06); }
 html[data-lux-theme="light"] .lux-admin-server-mark { border-color: rgba(167,49,148,.24); color: #a73194; background: rgba(167,49,148,.08); box-shadow: none; }

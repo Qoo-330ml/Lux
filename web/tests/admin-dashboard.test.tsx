@@ -135,6 +135,7 @@ describe("AdminDashboardPage", () => {
     expect(overview?.querySelector('[data-overview-value="版本"] strong')?.textContent).toBe("v0.1.0");
     expect(overview?.querySelector('[data-overview-value="运行时长"] strong')?.textContent).toBe("");
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-value")).toHaveLength(6);
+    expect(overview?.querySelectorAll(".lux-admin-overview-metric-icon")).toHaveLength(0);
     expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["", "", "", "", "", ""]);
     expect(overview?.querySelector(".lux-admin-overview-device")?.textContent).toBe("");
     expect(container.querySelector(".lux-admin-stat-grid")).toBeNull();

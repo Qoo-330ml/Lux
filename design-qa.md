@@ -42,6 +42,24 @@ final result: passed
 
 ---
 
+# Dashboard overview flatness follow-up
+
+- Implementation screenshot: `/Users/Qoo/Desktop/mywork/Lux/.playwright-cli/page-2026-08-07T04-23-20-075Z.png`
+- Mobile screenshot: `/Users/Qoo/Desktop/mywork/Lux/.playwright-cli/page-2026-08-07T04-24-51-154Z.png`
+- Desktop viewport: `1672 × 941`; mobile viewport: `390 × 844`; device scale factor: `1`.
+- State: light theme, `/admin`, read-only mocked dashboard response, unavailable metrics empty.
+
+## Findings
+
+- The overview no longer has an outer card border, radius, background treatment, or shadow.
+- The version/runtime divider and six metric vertical dividers were removed; one horizontal divider remains between the identity row and metric row.
+- The six empty metric icons were removed to reduce visual noise. The editable name pencil, online status dot, version icon, and runtime icon remain as meaningful controls/status cues.
+- Desktop and mobile screenshots show no horizontal overflow; at 390px the body width remains `390px`. Browser console error check returned zero errors.
+
+final result: passed
+
+---
+
 # Dashboard overview card design QA
 
 ## Source and implementation
