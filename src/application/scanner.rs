@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{
+        admin_events::{AdminEventHub, AdminEventScope},
         media_matching::{MediaKind, clean_title, parse_media_name},
         metadata::MetadataEnricher,
         probe::MediaProbeService,
@@ -872,6 +873,7 @@ impl LibraryScanner {
 pub struct ScanJobService {
     scanner: LibraryScanner,
     database: Database,
+    admin_events: AdminEventHub,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -886,7 +888,13 @@ impl ScanJobService {
         Self {
             scanner: LibraryScanner::new(database.clone()),
             database,
+            admin_events: AdminEventHub::new(),
         }
+    }
+
+    pub fn with_admin_events(mut self, admin_events: AdminEventHub) -> Self {
+        self.admin_events = admin_events;
+        self
     }
 
     pub async fn enqueue_incremental_changes(
@@ -1777,6 +1785,7 @@ impl ScanJobService {
                 details_json,
             })
             .await;
+        self.admin_events.publish(AdminEventScope::Jobs);
     }
 }
 

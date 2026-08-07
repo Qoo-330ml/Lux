@@ -39,6 +39,7 @@ use crate::{
     application::setup::{SetupError, SetupService},
     application::{
         access::{AccessPrincipal, MediaAccessService},
+        admin_events::{AdminEventHub, AdminEventScope},
         candidates::{
             MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
@@ -85,9 +86,11 @@ use crate::{
         RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
         redact_proxy_url,
     },
+    observability::resources::ResourceMetrics,
     security::LoginRateLimiter,
     storage::{
-        Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError, StoredPlaybackSession,
+        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError,
+        StoredPlaybackSession,
     },
 };
 use tokio::{
@@ -127,6 +130,8 @@ pub struct AppState {
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
     ip_location: Option<IpLocationService>,
+    admin_events: AdminEventHub,
+    resources: ResourceMetrics,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
 }
@@ -152,6 +157,7 @@ impl AppState {
     ) -> Self {
         let server_id = database.server_id().to_owned();
         let config_dir = config.config_dir.clone();
+        let admin_events = AdminEventHub::new();
         let access = MediaAccessService::new(database.clone());
         let image_writes =
             ImageWriteService::new_with_proxy(database.clone(), network_proxy_url.clone()).ok();
@@ -174,12 +180,15 @@ impl AppState {
             tmdb.clone(),
             scraper_resolver.clone(),
         ));
-        let metadata_reidentify = Some(MetadataReidentifyService::with_resolver_and_selection(
-            database.clone(),
-            tmdb.clone(),
-            scraper_resolver.clone(),
-            metadata_selection.clone(),
-        ));
+        let metadata_reidentify = Some(
+            MetadataReidentifyService::with_resolver_and_selection(
+                database.clone(),
+                tmdb.clone(),
+                scraper_resolver.clone(),
+                metadata_selection.clone(),
+            )
+            .with_admin_events(admin_events.clone()),
+        );
         let image_candidates = Some(ImageCandidateService::with_resolver(
             database.clone(),
             tmdb.clone(),
@@ -211,7 +220,9 @@ impl AppState {
                 FfprobeRunner::default(),
             )),
             thumbnails: Some(ThumbnailService::new(database.clone())),
-            scan_jobs: Some(ScanJobService::new(database.clone())),
+            scan_jobs: Some(
+                ScanJobService::new(database.clone()).with_admin_events(admin_events.clone()),
+            ),
             strm_probe: Some(StrmProbeService::new(database.clone(), plugins.clone())),
             danmaku: Some(DanmakuService::new(
                 database.clone(),
@@ -222,8 +233,13 @@ impl AppState {
             scraper_resolver: Some(scraper_resolver),
             tmdb: Some(tmdb),
             collections,
-            people: Some(PeopleService::new_with_proxy(config_dir, network_proxy_url)),
+            people: Some(PeopleService::new_with_proxy(
+                config_dir,
+                network_proxy_url.clone(),
+            )),
             ip_location: Some(IpLocationService::new(plugins.clone())),
+            admin_events,
+            resources: ResourceMetrics::new(),
             remote_access: RemoteAccessPolicy::from_env(),
             login_rate_limiter: LoginRateLimiter::default(),
         }
@@ -241,23 +257,28 @@ impl AppState {
                 tmdb.clone(),
                 resolver.clone(),
             ));
-            self.metadata_reidentify =
-                Some(MetadataReidentifyService::with_resolver_and_selection(
+            self.metadata_reidentify = Some(
+                MetadataReidentifyService::with_resolver_and_selection(
                     database.clone(),
                     tmdb.clone(),
                     resolver.clone(),
                     self.metadata_selection.clone(),
-                ));
+                )
+                .with_admin_events(self.admin_events.clone()),
+            );
             self.image_candidates = Some(ImageCandidateService::with_resolver(
                 database, tmdb, resolver,
             ));
         } else {
             self.collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
-            self.metadata_reidentify = Some(MetadataReidentifyService::with_selection(
-                database.clone(),
-                tmdb.clone(),
-                self.metadata_selection.clone(),
-            ));
+            self.metadata_reidentify = Some(
+                MetadataReidentifyService::with_selection(
+                    database.clone(),
+                    tmdb.clone(),
+                    self.metadata_selection.clone(),
+                )
+                .with_admin_events(self.admin_events.clone()),
+            );
             self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
         }
         self
@@ -564,6 +585,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
+        .route("/api/v1/admin/events", get(admin_events))
         .route("/api/v1/admin/audit", get(admin_list_audit))
         .route("/api/v1/admin/logs", get(admin_list_logs))
         .route("/api/v1/libraries", get(lux_list_libraries))
@@ -1092,6 +1114,7 @@ async fn emby_authenticate(
             let user_id = result.user.id.to_string();
             record_activity_event(
                 state.database.as_ref(),
+                &state.admin_events,
                 &user_id,
                 "AUTH_LOGIN",
                 None,
@@ -2290,6 +2313,7 @@ async fn handle_emby_playback_event(
             if let Some(event_type) = activity_event {
                 record_activity_event(
                     Some(database),
+                    &state.admin_events,
                     &user_id,
                     event_type,
                     Some(&request.item_id),
@@ -2532,6 +2556,7 @@ async fn lux_post_progress(
             if let Some(event_type) = activity_event {
                 record_activity_event(
                     Some(database),
+                    &state.admin_events,
                     &user_id,
                     event_type,
                     Some(&item_id),
@@ -3371,6 +3396,7 @@ async fn auth_login(
     let user_id = session.user.id.to_string();
     record_activity_event(
         state.database.as_ref(),
+        &state.admin_events,
         &user_id,
         "AUTH_LOGIN",
         None,
@@ -8460,7 +8486,7 @@ async fn record_audit_event(
         return;
     };
     let actor_user_id = session.user.id.to_string();
-    let _ = database
+    if database
         .insert_audit_event(crate::storage::NewAuditEvent {
             actor_user_id: Some(&actor_user_id),
             event_type,
@@ -8468,11 +8494,43 @@ async fn record_audit_event(
             target_id,
             metadata_json,
         })
-        .await;
+        .await
+        .is_ok()
+    {
+        state
+            .admin_events
+            .publish(admin_event_scope_for_audit(event_type));
+    }
+}
+
+fn admin_event_scope_for_audit(event_type: &str) -> AdminEventScope {
+    if event_type == "SETTINGS_UPDATED" {
+        return AdminEventScope::Settings;
+    }
+    if event_type.starts_with("PLUGIN_") {
+        return AdminEventScope::Plugins;
+    }
+    if event_type.starts_with("USER_") || event_type == "LIBRARY_ACCESS_UPDATED" {
+        return AdminEventScope::Users;
+    }
+    if event_type.starts_with("LIBRARY_") || event_type == "SCHEDULE_UPDATED" {
+        return AdminEventScope::Libraries;
+    }
+    if event_type.starts_with("METADATA_") {
+        return AdminEventScope::Metadata;
+    }
+    if event_type.starts_with("SCAN_")
+        || event_type.starts_with("STRM_")
+        || event_type.starts_with("DANMAKU_")
+    {
+        return AdminEventScope::Jobs;
+    }
+    AdminEventScope::All
 }
 
 async fn record_activity_event(
     database: Option<&Database>,
+    admin_events: &AdminEventHub,
     user_id: &str,
     event_type: &str,
     target_id: Option<&str>,
@@ -8485,7 +8543,7 @@ async fn record_activity_event(
         Ok(metadata_json) => metadata_json,
         Err(_) => return,
     };
-    let _ = database
+    if database
         .insert_audit_event(crate::storage::NewAuditEvent {
             actor_user_id: Some(user_id),
             event_type,
@@ -8493,7 +8551,11 @@ async fn record_activity_event(
             target_id,
             metadata_json: &metadata_json,
         })
-        .await;
+        .await
+        .is_ok()
+    {
+        admin_events.publish(AdminEventScope::Dashboard);
+    }
 }
 
 fn playback_activity_event_type(
@@ -8719,6 +8781,64 @@ async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Resp
     }
 }
 
+async fn admin_events(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+
+    let mut receiver = state.admin_events.subscribe();
+    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+    tokio::spawn(async move {
+        if writer
+            .write_all(b"event: ready\ndata: {\"version\":1}\n\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                event = receiver.recv() => {
+                    let scope = match event {
+                        Ok(scope) => scope,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => AdminEventScope::All,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    let frame = format!(
+                        "event: invalidate\ndata: {{\"scope\":\"{}\"}}\n\n",
+                        scope.as_str(),
+                    );
+                    if writer.write_all(frame.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if writer.write_all(b": keep-alive\n\n").await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(tokio_util::io::ReaderStream::new(reader)));
+    response.headers_mut().insert(
+        "Content-Type",
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        "Cache-Control",
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    response
+        .headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    response
+}
+
 async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
     let Some(database) = state.database.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -8727,6 +8847,7 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
         Ok(version) => version,
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
+    let resources = state.resources.snapshot().await;
     let database_writable = database.probe_write().await.is_ok();
     let config_available = match state.config_dir.as_deref() {
         Some(path) => fs::metadata(path)
@@ -8783,6 +8904,8 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
     Ok(json!({
         "status": status,
         "schemaVersion": schema_version,
+        "runtime": { "seconds": resources.runtime_seconds },
+        "resources": resources,
         "database": {
             "status": if database_writable { "ok" } else { "degraded" },
             "journalMode": "wal",
@@ -8820,6 +8943,10 @@ async fn admin_dashboard(headers: HeaderMap, State(state): State<AppState>) -> R
         Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let stats = match database.dashboard_stats().await {
+        Ok(stats) => stats,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let sessions = match database.list_playback_sessions(None).await {
         Ok(sessions) => sessions,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -8852,11 +8979,20 @@ async fn admin_dashboard(headers: HeaderMap, State(state): State<AppState>) -> R
             "commit": COMMIT,
             "schemaVersion": health["schemaVersion"],
         },
+        "stats": dashboard_stats_json(&stats),
         "health": health,
         "nowPlaying": now_playing,
         "activity": activity,
     }))
     .into_response()
+}
+
+fn dashboard_stats_json(stats: &DashboardStats) -> Value {
+    json!({
+        "movieCount": stats.movie_count,
+        "seriesCount": stats.series_count,
+        "userCount": stats.user_count,
+    })
 }
 
 async fn dashboard_playback_json(
@@ -8951,8 +9087,8 @@ fn dashboard_playback_item_json(
         "deviceId": session.device_id,
         "deviceName": session.device_name,
         "deviceType": session.device_type,
-        "remoteIpLocation": remote_ip_location.map(dashboard_ip_location_json),
         "remoteIp": session.remote_ip,
+        "remoteIpLocation": remote_ip_location.map(dashboard_ip_location_json),
         "playSessionId": session.play_session_id,
         "source": source.map(dashboard_source_json),
     })
@@ -11265,11 +11401,17 @@ mod tests {
     use super::{
         build_cookie, emby_media_source_json, is_emby_playback_callback_path,
         lux_catalog_source_json, playback_client_label, playback_identifier_prefix,
-        safe_trace_path, secure_cookie_for_request,
+        record_activity_event, safe_trace_path, secure_cookie_for_request,
     };
+    use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::catalog::{CatalogSource, CatalogStream};
+    use crate::application::setup::SetupService;
+    use crate::config::Config;
     use crate::network::RemoteAccessPolicy;
+    use crate::storage::Database;
     use axum::http::{HeaderMap, HeaderValue, Uri};
+    use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn direct_http_cookie_is_not_marked_secure() {
@@ -11345,6 +11487,45 @@ mod tests {
         assert_eq!(playback_client_label(Some("VidHub")), "vidhub");
         assert_eq!(playback_client_label(Some("unknown-client")), "other");
         assert_eq!(playback_client_label(None), "unknown");
+    }
+
+    #[tokio::test]
+    async fn activity_events_publish_dashboard_invalidations() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097"
+                .parse()
+                .expect("test address should be valid"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config)
+            .await
+            .expect("test database should connect");
+        let setup = SetupService::new(database.clone()).expect("setup service should initialize");
+        let user = setup
+            .complete("admin", "Admin", "correct password")
+            .await
+            .expect("initial admin should be created");
+        let hub = AdminEventHub::new();
+        let mut receiver = hub.subscribe();
+
+        record_activity_event(
+            Some(&database),
+            &hub,
+            &user.id.to_string(),
+            "PLAYBACK_STARTED",
+            Some("item-1"),
+            json!({ "client": "Lux" }),
+        )
+        .await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("dashboard invalidation should be published")
+                .expect("event stream should remain open"),
+            AdminEventScope::Dashboard
+        );
     }
 
     #[test]

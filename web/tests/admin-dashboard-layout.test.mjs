@@ -32,7 +32,9 @@ test("dashboard overview follows account settings section rhythm", () => {
   const cardRule = stylesheet.match(/\.lux-admin-overview-card\s*\{([^}]*)\}/)?.[1] ?? "";
   const topRule = stylesheet.match(/\.lux-admin-overview-top\s*\{([^}]*)\}/)?.[1] ?? "";
   const identityRule = stylesheet.match(/\.lux-admin-overview-identity\s*\{([^}]*)\}/)?.[1] ?? "";
-  const nameRule = stylesheet.match(/\.lux-admin-overview-name-form input\s*\{([^}]*)\}/)?.[1] ?? "";
+  const nameRule = stylesheet.match(/\.lux-admin-overview-server-name\s*\{([^}]*)\}/)?.[1] ?? "";
+  const dialogRule = stylesheet.match(/\.lux-server-name-dialog\s*\{([^}]*)\}/)?.[1] ?? "";
+  const dialogFormRule = stylesheet.match(/\.lux-server-name-dialog-form\s*\{([^}]*)\}/)?.[1] ?? "";
   const infoCopyRule = stylesheet.match(/\.lux-admin-overview-info\s*>\s*span:last-child\s*\{([^}]*)\}/)?.[1] ?? "";
   const metricsRule = stylesheet.match(/\.lux-admin-overview-metrics\s*\{([^}]*)\}/)?.[1] ?? "";
   const metricDividerRule = stylesheet.match(/\.lux-admin-overview-metric\s*\+\s*\.lux-admin-overview-metric\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -49,9 +51,11 @@ test("dashboard overview follows account settings section rhythm", () => {
   assert.match(identityRule, /display:\s*block/);
   assert.match(infoCopyRule, /display:\s*flex/);
   assert.match(infoCopyRule, /align-items:\s*baseline/);
-  assert.match(nameRule, /min-height:\s*42px/);
-  assert.match(nameRule, /border:\s*0/);
-  assert.match(nameRule, /background:\s*transparent/);
+  assert.match(nameRule, /overflow:\s*hidden/);
+  assert.match(dialogRule, /width:\s*min\(568px,\s*calc\(100vw\s*-\s*20px\)\)/);
+  assert.match(dialogRule, /min-height:\s*316px/);
+  assert.match(dialogRule, /border-radius:\s*13px/);
+  assert.match(dialogFormRule, /display:\s*flex/);
   assert.doesNotMatch(stylesheet, /\.lux-admin-overview-device\s*\{/);
   assert.doesNotMatch(stylesheet, /\.lux-admin-overview-info-icon/);
   assert.match(metricsRule, /display:\s*grid/);

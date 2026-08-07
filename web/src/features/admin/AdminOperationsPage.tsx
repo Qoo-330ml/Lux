@@ -157,18 +157,10 @@ export function AdminOperationsPage() {
   const runningCount = jobItems.filter((job) => isActiveJob(job.status)).length;
   const failedCount = jobItems.filter((job) => job.status === "FAILED").length;
   const enabledCount = registeredTasks.filter((task) => task.isEnabled && Boolean(task.schedule)).length;
-  const refresh = () => {
-    void tasks.refetch();
-    void jobs.refetch();
-    void metadataJobs.refetch();
-    void logs.refetch();
-  };
-
   return (
     <div className="lux-admin-page lux-admin-operations-page">
       <header className="lux-admin-page-heading lux-operations-heading">
         <div><span className="lux-eyebrow">任务总览</span><h1>任务与日志</h1><p>所有后台工作都从系统或插件注册开始。</p></div>
-        <button className="lux-button lux-button-secondary" type="button" onClick={refresh}><RefreshCw size={16} /> 刷新</button>
       </header>
 
       <section className="lux-operations-summary" aria-label="任务概览">

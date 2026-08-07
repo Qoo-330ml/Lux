@@ -1,0 +1,416 @@
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+use serde::Serialize;
+use tokio::{fs, process::Command};
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const MEDIA_PATH: &str = "/media";
+
+#[derive(Clone)]
+pub struct ResourceMetrics {
+    started_at: Instant,
+    cpu_sample: Arc<Mutex<Option<CpuSample>>>,
+}
+
+impl Default for ResourceMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResourceMetrics {
+    pub fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            cpu_sample: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn snapshot(&self) -> ResourceSnapshot {
+        let (cpu, memory, media_storage) = tokio::join!(
+            cpu_snapshot(Arc::clone(&self.cpu_sample)),
+            memory_snapshot(),
+            media_storage_snapshot(),
+        );
+        ResourceSnapshot {
+            runtime_seconds: self.started_at.elapsed().as_secs(),
+            cpu,
+            memory,
+            media_storage,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResourceSnapshot {
+    pub runtime_seconds: u64,
+    pub cpu: CpuSnapshot,
+    pub memory: MemorySnapshot,
+    #[serde(rename = "mediaStorage")]
+    pub media_storage: MediaStorageSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CpuSnapshot {
+    pub available: bool,
+    pub source: &'static str,
+    #[serde(rename = "usagePercent")]
+    pub usage_percent: Option<f64>,
+    #[serde(rename = "limitCores")]
+    pub limit_cores: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemorySnapshot {
+    pub available: bool,
+    pub source: &'static str,
+    #[serde(rename = "usedBytes")]
+    pub used_bytes: Option<u64>,
+    #[serde(rename = "limitBytes")]
+    pub limit_bytes: Option<u64>,
+    #[serde(rename = "usagePercent")]
+    pub usage_percent: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MediaStorageSnapshot {
+    pub available: bool,
+    pub source: &'static str,
+    pub path: &'static str,
+    #[serde(rename = "totalBytes")]
+    pub total_bytes: Option<u64>,
+    #[serde(rename = "usedBytes")]
+    pub used_bytes: Option<u64>,
+    #[serde(rename = "availableBytes")]
+    pub available_bytes: Option<u64>,
+    #[serde(rename = "usagePercent")]
+    pub usage_percent: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+struct CpuSample {
+    usage_usec: u64,
+    observed_at: Instant,
+}
+
+async fn cpu_snapshot(previous_sample: Arc<Mutex<Option<CpuSample>>>) -> CpuSnapshot {
+    let Some((usage_usec, limit_cores)) = read_cpu_usage().await else {
+        return CpuSnapshot {
+            available: false,
+            source: "cgroup",
+            usage_percent: None,
+            limit_cores: None,
+        };
+    };
+
+    let observed_at = Instant::now();
+    let previous = previous_sample.lock().ok().and_then(|mut sample| {
+        sample.replace(CpuSample {
+            usage_usec,
+            observed_at,
+        })
+    });
+    let usage_percent = previous.and_then(|sample| {
+        let elapsed_usec = observed_at.checked_duration_since(sample.observed_at)?;
+        let elapsed_usec = u64::try_from(elapsed_usec.as_micros()).ok()?;
+        calculate_cpu_usage_percent(
+            usage_usec.saturating_sub(sample.usage_usec),
+            elapsed_usec,
+            limit_cores.unwrap_or(1.0),
+        )
+        .map(|percent| {
+            if limit_cores.is_some() {
+                percent.min(100.0)
+            } else {
+                percent
+            }
+        })
+    });
+
+    CpuSnapshot {
+        available: true,
+        source: "cgroup",
+        usage_percent,
+        limit_cores,
+    }
+}
+
+async fn read_cpu_usage() -> Option<(u64, Option<f64>)> {
+    if let Some(stat) = read_cgroup_v2_file("cpu.stat").await {
+        let usage_usec = parse_keyed_value(&stat, "usage_usec")?;
+        let max = read_cgroup_v2_file("cpu.max").await?;
+        return Some((usage_usec, parse_cpu_limit(&max)));
+    }
+
+    let usage_ns = read_cgroup_v1_file("cpu,cpuacct", "cpuacct.usage")
+        .await
+        .or(read_cgroup_v1_file("cpuacct", "cpuacct.usage").await)
+        .and_then(|value| parse_unsigned(&value))?;
+    let quota = read_cgroup_v1_file("cpu,cpuacct", "cpu.cfs_quota_us")
+        .await
+        .or(read_cgroup_v1_file("cpu", "cpu.cfs_quota_us").await);
+    let period = read_cgroup_v1_file("cpu,cpuacct", "cpu.cfs_period_us")
+        .await
+        .or(read_cgroup_v1_file("cpu", "cpu.cfs_period_us").await);
+    let limit_cores = quota
+        .zip(period)
+        .and_then(|(quota, period)| parse_cpu_quota(&quota, &period));
+    Some((usage_ns / 1_000, limit_cores))
+}
+
+async fn memory_snapshot() -> MemorySnapshot {
+    let (current, limit) = if let Some(current) = read_cgroup_v2_file("memory.current").await {
+        let current = parse_unsigned(&current);
+        let limit = read_cgroup_v2_file("memory.max")
+            .await
+            .and_then(|value| parse_cgroup_limit(&value));
+        (current, limit)
+    } else {
+        let current = read_cgroup_v1_file("memory", "memory.usage_in_bytes")
+            .await
+            .and_then(|value| parse_unsigned(&value));
+        let limit = read_cgroup_v1_file("memory", "memory.limit_in_bytes")
+            .await
+            .and_then(|value| parse_cgroup_limit(&value));
+        (current, limit)
+    };
+
+    MemorySnapshot {
+        available: current.is_some(),
+        source: "cgroup",
+        used_bytes: current,
+        limit_bytes: limit,
+        usage_percent: current.and_then(|used| memory_usage_percent(used, limit)),
+    }
+}
+
+async fn media_storage_snapshot() -> MediaStorageSnapshot {
+    let output = Command::new("df")
+        .args(["-P", "-k", MEDIA_PATH])
+        .output()
+        .await;
+    let Some(output) = output.ok().filter(|output| output.status.success()) else {
+        return unavailable_media_storage();
+    };
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return unavailable_media_storage();
+    };
+    let Some((total_bytes, used_bytes, available_bytes)) = parse_media_storage_values(&stdout)
+    else {
+        return unavailable_media_storage();
+    };
+
+    MediaStorageSnapshot {
+        available: true,
+        source: "container-filesystem",
+        path: MEDIA_PATH,
+        total_bytes: Some(total_bytes),
+        used_bytes: Some(used_bytes),
+        available_bytes: Some(available_bytes),
+        usage_percent: calculate_storage_usage_percent(used_bytes, total_bytes),
+    }
+}
+
+fn unavailable_media_storage() -> MediaStorageSnapshot {
+    MediaStorageSnapshot {
+        available: false,
+        source: "container-filesystem",
+        path: MEDIA_PATH,
+        total_bytes: None,
+        used_bytes: None,
+        available_bytes: None,
+        usage_percent: None,
+    }
+}
+
+async fn read_cgroup_v2_file(name: &str) -> Option<String> {
+    let relative = cgroup_relative_path().await?;
+    let root = Path::new(CGROUP_ROOT);
+    let mut paths = vec![root.join(&relative).join(name)];
+    if !relative.as_os_str().is_empty() {
+        paths.push(root.join(name));
+    }
+    read_current_cgroup_file(paths).await
+}
+
+async fn read_cgroup_v1_file(controller: &str, name: &str) -> Option<String> {
+    let relative = cgroup_relative_path().await?;
+    let root = Path::new(CGROUP_ROOT).join(controller);
+    let mut paths = vec![root.join(&relative).join(name)];
+    if !relative.as_os_str().is_empty() {
+        paths.push(root.join(name));
+    }
+    read_current_cgroup_file(paths).await
+}
+
+async fn read_current_cgroup_file(paths: Vec<PathBuf>) -> Option<String> {
+    let pid = std::process::id();
+    for path in paths {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let Ok(processes) = fs::read_to_string(parent.join("cgroup.procs")).await else {
+            continue;
+        };
+        if !process_is_member(&processes, pid) {
+            continue;
+        }
+        if let Ok(value) = fs::read_to_string(path).await {
+            return Some(value);
+        }
+    }
+    None
+}
+
+async fn cgroup_relative_path() -> Option<PathBuf> {
+    let content = fs::read_to_string("/proc/self/cgroup").await.ok()?;
+    let value = content.lines().find_map(|line| {
+        line.strip_prefix("0::")
+            .or_else(|| line.splitn(3, ':').nth(2))
+    })?;
+    let path = Path::new(value);
+    let relative = path.strip_prefix("/").ok()?.to_path_buf();
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::CurDir | Component::ParentDir | Component::RootDir
+        )
+    }) {
+        return None;
+    }
+    Some(relative)
+}
+
+fn parse_keyed_value(input: &str, key: &str) -> Option<u64> {
+    input.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let current_key = fields.next()?;
+        let value = fields.next()?;
+        (current_key == key).then(|| parse_unsigned(value))?
+    })
+}
+
+fn parse_unsigned(input: &str) -> Option<u64> {
+    input.trim().parse().ok()
+}
+
+fn process_is_member(processes: &str, pid: u32) -> bool {
+    processes
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .any(|candidate| candidate == pid)
+}
+
+fn parse_cgroup_limit(input: &str) -> Option<u64> {
+    let value = input.split_whitespace().next()?;
+    (value != "max").then(|| value.parse().ok())?
+}
+
+fn parse_cpu_limit(input: &str) -> Option<f64> {
+    let mut fields = input.split_whitespace();
+    let quota = fields.next()?;
+    let period = fields.next()?;
+    if quota == "max" {
+        return None;
+    }
+    parse_cpu_quota(quota, period)
+}
+
+fn parse_cpu_quota(quota: &str, period: &str) -> Option<f64> {
+    let quota = quota.parse::<f64>().ok()?;
+    let period = period.parse::<f64>().ok()?;
+    (quota > 0.0 && period > 0.0).then_some(quota / period)
+}
+
+fn parse_blocks(input: &str) -> Option<u64> {
+    input.parse::<u64>().ok()?.checked_mul(1024)
+}
+
+fn parse_media_storage_values(output: &str) -> Option<(u64, u64, u64)> {
+    let line = output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with("Filesystem"))?;
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 6 {
+        return None;
+    }
+    let data = &fields[fields.len() - 5..fields.len() - 1];
+    Some((
+        parse_blocks(data[0])?,
+        parse_blocks(data[1])?,
+        parse_blocks(data[2])?,
+    ))
+}
+
+fn calculate_cpu_usage_percent(
+    delta_usage_usec: u64,
+    elapsed_usec: u64,
+    capacity_cores: f64,
+) -> Option<f64> {
+    if elapsed_usec == 0 || capacity_cores <= 0.0 {
+        return None;
+    }
+    Some(delta_usage_usec as f64 * 100.0 / elapsed_usec as f64 / capacity_cores)
+}
+
+fn memory_usage_percent(used_bytes: u64, limit_bytes: Option<u64>) -> Option<f64> {
+    let limit_bytes = limit_bytes.filter(|limit| *limit > 0)?;
+    Some((used_bytes as f64 * 100.0 / limit_bytes as f64).min(100.0))
+}
+
+fn calculate_storage_usage_percent(used_bytes: u64, total_bytes: u64) -> Option<f64> {
+    (total_bytes > 0).then(|| (used_bytes as f64 * 100.0 / total_bytes as f64).min(100.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        calculate_cpu_usage_percent, memory_usage_percent, parse_cgroup_limit,
+        parse_media_storage_values, process_is_member,
+    };
+
+    #[test]
+    fn cgroup_max_is_an_unlimited_container_limit() {
+        assert_eq!(parse_cgroup_limit("max\n"), None);
+        assert_eq!(parse_cgroup_limit("1048576\n"), Some(1_048_576));
+    }
+
+    #[test]
+    fn cpu_usage_is_normalized_to_the_container_capacity() {
+        assert_eq!(
+            calculate_cpu_usage_percent(200_000, 1_000_000, 2.0),
+            Some(10.0)
+        );
+        assert_eq!(
+            calculate_cpu_usage_percent(2_000_000, 1_000_000, 2.0),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn memory_usage_is_unavailable_without_a_finite_container_limit() {
+        assert_eq!(memory_usage_percent(512, None), None);
+        assert_eq!(memory_usage_percent(512, Some(1_024)), Some(50.0));
+    }
+
+    #[test]
+    fn cgroup_membership_requires_an_exact_process_id() {
+        assert!(process_is_member("100\n123\n", 123));
+        assert!(!process_is_member("1230\n", 123));
+    }
+
+    #[test]
+    fn parses_posix_df_output_without_trusting_the_mount_label() {
+        assert_eq!(
+            parse_media_storage_values(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n                 overlay 102400 20480 81920 20% /media\n"
+            ),
+            Some((102_400 * 1024, 20_480 * 1024, 81_920 * 1024))
+        );
+    }
+}

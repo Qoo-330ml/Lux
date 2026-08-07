@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Download, PackageOpen, RefreshCw, Save, Settings2, X } from "lucide-react";
+import { CheckCircle2, Download, PackageOpen, Save, Settings2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -36,7 +36,6 @@ export function AdminPluginsPage() {
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading">
         <div><h1>插件库</h1><p>安装已内置并经过验证的元数据插件，再为媒体库选择刮削器。</p></div>
-        <button className="lux-button lux-button-secondary lux-admin-refresh" type="button" onClick={() => { void plugins.refetch(); void installedPlugins.refetch(); }}><RefreshCw size={16} /> 刷新</button>
       </header>
       <nav className="lux-admin-plugin-tabs" aria-label="插件库视图">
         <button className={mode === "store" ? "is-active" : ""} type="button" aria-pressed={mode === "store"} onClick={() => setMode("store")}>插件商店<span>{plugins.data.total ?? plugins.data.plugins?.length ?? 0}</span></button>

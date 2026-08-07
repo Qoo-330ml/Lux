@@ -141,6 +141,15 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     let body: Value = dashboard.json().await?;
     assert_eq!(body["server"]["name"], "客厅 Lux");
     assert_eq!(body["server"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["stats"]["movieCount"], 0);
+    assert_eq!(body["stats"]["seriesCount"], 1);
+    assert_eq!(body["stats"]["userCount"], 1);
+    assert!(body["health"]["runtime"]["seconds"].is_number());
+    assert_eq!(body["health"]["resources"]["cpu"]["source"], "cgroup");
+    assert_eq!(
+        body["health"]["resources"]["mediaStorage"]["path"],
+        "/media"
+    );
     assert_eq!(body["nowPlaying"][0]["userName"], "Admin");
     assert_eq!(body["nowPlaying"][0]["title"], "张启山和吴老狗达成合作");
     assert_eq!(body["nowPlaying"][0]["seriesTitle"], "九门");

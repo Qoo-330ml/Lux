@@ -1,5 +1,6 @@
 import { Activity, Database, FileClock, Image, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
 import { NavLink, Outlet } from "react-router-dom";
+import { useAdminEvents } from "./useAdminEvents";
 
 const adminNav = [
   { to: "/admin", label: "仪表盘", icon: Activity, end: true },
@@ -12,6 +13,8 @@ const adminNav = [
 ];
 
 export function AdminLayout() {
+  useAdminEvents();
+
   return (
     <section className="lux-admin-layout">
       <aside className="lux-admin-sidebar" aria-label="管理员导航">

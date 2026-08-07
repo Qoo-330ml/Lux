@@ -1,4 +1,5 @@
 pub mod access;
+pub mod admin_events;
 pub mod candidates;
 pub mod catalog;
 pub mod collections;

@@ -98,6 +98,14 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
     assert_eq!(body["config"]["writable"], true);
     assert!(body["ffprobe"]["available"].is_boolean());
     assert_eq!(body["tmdb"]["configured"], true);
+    assert!(body["runtime"]["seconds"].is_number());
+    assert_eq!(body["resources"]["cpu"]["source"], "cgroup");
+    assert_eq!(body["resources"]["memory"]["source"], "cgroup");
+    assert_eq!(body["resources"]["mediaStorage"]["path"], "/media");
+    assert_eq!(
+        body["resources"]["mediaStorage"]["source"],
+        "container-filesystem"
+    );
     assert_eq!(body["libraries"][0]["rootCount"], 1);
     assert!(body.get("configDir").is_none());
     let body_text = body.to_string();

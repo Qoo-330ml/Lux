@@ -1753,6 +1753,7 @@ services:
 | LUX-146 | src/application/plugin_protocol.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/application/strm_probe.rs、src/application/strm_probe_policy.rs、src/application/probe.rs、src/storage/、src/api/mod.rs、src/bin/lux-plugin-strm-media-info.rs、src/bin/lux-plugin-pack.rs、migrations/、scripts/、tests/、docs/ |
 | LUX-150 | src/application/danmaku.rs、src/storage/、src/api/mod.rs、migrations/、tests/、docs/ |
 | LUX-151 | src/application/ip_location.rs、src/api/mod.rs、tests/、web/src/features/admin/、web/src/lib/api/、docs/ |
+| LUX-153 | src/application/admin_events.rs、src/api/mod.rs、tests/admin_events.rs、web/src/features/admin/、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2584,7 +2585,7 @@ services:
 - 播放卡片中，电影只显示电影标题；剧集以剧名为白色主标题，灰色副标题显示 `S01E02 · 单集标题`，并按用户、设备、客户端展示账户信息。
 - 播放卡片明确显示客户端名称/版本、设备名称/类型和设备 ID（设备 ID 可折叠或以次要信息展示）。
 - 显示最近登录、开始播放、暂停和停止播放的账户活动；活动记录由服务端统一写入并按时间倒序返回。
-- 仪表盘数据有服务端数量上限，Web 端只使用低频刷新，不因页面打开产生过度轮询负载。
+- 仪表盘数据有服务端数量上限，管理员 Web 端通过受保护的 SSE 接收变更通知并按作用域刷新查询；CPU、内存和存储等资源指标仍使用低频采样，不因页面打开产生过度轮询负载。
 
 验证：API 集成测试、组件测试和 Playwright。
 
@@ -3187,6 +3188,42 @@ ip138，不再把它作为回退。Hiofd 插件显示名称为“IP归属地查�
 - 不新增公开 IP 查询 API，不把归属地作为认证、ACL、近远端判断或其他安全决策依据。
 - 不把 Hiofd 或 qoo-ip138 的供应商字段协议暴露为 Lux 公共协议，不持久化归属地数据。
 - 不在 Lux 主进程中保留 Hiofd/qoo-ip138 的第三方 HTTP 解析实现；第三方请求只在对应插件进程中执行。
+
+#### LUX-153：管理员控制台 SSE 实时更新
+
+管理员控制台通过 `GET /api/v1/admin/events` 接收同源 SSE 变更通知。端点只允许已登录且
+具有 `canManageServer` 的管理员 Web session，读取不要求 CSRF。服务端发送版本为 1 的
+`ready` 首帧、带 `scope` 的 `invalidate` 事件和 15 秒注释心跳；广播缓冲区丢帧时发送
+`all`，客户端重新读取所有活动管理员查询。作用域包括 `all`、`dashboard`、`jobs`、
+`libraries`、`plugins`、`users`、`metadata` 和 `settings`。
+
+前端只在 `AdminLayout` 建立一条 EventSource，连接恢复时补偿失效所有管理员查询，卸载时
+关闭连接。扫描、元数据、插件、用户、媒体库、设置和播放/登录活动在对应服务端写入成功后
+发布作用域通知；受影响的管理员审计日志和用户媒体库 ACL 查询也会失效。SSE 只传通知，不传
+业务数据。页面移除页面级刷新按钮，但保留扫描、刮削、取消和重试等主动命令。资源指标继续
+低频刷新，SSE 不替代资源采样。
+
+验收：
+
+- [ ] SSE 端点完成管理员鉴权、协议头、ready 帧、心跳和丢帧退化测试。
+- [ ] 活动、后台任务和管理配置变更发布正确作用域，前端只失效受影响查询。
+- [ ] 管理布局维持单连接、自动重连、重连补偿和卸载关闭行为；页面级刷新按钮全部移除。
+- [ ] Rust/Web 测试、格式化、Clippy 和 Web 构建通过，并记录 ARM 本机 `uname -m`。
+
+验证：
+
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-102、LUX-103、LUX-105、LUX-106。
+
+明确不做：
+
+- 不向普通用户或 Emby 兼容 API 提供 SSE，不传输业务数据或敏感信息。
+- 不用 SSE 替代资源指标的低频采样，不增加页面级轮询。
 
 ## 26. 风险与缓解
 

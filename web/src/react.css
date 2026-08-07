@@ -425,7 +425,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-page-heading:not(:has(> .lux-button)) { height: 0; margin-bottom: 0; }
 .lux-admin-page-heading h1 { margin: 10px 0 8px; color: #fff; font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.075em; }
 .lux-admin-page-heading p { margin: 0; color: var(--lux-muted); }
-.lux-admin-refresh { min-height: 42px; padding: 0 16px; }
 .lux-admin-dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(310px, .95fr); gap: 0; margin-top: 28px; border-bottom: 1px solid var(--lux-line-soft); }
 .lux-admin-panel { min-width: 0; padding: 22px; border: 0; border-radius: 0; background: transparent; }
 .lux-admin-panel + .lux-admin-panel { border-left: 1px solid var(--lux-line-soft); }

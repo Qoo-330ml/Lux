@@ -4369,6 +4369,29 @@ impl Database {
         })
     }
 
+    pub(crate) async fn dashboard_stats(&self) -> Result<DashboardStats, StorageError> {
+        sqlx::query(
+            "SELECT
+                COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
+                COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
+                (SELECT COUNT(*) FROM users WHERE is_disabled = 0) AS user_count
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.removed_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map(|row| DashboardStats {
+            movie_count: row.get("movie_count"),
+            series_count: row.get("series_count"),
+            user_count: row.get("user_count"),
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn search_catalog_item_ids(
         &self,
         query: &str,
@@ -6992,6 +7015,13 @@ impl Database {
     pub async fn close(self) {
         self.pool.close().await;
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct DashboardStats {
+    pub(crate) movie_count: i64,
+    pub(crate) series_count: i64,
+    pub(crate) user_count: i64,
 }
 
 #[derive(Debug)]

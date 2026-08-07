@@ -223,6 +223,31 @@ export type AdminUser = LuxUser & {
 export type AdminHealth = {
   status: "ok" | "degraded" | string;
   schemaVersion: number;
+  runtime: { seconds: number };
+  resources: {
+    cpu: {
+      available: boolean;
+      source: string;
+      usagePercent: number | null;
+      limitCores: number | null;
+    };
+    memory: {
+      available: boolean;
+      source: string;
+      usedBytes: number | null;
+      limitBytes: number | null;
+      usagePercent: number | null;
+    };
+    mediaStorage: {
+      available: boolean;
+      source: string;
+      path: string;
+      totalBytes: number | null;
+      usedBytes: number | null;
+      availableBytes: number | null;
+      usagePercent: number | null;
+    };
+  };
   database: { status: string; journalMode: string; writable: boolean };
   config: { available: boolean; writable: boolean };
   ffprobe: { available: boolean };
@@ -248,6 +273,11 @@ export type AdminDashboard = {
     version: string;
     commit: string;
     schemaVersion: number;
+  };
+  stats: {
+    movieCount: number;
+    seriesCount: number;
+    userCount: number;
   };
   health: AdminHealth;
   nowPlaying: AdminPlaybackSession[];
@@ -289,7 +319,6 @@ export type AdminIpLocation = {
   street?: string | null;
   isp?: string | null;
 };
-
 
 export type AdminPlaybackSource = {
   id: string;

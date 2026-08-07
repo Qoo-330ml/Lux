@@ -1,3 +1,5 @@
+pub mod resources;
+
 use tracing_subscriber::{EnvFilter, fmt};
 
 pub fn init() {

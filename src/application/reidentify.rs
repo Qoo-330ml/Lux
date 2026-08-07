@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{
+        admin_events::{AdminEventHub, AdminEventScope},
         candidates::{
             MetadataCandidateError, MetadataCandidateService, MetadataSelectionError,
             MetadataSelectionMode, MetadataSelectionService,
@@ -42,6 +43,7 @@ pub struct MetadataReidentifyService {
     selection: Option<MetadataSelectionService>,
     tmdb: TmdbProvider,
     resolver: Option<ScraperResolver>,
+    admin_events: AdminEventHub,
 }
 
 impl MetadataReidentifyService {
@@ -55,6 +57,7 @@ impl MetadataReidentifyService {
             database,
             tmdb: tmdb.into(),
             resolver: None,
+            admin_events: AdminEventHub::new(),
         }
     }
 
@@ -79,6 +82,7 @@ impl MetadataReidentifyService {
             database,
             tmdb: tmdb.into(),
             resolver: None,
+            admin_events: AdminEventHub::new(),
         }
     }
 
@@ -97,7 +101,13 @@ impl MetadataReidentifyService {
             database,
             tmdb: tmdb.into(),
             resolver: Some(resolver),
+            admin_events: AdminEventHub::new(),
         }
+    }
+
+    pub fn with_admin_events(mut self, admin_events: AdminEventHub) -> Self {
+        self.admin_events = admin_events;
+        self
     }
 
     pub async fn create_job(
@@ -154,6 +164,7 @@ impl MetadataReidentifyService {
         self.database
             .create_metadata_reidentify_job(&job_id, &unique_ids, mode.as_str())
             .await?;
+        self.admin_events.publish(AdminEventScope::Jobs);
         self.get_job(&job_id).await
     }
 
@@ -211,6 +222,7 @@ impl MetadataReidentifyService {
         self.database
             .create_metadata_reidentify_library_job(&job_id, &item_ids, mode.as_str())
             .await?;
+        self.admin_events.publish(AdminEventScope::Jobs);
         self.get_job(&job_id).await
     }
 
@@ -336,6 +348,7 @@ impl MetadataReidentifyService {
                 (status == "FAILED").then_some("ITEM_FAILED"),
             )
             .await;
+        self.admin_events.publish(AdminEventScope::Jobs);
     }
 
     async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
@@ -374,6 +387,8 @@ impl MetadataReidentifyService {
                         None,
                     )
                     .await;
+                self.admin_events.publish(AdminEventScope::Jobs);
+                self.admin_events.publish(AdminEventScope::Metadata);
             }
             Err(error) => {
                 let code = error.code();
@@ -381,6 +396,8 @@ impl MetadataReidentifyService {
                     .database
                     .finish_metadata_reidentify_item(job_id, item_id, "FAILED", 0, Some(code))
                     .await;
+                self.admin_events.publish(AdminEventScope::Jobs);
+                self.admin_events.publish(AdminEventScope::Metadata);
             }
         }
     }
@@ -492,6 +509,7 @@ impl MetadataReidentifyService {
         {
             return Err(MetadataReidentifyError::JobNotCancelable);
         }
+        self.admin_events.publish(AdminEventScope::Jobs);
         Ok(())
     }
 
@@ -505,6 +523,7 @@ impl MetadataReidentifyService {
         {
             return Err(MetadataReidentifyError::JobNotRetryable);
         }
+        self.admin_events.publish(AdminEventScope::Jobs);
         self.get_job(job_id).await
     }
 

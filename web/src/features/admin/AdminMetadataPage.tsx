@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Image, RefreshCw, ScanSearch, Trash2 } from "lucide-react";
+import { Check, Image, ScanSearch, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -11,7 +11,7 @@ export function AdminMetadataPage() {
   if (pending.isPending) return <AdminMetadataState label="正在读取待处理元数据…" />;
   if (pending.error) return <AdminMetadataState label={pending.error.message} error />;
   const items = pending.data.items ?? [];
-  return <div className="lux-admin-page"><header className="lux-admin-page-heading"><div><h1>元数据纠错</h1><p>查看低置信度匹配，确认候选并写回 NFO 与图片。</p></div><button className="lux-button lux-button-secondary" type="button" onClick={() => void pending.refetch()}><RefreshCw size={16} /> 刷新</button></header><section className="lux-admin-panel"><div className="lux-admin-panel-heading"><div><h2>待处理候选</h2></div><span className="lux-status-pill">{pending.data.total ?? items.length} 个</span></div>{items.length === 0 ? <div className="lux-admin-empty"><Check size={25} /><h2>没有待处理匹配</h2><p>当前所有条目的元数据都已确认。</p></div> : <div className="lux-admin-metadata-list">{items.map((item) => <MetadataCandidateRow key={item.id} item={item} onSelected={() => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminPendingMetadata }); }} />)}</div>}</section></div>;
+  return <div className="lux-admin-page"><header className="lux-admin-page-heading"><div><h1>元数据纠错</h1><p>查看低置信度匹配，确认候选并写回 NFO 与图片。</p></div></header><section className="lux-admin-panel"><div className="lux-admin-panel-heading"><div><h2>待处理候选</h2></div><span className="lux-status-pill">{pending.data.total ?? items.length} 个</span></div>{items.length === 0 ? <div className="lux-admin-empty"><Check size={25} /><h2>没有待处理匹配</h2><p>当前所有条目的元数据都已确认。</p></div> : <div className="lux-admin-metadata-list">{items.map((item) => <MetadataCandidateRow key={item.id} item={item} onSelected={() => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminPendingMetadata }); }} />)}</div>}</section></div>;
 }
 
 function MetadataCandidateRow({ item, onSelected }: { item: AdminMetadataCandidate; onSelected: () => void }) {

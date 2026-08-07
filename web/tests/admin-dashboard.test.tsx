@@ -13,9 +13,16 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const dashboard: AdminDashboard = {
   server: { name: "客厅 Lux", version: "0.1.0", commit: "abc1234", schemaVersion: 37 },
+  stats: { movieCount: 42, seriesCount: 7, userCount: 3 },
   health: {
     status: "ok",
     schemaVersion: 37,
+    runtime: { seconds: 90_061 },
+    resources: {
+      cpu: { available: true, source: "cgroup", usagePercent: 37.5, limitCores: 2 },
+      memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: 4_294_967_296, usagePercent: 25 },
+      mediaStorage: { available: true, source: "container-filesystem", path: "/media", totalBytes: 107_374_182_400, usedBytes: 10_737_418_240, availableBytes: 96_636_764_160, usagePercent: 10 },
+    },
     database: { status: "ok", journalMode: "wal", writable: true },
     config: { available: true, writable: true },
     ffprobe: { available: true },
@@ -107,7 +114,7 @@ describe("AdminDashboardPage", () => {
 
   it("renders server identity, rich playback cards, and account activity", async () => {
     const load = vi.spyOn(api, "adminDashboard").mockResolvedValue(dashboard);
-    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
+    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({ ...settings, serverName: "书房 Lux" });
     vi.spyOn(api, "adminHealth").mockResolvedValue(dashboard.health);
     vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -123,7 +130,7 @@ describe("AdminDashboardPage", () => {
     });
 
     await act(async () => {
-      await vi.waitFor(() => expect(container.querySelector<HTMLInputElement>("input[name='serverName']")?.value).toBe("客厅 Lux"));
+      await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-server-name")?.textContent).toBe("客厅 Lux"));
     });
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.adminDashboard })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.liveDashboard);
@@ -133,11 +140,16 @@ describe("AdminDashboardPage", () => {
     expect(overview).not.toBeNull();
     expect(overview?.querySelector(".lux-admin-overview-status")?.textContent).toContain("在线");
     expect(overview?.querySelector('[data-overview-value="版本"] strong')?.textContent).toBe("v0.1.0");
-    expect(overview?.querySelector('[data-overview-value="运行时长"] strong')?.textContent).toBe("");
+    expect(overview?.querySelector('[data-overview-value="运行时长"] strong')?.textContent).toBe("1天 1时 1分 1秒");
+    expect(overview?.querySelector('[data-overview-value="版本"]')?.textContent).toBe("版本：v0.1.0");
+    expect(overview?.querySelector('[data-overview-value="运行时长"]')?.textContent).toBe("运行时长：1天 1时 1分 1秒");
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-value")).toHaveLength(6);
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-icon")).toHaveLength(0);
-    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["", "", "", "", "", ""]);
-    expect(overview?.querySelector(".lux-admin-overview-device")?.textContent).toBe("");
+    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["42", "7", "3", "37.5%", "1.0 GiB / 4.0 GiB", "10.0 GiB / 100.0 GiB"]);
+    expect(overview?.querySelector(".lux-admin-overview-device")).toBeNull();
+    expect(overview?.querySelectorAll(".lux-admin-overview-info-icon")).toHaveLength(0);
+    expect(overview?.textContent).toContain("存储空间");
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
     expect(container.querySelector(".lux-admin-stat-grid")).toBeNull();
     expect(container.querySelectorAll(".lux-admin-stat")).toHaveLength(0);
     expect(container.textContent).toContain("爱情情节顶红");
@@ -178,6 +190,10 @@ describe("AdminDashboardPage", () => {
     expect(container.textContent).not.toContain("viewer 11");
     expect(container.querySelectorAll(".lux-admin-activity-row")).toHaveLength(10);
 
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="编辑服务器名称"]')?.click();
+      await vi.waitFor(() => expect(container.querySelector('[role="dialog"]')).not.toBeNull());
+    });
     const input = container.querySelector<HTMLInputElement>("input[name='serverName']");
     expect(input?.value).toBe("客厅 Lux");
     await act(async () => {
@@ -185,9 +201,44 @@ describe("AdminDashboardPage", () => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "书房 Lux");
       input.dispatchEvent(new Event("input", { bubbles: true }));
       input.dispatchEvent(new Event("change", { bubbles: true }));
-      container.querySelector<HTMLButtonElement>("button[type='submit']")?.click();
+      container.querySelector<HTMLButtonElement>(".lux-server-name-dialog-save")?.click();
       await vi.waitFor(() => expect(update).toHaveBeenCalledWith({ serverName: "书房 Lux" }));
     });
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.querySelector(".lux-admin-overview-server-name")?.textContent).toBe("书房 Lux");
+  });
+
+  it("shows unavailable when container resource metrics cannot be read", async () => {
+    const unavailableDashboard: AdminDashboard = {
+      ...dashboard,
+      health: {
+        ...dashboard.health,
+        resources: {
+          cpu: { available: false, source: "cgroup", usagePercent: null, limitCores: null },
+          memory: { available: false, source: "cgroup", usedBytes: null, limitBytes: null, usagePercent: null },
+          mediaStorage: { available: false, source: "container-filesystem", path: "/media", totalBytes: null, usedBytes: null, availableBytes: null, usagePercent: null },
+        },
+      },
+    };
+    vi.spyOn(api, "adminDashboard").mockResolvedValue(unavailableDashboard);
+    vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminDashboardPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-card")).not.toBeNull());
+    });
+    const values = [...container.querySelectorAll(".lux-admin-overview-metric-value")].map((value) => value.textContent);
+    expect(values.slice(3)).toEqual(["不可用", "不可用", "不可用"]);
   });
 
   it("shows a movie kind once instead of repeating it across card metadata", async () => {
