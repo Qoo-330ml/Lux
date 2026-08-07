@@ -5833,9 +5833,7 @@ async fn serve_emby_library_cover(
             return None;
         }
     } else {
-        let Some(principal) = principal else {
-            return None;
-        };
+        let principal = principal?;
         let Some(access) = state.access.as_ref() else {
             return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
         };
