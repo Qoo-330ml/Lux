@@ -54,8 +54,7 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
             <DeviceField
               icon={<Monitor size={15} />}
               label="设备"
-              value={session.deviceName || session.deviceId || "—"}
-              detail={deviceDetail(session)}
+              value={session.deviceName || "—"}
             />
             <DeviceField
               icon={<Radio size={15} />}
@@ -97,13 +96,6 @@ function Fact({ icon, label, value, detail }: { icon: ReactNode; label: string; 
 
 function DeviceField({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail?: string | null }) {
   return <span className="lux-now-playing-account-entry"><span className="lux-now-playing-account-entry-icon">{icon}</span><span><small>{label}</small><strong>{value}</strong>{detail ? <em>{detail}</em> : null}</span></span>;
-}
-
-function deviceDetail(session: AdminPlaybackSession) {
-  return [
-    session.deviceType,
-    session.deviceId && session.deviceId !== session.deviceName ? `ID ${session.deviceId}` : undefined,
-  ].filter(Boolean).join(" · ") || undefined;
 }
 
 function NetworkField({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {

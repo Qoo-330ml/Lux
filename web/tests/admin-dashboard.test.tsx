@@ -133,8 +133,8 @@ describe("AdminDashboardPage", () => {
     expect(container.textContent).toContain("S1 · E9");
     expect(container.textContent).toContain("VidHub");
     expect(container.textContent).toContain("v3.0.2");
-    expect(container.textContent).toContain("Phone");
-    expect(container.textContent).toContain("ID iphone");
+    const deviceEntry = container.querySelectorAll(".lux-now-playing-account-entry")[0];
+    expect(deviceEntry?.textContent).toBe("设备iPhone");
     expect(container.textContent).toContain("4K HEVC");
     expect(container.textContent).toContain("HEVC");
     expect(container.textContent).toContain("AAC · zh-CN");
