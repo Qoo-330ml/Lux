@@ -326,6 +326,53 @@ async fn reconciliation_does_not_mark_files_missing_when_root_disappears_after_d
 }
 
 #[tokio::test]
+async fn reconciliation_skips_prefetched_sibling_directories_after_one_directory_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for (directory, filename) in [
+        ("Alpha", "Alpha.Movie.2020.mkv"),
+        ("Beta", "Beta.Movie.2021.mkv"),
+    ] {
+        tokio::fs::create_dir_all(root.join(directory)).await?;
+        tokio::fs::write(root.join(directory).join(filename), b"fixture").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_batch(&reconciliation.id, 100).await?;
+    tokio::fs::rename(root.join("Alpha"), temp_dir.path().join("Alpha-unmounted")).await?;
+    jobs.run_to_completion(&reconciliation.id, 100, None)
+        .await?;
+
+    let missing_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM filesystem_entries WHERE is_missing = 1")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(missing_count, 0);
+    let root_available: i64 = sqlx::query_scalar("SELECT is_available FROM library_roots")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(root_available, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn incremental_scan_processes_only_queued_file() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {

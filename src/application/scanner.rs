@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt,
     path::{Component, Path, PathBuf},
     time::UNIX_EPOCH,
@@ -1054,7 +1055,11 @@ impl ScanJobService {
             .database
             .list_reconciliation_scan_entries(&job.id, "DIRECTORY", limit)
             .await?;
+        let mut unavailable_root_ids = HashSet::new();
         for directory in directories {
+            if unavailable_root_ids.contains(&directory.library_root_id) {
+                continue;
+            }
             let Some(root) = self
                 .database
                 .find_library_root(&directory.library_root_id)
@@ -1083,6 +1088,7 @@ impl ScanJobService {
                         .await?;
                 }
                 Err(ScannerError::Io { .. }) => {
+                    unavailable_root_ids.insert(root.id.clone());
                     self.database
                         .update_library_root_availability(&root.id, false)
                         .await?;
