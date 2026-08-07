@@ -28,20 +28,29 @@ test("dashboard panels use separators instead of card chrome", () => {
   assert.match(panelGridRule, /border-bottom:\s*1px\s+solid\s+var\(--lux-line-soft\)/);
 });
 
-test("dashboard overview stays flat with only one content divider", () => {
+test("dashboard overview follows account settings section rhythm", () => {
   const cardRule = stylesheet.match(/\.lux-admin-overview-card\s*\{([^}]*)\}/)?.[1] ?? "";
   const topRule = stylesheet.match(/\.lux-admin-overview-top\s*\{([^}]*)\}/)?.[1] ?? "";
+  const identityRule = stylesheet.match(/\.lux-admin-overview-identity\s*\{([^}]*)\}/)?.[1] ?? "";
+  const nameRule = stylesheet.match(/\.lux-admin-overview-name-form input\s*\{([^}]*)\}/)?.[1] ?? "";
   const metricsRule = stylesheet.match(/\.lux-admin-overview-metrics\s*\{([^}]*)\}/)?.[1] ?? "";
   const metricDividerRule = stylesheet.match(/\.lux-admin-overview-metric\s*\+\s*\.lux-admin-overview-metric\s*\{([^}]*)\}/)?.[1] ?? "";
 
+  assert.match(cardRule, /padding:\s*0/);
   assert.match(cardRule, /border:\s*0/);
   assert.match(cardRule, /border-radius:\s*0/);
   assert.match(cardRule, /background:\s*transparent/);
   assert.match(cardRule, /box-shadow:\s*none/);
   assert.match(topRule, /display:\s*grid/);
   assert.match(topRule, /align-items:\s*center/);
+  assert.match(topRule, /padding:\s*20px\s+22px/);
+  assert.match(topRule, /border-bottom:\s*1px\s+solid\s+var\(--lux-overview-line\)/);
+  assert.match(identityRule, /display:\s*grid/);
+  assert.match(identityRule, /grid-template-columns:\s*auto\s+minmax\(0,\s*1fr\)/);
+  assert.match(nameRule, /min-height:\s*42px/);
   assert.match(metricsRule, /display:\s*grid/);
-  assert.match(metricsRule, /border-top:\s*1px\s+solid\s+var\(--lux-overview-line\)/);
+  assert.match(metricsRule, /padding:\s*22px\s+22px\s+0/);
+  assert.doesNotMatch(metricsRule, /border-top:/);
   assert.doesNotMatch(stylesheet, /\.lux-admin-overview-info\s*\+\s*\.lux-admin-overview-info\s*\{[^}]*border-left:/);
   assert.doesNotMatch(metricDividerRule, /border-left:/);
 });
