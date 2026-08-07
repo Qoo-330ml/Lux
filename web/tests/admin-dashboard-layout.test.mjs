@@ -48,6 +48,8 @@ test("dashboard overview follows account settings section rhythm", () => {
   assert.match(identityRule, /display:\s*grid/);
   assert.match(identityRule, /grid-template-columns:\s*auto\s+minmax\(0,\s*1fr\)/);
   assert.match(nameRule, /min-height:\s*42px/);
+  assert.match(nameRule, /border:\s*0/);
+  assert.match(nameRule, /background:\s*transparent/);
   assert.match(metricsRule, /display:\s*grid/);
   assert.match(metricsRule, /padding:\s*22px\s+22px\s+0/);
   assert.doesNotMatch(metricsRule, /border-top:/);

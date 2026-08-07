@@ -476,8 +476,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-overview-identity { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 12px; min-width: 0; }
 .lux-admin-overview-device { display: grid; place-items: center; width: 38px; height: 38px; min-height: 38px; border: 1px solid var(--lux-overview-line); border-radius: 9px; color: var(--lux-overview-icon); background: var(--lux-overview-input-bg); }
 .lux-admin-overview-name-form { position: relative; min-width: 0; }
-.lux-admin-overview-name-form input { width: 100%; min-height: 42px; padding: 0 48px 0 12px; overflow: hidden; border: 1px solid var(--lux-overview-line); border-radius: 8px; outline: 0; color: var(--lux-overview-text); background: var(--lux-overview-input-bg); font-size: 1.05rem; letter-spacing: -.025em; text-overflow: ellipsis; }
-.lux-admin-overview-name-form input:focus { border-color: color-mix(in srgb, var(--lux-overview-accent) 48%, var(--lux-overview-line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--lux-overview-accent) 14%, transparent); }
+.lux-admin-overview-name-form input { width: 100%; min-height: 42px; padding: 0 40px 0 0; overflow: hidden; border: 0; border-radius: 0; outline: 0; color: var(--lux-overview-text); background: transparent; font-size: 1.05rem; letter-spacing: -.025em; text-overflow: ellipsis; }
+.lux-admin-overview-name-form input:focus { border-color: transparent; box-shadow: 0 2px 0 color-mix(in srgb, var(--lux-overview-accent) 48%, transparent); }
 .lux-admin-overview-name-form button { position: absolute; top: 50%; right: 8px; display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; color: var(--lux-overview-icon); background: transparent; transform: translateY(-50%); }
 .lux-admin-overview-name-form button:hover:not(:disabled) { color: var(--lux-overview-accent); }
 .lux-admin-overview-name-form button:disabled { opacity: .55; }
