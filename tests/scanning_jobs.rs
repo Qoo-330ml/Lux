@@ -41,11 +41,22 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     assert_eq!(job.status, "PENDING");
-    assert_eq!(job.total_count, 3);
+    assert_eq!(job.total_count, 0);
     assert!(matches!(
         jobs.create_movie_scan_job(library.id).await,
         Err(ScanJobError::AlreadyActive(_))
     ));
+
+    let root_discovery = jobs.run_batch(&job.id, 100).await?;
+    assert_eq!(root_discovery.processed, 0);
+    let child_discovery = jobs.run_batch(&job.id, 100).await?;
+    assert_eq!(child_discovery.processed, 0);
+    let discovered_total: i64 =
+        sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(discovered_total, 3);
 
     let first_batch = jobs.run_batch(&job.id, 1).await?;
     assert_eq!(first_batch.status, "RUNNING");
@@ -126,6 +137,191 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
         cancel_event,
         ("INFO".to_owned(), "JOB_CANCELLED".to_owned())
     );
+    let cancelled_work: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_scan_entries WHERE job_id = ?")
+            .bind(&cancel_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cancelled_work, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_job_discovers_once_and_processes_a_persisted_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Alpha.Movie.2020.mkv"), b"fixture").await?;
+    tokio::fs::write(root.join("Beta.Movie.2021.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    assert_eq!(job.total_count, 0, "job creation must not walk the root");
+
+    let discovery = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(discovery.status, "RUNNING");
+    assert_eq!(discovery.processed, 0);
+    assert!(!discovery.completed);
+    let discovered_total: i64 =
+        sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(discovered_total, 2);
+
+    tokio::fs::write(root.join("Gamma.Movie.2022.mkv"), b"late fixture").await?;
+    jobs.run_to_completion(&job.id, 1, None).await?;
+
+    let final_counts: (i64, i64) =
+        sqlx::query_as("SELECT processed_count, total_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(final_counts, (2, 2));
+    let indexed_paths: Vec<String> =
+        sqlx::query_scalar("SELECT relative_path FROM filesystem_entries ORDER BY relative_path")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        indexed_paths,
+        vec![
+            "Alpha.Movie.2020.mkv".to_owned(),
+            "Beta.Movie.2021.mkv".to_owned()
+        ]
+    );
+    let remaining_work: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_scan_entries WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_work, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_discovery_resumes_without_reading_completed_directories_again()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for (directory, filename) in [
+        ("Alpha", "Alpha.Movie.2020.mkv"),
+        ("Beta", "Beta.Movie.2021.mkv"),
+    ] {
+        tokio::fs::create_dir_all(root.join(directory)).await?;
+        tokio::fs::write(root.join(directory).join(filename), b"fixture").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let root_discovery = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(root_discovery.processed, 0);
+    let queued_directories: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = ? AND entry_type = 'DIRECTORY'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(queued_directories, 2);
+
+    let late_directory = root.join("Gamma");
+    tokio::fs::create_dir_all(&late_directory).await?;
+    tokio::fs::write(late_directory.join("Gamma.Movie.2022.mkv"), b"late fixture").await?;
+
+    let restarted_jobs = ScanJobService::new(database.clone());
+    restarted_jobs.run_to_completion(&job.id, 1, None).await?;
+
+    let indexed_paths: Vec<String> =
+        sqlx::query_scalar("SELECT relative_path FROM filesystem_entries ORDER BY relative_path")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        indexed_paths,
+        vec![
+            "Alpha/Alpha.Movie.2020.mkv".to_owned(),
+            "Beta/Beta.Movie.2021.mkv".to_owned()
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_does_not_mark_files_missing_when_root_disappears_after_discovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Keep.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    let discovery = jobs.run_batch(&reconciliation.id, 100).await?;
+    assert_eq!(discovery.processed, 0);
+    let discovered_total: i64 =
+        sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
+            .bind(&reconciliation.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(discovered_total, 1);
+
+    tokio::fs::rename(&root, temp_dir.path().join("Movies-unmounted")).await?;
+    jobs.run_to_completion(&reconciliation.id, 100, None)
+        .await?;
+
+    let entry_missing: i64 = sqlx::query_scalar("SELECT is_missing FROM filesystem_entries")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(entry_missing, 0);
+    let root_available: i64 = sqlx::query_scalar("SELECT is_available FROM library_roots")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(root_available, 0);
+    let remaining_work: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_scan_entries WHERE job_id = ?")
+            .bind(&reconciliation.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_work, 0);
     Ok(())
 }
 
@@ -266,7 +462,7 @@ async fn scan_job_marks_inaccessible_root_unavailable_and_recovers_after_restore
 
     let jobs = ScanJobService::new(database.clone());
     let initial = jobs.create_movie_scan_job(library.id).await?;
-    assert_eq!(initial.total_count, 1);
+    assert_eq!(initial.total_count, 0);
     finish_scan(&jobs, &initial.id).await?;
 
     let mut permissions = tokio::fs::metadata(&root).await?.permissions();
@@ -294,7 +490,7 @@ async fn scan_job_marks_inaccessible_root_unavailable_and_recovers_after_restore
     tokio::fs::set_permissions(&root, permissions).await?;
 
     let recovered = jobs.create_movie_scan_job(library.id).await?;
-    assert_eq!(recovered.total_count, 1);
+    assert_eq!(recovered.total_count, 0);
     finish_scan(&jobs, &recovered.id).await?;
     let recovered_available: i64 =
         sqlx::query_scalar("SELECT is_available FROM library_roots WHERE library_id = ?")
