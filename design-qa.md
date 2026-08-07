@@ -42,20 +42,6 @@ final result: passed
 
 ---
 
-# Server name editor screenshot QA
-
-- Source visual truth: `/var/folders/qn/0r3kf149147grtl23x25glhr0000gp/T/TemporaryItems/NSIRD_screencaptureui_x8ZUQu/截屏2026-08-07 16.17.58.png`
-- Implementation screenshot: not captured; the Codex Desktop thread has no available in-app browser or Chrome runtime.
-- State: server name editor dialog implemented and verified through component tests, but not visually rendered for comparison.
-
-## Blocker
-
-- A same-viewport source/implementation comparison and browser console check could not be performed in this environment.
-
-final result: blocked
-
----
-
 # Dashboard overview flatness follow-up
 
 - Implementation screenshot: `/Users/Qoo/Desktop/mywork/Lux/.playwright-cli/page-2026-08-07T04-23-20-075Z.png`
@@ -114,3 +100,17 @@ final result: passed
 - [x] Console errors checked.
 
 final result: passed
+
+---
+
+# Server name editor screenshot QA
+
+- Source visual truth: `/var/folders/qn/0r3kf149147grtl23x25glhr0000gp/T/TemporaryItems/NSIRD_screencaptureui_x8ZUQu/截屏2026-08-07 16.17.58.png`
+- Implementation screenshot: not captured; the Codex Desktop thread has no available in-app browser or Chrome runtime.
+- State: server name editor dialog implemented and verified through component tests, but not visually rendered for comparison.
+
+## Blocker
+
+- A same-viewport source/implementation comparison and browser console check could not be performed in this environment.
+
+final result: blocked
