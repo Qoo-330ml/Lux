@@ -130,7 +130,7 @@ fn tag_contents<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
     values
 }
 
-fn row_cells<'a>(row: &'a str) -> Vec<&'a str> {
+fn row_cells(row: &str) -> Vec<&str> {
     let lower = row.to_ascii_lowercase();
     let mut cells = Vec::new();
     let mut cursor = 0;
