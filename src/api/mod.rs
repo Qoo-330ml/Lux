@@ -7942,7 +7942,16 @@ async fn admin_upsert_scheduled_task(
             .await
         {
             Ok(Some(task)) => task,
-            Ok(None) | Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Ok(None) => {
+                return api_error(
+                    &headers,
+                    StatusCode::NOT_FOUND,
+                    lux::ApiErrorCode::NotFound,
+                    "任务尚未注册",
+                )
+                .into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
         let target_id = format!("global:{task_type}");
         record_audit_event(
@@ -7976,6 +7985,25 @@ async fn admin_upsert_scheduled_task(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "任务尚未注册",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
     let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
     let schedule = if enabled {
         request.schedule.map(|value| value.trim().to_owned())
@@ -8000,15 +8028,21 @@ async fn admin_upsert_scheduled_task(
     if let Err(error) = libraries.update_settings(library_id, settings).await {
         return library_error(&headers, error);
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let task = match database
         .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
         .await
     {
         Ok(Some(task)) => task,
-        Ok(None) | Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "任务尚未注册",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let target_id = format!("{}:{}", library_id, task_type);
     record_audit_event(
@@ -8282,10 +8316,15 @@ fn scheduled_task_json(task: &crate::storage::StoredScheduledTaskConfig) -> Valu
         .clone()
         .or_else(|| (task.owner_type == "GLOBAL").then(|| "全局".to_owned()));
     json!({
+        "id": format!("{}:{}:{}", task.owner_type, task.owner_id, task.task_type),
         "ownerType": task.owner_type,
         "ownerId": task.owner_id,
         "ownerName": owner_name,
         "taskType": task.task_type,
+        "name": task.task_name,
+        "description": task.task_description,
+        "sourceType": task.source_type,
+        "pluginId": task.plugin_id,
         "schedule": task.cron_or_interval,
         "isEnabled": task.is_enabled,
         "resourceLimit": resource_limit,

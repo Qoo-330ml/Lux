@@ -46,8 +46,8 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
 - `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
-- `GET /api/v1/admin/scheduled-tasks?page=1&pageSize=100`：分页查看所有已保存的计划配置，包含 `ownerType`、媒体库名称、`taskType`、`schedule`、启用状态、资源限制和更新时间；结果也包含已停用配置，便于发现其他管理页留下的设置。
-- `PUT /api/v1/admin/scheduled-tasks`：从任务页新增、修改或清空库级计划。请求体为 `{ "ownerType": "LIBRARY", "ownerId": "...", "taskType": "INCREMENTAL_SCAN|RECONCILIATION_SCAN|METADATA_PARSE", "schedule": "interval:1h", "isEnabled": true }`；`schedule: null` 或 `isEnabled: false` 会清空该库对应的计划。写操作需要管理员 Web session 和 CSRF，并与 `PATCH /api/v1/admin/libraries/{libraryId}` 保持同一份配置。当前端点只管理计划配置，不新增 cron 解析或后台调度执行器。
+- `GET /api/v1/admin/scheduled-tasks?page=1&pageSize=100`：分页查看所有已注册的任务，包含 `ownerType`、媒体库名称、`taskType`、`name`、`description`、`sourceType`、可空 `pluginId`、`schedule`、启用状态、资源限制和更新时间；结果也包含已停用或尚未配置计划的注册项。
+- `PUT /api/v1/admin/scheduled-tasks`：只修改已注册任务的计划。请求体为 `{ "ownerType": "LIBRARY", "ownerId": "...", "taskType": "INCREMENTAL_SCAN|METADATA_PARSE", "schedule": "interval:1h", "isEnabled": true }`；`schedule: null` 或 `isEnabled: false` 会清空已注册任务的计划。不存在的注册项返回 404，不会因为管理请求凭空创建任务。写操作需要管理员 Web session 和 CSRF，并与 `PATCH /api/v1/admin/libraries/{libraryId}` 保持同一份配置。当前端点只管理计划配置，不新增 cron 解析或后台调度执行器。
 - `POST /api/v1/admin/strm-probe-jobs`：按 `org.lux.strm-media-info` 已保存的插件配置创建并异步执行 STRM 远程媒体信息任务，返回 202 和按库拆分的任务；不从请求体读取媒体库或并发配置，也不返回 URL。
 - `GET /api/v1/admin/strm-probe-jobs?page=1&pageSize=50&status=FAILED`：分页查看 STRM 探测任务，状态支持 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 和 `FAILED`。
 - `GET /api/v1/admin/strm-probe-jobs/{jobId}`：查看单个 STRM 探测任务的状态、进度、并发、旁车开关和安全错误摘要。

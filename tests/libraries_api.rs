@@ -676,7 +676,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(scheduled_tasks.len(), 6);
+    assert_eq!(scheduled_tasks.len(), 4);
     assert!(
         scheduled_tasks
             .iter()
@@ -687,16 +687,9 @@ async fn admin_can_update_independent_library_schedules_without_restart()
                     && *enabled == 1
             })
     );
-    assert!(
-        scheduled_tasks
-            .iter()
-            .any(|(owner, task, schedule, enabled, _)| {
-                owner == &library_ids[1]
-                    && task == "RECONCILIATION_SCAN"
-                    && schedule.is_none()
-                    && *enabled == 0
-            })
-    );
+    assert!(!scheduled_tasks
+        .iter()
+        .any(|(owner, task, _, _, _)| owner == &library_ids[1] && task == "RECONCILIATION_SCAN"));
 
     let cleared = client
         .patch(format!(
@@ -769,6 +762,16 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
     assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
     let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
 
+    let initial_tasks = client
+        .get(format!(
+            "{base_url}/api/v1/admin/scheduled-tasks?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(initial_tasks.status(), reqwest::StatusCode::OK);
+    assert_eq!(initial_tasks.json::<Value>().await?["total"], 0);
+
     let created = client
         .post(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookies)
@@ -781,6 +784,35 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .as_str()
         .ok_or("missing library ID")?
         .to_owned();
+
+    let registered = client
+        .get(format!(
+            "{base_url}/api/v1/admin/scheduled-tasks?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(registered.status(), reqwest::StatusCode::OK);
+    let registered_body: Value = registered.json().await?;
+    assert_eq!(registered_body["total"], 2);
+    assert_eq!(
+        registered_body["scheduledTasks"]
+            .as_array()
+            .and_then(|tasks| tasks
+                .iter()
+                .find(|task| task["taskType"] == "INCREMENTAL_SCAN"))
+            .and_then(|task| task["name"].as_str()),
+        Some("扫描媒体文件夹")
+    );
+    assert_eq!(
+        registered_body["scheduledTasks"]
+            .as_array()
+            .and_then(|tasks| tasks
+                .iter()
+                .find(|task| task["taskType"] == "METADATA_PARSE"))
+            .and_then(|task| task["sourceType"].as_str()),
+        Some("SYSTEM")
+    );
 
     let seeded = client
         .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
@@ -800,7 +832,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .await?;
     assert_eq!(listed.status(), reqwest::StatusCode::OK);
     let listed_body: Value = listed.json().await?;
-    assert_eq!(listed_body["total"], 3);
+    assert_eq!(listed_body["total"], 2);
     let tasks = listed_body["scheduledTasks"]
         .as_array()
         .ok_or("missing scheduled tasks")?;
@@ -855,12 +887,36 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         }))
         .send()
         .await?;
-    assert_eq!(global_schedule.status(), reqwest::StatusCode::OK);
-    let global_body: Value = global_schedule.json().await?;
-    assert_eq!(global_body["scheduledTask"]["ownerType"], "GLOBAL");
-    assert_eq!(global_body["scheduledTask"]["ownerId"], "global");
-    assert_eq!(global_body["scheduledTask"]["ownerName"], "全局");
-    assert_eq!(global_body["scheduledTask"]["schedule"], "interval:6h");
+    assert_eq!(global_schedule.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let unregistered_library_task = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "RECONCILIATION_SCAN",
+            "schedule": "interval:6h"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        unregistered_library_task.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let unchanged_library = client
+        .get(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let unchanged_library = unchanged_library["libraries"]
+        .as_array()
+        .and_then(|libraries| libraries.iter().find(|library| library["id"] == library_id))
+        .ok_or("missing library after unregistered task update")?;
+    assert_eq!(unchanged_library["reconciliationSchedule"], Value::Null);
 
     let invalid_task = client
         .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))

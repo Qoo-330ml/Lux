@@ -638,6 +638,14 @@ impl Database {
     }
 
     pub(crate) async fn insert_library(&self, library: NewLibrary<'_>) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         sqlx::query(
             "INSERT INTO libraries (
                 id, name, kind, is_enabled, realtime_watch_enabled,
@@ -655,13 +663,74 @@ impl Database {
         .bind(library.scan_concurrency)
         .bind(library.probe_concurrency)
         .bind(library.scraper_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+
+        let registrations = [
+            (
+                "INCREMENTAL_SCAN",
+                "扫描媒体文件夹",
+                "按计划检查媒体库根路径中的新增和变更文件。",
+                "SYSTEM",
+                None,
+                library.incremental_schedule,
+            ),
+            (
+                "METADATA_PARSE",
+                "元数据刮削",
+                "解析本地元数据，并在已配置时调用刮削插件补全内容。",
+                if library.scraper_id.is_some() {
+                    "PLUGIN"
+                } else {
+                    "SYSTEM"
+                },
+                library.scraper_id,
+                library.metadata_schedule,
+            ),
+        ];
+        for (task_type, task_name, task_description, source_type, plugin_id, schedule) in
+            registrations
+        {
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
+                ) VALUES ('LIBRARY', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(library.id)
+            .bind(task_type)
+            .bind(task_name)
+            .bind(task_description)
+            .bind(source_type)
+            .bind(plugin_id)
+            .bind(schedule)
+            .bind(schedule.is_some())
+            .bind(if task_type == "INCREMENTAL_SCAN" {
+                format!(
+                    "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
+                    library.scan_concurrency, library.probe_concurrency
+                )
+            } else {
+                "{}".to_owned()
+            })
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
@@ -978,9 +1047,16 @@ impl Database {
             })?;
         }
 
-        let current: (Option<String>, Option<String>, Option<String>, i64, i64) = sqlx::query_as(
+        let current: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            Option<String>,
+        ) = sqlx::query_as(
             "SELECT incremental_schedule, reconciliation_schedule, metadata_schedule,
-                    scan_concurrency, probe_concurrency
+                    scan_concurrency, probe_concurrency, scraper_id
              FROM libraries WHERE id = ?",
         )
         .bind(library_id)
@@ -1006,21 +1082,28 @@ impl Database {
         ];
         for (task_type, schedule, resource_limit_json) in task_configs {
             sqlx::query(
-                "INSERT INTO scheduled_task_configs (
-                    owner_type, owner_id, task_type, cron_or_interval,
-                    is_enabled, resource_limit_json, updated_at
-                ) VALUES ('LIBRARY', ?, ?, ?, ?, ?, unixepoch())
-                ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
-                    cron_or_interval = excluded.cron_or_interval,
-                    is_enabled = excluded.is_enabled,
-                    resource_limit_json = excluded.resource_limit_json,
-                    updated_at = unixepoch()",
+                "UPDATE scheduled_task_configs
+                 SET cron_or_interval = ?,
+                     is_enabled = ?,
+                     resource_limit_json = ?,
+                     source_type = CASE
+                         WHEN task_type = 'METADATA_PARSE' AND ? IS NOT NULL THEN 'PLUGIN'
+                         ELSE 'SYSTEM'
+                     END,
+                     plugin_id = CASE
+                         WHEN task_type = 'METADATA_PARSE' THEN ?
+                         ELSE NULL
+                     END,
+                     updated_at = unixepoch()
+                 WHERE owner_type = 'LIBRARY' AND owner_id = ? AND task_type = ?",
             )
-            .bind(library_id)
-            .bind(task_type)
             .bind(schedule)
             .bind(schedule.is_some())
             .bind(resource_limit_json)
+            .bind(current.5.as_deref())
+            .bind(current.5.as_deref())
+            .bind(library_id)
+            .bind(task_type)
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -1052,8 +1135,10 @@ impl Database {
                 source,
             })?;
         let rows = sqlx::query(
-            "SELECT s.owner_type, s.owner_id, s.task_type, s.cron_or_interval,
-                    s.is_enabled, s.resource_limit_json, s.created_at, s.updated_at,
+            "SELECT s.owner_type, s.owner_id, s.task_type, s.task_name,
+                    s.task_description, s.source_type, s.plugin_id,
+                    s.cron_or_interval, s.is_enabled, s.resource_limit_json,
+                    s.created_at, s.updated_at,
                     l.name AS library_name
              FROM scheduled_task_configs s
              LEFT JOIN libraries l
@@ -1080,27 +1165,25 @@ impl Database {
         schedule: Option<&str>,
         is_enabled: bool,
     ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
-        sqlx::query(
-            "INSERT INTO scheduled_task_configs (
-                owner_type, owner_id, task_type, cron_or_interval,
-                is_enabled, resource_limit_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, '{}', unixepoch())
-            ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
-                cron_or_interval = excluded.cron_or_interval,
-                is_enabled = excluded.is_enabled,
-                updated_at = unixepoch()",
+        let result = sqlx::query(
+            "UPDATE scheduled_task_configs
+             SET cron_or_interval = ?, is_enabled = ?, updated_at = unixepoch()
+             WHERE owner_type = ? AND owner_id = ? AND task_type = ?",
         )
+        .bind(schedule)
+        .bind(is_enabled)
         .bind(owner_type)
         .bind(owner_id)
         .bind(task_type)
-        .bind(schedule)
-        .bind(is_enabled)
         .execute(&self.pool)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
+        if result.rows_affected() != 1 {
+            return Ok(None);
+        }
         self.find_scheduled_task_config(owner_type, owner_id, task_type)
             .await
     }
@@ -1112,8 +1195,10 @@ impl Database {
         task_type: &str,
     ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
         sqlx::query(
-            "SELECT s.owner_type, s.owner_id, s.task_type, s.cron_or_interval,
-                    s.is_enabled, s.resource_limit_json, s.created_at, s.updated_at,
+            "SELECT s.owner_type, s.owner_id, s.task_type, s.task_name,
+                    s.task_description, s.source_type, s.plugin_id,
+                    s.cron_or_interval, s.is_enabled, s.resource_limit_json,
+                    s.created_at, s.updated_at,
                     l.name AS library_name
              FROM scheduled_task_configs s
              LEFT JOIN libraries l
@@ -7013,6 +7098,10 @@ pub(crate) struct StoredScheduledTaskConfig {
     pub(crate) owner_type: String,
     pub(crate) owner_id: String,
     pub(crate) task_type: String,
+    pub(crate) task_name: String,
+    pub(crate) task_description: String,
+    pub(crate) source_type: String,
+    pub(crate) plugin_id: Option<String>,
     pub(crate) cron_or_interval: Option<String>,
     pub(crate) is_enabled: bool,
     pub(crate) resource_limit_json: String,
@@ -7039,6 +7128,10 @@ fn stored_scheduled_task(row: sqlx::sqlite::SqliteRow) -> StoredScheduledTaskCon
         owner_type: row.get("owner_type"),
         owner_id: row.get("owner_id"),
         task_type: row.get("task_type"),
+        task_name: row.get("task_name"),
+        task_description: row.get("task_description"),
+        source_type: row.get("source_type"),
+        plugin_id: row.get("plugin_id"),
         cron_or_interval: row.get("cron_or_interval"),
         is_enabled: row.get::<i64, _>("is_enabled") != 0,
         resource_limit_json: row.get("resource_limit_json"),

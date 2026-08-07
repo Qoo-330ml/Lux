@@ -329,10 +329,15 @@ export type AdminJob = {
 };
 
 export type AdminScheduledTask = {
+  id?: string;
   ownerType: "GLOBAL" | "LIBRARY" | string;
   ownerId: string;
   ownerName?: string | null;
   taskType: string;
+  name?: string | null;
+  description?: string | null;
+  sourceType?: "SYSTEM" | "PLUGIN" | string;
+  pluginId?: string | null;
   schedule?: string | null;
   isEnabled: boolean;
   resourceLimit?: Record<string, unknown>;
