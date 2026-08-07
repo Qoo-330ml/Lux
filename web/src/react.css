@@ -502,11 +502,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-now-playing-poster-status { position: absolute; right: 6px; bottom: 6px; left: 6px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 22px; border: 1px solid rgba(255,255,255,.68); border-radius: 999px; color: #fff; background: rgba(28,48,73,.72); font-size: .56rem; font-weight: 650; backdrop-filter: blur(10px); }
 .lux-now-playing-poster-status.is-paused { color: #6c4d1d; background: rgba(255,237,197,.9); }
 .lux-now-playing-content { display: flex; min-width: 0; flex-direction: column; justify-content: space-between; padding: 0; }
-.lux-now-playing-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.lux-now-playing-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 0 12px; }
 .lux-now-playing-heading-copy { min-width: 0; }
 .lux-now-playing-title { display: block; margin-top: 0; overflow: hidden; color: var(--lux-now-card-title); font-size: 1rem; font-weight: 700; letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap; }
 .lux-now-playing-title:hover { color: var(--lux-now-card-accent); }
-.lux-now-playing-subtitle { display: -webkit-box; margin-top: 2px; overflow: hidden; color: var(--lux-now-card-secondary); font-size: .58rem; line-height: 1.35; text-overflow: ellipsis; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
+.lux-now-playing-subtitle { display: -webkit-box; grid-column: 1 / -1; min-width: 0; margin-top: 2px; overflow: hidden; color: var(--lux-now-card-secondary); font-size: .58rem; line-height: 1.35; text-overflow: ellipsis; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
 .lux-now-playing-year { flex: 0 0 auto; color: var(--lux-now-card-meta); font-size: .7rem; font-weight: 700; }
 .lux-now-playing-account { display: flex; align-items: flex-start; flex-direction: column; gap: 4px; margin-top: 8px; color: var(--lux-now-card-meta); font-size: .58rem; }
 .lux-now-playing-account strong { color: var(--lux-now-card-title); font-weight: 700; }

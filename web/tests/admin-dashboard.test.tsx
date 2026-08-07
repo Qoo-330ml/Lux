@@ -136,6 +136,8 @@ describe("AdminDashboardPage", () => {
     expect(playbackCard?.querySelector(".lux-now-playing-title")?.textContent).toBe("九门");
     expect(playbackCard?.querySelector(".lux-now-playing-title")?.getAttribute("href")).toBe("/items/series-1");
     expect(playbackCard?.querySelector(".lux-now-playing-subtitle")?.textContent).toBe("S01E09 · 爱情情节顶红");
+    expect(playbackCard?.querySelector(".lux-now-playing-heading > .lux-now-playing-subtitle")).not.toBeNull();
+    expect(playbackCard?.querySelector(".lux-now-playing-heading-copy > .lux-now-playing-subtitle")).toBeNull();
     expect(container.textContent).toContain("VidHub");
     expect(container.textContent).toContain("v3.0.2");
     const accountEntries = [...container.querySelectorAll(".lux-now-playing-account-entry")]

@@ -41,9 +41,9 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
           <div className="lux-now-playing-heading">
             <div className="lux-now-playing-heading-copy">
               <Link className="lux-now-playing-title" to={`/items/${encodeURIComponent(detailItemId)}`}>{cardTitle}</Link>
-              {subtitle ? <div className="lux-now-playing-subtitle">{subtitle}</div> : null}
             </div>
             <span className="lux-now-playing-year">{session.productionYear ?? "—"}</span>
+            {subtitle ? <div className="lux-now-playing-subtitle">{subtitle}</div> : null}
           </div>
 
           <div className="lux-now-playing-account">
