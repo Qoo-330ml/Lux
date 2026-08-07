@@ -262,6 +262,8 @@ export type AdminPlaybackSession = {
   title: string;
   originalTitle?: string | null;
   itemType: string;
+  seriesId?: string | null;
+  seriesTitle?: string | null;
   productionYear?: number | null;
   parentIndexNumber?: number | null;
   indexNumber?: number | null;

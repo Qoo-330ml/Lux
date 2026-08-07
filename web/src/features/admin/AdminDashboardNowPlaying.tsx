@@ -15,6 +15,13 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
   const duration = session.durationTicks ?? 0;
   const percent = duration > 0 ? Math.min(100, Math.round((session.positionTicks / duration) * 100)) : 0;
   const source = session.source;
+  const isEpisode = session.itemType === "EPISODE";
+  const seriesTitle = session.seriesTitle?.trim();
+  const cardTitle = isEpisode && seriesTitle ? seriesTitle : session.title;
+  const subtitle = isEpisode
+    ? [episodeLabel(session), seriesTitle ? session.title : undefined].filter(Boolean).join(" · ")
+    : undefined;
+  const detailItemId = isEpisode ? session.seriesId || session.itemId : session.itemId;
   const posterUrl = session.posterAvailable
     ? `/api/v1/items/${encodeURIComponent(session.itemId)}/images/poster`
     : undefined;
@@ -23,7 +30,7 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
     <article className="lux-now-playing-card">
       <div className="lux-now-playing-body">
         <div className="lux-now-playing-poster">
-          {posterUrl ? <img src={posterUrl} alt={`${session.title} 海报`} /> : <span aria-hidden="true"><Monitor size={32} /></span>}
+          {posterUrl ? <img src={posterUrl} alt={`${cardTitle} 海报`} /> : <span aria-hidden="true"><Monitor size={32} /></span>}
           <span className={session.isPaused ? "lux-now-playing-poster-status is-paused" : "lux-now-playing-poster-status"}>
             {session.isPaused ? <Pause size={12} /> : <Play size={12} fill="currentColor" />}
             {session.isPaused ? "已暂停" : "正在播放"}
@@ -33,10 +40,8 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
         <div className="lux-now-playing-content">
           <div className="lux-now-playing-heading">
             <div className="lux-now-playing-heading-copy">
-              <Link className="lux-now-playing-title" to={`/items/${encodeURIComponent(session.itemId)}`}>{session.title}</Link>
-              <div className="lux-now-playing-subtitle">
-                {episodeLabel(session)}{session.originalTitle && session.originalTitle !== session.title ? ` · ${session.originalTitle}` : ""}
-              </div>
+              <Link className="lux-now-playing-title" to={`/items/${encodeURIComponent(detailItemId)}`}>{cardTitle}</Link>
+              {subtitle ? <div className="lux-now-playing-subtitle">{subtitle}</div> : null}
             </div>
             <span className="lux-now-playing-year">{session.productionYear ?? "—"}</span>
           </div>
@@ -97,10 +102,9 @@ function NetworkField({ icon, label, value }: { icon: ReactNode; label: string; 
 }
 
 function episodeLabel(session: AdminPlaybackSession) {
-  if (session.itemType !== "EPISODE") return session.itemType === "MOVIE" ? "电影" : "媒体";
-  const season = session.parentIndexNumber == null ? "" : `S${session.parentIndexNumber}`;
-  const episode = session.indexNumber == null ? "" : `E${session.indexNumber}`;
-  return season && episode ? `${season} · ${episode}` : season || episode || "单集";
+  const season = session.parentIndexNumber == null ? "" : `S${String(session.parentIndexNumber).padStart(2, "0")}`;
+  const episode = session.indexNumber == null ? "" : `E${String(session.indexNumber).padStart(2, "0")}`;
+  return season && episode ? `${season}${episode}` : season || episode || "单集";
 }
 
 function audioLabel(source: AdminPlaybackSession["source"]) {

@@ -29,6 +29,8 @@ const dashboard: AdminDashboard = {
     userName: "pdz",
     itemId: "item-1",
     title: "爱情情节顶红",
+    seriesId: "series-1",
+    seriesTitle: "九门",
     itemType: "EPISODE",
     productionYear: 2025,
     parentIndexNumber: 1,
@@ -130,10 +132,10 @@ describe("AdminDashboardPage", () => {
     expect(container.querySelector(".lux-admin-stat-grid")).toBeNull();
     expect(container.querySelectorAll(".lux-admin-stat")).toHaveLength(0);
     expect(container.textContent).toContain("爱情情节顶红");
-    expect(container.textContent).toContain("S1 · E9");
     const playbackCard = container.querySelector(".lux-now-playing-card");
-    expect(playbackCard?.querySelector(".lux-now-playing-meta")).toBeNull();
-    expect(playbackCard?.textContent?.match(/S1 · E9/g)).toHaveLength(1);
+    expect(playbackCard?.querySelector(".lux-now-playing-title")?.textContent).toBe("九门");
+    expect(playbackCard?.querySelector(".lux-now-playing-title")?.getAttribute("href")).toBe("/items/series-1");
+    expect(playbackCard?.querySelector(".lux-now-playing-subtitle")?.textContent).toBe("S01E09 · 爱情情节顶红");
     expect(container.textContent).toContain("VidHub");
     expect(container.textContent).toContain("v3.0.2");
     const deviceEntry = container.querySelectorAll(".lux-now-playing-account-entry")[0];
@@ -181,6 +183,8 @@ describe("AdminDashboardPage", () => {
         id: "playback-movie",
         title: "一毛",
         originalTitle: null,
+        seriesId: null,
+        seriesTitle: null,
         itemType: "MOVIE",
         productionYear: 2019,
         parentIndexNumber: null,
@@ -208,7 +212,7 @@ describe("AdminDashboardPage", () => {
     });
 
     const movieCard = container.querySelector(".lux-now-playing-card");
-    expect(movieCard?.textContent?.match(/电影/g)).toHaveLength(1);
-    expect(movieCard?.querySelector(".lux-now-playing-meta")).toBeNull();
+    expect(movieCard?.querySelector(".lux-now-playing-title")?.textContent).toBe("一毛");
+    expect(movieCard?.querySelector(".lux-now-playing-subtitle")).toBeNull();
   });
 });

@@ -38,16 +38,21 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     setup.complete("Admin", "Admin", "correct password").await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
-        .create_library("Movies", LibraryKind::Movie, false)
+        .create_library("Shows", LibraryKind::Series, false)
         .await?;
-    let root = temp_dir.path().join("Movies");
-    tokio::fs::create_dir_all(&root).await?;
-    tokio::fs::write(root.join("Session.Movie.2024.mkv"), b"video").await?;
+    let root = temp_dir.path().join("Shows");
+    let season_dir = root.join("九门/Season 01");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    tokio::fs::write(
+        season_dir.join("张启山和吴老狗达成合作.S01E02.mkv"),
+        b"video",
+    )
+    .await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
         .await?;
     LibraryScanner::new(database.clone())
-        .scan_movie_library(library.id)
+        .scan_series_library(library.id)
         .await?;
 
     let auth = WebAuthService::new(database.clone())?;
@@ -88,9 +93,10 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .as_str()
         .ok_or("missing Emby token")?
         .to_owned();
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let playing = client
         .post(format!("{base_url}/Sessions/Playing"))
         .header("X-Emby-Token", &token)
@@ -136,7 +142,9 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(body["server"]["name"], "客厅 Lux");
     assert_eq!(body["server"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["nowPlaying"][0]["userName"], "Admin");
-    assert_eq!(body["nowPlaying"][0]["title"], "Session Movie");
+    assert_eq!(body["nowPlaying"][0]["title"], "张启山和吴老狗达成合作");
+    assert_eq!(body["nowPlaying"][0]["seriesTitle"], "九门");
+    assert!(body["nowPlaying"][0]["seriesId"].is_string());
     assert_eq!(body["nowPlaying"][0]["client"], "DashboardTest");
     assert_eq!(body["nowPlaying"][0]["clientVersion"], "4.2.1");
     assert_eq!(body["nowPlaying"][0]["deviceName"], "Mac");

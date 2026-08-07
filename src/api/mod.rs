@@ -8778,9 +8778,21 @@ async fn dashboard_playback_json(
             Ok(None) => continue,
             Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
         };
+        let series = if item.item_type == "EPISODE" {
+            match item.series_id.as_deref() {
+                Some(series_id) => match catalog.find_item(principal, series_id).await {
+                    Ok(series) => series,
+                    Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         values.push(dashboard_playback_item_json(
             session,
             &item,
+            series.as_ref(),
             user_names
                 .get(&session.user_id)
                 .map(String::as_str)
@@ -8793,6 +8805,7 @@ async fn dashboard_playback_json(
 fn dashboard_playback_item_json(
     session: &StoredPlaybackSession,
     item: &CatalogItem,
+    series: Option<&CatalogItem>,
     user_name: &str,
 ) -> Value {
     let source = session
@@ -8813,6 +8826,8 @@ fn dashboard_playback_item_json(
         "title": item.title,
         "originalTitle": item.original_title,
         "itemType": item.item_type,
+        "seriesId": item.series_id,
+        "seriesTitle": series.map(|item| item.title.as_str()),
         "productionYear": item.production_year,
         "parentIndexNumber": item.season_number,
         "indexNumber": item.episode_number,
