@@ -288,6 +288,7 @@ Lux 的核心价值不是功能数量，而是：
 - 后台任务队列、运行中任务和失败重试。
 - 待处理、元数据匹配失败、NFO 回写失败和图片下载失败数量。
 - 服务端版本、运行时间、数据库状态、磁盘可写状态。
+- 管理仪表盘显示 Lux 容器自身的 CPU 使用率、内存使用量/限制、`/media` 挂载点空间使用量/可用量；这些指标只能来自容器 cgroup 和容器内 `/media` 文件系统，不得回退为宿主机整体资源。
 - 结构化日志查看和下载。
 
 首版不提供内置备份与恢复。配置和数据库通过 Docker 持久化卷由 NAS 自己备份。
@@ -1747,6 +1748,7 @@ services:
 | LUX-145 | src/application/thumbnails.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、tests/thumbnails.rs、docs/ |
 | LUX-146 | src/application/plugin_protocol.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/application/strm_probe.rs、src/application/strm_probe_policy.rs、src/application/probe.rs、src/storage/、src/api/mod.rs、src/bin/lux-plugin-strm-media-info.rs、src/bin/lux-plugin-pack.rs、migrations/、scripts/、tests/、docs/ |
 | LUX-150 | src/application/danmaku.rs、src/storage/、src/api/mod.rs、migrations/、tests/、docs/ |
+| LUX-151 | src/application/ip_location.rs、src/api/mod.rs、tests/、web/src/features/admin/、web/src/lib/api/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2573,6 +2575,7 @@ services:
 验收：
 
 - 使用一个受保护的仪表盘接口显示可编辑的服务器名称、Lux 版本、库统计、运行任务、错误数和健康检查。
+- 概览显示 Lux 进程运行时长，以及仅基于容器 cgroup 的 CPU、内存和 `/media` 挂载点存储指标；容器未暴露对应 cgroup 或挂载点不可用时明确显示不可用，不伪造宿主机数据。
 - 显示当前正在播放会话；卡片包含账户、媒体标题/剧集信息、海报、进度、客户端/设备、客户端来源 IP、来源质量、视频轨和音频轨摘要。
 - 播放卡片中，电影只显示电影标题；剧集以剧名为白色主标题，灰色副标题显示 `S01E02 · 单集标题`，并按用户、设备、客户端展示账户信息。
 - 播放卡片明确显示客户端名称/版本、设备名称/类型和设备 ID（设备 ID 可折叠或以次要信息展示）。
@@ -3100,6 +3103,36 @@ Emby 兼容层提供 `/api/danmu/{itemId}`、`/api/danmu/{itemId}/raw`，并保�
 - 不把弹幕 XML 当作普通字幕，不新增 Emby 标准字幕类型或强制客户端显示。
 - 不执行用户输入的上游 URL，不做代理播放，不保存完整 XML 到 SQLite，不在 Web 播放器中渲染弹幕。
 - 不生成 ASS、不做颜色/位置转换、不实现弹幕发送、实时推送或计划任务。
+
+#### LUX-151：播放会话 IP 归属地
+
+范围：参考 `IP-hiofd` 的请求签名和字段映射，在 Lux 内置一个受限的 Hiofd IP 归属地客户端。协议字段通过 `LUX_HIOFD_KEY` 和 `LUX_HIOFD_PWD` 注入，Lux 不在仓库中内置第三方协议凭据；缺少配置时该能力保持关闭。管理员仪表盘的正在播放会话在已有 `remoteIp` 基础上异步显示国家、省、市、区、街道和运营商信息；解析结果只保存在进程内短期缓存，不写入 SQLite、不写入日志，也不提供普通用户查询接口。
+
+首次展示时只返回已缓存结果，后台解析不会阻塞仪表盘请求；同一 IP 的并发解析合并，成功结果缓存 24 小时，失败结果缓存 5 分钟。回环、私网、链路本地、未指定和多播地址不发送到第三方服务。Hiofd 响应必须限制大小、验证 JSON、结果 IP 与查询 IP 一致，网络失败只显示未解析且不影响播放会话。
+
+验收：
+
+- [ ] 合法 IPv4/IPv6 可以按 Hiofd 协议生成请求并解析国家、省、市、区、街道和运营商；非法或非公网地址不发起查询。
+- [ ] Hiofd 返回错误、超时、超大响应、非法 JSON 或结果 IP 不一致时，Lux 不泄露响应内容、不记录敏感信息，且仪表盘仍正常返回。
+- [ ] 管理员仪表盘 API 返回可空的 `remoteIpLocation`，Web 在解析完成后显示归属地和运营商；非管理员不能访问仪表盘。
+- [ ] 内存缓存有 TTL 和并发上限，不保存完整第三方响应，不新增数据库迁移。
+- [ ] 通过 Rust/Web 测试、格式化、Clippy 和 Web 构建检查；ARM 本机记录 `uname -m`，不宣称 NAS/x86 性能。
+
+验证：
+
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-073、LUX-092、LUX-102。
+
+明确不做：
+
+- 不把 IP 归属地作为登录、ACL、远近端判断或安全决策依据。
+- 不持久化客户端 IP 归属地、不提供任意 IP 的公开查询、不接入第二个地理位置服务。
+- 不在播放、搜索、媒体库扫描或普通用户请求路径中同步调用 Hiofd。
 
 ## 26. 风险与缓解
 
