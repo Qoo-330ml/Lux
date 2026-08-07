@@ -123,7 +123,7 @@ export function DirectoryPicker({
         </ul>
       </div>
       <footer className="lux-directory-picker-actions">
-        <span>{selectedPath === "/" ? "请选择具体的媒体目录" : isSubmitting ? "正在添加此路径…" : "点击“使用此路径”后将直接添加到媒体库"}</span>
+        <span>{selectedPath === "/" ? "请选择具体的媒体目录" : isSubmitting ? "正在添加此路径…" : "点击“使用此路径”确认当前路径"}</span>
         <button className="lux-library-toolbar-button is-primary" type="button" disabled={selectedPath === "/" || isSubmitting} onClick={() => onSelect(selectedPath)}>{isSubmitting ? "添加中…" : "使用此路径"}</button>
       </footer>
     </section>

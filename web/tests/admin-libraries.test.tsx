@@ -134,6 +134,101 @@ describe("AdminLibrariesPage library cards", () => {
     });
   }
 
+  it("creates a library and adds the selected folder from the same dialog", async () => {
+    const createdLibrary = { ...library, id: "library-2", name: "电影库", roots: [] };
+    const createLibrary = vi.spyOn(api, "createAdminLibrary").mockResolvedValue({ library: createdLibrary });
+    const addRoot = vi.spyOn(api, "addAdminLibraryRoot").mockResolvedValue({
+      root: {
+        ...library.roots[0],
+        id: "root-2",
+        libraryId: "library-2",
+        canonicalPath: "/media",
+        displayPath: "/media",
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      path: "/",
+      parentPath: null,
+      directories: [{ name: "media", path: "/media" }],
+      page: 1,
+      pageSize: 50,
+      hasMore: false,
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("新增媒体库"))
+        ?.click();
+    });
+
+    const dialog = container.querySelector('[role="dialog"]');
+    expect(dialog?.textContent).toContain("文件夹");
+    const nameInput = dialog?.querySelector<HTMLInputElement>("#new-library-name");
+    const rootInput = dialog?.querySelector<HTMLInputElement>("[aria-label='新媒体库根路径']");
+    expect(nameInput).toBeTruthy();
+    expect(rootInput).toBeTruthy();
+
+    await act(async () => {
+      if (!nameInput) throw new Error("new library name input missing");
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(nameInput, "电影库");
+      nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+      nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+      dialog?.querySelector<HTMLButtonElement>("[aria-label='浏览服务器目录']")?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>("[aria-label='选择目录 /media']")?.click();
+    });
+    const usePathButton = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("使用此路径"));
+    await act(async () => usePathButton?.click());
+
+    expect(rootInput?.value).toBe("/media");
+    await act(async () => {
+      [...(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])]
+        .find((button) => button.textContent?.includes("创建媒体库"))
+        ?.click();
+      await vi.waitFor(() => expect(addRoot).toHaveBeenCalledWith("library-2", "/media"));
+    });
+
+    expect(createLibrary).toHaveBeenCalledWith({ name: "电影库", kind: "MOVIE", scraperId: null });
+    expect(createLibrary.mock.invocationCallOrder[0]).toBeLessThan(addRoot.mock.invocationCallOrder[0]);
+    expect(container.querySelector("#new-library-title")).toBeNull();
+  });
+
+  it("does not leave a retryable create form when folder addition is not completed", async () => {
+    const createdLibrary = { ...library, id: "library-2", name: "电影库", roots: [] };
+    const createLibrary = vi.spyOn(api, "createAdminLibrary").mockResolvedValue({ library: createdLibrary });
+    const addRoot = vi.spyOn(api, "addAdminLibraryRoot").mockRejectedValue(new Error("路径不可用"));
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("新增媒体库"))
+        ?.click();
+    });
+    const dialog = container.querySelector('[role="dialog"]');
+    const nameInput = dialog?.querySelector<HTMLInputElement>("#new-library-name");
+    const rootInput = dialog?.querySelector<HTMLInputElement>("[aria-label='新媒体库根路径']");
+    await act(async () => {
+      if (!nameInput || !rootInput) throw new Error("new library inputs missing");
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(nameInput, "电影库");
+      nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(rootInput, "/media");
+      rootInput.dispatchEvent(new Event("input", { bubbles: true }));
+      dialog?.querySelector<HTMLButtonElement>("button[type='submit']")?.click();
+      await vi.waitFor(() => expect(addRoot).toHaveBeenCalledWith("library-2", "/media"));
+    });
+
+    expect(createLibrary).toHaveBeenCalledOnce();
+    expect(container.querySelector("#new-library-title")).toBeNull();
+    expect(container.textContent).toContain("媒体库已创建");
+    expect(container.textContent).toContain("路径不可用");
+  });
+
   it("renders a library card with its cover, type, and root path", async () => {
     await renderPage();
 

@@ -38,7 +38,10 @@ export function AdminLibrariesPage() {
   const [name, setName] = useState("");
   const [kind, setKind] = useState("MOVIE");
   const [scraperId, setScraperId] = useState("");
+  const [createRootPath, setCreateRootPath] = useState("");
+  const [createDirectoryPickerOpen, setCreateDirectoryPickerOpen] = useState(false);
   const [formError, setFormError] = useState("");
+  const [createNotice, setCreateNotice] = useState("");
   const saveStrategy = useMutation({
     mutationFn: (next: MediaStrategySettings) => api.updateAdminSettings({ mediaStrategy: next }),
     onSuccess: (data) => {
@@ -70,16 +73,39 @@ export function AdminLibrariesPage() {
     },
   });
   const create = useMutation({
-    mutationFn: () => api.createAdminLibrary({ name: name.trim(), kind, scraperId: scraperId || null }),
-    onSuccess: () => {
+    mutationFn: async (values: { name: string; kind: string; scraperId: string | null; rootPath: string }) => {
+      const response = await api.createAdminLibrary({ name: values.name, kind: values.kind, scraperId: values.scraperId });
+      if (!values.rootPath) return { ...response, rootError: "" };
+      try {
+        await api.addAdminLibraryRoot(response.library.id, values.rootPath);
+        return { ...response, rootError: "" };
+      } catch (error) {
+        return { ...response, rootError: error instanceof Error ? error.message : "文件夹添加失败" };
+      }
+    },
+    onSuccess: ({ rootError }) => {
       setName("");
       setScraperId("");
+      setCreateRootPath("");
+      setCreateDirectoryPickerOpen(false);
       setFormError("");
+      setCreateNotice(rootError ? `媒体库已创建，但文件夹添加未完成：${rootError}。请在“编辑”中检查并添加文件夹。` : "");
       setCreateOpen(false);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
     },
     onError: (error) => setFormError(error.message),
   });
+
+  function openCreate() {
+    setName("");
+    setKind("MOVIE");
+    setScraperId("");
+    setCreateRootPath("");
+    setCreateDirectoryPickerOpen(false);
+    setFormError("");
+    setCreateNotice("");
+    setCreateOpen(true);
+  }
 
   if (libraries.isPending || plugins.isPending || settings.isPending) return <AdminLibraryState label="正在读取媒体库、插件与全局策略…" />;
   if (libraries.error || plugins.error || settings.error) return <AdminLibraryState label={libraries.error?.message || plugins.error?.message || settings.error?.message || "管理数据加载失败"} error />;
@@ -92,7 +118,7 @@ export function AdminLibrariesPage() {
       setFormError("请输入媒体库名称");
       return;
     }
-    create.mutate();
+    create.mutate({ name: name.trim(), kind, scraperId: scraperId || null, rootPath: createRootPath.trim() });
   }
 
   return (
@@ -110,10 +136,11 @@ export function AdminLibrariesPage() {
           <div className="lux-library-management-toolbar">
             <span>共 {items.length} 个媒体库</span>
             <div>
-              <button className="lux-library-toolbar-button" type="button" onClick={() => setCreateOpen(true)}><Plus size={16} /> 新增媒体库</button>
+              <button className="lux-library-toolbar-button" type="button" onClick={openCreate}><Plus size={16} /> 新增媒体库</button>
               <button className="lux-library-toolbar-button" type="button" onClick={() => scanAll.mutate()} disabled={scanAll.isPending}><RefreshCw size={16} /> {scanAll.isPending ? "扫描中…" : "扫描媒体库文件"}</button>
             </div>
           </div>
+          {createNotice ? <p className="lux-error-copy" role="status">{createNotice}</p> : null}
           {items.length === 0 ? <div className="lux-admin-empty"><Database size={24} /><h2>还没有媒体库</h2><p>创建第一个媒体库后，Lux 才能开始索引内容。</p></div> : <div className="lux-admin-library-grid">{items.map((library) => <LibraryAdminCard key={library.id} library={library} plugins={pluginItems} globalStrategy={strategy ?? undefined} />)}</div>}
         </>
       ) : (
@@ -127,6 +154,12 @@ export function AdminLibrariesPage() {
             <label htmlFor="new-library-name">名称<input id="new-library-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：电影" /></label>
             <label htmlFor="new-library-kind">类型<LuxSelect id="new-library-kind" value={kind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setKind} aria-label="媒体库类型" /></label>
             <ScraperSelect id="new-library-scraper" value={scraperId} plugins={pluginItems} onChange={setScraperId} />
+            <section className="lux-library-dialog-section lux-library-create-root-section">
+              <div className="lux-library-dialog-section-heading"><div><h3>文件夹</h3><span>创建后自动开始扫描</span></div><Folder size={18} aria-hidden="true" /></div>
+              <div className="lux-library-root-form"><input id="new-library-root-path" value={createRootPath} onChange={(event) => { setCreateRootPath(event.target.value); setFormError(""); }} placeholder="输入 Docker 内的媒体路径" aria-label="新媒体库根路径" /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setCreateDirectoryPickerOpen(true)}><Folder size={17} /></button></div>
+              <p className="lux-library-create-root-help">可选。选择后，创建媒体库时会同时添加此文件夹，无需再进入编辑。</p>
+              {createDirectoryPickerOpen ? <DirectoryPicker initialPath={createRootPath.trim()} isSubmitting={create.isPending} onClose={() => setCreateDirectoryPickerOpen(false)} onSelect={(path) => { setCreateRootPath(path); setFormError(""); setCreateDirectoryPickerOpen(false); }} /> : null}
+            </section>
             {formError ? <p className="lux-error-copy">{formError}</p> : null}
             <div className="lux-library-dialog-actions"><button className="lux-library-toolbar-button" type="button" onClick={() => setCreateOpen(false)}>取消</button><button className="lux-library-toolbar-button is-primary" type="submit" disabled={create.isPending}><Plus size={16} /> {create.isPending ? "创建中…" : "创建媒体库"}</button></div>
           </form>
