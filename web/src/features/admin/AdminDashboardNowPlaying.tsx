@@ -47,9 +47,11 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
           </div>
 
           <div className="lux-now-playing-account">
-            <span className="lux-now-playing-account-avatar"><UserRound size={15} /></span>
-            <strong>{session.userName || "未知账户"}</strong>
-            <span className="lux-now-playing-account-separator" aria-hidden="true">•</span>
+            <DeviceField
+              icon={<UserRound size={15} />}
+              label="用户"
+              value={session.userName || "未知账户"}
+            />
             <DeviceField
               icon={<Monitor size={15} />}
               label="设备"

@@ -138,8 +138,9 @@ describe("AdminDashboardPage", () => {
     expect(playbackCard?.querySelector(".lux-now-playing-subtitle")?.textContent).toBe("S01E09 · 爱情情节顶红");
     expect(container.textContent).toContain("VidHub");
     expect(container.textContent).toContain("v3.0.2");
-    const deviceEntry = container.querySelectorAll(".lux-now-playing-account-entry")[0];
-    expect(deviceEntry?.textContent).toBe("设备iPhone");
+    const accountEntries = [...container.querySelectorAll(".lux-now-playing-account-entry")]
+      .map((entry) => entry.textContent);
+    expect(accountEntries).toEqual(["用户pdz", "设备iPhone", "客户端VidHubv3.0.2"]);
     expect(container.textContent).toContain("4K HEVC");
     expect(container.textContent).toContain("HEVC");
     expect(container.textContent).toContain("AAC · zh-CN");
