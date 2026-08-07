@@ -41,6 +41,15 @@ fn coalescer_merges_same_path_and_keeps_distinct_paths() {
     assert_eq!(LibraryWatcher::channel_capacity(), 256);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_uses_fsevents_without_one_file_descriptor_per_directory() {
+    assert_eq!(
+        <notify::RecommendedWatcher as notify::Watcher>::kind(),
+        notify::WatcherKind::Fsevent
+    );
+}
+
 #[tokio::test]
 async fn watcher_receives_temp_directory_changes() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
