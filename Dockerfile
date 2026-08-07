@@ -12,6 +12,7 @@ RUN pnpm build
 FROM rust:1.85-bookworm AS builder
 
 WORKDIR /src
+ARG LUX_PLUGIN_VERSION=1.0.0
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -23,7 +24,21 @@ COPY logo.svg ./logo.svg
 COPY web ./web
 COPY --from=web-builder /src/web/dist ./web/dist
 
-RUN cargo build --release --locked
+RUN cargo build --release --locked --bin luxd --bin lux-plugin-tmdb --bin lux-plugin-pack \
+    && plugin_arch="$(uname -m)" \
+    && case "$plugin_arch" in \
+         x86_64) plugin_arch="x86_64" ;; \
+         aarch64) plugin_arch="aarch64" ;; \
+         *) echo "unsupported plugin architecture: $plugin_arch" >&2; exit 1 ;; \
+       esac \
+    && mkdir -p /src/dist \
+    && cargo run --release --locked --bin lux-plugin-pack -- \
+         --plugin tmdb \
+         --binary /src/target/release/lux-plugin-tmdb \
+         --output /src/dist/org.lux.tmdb.zip \
+         --version "$LUX_PLUGIN_VERSION" \
+         --platform linux \
+         --arch "$plugin_arch"
 
 FROM debian:bookworm-slim
 
@@ -35,10 +50,11 @@ LABEL org.opencontainers.image.title="Lux" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
-    && mkdir -p /config /media \
+    && mkdir -p /config /media /usr/local/share/lux/plugins \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
+COPY --from=builder /src/dist/org.lux.tmdb.zip /usr/local/share/lux/plugins/org.lux.tmdb.zip
 COPY --from=web-builder /src/web/dist /usr/local/share/lux/web
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

@@ -12,7 +12,7 @@ docker compose pull
 docker compose up -d
 ```
 
-镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本只确保 `/config` 存在，不递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。
+镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本会创建 `/config/plugins`，并将镜像内置的 TMDb 插件包复制到持久化配置目录；不会递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。项目自带的 TMDb 插件会在发现后自动标记为已安装、已启用。
 
 首次部署只在内网访问 `http://127.0.0.1:8097/` 完成初始化。初始化完成后再开放反向代理入口；不要把未初始化的 setup 页面直接暴露到公网。
 

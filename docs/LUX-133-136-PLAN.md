@@ -6,6 +6,7 @@
 - [x] runtime 使用非 root `lux` 用户，包含 `ffprobe`、Web 静态资源和 `/health/live` 健康检查。
 - [x] compose 提供 `/config` 宿主机持久化目录、`/media` 媒体挂载、端口和 trusted proxy/TMDb 配置入口。
 - [x] compose 媒体挂载使用读写模式，满足 NFO/图片回写要求。
+- [x] Docker 启动时自动创建 `/config/plugins`，复制镜像内置 TMDb 插件，并自动标记为已安装、已启用。
 
 ## 已验证
 
