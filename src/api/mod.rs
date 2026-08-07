@@ -403,6 +403,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_install_plugin),
         )
         .route(
+            "/api/v1/admin/plugins/{plugin_id}/enabled",
+            patch(admin_update_plugin_enabled),
+        )
+        .route(
             "/api/v1/admin/plugins/{plugin_id}/config",
             put(admin_update_plugin_config),
         )
@@ -10188,6 +10192,55 @@ async fn admin_install_plugin(
             (
                 status,
                 Json(json!({ "plugin": plugin_json(&result.plugin) })),
+            )
+                .into_response()
+        }
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginEnabledRequest {
+    enabled: bool,
+}
+
+async fn admin_update_plugin_enabled(
+    headers: HeaderMap,
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PluginEnabledRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match plugins.set_enabled(&plugin_id, request.enabled).await {
+        Ok(plugin) => {
+            record_audit_event(
+                &state,
+                &headers,
+                if request.enabled {
+                    "PLUGIN_ENABLED"
+                } else {
+                    "PLUGIN_DISABLED"
+                },
+                Some("plugin"),
+                Some(&plugin_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({ "plugin": plugin_json(&plugin) })),
             )
                 .into_response()
         }

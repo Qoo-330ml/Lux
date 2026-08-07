@@ -243,6 +243,79 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
 }
 
 #[tokio::test]
+async fn admin_can_disable_an_installed_plugin_without_removing_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = admin_session(&client, &base_url).await?;
+
+    let installed = client
+        .post(format!("{base_url}/api/v1/admin/plugins/tmdb/install"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+
+    let disabled = client
+        .patch(format!("{base_url}/api/v1/admin/plugins/tmdb/enabled"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await?;
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+    let disabled_body: Value = disabled.json().await?;
+    assert_eq!(disabled_body["plugin"]["installed"], true);
+    assert_eq!(disabled_body["plugin"]["enabled"], false);
+    assert_eq!(disabled_body["plugin"]["available"], false);
+
+    let managed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/plugins/installed?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(managed.status(), reqwest::StatusCode::OK);
+    let managed_body: Value = managed.json().await?;
+    assert_eq!(managed_body["total"], 1);
+    assert_eq!(managed_body["plugins"][0]["installed"], true);
+    assert_eq!(managed_body["plugins"][0]["enabled"], false);
+
+    let rejected = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "name": "Movies",
+            "kind": "MOVIE",
+            "scraperId": "tmdb"
+        }))
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+
+    let enabled = client
+        .patch(format!("{base_url}/api/v1/admin/plugins/tmdb/enabled"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "enabled": true }))
+        .send()
+        .await?;
+    assert_eq!(enabled.status(), reqwest::StatusCode::OK);
+    assert_eq!(enabled.json::<Value>().await?["plugin"]["enabled"], true);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_configure_tmdb_key_and_reset_to_the_embedded_default()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -165,6 +165,62 @@
   background: rgba(255, 255, 255, .14);
 }
 
+.lux-admin-plugin-enable-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 4px 10px 4px 6px;
+  border: 1px solid var(--lux-line);
+  border-radius: 999px;
+  color: var(--lux-text);
+  background: rgba(255, 255, 255, .06);
+  font-size: .73rem;
+  font-weight: 650;
+  white-space: nowrap;
+  transition: border-color .2s ease, background .2s ease, opacity .2s ease;
+}
+
+.lux-admin-plugin-enable-switch:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--lux-accent) 62%, var(--lux-line));
+  background: color-mix(in srgb, var(--lux-accent) 12%, transparent);
+}
+
+.lux-admin-plugin-enable-switch:disabled {
+  cursor: not-allowed;
+  opacity: .58;
+}
+
+.lux-admin-plugin-enable-switch-track {
+  position: relative;
+  display: block;
+  width: 31px;
+  height: 18px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .2);
+  transition: background .2s ease;
+}
+
+.lux-admin-plugin-enable-switch-track span {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--lux-text);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .28);
+  transition: transform .2s ease;
+}
+
+.lux-admin-plugin-enable-switch.is-enabled .lux-admin-plugin-enable-switch-track {
+  background: var(--lux-accent);
+}
+
+.lux-admin-plugin-enable-switch.is-enabled .lux-admin-plugin-enable-switch-track span {
+  transform: translateX(13px);
+}
+
 .lux-admin-plugin-config-button {
   padding: 0 10px;
   border: 1px solid transparent;
@@ -179,6 +235,7 @@
 }
 
 .lux-admin-plugin-install-status:focus-visible,
+.lux-admin-plugin-enable-switch:focus-visible,
 .lux-admin-plugin-config-button:focus-visible,
 .lux-admin-plugin-dialog-close:focus-visible {
   outline: 2px solid #fff;
@@ -364,6 +421,10 @@
 
   .lux-admin-plugin-install-status {
     padding: 0 9px;
+  }
+
+  .lux-admin-plugin-enable-switch {
+    padding-right: 7px;
   }
 
   .lux-admin-plugin-dialog {

@@ -63,6 +63,7 @@ describe("AdminPluginsPage plugin cards", () => {
     vi.spyOn(api, "adminPlugins").mockImplementation(async () => ({ plugins: [currentPlugin], total: 1 }));
     vi.spyOn(api, "adminInstalledPlugins").mockImplementation(async () => ({ plugins: currentPlugin.installed ? [currentPlugin] : [], total: currentPlugin.installed ? 1 : 0 }));
     vi.spyOn(api, "updateAdminPluginConfig").mockResolvedValue({ plugin: configuredPlugin });
+    vi.spyOn(api, "updateAdminPluginEnabled").mockImplementation(async (_pluginId, enabled) => ({ plugin: { ...currentPlugin, enabled, available: enabled } }));
     vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
     vi.spyOn(api, "installAdminPlugin").mockResolvedValue({ plugin: configuredPlugin });
     container = document.createElement("div");
@@ -244,6 +245,49 @@ describe("AdminPluginsPage plugin cards", () => {
 
     expect(container.querySelector('[aria-label="安装 TMDb 元数据插件"]')).toBeTruthy();
     expect(container.querySelector('[aria-label="插件状态：已安装"]')).toBeNull();
+  });
+
+  it("replaces the installed badge with an accessible enable switch in installed management", async () => {
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-pressed="false"]')?.click();
+    });
+
+    const card = container.querySelector<HTMLElement>(".lux-admin-plugin-card");
+    const toggle = card?.querySelector<HTMLButtonElement>('[role="switch"]');
+    expect(toggle).toBeTruthy();
+    expect(toggle?.getAttribute("aria-checked")).toBe("true");
+    expect(toggle?.getAttribute("aria-label")).toBe("禁用 TMDb 元数据插件");
+    expect(toggle?.textContent).toContain("已启用");
+    expect(card?.textContent).not.toContain("已安装");
+    expect(card?.querySelector('[aria-label="插件状态：已安装"]')).toBeNull();
+    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-enable-switch\s*\{/);
+
+    await act(async () => {
+      toggle?.click();
+    });
+    expect(api.updateAdminPluginEnabled).toHaveBeenCalledWith("tmdb", false);
+  });
+
+  it("shows a disabled installed plugin as off and offers to enable it", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      enabled: false,
+      available: false,
+      status: "DISABLED",
+      unavailableReason: "DISABLED",
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-pressed="false"]')?.click();
+    });
+
+    const toggle = container.querySelector<HTMLButtonElement>('[role="switch"]');
+    expect(toggle?.getAttribute("aria-checked")).toBe("false");
+    expect(toggle?.getAttribute("aria-label")).toBe("启用 TMDb 元数据插件");
+    expect(toggle?.textContent).toContain("已禁用");
   });
 
   it("renders media-info settings and runs with the saved plugin configuration", async () => {

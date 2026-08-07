@@ -341,6 +341,13 @@ export class LuxApiClient {
     );
   }
 
+  updateAdminPluginEnabled(pluginId: string, enabled: boolean) {
+    return this.request<{ plugin: AdminPlugin }>(
+      `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/enabled`,
+      { method: "PATCH", body: JSON.stringify({ enabled }) },
+    );
+  }
+
   updateAdminPluginConfig(
     pluginId: string,
     input: string | Record<string, unknown>,

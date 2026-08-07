@@ -67,7 +67,8 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 以下接口要求 `canManageServer`；写操作还要求 `X-CSRF-Token`：
 
 - `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回启动时从 `/config/plugins` 发现的插件包及 `installed`、`enabled`、`running`、`configured`、`available`、`configurable`、`configFields`、非敏感 `configValues`、`configSource`、`version`、`runtime`、`capabilities`、`status` 和脱敏 `lastError` 状态。`configFields` 包含输入类型、是否多选、默认值、数值范围和选项来源；`media-libraries` 选项由当前媒体库动态填充。TMDb 的 `configValues` 返回非敏感设置，不返回 API Key 或 Token。
-- `POST /api/v1/admin/plugins/{pluginId}/install`：启用已发现的插件包；它不会从网络下载代码。首次启用返回 201，重复请求返回 200。未知插件返回 404。
+- `POST /api/v1/admin/plugins/{pluginId}/install`：安装已发现的插件包并默认启用；它不会从网络下载代码。首次安装返回 201，重复请求返回 200。未知插件返回 404。
+- `PATCH /api/v1/admin/plugins/{pluginId}/enabled`：更新已安装插件的启用状态，请求体为 `{ "enabled": true }` 或 `{ "enabled": false }`。禁用只改变运行/选择状态，不删除安装记录；已安装管理列表仍会返回该插件。未安装或未知插件返回相应错误，成功返回更新后的插件状态。
 - `PUT /api/v1/admin/plugins/{pluginId}/config`：替换或更新插件配置。TMDb 请求体可包含 `{ "apiKey": "...", "preferredLanguage": "zh-CN", "languageFallbackEnabled": false, "fallbackLanguages": ["zh-SG", "zh-HK", "zh-TW"], "alternateApiEnabled": true, "apiBaseUrl": "https://api.tmdb.org" }`；`org.lux.strm-media-info` 请求体为 `{ "libraryIds": ["..."], "concurrency": 2, "existingInfoPolicy": "SKIP", "writeSidecars": true }`，其中也支持 `OVERWRITE` 覆盖已有媒体信息。媒体插件配置按 manifest 校验并保存到插件专属配置文件；成功返回不含明文凭据的插件状态。
 - `POST /api/v1/admin/plugins/org.lux.strm-media-info/run`：按已保存的 strm-media-info 插件配置创建 STRM 探测任务，返回 202；不接受媒体库、并发等宿主覆盖参数。
 - 插件包必须是 `.zip` 或开发用解压目录，根目录包含 `manifest.json`。Lux 启动时校验包格式、协议版本、平台架构、文件哈希和签名；校验失败的包不会运行。

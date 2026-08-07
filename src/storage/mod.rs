@@ -1205,21 +1205,34 @@ impl Database {
         })
     }
 
+    pub(crate) async fn plugin_installation_status(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<bool>, StorageError> {
+        sqlx::query_scalar("SELECT is_enabled FROM installed_plugins WHERE plugin_id = ?")
+            .bind(plugin_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|value: Option<i64>| value.map(|value| value != 0))
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn is_plugin_installed(&self, plugin_id: &str) -> Result<bool, StorageError> {
-        sqlx::query_scalar(
-            "SELECT EXISTS(
-                SELECT 1 FROM installed_plugins
-                WHERE plugin_id = ? AND is_enabled = 1
-            )",
-        )
-        .bind(plugin_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        self.plugin_installation_status(plugin_id)
+            .await
+            .map(|status| status == Some(true))
+    }
+
+    pub(crate) async fn has_plugin_installation(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.plugin_installation_status(plugin_id)
+            .await
+            .map(|status| status.is_some())
     }
 
     pub(crate) async fn install_plugin(&self, plugin_id: &str) -> Result<(), StorageError> {
@@ -1234,6 +1247,27 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_plugin_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE installed_plugins
+             SET is_enabled = ?, updated_at = unixepoch()
+             WHERE plugin_id = ?",
+        )
+        .bind(enabled)
+        .bind(plugin_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

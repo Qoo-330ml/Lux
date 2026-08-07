@@ -226,21 +226,33 @@ impl PluginService {
             .iter()
             .any(|plugin| is_tmdb_plugin_id(&plugin.manifest.id));
         if !has_tmdb_package {
-            let installed = self.database.is_plugin_installed(TMDB_PLUGIN_ID).await?;
+            let status = self
+                .database
+                .plugin_installation_status(TMDB_PLUGIN_ID)
+                .await?;
+            let installed = status.is_some();
+            let enabled = status == Some(true);
             if !installed_only || installed {
                 views.push(
-                    legacy_tmdb_view(installed, self.tmdb_config_source().await, &self.config_dir)
-                        .await,
+                    legacy_tmdb_view(
+                        installed,
+                        enabled,
+                        self.tmdb_config_source().await,
+                        &self.config_dir,
+                    )
+                    .await,
                 );
             }
         }
         for plugin in &self.catalog.plugins {
-            let installed = self
+            let status = self
                 .database
-                .is_plugin_installed(&plugin.manifest.id)
+                .plugin_installation_status(&plugin.manifest.id)
                 .await?;
+            let installed = status.is_some();
+            let enabled = status == Some(true);
             if !installed_only || installed {
-                views.push(self.dynamic_view(plugin, installed).await?);
+                views.push(self.dynamic_view(plugin, installed, enabled).await?);
             }
         }
         let total = i64::try_from(views.len()).unwrap_or(i64::MAX);
@@ -257,13 +269,33 @@ impl PluginService {
     pub async fn install(&self, plugin_id: &str) -> Result<PluginInstall, PluginServiceError> {
         let plugin_id = self.canonical_plugin_id(plugin_id);
         self.ensure_known_plugin(&plugin_id)?;
-        let was_installed = self.database.is_plugin_installed(&plugin_id).await?;
+        let was_installed = self.database.has_plugin_installation(&plugin_id).await?;
         self.database.install_plugin(&plugin_id).await?;
-        let plugin = self.view_for_id(&plugin_id, true).await?;
+        let plugin = self.view_for_id(&plugin_id, true, true).await?;
         Ok(PluginInstall {
             plugin,
             was_installed,
         })
+    }
+
+    pub async fn set_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<PluginView, PluginServiceError> {
+        let plugin_id = self.canonical_plugin_id(plugin_id);
+        self.ensure_known_plugin(&plugin_id)?;
+        if !self.database.has_plugin_installation(&plugin_id).await? {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        self.database
+            .set_plugin_enabled(&plugin_id, enabled)
+            .await?;
+        if !enabled {
+            self.supervisor.stop(&plugin_id).await;
+        }
+        let (installed, enabled) = self.plugin_state(&plugin_id).await?;
+        self.view_for_id(&plugin_id, installed, enabled).await
     }
 
     pub async fn update_config(
@@ -319,8 +351,8 @@ impl PluginService {
                     PluginServiceError::InvalidConfig
                 }
             })?;
-        let installed = self.database.is_plugin_installed(plugin_id).await?;
-        self.view_for_id(plugin_id, installed).await
+        let (installed, enabled) = self.plugin_state(plugin_id).await?;
+        self.view_for_id(plugin_id, installed, enabled).await
     }
 
     pub async fn validate_selection(
@@ -336,7 +368,7 @@ impl PluginService {
         if !self.database.is_plugin_installed(&scraper_id).await? {
             return Err(PluginServiceError::Unavailable(scraper_id));
         }
-        let view = self.view_for_id(&scraper_id, true).await?;
+        let view = self.view_for_id(&scraper_id, true, true).await?;
         if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
             return Err(PluginServiceError::Unavailable(scraper_id));
         }
@@ -440,8 +472,8 @@ impl PluginService {
         let values = normalize_plugin_config(&plugin_id, values);
         let values = validate_config_values(&fields, &values)?;
         self.write_plugin_config(&plugin_id, &values).await?;
-        let installed = self.database.is_plugin_installed(&plugin_id).await?;
-        self.view_for_id(&plugin_id, installed).await
+        let (installed, enabled) = self.plugin_state(&plugin_id).await?;
+        self.view_for_id(&plugin_id, installed, enabled).await
     }
 
     pub async fn media_info_settings(&self) -> Result<MediaInfoSettings, PluginServiceError> {
@@ -643,8 +675,8 @@ impl PluginService {
         if plugin_id == TMDB_PLUGIN_ID {
             return Err(PluginServiceError::Unavailable(plugin_id));
         }
-        let installed = self.database.is_plugin_installed(&plugin_id).await?;
-        let view = self.view_for_id(&plugin_id, installed).await?;
+        let (installed, enabled) = self.plugin_state(&plugin_id).await?;
+        let view = self.view_for_id(&plugin_id, installed, enabled).await?;
         if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
             return Err(PluginServiceError::Unavailable(plugin_id));
         }
@@ -667,10 +699,12 @@ impl PluginService {
         &self,
         plugin_id: &str,
         installed: bool,
+        enabled: bool,
     ) -> Result<PluginView, PluginServiceError> {
         if plugin_id == TMDB_PLUGIN_ID {
             return Ok(legacy_tmdb_view(
                 installed,
+                enabled,
                 self.tmdb_config_source().await,
                 &self.config_dir,
             )
@@ -679,13 +713,18 @@ impl PluginService {
         let Some(plugin) = self.catalog.get(plugin_id) else {
             return Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()));
         };
-        self.dynamic_view(plugin, installed).await
+        self.dynamic_view(plugin, installed, enabled).await
+    }
+
+    async fn plugin_state(&self, plugin_id: &str) -> Result<(bool, bool), PluginServiceError> {
+        let status = self.database.plugin_installation_status(plugin_id).await?;
+        Ok((status.is_some(), status == Some(true)))
     }
 
     async fn ensure_builtin_plugins_installed(&self) -> Result<(), PluginServiceError> {
         for plugin_id in [TMDB_DYNAMIC_PLUGIN_ID, IP138_PLUGIN_ID] {
             if self.catalog.get(plugin_id).is_some()
-                && !self.database.is_plugin_installed(plugin_id).await?
+                && !self.database.has_plugin_installation(plugin_id).await?
             {
                 self.database.install_plugin(plugin_id).await?;
             }
@@ -723,6 +762,7 @@ impl PluginService {
         &self,
         plugin: &DiscoveredPlugin,
         installed: bool,
+        enabled: bool,
     ) -> Result<PluginView, PluginServiceError> {
         let runtime = self.supervisor.status(&plugin.manifest.id).await;
         let disabled_by_other_ip_provider = plugin.manifest.id == IP138_PLUGIN_ID
@@ -744,7 +784,7 @@ impl PluginService {
             config_fields.is_empty()
                 || validate_config_values(&config_fields, &config_values).is_ok()
         };
-        let enabled = installed && !disabled_by_other_ip_provider;
+        let enabled = installed && enabled && !disabled_by_other_ip_provider;
         let available = enabled && configured;
         Ok(PluginView {
             id: plugin.manifest.id.clone(),
@@ -762,6 +802,8 @@ impl PluginService {
                 "ERROR".to_owned()
             } else if enabled {
                 "READY".to_owned()
+            } else if installed {
+                "DISABLED".to_owned()
             } else {
                 "AVAILABLE".to_owned()
             },
@@ -775,6 +817,8 @@ impl PluginService {
                 Some("OTHER_IP_LOCATION_PLUGIN_INSTALLED".to_owned())
             } else if !installed {
                 Some("NOT_INSTALLED".to_owned())
+            } else if !enabled {
+                Some("DISABLED".to_owned())
             } else if !configured {
                 Some("NOT_CONFIGURED".to_owned())
             } else {
@@ -1162,6 +1206,7 @@ impl From<StorageError> for PluginServiceError {
 
 async fn legacy_tmdb_view(
     installed: bool,
+    enabled: bool,
     config_source: &str,
     config_dir: &std::path::Path,
 ) -> PluginView {
@@ -1180,15 +1225,23 @@ async fn legacy_tmdb_view(
             "metadata.externalIds".to_owned(),
             "metadata.trailers".to_owned(),
         ],
-        status: "BUILT_IN_COMPATIBILITY".to_owned(),
+        status: if installed && enabled {
+            "BUILT_IN_COMPATIBILITY".to_owned()
+        } else if installed {
+            "DISABLED".to_owned()
+        } else {
+            "BUILT_IN_COMPATIBILITY".to_owned()
+        },
         running: true,
         last_error: None,
         installed,
-        enabled: installed,
+        enabled,
         configured: config_source != CONFIG_SOURCE_NONE,
-        available: installed && config_source != CONFIG_SOURCE_NONE,
+        available: enabled && config_source != CONFIG_SOURCE_NONE,
         unavailable_reason: if !installed {
             Some("NOT_INSTALLED".to_owned())
+        } else if !enabled {
+            Some("DISABLED".to_owned())
         } else if config_source == CONFIG_SOURCE_NONE {
             Some("NOT_CONFIGURED".to_owned())
         } else {

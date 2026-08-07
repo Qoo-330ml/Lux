@@ -19,6 +19,14 @@ export function AdminPluginsPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
     },
   });
+  const toggleEnabled = useMutation({
+    mutationFn: ({ pluginId, enabled }: { pluginId: string; enabled: boolean }) => api.updateAdminPluginEnabled(pluginId, enabled),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
+    },
+  });
 
   if (plugins.isPending || installedPlugins.isPending) return <AdminPluginsState label="正在读取插件库…" />;
   if (plugins.error || installedPlugins.error) return <AdminPluginsState label={plugins.error?.message || installedPlugins.error?.message || "插件库加载失败"} error />;
@@ -35,14 +43,14 @@ export function AdminPluginsPage() {
         <button className={mode === "installed" ? "is-active" : ""} type="button" aria-pressed={mode === "installed"} onClick={() => setMode("installed")}>已安装管理<span>{installedPlugins.data.total ?? installedPlugins.data.plugins?.length ?? 0}</span></button>
       </nav>
       <section className="lux-admin-plugin-grid" aria-label="可用插件">
-        {items.length === 0 ? <div className="lux-admin-empty"><PackageOpen size={24} /><h2>{mode === "store" ? "暂无可用插件" : "还没有已安装插件"}</h2><p>{mode === "store" ? "插件目录为空，请稍后重试。" : "从插件商店安装插件后，会在这里统一配置和管理。"}</p></div> : items.map((plugin) => <PluginCard key={plugin.id} plugin={plugin} installing={install.isPending && install.variables === plugin.id} onInstall={() => install.mutate(plugin.id)} />)}
+        {items.length === 0 ? <div className="lux-admin-empty"><PackageOpen size={24} /><h2>{mode === "store" ? "暂无可用插件" : "还没有已安装插件"}</h2><p>{mode === "store" ? "插件目录为空，请稍后重试。" : "从插件商店安装插件后，会在这里统一配置和管理。"}</p></div> : items.map((plugin) => <PluginCard key={plugin.id} plugin={plugin} installing={install.isPending && install.variables === plugin.id} installedManagement={mode === "installed"} toggling={toggleEnabled.isPending && toggleEnabled.variables?.pluginId === plugin.id} onInstall={() => install.mutate(plugin.id)} onToggleEnabled={(enabled) => toggleEnabled.mutate({ pluginId: plugin.id, enabled })} />)}
       </section>
-      {install.error ? <p className="lux-error-copy" role="alert">{install.error.message}</p> : null}
+      {install.error || toggleEnabled.error ? <p className="lux-error-copy" role="alert">{install.error?.message || toggleEnabled.error?.message}</p> : null}
     </div>
   );
 }
 
-function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; installing: boolean; onInstall: () => void }) {
+function PluginCard({ plugin, installing, installedManagement, toggling, onInstall, onToggleEnabled }: { plugin: AdminPlugin; installing: boolean; installedManagement: boolean; toggling: boolean; onInstall: () => void; onToggleEnabled: (enabled: boolean) => void }) {
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
@@ -71,6 +79,7 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
   const writeSidecarsField = plugin.configFields.find((field) => field.key === "writeSidecars");
   const customApiBaseUrlOption = apiBaseUrlField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
   const canConfigure = plugin.installed && plugin.configurable && plugin.configFields.length > 0;
+  const toggleBlockedByProvider = plugin.unavailableReason === "OTHER_IP_LOCATION_PLUGIN_INSTALLED";
   const closeDialog = useCallback(() => setOpen(false), []);
   const save = useMutation({
     mutationFn: () => isMediaInfo
@@ -160,7 +169,12 @@ function PluginCard({ plugin, installing, onInstall }: { plugin: AdminPlugin; in
         <p title={plugin.description}>{plugin.description}</p>
       </div>
       <div className="lux-admin-plugin-actions">
-        {plugin.installed ? (
+        {plugin.installed && installedManagement ? (
+          <button className={`lux-admin-plugin-enable-switch${plugin.enabled ? " is-enabled" : ""}`} type="button" role="switch" aria-checked={plugin.enabled} aria-label={toggleBlockedByProvider ? `由其他插件停用 ${plugin.name}` : `${plugin.enabled ? "禁用" : "启用"} ${plugin.name}`} disabled={toggling || toggleBlockedByProvider} onClick={() => onToggleEnabled(!plugin.enabled)}>
+            <span className="lux-admin-plugin-enable-switch-track" aria-hidden="true"><span /></span>
+            <span>{plugin.enabled ? "已启用" : "已禁用"}</span>
+          </button>
+        ) : plugin.installed ? (
           <span className="lux-admin-plugin-install-status is-installed" role="status" aria-label="插件状态：已安装"><CheckCircle2 size={15} /> 已安装</span>
         ) : (
           <button className="lux-admin-plugin-install-status is-install" type="button" aria-label={`安装 ${plugin.name}`} disabled={installing} onClick={onInstall}><Download size={15} /> {installing ? "安装中…" : "安装"}</button>
