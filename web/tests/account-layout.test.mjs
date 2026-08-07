@@ -36,7 +36,7 @@ test("account settings keeps the sidebar left and sync status aligned with the c
   assert.match(pageRule, /--lux-account-settings-gap:\s*clamp\(28px,\s*5vw,\s*84px\)/);
   assert.match(headingRule, /margin-right:\s*max\(0px,/);
   assert.match(headingRule, /clamp\(20px,\s*3vw,\s*48px\)/);
-  assert.match(headingTitleRule, /font-size:\s*clamp\(2rem,\s*4vw,\s*3.6rem\)/);
+  assert.match(headingTitleRule, /font-size:\s*clamp\(1\.75rem,\s*3vw,\s*2\.6rem\)/);
   assert.match(sidebarRule, /transform:\s*translateX\(calc\(-1\s*\*\s*clamp\(24px,\s*3vw,\s*48px\)\)\)/);
   assert.match(mobileGridRule, /transform:\s*none/);
   assert.match(mobileSidebarRule, /transform:\s*none/);
