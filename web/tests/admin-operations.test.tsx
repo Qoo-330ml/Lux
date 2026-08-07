@@ -133,6 +133,11 @@ describe("AdminOperationsPage", () => {
     const ownerSelect = container.querySelector("select[name='schedule-owner']") as HTMLSelectElement;
     const scheduleInput = container.querySelector("input[name='schedule-expression']") as HTMLInputElement;
     act(() => {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(ownerSelect, "LIBRARY:library-1");
+      ownerSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(ownerSelect.value).toBe("LIBRARY:library-1");
+    act(() => {
       Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(ownerSelect, "GLOBAL:global");
       ownerSelect.dispatchEvent(new Event("change", { bubbles: true }));
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(scheduleInput, "interval:1h");
