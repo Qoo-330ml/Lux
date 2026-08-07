@@ -9,8 +9,11 @@ pub const PLUGIN_FORMAT_VERSION: u32 = 1;
 pub const PLUGIN_API_VERSION: u32 = 1;
 pub const PLUGIN_CATEGORY_SCRAPER: &str = "SCRAPER";
 pub const PLUGIN_CATEGORY_MEDIA: &str = "MEDIA";
+pub const PLUGIN_CATEGORY_NETWORK: &str = "NETWORK";
 pub const PLUGIN_TYPE_MEDIA_PROBE: &str = "media_probe";
+pub const PLUGIN_TYPE_IP_LOCATION: &str = "ip_location";
 pub const MEDIA_PROBE_CAPABILITY: &str = "media.probe";
+pub const IP_LOCATION_CAPABILITY: &str = "ip.location";
 pub const CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES: &str = "media-libraries";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -82,6 +85,22 @@ impl PluginManifest {
                 {
                     return Err(PluginManifestError::Invalid(
                         "media probe plugins must declare media.probe".to_owned(),
+                    ));
+                }
+            }
+            PLUGIN_TYPE_IP_LOCATION => {
+                if self.category != PLUGIN_CATEGORY_NETWORK {
+                    return Err(PluginManifestError::Invalid(
+                        "ip location plugins must use the NETWORK category".to_owned(),
+                    ));
+                }
+                if !self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == IP_LOCATION_CAPABILITY)
+                {
+                    return Err(PluginManifestError::Invalid(
+                        "ip location plugins must declare ip.location".to_owned(),
                     ));
                 }
             }
@@ -352,6 +371,34 @@ pub struct PluginResponse {
 pub struct PluginRpcError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpLocationRpcRequest {
+    pub ip: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpLocationRpcResult {
+    pub ip: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub province: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub district: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub street: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

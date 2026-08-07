@@ -1,5 +1,7 @@
 use luxd::application::plugin_protocol::{
-    PLUGIN_API_VERSION, PLUGIN_FORMAT_VERSION, PluginManifest, PluginRequest,
+    IP_LOCATION_CAPABILITY, PLUGIN_API_VERSION, PLUGIN_CATEGORY_NETWORK,
+    PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_IP_LOCATION, IpLocationRpcResult, PluginManifest,
+    PluginRequest,
 };
 use serde_json::json;
 
@@ -112,6 +114,60 @@ fn accepts_a_media_probe_plugin_manifest() {
     );
     assert_eq!(manifest.config_fields[1].input_type, "number");
     assert_eq!(manifest.config_fields[1].default_value, Some(json!(2)));
+}
+
+#[test]
+fn accepts_an_ip_location_plugin_manifest_and_result() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.ip-hiofd",
+        "name": "IP归属地查询增强",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_IP_LOCATION,
+        "category": PLUGIN_CATEGORY_NETWORK,
+        "capabilities": [IP_LOCATION_CAPABILITY],
+        "permissions": {"network": ["toola.hiofd.com"]},
+        "files": []
+    }))
+    .expect("ip location manifest should validate");
+
+    let result: IpLocationRpcResult = serde_json::from_value(json!({
+        "ip": "8.8.8.8",
+        "country": "美国",
+        "province": "加利福尼亚州",
+        "city": "山景城",
+        "isp": "Google",
+        "latitude": null,
+        "longitude": null
+    }))
+    .expect("ip location result should deserialize");
+
+    assert_eq!(manifest.plugin_type, PLUGIN_TYPE_IP_LOCATION);
+    assert_eq!(manifest.category, PLUGIN_CATEGORY_NETWORK);
+    assert_eq!(manifest.capabilities, vec![IP_LOCATION_CAPABILITY]);
+    assert_eq!(result.ip, "8.8.8.8");
+    assert_eq!(result.city.as_deref(), Some("山景城"));
+}
+
+#[test]
+fn rejects_an_ip_location_manifest_without_the_network_capability() {
+    let error = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.ip-invalid",
+        "name": "Invalid IP plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_IP_LOCATION,
+        "category": PLUGIN_CATEGORY_NETWORK,
+        "capabilities": [],
+        "files": []
+    }))
+    .expect_err("ip location plugin capability must be declared");
+
+    assert!(error.to_string().contains("ip.location"));
 }
 
 #[test]
