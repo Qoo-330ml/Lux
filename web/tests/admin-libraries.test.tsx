@@ -194,6 +194,9 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(container.querySelector('[role="dialog"]')?.textContent).toContain("01每日更新");
     expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 媒体库名称"]')?.value).toBe("01每日更新");
+    expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("增量扫描");
+    expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("全量校验");
+    expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("元数据任务");
   });
 
   it("adds a selected server directory as a library root", async () => {
