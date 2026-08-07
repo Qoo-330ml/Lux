@@ -2,8 +2,9 @@
 
 ## 目标
 
-把 IP 归属地查询抽象为 Lux Plugin SDK v1 的统一网络插件能力，并将 Hiofd 和 qoo-ip138
-分别作为可独立启停、可回退的插件运行。现有播放会话仪表盘的异步行为和 24 小时缓存保持不变。
+把 IP 归属地查询抽象为 Lux Plugin SDK v1 的统一网络插件能力，并将 Hiofd 和 ip138
+分别作为可独立启停的插件运行。ip138 默认启用；安装其他归属地插件后停用 ip138。现有播放
+会话仪表盘的异步行为和 24 小时缓存保持不变。
 
 ## 统一接口
 
@@ -46,11 +47,12 @@ Lux 宿主在 RPC 边界重新验证 JSON、IP 一致性和字段长度，并计
 
 | 插件 ID | 显示名称 | 上游 | 优先级 |
 | --- | --- | --- | --- |
-| `org.lux.ip-hiofd` | IP归属地查询增强 | Hiofd `IpQuery` | 1 |
-| `org.lux.qoo-ip138` | qoo-ip138 IP归属地查询 | ipshudi.com 页面 | 2 |
+| `org.lux.ip-hiofd` | IP归属地查询增强 | Hiofd `IpQuery` | 安装后优先 |
+| `org.lux.qoo-ip138` | ip138 IP归属地查询 | ipshudi.com 页面 | 默认 |
 
 插件只声明 `ip.location`，并实现 `plugin.hello`、`plugin.health`、`ip.location` 和
-`plugin.shutdown`。宿主只尝试已安装且能力声明正确的插件；Hiofd 失败时才尝试 qoo-ip138。
+`plugin.shutdown`。宿主只尝试已安装且能力声明正确的插件；没有其他归属地插件时使用 ip138，
+安装其他归属地插件后停用 ip138。
 
 ## 安全与可靠性边界
 
@@ -65,7 +67,7 @@ Lux 宿主在 RPC 边界重新验证 JSON、IP 一致性和字段长度，并计
 ## 实施切片
 
 1. 扩展 manifest 校验和协议结构，并覆盖无效类型、能力和 IP 返回的测试。
-2. 在 `PluginService` 中按固定优先级调用已安装 IP 插件并校验结果。
+2. 在 `PluginService` 中按 ip138 默认、其他已安装归属地插件替代的规则调用并校验结果。
 3. 让 `IpLocationService` 依赖 `PluginService`，删除主进程 Hiofd HTTP 逻辑，保留缓存。
 4. 将 `/Users/Qoo/Desktop/mywork/IP/IP-hiofd` 和 `qoo-ip138` 增加标准 JSON-RPC 插件入口、manifest 和测试。
 5. 扩展包构建脚本和 Rust 集成测试，运行全量检查并记录 ARM 架构。

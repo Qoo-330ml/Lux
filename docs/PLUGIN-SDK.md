@@ -217,7 +217,8 @@ IP 归属地插件必须声明 `type: "ip_location"`、`category: "NETWORK"` 和
 `{"ip":"8.8.8.8","country":"美国","province":null,"city":null,"district":null,"street":null,"isp":"示例运营商","latitude":null,"longitude":null}`
 
 `ip` 必须与查询地址相同；Lux 会再次校验 IP、字段长度和响应大小，并把无效结果视为插件失败。
-Lux 依次尝试已安装的 `org.lux.ip-hiofd` 和 `org.lux.qoo-ip138`，前者显示名称为“IP归属地查询增强”。
+默认使用已安装的 `org.lux.qoo-ip138`（显示名称“ip138 IP归属地查询”）。如果安装了其他
+`ip_location` 插件，Lux 会停用 ip138，并只使用其他已安装的归属地插件；Hiofd 显示名称为“IP归属地查询增强”。
 成功结果只放在进程内 24 小时缓存，失败结果只放 5 分钟；不写入 SQLite、不提供公开查询接口。
 插件负责第三方 HTTP/HTML/JSON 解析，不得返回凭据、完整第三方响应、签名字段或完整上游 URL。
 

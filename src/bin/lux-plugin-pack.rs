@@ -284,7 +284,7 @@ fn manifest_value(
         PluginKind::QooIp138 => json!({
             "formatVersion": 1,
             "id": "org.lux.qoo-ip138",
-            "name": "qoo-ip138 IP归属地查询",
+            "name": "ip138 IP归属地查询",
             "description": "通过 ipshudi.com 查询公网 IP 的归属地信息。",
             "version": version,
             "apiVersion": 1,

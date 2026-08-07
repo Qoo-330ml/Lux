@@ -186,7 +186,7 @@ fn packages_both_ip_location_plugin_zips_with_network_manifests()
         (
             "qoo-ip138",
             "org.lux.qoo-ip138",
-            "qoo-ip138 IP归属地查询",
+            "ip138 IP归属地查询",
             "www.ipshudi.com",
         ),
     ] {

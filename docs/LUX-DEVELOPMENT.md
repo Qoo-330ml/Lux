@@ -3139,7 +3139,9 @@ Emby 兼容层提供 `/api/danmu/{itemId}`、`/api/danmu/{itemId}/raw`，并保�
 范围：将 IP 归属地查询从 Lux 主进程内置的 Hiofd HTTP 客户端拆分为统一的动态插件能力。
 插件通过现有 Plugin SDK v1 的独立进程和 JSON-RPC stdin/stdout 运行，Lux 只负责输入地址校验、
 插件选择、结果校验、归一化展示和内存缓存。固定插件 ID 为 `org.lux.ip-hiofd` 和
-`org.lux.qoo-ip138`，优先级依次为 Hiofd、qoo-ip138；Hiofd 插件显示名称为“IP归属地查询增强”。
+`org.lux.qoo-ip138`。默认使用 ip138 插件；如果安装了其他 `ip_location` 插件，则停用
+ip138，不再把它作为回退。Hiofd 插件显示名称为“IP归属地查询增强”，ip138 插件显示名称为
+“ip138 IP归属地查询”。
 
 统一 RPC 方法为 `ip.location`，请求为 `{ "ip": "8.8.8.8" }`，返回必须包含与查询地址一致的
 `ip`，以及可选的 `country`、`province`、`city`、`district`、`street`、`isp`、`latitude` 和
@@ -3147,15 +3149,16 @@ Emby 兼容层提供 `/api/danmu/{itemId}`、`/api/danmu/{itemId}/raw`，并保�
 返回给 Lux API 或写入日志。
 
 宿主只向声明 `type: "ip_location"`、`category: "NETWORK"`、`capabilities: ["ip.location"]`
-且已安装的插件发送查询；插件按固定优先级尝试，失败后回退下一个插件。宿主拒绝非 IP、回环、
+且已安装的插件发送查询；没有其他已安装归属地插件时使用 ip138；存在其他已安装归属地插件时
+只尝试这些插件，不回退到 ip138。宿主拒绝非 IP、回环、
 私网、链路本地、未指定和多播地址，并限制字段长度和插件响应大小。现有管理员仪表盘异步查询和
 成功 24 小时/失败 5 分钟的进程内缓存保持不变，不新增数据库表或公开 IP 查询接口。
 
 验收：
 
 - [ ] Plugin SDK 能校验 IP 归属地 manifest 和 `ip.location` RPC 数据结构；未知插件类型或能力声明不能运行。
-- [ ] Lux 按 Hiofd → qoo-ip138 顺序调用已安装插件，校验返回 IP 与查询 IP 一致；单个插件失败不会影响播放会话。
-- [ ] Hiofd 插件名称为“IP归属地查询增强”，qoo-ip138 插件可作为独立回退插件；两者都提供 `plugin.hello`、`plugin.health`、`ip.location` 和 `plugin.shutdown`。
+- [ ] 没有其他已安装归属地插件时 Lux 使用 ip138；安装 Hiofd 或其他 `ip_location` 插件后停用 ip138，校验返回 IP 与查询 IP 一致；单个插件失败不会影响播放会话。
+- [ ] Hiofd 插件名称为“IP归属地查询增强”，ip138 插件名称为“ip138 IP归属地查询”；两者都提供 `plugin.hello`、`plugin.health`、`ip.location` 和 `plugin.shutdown`。
 - [ ] 现有仪表盘仍只返回管理员可见的可空 `remoteIpLocation`；成功结果缓存 24 小时，失败结果缓存 5 分钟，同一 IP 不重复请求。
 - [ ] 插件响应、错误和日志不包含 Hiofd 私有签名字段、凭据、完整第三方响应或完整上游 URL；第三方 HTML/JSON 经过大小和字段限制。
 - [ ] 两个参考项目均提供可被 Lux Plugin SDK 直接启动的插件入口和 manifest，并有可重复的 Lux 插件包构建方式。

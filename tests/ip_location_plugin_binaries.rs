@@ -17,7 +17,7 @@ fn ip_location_plugin_binaries_implement_the_common_rpc() -> Result<(), Box<dyn 
         (
             env!("CARGO_BIN_EXE_lux-plugin-qoo-ip138"),
             "org.lux.qoo-ip138",
-            "qoo-ip138 IP归属地查询",
+            "ip138 IP归属地查询",
         ),
     ] {
         let mut child = Command::new(binary)

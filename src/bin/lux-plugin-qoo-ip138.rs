@@ -11,7 +11,7 @@ use luxd::application::plugin_protocol::{
 use serde_json::{Value, json};
 
 const PLUGIN_ID: &str = "org.lux.qoo-ip138";
-const PLUGIN_NAME: &str = "qoo-ip138 IP归属地查询";
+const PLUGIN_NAME: &str = "ip138 IP归属地查询";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[tokio::main]

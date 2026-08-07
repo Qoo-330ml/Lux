@@ -36,8 +36,7 @@ pub const TMDB_DYNAMIC_PLUGIN_ID: &str = "org.lux.tmdb";
 pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.strm-media-info";
 pub const MEDIA_INFO_LEGACY_PLUGIN_ID: &str = "org.lux.media-info";
 pub const IP_HIOFD_PLUGIN_ID: &str = "org.lux.ip-hiofd";
-pub const QOO_IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
-const IP_LOCATION_PLUGIN_IDS: &[&str] = &[IP_HIOFD_PLUGIN_ID, QOO_IP138_PLUGIN_ID];
+pub const IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
 const TMDB_PLUGIN_NAME: &str = "TMDb 元数据插件";
 const TMDB_PLUGIN_DESCRIPTION: &str = "使用 TMDb 补全电影和剧集元数据、海报与背景图。";
 const TMDB_PLUGIN_VERSION: &str = "1.0.0";
@@ -367,25 +366,23 @@ impl PluginService {
         }
         self.ensure_builtin_plugins_installed().await?;
         let query_ip = ip.to_string();
-        for plugin_id in IP_LOCATION_PLUGIN_IDS {
-            let Some(plugin) = self.catalog.get(plugin_id) else {
+        let other_plugins = self.installed_other_ip_location_plugins().await?;
+        let plugin_ids = if other_plugins.is_empty() {
+            vec![IP138_PLUGIN_ID.to_owned()]
+        } else {
+            other_plugins
+        };
+        for plugin_id in plugin_ids {
+            let Some(plugin) = self.catalog.get(&plugin_id) else {
                 continue;
             };
-            if plugin.manifest.plugin_type != PLUGIN_TYPE_IP_LOCATION
-                || plugin.manifest.category != PLUGIN_CATEGORY_NETWORK
-                || !plugin
-                    .manifest
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == IP_LOCATION_CAPABILITY)
-                || !self.database.is_plugin_installed(plugin_id).await?
-            {
+            if !is_ip_location_plugin(plugin) {
                 continue;
             }
             let value = match self
                 .supervisor
                 .call(
-                    plugin_id,
+                    &plugin_id,
                     "ip.location",
                     serde_json::to_value(IpLocationRpcRequest {
                         ip: query_ip.clone(),
@@ -686,11 +683,7 @@ impl PluginService {
     }
 
     async fn ensure_builtin_plugins_installed(&self) -> Result<(), PluginServiceError> {
-        for plugin_id in [
-            TMDB_DYNAMIC_PLUGIN_ID,
-            IP_HIOFD_PLUGIN_ID,
-            QOO_IP138_PLUGIN_ID,
-        ] {
+        for plugin_id in [TMDB_DYNAMIC_PLUGIN_ID, IP138_PLUGIN_ID] {
             if self.catalog.get(plugin_id).is_some()
                 && !self.database.is_plugin_installed(plugin_id).await?
             {
@@ -700,12 +693,40 @@ impl PluginService {
         Ok(())
     }
 
+    async fn installed_other_ip_location_plugins(&self) -> Result<Vec<String>, PluginServiceError> {
+        let mut plugin_ids = Vec::new();
+        for plugin_id in [IP_HIOFD_PLUGIN_ID] {
+            if let Some(plugin) = self.catalog.get(plugin_id)
+                && is_ip_location_plugin(plugin)
+                && self.database.is_plugin_installed(plugin_id).await?
+            {
+                plugin_ids.push(plugin_id.to_owned());
+            }
+        }
+        for plugin in &self.catalog.plugins {
+            if plugin.manifest.id == IP138_PLUGIN_ID
+                || plugin.manifest.id == IP_HIOFD_PLUGIN_ID
+                || !is_ip_location_plugin(plugin)
+                || !self
+                    .database
+                    .is_plugin_installed(&plugin.manifest.id)
+                    .await?
+            {
+                continue;
+            }
+            plugin_ids.push(plugin.manifest.id.clone());
+        }
+        Ok(plugin_ids)
+    }
+
     async fn dynamic_view(
         &self,
         plugin: &DiscoveredPlugin,
         installed: bool,
     ) -> Result<PluginView, PluginServiceError> {
         let runtime = self.supervisor.status(&plugin.manifest.id).await;
+        let disabled_by_other_ip_provider = plugin.manifest.id == IP138_PLUGIN_ID
+            && !self.installed_other_ip_location_plugins().await?.is_empty();
         let config_source = if is_tmdb_plugin_id(&plugin.manifest.id) {
             self.tmdb_config_source().await.to_owned()
         } else if plugin.manifest.config_fields.is_empty() {
@@ -723,7 +744,8 @@ impl PluginService {
             config_fields.is_empty()
                 || validate_config_values(&config_fields, &config_values).is_ok()
         };
-        let available = installed && configured;
+        let enabled = installed && !disabled_by_other_ip_provider;
+        let available = enabled && configured;
         Ok(PluginView {
             id: plugin.manifest.id.clone(),
             name: plugin.manifest.name.clone(),
@@ -732,11 +754,13 @@ impl PluginService {
             version: Some(plugin.manifest.version.clone()),
             runtime: Some(plugin.manifest.runtime.kind.clone()),
             capabilities: plugin.manifest.capabilities.clone(),
-            status: if runtime.running {
+            status: if disabled_by_other_ip_provider {
+                "DISABLED".to_owned()
+            } else if runtime.running {
                 "RUNNING".to_owned()
             } else if runtime.last_error.is_some() {
                 "ERROR".to_owned()
-            } else if installed {
+            } else if enabled {
                 "READY".to_owned()
             } else {
                 "AVAILABLE".to_owned()
@@ -744,10 +768,12 @@ impl PluginService {
             running: runtime.running,
             last_error: runtime.last_error,
             installed,
-            enabled: installed,
+            enabled,
             configured,
             available,
-            unavailable_reason: if !installed {
+            unavailable_reason: if disabled_by_other_ip_provider {
+                Some("OTHER_IP_LOCATION_PLUGIN_INSTALLED".to_owned())
+            } else if !installed {
                 Some("NOT_INSTALLED".to_owned())
             } else if !configured {
                 Some("NOT_CONFIGURED".to_owned())
@@ -1116,6 +1142,16 @@ fn normalize_ip_location_field(value: Option<String>) -> Option<String> {
         && value.chars().count() <= MAX_IP_LOCATION_FIELD_CHARS
         && !value.chars().any(char::is_control))
     .then_some(value)
+}
+
+fn is_ip_location_plugin(plugin: &DiscoveredPlugin) -> bool {
+    plugin.manifest.plugin_type == PLUGIN_TYPE_IP_LOCATION
+        && plugin.manifest.category == PLUGIN_CATEGORY_NETWORK
+        && plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == IP_LOCATION_CAPABILITY)
 }
 
 impl From<StorageError> for PluginServiceError {
