@@ -227,6 +227,7 @@ pub fn is_public_address(address: IpAddr) -> bool {
                     | (169, 254)
                     | (172, 16..=31)
                     | (192, 168)
+                    | (224..=255, _)
             )
         }
         IpAddr::V6(address) => {
@@ -284,5 +285,18 @@ mod tests {
     fn empty_proxy_configuration_is_disabled() {
         assert!(apply_proxy(Client::builder(), Some("  ")).is_ok());
         assert!(apply_proxy(Client::builder(), None).is_ok());
+    }
+
+    #[test]
+    fn public_address_filter_rejects_multicast_and_reserved_ipv4() {
+        assert!(!super::is_public_address(
+            "224.0.0.1".parse().expect("multicast IP")
+        ));
+        assert!(!super::is_public_address(
+            "240.0.0.1".parse().expect("reserved IP")
+        ));
+        assert!(!super::is_public_address(
+            "255.255.255.255".parse().expect("broadcast IP")
+        ));
     }
 }
