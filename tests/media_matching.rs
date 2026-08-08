@@ -56,3 +56,10 @@ fn parses_movie_filename_with_chinese_title_and_release_suffix() {
     assert_eq!(parsed.title, "二毛");
     assert_eq!(parsed.production_year, Some(2019));
 }
+
+#[test]
+fn removes_cd_part_marker_from_movie_title() {
+    let parsed = parse_media_name("FC22378556无码 cd1.mp4", MediaKind::Movie).expect("movie name");
+
+    assert_eq!(parsed.title, "FC22378556无码");
+}

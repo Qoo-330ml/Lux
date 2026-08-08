@@ -265,6 +265,9 @@ fn format_episode_marker(season: &Option<u32>, episode: &Option<u32>) -> String 
 
 fn is_technical_word(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase().replace(' ', "");
+    if is_multi_part_marker(&normalized) {
+        return true;
+    }
     if normalized == "h"
         || normalized
             .chars()
@@ -337,6 +340,14 @@ fn is_technical_word(value: &str) -> bool {
             | "special"
             | "remastered"
     )
+}
+
+fn is_multi_part_marker(value: &str) -> bool {
+    ["cd", "disc", "disk", "part"].iter().any(|prefix| {
+        value
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+    })
 }
 
 fn parse_edition_name(words: &[&str]) -> Option<String> {
