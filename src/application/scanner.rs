@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -29,8 +29,8 @@ use crate::{
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     storage::{
         Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource,
-        NewScanJobEvent, StorageError, StoredLibraryRoot, StoredReconciliationScanEntry,
-        StoredScanJob, StoredScanJobPath,
+        NewScanJobEvent, StorageError, StoredFilesystemEntry, StoredLibraryRoot,
+        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
     },
 };
 
@@ -90,12 +90,37 @@ impl LibraryScanner {
                 }
                 Err(error) => return Err(error),
             };
+            let existing_entries = self
+                .database
+                .list_filesystem_entries_for_root(&root.id)
+                .await?
+                .into_iter()
+                .map(|entry| (entry.relative_path.clone(), entry))
+                .collect::<HashMap<_, _>>();
+            let mut seen_entry_ids = Vec::new();
             for path in files {
-                report.merge(
-                    self.scan_movie_file(&library_id_text, &root, &root_path, &path, &generation)
+                if let Some((entry_id, quick_report)) = self
+                    .scan_movie_file_if_unchanged(&root_path, &path, &existing_entries)
+                    .await?
+                {
+                    seen_entry_ids.push(entry_id);
+                    report.merge(quick_report);
+                } else {
+                    report.merge(
+                        self.scan_movie_file(
+                            &library_id_text,
+                            &root,
+                            &root_path,
+                            &path,
+                            &generation,
+                        )
                         .await?,
-                );
+                    );
+                }
             }
+            self.database
+                .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
+                .await?;
             report.marked_missing += usize::try_from(
                 self.database
                     .mark_missing_filesystem_entries(&root.id, &generation)
@@ -757,6 +782,57 @@ impl LibraryScanner {
             );
         }
         Ok(report)
+    }
+
+    async fn scan_movie_file_if_unchanged(
+        &self,
+        root_path: &Path,
+        path: &Path,
+        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+    ) -> Result<Option<(String, ScanReport)>, ScannerError> {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        if parse_movie_filename(file_name).is_none() || is_strm_file(path) {
+            return Ok(None);
+        }
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        let Some(existing_entry) = existing_entries.get(&relative_path) else {
+            return Ok(None);
+        };
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let size = i64::try_from(metadata.len())
+            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        let (device, inode) = file_identity(&metadata);
+        let fingerprint =
+            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+            return Ok(None);
+        }
+        Ok(Some((
+            existing_entry.id.clone(),
+            ScanReport {
+                discovered_files: 1,
+                skipped_files: 1,
+                ..ScanReport::default()
+            },
+        )))
     }
 
     pub(crate) async fn scan_movie_file(

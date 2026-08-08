@@ -3568,7 +3568,7 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         sqlx::query(
-            "SELECT fe.id, fe.fingerprint, ms.item_id
+            "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
              FROM filesystem_entries fe
              LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
              WHERE fe.library_root_id = ? AND fe.relative_path = ?",
@@ -3582,6 +3582,74 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_filesystem_entries_for_root(
+        &self,
+        library_root_id: &str,
+    ) -> Result<Vec<StoredFilesystemEntry>, StorageError> {
+        sqlx::query(
+            "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
+             FROM filesystem_entries fe
+             LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+             WHERE fe.library_root_id = ?",
+        )
+        .bind(library_root_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_filesystem_entry).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_filesystem_entries_seen_batch(
+        &self,
+        entry_ids: &[String],
+        last_seen_generation: &str,
+    ) -> Result<(), StorageError> {
+        if entry_ids.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for chunk in entry_ids.chunks(500) {
+            let mut query_builder = QueryBuilder::<sqlx::Sqlite>::new(
+                "UPDATE filesystem_entries
+                 SET last_seen_generation = ",
+            );
+            query_builder.push_bind(last_seen_generation).push(
+                ", is_missing = 0, updated_at = unixepoch()
+                       WHERE id IN (",
+            );
+            let mut separated = query_builder.separated(", ");
+            for entry_id in chunk {
+                separated.push_bind(entry_id);
+            }
+            separated.push_unseparated(")");
+            query_builder
+                .build()
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn update_filesystem_entry(
@@ -7632,6 +7700,7 @@ fn stored_library_root(row: sqlx::sqlite::SqliteRow) -> StoredLibraryRoot {
 #[derive(Debug)]
 pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
+    pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) item_id: Option<String>,
 }
@@ -7639,6 +7708,7 @@ pub(crate) struct StoredFilesystemEntry {
 fn stored_filesystem_entry(row: sqlx::sqlite::SqliteRow) -> StoredFilesystemEntry {
     StoredFilesystemEntry {
         id: row.get("id"),
+        relative_path: row.get("relative_path"),
         fingerprint: row.get("fingerprint"),
         item_id: row.get("item_id"),
     }
