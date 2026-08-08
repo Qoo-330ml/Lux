@@ -12,7 +12,7 @@ use image::{
 };
 use imageproc::{
     drawing::draw_text_mut,
-    geometric_transformations::{Interpolation, rotate_about_center},
+    geometric_transformations::{Interpolation, Projection, warp_into},
 };
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -21,6 +21,7 @@ use tokio::{fs, sync::Semaphore};
 use crate::{
     application::images::{ImageWriteError, write_image_atomically},
     domain::ids::LibraryId,
+    library::LibraryKind,
     storage::{Database, StorageError},
 };
 
@@ -102,9 +103,10 @@ impl LibraryCoverService {
         let font_bytes = fs::read(&font_path)
             .await
             .map_err(|source| image_io_error(&font_path, source))?;
+        let library_subtitle = library_kind_subtitle(&library.kind);
         let library_name = library.name;
         let bytes = tokio::task::spawn_blocking(move || {
-            render_auto_library_cover(&library_name, &poster_bytes, &font_bytes)
+            render_auto_library_cover(&library_name, library_subtitle, &poster_bytes, &font_bytes)
         })
         .await
         .map_err(|_| LibraryCoverError::RenderPanicked)??;
@@ -166,9 +168,10 @@ impl LibraryCoverService {
         let font_bytes = fs::read(&font_path)
             .await
             .map_err(|source| image_io_error(&font_path, source))?;
+        let library_subtitle = library_kind_subtitle(&library.kind);
         let library_name = library.name;
         let bytes = tokio::task::spawn_blocking(move || {
-            render_auto_library_cover(&library_name, &poster_bytes, &font_bytes)
+            render_auto_library_cover(&library_name, library_subtitle, &poster_bytes, &font_bytes)
         })
         .await
         .map_err(|_| LibraryCoverError::RenderPanicked)??;
@@ -560,6 +563,7 @@ fn discover_cover_font() -> Option<PathBuf> {
 
 fn render_auto_library_cover(
     library_name: &str,
+    library_subtitle: &str,
     poster_bytes: &[Vec<u8>],
     font_bytes: &[u8],
 ) -> Result<Vec<u8>, LibraryCoverError> {
@@ -598,12 +602,7 @@ fn render_auto_library_cover(
             let y = i64::from(row as u32 * card_h) + i64::from(stack_gap * row as i32);
             overlay(&mut stack, &processed[index], 0, y as i32);
         }
-        let rotated = rotate_about_center(
-            &stack,
-            -16.0_f32.to_radians(),
-            Interpolation::Bicubic,
-            Rgba([0, 0, 0, 0]),
-        );
+        let rotated = rotate_cover_column(&stack);
         let x = 350 + column as i32 * (410 - 50 + 50);
         let y = -200 - column as i32 * 80;
         overlay(&mut canvas, &rotated, x, y);
@@ -613,13 +612,49 @@ fn render_auto_library_cover(
     let font = FontArc::try_from_vec(font_bytes.to_vec())
         .or_else(|_| FontVec::try_from_vec_and_index(font_bytes.to_vec(), 0).map(Into::into))
         .map_err(|_| LibraryCoverError::Render("cover font could not be loaded".to_owned()))?;
-    draw_library_name(&mut canvas, library_name, &font);
+    draw_library_text(&mut canvas, library_name, library_subtitle, &font);
 
     let mut output = Vec::new();
     DynamicImage::ImageRgba8(canvas)
         .write_to(&mut Cursor::new(&mut output), RasterFormat::Jpeg)
         .map_err(|error| LibraryCoverError::Render(error.to_string()))?;
     Ok(output)
+}
+
+fn library_kind_subtitle(kind: &str) -> &'static str {
+    match kind.parse::<LibraryKind>() {
+        Ok(LibraryKind::Movie) => "Movies",
+        Ok(LibraryKind::Series) => "Series",
+        Ok(LibraryKind::Mixed) => "Mixed",
+        Err(_) => "Media",
+    }
+}
+
+fn rotate_cover_column(column: &RgbaImage) -> RgbaImage {
+    // Pillow's rotate(-16, expand=True) is clockwise; imageproc uses clockwise-positive radians.
+    let theta = 16.0_f32.to_radians();
+    let (sin_theta, cos_theta) = theta.sin_cos();
+    let output_width = (column.width() as f32 * cos_theta.abs()
+        + column.height() as f32 * sin_theta.abs())
+    .ceil() as u32;
+    let output_height = (column.height() as f32 * cos_theta.abs()
+        + column.width() as f32 * sin_theta.abs())
+    .ceil() as u32;
+    let projection = Projection::translate(output_width as f32 / 2.0, output_height as f32 / 2.0)
+        * Projection::rotate(theta)
+        * Projection::translate(
+            -(column.width() as f32) / 2.0,
+            -(column.height() as f32) / 2.0,
+        );
+    let mut rotated = RgbaImage::new(output_width, output_height);
+    warp_into(
+        column,
+        &projection,
+        Interpolation::Bicubic,
+        Rgba([0, 0, 0, 0]),
+        &mut rotated,
+    );
+    rotated
 }
 
 fn gradient_background(first_poster: &DynamicImage) -> RgbaImage {
@@ -755,7 +790,7 @@ fn overlay(base: &mut RgbaImage, layer: &RgbaImage, left: i32, top: i32) {
     }
 }
 
-fn draw_library_name(canvas: &mut RgbaImage, name: &str, font: &FontArc) {
+fn draw_library_text(canvas: &mut RgbaImage, name: &str, subtitle: &str, font: &FontArc) {
     let scale = PxScale::from(160.0);
     let lines = wrap_text(font, scale, name, 960.0);
     let line_height = font.as_scaled(scale).height().ceil() as i32;
@@ -765,6 +800,25 @@ fn draw_library_name(canvas: &mut RgbaImage, name: &str, font: &FontArc) {
         draw_text_mut(canvas, Rgba([0, 0, 0, 100]), 101, y + 5, scale, font, line);
         draw_text_mut(canvas, Rgba([255, 255, 255, 255]), 96, y, scale, font, line);
     }
+    let subtitle_scale = PxScale::from(50.0);
+    draw_text_mut(
+        canvas,
+        Rgba([0, 0, 0, 100]),
+        156,
+        629,
+        subtitle_scale,
+        font,
+        subtitle,
+    );
+    draw_text_mut(
+        canvas,
+        Rgba([255, 255, 255, 255]),
+        153,
+        626,
+        subtitle_scale,
+        font,
+        subtitle,
+    );
 }
 
 fn draw_accent_bar(canvas: &mut RgbaImage, left: i32, top: i32, width: u32, height: u32) {
@@ -879,7 +933,16 @@ fn image_io_error(path: &Path, source: std::io::Error) -> LibraryCoverError {
 
 #[cfg(test)]
 mod tests {
-    use super::{RgbaImage, add_shadow};
+    use image::Rgba;
+
+    use super::{RgbaImage, add_shadow, library_kind_subtitle, rotate_cover_column};
+
+    #[test]
+    fn library_kind_uses_english_cover_subtitle() {
+        assert_eq!(library_kind_subtitle("MOVIE"), "Movies");
+        assert_eq!(library_kind_subtitle("SERIES"), "Series");
+        assert_eq!(library_kind_subtitle("MIXED"), "Mixed");
+    }
 
     #[test]
     fn shadow_canvas_matches_python_layout() {
@@ -888,5 +951,26 @@ mod tests {
         let shadowed = add_shadow(&image, 15, 15, 15.0);
 
         assert_eq!((shadowed.width(), shadowed.height()), (455, 655));
+    }
+
+    #[test]
+    fn cover_column_rotation_matches_pillow_expand_and_direction() {
+        let mut column = RgbaImage::new(455, 2021);
+        for y in 0..20 {
+            for x in 218..238 {
+                column.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+
+        let rotated = rotate_cover_column(&column);
+
+        assert_eq!((rotated.width(), rotated.height()), (995, 2069));
+        let visible_x = rotated
+            .enumerate_pixels()
+            .filter(|(_, _, pixel)| pixel[3] > 0)
+            .map(|(x, _, _)| u64::from(x))
+            .collect::<Vec<_>>();
+        assert!(!visible_x.is_empty());
+        assert!(visible_x.iter().sum::<u64>() / visible_x.len() as u64 > 497);
     }
 }
