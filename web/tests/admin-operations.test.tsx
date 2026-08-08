@@ -130,6 +130,78 @@ describe("AdminOperationsPage", () => {
     });
   });
 
+  it("runs a registered task immediately with its task-specific worker", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    const startScan = vi.spyOn(api, "startAdminScan").mockResolvedValue({
+      job: {
+        id: "scan-job-1",
+        libraryId: "library-1",
+        jobType: "RECONCILE_LIBRARY",
+        status: "PENDING",
+      },
+    });
+    const startMetadataRefresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
+      totalCount: 2,
+      mode: "FILL_MISSING",
+      job: {
+        id: "metadata-job-1",
+        status: "QUEUED",
+        mode: "FILL_MISSING",
+        processedCount: 0,
+        totalCount: 2,
+        createdAt: 1_700_000_000,
+      },
+    });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({
+      scheduledTasks: [
+        {
+          id: "LIBRARY:library-1:RECONCILIATION_SCAN",
+          ownerType: "LIBRARY",
+          ownerId: "library-1",
+          ownerName: "电影库",
+          taskType: "RECONCILIATION_SCAN",
+          name: "全量校验媒体库",
+          description: "按计划校验媒体库索引与文件系统的一致性。",
+          sourceType: "SYSTEM",
+          schedule: null,
+          isEnabled: false,
+        },
+        {
+          id: "LIBRARY:library-1:METADATA_PARSE",
+          ownerType: "LIBRARY",
+          ownerId: "library-1",
+          ownerName: "电影库",
+          taskType: "METADATA_PARSE",
+          name: "元数据刮削",
+          description: "解析本地元数据，并在已配置时调用刮削插件补全内容。",
+          sourceType: "SYSTEM",
+          schedule: null,
+          isEnabled: false,
+        },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 100,
+    });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("元数据刮削"));
+    });
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行全量校验媒体库"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(startScan).toHaveBeenCalledWith("library-1"));
+    });
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行元数据刮削"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(startMetadataRefresh).toHaveBeenCalledWith("library-1", "FILL_MISSING"));
+    });
+  });
+
   function renderPage() {
     container = document.createElement("div");
     document.body.append(container);

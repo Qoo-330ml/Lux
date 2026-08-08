@@ -771,7 +771,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-registered-task-meta span + span::before { margin-right: 7px; color: var(--lux-line); content: "·"; }
 .lux-registered-task-meta code { color: var(--lux-subtle); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .62rem; }
 .lux-registered-task-schedule { display: block; margin-top: 10px; color: var(--lux-subtle); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .66rem; }
+.lux-registered-task-actions { display: flex; align-items: flex-start; gap: 7px; }
+.lux-registered-task-run { min-height: 32px; padding: 0 11px; font-size: .68rem; white-space: nowrap; }
 .lux-registered-task-edit { margin-top: 3px; }
+.lux-registered-task-error { grid-column: 2 / -1; margin: 0; }
 .lux-registered-task-editor { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; align-items: end; gap: 10px 13px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--lux-line-soft); }
 .lux-registered-task-editor label:not(.lux-admin-toggle) { display: grid; gap: 7px; color: var(--lux-muted); font-size: .7rem; }
 .lux-registered-task-editor input:not([type="checkbox"]) { min-height: 40px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
@@ -967,6 +970,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-operations-source-note { padding-top: 0; }
   .lux-registered-task-editor { grid-template-columns: 1fr; align-items: stretch; }
   .lux-registered-task-editor-actions { justify-content: flex-end; }
+  .lux-registered-task-actions { flex-wrap: wrap; justify-content: flex-end; }
   .lux-operations-log-row { grid-template-columns: 45px minmax(0, 1fr) auto; }
   .lux-operations-log-row time { grid-column: 2; grid-row: 2; padding-top: 0; }
   .lux-operations-log-row > .lux-icon-button { grid-column: 3; grid-row: 1 / span 2; }

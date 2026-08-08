@@ -6,6 +6,7 @@ import {
   FileClock,
   Inbox,
   Pencil,
+  Play,
   RefreshCw,
   RotateCcw,
   Save,
@@ -250,9 +251,19 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
       onSaved();
     },
   });
+  const runNow = useMutation({
+    mutationFn: () => runRegisteredTask(task),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLogs });
+      onSaved();
+    },
+  });
   const name = task.name || taskLabel(task.taskType);
   const configured = Boolean(task.schedule);
   const stateLabel = task.isEnabled && configured ? "已启用" : configured ? "已停用" : "未配置计划";
+  const canRunNow = isRunnableTask(task);
 
   const beginEditing = () => {
     setSchedule(task.schedule ?? "");
@@ -273,7 +284,11 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
         <div className="lux-registered-task-meta"><span>{task.ownerName || (task.ownerType === "GLOBAL" ? "全局" : "指定媒体库")}</span><span>{task.sourceType === "PLUGIN" ? `插件注册${task.pluginId ? ` · ${task.pluginId}` : ""}` : "系统注册"}</span><code>{task.taskType}</code></div>
         {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><label htmlFor={`schedule-${task.id ?? task.taskType}`}>执行计划<input id={`schedule-${task.id ?? task.taskType}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 interval:1h" maxLength={128} /></label><label className="lux-admin-toggle" htmlFor={`enabled-${task.id ?? task.taskType}`}><input id={`enabled-${task.id ?? task.taskType}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此任务</span></label><div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></button></div>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.schedule || "尚未配置执行计划"}</span>}
       </div>
-      {!editing ? <button className="lux-icon-button lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing}><Pencil size={15} /></button> : null}
+      {!editing ? <div className="lux-registered-task-actions">
+        {canRunNow ? <button className="lux-button lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button> : null}
+        <button className="lux-icon-button lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing}><Pencil size={15} /></button>
+      </div> : null}
+      {runNow.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{runNow.error.message}</p> : null}
     </article>
   );
 }
@@ -338,6 +353,22 @@ function jobTypeForMetadataJob(job: AdminMetadataReidentifyJob) {
 
 function taskLabel(taskType: string) {
   return JOB_TYPE_LABELS[taskType] || "后台任务";
+}
+
+function isRunnableTask(task: AdminScheduledTask) {
+  return task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE"].includes(task.taskType);
+}
+
+async function runRegisteredTask(task: AdminScheduledTask) {
+  if (task.taskType === "RECONCILIATION_SCAN") {
+    await api.startAdminScan(task.ownerId);
+    return;
+  }
+  if (task.taskType === "METADATA_PARSE") {
+    await api.startLibraryMetadataRefresh(task.ownerId, "FILL_MISSING");
+    return;
+  }
+  return Promise.reject(new Error("该任务暂不支持立即执行"));
 }
 
 function formatJobType(jobType: string) {
