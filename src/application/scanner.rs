@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fmt,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::UNIX_EPOCH,
 };
 
@@ -9,7 +10,10 @@ use quick_xml::{events::Event, reader::Reader};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use tokio::fs;
+use tokio::{
+    fs,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -876,6 +880,7 @@ pub struct ScanJobService {
     scanner: LibraryScanner,
     database: Database,
     admin_events: AdminEventHub,
+    scan_lock: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -891,7 +896,13 @@ impl ScanJobService {
             scanner: LibraryScanner::new(database.clone()),
             database,
             admin_events: AdminEventHub::new(),
+            scan_lock: Arc::new(Semaphore::new(1)),
         }
+    }
+
+    pub fn with_scan_lock(mut self, scan_lock: Arc<Semaphore>) -> Self {
+        self.scan_lock = scan_lock;
+        self
     }
 
     pub fn with_admin_events(mut self, admin_events: AdminEventHub) -> Self {
@@ -1001,6 +1012,15 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
+        let _scan_permit = self.acquire_scan_lock().await?;
+        self.run_batch_unlocked(job_id, batch_size).await
+    }
+
+    async fn run_batch_unlocked(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+    ) -> Result<ScanBatchReport, ScanJobError> {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Err(ScanJobError::JobNotFound);
         };
@@ -1583,8 +1603,12 @@ impl ScanJobService {
         metadata: Option<MetadataReidentifyService>,
         thumbnails: Option<ThumbnailService>,
     ) -> Result<(), ScanJobError> {
+        if batch_size == 0 {
+            return Err(ScanJobError::InvalidBatchSize);
+        }
+        let _scan_permit = self.acquire_scan_lock().await?;
         loop {
-            let report = self.run_batch(job_id, batch_size).await?;
+            let report = self.run_batch_unlocked(job_id, batch_size).await?;
             if !report.completed {
                 continue;
             }
@@ -1607,6 +1631,13 @@ impl ScanJobService {
             }
             return Ok(());
         }
+    }
+
+    async fn acquire_scan_lock(&self) -> Result<OwnedSemaphorePermit, ScanJobError> {
+        Arc::clone(&self.scan_lock)
+            .acquire_owned()
+            .await
+            .map_err(|_| ScanJobError::ScanLockClosed)
     }
 
     async fn run_thumbnails_after_scan(
@@ -1946,6 +1977,7 @@ pub enum ScanJobError {
     NoChanges,
     AlreadyActive(String),
     InvalidBatchSize,
+    ScanLockClosed,
     Scanner(ScannerError),
     Storage(StorageError),
 }
@@ -1958,6 +1990,7 @@ impl std::fmt::Display for ScanJobError {
             Self::NoChanges => formatter.write_str("incremental scan has no valid changes"),
             Self::AlreadyActive(id) => write!(formatter, "scan job already active: {id}"),
             Self::InvalidBatchSize => formatter.write_str("scan batch size must be positive"),
+            Self::ScanLockClosed => formatter.write_str("scan lock is closed"),
             Self::Scanner(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }

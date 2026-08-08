@@ -334,7 +334,10 @@ impl AppState {
         let Some(database) = self.database.clone() else {
             return;
         };
-        LibraryWatchService::new(database).spawn();
+        let Some(scan_jobs) = self.scan_jobs.clone() else {
+            return;
+        };
+        LibraryWatchService::with_scan_jobs(database, scan_jobs).spawn();
     }
 
     pub async fn resume_strm_probe_jobs(&self) {

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use luxd::{
     application::{
@@ -11,6 +11,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
+use tokio::sync::Semaphore;
 
 #[tokio::test]
 async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn std::error::Error>> {
@@ -545,6 +546,99 @@ async fn scan_job_marks_inaccessible_root_unavailable_and_recovers_after_restore
             .fetch_one(database.pool())
             .await?;
     assert_eq!(recovered_available, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let first_library = libraries
+        .create_library("First Movies", LibraryKind::Movie, false)
+        .await?;
+    let second_library = libraries
+        .create_library("Second Movies", LibraryKind::Movie, false)
+        .await?;
+    let first_root = temp_dir.path().join("first");
+    let second_root = temp_dir.path().join("second");
+    tokio::fs::create_dir_all(&first_root).await?;
+    tokio::fs::create_dir_all(&second_root).await?;
+    for index in 0..128 {
+        tokio::fs::write(
+            first_root.join(format!("First.Movie.{}.mkv", 2000 + index)),
+            b"fixture",
+        )
+        .await?;
+    }
+    tokio::fs::write(second_root.join("Second.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(
+            first_library.id,
+            first_root.to_str().ok_or("non-utf8 first root")?,
+        )
+        .await?;
+    libraries
+        .add_root(
+            second_library.id,
+            second_root.to_str().ok_or("non-utf8 second root")?,
+        )
+        .await?;
+
+    let scan_lock = Arc::new(Semaphore::new(1));
+    let held_permit = scan_lock.clone().acquire_owned().await?;
+    let first_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
+    let second_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
+    let first_job = first_jobs.create_movie_scan_job(first_library.id).await?;
+    let second_job = second_jobs.create_movie_scan_job(second_library.id).await?;
+    let first_job_id = first_job.id.clone();
+    let second_job_id = second_job.id.clone();
+
+    let first_worker =
+        tokio::spawn(async move { first_jobs.run_to_completion(&first_job_id, 50, None).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second_worker = tokio::spawn(async move {
+        second_jobs
+            .run_to_completion(&second_job_id, 50, None)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let first_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&first_job.id)
+        .fetch_one(database.pool())
+        .await?;
+    let second_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&second_job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(first_status, "PENDING");
+    assert_eq!(second_status, "PENDING");
+
+    drop(held_permit);
+    first_worker.await??;
+    second_worker.await??;
+
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT job_id, event_code
+         FROM scan_job_events
+         WHERE job_id IN (?, ?)
+           AND event_code IN ('JOB_STARTED', 'JOB_COMPLETED')
+         ORDER BY created_at, id",
+    )
+    .bind(&first_job.id)
+    .bind(&second_job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[1].0, events[0].0);
+    assert_eq!(events[1].1, "JOB_COMPLETED");
+    assert_ne!(events[2].0, events[0].0);
+    assert_eq!(events[2].1, "JOB_STARTED");
     Ok(())
 }
 

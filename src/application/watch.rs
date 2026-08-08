@@ -126,8 +126,13 @@ pub struct LibraryWatchService {
 
 impl LibraryWatchService {
     pub fn new(database: Database) -> Self {
+        let scan_jobs = ScanJobService::new(database.clone());
+        Self::with_scan_jobs(database, scan_jobs)
+    }
+
+    pub fn with_scan_jobs(database: Database, scan_jobs: ScanJobService) -> Self {
         Self {
-            scan_jobs: ScanJobService::new(database.clone()),
+            scan_jobs,
             database,
         }
     }
