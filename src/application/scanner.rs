@@ -280,15 +280,49 @@ impl LibraryScanner {
         let (device, inode) = file_identity(&metadata);
         let fingerprint =
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let existing_entry = self
+            .database
+            .find_filesystem_entry(&root.id, &relative_path)
+            .await?;
+        let fingerprint_unchanged = existing_entry
+            .as_ref()
+            .is_some_and(|entry| entry.fingerprint.as_deref() == Some(fingerprint.as_slice()));
+        let episode_is_current = if fingerprint_unchanged {
+            let hierarchy = episode_hierarchy(&relative_path, &parsed);
+            let identity = Self::episode_identity_key(root, &hierarchy, &parsed);
+            self.database
+                .find_media_item_by_identity(&identity)
+                .await?
+                .is_some_and(|item| {
+                    existing_entry
+                        .as_ref()
+                        .and_then(|entry| entry.item_id.as_deref())
+                        == Some(item.id.as_str())
+                })
+        } else {
+            false
+        };
+        if episode_is_current && let Some(existing_entry) = existing_entry.as_ref() {
+            if is_strm {
+                self.database
+                    .update_media_source_external_url(&existing_entry.id, external_url.as_deref())
+                    .await?;
+            }
+            self.database
+                .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                .await?;
+            return Ok(ScanReport {
+                discovered_files: 1,
+                skipped_files: 1,
+                ..ScanReport::default()
+            });
+        }
+
         let hierarchy = episode_hierarchy(&relative_path, &parsed);
         let ensured = self
             .ensure_episode_hierarchy(library_id_text, root, &parsed, &hierarchy)
             .await?;
-        if let Some(existing_entry) = self
-            .database
-            .find_filesystem_entry(&root.id, &relative_path)
-            .await?
-        {
+        if let Some(existing_entry) = existing_entry {
             let hierarchy_changed = self
                 .database
                 .reassign_media_source_item(&existing_entry.id, &ensured.episode_id)
@@ -300,7 +334,7 @@ impl LibraryScanner {
                     parsed.quality_label.as_deref(),
                 )
                 .await?;
-            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+            if fingerprint_unchanged {
                 if is_strm {
                     self.database
                         .update_media_source_external_url(
@@ -566,6 +600,22 @@ impl LibraryScanner {
         Ok((id, true))
     }
 
+    fn episode_identity_key(
+        root: &StoredLibraryRoot,
+        hierarchy: &EpisodeHierarchy,
+        parsed: &ParsedEpisodeFilename,
+    ) -> String {
+        let edition_key = parsed
+            .edition_name
+            .as_deref()
+            .unwrap_or("standard")
+            .to_ascii_lowercase();
+        format!(
+            "episode:{}:{}:season:{}:episode:{}:edition:{}",
+            root.id, hierarchy.series_path, hierarchy.season_number, parsed.episode, edition_key
+        )
+    }
+
     async fn ensure_episode_hierarchy(
         &self,
         library_id_text: &str,
@@ -620,15 +670,7 @@ impl LibraryScanner {
                 identity_key: &season_identity,
             })
             .await?;
-        let edition_key = parsed
-            .edition_name
-            .as_deref()
-            .unwrap_or("standard")
-            .to_ascii_lowercase();
-        let episode_identity = format!(
-            "episode:{}:{}:season:{}:episode:{}:edition:{}",
-            root.id, hierarchy.series_path, hierarchy.season_number, parsed.episode, edition_key
-        );
+        let episode_identity = Self::episode_identity_key(root, hierarchy, parsed);
         let episode_title = parsed.title.clone();
         let episode_sort_title = episode_title.to_lowercase();
         let episode_new_id = ItemId::new().to_string();

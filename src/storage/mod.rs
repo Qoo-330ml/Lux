@@ -3568,9 +3568,10 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         sqlx::query(
-            "SELECT id, fingerprint
-             FROM filesystem_entries
-             WHERE library_root_id = ? AND relative_path = ?",
+            "SELECT fe.id, fe.fingerprint, ms.item_id
+             FROM filesystem_entries fe
+             LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+             WHERE fe.library_root_id = ? AND fe.relative_path = ?",
         )
         .bind(library_root_id)
         .bind(relative_path)
@@ -7632,12 +7633,14 @@ fn stored_library_root(row: sqlx::sqlite::SqliteRow) -> StoredLibraryRoot {
 pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
+    pub(crate) item_id: Option<String>,
 }
 
 fn stored_filesystem_entry(row: sqlx::sqlite::SqliteRow) -> StoredFilesystemEntry {
     StoredFilesystemEntry {
         id: row.get("id"),
         fingerprint: row.get("fingerprint"),
+        item_id: row.get("item_id"),
     }
 }
 
