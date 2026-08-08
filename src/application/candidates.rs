@@ -11,7 +11,7 @@ use crate::{
     application::{
         images::{ImageWriteError, ImageWriteService},
         media_matching::{MediaKind, parse_media_name, title_candidates},
-        metadata::{MetadataCandidate, MetadataSource, MetadataState, NfoMetadata},
+        metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
         nfo::{NfoWriteError, NfoWriteService},
         people::{ActorCredit, PeopleError},
         scraper::{
@@ -761,6 +761,34 @@ impl MetadataSelectionService {
         }
     }
 
+    pub(crate) async fn is_fill_missing_complete(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, MetadataSelectionError> {
+        let current = self
+            .database
+            .find_media_item_metadata(item_id)
+            .await?
+            .ok_or(MetadataSelectionError::ItemNotFound)?;
+        let Some(fields) = fill_missing_fields(&current.item_type) else {
+            return Ok(false);
+        };
+        let state = metadata_state(&current);
+        if !state.has_complete_fill_values(fields)
+            || !fill_missing_scalar_values_complete(&current)
+            || !has_selected_provider_id(&current)
+        {
+            return Ok(false);
+        }
+        let image_policy = self.image_selection_policy(item_id).await?;
+        for image_type in image_policy.enabled_types() {
+            if !self.images.has_local_image(item_id, image_type).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn select(
         &self,
         item_id: &str,
@@ -784,18 +812,7 @@ impl MetadataSelectionService {
         }
         let payload = candidate_payload(&candidate)?;
         let image_policy = self.image_selection_policy(item_id).await?;
-        let mut state = MetadataState::from_persisted(
-            NfoMetadata {
-                title: Some(current.title.clone()),
-                original_title: current.original_title.clone(),
-                overview: current.overview.clone(),
-                production_year: current
-                    .production_year
-                    .and_then(|year| i32::try_from(year).ok()),
-            },
-            current.provenance_json.as_deref(),
-            current.locked_fields_json.as_deref(),
-        );
+        let mut state = metadata_state(&current);
         let metadata_candidate = MetadataCandidate {
             source: MetadataSource::ScraperLocalized,
             metadata: payload.metadata,
@@ -925,6 +942,78 @@ impl MetadataSelectionService {
             global.as_deref(),
         ))
     }
+}
+
+const MOVIE_FILL_MISSING_FIELDS: &[MetadataField] = &[
+    MetadataField::Title,
+    MetadataField::OriginalTitle,
+    MetadataField::Overview,
+    MetadataField::ProductionYear,
+];
+const SERIES_FILL_MISSING_FIELDS: &[MetadataField] = MOVIE_FILL_MISSING_FIELDS;
+const CHILD_FILL_MISSING_FIELDS: &[MetadataField] =
+    &[MetadataField::Title, MetadataField::Overview];
+
+fn fill_missing_fields(item_type: &str) -> Option<&'static [MetadataField]> {
+    match item_type {
+        "MOVIE" => Some(MOVIE_FILL_MISSING_FIELDS),
+        "SERIES" => Some(SERIES_FILL_MISSING_FIELDS),
+        "SEASON" | "EPISODE" => Some(CHILD_FILL_MISSING_FIELDS),
+        _ => None,
+    }
+}
+
+fn metadata_state(current: &StoredMediaMetadata) -> MetadataState {
+    MetadataState::from_persisted(
+        NfoMetadata {
+            title: Some(current.title.clone()),
+            original_title: current.original_title.clone(),
+            overview: current.overview.clone(),
+            production_year: current
+                .production_year
+                .and_then(|year| i32::try_from(year).ok()),
+        },
+        current.provenance_json.as_deref(),
+        current.locked_fields_json.as_deref(),
+    )
+}
+
+fn fill_missing_scalar_values_complete(current: &StoredMediaMetadata) -> bool {
+    let has_text = |value: Option<&String>| value.is_some_and(|value| !value.trim().is_empty());
+    match current.item_type.as_str() {
+        "MOVIE" => {
+            has_text(current.premiere_date.as_ref())
+                && has_text(current.original_language.as_ref())
+                && current.rating.is_some()
+        }
+        "SERIES" => {
+            has_text(current.premiere_date.as_ref())
+                && has_text(current.last_air_date.as_ref())
+                && has_text(current.status.as_ref())
+                && has_text(current.original_language.as_ref())
+                && current.rating.is_some()
+        }
+        "SEASON" | "EPISODE" => has_text(current.premiere_date.as_ref()),
+        _ => false,
+    }
+}
+
+fn has_selected_provider_id(current: &StoredMediaMetadata) -> bool {
+    let Some(scraper) = current.scraper_id.as_deref() else {
+        return true;
+    };
+    let Some(raw) = current.provider_ids_json.as_deref() else {
+        return false;
+    };
+    let Ok(Value::Object(provider_ids)) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    let short_scraper = scraper.rsplit(['.', ':', '/']).next().unwrap_or(scraper);
+    provider_ids.iter().any(|(provider, id)| {
+        id.as_str().is_some_and(|value| !value.trim().is_empty())
+            && (provider.eq_ignore_ascii_case(scraper)
+                || provider.eq_ignore_ascii_case(short_scraper))
+    })
 }
 
 #[derive(Debug)]

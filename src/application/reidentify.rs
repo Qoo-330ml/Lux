@@ -357,18 +357,36 @@ impl MetadataReidentifyService {
                 if item.title.trim().is_empty() {
                     Err(MetadataReidentifyError::InvalidSearch)
                 } else {
-                    match self
-                        .provider_for_item_with_requirement(
-                            item_id,
-                            !matches!(mode, MetadataRefreshMode::Reidentify),
-                        )
-                        .await
-                    {
-                        Ok(Some(provider)) => {
-                            self.refresh_item(item_id, &item, mode, &provider).await
+                    let skip = if matches!(mode, MetadataRefreshMode::FillMissing) {
+                        if let Some(selection) = self.selection.as_ref() {
+                            selection
+                                .is_fill_missing_complete(item_id)
+                                .await
+                                .map_err(MetadataReidentifyError::Selection)
+                        } else {
+                            Ok(false)
                         }
-                        Ok(None) => Ok(0),
-                        Err(error) => Err(MetadataReidentifyError::Scraper(error)),
+                    } else {
+                        Ok(false)
+                    };
+                    match skip {
+                        Ok(true) => Ok(0),
+                        Ok(false) => {
+                            match self
+                                .provider_for_item_with_requirement(
+                                    item_id,
+                                    !matches!(mode, MetadataRefreshMode::Reidentify),
+                                )
+                                .await
+                            {
+                                Ok(Some(provider)) => {
+                                    self.refresh_item(item_id, &item, mode, &provider).await
+                                }
+                                Ok(None) => Ok(0),
+                                Err(error) => Err(MetadataReidentifyError::Scraper(error)),
+                            }
+                        }
+                        Err(error) => Err(error),
                     }
                 }
             }

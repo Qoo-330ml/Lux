@@ -246,6 +246,16 @@ impl MetadataState {
         serde_json::to_string(&self.locked_fields).unwrap_or_else(|_| "[]".to_owned())
     }
 
+    pub fn has_complete_fill_values(&self, fields: &[MetadataField]) -> bool {
+        fields.iter().all(|field| {
+            self.has_value(*field)
+                && self
+                    .provenance
+                    .get(field)
+                    .is_some_and(|source| *source != MetadataSource::Fallback)
+        })
+    }
+
     fn has_value(&self, field: MetadataField) -> bool {
         match field {
             MetadataField::Title => self

@@ -10,7 +10,9 @@ use axum::{Json, Router, extract::State as AxumState, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
+        images::ImageWriteService,
         libraries::LibraryService,
+        metadata::MetadataEnricher,
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
         setup::SetupService,
@@ -39,6 +41,29 @@ async fn tmdb_search_stub() -> Json<Value> {
             "overview": "A local batch reidentify result.",
             "release_date": "2024-04-01",
             "original_language": "en"
+        }]
+    }))
+}
+
+#[derive(Clone)]
+struct RequestTracker {
+    requests: Arc<AtomicUsize>,
+}
+
+async fn complete_movie_tmdb_stub(AxumState(tracker): AxumState<RequestTracker>) -> Json<Value> {
+    tracker.requests.fetch_add(1, Ordering::SeqCst);
+    Json(json!({
+        "page": 1,
+        "total_pages": 1,
+        "total_results": 1,
+        "results": [{
+            "id": 999,
+            "title": "Complete Movie",
+            "original_title": "Complete Movie Original",
+            "overview": "Complete movie overview.",
+            "release_date": "2024-04-01",
+            "original_language": "en",
+            "vote_average": 8.0
         }]
     }))
 }
@@ -499,6 +524,113 @@ async fn item_metadata_refresh_includes_series_children() -> Result<(), Box<dyn 
     .fetch_all(database.pool())
     .await?;
     assert_eq!(refreshed_types, ["SERIES", "SEASON", "EPISODE", "EPISODE"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_skips_complete_movie_without_scraper_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Complete Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Complete.Movie.2024.mkv"), b"fixture").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        "<movie><title>Complete Movie</title><originaltitle>Complete Movie Original</originaltitle><year>2024</year><plot>Complete movie overview.</plot></movie>",
+    )
+    .await?;
+    for image in ["poster", "fanart", "logo", "thumb"] {
+        tokio::fs::write(movie_dir.join(format!("{image}.png")), b"fixture").await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items
+         SET premiere_date = '2024-04-01', original_language = 'en', rating = 8.0,
+             provider_ids_json = '{\"tmdb\":\"999\"}', identification_status = 'ONLINE_CONFIRMED'
+         WHERE id = ?",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+
+    let images = ImageWriteService::new(database.clone())?;
+    let selection =
+        luxd::application::candidates::MetadataSelectionService::new(database.clone(), images);
+    let tracker = RequestTracker {
+        requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(complete_movie_tmdb_stub))
+        .with_state(tracker.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata = MetadataReidentifyService::with_selection(
+        database.clone(),
+        TmdbProvider::from(tmdb),
+        Some(selection),
+    );
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.items[0].candidate_count, 0);
+    assert_eq!(tracker.requests.load(Ordering::SeqCst), 0);
+
+    tokio::fs::remove_file(movie_dir.join("poster.png")).await?;
+    let incomplete_job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    metadata.run(&incomplete_job.id).await;
+    let requests_after_incomplete = tracker.requests.load(Ordering::SeqCst);
+    assert!(requests_after_incomplete > 0);
+
+    let full_refresh_job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FullRefresh)
+        .await?;
+    metadata.run(&full_refresh_job.id).await;
+    assert!(tracker.requests.load(Ordering::SeqCst) > requests_after_incomplete);
+
+    tmdb_server.abort();
     Ok(())
 }
 

@@ -212,6 +212,28 @@ fn explicit_selection_modes_fill_or_refresh_only_unlocked_fields() {
 }
 
 #[test]
+fn fill_missing_completeness_rejects_fallback_values() {
+    let fields = [
+        MetadataField::Title,
+        MetadataField::OriginalTitle,
+        MetadataField::Overview,
+        MetadataField::ProductionYear,
+    ];
+    let mut state = MetadataState::from_metadata(NfoMetadata {
+        title: Some("标题".to_owned()),
+        original_title: Some("Original".to_owned()),
+        overview: Some("简介".to_owned()),
+        production_year: Some(2024),
+    });
+    assert!(!state.has_complete_fill_values(&fields));
+
+    for field in fields {
+        state.provenance.insert(field, MetadataSource::LocalNfo);
+    }
+    assert!(state.has_complete_fill_values(&fields));
+}
+
+#[test]
 fn fill_missing_replaces_scanner_fallback_with_online_episode_title() {
     let mut state = MetadataState::from_metadata(NfoMetadata {
         title: Some("暗夜与黎明".to_owned()),

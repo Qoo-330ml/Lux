@@ -193,6 +193,14 @@ impl ImageWriteService {
         image_file_stamp(&path).await.map(|_| true)
     }
 
+    pub(crate) async fn has_local_image(
+        &self,
+        item_id: &str,
+        image_type: &str,
+    ) -> Result<bool, ImageWriteError> {
+        self.local_image_exists(item_id, image_type).await
+    }
+
     pub async fn download_item_image(
         &self,
         item_id: &str,
