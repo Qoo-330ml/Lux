@@ -67,6 +67,18 @@ pub fn parse_media_name(input: &str, kind: MediaKind) -> Option<ParsedMediaName>
     })
 }
 
+pub fn has_multi_part_marker(input: &str) -> bool {
+    let Some(stem) = Path::new(input)
+        .file_stem()
+        .and_then(|value| value.to_str())
+    else {
+        return false;
+    };
+    normalize_separators(stem)
+        .split_whitespace()
+        .any(is_multi_part_marker)
+}
+
 pub fn clean_title(value: &str) -> String {
     let normalized = normalize_separators(value);
     let production_year = normalized.split_whitespace().find_map(parse_year);

@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     application::{
         admin_events::{AdminEventHub, AdminEventScope},
-        media_matching::{MediaKind, clean_title, parse_media_name},
+        media_matching::{MediaKind, clean_title, has_multi_part_marker, parse_media_name},
         metadata::MetadataEnricher,
         probe::MediaProbeService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
@@ -101,7 +101,12 @@ impl LibraryScanner {
             let mut pending_new_files = Vec::with_capacity(500);
             for path in files {
                 if let Some((entry_id, quick_report)) = self
-                    .scan_movie_file_if_unchanged(&root_path, &path, &existing_entries)
+                    .scan_movie_file_if_unchanged(
+                        &library_id_text,
+                        &root_path,
+                        &path,
+                        &existing_entries,
+                    )
                     .await?
                 {
                     seen_entry_ids.push(entry_id);
@@ -814,6 +819,7 @@ impl LibraryScanner {
 
     async fn scan_movie_file_if_unchanged(
         &self,
+        library_id_text: &str,
         root_path: &Path,
         path: &Path,
         existing_entries: &HashMap<String, StoredFilesystemEntry>,
@@ -852,6 +858,25 @@ impl LibraryScanner {
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
             return Ok(None);
+        }
+        if has_multi_part_marker(file_name) {
+            let Some(parsed_name) = parse_movie_filename(file_name) else {
+                return Ok(None);
+            };
+            let target_item = self
+                .database
+                .find_media_item(
+                    library_id_text,
+                    &parsed_name.sort_title,
+                    parsed_name.production_year.map(i64::from),
+                )
+                .await?;
+            if target_item
+                .as_ref()
+                .is_none_or(|item| existing_entry.item_id.as_deref() != Some(item.id.as_str()))
+            {
+                return Ok(None);
+            }
         }
         Ok(Some((
             existing_entry.id.clone(),
@@ -1000,10 +1025,12 @@ impl LibraryScanner {
             discovered_files: 1,
             ..ScanReport::default()
         };
-        if let Some(existing_entry) = self
+        let existing_entry = self
             .database
             .find_filesystem_entry(&root.id, &relative_path)
-            .await?
+            .await?;
+        if !has_multi_part_marker(file_name)
+            && let Some(existing_entry) = existing_entry.as_ref()
         {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
                 if is_strm {
@@ -1041,6 +1068,81 @@ impl LibraryScanner {
             return Ok(report);
         }
 
+        let existing_item = self
+            .database
+            .find_media_item(
+                library_id_text,
+                &parsed_name.sort_title,
+                parsed_name.production_year.map(i64::from),
+            )
+            .await?;
+        let (item_id, created_item) = if let Some(item) = existing_item {
+            (item.id, false)
+        } else {
+            let item_id = ItemId::new().to_string();
+            self.database
+                .insert_media_item(NewMediaItem {
+                    id: &item_id,
+                    library_id: library_id_text,
+                    title: &parsed_name.title,
+                    sort_title: &parsed_name.sort_title,
+                    original_title: Some(&parsed_name.title),
+                    production_year: parsed_name.production_year.map(i64::from),
+                })
+                .await?;
+            (item_id, true)
+        };
+        if let Some(existing_entry) = existing_entry {
+            let reassigned = self
+                .database
+                .reassign_media_source_item(&existing_entry.id, &item_id)
+                .await?;
+            self.database
+                .update_media_source_variant_labels(
+                    &existing_entry.id,
+                    parsed_name.edition_name.as_deref(),
+                    parsed_name.quality_label.as_deref(),
+                )
+                .await?;
+            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+                if is_strm {
+                    self.database
+                        .update_media_source_external_url(
+                            &existing_entry.id,
+                            external_url.as_deref(),
+                        )
+                        .await?;
+                }
+                self.database
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .await?;
+                report.created_items = usize::from(created_item);
+                report.changed_files = usize::from(reassigned);
+                report.skipped_files = 1;
+                return Ok(report);
+            }
+            self.database
+                .update_filesystem_entry(
+                    &existing_entry.id,
+                    size,
+                    modified_at,
+                    &fingerprint,
+                    generation,
+                )
+                .await?;
+            self.database
+                .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
+                .await?;
+            if is_strm {
+                self.database
+                    .update_media_source_external_url(&existing_entry.id, external_url.as_deref())
+                    .await?;
+            }
+            report.created_items = usize::from(created_item);
+            report.changed_files = 1;
+            return Ok(report);
+        }
+
         let entry_id = FilesystemEntryId::new().to_string();
         self.database
             .insert_filesystem_entry(NewFilesystemEntry {
@@ -1054,37 +1156,6 @@ impl LibraryScanner {
                 last_seen_generation: generation,
             })
             .await?;
-        let existing_item = self
-            .database
-            .find_media_item(
-                library_id_text,
-                &parsed_name.sort_title,
-                parsed_name.production_year.map(i64::from),
-            )
-            .await?;
-        let (item_id, created_item) = if let Some(item) = existing_item {
-            (
-                item.id
-                    .parse::<ItemId>()
-                    .map_err(|error| ScannerError::InvalidItemId(error.to_string()))?,
-                false,
-            )
-        } else {
-            let item_id = ItemId::new();
-            let item_id_text = item_id.to_string();
-            self.database
-                .insert_media_item(NewMediaItem {
-                    id: &item_id_text,
-                    library_id: library_id_text,
-                    title: &parsed_name.title,
-                    sort_title: &parsed_name.sort_title,
-                    original_title: Some(&parsed_name.title),
-                    production_year: parsed_name.production_year.map(i64::from),
-                })
-                .await?;
-            (item_id, true)
-        };
-        let item_id_text = item_id.to_string();
         let source_id = SourceId::new().to_string();
         let container = path
             .extension()
@@ -1094,7 +1165,7 @@ impl LibraryScanner {
         self.database
             .insert_media_source(NewMediaSource {
                 id: &source_id,
-                item_id: &item_id_text,
+                item_id: &item_id,
                 source_kind: if is_strm { "STRM_URL" } else { "LOCAL_FILE" },
                 filesystem_entry_id: &entry_id,
                 edition_name: parsed_name.edition_name.as_deref(),
