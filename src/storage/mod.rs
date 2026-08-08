@@ -8029,6 +8029,7 @@ const CATALOG_VISIBLE_PREDICATE: &str = " AND (
         JOIN filesystem_entries child_entry
           ON child_entry.id = child_source.filesystem_entry_id
         WHERE visible_child.removed_at IS NULL
+          AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET', 'FOLDER')
           AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
           AND child_entry.is_missing = 0
     )

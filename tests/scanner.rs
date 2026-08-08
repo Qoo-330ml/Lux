@@ -342,7 +342,7 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 42);
+    assert_eq!(database.schema_version().await?, 44);
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master
          WHERE type = 'table' AND name IN ('filesystem_entries', 'media_items', 'media_sources', 'media_streams')
@@ -357,6 +357,23 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
             "media_items",
             "media_sources",
             "media_streams"
+        ]
+    );
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'index' AND name IN (
+             'idx_media_items_parent_removed',
+             'idx_media_items_series_removed'
+         )
+         ORDER BY name",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        indexes,
+        [
+            "idx_media_items_parent_removed",
+            "idx_media_items_series_removed"
         ]
     );
     Ok(())
