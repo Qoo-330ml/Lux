@@ -2,12 +2,15 @@ use std::{sync::Arc, time::Duration};
 
 use luxd::{
     application::{
+        access::{AccessPrincipal, MediaAccessService},
+        catalog::{CatalogFilter, CatalogService},
         libraries::LibraryService,
         probe::{FfprobeRunner, MediaProbeService},
         scanner::{IncrementalScanChange, ScanJobError, ScanJobService},
         watch::ChangeKind,
     },
     config::Config,
+    domain::ids::UserId,
     library::LibraryKind,
     storage::Database,
 };
@@ -209,6 +212,85 @@ async fn reconciliation_job_discovers_once_and_processes_a_persisted_snapshot()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(remaining_work, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_hides_items_after_their_last_file_is_deleted()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let deleted_path = root.join("Deleted.Movie.2020.mkv");
+    tokio::fs::write(&deleted_path, b"fixture").await?;
+    tokio::fs::write(root.join("Kept.Movie.2021.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    tokio::fs::remove_file(&deleted_path).await?;
+    tokio::fs::write(root.join("Added.Movie.2022.mkv"), b"fixture").await?;
+    let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&reconciliation.id, 100, None)
+        .await?;
+
+    let deleted_is_missing: i64 = sqlx::query_scalar(
+        "SELECT is_missing FROM filesystem_entries WHERE relative_path = 'Deleted.Movie.2020.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(deleted_is_missing, 1);
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let principal = AccessPrincipal::new(UserId::new(), true);
+    let page = catalog
+        .list_library_items_filtered(
+            principal,
+            &library.id.to_string(),
+            &CatalogFilter::default(),
+            0,
+            100,
+        )
+        .await?;
+    let titles = page
+        .items
+        .iter()
+        .map(|item| item.title.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(page.total, 2);
+    assert_eq!(titles, vec!["Added Movie", "Kept Movie"]);
+
+    let unfiltered_page = catalog
+        .list_library_items(principal, &library.id.to_string(), 0, 100)
+        .await?;
+    assert_eq!(unfiltered_page.total, 2);
+    let deleted_item_id: String = sqlx::query_scalar(
+        "SELECT ms.item_id
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Deleted.Movie.2020.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        catalog
+            .find_item(principal, &deleted_item_id)
+            .await?
+            .is_none()
+    );
     Ok(())
 }
 
