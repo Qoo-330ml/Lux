@@ -32,8 +32,8 @@ docker compose up -d
 镜像名为 `docker.io/<DOCKERHUB_USERNAME>/lux`。例如发布版本：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 ## 常用命令
