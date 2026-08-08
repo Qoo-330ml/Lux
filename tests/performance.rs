@@ -92,7 +92,43 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     });
     tokio::task::yield_now().await;
     let scan_running_before_api = !unchanged_handle.is_finished();
-    let foreground_ms = measure_foreground_requests(&client, &base_url, &cookies).await?;
+    let foreground_ms = measure_get_requests(
+        &client,
+        &format!("{base_url}/api/v1/admin/libraries"),
+        &cookies,
+        "foreground",
+    )
+    .await?;
+    let catalog_list_ms = measure_get_requests(
+        &client,
+        &format!(
+            "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
+            library.id
+        ),
+        &cookies,
+        "catalog list",
+    )
+    .await?;
+    let catalog_search_single_started = Instant::now();
+    let catalog_search_single_response = client
+        .get(format!(
+            "{base_url}/api/v1/search?q=Fixture&page=1&pageSize=50"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(
+        catalog_search_single_response.status(),
+        reqwest::StatusCode::OK
+    );
+    let catalog_search_single_ms = catalog_search_single_started.elapsed().as_millis();
+    let catalog_search_ms = measure_get_requests(
+        &client,
+        &format!("{base_url}/api/v1/search?q=Fixture&page=1&pageSize=50"),
+        &cookies,
+        "catalog search",
+    )
+    .await?;
     let (unchanged, unchanged_ms) = unchanged_handle.await??;
     assert_eq!(unchanged.discovered_files, file_count);
     assert_eq!(unchanged.created_items, 0);
@@ -145,6 +181,11 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
             "foregroundDuringScan": scan_running_before_api,
             "foregroundP50Ms": percentile(&foreground_ms, 50),
             "foregroundP95Ms": percentile(&foreground_ms, 95),
+            "catalogListP50Ms": percentile(&catalog_list_ms, 50),
+            "catalogListP95Ms": percentile(&catalog_list_ms, 95),
+            "catalogSearchSingleMs": catalog_search_single_ms,
+            "catalogSearchP50Ms": percentile(&catalog_search_ms, 50),
+            "catalogSearchP95Ms": percentile(&catalog_search_ms, 95),
             "foregroundErrors": 0,
             "nonPendingProbeCount": non_pending_probe_count,
             "metadataFingerprintCount": metadata_fingerprint_count,
@@ -156,16 +197,18 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-async fn measure_foreground_requests(
+async fn measure_get_requests(
     client: &reqwest::Client,
-    base_url: &str,
+    url: &str,
     cookies: &str,
+    label: &str,
 ) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
     let mut requests = Vec::with_capacity(FOREGROUND_REQUESTS);
     for _ in 0..FOREGROUND_REQUESTS {
         let client = client.clone();
-        let url = format!("{base_url}/api/v1/admin/libraries");
+        let url = url.to_owned();
         let cookies = cookies.to_owned();
+        let label = label.to_owned();
         requests.push(tokio::spawn(async move {
             let started = Instant::now();
             let response = client
@@ -177,7 +220,7 @@ async fn measure_foreground_requests(
             let status = response.status();
             let _ = response.bytes().await.map_err(|error| error.to_string())?;
             if status != reqwest::StatusCode::OK {
-                return Err(format!("foreground request returned {status}"));
+                return Err(format!("{label} request returned {status}"));
             }
             Ok::<u128, String>(started.elapsed().as_millis())
         }));

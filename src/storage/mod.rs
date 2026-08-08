@@ -4910,6 +4910,27 @@ impl Database {
              WHERE media_search MATCH ? AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
         );
+        // Complete-token searches are served by FTS alone. The LIKE branch remains
+        // available for partial searches, but is avoided when FTS already has a page.
+        let fts_page_query = format!(
+            "SELECT matches.id, COUNT(*) OVER() AS total FROM ({fts_query}) matches
+             JOIN media_items mi ON mi.id = matches.id
+             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+        );
+        let fts_page = self
+            .fetch_catalog_search_page(
+                &fts_page_query,
+                Some(query),
+                None,
+                library_ids,
+                offset,
+                limit,
+            )
+            .await?;
+        if !fts_page.0.is_empty() {
+            return Ok(fts_page);
+        }
+
         let like_query_sql = format!(
             "SELECT mi.id FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -4919,52 +4940,68 @@ impl Database {
                AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
         );
-        let union_query = format!("{fts_query} UNION {like_query_sql}");
-        let count_query = format!("SELECT COUNT(*) FROM ({union_query}) matches");
-        let mut count_statement =
-            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_query)).bind(query);
-        if let Some(library_ids) = library_ids {
-            for library_id in library_ids {
-                count_statement = count_statement.bind(library_id);
-            }
-        }
-        count_statement = count_statement
-            .bind(like_query)
-            .bind(like_query)
-            .bind(like_query);
-        if let Some(library_ids) = library_ids {
-            for library_id in library_ids {
-                count_statement = count_statement.bind(library_id);
-            }
-        }
-        let total = count_statement
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let list_query = format!(
-            "SELECT matches.id FROM ({union_query}) matches
+        let like_page_query = format!(
+            "SELECT matches.id, COUNT(*) OVER() AS total FROM ({like_query_sql}) matches
              JOIN media_items mi ON mi.id = matches.id
              ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
         );
-        let mut list_statement = sqlx::query(sqlx::AssertSqlSafe(list_query)).bind(query);
-        if let Some(library_ids) = library_ids {
-            for library_id in library_ids {
-                list_statement = list_statement.bind(library_id);
+        if offset == 0 {
+            return self
+                .fetch_catalog_search_page(
+                    &like_page_query,
+                    None,
+                    Some(like_query),
+                    library_ids,
+                    offset,
+                    limit,
+                )
+                .await;
+        }
+
+        let union_query = format!("{fts_query} UNION {like_query_sql}");
+        let union_page_query = format!(
+            "SELECT matches.id, COUNT(*) OVER() AS total FROM ({union_query}) matches
+             JOIN media_items mi ON mi.id = matches.id
+             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+        );
+        self.fetch_catalog_search_page(
+            &union_page_query,
+            Some(query),
+            Some(like_query),
+            library_ids,
+            offset,
+            limit,
+        )
+        .await
+    }
+
+    async fn fetch_catalog_search_page(
+        &self,
+        query: &str,
+        fts_query: Option<&str>,
+        like_query: Option<&str>,
+        library_ids: Option<&[String]>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<String>, i64), StorageError> {
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+        if let Some(fts_query) = fts_query {
+            statement = statement.bind(fts_query);
+            if let Some(library_ids) = library_ids {
+                for library_id in library_ids {
+                    statement = statement.bind(library_id);
+                }
             }
         }
-        list_statement = list_statement
-            .bind(like_query)
-            .bind(like_query)
-            .bind(like_query);
-        if let Some(library_ids) = library_ids {
-            for library_id in library_ids {
-                list_statement = list_statement.bind(library_id);
+        if let Some(like_query) = like_query {
+            statement = statement.bind(like_query).bind(like_query).bind(like_query);
+            if let Some(library_ids) = library_ids {
+                for library_id in library_ids {
+                    statement = statement.bind(library_id);
+                }
             }
         }
-        let rows = list_statement
+        let rows = statement
             .bind(limit)
             .bind(offset)
             .fetch_all(&self.pool)
@@ -4973,6 +5010,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let total = rows.first().map(|row| row.get("total")).unwrap_or(0);
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
 
@@ -5803,49 +5841,134 @@ impl Database {
             .await
     }
 
+    pub(crate) async fn list_catalog_rows_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        let mut rows = Vec::new();
+        for item_ids in item_ids.chunks(500) {
+            if item_ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                        mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                        mi.title, mi.sort_title, mi.original_title, mi.overview,
+                        mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                         ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                         ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
+                         ORDER BY image_index LIMIT 1) AS thumb_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                         ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                        ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                        ms.edition_name, ms.quality_label,
+                        ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                        mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                        mt.codec, mt.language, mt.title AS stream_title,
+                        mt.details_json AS stream_details_json,
+                        mt.is_external AS stream_is_external,
+                        mt.is_default AS stream_is_default,
+                        mt.is_forced AS stream_is_forced
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN media_sources ms
+                   ON ms.item_id = mi.id
+                  AND EXISTS (
+                      SELECT 1 FROM filesystem_entries fe
+                      WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                  )
+                 LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+                 WHERE mi.id IN ({placeholders})
+                   AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                 ORDER BY mi.sort_title, mi.id, ms.id, mt.stream_index"
+            );
+            let binds = item_ids
+                .iter()
+                .map(|item_id| CatalogBind::Text(item_id))
+                .collect::<Vec<_>>();
+            rows.extend(self.fetch_catalog_rows(&query, &binds).await?);
+        }
+        Ok(rows)
+    }
+
     pub(crate) async fn find_catalog_detail(
         &self,
         item_id: &str,
     ) -> Result<Option<StoredCatalogDetail>, StorageError> {
-        sqlx::query(
-            "SELECT mi.premiere_date, mi.last_air_date, mi.status, mi.original_language,
-                    mi.provider_ids_json,
-                    (SELECT COUNT(*) FROM media_items child
-                     WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
-                       AND child.removed_at IS NULL) AS season_count,
-                    (SELECT COUNT(DISTINCT CASE
-                                WHEN mi.item_type = 'SERIES' THEN
-                                    COALESCE(CAST(child.season_number AS TEXT), '') || ':' ||
-                                    COALESCE(CAST(child.episode_number AS TEXT), child.id)
-                                ELSE COALESCE(CAST(child.episode_number AS TEXT), child.id)
-                            END)
-                     FROM media_items child
-                     WHERE child.item_type = 'EPISODE'
-                       AND child.removed_at IS NULL
-                       AND ((mi.item_type = 'SERIES' AND child.series_id = mi.id)
-                         OR (mi.item_type = 'SEASON' AND child.parent_id = mi.id))) AS episode_count
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.id = ? AND mi.removed_at IS NULL",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| {
-            row.map(|row| StoredCatalogDetail {
-                premiere_date: row.get("premiere_date"),
-                last_air_date: row.get("last_air_date"),
-                status: row.get("status"),
-                original_language: row.get("original_language"),
-                provider_ids_json: row.get("provider_ids_json"),
-                season_count: row.get("season_count"),
-                episode_count: row.get("episode_count"),
-            })
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        Ok(self
+            .list_catalog_details_by_ids(&[item_id.to_owned()])
+            .await?
+            .remove(item_id))
+    }
+
+    pub(crate) async fn list_catalog_details_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, StoredCatalogDetail>, StorageError> {
+        let mut details = HashMap::with_capacity(item_ids.len());
+        for item_ids in item_ids.chunks(500) {
+            if item_ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.premiere_date, mi.last_air_date,
+                        mi.status, mi.original_language, mi.provider_ids_json,
+                        (SELECT COUNT(*) FROM media_items child
+                         WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
+                           AND child.removed_at IS NULL) AS season_count,
+                        (SELECT COUNT(DISTINCT CASE
+                                    WHEN mi.item_type = 'SERIES' THEN
+                                        COALESCE(CAST(child.season_number AS TEXT), '') || ':' ||
+                                        COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                                    ELSE COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                                END)
+                         FROM media_items child
+                         WHERE child.item_type = 'EPISODE'
+                           AND child.removed_at IS NULL
+                           AND ((mi.item_type = 'SERIES' AND child.series_id = mi.id)
+                             OR (mi.item_type = 'SEASON' AND child.parent_id = mi.id))) AS episode_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
+            );
+            let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+            for item_id in item_ids {
+                statement = statement.bind(item_id);
+            }
+            let batch =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in batch {
+                let item_id: String = row.get("item_id");
+                details.insert(
+                    item_id.clone(),
+                    StoredCatalogDetail {
+                        premiere_date: row.get("premiere_date"),
+                        last_air_date: row.get("last_air_date"),
+                        status: row.get("status"),
+                        original_language: row.get("original_language"),
+                        provider_ids_json: row.get("provider_ids_json"),
+                        season_count: row.get("season_count"),
+                        episode_count: row.get("episode_count"),
+                    },
+                );
+            }
+        }
+        Ok(details)
     }
 
     async fn fetch_catalog_rows(
@@ -8217,25 +8340,16 @@ fn catalog_filter_where_clause<'a>(
 }
 
 const CATALOG_VISIBLE_PREDICATE: &str = " AND (
-    EXISTS (
-        SELECT 1
-        FROM media_sources visible_source
-        JOIN filesystem_entries visible_entry
-          ON visible_entry.id = visible_source.filesystem_entry_id
-        WHERE visible_source.item_id = mi.id
-          AND visible_entry.is_missing = 0
-    )
-    OR EXISTS (
-        SELECT 1
-        FROM media_items visible_child
-        JOIN media_sources child_source
-          ON child_source.item_id = visible_child.id
-        JOIN filesystem_entries child_entry
-          ON child_entry.id = child_source.filesystem_entry_id
-        WHERE visible_child.removed_at IS NULL
-          AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET', 'FOLDER')
-          AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
-          AND child_entry.is_missing = 0
+    mi.has_available_source = 1
+    OR (
+        mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET', 'FOLDER')
+        AND EXISTS (
+            SELECT 1
+            FROM media_items visible_child
+            WHERE visible_child.removed_at IS NULL
+              AND visible_child.has_available_source = 1
+              AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+        )
     )
 )";
 
@@ -8833,6 +8947,21 @@ mod tests {
             .expect("source count");
         assert_eq!(item_count, 1);
         assert_eq!(source_count, 2);
+
+        let item_id: String = sqlx::query_scalar("SELECT id FROM media_items")
+            .fetch_one(database.pool())
+            .await
+            .expect("item id");
+        let rows = database
+            .list_catalog_rows_by_ids(std::slice::from_ref(&item_id))
+            .await
+            .expect("catalog rows");
+        assert_eq!(rows.iter().filter(|row| row.item_id == item_id).count(), 2);
+        let details = database
+            .list_catalog_details_by_ids(std::slice::from_ref(&item_id))
+            .await
+            .expect("catalog details");
+        assert!(details.contains_key(&item_id));
     }
 
     #[tokio::test]

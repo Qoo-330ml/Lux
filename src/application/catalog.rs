@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
@@ -7,7 +10,7 @@ use crate::{
     },
     storage::{
         CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database, ResumeItemsQuery,
-        StorageError, StoredCatalogRow,
+        StorageError, StoredCatalogDetail, StoredCatalogRow,
     },
 };
 
@@ -455,15 +458,7 @@ impl CatalogService {
             return Ok(None);
         };
         if let Some(detail) = self.database.find_catalog_detail(item_id).await? {
-            item.premiere_date = detail.premiere_date;
-            item.last_air_date = detail.last_air_date;
-            item.status = detail.status;
-            item.original_language = detail.original_language;
-            item.provider_ids = provider_ids_from_json(detail.provider_ids_json.as_deref());
-            if item.item_type == "SERIES" || item.item_type == "SEASON" {
-                item.season_count = Some(detail.season_count);
-                item.episode_count = Some(detail.episode_count);
-            }
+            apply_catalog_detail(&mut item, &detail);
         }
         Ok(Some(item))
     }
@@ -530,11 +525,21 @@ impl CatalogService {
             .database
             .search_catalog_item_ids(query, like_query, library_filter, offset, limit)
             .await?;
+        let rows = self.database.list_catalog_rows_by_ids(&ids).await?;
+        let items_by_id = assemble_items(rows)
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<HashMap<_, _>>();
+        let details = self.database.list_catalog_details_by_ids(&ids).await?;
         let mut items = Vec::with_capacity(ids.len());
         for item_id in ids {
-            if let Some(item) = self.find_item(principal, &item_id).await? {
-                items.push(item);
+            let Some(mut item) = items_by_id.get(&item_id).cloned() else {
+                continue;
+            };
+            if let Some(detail) = details.get(&item_id) {
+                apply_catalog_detail(&mut item, detail);
             }
+            items.push(item);
         }
         Ok(CatalogPage {
             items,
@@ -739,6 +744,18 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
         let _ = stream_id;
     }
     items
+}
+
+fn apply_catalog_detail(item: &mut CatalogItem, detail: &StoredCatalogDetail) {
+    item.premiere_date = detail.premiere_date.clone();
+    item.last_air_date = detail.last_air_date.clone();
+    item.status = detail.status.clone();
+    item.original_language = detail.original_language.clone();
+    item.provider_ids = provider_ids_from_json(detail.provider_ids_json.as_deref());
+    if item.item_type == "SERIES" || item.item_type == "SEASON" {
+        item.season_count = Some(detail.season_count);
+        item.episode_count = Some(detail.episode_count);
+    }
 }
 
 fn provider_ids_from_json(raw: Option<&str>) -> BTreeMap<String, String> {
