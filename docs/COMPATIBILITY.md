@@ -9,6 +9,7 @@
 | Infuse | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 未测试 | 待 LUX-025 |
 | VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目详情通过 | 通过 | 通过 | 未测试 | 2026-08-05 本机 ARM64 真实 UI 播放本地 MKV，Playing/Progress/Stopped 回传和 Resume 读回通过；收藏/已观看状态另有 2026-08-03 证据 |
 | SenPlayer | 6.0.6 | macOS arm64 | 通过 | 通过 | 首页、电影列表通过 | 通过 | 未测试 | 未测试 | 2026-08-07 本机 ARM64 真实 UI 播放 `.strm` 电影通过；服务端兼容客户端生成的小写 `/emby/videos` 和路径内编码查询参数，并对远程源返回 307 直连重定向 |
+| Harbor | 1.4.6 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目列表通过 | 未测试 | 未测试 | 未测试 | 2026-08-09 本机 Harbor 连接本机 Lux 后，媒体库详情请求 `/Users/:userId/Items/:libraryId` 从 404 修复为 200，并进入电影库显示条目 |
 | Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
 
 ## 记录格式
@@ -25,6 +26,7 @@
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
 - Web 的“已实现”仅表示代码路径和服务端静态集成已完成；当前 Chrome smoke 覆盖登录、筛选、播放、收藏、账户会话和管理流程，不等同于所有浏览器/编码格式兼容。
 - LUX-121 兼容补齐：Emby `Views` 返回媒体库类型、`ChildCount` 和标准 `ImageTags.Primary`；条目详情同时返回本地徽标的 `ImageTags.Logo`，并通过 `/Items/{itemId}/Images/Logo` 提供标准图片读取；媒体库封面支持 `/Items/{libraryId}/Images/Primary` 及带索引、HEAD、ETag 和 ACL。尚待 VidHub UI 重新实测确认。
+- Harbor 1.4.6 兼容修复：Emby 媒体库自身的 `/Users/{userId}/Items/{libraryId}` 详情现在返回 `CollectionFolder`，并复用媒体库启用状态和 ACL 校验；本机 Harbor 真实 UI 已验证可进入库并显示条目。
 - 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - 播放会话失活保护：若第三方客户端异常退出、网络中断或未发送 `Stopped`，`PLAYING`/`PAUSED` 会话在连续 90 秒没有事件后从 Emby `GET /Sessions`、管理员控制台和 Web 播放状态中隐藏；显式 `Stopped` 仍立即清理活动会话。
 - LUX-091 下载回归已覆盖 Lux/Emby 的 GET/HEAD 单资源响应、Range/文件名响应，以及 `.strm` 远程资源流式转发；尚未完成第三方客户端的真实下载 UI 实测，因此不据此宣称 Infuse、VidHub 或 SenPlayer 下载兼容。

@@ -256,6 +256,28 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .await?;
     let emby_views_body: Value = emby_views.json().await?;
     assert_eq!(emby_views_body["Items"].as_array().map(Vec::len), Some(1));
+    let allowed_library_detail = client
+        .get(format!("{base_url}/Users/{}/Items/{}", viewer.id, first.id))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(allowed_library_detail.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        allowed_library_detail.json::<Value>().await?["Type"],
+        "CollectionFolder"
+    );
+    let denied_library_detail = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/{}",
+            viewer.id, second.id
+        ))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(
+        denied_library_detail.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
     let emby_denied_items = client
         .get(format!(
             "{base_url}/Users/{}/Items?ParentId={}",

@@ -89,6 +89,18 @@ impl LibraryService {
         Ok(views)
     }
 
+    pub async fn get_library(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<LibraryRecord, LibraryServiceError> {
+        let stored = self
+            .database
+            .find_library(&library_id.to_string())
+            .await?
+            .ok_or(LibraryServiceError::LibraryNotFound)?;
+        stored_library(stored)
+    }
+
     pub async fn update_settings(
         &self,
         library_id: LibraryId,

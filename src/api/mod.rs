@@ -1974,6 +1974,40 @@ async fn emby_item_response(
     principal: AccessPrincipal,
     item_id: &str,
 ) -> Response {
+    if let Ok(library_id) = item_id.parse::<crate::domain::ids::LibraryId>()
+        && let Some(libraries) = state.libraries.as_ref()
+    {
+        match libraries.get_library(library_id).await {
+            Ok(library) => {
+                if !library.is_enabled {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                let Some(access) = state.access.as_ref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                match access.can_view_library(principal, item_id).await {
+                    Ok(true) => {}
+                    Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                }
+                let Some(database) = state.database.as_ref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                let child_count = match database.count_catalog_items(Some(item_id)).await {
+                    Ok(count) => count,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
+                return Json(emby_library_view_json(
+                    &library,
+                    &state.server_id,
+                    child_count,
+                ))
+                .into_response();
+            }
+            Err(LibraryServiceError::LibraryNotFound) => {}
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };

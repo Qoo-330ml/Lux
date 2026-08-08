@@ -220,6 +220,23 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(shows_view["CollectionType"], "tvshows");
     assert_eq!(shows_view["ChildCount"], 0);
 
+    let emby_library_detail = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/{}?EnableUserData=true&Fields=CollectionType,ChildCount",
+            admin.id, library.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_library_detail.status(), reqwest::StatusCode::OK);
+    let emby_library_detail_body: Value = emby_library_detail.json().await?;
+    assert_eq!(emby_library_detail_body["Id"], library.id.to_string());
+    assert_eq!(emby_library_detail_body["Name"], "Movies");
+    assert_eq!(emby_library_detail_body["Type"], "CollectionFolder");
+    assert_eq!(emby_library_detail_body["IsFolder"], true);
+    assert_eq!(emby_library_detail_body["CollectionType"], "movies");
+    assert_eq!(emby_library_detail_body["ChildCount"], 2);
+
     let emby_cover = client
         .get(format!("{base_url}/Items/{}/Images/Primary", library.id))
         .header("X-Emby-Token", &admin_token)
