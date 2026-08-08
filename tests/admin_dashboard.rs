@@ -174,6 +174,27 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     );
     assert!(events.len() <= 24);
 
+    sqlx::query(
+        "UPDATE playback_sessions
+         SET last_event_at = unixepoch() - 3600
+         WHERE play_session_id = ?",
+    )
+    .bind("dashboard-play-session")
+    .execute(database.pool())
+    .await?;
+    let stale_dashboard = client
+        .get(format!("{base_url}/api/v1/admin/dashboard"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(
+        stale_dashboard["nowPlaying"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+
     let stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
         .header("X-Emby-Token", &token)

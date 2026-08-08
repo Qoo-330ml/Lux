@@ -150,6 +150,29 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(sessions_body[0]["ApplicationVersion"], "1");
     assert_eq!(sessions_body[0]["RemoteEndPoint"], "127.0.0.1");
 
+    sqlx::query(
+        "UPDATE playback_sessions
+         SET last_event_at = unixepoch() - 3600
+         WHERE play_session_id = ?",
+    )
+    .bind("session-1")
+    .execute(database.pool())
+    .await?;
+    let stale_sessions = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(stale_sessions.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        stale_sessions
+            .json::<Value>()
+            .await?
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
     let stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
         .header("X-Emby-Token", &token)
@@ -263,6 +286,22 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .cloned()
         .ok_or("missing web playback session")?;
     assert_eq!(web_session_body["PlayState"]["IsPaused"], true);
+
+    sqlx::query(
+        "UPDATE playback_sessions
+         SET last_event_at = unixepoch() - 3600
+         WHERE item_id = ? AND device_id = 'lux-web'",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let stale_web_playback = client
+        .get(format!("{base_url}/api/v1/items/{item_id}/playback"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    let stale_web_playback_body = stale_web_playback.json::<Value>().await?;
+    assert_eq!(stale_web_playback_body["state"], Value::Null);
 
     let web_stopped = client
         .post(&web_progress_url)

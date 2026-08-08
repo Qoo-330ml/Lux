@@ -12,6 +12,8 @@ use crate::config::Config;
 
 static MIGRATOR: Migrator = sqlx::migrate!();
 
+pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
+
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
@@ -1650,7 +1652,9 @@ impl Database {
                         position_ticks, duration_ticks, is_paused, started_at,
                         last_event_at
                  FROM playback_sessions
-                 WHERE user_id = ? AND state != 'STOPPED'
+                 WHERE user_id = ?
+                   AND state != 'STOPPED'
+                   AND last_event_at > unixepoch() - ?
                  ORDER BY last_event_at DESC, id",
                 user_id,
             )
@@ -1663,6 +1667,7 @@ impl Database {
                         last_event_at
                  FROM playback_sessions
                  WHERE state != 'STOPPED'
+                   AND last_event_at > unixepoch() - ?
                  ORDER BY last_event_at DESC, id",
                 None,
             )
@@ -1671,6 +1676,7 @@ impl Database {
         if let Some(user_id) = bind {
             statement = statement.bind(user_id);
         }
+        statement = statement.bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
         statement
             .fetch_all(&self.pool)
             .await
@@ -1718,12 +1724,16 @@ impl Database {
                     position_ticks, duration_ticks, is_paused, started_at,
                     last_event_at
              FROM playback_sessions
-             WHERE user_id = ? AND item_id = ? AND state != 'STOPPED'
+             WHERE user_id = ?
+               AND item_id = ?
+               AND state != 'STOPPED'
+               AND last_event_at > unixepoch() - ?
              ORDER BY last_event_at DESC, id
              LIMIT 1",
         )
         .bind(user_id)
         .bind(item_id)
+        .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_playback_session))
