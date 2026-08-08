@@ -424,3 +424,78 @@ async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
     assert_eq!(image_count, 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn metadata_enrichment_skips_conflicting_nfo_and_indexes_following_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let existing_dir = root.join("Target Movie (1987)");
+    let conflicting_dir = root.join("Target Movie (2018)");
+    let following_dir = root.join("Z Later Movie (2020)");
+    for directory in [&existing_dir, &conflicting_dir, &following_dir] {
+        tokio::fs::create_dir_all(directory).await?;
+    }
+    tokio::fs::write(
+        existing_dir.join("Target Movie (1987).mkv"),
+        b"existing movie",
+    )
+    .await?;
+    tokio::fs::write(
+        conflicting_dir.join("Target Movie (2018).mkv"),
+        b"conflicting movie",
+    )
+    .await?;
+    tokio::fs::write(
+        conflicting_dir.join("Target Movie (2018).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+    tokio::fs::write(conflicting_dir.join("poster.jpg"), b"conflicting poster").await?;
+    tokio::fs::write(
+        following_dir.join("Z Later Movie (2020).mkv"),
+        b"following movie",
+    )
+    .await?;
+    tokio::fs::write(following_dir.join("poster.jpg"), b"following poster").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+
+    assert_eq!(report.nfo_loaded, 0);
+    assert_eq!(report.nfo_failed, 1);
+    assert_eq!(report.images_found, 2);
+    let image_paths: Vec<String> =
+        sqlx::query_scalar("SELECT local_path FROM item_images ORDER BY local_path")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(image_paths.len(), 2);
+    assert!(
+        image_paths
+            .iter()
+            .any(|path| path.ends_with("Target Movie (2018)/poster.jpg"))
+    );
+    assert!(
+        image_paths
+            .iter()
+            .any(|path| path.ends_with("Z Later Movie (2020)/poster.jpg"))
+    );
+    Ok(())
+}

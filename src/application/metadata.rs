@@ -565,137 +565,169 @@ impl MetadataEnricher {
         let mut report = MetadataReport::default();
         for source in sources {
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            let nfo_path = find_nfo_path(&media_path).await;
-            if let Some(nfo_path) = nfo_path {
-                let fingerprint = nfo_fingerprint(&nfo_path).await.ok();
-                let already_checked = if let Some(fingerprint) = fingerprint.as_deref() {
-                    self.database
-                        .media_item_metadata_fingerprint(&source.item_id)
-                        .await?
-                        .as_deref()
-                        == Some(fingerprint)
-                } else {
-                    false
-                };
-                if already_checked {
-                    report.nfo_skipped += 1;
-                } else {
-                    match fs::read(&nfo_path).await {
-                        Err(_) => report.nfo_failed += 1,
-                        Ok(bytes) => match parse_nfo(&bytes) {
-                            Ok(metadata) => {
-                                if let Some(fingerprint) = fingerprint.as_deref() {
-                                    if let Some(current) = self
-                                        .database
-                                        .find_media_item_metadata(&source.item_id)
-                                        .await?
-                                    {
-                                        let current_metadata = NfoMetadata {
-                                            title: Some(current.title.clone()),
-                                            original_title: current.original_title,
-                                            overview: current.overview,
-                                            production_year: current
-                                                .production_year
-                                                .and_then(|year| i32::try_from(year).ok()),
-                                        };
-                                        let mut state = MetadataState::from_persisted(
-                                            current_metadata,
-                                            current.provenance_json.as_deref(),
-                                            current.locked_fields_json.as_deref(),
-                                        );
-                                        state.apply_automatic(&MetadataCandidate {
-                                            source: MetadataSource::LocalNfo,
-                                            metadata,
-                                        });
-                                        let provenance_json = state.provenance_json();
-                                        let locked_fields_json = state.locked_fields_json();
-                                        self.database
-                                            .update_media_item_metadata(MediaMetadataUpdate {
-                                                item_id: &source.item_id,
-                                                title: state
-                                                    .metadata
-                                                    .title
-                                                    .as_deref()
-                                                    .unwrap_or(current.title.as_str()),
-                                                original_title: state
-                                                    .metadata
-                                                    .original_title
-                                                    .as_deref(),
-                                                overview: state.metadata.overview.as_deref(),
-                                                production_year: state
-                                                    .metadata
-                                                    .production_year
-                                                    .map(i64::from),
-                                                metadata_fingerprint: fingerprint,
-                                                provenance_json: &provenance_json,
-                                                locked_fields_json: &locked_fields_json,
-                                            })
-                                            .await?;
-                                    }
-                                }
-                                report.nfo_loaded += 1;
-                            }
-                            Err(_) => {
-                                if let Some(fingerprint) = fingerprint.as_deref() {
-                                    self.database
-                                        .mark_media_item_metadata_checked(
-                                            &source.item_id,
-                                            fingerprint,
-                                        )
-                                        .await?;
-                                }
-                                report.nfo_failed += 1;
-                            }
-                        },
-                    }
+            match self.enrich_movie_nfo(&source.item_id, &media_path).await {
+                Ok(nfo_report) => report.merge(nfo_report),
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %source.item_id,
+                        %error,
+                        "local movie NFO failed; continuing with images and remaining items"
+                    );
+                    report.nfo_failed += 1;
                 }
             }
-            let mut entries = fs::read_dir(media_path.parent().unwrap_or(Path::new(".")))
-                .await
-                .map_err(|source| MetadataError::Io {
-                    path: media_path.clone(),
-                    source,
-                })?;
-            let mut image_paths = Vec::new();
-            while let Some(entry) =
-                entries
-                    .next_entry()
-                    .await
-                    .map_err(|source| MetadataError::Io {
-                        path: media_path.clone(),
-                        source,
-                    })?
-            {
-                image_paths.push(entry.path());
-            }
-            for image in find_local_images(image_paths) {
-                let file_size = fs::metadata(&image.path)
-                    .await
-                    .map_err(|source| MetadataError::Io {
-                        path: image.path.clone(),
-                        source,
-                    })?
-                    .len();
-                let file_size =
-                    i64::try_from(file_size).map_err(|_| MetadataError::FileSizeOutOfRange {
-                        path: image.path.clone(),
-                        size: file_size,
-                    })?;
-                let inserted = self
-                    .database
-                    .insert_item_image(
-                        &source.item_id,
-                        image.image_type.as_str(),
-                        &image.path,
-                        file_size,
-                    )
-                    .await?;
-                if inserted {
-                    report.images_found += 1;
+
+            match self.index_movie_images(&source.item_id, &media_path).await {
+                Ok(images_found) => report.images_found += images_found,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %source.item_id,
+                        %error,
+                        "local movie image directory failed; continuing with remaining items"
+                    );
                 }
             }
         }
         Ok(report)
+    }
+
+    async fn enrich_movie_nfo(
+        &self,
+        item_id: &str,
+        media_path: &Path,
+    ) -> Result<MetadataReport, MetadataError> {
+        let mut report = MetadataReport::default();
+        let Some(nfo_path) = find_nfo_path(media_path).await else {
+            return Ok(report);
+        };
+        let fingerprint = nfo_fingerprint(&nfo_path).await.ok();
+        let already_checked = if let Some(fingerprint) = fingerprint.as_deref() {
+            self.database
+                .media_item_metadata_fingerprint(item_id)
+                .await?
+                .as_deref()
+                == Some(fingerprint)
+        } else {
+            false
+        };
+        if already_checked {
+            report.nfo_skipped = 1;
+            return Ok(report);
+        }
+
+        let bytes = match fs::read(&nfo_path).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                report.nfo_failed = 1;
+                return Ok(report);
+            }
+        };
+        let metadata = match parse_nfo(&bytes) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                if let Some(fingerprint) = fingerprint.as_deref() {
+                    self.database
+                        .mark_media_item_metadata_checked(item_id, fingerprint)
+                        .await?;
+                }
+                report.nfo_failed = 1;
+                return Ok(report);
+            }
+        };
+        if let Some(fingerprint) = fingerprint.as_deref()
+            && let Some(current) = self.database.find_media_item_metadata(item_id).await?
+        {
+            let current_metadata = NfoMetadata {
+                title: Some(current.title.clone()),
+                original_title: current.original_title,
+                overview: current.overview,
+                production_year: current
+                    .production_year
+                    .and_then(|year| i32::try_from(year).ok()),
+            };
+            let mut state = MetadataState::from_persisted(
+                current_metadata,
+                current.provenance_json.as_deref(),
+                current.locked_fields_json.as_deref(),
+            );
+            state.apply_automatic(&MetadataCandidate {
+                source: MetadataSource::LocalNfo,
+                metadata,
+            });
+            let provenance_json = state.provenance_json();
+            let locked_fields_json = state.locked_fields_json();
+            self.database
+                .update_media_item_metadata(MediaMetadataUpdate {
+                    item_id,
+                    title: state
+                        .metadata
+                        .title
+                        .as_deref()
+                        .unwrap_or(current.title.as_str()),
+                    original_title: state.metadata.original_title.as_deref(),
+                    overview: state.metadata.overview.as_deref(),
+                    production_year: state.metadata.production_year.map(i64::from),
+                    metadata_fingerprint: fingerprint,
+                    provenance_json: &provenance_json,
+                    locked_fields_json: &locked_fields_json,
+                })
+                .await?;
+        }
+        report.nfo_loaded = 1;
+        Ok(report)
+    }
+
+    async fn index_movie_images(
+        &self,
+        item_id: &str,
+        media_path: &Path,
+    ) -> Result<usize, MetadataError> {
+        let image_paths =
+            read_directory_paths(media_path.parent().unwrap_or(Path::new("."))).await?;
+        let mut inserted_count = 0;
+        for image in find_local_images(image_paths) {
+            let file_size = match fs::metadata(&image.path).await {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        path = %image.path.display(),
+                        %error,
+                        "local movie image could not be read; skipping image"
+                    );
+                    continue;
+                }
+            };
+            let file_size = match i64::try_from(file_size) {
+                Ok(file_size) => file_size,
+                Err(_) => {
+                    tracing::warn!(
+                        item_id,
+                        path = %image.path.display(),
+                        file_size,
+                        "local movie image is too large for storage; skipping image"
+                    );
+                    continue;
+                }
+            };
+            match self
+                .database
+                .insert_item_image(item_id, image.image_type.as_str(), &image.path, file_size)
+                .await
+            {
+                Ok(true) => inserted_count += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        path = %image.path.display(),
+                        %error,
+                        "local movie image indexing failed; skipping image"
+                    );
+                }
+            }
+        }
+        Ok(inserted_count)
     }
 
     pub async fn enrich_series_library(
