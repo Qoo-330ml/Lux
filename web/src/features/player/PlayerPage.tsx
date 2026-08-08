@@ -20,12 +20,17 @@ export function PlayerPage() {
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
   const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
   const videoRef = useRef<HTMLVideoElement>(null);
+  const lastVideoRef = useRef<HTMLVideoElement | null>(null);
   const lastProgressReportRef = useRef(0);
   const hasStartedRef = useRef(false);
   const hasRestoredPositionRef = useRef(false);
+  const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
+    videoRef.current = video;
+    if (video) lastVideoRef.current = video;
+  }, []);
 
-  const reportPlayback = useCallback((state: PlaybackEventState, force = false, keepalive = false) => {
-    const video = videoRef.current;
+  const reportPlayback = useCallback((state: PlaybackEventState, force = false, keepalive = false, videoOverride?: HTMLVideoElement | null) => {
+    const video = videoOverride ?? videoRef.current;
     if (!video || (state === "STOPPED" && !hasStartedRef.current)) return;
     const now = Date.now();
     if (!force && now - lastProgressReportRef.current < PROGRESS_REPORT_INTERVAL_MS) return;
@@ -53,7 +58,10 @@ export function PlayerPage() {
   useEffect(() => {
     const handlePageHide = () => reportPlayback("STOPPED", true, true);
     window.addEventListener("pagehide", handlePageHide);
-    return () => window.removeEventListener("pagehide", handlePageHide);
+    return () => {
+      window.removeEventListener("pagehide", handlePageHide);
+      reportPlayback("STOPPED", true, false, lastVideoRef.current);
+    };
   }, [reportPlayback]);
 
   const restorePlaybackPosition = useCallback(() => {
@@ -101,7 +109,7 @@ export function PlayerPage() {
       <div className="lux-player-frame">
         {streamUrl ? (
           <video
-            ref={videoRef}
+            ref={setVideoRef}
             className="lux-video"
             src={streamUrl}
             poster={poster}

@@ -109,4 +109,67 @@ describe("PlayerPage playback synchronization", () => {
     );
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.home });
   });
+
+  it("reports stopped when the player route is unmounted", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-2",
+      title: "离开播放器测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-2", isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-2"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 30 });
+
+    await act(async () => video.dispatchEvent(new Event("play")));
+    await act(async () => {
+      root?.unmount();
+      root = undefined;
+    });
+
+    expect(api.progress).toHaveBeenNthCalledWith(
+      1,
+      "movie-2",
+      300_000_000,
+      1_200_000_000,
+      "PLAYING",
+      false,
+    );
+    expect(api.progress).toHaveBeenNthCalledWith(
+      2,
+      "movie-2",
+      300_000_000,
+      1_200_000_000,
+      "STOPPED",
+      false,
+    );
+  });
 });
