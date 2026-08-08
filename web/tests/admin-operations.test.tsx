@@ -154,6 +154,10 @@ describe("AdminOperationsPage", () => {
         createdAt: 1_700_000_000,
       },
     });
+    const runAutoLibraryCover = vi.spyOn(api, "runAutoLibraryCover").mockResolvedValue({
+      status: "QUEUED",
+      taskType: "AUTO_LIBRARY_COVER",
+    });
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({
       scheduledTasks: [
         {
@@ -180,8 +184,20 @@ describe("AdminOperationsPage", () => {
           schedule: null,
           isEnabled: false,
         },
+        {
+          id: "LIBRARY:library-1:AUTO_LIBRARY_COVER",
+          ownerType: "LIBRARY",
+          ownerId: "library-1",
+          ownerName: "电影库",
+          taskType: "AUTO_LIBRARY_COVER",
+          name: "自动生成媒体库封面",
+          description: "首次达到至少 9 张海报后生成媒体库封面。",
+          sourceType: "SYSTEM",
+          schedule: null,
+          isEnabled: false,
+        },
       ],
-      total: 2,
+      total: 3,
       page: 1,
       pageSize: 100,
     });
@@ -200,6 +216,12 @@ describe("AdminOperationsPage", () => {
     await act(async () => {
       await vi.waitFor(() => expect(startMetadataRefresh).toHaveBeenCalledWith("library-1", "FILL_MISSING"));
     });
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行自动生成媒体库封面"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(runAutoLibraryCover).toHaveBeenCalledWith("library-1"));
+    });
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="编辑自动生成媒体库封面"]')).toBeNull();
   });
 
   function renderPage() {

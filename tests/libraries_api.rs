@@ -472,6 +472,69 @@ async fn library_cover_survives_server_restart() -> Result<(), Box<dyn std::erro
 }
 
 #[tokio::test]
+async fn admin_can_run_registered_auto_library_cover_task_manually()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "Movies", "kind": "MOVIE" }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let library_id = created.json::<Value>().await?["library"]["id"]
+        .as_str()
+        .ok_or("missing library ID")?
+        .to_owned();
+    sqlx::query(
+        "INSERT INTO scheduled_task_configs (
+            owner_type, owner_id, task_type, task_name, task_description,
+            source_type, is_enabled, resource_limit_json
+         ) VALUES ('LIBRARY', ?, 'AUTO_LIBRARY_COVER', '自动生成媒体库封面',
+                   '手动测试任务', 'SYSTEM', 0, '{\"oneShot\":true}')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+
+    let response = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{library_id}/cover/auto"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let body: Value = response.json().await?;
+    assert_eq!(body["status"], "QUEUED");
+    assert_eq!(body["taskType"], "AUTO_LIBRARY_COVER");
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn non_admin_cannot_manage_libraries() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {

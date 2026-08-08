@@ -52,6 +52,7 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   REIDENTIFY: "整库元数据匹配",
   FILL_MISSING: "元数据仅补全",
   FULL_REFRESH: "元数据完整刷新",
+  AUTO_LIBRARY_COVER: "自动生成媒体库封面",
 };
 
 const AUDIT_EVENT_LABELS: Record<string, string> = {
@@ -78,6 +79,7 @@ const AUDIT_EVENT_LABELS: Record<string, string> = {
   LIBRARY_ROOT_DELETED: "删除媒体库路径",
   LIBRARY_DELETED: "删除媒体库",
   SCHEDULE_UPDATED: "更新计划任务",
+  LIBRARY_COVER_GENERATION_STARTED: "开始生成媒体库封面",
 };
 
 const ERROR_LABELS: Record<string, string> = {
@@ -264,6 +266,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
   const configured = Boolean(task.schedule);
   const stateLabel = task.isEnabled && configured ? "已启用" : configured ? "已停用" : "未配置计划";
   const canRunNow = isRunnableTask(task);
+  const canEdit = isSchedulableTask(task);
 
   const beginEditing = () => {
     setSchedule(task.schedule ?? "");
@@ -286,7 +289,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
       </div>
       {!editing ? <div className="lux-registered-task-actions">
         {canRunNow ? <button className="lux-button lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button> : null}
-        <button className="lux-icon-button lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing}><Pencil size={15} /></button>
+        {canEdit ? <button className="lux-icon-button lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing}><Pencil size={15} /></button> : null}
       </div> : null}
       {runNow.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{runNow.error.message}</p> : null}
     </article>
@@ -356,6 +359,10 @@ function taskLabel(taskType: string) {
 }
 
 function isRunnableTask(task: AdminScheduledTask) {
+  return task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE", "AUTO_LIBRARY_COVER"].includes(task.taskType);
+}
+
+function isSchedulableTask(task: AdminScheduledTask) {
   return task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE"].includes(task.taskType);
 }
 
@@ -366,6 +373,10 @@ async function runRegisteredTask(task: AdminScheduledTask) {
   }
   if (task.taskType === "METADATA_PARSE") {
     await api.startLibraryMetadataRefresh(task.ownerId, "FILL_MISSING");
+    return;
+  }
+  if (task.taskType === "AUTO_LIBRARY_COVER") {
+    await api.runAutoLibraryCover(task.ownerId);
     return;
   }
   return Promise.reject(new Error("该任务暂不支持立即执行"));

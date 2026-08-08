@@ -206,7 +206,7 @@ impl AppState {
             images: Some(ImageService::new(database.clone(), access.clone())),
             image_writes,
             image_candidates,
-            library_covers,
+            library_covers: library_covers.clone(),
             access: Some(access),
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
@@ -220,9 +220,14 @@ impl AppState {
                 FfprobeRunner::default(),
             )),
             thumbnails: Some(ThumbnailService::new(database.clone())),
-            scan_jobs: Some(
-                ScanJobService::new(database.clone()).with_admin_events(admin_events.clone()),
-            ),
+            scan_jobs: Some({
+                let service =
+                    ScanJobService::new(database.clone()).with_admin_events(admin_events.clone());
+                match library_covers.clone() {
+                    Some(covers) => service.with_library_covers(covers),
+                    None => service,
+                }
+            }),
             strm_probe: Some(StrmProbeService::new(database.clone(), plugins.clone())),
             danmaku: Some(DanmakuService::new(
                 database.clone(),
@@ -416,6 +421,10 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/libraries/{library_id}/cover",
             put(admin_update_library_cover)
                 .layer(DefaultBodyLimit::max(MAX_LIBRARY_COVER_BYTES as usize)),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}/cover/auto",
+            post(admin_run_auto_library_cover),
         )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
         .route(
@@ -4194,7 +4203,15 @@ async fn lux_library_cover(
         Err(LibraryCoverError::Storage(_)) => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        Err(LibraryCoverError::Io { .. } | LibraryCoverError::ImageWrite(_)) => {
+        Err(
+            LibraryCoverError::Io { .. }
+            | LibraryCoverError::ImageWrite(_)
+            | LibraryCoverError::FontNotFound
+            | LibraryCoverError::Render(_)
+            | LibraryCoverError::RenderPanicked
+            | LibraryCoverError::GeneratedCoverRace
+            | LibraryCoverError::GenerationUnavailable,
+        ) => {
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(
@@ -10770,6 +10787,88 @@ async fn admin_update_library_cover(
     }
 }
 
+async fn admin_run_auto_library_cover(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id,
+        Err(error) => {
+            return library_error(
+                &headers,
+                LibraryServiceError::InvalidLibraryId(error.to_string()),
+            );
+        }
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_id_text = library_id.to_string();
+    match database
+        .find_scheduled_task_config(
+            "LIBRARY",
+            &library_id_text,
+            crate::application::library_covers::AUTO_LIBRARY_COVER_TASK_TYPE,
+        )
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "自动媒体库封面任务尚未注册",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(covers) = state.library_covers.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let worker_library_id = library_id;
+    tokio::spawn(async move {
+        match covers.run_manually(worker_library_id).await {
+            Ok(crate::application::library_covers::AutoLibraryCoverResult::Generated) => {
+                tracing::info!(library_id = %worker_library_id, "manual automatic library cover generation completed");
+            }
+            Ok(
+                crate::application::library_covers::AutoLibraryCoverResult::ExistingCover
+                | crate::application::library_covers::AutoLibraryCoverResult::BelowThreshold
+                | crate::application::library_covers::AutoLibraryCoverResult::TaskNotRegistered
+                | crate::application::library_covers::AutoLibraryCoverResult::AlreadyHandled,
+            ) => {
+                tracing::info!(library_id = %worker_library_id, "manual automatic library cover generation skipped");
+            }
+            Err(error) => {
+                tracing::warn!(library_id = %worker_library_id, %error, "manual automatic library cover generation failed");
+            }
+        }
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "LIBRARY_COVER_GENERATION_STARTED",
+        Some("library"),
+        Some(&library_id_text),
+        "{\"mode\":\"manual\"}",
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "QUEUED",
+            "taskType": crate::application::library_covers::AUTO_LIBRARY_COVER_TASK_TYPE,
+        })),
+    )
+        .into_response()
+}
+
 async fn admin_delete_library_root(
     headers: HeaderMap,
     Path((library_id, root_id)): Path<(String, String)>,
@@ -10949,7 +11048,12 @@ fn library_cover_error(headers: &HeaderMap, error: LibraryCoverError) -> Respons
         .into_response(),
         LibraryCoverError::Io { .. }
         | LibraryCoverError::ImageWrite(_)
-        | LibraryCoverError::Storage(_) => api_error(
+        | LibraryCoverError::Storage(_)
+        | LibraryCoverError::FontNotFound
+        | LibraryCoverError::Render(_)
+        | LibraryCoverError::RenderPanicked
+        | LibraryCoverError::GeneratedCoverRace
+        | LibraryCoverError::GenerationUnavailable => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,

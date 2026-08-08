@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::{
     application::{
         admin_events::{AdminEventHub, AdminEventScope},
+        library_covers::{AutoLibraryCoverResult, LibraryCoverService},
         media_matching::{MediaKind, clean_title, has_multi_part_marker, parse_media_name},
         metadata::MetadataEnricher,
         probe::MediaProbeService,
@@ -1188,6 +1189,7 @@ pub struct ScanJobService {
     database: Database,
     admin_events: AdminEventHub,
     scan_lock: Arc<Semaphore>,
+    library_covers: Option<LibraryCoverService>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1204,6 +1206,7 @@ impl ScanJobService {
             database,
             admin_events: AdminEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
+            library_covers: None,
         }
     }
 
@@ -1214,6 +1217,11 @@ impl ScanJobService {
 
     pub fn with_admin_events(mut self, admin_events: AdminEventHub) -> Self {
         self.admin_events = admin_events;
+        self
+    }
+
+    pub fn with_library_covers(mut self, library_covers: LibraryCoverService) -> Self {
+        self.library_covers = Some(library_covers);
         self
     }
 
@@ -1926,11 +1934,13 @@ impl ScanJobService {
                     .await?
                     .is_some_and(|job| job.job_type == "INCREMENTAL_SCAN");
                 if incremental {
+                    self.run_auto_library_cover_after_scan(job_id).await?;
                     return Ok(());
                 }
                 self.run_probe_after_scan(job_id, probe).await?;
                 self.run_metadata_after_scan(job_id).await?;
                 self.run_thumbnails_after_scan(job_id, thumbnails).await?;
+                self.run_auto_library_cover_after_scan(job_id).await?;
                 if let Some(metadata) = metadata {
                     self.schedule_online_metadata_after_scan(job_id, metadata)
                         .await;
@@ -1938,6 +1948,53 @@ impl ScanJobService {
             }
             return Ok(());
         }
+    }
+
+    async fn run_auto_library_cover_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
+        let Some(covers) = self.library_covers.as_ref() else {
+            return Ok(());
+        };
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
+        let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
+            tracing::warn!(
+                job_id,
+                library_id = %job.library_id,
+                "automatic library cover generation skipped for invalid library ID"
+            );
+            return Ok(());
+        };
+        match covers.generate_if_eligible(library_id).await {
+            Ok(AutoLibraryCoverResult::Generated) => {
+                self.record_event(
+                    job_id,
+                    "INFO",
+                    "LIBRARY_COVER_GENERATED",
+                    "已自动生成媒体库封面",
+                    "{}",
+                )
+                .await;
+            }
+            Ok(
+                AutoLibraryCoverResult::BelowThreshold
+                | AutoLibraryCoverResult::ExistingCover
+                | AutoLibraryCoverResult::TaskNotRegistered
+                | AutoLibraryCoverResult::AlreadyHandled,
+            ) => {}
+            Err(error) => {
+                tracing::warn!(job_id, %error, "automatic library cover generation failed");
+                self.record_event(
+                    job_id,
+                    "ERROR",
+                    "LIBRARY_COVER_FAILED",
+                    "自动媒体库封面生成失败",
+                    "{}",
+                )
+                .await;
+            }
+        }
+        Ok(())
     }
 
     async fn acquire_scan_lock(&self) -> Result<OwnedSemaphorePermit, ScanJobError> {

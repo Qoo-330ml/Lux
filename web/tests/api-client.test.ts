@@ -282,6 +282,19 @@ describe("LuxApiClient", () => {
     expect(JSON.parse(String(options?.body))).toEqual({ mode: "FULL_REFRESH" });
   });
 
+  it("queues a manual automatic library cover generation", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ status: "QUEUED", taskType: "AUTO_LIBRARY_COVER" }), { status: 202 }),
+    );
+
+    await expect(new LuxApiClient().runAutoLibraryCover("library/1"))
+      .resolves.toEqual({ status: "QUEUED", taskType: "AUTO_LIBRARY_COVER" });
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/admin/libraries/library%2F1/cover/auto");
+    expect(options?.method).toBe("POST");
+  });
+
   it("updates the editable flags of an indexed external subtitle", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       expect(String(input)).toBe("/api/v1/admin/items/item-1/subtitles/2");

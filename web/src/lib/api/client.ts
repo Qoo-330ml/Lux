@@ -505,6 +505,13 @@ export class LuxApiClient {
     );
   }
 
+  runAutoLibraryCover(libraryId: string) {
+    return this.request<{ status: string; taskType: string }>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/cover/auto`,
+      { method: "POST" },
+    );
+  }
+
   adminMetadataReidentifyJobs(status?: string) {
     const params = new URLSearchParams({ page: "1", pageSize: "50" });
     if (status) params.set("status", status);

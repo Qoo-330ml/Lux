@@ -68,7 +68,7 @@ LABEL org.opencontainers.image.title="Lux" \
       org.opencontainers.image.revision="$LUX_REVISION"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
+    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg fonts-noto-cjk \
     && mkdir -p /config /media /usr/local/share/lux/plugins \
     && rm -rf /var/lib/apt/lists/*
 

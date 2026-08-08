@@ -816,6 +816,31 @@ impl Database {
         })
     }
 
+    pub(crate) async fn register_auto_library_cover_task(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO scheduled_task_configs (
+                owner_type, owner_id, task_type, task_name, task_description,
+                source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
+             ) VALUES (
+                'LIBRARY', ?, 'AUTO_LIBRARY_COVER',
+                '自动生成媒体库封面',
+                '首次达到至少 9 张海报后，随机选择 9 张海报生成带媒体库名称的旋转堆叠封面；自动仅执行一次，管理员可手动重跑。',
+                'SYSTEM', NULL, NULL, 0, '{\"oneShot\":true}'
+             )",
+        )
+        .bind(library_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn delete_library(&self, id: &str) -> Result<bool, StorageError> {
         let mut transaction = self
             .pool
@@ -1229,6 +1254,69 @@ impl Database {
         .bind(size)
         .bind(tag)
         .bind(library_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_library_cover_if_missing(
+        &self,
+        library_id: &str,
+        path: &str,
+        content_type: &str,
+        size: i64,
+        tag: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE libraries
+             SET cover_image_path = ?,
+                 cover_image_content_type = ?,
+                 cover_image_size = ?,
+                 cover_image_tag = ?,
+                 updated_at = unixepoch()
+             WHERE id = ? AND cover_image_path IS NULL",
+        )
+        .bind(path)
+        .bind(content_type)
+        .bind(size)
+        .bind(tag)
+        .bind(library_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_library_cover_if_auto(
+        &self,
+        library_id: &str,
+        path: &str,
+        content_type: &str,
+        size: i64,
+        tag: &str,
+    ) -> Result<bool, StorageError> {
+        sqlx::query(
+            "UPDATE libraries
+             SET cover_image_path = ?,
+                 cover_image_content_type = ?,
+                 cover_image_size = ?,
+                 cover_image_tag = ?,
+                 updated_at = unixepoch()
+             WHERE id = ? AND (cover_image_path IS NULL OR cover_image_path = ?)",
+        )
+        .bind(path)
+        .bind(content_type)
+        .bind(size)
+        .bind(tag)
+        .bind(library_id)
+        .bind(path)
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
@@ -7356,6 +7444,43 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_random_library_poster_paths(
+        &self,
+        library_id: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredLibraryPoster>, StorageError> {
+        sqlx::query(
+            "SELECT ii.item_id, ii.local_path, lr.canonical_path AS root_path
+             FROM item_images ii
+             JOIN media_items mi ON mi.id = ii.item_id
+             JOIN library_roots lr ON lr.library_id = mi.library_id
+             WHERE mi.library_id = ?
+               AND mi.removed_at IS NULL
+               AND ii.image_type = 'POSTER'
+               AND ii.image_index = 0
+             GROUP BY ii.item_id, ii.local_path, lr.canonical_path
+             ORDER BY random()
+             LIMIT ?",
+        )
+        .bind(library_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredLibraryPoster {
+                    item_id: row.get("item_id"),
+                    local_path: row.get("local_path"),
+                    root_path: row.get("root_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_item_image(
         &self,
         item_id: &str,
@@ -8254,6 +8379,13 @@ pub(crate) struct StoredItemImage {
     pub(crate) content_tag: Option<String>,
     pub(crate) source: String,
     pub(crate) root_path: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredLibraryPoster {
+    pub(crate) item_id: String,
+    pub(crate) local_path: String,
+    pub(crate) root_path: String,
 }
 
 fn stored_item_image(row: sqlx::sqlite::SqliteRow) -> StoredItemImage {
