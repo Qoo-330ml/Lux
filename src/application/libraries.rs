@@ -57,7 +57,6 @@ impl LibraryService {
                 kind: kind.as_str(),
                 scraper_id: scraper_id.as_deref(),
                 realtime_watch_enabled: true,
-                incremental_schedule: None,
                 reconciliation_schedule: None,
                 metadata_schedule: None,
                 scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
@@ -97,7 +96,6 @@ impl LibraryService {
     ) -> Result<LibraryView, LibraryServiceError> {
         validate_concurrency(settings.scan_concurrency)?;
         validate_concurrency(settings.probe_concurrency)?;
-        let incremental_schedule = normalize_schedule(settings.incremental_schedule)?;
         let reconciliation_schedule = normalize_schedule(settings.reconciliation_schedule)?;
         let metadata_schedule = normalize_schedule(settings.metadata_schedule)?;
         let name = settings
@@ -117,9 +115,6 @@ impl LibraryService {
                     kind,
                     is_enabled: settings.is_enabled,
                     realtime_watch_enabled: settings.realtime_watch_enabled.map(|_| true),
-                    incremental_schedule: incremental_schedule
-                        .as_ref()
-                        .map(|value| value.as_deref()),
                     reconciliation_schedule: reconciliation_schedule
                         .as_ref()
                         .map(|value| value.as_deref()),
@@ -269,7 +264,6 @@ pub struct LibrarySettingsPatch {
     pub kind: Option<LibraryKind>,
     pub is_enabled: Option<bool>,
     pub realtime_watch_enabled: Option<bool>,
-    pub incremental_schedule: Option<Option<String>>,
     pub reconciliation_schedule: Option<Option<String>>,
     pub metadata_schedule: Option<Option<String>>,
     pub scraper_id: Option<Option<String>>,

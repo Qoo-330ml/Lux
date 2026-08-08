@@ -76,21 +76,21 @@ describe("AdminOperationsPage", () => {
         ownerType: "LIBRARY",
         ownerId: "library-1",
         ownerName: "电影库",
-        taskType: "INCREMENTAL_SCAN",
-        name: "扫描媒体文件夹",
+        taskType: "RECONCILIATION_SCAN",
+        name: "全量校验媒体库",
         schedule: "interval:1h",
         isEnabled: true,
       },
     });
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({
       scheduledTasks: [{
-        id: "LIBRARY:library-1:INCREMENTAL_SCAN",
+        id: "LIBRARY:library-1:RECONCILIATION_SCAN",
         ownerType: "LIBRARY",
         ownerId: "library-1",
         ownerName: "电影库",
-        taskType: "INCREMENTAL_SCAN",
-        name: "扫描媒体文件夹",
-        description: "按计划检查媒体库根路径中的新增和变更文件。",
+        taskType: "RECONCILIATION_SCAN",
+        name: "全量校验媒体库",
+        description: "按计划校验媒体库索引与文件系统的一致性。",
         sourceType: "SYSTEM",
         schedule: null,
         isEnabled: false,
@@ -102,13 +102,13 @@ describe("AdminOperationsPage", () => {
     renderPage();
 
     await act(async () => {
-      await vi.waitFor(() => expect(container.textContent).toContain("扫描媒体文件夹"));
+      await vi.waitFor(() => expect(container.textContent).toContain("全量校验媒体库"));
     });
     expect(container.textContent).toContain("系统注册");
     expect(container.textContent).toContain("未配置计划");
     expect(container.textContent).not.toContain("新增任务");
 
-    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑扫描媒体文件夹"]')?.click());
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑全量校验媒体库"]')?.click());
     const input = container.querySelector<HTMLInputElement>("input[id^='schedule-LIBRARY']");
     const enabled = container.querySelector<HTMLInputElement>("input[id^='enabled-LIBRARY']");
     expect(input).not.toBeNull();
@@ -123,7 +123,7 @@ describe("AdminOperationsPage", () => {
       await vi.waitFor(() => expect(updateSchedule).toHaveBeenCalledWith({
         ownerType: "LIBRARY",
         ownerId: "library-1",
-        taskType: "INCREMENTAL_SCAN",
+        taskType: "RECONCILIATION_SCAN",
         schedule: "interval:1h",
         isEnabled: true,
       }));

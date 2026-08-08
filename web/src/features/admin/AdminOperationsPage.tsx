@@ -42,9 +42,9 @@ const JOB_STATUS_LABELS: Record<string, string> = {
 };
 
 const JOB_TYPE_LABELS: Record<string, string> = {
-  RECONCILE_LIBRARY: "媒体库扫描",
+  RECONCILE_LIBRARY: "全量校验",
   SCAN: "媒体库扫描",
-  INCREMENTAL_SCAN: "增量扫描",
+  INCREMENTAL_SCAN: "实时增量扫描",
   RECONCILIATION_SCAN: "全量校验",
   TMDB_REIDENTIFY: "整库元数据匹配",
   METADATA_REIDENTIFY: "整库元数据匹配",
@@ -220,7 +220,7 @@ function RegisteredTasksSection({
 }) {
   return (
     <section className="lux-admin-panel lux-operations-section" aria-labelledby="registered-tasks-title">
-      <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">任务注册</span><h2 id="registered-tasks-title">已注册任务</h2><p>这里显示由 Lux 系统或插件注册的任务。页面只负责配置，不负责创建任务。</p></div><span className="lux-operations-source-note">注册项自动持久化</span></div>
+      <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">任务注册</span><h2 id="registered-tasks-title">已注册任务</h2><p>这里显示由 Lux 系统或插件注册的计划任务。实时增量扫描由文件系统监听触发，不在此配置。</p></div><span className="lux-operations-source-note">注册项自动持久化</span></div>
       {tasks.length === 0 ? <RegisteredTasksEmpty /> : <div className="lux-registered-task-list">{tasks.map((task) => <RegisteredTaskRow key={task.id ?? `${task.ownerType}:${task.ownerId}:${task.taskType}`} task={task} onSaved={onRefresh} />)}</div>}
       {tasks.length > 0 && total > pageSize ? <Pagination page={page} pageSize={pageSize} total={total} onPageChange={onPageChange} /> : null}
     </section>

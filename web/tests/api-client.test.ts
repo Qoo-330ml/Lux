@@ -240,7 +240,7 @@ describe("LuxApiClient", () => {
       expect(JSON.parse(String(init.body))).toEqual({
         ownerType: "LIBRARY",
         ownerId: "library-1",
-        taskType: "INCREMENTAL_SCAN",
+        taskType: "RECONCILIATION_SCAN",
         schedule: "interval:1h",
         isEnabled: true,
       });
@@ -257,7 +257,7 @@ describe("LuxApiClient", () => {
     await expect(client.updateAdminScheduledTask({
       ownerType: "LIBRARY",
       ownerId: "library-1",
-      taskType: "INCREMENTAL_SCAN",
+      taskType: "RECONCILIATION_SCAN",
       schedule: "interval:1h",
       isEnabled: true,
     })).resolves.toEqual({ scheduledTask: { ownerId: "library-1" } });

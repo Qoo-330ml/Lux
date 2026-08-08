@@ -649,15 +649,14 @@ impl Database {
         sqlx::query(
             "INSERT INTO libraries (
                 id, name, kind, is_enabled, realtime_watch_enabled,
-                incremental_schedule, reconciliation_schedule, metadata_schedule,
+                reconciliation_schedule, metadata_schedule,
                 scan_concurrency, probe_concurrency, scraper_id
-            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
         )
         .bind(library.id)
         .bind(library.name)
         .bind(library.kind)
         .bind(library.realtime_watch_enabled)
-        .bind(library.incremental_schedule)
         .bind(library.reconciliation_schedule)
         .bind(library.metadata_schedule)
         .bind(library.scan_concurrency)
@@ -672,12 +671,12 @@ impl Database {
 
         let registrations = [
             (
-                "INCREMENTAL_SCAN",
-                "扫描媒体文件夹",
-                "按计划检查媒体库根路径中的新增和变更文件。",
+                "RECONCILIATION_SCAN",
+                "全量校验媒体库",
+                "按计划校验媒体库索引与文件系统的一致性。",
                 "SYSTEM",
                 None,
-                library.incremental_schedule,
+                library.reconciliation_schedule,
             ),
             (
                 "METADATA_PARSE",
@@ -709,7 +708,7 @@ impl Database {
             .bind(plugin_id)
             .bind(schedule)
             .bind(schedule.is_some())
-            .bind(if task_type == "INCREMENTAL_SCAN" {
+            .bind(if task_type == "RECONCILIATION_SCAN" {
                 format!(
                     "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
                     library.scan_concurrency, library.probe_concurrency
@@ -941,21 +940,6 @@ impl Database {
                 source,
             })?;
         }
-        if let Some(value) = settings.incremental_schedule {
-            sqlx::query(
-                "UPDATE libraries
-                 SET incremental_schedule = ?, updated_at = unixepoch()
-                 WHERE id = ?",
-            )
-            .bind(value)
-            .bind(library_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
         if let Some(value) = settings.reconciliation_schedule {
             sqlx::query(
                 "UPDATE libraries
@@ -1047,15 +1031,8 @@ impl Database {
             })?;
         }
 
-        let current: (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            i64,
-            i64,
-            Option<String>,
-        ) = sqlx::query_as(
-            "SELECT incremental_schedule, reconciliation_schedule, metadata_schedule,
+        let current: (Option<String>, Option<String>, i64, i64, Option<String>) = sqlx::query_as(
+            "SELECT reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, scraper_id
              FROM libraries WHERE id = ?",
         )
@@ -1069,16 +1046,15 @@ impl Database {
 
         let resources = format!(
             "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
-            current.3, current.4
+            current.2, current.3
         );
         let task_configs = [
-            ("INCREMENTAL_SCAN", current.0.as_deref(), resources.as_str()),
             (
                 "RECONCILIATION_SCAN",
-                current.1.as_deref(),
+                current.0.as_deref(),
                 resources.as_str(),
             ),
-            ("METADATA_PARSE", current.2.as_deref(), "{}"),
+            ("METADATA_PARSE", current.1.as_deref(), "{}"),
         ];
         for (task_type, schedule, resource_limit_json) in task_configs {
             sqlx::query(
@@ -1100,8 +1076,8 @@ impl Database {
             .bind(schedule)
             .bind(schedule.is_some())
             .bind(resource_limit_json)
-            .bind(current.5.as_deref())
-            .bind(current.5.as_deref())
+            .bind(current.4.as_deref())
+            .bind(current.4.as_deref())
             .bind(library_id)
             .bind(task_type)
             .execute(&mut *transaction)
@@ -8284,7 +8260,6 @@ pub(crate) struct NewLibrary<'a> {
     pub(crate) name: &'a str,
     pub(crate) kind: &'a str,
     pub(crate) realtime_watch_enabled: bool,
-    pub(crate) incremental_schedule: Option<&'a str>,
     pub(crate) reconciliation_schedule: Option<&'a str>,
     pub(crate) metadata_schedule: Option<&'a str>,
     pub(crate) scan_concurrency: i64,
@@ -8337,7 +8312,6 @@ pub(crate) struct LibrarySettingsUpdate<'a> {
     pub(crate) kind: Option<&'a str>,
     pub(crate) is_enabled: Option<bool>,
     pub(crate) realtime_watch_enabled: Option<bool>,
-    pub(crate) incremental_schedule: Option<Option<&'a str>>,
     pub(crate) reconciliation_schedule: Option<Option<&'a str>>,
     pub(crate) metadata_schedule: Option<Option<&'a str>>,
     pub(crate) scan_concurrency: Option<i64>,

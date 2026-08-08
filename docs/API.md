@@ -37,7 +37,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 - `GET /api/v1/admin/libraries`：列出媒体库及其根路径。
 - `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；实时监听默认开启，不再提供关闭选项。历史客户端发送的 `realtimeWatchEnabled` 字段会被兼容接受但不会关闭监听。`scraperId` 可省略或为 `null`，表示不进行在线刮削，但仍读取本地 NFO 和图片。
-- `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新增量/调和/元数据计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。历史 `realtimeWatchEnabled` 字段会被兼容接受但始终按 `true` 处理。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。`mediaStrategy` 的结构与全局策略相同，未设置时返回 `null` 并继承全局默认。例如 `{ "scraperId": "tmdb", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
+- `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新全量校验/元数据计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。实时增量扫描由文件系统监听触发，不接受计划配置。历史 `realtimeWatchEnabled` 字段会被兼容接受但始终按 `true` 处理；历史 `incrementalSchedule` 字段也会被兼容接受但忽略，响应始终为 `null`。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，非空字符串最长 128 个字符；并发范围为 1-64。`mediaStrategy` 的结构与全局策略相同，未设置时返回 `null` 并继承全局默认。例如 `{ "scraperId": "tmdb", "reconciliationSchedule": "0 3 * * *", "metadataSchedule": "interval:5m" }`。修改无需重启，下一次任务读取最新配置；刮削器必须已安装且配置完成。
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`；成功后自动创建异步扫描任务并返回 `scanJob`，扫描完成后若配置刮削器会继续自动匹配元数据。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
@@ -47,7 +47,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
 - `GET /api/v1/admin/scheduled-tasks?page=1&pageSize=100`：分页查看所有已注册的任务，包含 `ownerType`、媒体库名称、`taskType`、`name`、`description`、`sourceType`、可空 `pluginId`、`schedule`、启用状态、资源限制和更新时间；结果也包含已停用或尚未配置计划的注册项。
-- `PUT /api/v1/admin/scheduled-tasks`：只修改已注册任务的计划。请求体为 `{ "ownerType": "LIBRARY", "ownerId": "...", "taskType": "INCREMENTAL_SCAN|METADATA_PARSE", "schedule": "interval:1h", "isEnabled": true }`；`schedule: null` 或 `isEnabled: false` 会清空已注册任务的计划。不存在的注册项返回 404，不会因为管理请求凭空创建任务。写操作需要管理员 Web session 和 CSRF，并与 `PATCH /api/v1/admin/libraries/{libraryId}` 保持同一份配置。当前端点只管理计划配置，不新增 cron 解析或后台调度执行器。
+- `PUT /api/v1/admin/scheduled-tasks`：只修改已注册任务的计划。请求体为 `{ "ownerType": "LIBRARY", "ownerId": "...", "taskType": "RECONCILIATION_SCAN|METADATA_PARSE", "schedule": "interval:1h", "isEnabled": true }`；`schedule: null` 或 `isEnabled: false` 会清空已注册任务的计划。实时增量扫描（`INCREMENTAL_SCAN`）由文件系统事件触发，不属于此接口管理范围。不存在的注册项返回 404，不会因为管理请求凭空创建任务。写操作需要管理员 Web session 和 CSRF，并与 `PATCH /api/v1/admin/libraries/{libraryId}` 保持同一份配置。当前端点只管理计划配置，不新增 cron 解析或后台调度执行器。
 - `POST /api/v1/admin/strm-probe-jobs`：按 `org.lux.strm-media-info` 已保存的插件配置创建并异步执行 STRM 远程媒体信息任务，返回 202 和按库拆分的任务；不从请求体读取媒体库或并发配置，也不返回 URL。
 - `GET /api/v1/admin/strm-probe-jobs?page=1&pageSize=50&status=FAILED`：分页查看 STRM 探测任务，状态支持 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 和 `FAILED`。
 - `GET /api/v1/admin/strm-probe-jobs/{jobId}`：查看单个 STRM 探测任务的状态、进度、并发、旁车开关和安全错误摘要。

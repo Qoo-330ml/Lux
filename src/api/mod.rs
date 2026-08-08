@@ -6083,6 +6083,8 @@ struct UpdateLibraryRequest {
     is_enabled: Option<bool>,
     realtime_watch_enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    #[allow(dead_code)]
+    /// Accepted for legacy clients; realtime incremental scanning has no schedule.
     incremental_schedule: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     reconciliation_schedule: Option<Option<String>>,
@@ -7876,8 +7878,7 @@ struct AdminScheduledTaskRequest {
     is_enabled: Option<bool>,
 }
 
-const SCHEDULE_TASK_TYPES: [&str; 3] =
-    ["INCREMENTAL_SCAN", "RECONCILIATION_SCAN", "METADATA_PARSE"];
+const SCHEDULE_TASK_TYPES: [&str; 2] = ["RECONCILIATION_SCAN", "METADATA_PARSE"];
 
 async fn admin_list_scheduled_tasks(
     headers: HeaderMap,
@@ -8036,7 +8037,6 @@ async fn admin_upsert_scheduled_task(
     };
     let mut settings = LibrarySettingsPatch::default();
     match task_type.as_str() {
-        "INCREMENTAL_SCAN" => settings.incremental_schedule = Some(schedule),
         "RECONCILIATION_SCAN" => settings.reconciliation_schedule = Some(schedule),
         "METADATA_PARSE" => settings.metadata_schedule = Some(schedule),
         _ => {
@@ -10672,7 +10672,6 @@ async fn admin_update_library(
         kind,
         is_enabled: request.is_enabled,
         realtime_watch_enabled: request.realtime_watch_enabled,
-        incremental_schedule: request.incremental_schedule,
         reconciliation_schedule: request.reconciliation_schedule,
         metadata_schedule: request.metadata_schedule,
         scraper_id: request.scraper_id.clone(),

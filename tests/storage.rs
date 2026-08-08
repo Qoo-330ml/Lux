@@ -1,6 +1,8 @@
 use std::fs;
 
-use luxd::{config::Config, storage::Database};
+use luxd::{
+    application::libraries::LibraryService, config::Config, library::LibraryKind, storage::Database,
+};
 
 #[tokio::test]
 async fn empty_config_dir_runs_migrations_and_configures_sqlite()
@@ -14,7 +16,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 42);
+    assert_eq!(database.schema_version().await?, 43);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -34,7 +36,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 42);
+    assert_eq!(second_database.schema_version().await?, 43);
     second_database.close().await;
     Ok(())
 }
@@ -50,12 +52,46 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 42);
+    assert_eq!(database.schema_version().await?, 43);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
             .await?;
     assert_eq!(probe_rows, 1);
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_registers_reconciliation_and_metadata_tasks_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, true)
+        .await?;
+
+    let task_types: Vec<String> = sqlx::query_scalar(
+        "SELECT task_type FROM scheduled_task_configs
+         WHERE owner_type = 'LIBRARY' AND owner_id = ?
+         ORDER BY task_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        task_types,
+        vec![
+            "METADATA_PARSE".to_owned(),
+            "RECONCILIATION_SCAN".to_owned()
+        ]
+    );
 
     database.close().await;
     Ok(())
