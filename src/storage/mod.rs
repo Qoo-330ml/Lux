@@ -4007,6 +4007,137 @@ impl Database {
         })
     }
 
+    pub(crate) async fn insert_movie_files_batch(
+        &self,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[NewMovieFile],
+    ) -> Result<usize, StorageError> {
+        if files.is_empty() {
+            return Ok(0);
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut created_items = 0;
+        for file in files {
+            sqlx::query(
+                "INSERT INTO filesystem_entries (
+                    id, library_root_id, relative_path, entry_kind, size,
+                    modified_at, fingerprint, last_seen_generation, is_missing
+                ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, 0)",
+            )
+            .bind(&file.filesystem_entry_id)
+            .bind(library_root_id)
+            .bind(&file.relative_path)
+            .bind(file.size)
+            .bind(file.modified_at)
+            .bind(&file.fingerprint)
+            .bind(generation)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+            let existing_item_id = match file.production_year {
+                Some(year) => {
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT id FROM media_items
+                         WHERE library_id = ? AND sort_title = ? AND production_year = ?
+                           AND removed_at IS NULL
+                         LIMIT 1",
+                    )
+                    .bind(library_id)
+                    .bind(&file.sort_title)
+                    .bind(year)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                }
+                None => {
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT id FROM media_items
+                         WHERE library_id = ? AND sort_title = ? AND production_year IS NULL
+                           AND removed_at IS NULL
+                         LIMIT 1",
+                    )
+                    .bind(library_id)
+                    .bind(&file.sort_title)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                }
+            }
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            let (item_id, is_new_item) = if let Some(item_id) = existing_item_id {
+                (item_id, false)
+            } else {
+                let item_id = Uuid::now_v7().to_string();
+                sqlx::query(
+                    "INSERT INTO media_items (
+                        id, library_id, item_type, title, sort_title,
+                        original_title, production_year, identification_status
+                    ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+                )
+                .bind(&item_id)
+                .bind(library_id)
+                .bind(&file.title)
+                .bind(&file.sort_title)
+                .bind(&file.original_title)
+                .bind(file.production_year)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                (item_id, true)
+            };
+            created_items += usize::from(is_new_item);
+
+            sqlx::query(
+                "INSERT INTO media_sources (
+                    id, item_id, source_kind, filesystem_entry_id,
+                    edition_name, quality_label, container, size,
+                    external_url, is_default, probe_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+            )
+            .bind(&file.source_id)
+            .bind(item_id)
+            .bind(&file.source_kind)
+            .bind(&file.filesystem_entry_id)
+            .bind(file.edition_name.as_deref())
+            .bind(file.quality_label.as_deref())
+            .bind(&file.container)
+            .bind(file.size)
+            .bind(file.external_url.as_deref())
+            .bind(is_new_item)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(created_items)
+    }
+
     pub(crate) async fn find_media_item(
         &self,
         library_id: &str,
@@ -8504,6 +8635,24 @@ pub(crate) struct NewMediaSource<'a> {
     pub(crate) is_default: bool,
 }
 
+pub(crate) struct NewMovieFile {
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) source_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) fingerprint: Vec<u8>,
+    pub(crate) title: String,
+    pub(crate) sort_title: String,
+    pub(crate) original_title: String,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) source_kind: String,
+    pub(crate) edition_name: Option<String>,
+    pub(crate) quality_label: Option<String>,
+    pub(crate) container: String,
+    pub(crate) external_url: Option<String>,
+}
+
 pub(crate) struct MediaProbeUpdate<'a> {
     pub(crate) source_id: &'a str,
     pub(crate) container: Option<&'a str>,
@@ -8602,6 +8751,89 @@ impl std::error::Error for StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+    #[tokio::test]
+    async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let root_path = temp_dir.path().join("media");
+        tokio::fs::create_dir_all(&root_path)
+            .await
+            .expect("media root");
+        libraries
+            .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+            .await
+            .expect("library root");
+        let root = database
+            .list_library_roots(&library.id.to_string())
+            .await
+            .expect("roots")
+            .into_iter()
+            .next()
+            .expect("root");
+        let files = vec![
+            NewMovieFile {
+                filesystem_entry_id: "entry-1".to_owned(),
+                source_id: "source-1".to_owned(),
+                relative_path: "Movie/Movie.2024.mkv".to_owned(),
+                size: 1,
+                modified_at: 1,
+                fingerprint: vec![1],
+                title: "Movie".to_owned(),
+                sort_title: "movie".to_owned(),
+                original_title: "Movie".to_owned(),
+                production_year: Some(2024),
+                source_kind: "LOCAL_FILE".to_owned(),
+                edition_name: None,
+                quality_label: None,
+                container: "mkv".to_owned(),
+                external_url: None,
+            },
+            NewMovieFile {
+                filesystem_entry_id: "entry-2".to_owned(),
+                source_id: "source-2".to_owned(),
+                relative_path: "Movie/Movie.2024.Directors.Cut.mkv".to_owned(),
+                size: 2,
+                modified_at: 2,
+                fingerprint: vec![2],
+                title: "Movie".to_owned(),
+                sort_title: "movie".to_owned(),
+                original_title: "Movie".to_owned(),
+                production_year: Some(2024),
+                source_kind: "LOCAL_FILE".to_owned(),
+                edition_name: Some("Director's Cut".to_owned()),
+                quality_label: None,
+                container: "mkv".to_owned(),
+                external_url: None,
+            },
+        ];
+        let created_items = database
+            .insert_movie_files_batch(&library.id.to_string(), &root.id, "generation", &files)
+            .await
+            .expect("batch insert");
+
+        assert_eq!(created_items, 1);
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+            .fetch_one(database.pool())
+            .await
+            .expect("item count");
+        let source_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_sources")
+            .fetch_one(database.pool())
+            .await
+            .expect("source count");
+        assert_eq!(item_count, 1);
+        assert_eq!(source_count, 2);
+    }
 
     #[tokio::test]
     async fn write_probe_reports_a_query_only_sqlite_connection() {

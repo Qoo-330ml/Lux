@@ -28,7 +28,7 @@ use crate::{
     },
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     storage::{
-        Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource,
+        Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource, NewMovieFile,
         NewScanJobEvent, StorageError, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
     },
@@ -98,6 +98,7 @@ impl LibraryScanner {
                 .map(|entry| (entry.relative_path.clone(), entry))
                 .collect::<HashMap<_, _>>();
             let mut seen_entry_ids = Vec::new();
+            let mut pending_new_files = Vec::with_capacity(500);
             for path in files {
                 if let Some((entry_id, quick_report)) = self
                     .scan_movie_file_if_unchanged(&root_path, &path, &existing_entries)
@@ -105,6 +106,25 @@ impl LibraryScanner {
                 {
                     seen_entry_ids.push(entry_id);
                     report.merge(quick_report);
+                } else if !existing_entries.contains_key(
+                    path.strip_prefix(&root_path)
+                        .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                        .to_str()
+                        .ok_or(ScannerError::NonUtf8Path)?,
+                ) {
+                    if let Some(file) = self.prepare_new_movie_file(&root_path, &path).await? {
+                        pending_new_files.push(file);
+                        if pending_new_files.len() == 500 {
+                            self.flush_new_movie_files(
+                                &library_id_text,
+                                &root,
+                                &generation,
+                                &mut pending_new_files,
+                                &mut report,
+                            )
+                            .await?;
+                        }
+                    }
                 } else {
                     report.merge(
                         self.scan_movie_file(
@@ -118,6 +138,14 @@ impl LibraryScanner {
                     );
                 }
             }
+            self.flush_new_movie_files(
+                &library_id_text,
+                &root,
+                &generation,
+                &mut pending_new_files,
+                &mut report,
+            )
+            .await?;
             self.database
                 .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
                 .await?;
@@ -833,6 +861,96 @@ impl LibraryScanner {
                 ..ScanReport::default()
             },
         )))
+    }
+
+    async fn prepare_new_movie_file(
+        &self,
+        root_path: &Path,
+        path: &Path,
+    ) -> Result<Option<NewMovieFile>, ScannerError> {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        let Some(parsed_name) = parse_movie_filename(file_name) else {
+            return Ok(None);
+        };
+        let is_strm = is_strm_file(path);
+        let external_url = if is_strm {
+            read_strm_url(path).await?
+        } else {
+            None
+        };
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let size = i64::try_from(metadata.len())
+            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        let (device, inode) = file_identity(&metadata);
+        let fingerprint =
+            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let container = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Ok(Some(NewMovieFile {
+            filesystem_entry_id: FilesystemEntryId::new().to_string(),
+            source_id: SourceId::new().to_string(),
+            relative_path,
+            size,
+            modified_at,
+            fingerprint,
+            title: parsed_name.title.clone(),
+            sort_title: parsed_name.sort_title,
+            original_title: parsed_name.title,
+            production_year: parsed_name.production_year.map(i64::from),
+            source_kind: if is_strm {
+                "STRM_URL".to_owned()
+            } else {
+                "LOCAL_FILE".to_owned()
+            },
+            edition_name: parsed_name.edition_name,
+            quality_label: parsed_name.quality_label,
+            container,
+            external_url,
+        }))
+    }
+
+    async fn flush_new_movie_files(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        generation: &str,
+        files: &mut Vec<NewMovieFile>,
+        report: &mut ScanReport,
+    ) -> Result<(), ScannerError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let file_count = files.len();
+        report.created_items += self
+            .database
+            .insert_movie_files_batch(library_id_text, &root.id, generation, files)
+            .await?;
+        report.discovered_files += file_count;
+        report.created_sources += file_count;
+        files.clear();
+        Ok(())
     }
 
     pub(crate) async fn scan_movie_file(
