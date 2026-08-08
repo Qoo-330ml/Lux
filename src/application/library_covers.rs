@@ -31,6 +31,7 @@ pub const AUTO_LIBRARY_COVER_POSTER_COUNT: usize = 9;
 const AUTO_LIBRARY_COVER_CANDIDATE_LIMIT: i64 = 64;
 const AUTO_LIBRARY_COVER_WIDTH: u32 = 1920;
 const AUTO_LIBRARY_COVER_HEIGHT: u32 = 1080;
+const SMILEY_SANS_FONT: &[u8] = include_bytes!("../../assets/fonts/SmileySans-Oblique.ttf");
 
 #[derive(Clone)]
 pub struct LibraryCoverService {
@@ -45,7 +46,7 @@ impl LibraryCoverService {
         Self {
             database,
             directory,
-            font_path: discover_cover_font(),
+            font_path: configured_cover_font(),
             generation_lock: std::sync::Arc::new(Semaphore::new(1)),
         }
     }
@@ -96,13 +97,7 @@ impl LibraryCoverService {
             return Ok(AutoLibraryCoverResult::ExistingCover);
         }
 
-        let font_path = self
-            .font_path
-            .clone()
-            .ok_or(LibraryCoverError::FontNotFound)?;
-        let font_bytes = fs::read(&font_path)
-            .await
-            .map_err(|source| image_io_error(&font_path, source))?;
+        let font_bytes = self.load_font_bytes().await?;
         let library_subtitle = library_kind_subtitle(&library.kind);
         let library_name = library.name;
         let bytes = tokio::task::spawn_blocking(move || {
@@ -161,13 +156,7 @@ impl LibraryCoverService {
         if poster_bytes.len() < AUTO_LIBRARY_COVER_POSTER_COUNT {
             return Ok(AutoLibraryCoverResult::BelowThreshold);
         }
-        let font_path = self
-            .font_path
-            .clone()
-            .ok_or(LibraryCoverError::FontNotFound)?;
-        let font_bytes = fs::read(&font_path)
-            .await
-            .map_err(|source| image_io_error(&font_path, source))?;
+        let font_bytes = self.load_font_bytes().await?;
         let library_subtitle = library_kind_subtitle(&library.kind);
         let library_name = library.name;
         let bytes = tokio::task::spawn_blocking(move || {
@@ -212,6 +201,15 @@ impl LibraryCoverService {
             }
         }
         Ok(poster_bytes)
+    }
+
+    async fn load_font_bytes(&self) -> Result<Vec<u8>, LibraryCoverError> {
+        let Some(font_path) = self.font_path.as_ref() else {
+            return Ok(bundled_cover_font().to_vec());
+        };
+        fs::read(font_path)
+            .await
+            .map_err(|source| image_io_error(font_path, source))
     }
 
     pub async fn store(
@@ -548,17 +546,12 @@ impl ImageFormat {
     }
 }
 
-fn discover_cover_font() -> Option<PathBuf> {
-    let configured = std::env::var_os("LUX_COVER_FONT_PATH").map(PathBuf::from);
-    configured
-        .into_iter()
-        .chain([
-            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
-            PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"),
-        ])
-        .find(|path| path.is_file())
+fn configured_cover_font() -> Option<PathBuf> {
+    std::env::var_os("LUX_COVER_FONT_PATH").map(PathBuf::from)
+}
+
+fn bundled_cover_font() -> &'static [u8] {
+    SMILEY_SANS_FONT
 }
 
 fn render_auto_library_cover(
@@ -935,7 +928,16 @@ fn image_io_error(path: &Path, source: std::io::Error) -> LibraryCoverError {
 mod tests {
     use image::Rgba;
 
-    use super::{RgbaImage, add_shadow, library_kind_subtitle, rotate_cover_column};
+    use super::{
+        RgbaImage, add_shadow, bundled_cover_font, library_kind_subtitle, rotate_cover_column,
+    };
+
+    #[test]
+    fn bundled_cover_font_is_smiley_sans() {
+        let font = bundled_cover_font();
+        assert!(font.len() > 2_000_000);
+        assert!(font.starts_with(&[0x00, 0x01, 0x00, 0x00]));
+    }
 
     #[test]
     fn library_kind_uses_english_cover_subtitle() {

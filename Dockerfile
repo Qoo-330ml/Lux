@@ -19,6 +19,7 @@ RUN apt-get update \
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src ./src
+COPY assets ./assets
 COPY migrations ./migrations
 COPY logo.svg ./logo.svg
 COPY web ./web
@@ -69,10 +70,11 @@ LABEL org.opencontainers.image.title="Lux" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg fonts-noto-cjk \
-    && mkdir -p /config /media /usr/local/share/lux/plugins \
+    && mkdir -p /config /media /usr/local/share/lux/plugins /usr/share/doc/lux \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
+COPY --from=builder /src/assets/fonts/SmileySans-LICENSE.txt /usr/share/doc/lux/SmileySans-LICENSE.txt
 COPY --from=builder /src/dist/org.lux.tmdb.zip /usr/local/share/lux/plugins/org.lux.tmdb.zip
 COPY --from=builder /src/dist/org.lux.ip-hiofd.zip /usr/local/share/lux/plugins/org.lux.ip-hiofd.zip
 COPY --from=builder /src/dist/org.lux.qoo-ip138.zip /usr/local/share/lux/plugins/org.lux.qoo-ip138.zip
