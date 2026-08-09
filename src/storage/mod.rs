@@ -5919,6 +5919,7 @@ impl Database {
             filter.library_ids,
             filter.user_id,
             filter.item_types,
+            filter.item_ids,
             filter.years,
             filter.is_played,
             filter.is_favorite,
@@ -8758,6 +8759,7 @@ fn catalog_filter_where_clause<'a>(
     library_ids: &'a [String],
     user_id: &'a str,
     item_types: &'a [String],
+    item_ids: Option<&'a [String]>,
     years: &'a [i64],
     is_played: Option<bool>,
     is_favorite: Option<bool>,
@@ -8774,6 +8776,23 @@ fn catalog_filter_where_clause<'a>(
         .iter()
         .map(|library_id| CatalogBind::Text(library_id.as_str()))
         .collect::<Vec<_>>();
+    match item_ids {
+        Some([]) => where_clause.push_str(" AND 1 = 0"),
+        Some(item_ids) => {
+            where_clause.push_str(&format!(
+                " AND mi.id IN ({})",
+                std::iter::repeat_n("?", item_ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            binds.extend(
+                item_ids
+                    .iter()
+                    .map(|item_id| CatalogBind::Text(item_id.as_str())),
+            );
+        }
+        None => {}
+    }
     if !item_types.is_empty() {
         where_clause.push_str(&format!(
             " AND mi.item_type IN ({})",
@@ -8887,6 +8906,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) library_ids: &'a [String],
     pub(crate) user_id: &'a str,
     pub(crate) item_types: &'a [String],
+    pub(crate) item_ids: Option<&'a [String]>,
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,

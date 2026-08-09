@@ -79,6 +79,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'beta movie'")
             .fetch_one(database.pool())
             .await?;
+    let alpha_source_id: String =
+        sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
     sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
         .bind(300_i64)
         .bind(&item_id)
@@ -288,6 +293,62 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         emby_page_body["Items"][0]["MediaSources"][0]["Container"],
         "mkv"
     );
+
+    let filtered_by_item_id = client
+        .get(format!(
+            "{base_url}/Items?Ids={item_id}&Fields=Path,MediaSources&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(filtered_by_item_id.status(), reqwest::StatusCode::OK);
+    let filtered_by_item_id_body: Value = filtered_by_item_id.json().await?;
+    assert_eq!(filtered_by_item_id_body["TotalRecordCount"], 1);
+    assert_eq!(
+        filtered_by_item_id_body["Items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(filtered_by_item_id_body["Items"][0]["Id"], item_id);
+
+    let filtered_by_multiple_item_ids = client
+        .get(format!(
+            "{base_url}/Items?Ids={item_id},{beta_item_id}&Limit=10"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        filtered_by_multiple_item_ids.status(),
+        reqwest::StatusCode::OK
+    );
+    let filtered_by_multiple_item_ids_body: Value = filtered_by_multiple_item_ids.json().await?;
+    assert_eq!(filtered_by_multiple_item_ids_body["TotalRecordCount"], 2);
+    assert_eq!(
+        filtered_by_multiple_item_ids_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    for id in [
+        alpha_source_id,
+        "00000000-0000-0000-0000-000000000000".to_owned(),
+    ] {
+        let filtered_by_unknown_id = client
+            .get(format!("{base_url}/Items?Ids={id}&Limit=1"))
+            .header("X-Emby-Token", &admin_token)
+            .send()
+            .await?;
+        assert_eq!(filtered_by_unknown_id.status(), reqwest::StatusCode::OK);
+        let filtered_by_unknown_id_body: Value = filtered_by_unknown_id.json().await?;
+        assert_eq!(filtered_by_unknown_id_body["TotalRecordCount"], 0);
+        assert_eq!(
+            filtered_by_unknown_id_body["Items"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+    }
 
     let emby_compact_page = client
         .get(format!(

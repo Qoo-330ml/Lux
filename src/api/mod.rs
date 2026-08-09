@@ -1452,6 +1452,8 @@ struct EmbyItemsQuery {
     user_id: Option<String>,
     #[serde(rename = "ParentId", default)]
     parent_id: Option<String>,
+    #[serde(rename = "Ids", default)]
+    ids: Option<String>,
     #[serde(rename = "IncludeItemTypes", default)]
     include_item_types: Option<String>,
     #[serde(rename = "SeasonId", default)]
@@ -1526,6 +1528,7 @@ fn catalog_filter_from_values(
         .unwrap_or_default();
     CatalogFilter {
         item_types,
+        item_ids: None,
         years,
         is_played,
         is_favorite,
@@ -1545,14 +1548,23 @@ fn catalog_filter_from_values(
 }
 
 fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
-    catalog_filter_from_values(
+    let mut filter = catalog_filter_from_values(
         query.include_item_types.as_deref(),
         query.years.as_deref(),
         query.is_played,
         query.is_favorite,
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
-    )
+    );
+    filter.item_ids = query.ids.as_deref().map(|values| {
+        values
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    filter
 }
 
 async fn emby_user_views(
