@@ -21,11 +21,11 @@ docker compose --profile postgres pull
 docker compose --profile postgres up -d
 ```
 
-该 PostgreSQL 服务是独立容器，不是 Lux 容器内的子进程；它的数据保存在 Docker 管理的命名卷
-`postgres-data`，不需要手动创建目录。执行 `docker compose down` 时数据卷会保留；只有执行
-`docker compose down -v` 才会删除该数据库数据。启用 profile 后，在 Lux 引导中选择 PostgreSQL，
-主机填写 Compose 服务名 `postgres`，端口填写 `5432`。也可以不启用 profile，连接外部已有的
-PostgreSQL 服务。
+该 PostgreSQL 服务是独立容器，不是 Lux 容器内的子进程；它的数据直接保存在项目目录
+`./postgres-data`，首次启动时 Docker 会自动创建该目录。执行 `docker compose down` 或
+`docker compose down -v` 都不会删除这个目录；只有手动删除 `./postgres-data` 才会删除数据库数据，
+因此删除前应先备份。启用 profile 后，在 Lux 引导中选择 PostgreSQL，主机填写 Compose 服务名
+`postgres`，端口填写 `5432`。也可以不启用 profile，连接外部已有的 PostgreSQL 服务。
 
 镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本会创建 `/config/plugins`，并将镜像内置的 TMDb 插件包复制到持久化配置目录；不会递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。项目自带的 TMDb 插件会在发现后自动标记为已安装、已启用。
 

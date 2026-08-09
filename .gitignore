@@ -10,6 +10,7 @@
 /config/
 /media/
 /data/
+/postgres-data/
 /logs/
 /compose.override.yaml
 /compose.override.yml

@@ -20,15 +20,11 @@ services:
       POSTGRES_USER: ${LUX_POSTGRES_USER:-lux}
       POSTGRES_PASSWORD: ${LUX_POSTGRES_PASSWORD:-}
     volumes:
-      # Docker-managed persistent storage for PostgreSQL data.
-      # `docker compose down` keeps it; `docker compose down -v` removes it.
-      - postgres-data:/var/lib/postgresql/data
+      # Store PostgreSQL data directly in the project directory.
+      - ./postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
-
-volumes:
-  postgres-data:
