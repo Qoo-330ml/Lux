@@ -18,6 +18,7 @@ use crate::{
 pub struct CatalogFilter {
     pub item_types: Vec<String>,
     pub item_ids: Option<Vec<String>>,
+    pub media_source_ids: Option<Vec<String>>,
     pub years: Vec<i64>,
     pub is_played: Option<bool>,
     pub is_favorite: Option<bool>,
@@ -100,6 +101,7 @@ impl CatalogService {
             user_id: &user_id,
             item_types: &filter.item_types,
             item_ids: filter.item_ids.as_deref(),
+            media_source_ids: filter.media_source_ids.as_deref(),
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
@@ -138,6 +140,7 @@ impl CatalogService {
             user_id: &user_id,
             item_types: &filter.item_types,
             item_ids: filter.item_ids.as_deref(),
+            media_source_ids: filter.media_source_ids.as_deref(),
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,

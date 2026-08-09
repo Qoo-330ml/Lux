@@ -1315,6 +1315,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 ### 15.4 必须正确的 Emby 查询语义
 
 - UserId、ParentId、Ids。
+- `GET /Items` 的 `Ids` 严格匹配条目 ID；为兼容使用媒体源 ID 查询路径的 Emby 代理，也可匹配 `MediaSourceId` 并返回其所属条目。完全未知的 ID 返回空列表，不得回退为未过滤目录页。
 - IncludeItemTypes、ExcludeItemTypes。
 - Recursive。
 - StartIndex、Limit。

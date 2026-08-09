@@ -1589,6 +1589,7 @@ fn catalog_filter_from_values(
     CatalogFilter {
         item_types,
         item_ids: None,
+        media_source_ids: None,
         years,
         is_played,
         is_favorite,
@@ -1616,7 +1617,7 @@ fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
     );
-    filter.item_ids = query.ids.as_deref().map(|values| {
+    let ids = query.ids.as_deref().map(|values| {
         values
             .split(',')
             .map(str::trim)
@@ -1624,36 +1625,9 @@ fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
             .map(str::to_owned)
             .collect()
     });
+    filter.item_ids = ids.clone();
+    filter.media_source_ids = ids;
     filter
-}
-
-async fn emby_compat_item_ids(
-    state: &AppState,
-    ids: Option<&str>,
-) -> Result<Option<Vec<String>>, StatusCode> {
-    let Some(ids) = ids else {
-        return Ok(None);
-    };
-    let ids = ids
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    if ids.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    let Some(database) = state.database.as_ref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    let mut resolved_ids = Vec::with_capacity(ids.len());
-    for id in ids {
-        match database.resolve_emby_item_id(id).await {
-            Ok(Some(item_id)) => resolved_ids.push(item_id),
-            Ok(None) => resolved_ids.push(id.to_owned()),
-            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
-        }
-    }
-    Ok(Some(resolved_ids))
 }
 
 fn emby_compat_media_source_id<'a>(ids: Option<&'a str>, page: &CatalogPage) -> Option<&'a str> {
@@ -2172,11 +2146,7 @@ async fn emby_catalog_page_from_query(
     let Some(catalog) = state.catalog.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let mut filter = catalog_filter_from_emby(query);
-    filter.item_ids = match emby_compat_item_ids(state, query.ids.as_deref()).await {
-        Ok(item_ids) => item_ids,
-        Err(status) => return Err(status),
-    };
+    let filter = catalog_filter_from_emby(query);
     let page = match query.parent_id.as_deref() {
         Some(parent_id) => {
             let Ok(parent_id) = parent_id.parse::<crate::domain::ids::LibraryId>() else {
@@ -12128,7 +12098,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        build_cookie, emby_media_source_json, emby_media_stream_item_id,
+        build_cookie, catalog_filter_from_emby, emby_media_source_json, emby_media_stream_item_id,
         emby_playback_info_item_id, is_emby_legacy_strm_path, is_emby_media_stream_segment,
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
         is_registered_emby_video_path, lux_catalog_source_json, playback_client_label,
@@ -12144,6 +12114,25 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri};
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn emby_ids_filter_preserves_item_and_media_source_candidates() {
+        let query = super::EmbyItemsQuery {
+            ids: Some("item-1, source-2".to_owned()),
+            ..super::EmbyItemsQuery::default()
+        };
+
+        let filter = catalog_filter_from_emby(&query);
+
+        assert_eq!(
+            filter.item_ids,
+            Some(vec!["item-1".to_owned(), "source-2".to_owned()])
+        );
+        assert_eq!(
+            filter.media_source_ids,
+            Some(vec!["item-1".to_owned(), "source-2".to_owned()])
+        );
+    }
 
     #[test]
     fn direct_http_cookie_is_not_marked_secure() {

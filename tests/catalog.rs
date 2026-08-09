@@ -331,7 +331,9 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     );
 
     let filtered_by_media_source_id = client
-        .get(format!("{base_url}/Items?Ids={alpha_source_id}&Limit=1"))
+        .get(format!(
+            "{base_url}/Items?Ids={alpha_source_id}&Fields=Path,MediaSources&Limit=1"
+        ))
         .header("X-Emby-Token", &admin_token)
         .send()
         .await?;
@@ -341,6 +343,12 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     );
     let filtered_by_media_source_id_body: Value = filtered_by_media_source_id.json().await?;
     assert_eq!(filtered_by_media_source_id_body["TotalRecordCount"], 1);
+    assert_eq!(
+        filtered_by_media_source_id_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
     assert_eq!(filtered_by_media_source_id_body["Items"][0]["Id"], item_id);
     assert_eq!(
         filtered_by_media_source_id_body["Items"][0]["MediaSources"][0]["Id"],
