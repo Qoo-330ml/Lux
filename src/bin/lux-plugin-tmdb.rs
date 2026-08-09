@@ -297,6 +297,7 @@ async fn search_movies(
     let client = client()
         .await
         .map_err(|error| luxd::application::tmdb::TmdbError::Transport(error.message))?;
+    let mut last_response = None;
     for search_year in search_years(year) {
         for candidate in title_candidates(query) {
             let response = client
@@ -305,9 +306,10 @@ async fn search_movies(
             if !response.results.is_empty() {
                 return Ok(response);
             }
+            last_response = Some(response);
         }
     }
-    Err(luxd::application::tmdb::TmdbError::NotFound)
+    completed_search(last_response)
 }
 
 async fn search_tv(
@@ -318,15 +320,21 @@ async fn search_tv(
     let client = client()
         .await
         .map_err(|error| luxd::application::tmdb::TmdbError::Transport(error.message))?;
+    let mut last_response = None;
     for search_year in search_years(year) {
         for candidate in title_candidates(query) {
             let response = client.search_tv(&candidate, search_year, language).await?;
             if !response.results.is_empty() {
                 return Ok(response);
             }
+            last_response = Some(response);
         }
     }
-    Err(luxd::application::tmdb::TmdbError::NotFound)
+    completed_search(last_response)
+}
+
+fn completed_search<T>(last_response: Option<T>) -> Result<T, luxd::application::tmdb::TmdbError> {
+    last_response.ok_or(luxd::application::tmdb::TmdbError::NotFound)
 }
 
 fn search_years(year: Option<i32>) -> Vec<Option<i32>> {
@@ -1049,5 +1057,24 @@ fn tmdb_error(error: luxd::application::tmdb::TmdbError) -> PluginRpcError {
     PluginRpcError {
         code: "PLUGIN_PROVIDER_ERROR".to_owned(),
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_search_response_is_not_reported_as_a_provider_error() {
+        let response = TmdbMovieSearchResponse {
+            page: 1,
+            total_pages: 0,
+            total_results: 0,
+            results: Vec::new(),
+        };
+
+        let completed = completed_search(Some(response)).expect("empty response");
+
+        assert!(completed.results.is_empty());
     }
 }
