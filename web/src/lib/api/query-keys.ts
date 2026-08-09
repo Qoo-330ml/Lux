@@ -1,5 +1,6 @@
 export const queryKeys = {
   setup: ["setup"] as const,
+  setupDatabase: ["setup", "database"] as const,
   me: ["me"] as const,
   home: ["home"] as const,
   libraries: ["libraries"] as const,

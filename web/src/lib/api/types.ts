@@ -2,6 +2,27 @@ export type SetupStatus = {
   initialized: boolean;
 };
 
+export type SetupDatabaseBackend = "SQLITE" | "POSTGRESQL";
+
+export type SetupDatabaseStatus = {
+  configured: boolean;
+  backend?: SetupDatabaseBackend | null;
+  currentBackend: SetupDatabaseBackend;
+  restartRequired: boolean;
+};
+
+export type DatabaseSetupInput =
+  | { backend: "SQLITE" }
+  | {
+      backend: "POSTGRESQL";
+      host: string;
+      port: number;
+      database: string;
+      username: string;
+      password: string;
+      sslMode: "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
+    };
+
 export type LuxUser = {
   id: string;
   usernameNormalized: string;

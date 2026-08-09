@@ -394,6 +394,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-auth-backdrop { position: absolute; inset: 0; background: radial-gradient(circle at 50% 20%, rgba(93, 55, 89, .24), transparent 40%), linear-gradient(120deg, #15151a, #050506 60%); opacity: .75; }
 .lux-auth-card { position: relative; width: min(100%, 430px); padding: 44px; border: 1px solid var(--lux-line); border-radius: 18px; background: rgba(14,14,17,.78); box-shadow: 0 28px 90px rgba(0,0,0,.54); backdrop-filter: blur(20px); }
 .lux-setup-card { width: min(100%, 530px); }
+.lux-setup-database-options { display: grid; gap: 12px; border: 0; padding: 0; margin: 20px 0 0; }
+.lux-setup-database-options legend { font-weight: 700; margin-bottom: 4px; }
+.lux-setup-database-options label { display: grid; grid-template-columns: auto 1fr; gap: 7px 10px; align-items: start; padding: 12px; border: 1px solid var(--lux-border); border-radius: 10px; cursor: pointer; }
+.lux-setup-database-options small { grid-column: 2; color: var(--lux-text-muted); }
+.lux-setup-postgres-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.lux-setup-database-actions { display: flex; gap: 10px; margin-top: 20px; }
+.lux-success-copy { color: #9dd9b4; }
 .lux-auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 44px; font-size: 1.16rem; }
 .lux-auth-card h1 { margin: 13px 0 8px; font-size: 1.8rem; letter-spacing: -.055em; }
 .lux-auth-card > p { margin: 0; color: var(--lux-muted); line-height: 1.6; }

@@ -23,6 +23,38 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
   });
 
+  it("checks and selects the configured database backend without changing the setup API contract", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      expect(path).toMatch(/\/api\/v1\/setup\/database/);
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        backend: "POSTGRESQL",
+        host: "127.0.0.1",
+        port: 5432,
+        database: "lux",
+        username: "lux",
+        sslMode: "disable",
+      });
+      return path.endsWith("/test")
+        ? new Response(JSON.stringify({ ok: true, backend: "POSTGRESQL" }), { status: 200 })
+        : new Response(JSON.stringify({ selected: true, backend: "POSTGRESQL", restartRequired: true }), { status: 200 });
+    });
+
+    const input = {
+      backend: "POSTGRESQL" as const,
+      host: "127.0.0.1",
+      port: 5432,
+      database: "lux",
+      username: "lux",
+      password: "test-only-password",
+      sslMode: "disable" as const,
+    };
+    await expect(new LuxApiClient().testDatabase(input)).resolves.toMatchObject({ ok: true });
+    await expect(new LuxApiClient().selectDatabase(input)).resolves.toMatchObject({ restartRequired: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("turns the Lux error envelope into a typed error", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(

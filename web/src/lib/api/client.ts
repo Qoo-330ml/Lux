@@ -17,6 +17,7 @@ import type {
   AdminMetadataReidentifyStart,
   AdminPlugin,
   ApiErrorBody,
+  DatabaseSetupInput,
   HomeResponse,
   Library,
   LuxUser,
@@ -29,6 +30,8 @@ import type {
   PlaybackState,
   PlaybackEventState,
   SetupStatus,
+  SetupDatabaseBackend,
+  SetupDatabaseStatus,
   MetadataRefreshMode,
 } from "./types";
 
@@ -121,6 +124,28 @@ export class LuxApiClient {
 
   setupStatus() {
     return this.request<SetupStatus>("/api/v1/setup/status");
+  }
+
+  setupDatabaseStatus() {
+    return this.request<SetupDatabaseStatus>("/api/v1/setup/database");
+  }
+
+  testDatabase(input: DatabaseSetupInput) {
+    return this.request<{ ok: boolean; backend: SetupDatabaseBackend }>(
+      "/api/v1/setup/database/test",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  selectDatabase(input: DatabaseSetupInput) {
+    return this.request<{
+      selected: boolean;
+      backend: SetupDatabaseBackend;
+      restartRequired: boolean;
+    }>("/api/v1/setup/database/select", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
   }
 
   setup(input: {
