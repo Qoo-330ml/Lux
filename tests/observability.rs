@@ -87,6 +87,34 @@ mod unix {
             .to_str()?
             .to_owned();
 
+        let playback_info = client
+            .get(format!(
+                "http://{address}/Items/playback-log-item/PlaybackInfo"
+            ))
+            .query(&[("api_key", "playback-secret")])
+            .send()
+            .await?;
+        assert_eq!(playback_info.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let playback_info_request_id = playback_info
+            .headers()
+            .get("x-request-id")
+            .ok_or("missing PlaybackInfo request ID")?
+            .to_str()?
+            .to_owned();
+
+        let playback_stream = client
+            .get(format!("http://{address}/Videos/playback-log-item/stream"))
+            .query(&[("api_key", "stream-secret")])
+            .send()
+            .await?;
+        assert_eq!(playback_stream.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let playback_stream_request_id = playback_stream
+            .headers()
+            .get("x-request-id")
+            .ok_or("missing playback stream request ID")?
+            .to_str()?
+            .to_owned();
+
         send_signal("TERM", pid).await?;
         let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
             .await
@@ -124,6 +152,31 @@ mod unix {
             .ok_or("missing structured error response log")?;
         assert_eq!(error_log["span"]["errorCode"], "AUTHENTICATION_REQUIRED");
         assert_eq!(error_log["span"]["statusCode"], 401);
+
+        let playback_log = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| {
+                value["fields"]["event"] == "emby_playback_info"
+                    && value["fields"]["request_id"] == playback_info_request_id
+            })
+            .ok_or("missing structured PlaybackInfo log")?;
+        assert_eq!(playback_log["fields"]["status_code"], 401);
+        assert_eq!(playback_log["fields"]["item_id_prefix"], "playback");
+
+        let playback_stream_log = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| {
+                value["fields"]["event"] == "emby_media_stream_failure"
+                    && value["fields"]["request_id"] == playback_stream_request_id
+            })
+            .ok_or("missing structured playback stream failure log")?;
+        assert_eq!(playback_stream_log["fields"]["status_code"], 401);
+        assert_eq!(playback_stream_log["fields"]["item_id_prefix"], "playback");
+        assert!(!logs.contains("playback-secret"));
+        assert!(!logs.contains("stream-secret"));
+        assert!(!logs.contains("?api_key"));
         Ok(())
     }
 

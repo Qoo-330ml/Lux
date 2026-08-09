@@ -690,6 +690,8 @@ pub fn app_with_state(state: AppState) -> Router {
         .with_state(state)
         .layer(middleware::from_fn(attach_peer_address))
         .layer(middleware::from_fn(trace_emby_playback_callback))
+        .layer(middleware::from_fn(trace_emby_playback_info))
+        .layer(middleware::from_fn(trace_emby_media_stream_failure))
         .layer(middleware::from_fn(normalize_empty_api_service_unavailable))
         .layer(
             tower::ServiceBuilder::new()
@@ -795,6 +797,41 @@ fn is_emby_playback_callback_path(path: &str) -> bool {
     )
 }
 
+fn emby_playback_info_item_id(path: &str) -> Option<&str> {
+    let path = path.strip_suffix("/PlaybackInfo")?;
+    let item_id = path
+        .strip_prefix("/Items/")
+        .or_else(|| path.strip_prefix("/emby/Items/"))?;
+    (!item_id.is_empty() && !item_id.contains('/')).then_some(item_id)
+}
+
+fn emby_media_stream_item_id(path: &str) -> Option<&str> {
+    let path = path
+        .strip_prefix("/Videos/")
+        .or_else(|| path.strip_prefix("/emby/Videos/"))?;
+    let mut segments = path.split('/');
+    let item_id = segments.next()?;
+    let second_segment = segments.next()?;
+    let third_segment = segments.next();
+    if segments.next().is_some() || item_id.is_empty() {
+        return None;
+    }
+    match third_segment {
+        None if is_emby_media_stream_segment(second_segment) => Some(item_id),
+        Some(stream) if !second_segment.is_empty() && is_emby_media_stream_segment(stream) => {
+            Some(item_id)
+        }
+        _ => None,
+    }
+}
+
+fn is_emby_media_stream_segment(segment: &str) -> bool {
+    segment == "stream"
+        || segment
+            .strip_prefix("stream.")
+            .is_some_and(|container| !container.is_empty())
+}
+
 async fn trace_emby_playback_callback(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path().to_owned();
     if !is_emby_playback_callback_path(&path) {
@@ -819,6 +856,60 @@ async fn trace_emby_playback_callback(request: Request<Body>, next: Next) -> Res
         duration_ms,
         "processed emby playback callback"
     );
+    response
+}
+
+async fn trace_emby_playback_info(request: Request<Body>, next: Next) -> Response {
+    let Some(item_id) = emby_playback_info_item_id(request.uri().path()).map(str::to_owned) else {
+        return next.run(request).await;
+    };
+    let method = request.method().clone();
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_owned();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        event = "emby_playback_info",
+        method = %method,
+        item_id_prefix = %playback_identifier_prefix(&item_id),
+        request_id = %request_id,
+        status_code = response.status().as_u16(),
+        duration_ms,
+        "processed emby PlaybackInfo request"
+    );
+    response
+}
+
+async fn trace_emby_media_stream_failure(request: Request<Body>, next: Next) -> Response {
+    let Some(item_id) = emby_media_stream_item_id(request.uri().path()).map(str::to_owned) else {
+        return next.run(request).await;
+    };
+    let method = request.method().clone();
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_owned();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::warn!(
+            event = "emby_media_stream_failure",
+            method = %method,
+            item_id_prefix = %playback_identifier_prefix(&item_id),
+            request_id = %request_id,
+            status_code = response.status().as_u16(),
+            duration_ms,
+            "emby media stream request failed"
+        );
+    }
     response
 }
 
@@ -11881,7 +11972,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        build_cookie, emby_media_source_json, is_emby_playback_callback_path,
+        build_cookie, emby_media_source_json, emby_media_stream_item_id,
+        emby_playback_info_item_id, is_emby_media_stream_segment, is_emby_playback_callback_path,
         lux_catalog_source_json, playback_client_label, playback_identifier_prefix,
         record_activity_event, safe_trace_path, secure_cookie_for_request,
     };
@@ -11961,6 +12053,48 @@ mod tests {
         assert!(!is_emby_playback_callback_path(
             "/Sessions/Playing?api_key=secret"
         ));
+    }
+
+    #[test]
+    fn playback_info_trace_extracts_only_single_path_segments() {
+        assert_eq!(
+            emby_playback_info_item_id("/Items/item-123/PlaybackInfo"),
+            Some("item-123")
+        );
+        assert_eq!(
+            emby_playback_info_item_id("/emby/Items/item-123/PlaybackInfo"),
+            Some("item-123")
+        );
+        assert_eq!(
+            emby_playback_info_item_id("/Items/item-123/PlaybackInfo?api_key=secret"),
+            None
+        );
+        assert_eq!(
+            emby_playback_info_item_id("/Items/item-123/PlaybackInfo/extra"),
+            None
+        );
+    }
+
+    #[test]
+    fn media_stream_trace_matches_only_direct_stream_routes() {
+        assert_eq!(
+            emby_media_stream_item_id("/Videos/item-123/stream"),
+            Some("item-123")
+        );
+        assert_eq!(
+            emby_media_stream_item_id("/emby/Videos/item-123/source-456/stream.mkv"),
+            Some("item-123")
+        );
+        assert!(is_emby_media_stream_segment("stream.mp4"));
+        assert!(!is_emby_media_stream_segment("Subtitles"));
+        assert_eq!(
+            emby_media_stream_item_id("/Videos/item-123/source-456/Subtitles/0/Stream"),
+            None
+        );
+        assert_eq!(
+            emby_media_stream_item_id("/Videos/item-123/stream?api_key=secret"),
+            None
+        );
     }
 
     #[test]
