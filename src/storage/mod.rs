@@ -1079,7 +1079,7 @@ impl Database {
                  SET is_enabled = ?, updated_at = unixepoch()
                  WHERE id = ?",
             )
-            .bind(value)
+            .bind(database_flag(value))
             .bind(library_id)
             .execute(&mut *transaction)
             .await
@@ -1094,7 +1094,7 @@ impl Database {
                  SET realtime_watch_enabled = ?, updated_at = unixepoch()
                  WHERE id = ?",
             )
-            .bind(value)
+            .bind(database_flag(value))
             .bind(library_id)
             .execute(&mut *transaction)
             .await
@@ -7516,14 +7516,18 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        self.query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.query_scalar(
+            "SELECT metadata_fingerprint
+             FROM media_items
+             WHERE id = ? AND metadata_fingerprint IS NOT NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn mark_media_item_metadata_checked(
