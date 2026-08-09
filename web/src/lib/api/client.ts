@@ -577,6 +577,27 @@ export class LuxApiClient {
     );
   }
 
+  async exportAdminLogs(from: string, to: string) {
+    const params = new URLSearchParams({ from, to });
+    const headers = new Headers({ Accept: "application/zip" });
+    const response = await fetch(`/api/v1/admin/logs/export?${params}`, {
+      credentials: "same-origin",
+      headers,
+    });
+    if (!response.ok) {
+      const body = await readJson<ApiErrorBody>(response);
+      throw new ApiError(
+        body && "error" in body ? body.error?.message ?? "请求失败" : "请求失败",
+        {
+          code: body && "error" in body ? body.error?.code : undefined,
+          requestId: body && "error" in body ? body.error?.requestId : undefined,
+          status: response.status,
+        },
+      );
+    }
+    return response.blob();
+  }
+
   adminSettings() {
     return this.request<AdminSettings>("/api/v1/admin/settings");
   }

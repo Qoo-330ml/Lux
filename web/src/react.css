@@ -795,6 +795,19 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-operations-log-toolbar { display: flex; gap: 9px; margin-bottom: 13px; }
 .lux-operations-log-toolbar input { flex: 1; min-height: 37px; min-width: 0; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.04); font-size: .72rem; }
 .lux-operations-log-toolbar input:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.lux-log-export-panel { display: grid; gap: 13px; margin-bottom: 18px; padding: 14px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: rgba(255,255,255,.025); }
+.lux-log-export-copy { display: flex; align-items: flex-start; gap: 9px; color: var(--lux-muted); }
+.lux-log-export-copy > svg { flex: 0 0 auto; margin-top: 1px; color: var(--lux-accent); }
+.lux-log-export-copy strong, .lux-log-export-copy span { display: block; }
+.lux-log-export-copy strong { color: var(--lux-text); font-size: .76rem; }
+.lux-log-export-copy span { margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-log-export-controls { display: flex; align-items: flex-end; gap: 9px; flex-wrap: wrap; }
+.lux-log-export-controls label { display: grid; gap: 5px; color: var(--lux-subtle); font-size: .65rem; }
+.lux-log-export-controls input { min-height: 37px; padding: 0 9px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-text); background: rgba(255,255,255,.04); font: inherit; }
+.lux-log-export-controls input:focus { border-color: rgba(255,255,255,.46); outline: 0; box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.lux-log-export-controls .lux-button { min-height: 37px; }
+.lux-log-export-panel .lux-error-copy, .lux-log-export-success { margin: 0; font-size: .68rem; }
+.lux-log-export-success { color: #9bdcb3; }
 .lux-operations-log-row { display: grid; grid-template-columns: 45px minmax(0, 1fr) auto auto; align-items: start; gap: 11px; padding: 13px 12px; border-bottom: 1px solid var(--lux-line-soft); }
 .lux-operations-log-row:first-child { border-top: 1px solid var(--lux-line-soft); }
 .lux-operations-log-level { padding-top: 2px; color: #9bdcb3; font-size: .61rem; font-weight: 700; letter-spacing: .05em; }
@@ -981,6 +994,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-operations-log-row { grid-template-columns: 45px minmax(0, 1fr) auto; }
   .lux-operations-log-row time { grid-column: 2; grid-row: 2; padding-top: 0; }
   .lux-operations-log-row > .lux-icon-button { grid-column: 3; grid-row: 1 / span 2; }
+  .lux-log-export-controls { display: grid; grid-template-columns: 1fr 1fr; align-items: end; }
+  .lux-log-export-controls .lux-button { grid-column: 1 / -1; }
 }
 
 /* Library manager reference layout */

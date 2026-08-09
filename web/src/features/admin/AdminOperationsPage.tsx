@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  AlertTriangle,
-  CheckCircle2,
-  ClipboardList,
+    AlertTriangle,
+    CalendarDays,
+    CheckCircle2,
+    ClipboardList,
+    Download,
   FileClock,
   Inbox,
   Pencil,
@@ -101,6 +103,11 @@ export function AdminOperationsPage() {
   const [status, setStatus] = useState("");
   const [logLevel, setLogLevel] = useState("");
   const [logSearch, setLogSearch] = useState("");
+  const [logExportFrom, setLogExportFrom] = useState(() => defaultLogDateRange().from);
+  const [logExportTo, setLogExportTo] = useState(() => defaultLogDateRange().to);
+  const [logExporting, setLogExporting] = useState(false);
+  const [logExportError, setLogExportError] = useState("");
+  const [logExportSuccess, setLogExportSuccess] = useState(false);
   const [taskPage, setTaskPage] = useState(1);
   const tasks = useQuery({
     queryKey: queryKeys.adminScheduledTasks(taskPage),
@@ -160,6 +167,31 @@ export function AdminOperationsPage() {
   const runningCount = jobItems.filter((job) => isActiveJob(job.status)).length;
   const failedCount = jobItems.filter((job) => job.status === "FAILED").length;
   const enabledCount = registeredTasks.filter((task) => task.isEnabled && Boolean(task.schedule)).length;
+  async function exportLogs() {
+    setLogExportError("");
+    setLogExportSuccess(false);
+    if (!logExportFrom || !logExportTo || logExportFrom > logExportTo) {
+      setLogExportError("请选择有效的 UTC 起止日期。");
+      return;
+    }
+    setLogExporting(true);
+    try {
+      const blob = await api.exportAdminLogs(logExportFrom, logExportTo);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `lux-logs-${logExportFrom.replaceAll("-", "")}-${logExportTo.replaceAll("-", "")}.zip`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      setLogExportSuccess(true);
+    } catch (error) {
+      setLogExportError(error instanceof Error ? error.message : "日志导出失败，请重试。");
+    } finally {
+      setLogExporting(false);
+    }
+  }
   return (
     <div className="lux-admin-page lux-admin-operations-page">
       <header className="lux-admin-page-heading lux-operations-heading">
@@ -200,7 +232,21 @@ export function AdminOperationsPage() {
         />
       ) : null}
       {tab === "logs" ? (
-        <LogsSection logs={logItems} level={logLevel} search={logSearch} onLevelChange={setLogLevel} onSearchChange={setLogSearch} />
+        <LogsSection
+          logs={logItems}
+          level={logLevel}
+          search={logSearch}
+          onLevelChange={setLogLevel}
+          onSearchChange={setLogSearch}
+          exportFrom={logExportFrom}
+          exportTo={logExportTo}
+          onExportFromChange={setLogExportFrom}
+          onExportToChange={setLogExportTo}
+          onExport={() => void exportLogs()}
+          exporting={logExporting}
+          exportError={logExportError}
+          exportSuccess={logExportSuccess}
+        />
       ) : null}
     </div>
   );
@@ -314,8 +360,50 @@ function RunsSection({
   return <section className="lux-admin-panel lux-operations-section" aria-labelledby="runs-title"><div className="lux-operations-section-heading"><div><span className="lux-eyebrow">执行历史</span><h2 id="runs-title">运行记录</h2><p>查看后台任务进度；失败或取消的任务可以从这里重试。</p></div><LuxSelect className="lux-admin-filter-select" value={status} options={[{ value: "", label: "全部状态" }, { value: "PENDING", label: "等待中" }, { value: "RUNNING", label: "运行中" }, { value: "FAILED", label: "失败" }, { value: "COMPLETED", label: "已完成" }, { value: "CANCELLED", label: "已取消" }]} onChange={onStatusChange} aria-label="运行记录状态" /></div><p className="lux-admin-muted">整库元数据操作会调用所属媒体库的注册刮削任务，低置信度条目请到 <Link to="/admin/metadata">元数据纠错</Link> 处理。</p><div className="lux-admin-job-list">{jobs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无运行记录</strong><p>手动或计划任务开始执行后，状态会显示在这里。</p></div></div> : jobs.map((job) => <JobRow key={`${job.kind}-${job.id}`} job={job} onCancel={() => onCancel(job)} onRetry={() => onRetry(job)} busy={busy} />)}</div></section>;
 }
 
-function LogsSection({ logs, level, search, onLevelChange, onSearchChange }: { logs: AdminAuditEvent[]; level: string; search: string; onLevelChange: (level: string) => void; onSearchChange: (search: string) => void }) {
-  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="logs-title"><div className="lux-operations-section-heading"><div><span className="lux-eyebrow">审计记录</span><h2 id="logs-title">系统日志</h2><p>管理员操作以脱敏事件形式记录，便于定位任务和权限变化。</p></div><FileClock size={20} className="lux-admin-panel-icon" /></div><div className="lux-operations-log-toolbar"><input aria-label="搜索系统日志" type="search" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索事件、操作者或对象" /><LuxSelect value={level} options={[{ value: "", label: "全部级别" }, { value: "INFO", label: "信息" }, { value: "WARN", label: "警告" }, { value: "ERROR", label: "错误" }]} onChange={onLevelChange} aria-label="日志级别" /></div><div className="lux-admin-log-list">{logs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无日志</strong><p>系统产生管理员事件后，会在这里保留脱敏记录。</p></div></div> : logs.map((log) => <LogRow key={log.id} log={log} />)}</div></section>;
+function LogsSection({
+  logs,
+  level,
+  search,
+  onLevelChange,
+  onSearchChange,
+  exportFrom,
+  exportTo,
+  onExportFromChange,
+  onExportToChange,
+  onExport,
+  exporting,
+  exportError,
+  exportSuccess,
+}: {
+  logs: AdminAuditEvent[];
+  level: string;
+  search: string;
+  onLevelChange: (level: string) => void;
+  onSearchChange: (search: string) => void;
+  exportFrom: string;
+  exportTo: string;
+  onExportFromChange: (value: string) => void;
+  onExportToChange: (value: string) => void;
+  onExport: () => void;
+  exporting: boolean;
+  exportError: string;
+  exportSuccess: boolean;
+}) {
+  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="logs-title">
+    <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">审计记录与诊断文件</span><h2 id="logs-title">系统日志</h2><p>管理员操作以脱敏事件形式记录；诊断文件按 UTC 日期保存，可直接打包带走分析。</p></div><FileClock size={20} className="lux-admin-panel-icon" /></div>
+    <div className="lux-log-export-panel">
+      <div className="lux-log-export-copy"><CalendarDays size={18} /><div><strong>导出运行日志</strong><span>最多选择 31 天，导出结果为 ZIP。</span></div></div>
+      <div className="lux-log-export-controls">
+        <label>起始日期<input aria-label="日志起始日期" type="date" value={exportFrom} onChange={(event) => onExportFromChange(event.target.value)} /></label>
+        <label>结束日期<input aria-label="日志结束日期" type="date" value={exportTo} onChange={(event) => onExportToChange(event.target.value)} /></label>
+        <button className="lux-button lux-button-secondary" type="button" aria-label="导出日志 ZIP" onClick={onExport} disabled={exporting}><Download size={15} />{exporting ? "打包中…" : "导出日志 ZIP"}</button>
+      </div>
+      {exportError ? <p className="lux-error-copy" role="alert">{exportError}</p> : null}
+      {exportSuccess ? <p className="lux-log-export-success" role="status">日志已导出。</p> : null}
+    </div>
+    <div className="lux-operations-log-toolbar"><input aria-label="搜索系统日志" type="search" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索事件、操作者或对象" /><LuxSelect value={level} options={[{ value: "", label: "全部级别" }, { value: "INFO", label: "信息" }, { value: "WARN", label: "警告" }, { value: "ERROR", label: "错误" }]} onChange={onLevelChange} aria-label="日志级别" /></div>
+    <div className="lux-admin-log-list">{logs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无日志</strong><p>系统产生管理员事件后，会在这里保留脱敏记录。</p></div></div> : logs.map((log) => <LogRow key={log.id} log={log} />)}</div>
+  </section>;
 }
 
 function LogRow({ log }: { log: AdminAuditEvent }) {
@@ -327,6 +415,17 @@ function LogRow({ log }: { log: AdminAuditEvent }) {
 
 function OperationsStat({ label, value, detail, icon, tone = "default" }: { label: string; value: number; detail: string; icon: ReactNode; tone?: "default" | "warn" }) {
   return <div className={`lux-operations-stat${tone === "warn" ? " is-warn" : ""}`}><span className="lux-operations-stat-icon">{icon}</span><div><small>{label}</small><strong>{value.toLocaleString("zh-CN")}</strong><p>{detail}</p></div></div>;
+}
+
+function defaultLogDateRange() {
+  const to = new Date();
+  const from = new Date(to);
+  from.setUTCDate(from.getUTCDate() - 6);
+  return { from: utcDateInputValue(from), to: utcDateInputValue(to) };
+}
+
+function utcDateInputValue(value: Date) {
+  return value.toISOString().slice(0, 10);
 }
 
 function OperationsTabButton({ active, label, count, onClick }: { active: boolean; label: string; count: number; onClick: () => void }) {

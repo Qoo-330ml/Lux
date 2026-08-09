@@ -296,6 +296,23 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("downloads an administrator log archive with a bounded date query", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("zip-bytes", {
+        status: 200,
+        headers: { "Content-Type": "application/zip" },
+      }),
+    );
+
+    const archive = await new LuxApiClient().exportAdminLogs("2026-08-08", "2026-08-09");
+
+    expect(await archive.text()).toBe("zip-bytes");
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/admin/logs/export?from=2026-08-08&to=2026-08-09");
+    expect(options?.credentials).toBe("same-origin");
+    expect((options?.headers as Headers).get("Accept")).toBe("application/zip");
+  });
+
   it("starts a whole-library metadata refresh with the selected mode", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

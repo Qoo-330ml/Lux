@@ -67,6 +67,43 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).not.toContain("METADATA_REIDENTIFY_STARTED");
   });
 
+  it("exports a selected UTC log date range from the system log tab", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    const exportLogs = vi.spyOn(api, "exportAdminLogs").mockResolvedValue(
+      new Blob(["zip"], { type: "application/zip" }),
+    );
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:lux-logs"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(3)')?.click());
+    const from = container.querySelector<HTMLInputElement>('input[aria-label="日志起始日期"]');
+    const to = container.querySelector<HTMLInputElement>('input[aria-label="日志结束日期"]');
+    const exportButton = container.querySelector<HTMLButtonElement>('button[aria-label="导出日志 ZIP"]');
+    expect(from).not.toBeNull();
+    expect(to).not.toBeNull();
+    expect(exportButton).not.toBeNull();
+
+    await act(async () => {
+      exportButton?.click();
+      await vi.waitFor(() => expect(exportLogs).toHaveBeenCalledWith(from?.value, to?.value));
+    });
+    expect(container.textContent).toContain("日志已导出");
+  });
+
   it("edits an existing registered task without exposing a task creation form", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
