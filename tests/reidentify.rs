@@ -10,6 +10,7 @@ use axum::{Json, Router, extract::State as AxumState, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
+        candidates::MetadataSelectionService,
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
@@ -148,6 +149,14 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
+    let low_confidence_metadata = MetadataReidentifyService::with_selection(
+        database.clone(),
+        tmdb.clone(),
+        Some(MetadataSelectionService::new(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+        )),
+    );
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(
@@ -279,6 +288,31 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(item_refresh_job["job"]["status"], "COMPLETED");
+
+    sqlx::query(
+        "UPDATE media_items SET title = 'Unrelated Local Title', sort_title = 'unrelated local title'
+         WHERE id = ?",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM metadata_candidates WHERE item_id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let low_confidence_job = low_confidence_metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FullRefresh)
+        .await?;
+    low_confidence_metadata.run(&low_confidence_job.id).await;
+    let low_confidence_job = low_confidence_metadata
+        .get_job(&low_confidence_job.id)
+        .await?;
+    assert_eq!(low_confidence_job.status, "COMPLETED");
+    assert_eq!(low_confidence_job.items[0].status, "COMPLETED");
+    assert_eq!(
+        low_confidence_job.items[0].error.as_deref(),
+        Some("LOW_CONFIDENCE")
+    );
 
     sqlx::query("UPDATE media_items SET title = '', sort_title = '' WHERE id = ?")
         .bind(&item_id)
