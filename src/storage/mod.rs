@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use sqlx::{
-    AnyPool, Executor, QueryBuilder, Row,
+    AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
 };
@@ -14,6 +14,10 @@ static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
 pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
+
+fn database_flag(value: bool) -> i64 {
+    i64::from(value)
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -68,13 +72,16 @@ impl Database {
             DatabaseBackend::Sqlite => {
                 "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"
             }
-            DatabaseBackend::Postgres => "SET TIME ZONE 'UTC'; SET application_name = 'lux';",
+            DatabaseBackend::Postgres => "SET TIME ZONE 'UTC'",
         };
         let pool = AnyPoolOptions::new()
             .max_connections(5)
             .after_connect(move |connection, _| {
                 Box::pin(async move {
                     connection.execute(after_connect_sql).await?;
+                    if backend == DatabaseBackend::Postgres {
+                        connection.execute("SET application_name = 'lux'").await?;
+                    }
                     Ok(())
                 })
             })
@@ -93,12 +100,13 @@ impl Database {
             pool.close().await;
             return Err(StorageError::Migration { path, source });
         }
-        let server_id = ensure_server_id(&pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: path.clone(),
-                source,
-            })?;
+        let server_id =
+            ensure_server_id(&pool, backend)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.clone(),
+                    source,
+                })?;
 
         Ok(Self {
             pool,
@@ -136,9 +144,8 @@ impl Database {
             .max_connections(1)
             .after_connect(|connection, _| {
                 Box::pin(async move {
-                    connection
-                        .execute("SET TIME ZONE 'UTC'; SET application_name = 'lux';")
-                        .await?;
+                    connection.execute("SET TIME ZONE 'UTC'").await?;
+                    connection.execute("SET application_name = 'lux'").await?;
                     Ok(())
                 })
             })
@@ -171,8 +178,22 @@ impl Database {
         self.backend
     }
 
+    fn scalar_max_function(&self) -> &'static str {
+        match self.backend {
+            DatabaseBackend::Sqlite => "MAX",
+            DatabaseBackend::Postgres => "GREATEST",
+        }
+    }
+
+    fn scalar_min_function(&self) -> &'static str {
+        match self.backend {
+            DatabaseBackend::Sqlite => "MIN",
+            DatabaseBackend::Postgres => "LEAST",
+        }
+    }
+
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users LIMIT 1)")
+        self.query_scalar("SELECT CASE WHEN EXISTS(SELECT 1 FROM users LIMIT 1) THEN 1 ELSE 0 END")
             .fetch_one(&self.pool)
             .await
             .map(|value: i64| value != 0)
@@ -197,25 +218,26 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let inserted = sqlx::query(
-            "INSERT INTO users (
+        let inserted = self
+            .query(
+                "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
                 is_admin, can_manage_server
             )
             SELECT ?, ?, ?, ?, 1, 1
             WHERE NOT EXISTS (SELECT 1 FROM users)",
-        )
-        .bind(id)
-        .bind(username_normalized)
-        .bind(display_name)
-        .bind(password_hash)
-        .execute(&mut *transaction)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(id)
+            .bind(username_normalized)
+            .bind(display_name)
+            .bind(password_hash)
+            .execute(&mut *transaction)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         transaction
             .commit()
             .await
@@ -234,7 +256,7 @@ impl Database {
         password_hash: &str,
         is_admin: bool,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
                 is_admin, can_manage_server
@@ -244,8 +266,8 @@ impl Database {
         .bind(username_normalized)
         .bind(display_name)
         .bind(password_hash)
-        .bind(is_admin)
-        .bind(is_admin)
+        .bind(database_flag(is_admin))
+        .bind(database_flag(is_admin))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -259,7 +281,7 @@ impl Database {
         &self,
         username_normalized: &str,
     ) -> Result<Option<StoredUser>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, username_normalized, display_name, password_hash,
                     is_disabled, is_admin, can_manage_server,
                     can_remote_access, can_download
@@ -288,19 +310,21 @@ impl Database {
     }
 
     pub(crate) async fn user_exists(&self, user_id: &str) -> Result<bool, StorageError> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)")
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await
-            .map(|value: i64| value != 0)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(SELECT 1 FROM users WHERE id = ?) THEN 1 ELSE 0 END",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn list_users(&self) -> Result<Vec<StoredUser>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, username_normalized, display_name, password_hash,
                     is_disabled, is_admin, can_manage_server,
                     can_remote_access, can_download
@@ -333,7 +357,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Option<StoredUser>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, username_normalized, display_name, password_hash,
                     is_disabled, is_admin, can_manage_server,
                     can_remote_access, can_download
@@ -362,17 +386,18 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let Some(current) = sqlx::query(
-            "SELECT is_disabled, can_manage_server
+        let Some(current) = self
+            .query(
+                "SELECT is_disabled, can_manage_server
              FROM users WHERE id = ?",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
         else {
             return Ok(None);
         };
@@ -380,23 +405,29 @@ impl Database {
         let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
         let next_disabled = update.is_disabled.unwrap_or(current_disabled);
         let next_can_manage = update.can_manage_server.unwrap_or(current_can_manage);
+        let is_disabled = update.is_disabled.map(database_flag);
+        let is_admin = update.is_admin.map(database_flag);
+        let can_manage_server = update.can_manage_server.map(database_flag);
+        let can_remote_access = update.can_remote_access.map(database_flag);
+        let can_download = update.can_download.map(database_flag);
         if current_can_manage && (!next_can_manage || next_disabled) {
-            let remaining: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM users
+            let remaining: i64 = self
+                .query_scalar(
+                    "SELECT COUNT(*) FROM users
                  WHERE can_manage_server = 1 AND is_disabled = 0 AND id != ?",
-            )
-            .bind(user_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                )
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
             if remaining == 0 {
                 return Err(StorageError::LastManager);
             }
         }
-        sqlx::query(
+        self.query(
             "UPDATE users
              SET display_name = COALESCE(?, display_name),
                  password_hash = COALESCE(?, password_hash),
@@ -410,11 +441,11 @@ impl Database {
         )
         .bind(update.display_name)
         .bind(update.password_hash)
-        .bind(update.is_disabled)
-        .bind(update.is_admin)
-        .bind(update.can_manage_server)
-        .bind(update.can_remote_access)
-        .bind(update.can_download)
+        .bind(is_disabled)
+        .bind(is_admin)
+        .bind(can_manage_server)
+        .bind(can_remote_access)
+        .bind(can_download)
         .bind(user_id)
         .execute(&mut *transaction)
         .await
@@ -436,7 +467,7 @@ impl Database {
         &self,
         event: NewAuditEvent<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO audit_events (
                 id, actor_user_id, event_type, target_type, target_id, metadata_json
             ) VALUES (?, ?, ?, ?, ?, ?)",
@@ -461,7 +492,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredAuditEvent>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
                     ae.event_type, ae.target_type, ae.target_id,
                     ae.metadata_json, ae.created_at
@@ -498,7 +529,7 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<StoredActivityEvent>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
                     ae.event_type, ae.target_type, ae.target_id,
                     mi.title AS target_title, ae.metadata_json, ae.created_at
@@ -539,7 +570,7 @@ impl Database {
         &self,
         token_hash: &[u8],
     ) -> Result<Option<StoredUser>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT u.id, u.username_normalized, u.display_name, u.password_hash,
                     u.is_disabled, u.is_admin, u.can_manage_server,
                     u.can_remote_access, u.can_download
@@ -573,7 +604,7 @@ impl Database {
         &self,
         token_hash: &[u8],
     ) -> Result<Option<StoredAccessTokenDevice>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT device_id, client_name, device_name, client_version
              FROM access_tokens
              WHERE token_hash = ? AND revoked_at IS NULL",
@@ -601,7 +632,7 @@ impl Database {
         library_id: &str,
         can_view: bool,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO user_library_access (user_id, library_id, can_view)
              VALUES (?, ?, ?)
              ON CONFLICT(user_id, library_id) DO UPDATE SET
@@ -609,7 +640,7 @@ impl Database {
         )
         .bind(user_id)
         .bind(library_id)
-        .bind(can_view)
+        .bind(database_flag(can_view))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -624,11 +655,11 @@ impl Database {
         user_id: &str,
         library_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar(
-            "SELECT EXISTS(
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM user_library_access
                 WHERE user_id = ? AND library_id = ? AND can_view = 1
-            )",
+            ) THEN 1 ELSE 0 END",
         )
         .bind(user_id)
         .bind(library_id)
@@ -645,7 +676,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Vec<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT ula.library_id
              FROM user_library_access ula
              JOIN libraries l ON l.id = ula.library_id
@@ -662,7 +693,7 @@ impl Database {
     }
 
     pub(crate) async fn list_enabled_library_ids(&self) -> Result<Vec<String>, StorageError> {
-        sqlx::query_scalar("SELECT id FROM libraries WHERE is_enabled = 1 ORDER BY name, id")
+        self.query_scalar("SELECT id FROM libraries WHERE is_enabled = 1 ORDER BY name, id")
             .fetch_all(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -675,7 +706,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT mi.library_id
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -694,19 +725,20 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        let value = sqlx::query_scalar::<_, String>(
-            "SELECT COALESCE(l.scraper_id, '')
+        let value = self
+            .query_scalar::<String>(
+                "SELECT COALESCE(l.scraper_id, '')
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE mi.id = ? AND mi.removed_at IS NULL",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         Ok(value.filter(|value| !value.trim().is_empty()))
     }
 
@@ -716,7 +748,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT id FROM media_items
              WHERE library_id = ? AND removed_at IS NULL
              ORDER BY CASE item_type
@@ -747,7 +779,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "INSERT INTO libraries (
                 id, name, kind, is_enabled, realtime_watch_enabled,
                 reconciliation_schedule, metadata_schedule,
@@ -757,7 +789,7 @@ impl Database {
         .bind(library.id)
         .bind(library.name)
         .bind(library.kind)
-        .bind(library.realtime_watch_enabled)
+        .bind(database_flag(library.realtime_watch_enabled))
         .bind(library.reconciliation_schedule)
         .bind(library.metadata_schedule)
         .bind(library.scan_concurrency)
@@ -795,7 +827,7 @@ impl Database {
         for (task_type, task_name, task_description, source_type, plugin_id, schedule) in
             registrations
         {
-            sqlx::query(
+            self.query(
                 "INSERT INTO scheduled_task_configs (
                     owner_type, owner_id, task_type, task_name, task_description,
                     source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
@@ -808,7 +840,7 @@ impl Database {
             .bind(source_type)
             .bind(plugin_id)
             .bind(schedule)
-            .bind(schedule.is_some())
+            .bind(database_flag(schedule.is_some()))
             .bind(if task_type == "RECONCILIATION_SCAN" {
                 format!(
                     "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
@@ -834,7 +866,7 @@ impl Database {
     }
 
     pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
@@ -877,7 +909,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<StoredLibrary>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
@@ -919,7 +951,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO scheduled_task_configs (
                 owner_type, owner_id, task_type, task_name, task_description,
                 source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
@@ -950,7 +982,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "DELETE FROM scheduled_task_configs
              WHERE owner_type = 'LIBRARY' AND owner_id = ?",
         )
@@ -961,7 +993,8 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        let deleted = sqlx::query("DELETE FROM libraries WHERE id = ?")
+        let deleted = self
+            .query("DELETE FROM libraries WHERE id = ?")
             .bind(id)
             .execute(&mut *transaction)
             .await
@@ -995,7 +1028,10 @@ impl Database {
                 source,
             })?;
 
-        let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM libraries WHERE id = ?)")
+        let exists: i64 = self
+            .query_scalar(
+                "SELECT CASE WHEN EXISTS(SELECT 1 FROM libraries WHERE id = ?) THEN 1 ELSE 0 END",
+            )
             .bind(library_id)
             .fetch_one(&mut *transaction)
             .await
@@ -1008,7 +1044,7 @@ impl Database {
         }
 
         if let Some(value) = settings.name {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET name = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1023,7 +1059,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.kind {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET kind = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1038,7 +1074,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.is_enabled {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET is_enabled = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1053,7 +1089,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.realtime_watch_enabled {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET realtime_watch_enabled = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1068,7 +1104,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.reconciliation_schedule {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET reconciliation_schedule = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1083,7 +1119,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.metadata_schedule {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET metadata_schedule = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1098,7 +1134,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.scraper_id {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET scraper_id = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1113,7 +1149,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.media_strategy_json {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET media_strategy_json = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1128,7 +1164,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.scan_concurrency {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET scan_concurrency = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1143,7 +1179,7 @@ impl Database {
             })?;
         }
         if let Some(value) = settings.probe_concurrency {
-            sqlx::query(
+            self.query(
                 "UPDATE libraries
                  SET probe_concurrency = ?, updated_at = unixepoch()
                  WHERE id = ?",
@@ -1158,18 +1194,19 @@ impl Database {
             })?;
         }
 
-        let current: (Option<String>, Option<String>, i64, i64, Option<String>) = sqlx::query_as(
-            "SELECT reconciliation_schedule, metadata_schedule,
+        let current: (Option<String>, Option<String>, i64, i64, Option<String>) = self
+            .query_as(
+                "SELECT reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, scraper_id
              FROM libraries WHERE id = ?",
-        )
-        .bind(library_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(library_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
 
         let resources = format!(
             "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
@@ -1184,7 +1221,7 @@ impl Database {
             ("METADATA_PARSE", current.1.as_deref(), "{}"),
         ];
         for (task_type, schedule, resource_limit_json) in task_configs {
-            sqlx::query(
+            self.query(
                 "UPDATE scheduled_task_configs
                  SET cron_or_interval = ?,
                      is_enabled = ?,
@@ -1201,7 +1238,7 @@ impl Database {
                  WHERE owner_type = 'LIBRARY' AND owner_id = ? AND task_type = ?",
             )
             .bind(schedule)
-            .bind(schedule.is_some())
+            .bind(database_flag(schedule.is_some()))
             .bind(resource_limit_json)
             .bind(current.4.as_deref())
             .bind(current.4.as_deref())
@@ -1230,15 +1267,17 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<StoredScheduledTaskConfig>, i64), StorageError> {
-        let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scheduled_task_configs")
+        let total = self
+            .query_scalar::<i64>("SELECT COUNT(*) FROM scheduled_task_configs")
             .fetch_one(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        let rows = sqlx::query(
-            "SELECT s.owner_type, s.owner_id, s.task_type, s.task_name,
+        let rows = self
+            .query(
+                "SELECT s.owner_type, s.owner_id, s.task_type, s.task_name,
                     s.task_description, s.source_type, s.plugin_id,
                     s.cron_or_interval, s.is_enabled, s.resource_limit_json,
                     s.created_at, s.updated_at,
@@ -1248,15 +1287,15 @@ impl Database {
                ON s.owner_type = 'LIBRARY' AND l.id = s.owner_id
              ORDER BY s.updated_at DESC, s.owner_type, s.owner_id, s.task_type
              LIMIT ? OFFSET ?",
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         Ok((rows.into_iter().map(stored_scheduled_task).collect(), total))
     }
 
@@ -1268,22 +1307,23 @@ impl Database {
         schedule: Option<&str>,
         is_enabled: bool,
     ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
-        let result = sqlx::query(
-            "UPDATE scheduled_task_configs
+        let result = self
+            .query(
+                "UPDATE scheduled_task_configs
              SET cron_or_interval = ?, is_enabled = ?, updated_at = unixepoch()
              WHERE owner_type = ? AND owner_id = ? AND task_type = ?",
-        )
-        .bind(schedule)
-        .bind(is_enabled)
-        .bind(owner_type)
-        .bind(owner_id)
-        .bind(task_type)
-        .execute(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(schedule)
+            .bind(database_flag(is_enabled))
+            .bind(owner_type)
+            .bind(owner_id)
+            .bind(task_type)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         if result.rows_affected() != 1 {
             return Ok(None);
         }
@@ -1297,7 +1337,7 @@ impl Database {
         owner_id: &str,
         task_type: &str,
     ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT s.owner_type, s.owner_id, s.task_type, s.task_name,
                     s.task_description, s.source_type, s.plugin_id,
                     s.cron_or_interval, s.is_enabled, s.resource_limit_json,
@@ -1321,15 +1361,17 @@ impl Database {
     }
 
     pub(crate) async fn library_exists(&self, library_id: &str) -> Result<bool, StorageError> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM libraries WHERE id = ?)")
-            .bind(library_id)
-            .fetch_one(&self.pool)
-            .await
-            .map(|value: i64| value != 0)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(SELECT 1 FROM libraries WHERE id = ?) THEN 1 ELSE 0 END",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn update_library_cover(
@@ -1340,7 +1382,7 @@ impl Database {
         size: i64,
         tag: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE libraries
              SET cover_image_path = ?,
                  cover_image_content_type = ?,
@@ -1371,7 +1413,7 @@ impl Database {
         size: i64,
         tag: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE libraries
              SET cover_image_path = ?,
                  cover_image_content_type = ?,
@@ -1402,7 +1444,7 @@ impl Database {
         size: i64,
         tag: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE libraries
              SET cover_image_path = ?,
                  cover_image_content_type = ?,
@@ -1431,7 +1473,7 @@ impl Database {
         user_id: &str,
         item_id: &str,
     ) -> Result<Option<StoredUserItemState>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT position_ticks, is_played, is_favorite, play_count,
                     last_played_at, version
              FROM user_item_state WHERE user_id = ? AND item_id = ?",
@@ -1460,7 +1502,7 @@ impl Database {
         &self,
         plugin_id: &str,
     ) -> Result<Option<bool>, StorageError> {
-        sqlx::query_scalar("SELECT is_enabled FROM installed_plugins WHERE plugin_id = ?")
+        self.query_scalar("SELECT is_enabled FROM installed_plugins WHERE plugin_id = ?")
             .bind(plugin_id)
             .fetch_optional(&self.pool)
             .await
@@ -1487,7 +1529,7 @@ impl Database {
     }
 
     pub(crate) async fn install_plugin(&self, plugin_id: &str) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO installed_plugins (plugin_id, is_enabled)
              VALUES (?, 1)
              ON CONFLICT(plugin_id) DO UPDATE SET
@@ -1509,12 +1551,12 @@ impl Database {
         plugin_id: &str,
         enabled: bool,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE installed_plugins
              SET is_enabled = ?, updated_at = unixepoch()
              WHERE plugin_id = ?",
         )
-        .bind(enabled)
+        .bind(database_flag(enabled))
         .bind(plugin_id)
         .execute(&self.pool)
         .await
@@ -1535,25 +1577,26 @@ impl Database {
             if chunk.is_empty() {
                 continue;
             }
-            let mut query_builder = QueryBuilder::<sqlx::Any>::new(
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "SELECT item_id, position_ticks, is_played, is_favorite, play_count,
                         last_played_at, version
-                 FROM user_item_state WHERE user_id = ",
+                 FROM user_item_state WHERE user_id = ? AND item_id IN ({placeholders})"
             );
-            query_builder.push_bind(user_id).push(" AND item_id IN (");
-            let mut separated = query_builder.separated(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(user_id);
             for item_id in chunk {
-                separated.push_bind(item_id);
+                statement = statement.bind(item_id);
             }
-            separated.push_unseparated(")");
-            let rows = query_builder
-                .build()
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
             for row in rows {
                 states.insert(
                     row.get("item_id"),
@@ -1572,16 +1615,17 @@ impl Database {
     }
 
     pub(crate) async fn resume_settings(&self) -> Result<(i64, i64), StorageError> {
-        let values: Vec<(String, String)> = sqlx::query_as(
-            "SELECT key, value FROM server_settings
+        let values: Vec<(String, String)> = self
+            .query_as(
+                "SELECT key, value FROM server_settings
              WHERE key IN ('resume_played_percent', 'resume_min_ticks')",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         let percent = values
             .iter()
             .find(|(key, _)| key == "resume_played_percent")
@@ -1616,7 +1660,7 @@ impl Database {
             ("resume_min_ticks", min_ticks.to_string()),
             ("media_strategy", media_strategy.to_owned()),
         ] {
-            sqlx::query(
+            self.query(
                 "INSERT INTO server_settings (key, value)
                  VALUES (?, ?)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
@@ -1640,7 +1684,7 @@ impl Database {
     }
 
     pub(crate) async fn server_name(&self) -> Result<Option<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT value FROM server_settings
              WHERE key = 'server_name'",
         )
@@ -1653,7 +1697,7 @@ impl Database {
     }
 
     pub(crate) async fn set_server_name(&self, name: &str) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO server_settings (key, value)
              VALUES ('server_name', ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
@@ -1669,7 +1713,7 @@ impl Database {
     }
 
     pub(crate) async fn media_strategy_settings(&self) -> Result<Option<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT value FROM server_settings
              WHERE key = 'media_strategy'",
         )
@@ -1687,7 +1731,7 @@ impl Database {
         item_id: &str,
         played: bool,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
              VALUES (?, ?, ?, CASE WHEN ? = 1 THEN 1 ELSE 0 END,
                      CASE WHEN ? = 1 THEN unixepoch() ELSE NULL END)
@@ -1704,9 +1748,9 @@ impl Database {
         )
         .bind(user_id)
         .bind(item_id)
-        .bind(played)
-        .bind(played)
-        .bind(played)
+        .bind(database_flag(played))
+        .bind(database_flag(played))
+        .bind(database_flag(played))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -1722,7 +1766,7 @@ impl Database {
         item_id: &str,
         favorite: bool,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO user_item_state (user_id, item_id, is_favorite)
              VALUES (?, ?, ?)
              ON CONFLICT(user_id, item_id) DO UPDATE SET
@@ -1732,7 +1776,7 @@ impl Database {
         )
         .bind(user_id)
         .bind(item_id)
-        .bind(favorite)
+        .bind(database_flag(favorite))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -1754,7 +1798,8 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        let max_function = self.scalar_max_function();
+        let playback_session_query = format!(
             "INSERT INTO playback_sessions (
                 id, user_id, item_id, media_source_id, play_session_id,
                 device_id, client, device_name, client_version, device_type,
@@ -1773,52 +1818,54 @@ impl Database {
                 device_type = COALESCE(excluded.device_type, playback_sessions.device_type),
                 remote_ip = COALESCE(excluded.remote_ip, playback_sessions.remote_ip),
                 state = excluded.state,
-                position_ticks = MAX(playback_sessions.position_ticks, excluded.position_ticks),
+                position_ticks = {max_function}(playback_sessions.position_ticks, excluded.position_ticks),
                 duration_ticks = COALESCE(excluded.duration_ticks, playback_sessions.duration_ticks),
                 is_paused = excluded.is_paused,
-                last_event_at = unixepoch()",
-        )
-        .bind(Uuid::now_v7().to_string())
-        .bind(event.user_id)
-        .bind(event.item_id)
-        .bind(event.media_source_id)
-        .bind(event.play_session_id)
-        .bind(event.device_id)
-        .bind(event.client)
-        .bind(event.device_name)
-        .bind(event.client_version)
-        .bind(event.device_type)
-        .bind(event.remote_ip)
-        .bind(event.state)
-        .bind(event.position_ticks)
-        .bind(event.duration_ticks)
-        .bind(event.is_paused)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        sqlx::query(
+                last_event_at = unixepoch()"
+        );
+        self.query(sqlx::AssertSqlSafe(playback_session_query))
+            .bind(Uuid::now_v7().to_string())
+            .bind(event.user_id)
+            .bind(event.item_id)
+            .bind(event.media_source_id)
+            .bind(event.play_session_id)
+            .bind(event.device_id)
+            .bind(event.client)
+            .bind(event.device_name)
+            .bind(event.client_version)
+            .bind(event.device_type)
+            .bind(event.remote_ip)
+            .bind(event.state)
+            .bind(event.position_ticks)
+            .bind(event.duration_ticks)
+            .bind(database_flag(event.is_paused))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let user_item_state_query = format!(
             "INSERT INTO user_item_state (user_id, item_id, position_ticks, last_played_at)
              VALUES (?, ?, ?, unixepoch())
              ON CONFLICT(user_id, item_id) DO UPDATE SET
-                 position_ticks = MAX(user_item_state.position_ticks, excluded.position_ticks),
+                 position_ticks = {max_function}(user_item_state.position_ticks, excluded.position_ticks),
                  last_played_at = CASE
                      WHEN excluded.position_ticks > user_item_state.position_ticks
                      THEN excluded.last_played_at ELSE user_item_state.last_played_at END,
                  version = user_item_state.version + CASE
-                     WHEN excluded.position_ticks > user_item_state.position_ticks THEN 1 ELSE 0 END",
-        )
-        .bind(event.user_id)
-        .bind(event.item_id)
-        .bind(event.position_ticks)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+                     WHEN excluded.position_ticks > user_item_state.position_ticks THEN 1 ELSE 0 END"
+        );
+        self.query(sqlx::AssertSqlSafe(user_item_state_query))
+            .bind(event.user_id)
+            .bind(event.item_id)
+            .bind(event.position_ticks)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         transaction
             .commit()
             .await
@@ -1860,7 +1907,7 @@ impl Database {
                 None,
             )
         };
-        let mut statement = sqlx::query(query);
+        let mut statement = self.query(query);
         if let Some(user_id) = bind {
             statement = statement.bind(user_id);
         }
@@ -1880,7 +1927,7 @@ impl Database {
         user_id: &str,
         play_session_id: &str,
     ) -> Result<Option<StoredPlaybackSession>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, user_id, item_id, media_source_id, play_session_id,
                     device_id, client, device_name, client_version, device_type,
                     remote_ip, state,
@@ -1905,7 +1952,7 @@ impl Database {
         user_id: &str,
         item_id: &str,
     ) -> Result<Option<StoredPlaybackSession>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, user_id, item_id, media_source_id, play_session_id,
                     device_id, client, device_name, client_version, device_type,
                     remote_ip, state,
@@ -1936,10 +1983,10 @@ impl Database {
         source_id: &str,
         item_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar(
-            "SELECT EXISTS(
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM media_sources WHERE id = ? AND item_id = ?
-            )",
+            ) THEN 1 ELSE 0 END",
         )
         .bind(source_id)
         .bind(item_id)
@@ -1956,7 +2003,7 @@ impl Database {
         &self,
         root: NewLibraryRoot<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO library_roots (
                 id, library_id, canonical_path, display_path, is_available, is_writable
             ) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1965,8 +2012,8 @@ impl Database {
         .bind(root.library_id)
         .bind(root.canonical_path)
         .bind(root.display_path)
-        .bind(root.is_available)
-        .bind(root.is_writable)
+        .bind(database_flag(root.is_available))
+        .bind(database_flag(root.is_writable))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -1980,7 +2027,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<Vec<StoredLibraryRoot>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, library_id, canonical_path, display_path,
                     is_available, is_writable, last_checked_at,
                     unavailable_since, scan_cursor
@@ -2002,7 +2049,7 @@ impl Database {
         library_id: &str,
         root_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query("DELETE FROM library_roots WHERE id = ? AND library_id = ?")
+        self.query("DELETE FROM library_roots WHERE id = ? AND library_id = ?")
             .bind(root_id)
             .bind(library_id)
             .execute(&self.pool)
@@ -2017,7 +2064,7 @@ impl Database {
     pub(crate) async fn list_all_library_roots(
         &self,
     ) -> Result<Vec<StoredLibraryRoot>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, library_id, canonical_path, display_path,
                     is_available, is_writable, last_checked_at,
                     unavailable_since, scan_cursor
@@ -2035,7 +2082,7 @@ impl Database {
     pub(crate) async fn list_enabled_library_roots(
         &self,
     ) -> Result<Vec<StoredLibraryRoot>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT lr.id, lr.library_id, lr.canonical_path, lr.display_path,
                     lr.is_available, lr.is_writable, lr.last_checked_at,
                     lr.unavailable_since, lr.scan_cursor
@@ -2061,7 +2108,7 @@ impl Database {
         generation: &str,
         total_count: i64,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, total_count)
              VALUES (?, ?, ?, 'PENDING', ?, ?)",
         )
@@ -2086,7 +2133,7 @@ impl Database {
         relative_path: &str,
         change_kind: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO scan_job_paths (
                 job_id, library_root_id, relative_path, change_kind
              ) VALUES (?, ?, ?, ?)
@@ -2106,7 +2153,7 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        sqlx::query(
+        self.query(
             "UPDATE scan_jobs
              SET total_count = (
                  SELECT COUNT(*) FROM scan_job_paths
@@ -2130,7 +2177,7 @@ impl Database {
         job_id: &str,
         limit: i64,
     ) -> Result<Vec<StoredScanJobPath>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT job_id, library_root_id, relative_path, change_kind
              FROM scan_job_paths
              WHERE job_id = ? AND processed_at IS NULL
@@ -2154,7 +2201,7 @@ impl Database {
         library_root_id: &str,
         relative_path: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE scan_job_paths
              SET processed_at = unixepoch(), updated_at = unixepoch()
              WHERE job_id = ? AND library_root_id = ? AND relative_path = ?",
@@ -2172,23 +2219,24 @@ impl Database {
     }
 
     pub(crate) async fn finish_scan_job_if_idle(&self, id: &str) -> Result<bool, StorageError> {
-        let result = sqlx::query(
-            "UPDATE scan_jobs
+        let result = self
+            .query(
+                "UPDATE scan_jobs
              SET status = 'COMPLETED', finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')
                AND NOT EXISTS (
                    SELECT 1 FROM scan_job_paths
                    WHERE job_id = ? AND processed_at IS NULL
                )",
-        )
-        .bind(id)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -2197,7 +2245,7 @@ impl Database {
         library_root_id: &str,
         relative_path: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE filesystem_entries
              SET is_missing = 1, updated_at = unixepoch()
              WHERE library_root_id = ? AND relative_path = ?",
@@ -2217,7 +2265,7 @@ impl Database {
         &self,
         job: NewStrmProbeJob<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO strm_probe_jobs (
                 id, operation_id, library_id, status, concurrency,
                 include_ready, write_sidecars, total_count
@@ -2240,10 +2288,10 @@ impl Database {
     }
 
     pub(crate) async fn has_active_strm_probe_jobs(&self) -> Result<bool, StorageError> {
-        sqlx::query_scalar(
-            "SELECT EXISTS(
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM strm_probe_jobs WHERE status IN ('PENDING', 'RUNNING')
-            )",
+            ) THEN 1 ELSE 0 END",
         )
         .fetch_one(&self.pool)
         .await
@@ -2258,7 +2306,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<StoredStrmProbeJob>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, operation_id, library_id, status, concurrency,
                     include_ready, write_sidecars, cursor, processed_count,
                     total_count, cancel_requested, error
@@ -2281,7 +2329,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredStrmProbeJob>, StorageError> {
         let rows = if let Some(status) = status {
-            sqlx::query(
+            self.query(
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, cursor, processed_count,
                         total_count, cancel_requested, error
@@ -2294,7 +2342,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         } else {
-            sqlx::query(
+            self.query(
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, cursor, processed_count,
                         total_count, cancel_requested, error
@@ -2328,7 +2376,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "INSERT INTO scan_jobs (
                 id, library_id, job_type, status, generation, total_count,
                 discovery_completed
@@ -2344,7 +2392,7 @@ impl Database {
             source,
         })?;
         for root_id in library_root_ids {
-            sqlx::query(
+            self.query(
                 "INSERT INTO reconciliation_scan_entries (
                     job_id, library_root_id, relative_path, entry_type
                  ) VALUES (?, ?, '', 'DIRECTORY')",
@@ -2373,7 +2421,7 @@ impl Database {
         entry_type: &str,
         limit: i64,
     ) -> Result<Vec<StoredReconciliationScanEntry>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT library_root_id, relative_path
              FROM reconciliation_scan_entries
              WHERE job_id = ? AND entry_type = ?
@@ -2414,7 +2462,7 @@ impl Database {
             })?;
         for (entry_type, paths) in [("DIRECTORY", child_directories), ("FILE", media_files)] {
             for path in paths {
-                sqlx::query(
+                self.query(
                     "INSERT INTO reconciliation_scan_entries (
                         job_id, library_root_id, relative_path, entry_type
                      ) VALUES (?, ?, ?, ?)
@@ -2432,7 +2480,7 @@ impl Database {
                 })?;
             }
         }
-        sqlx::query(
+        self.query(
             "DELETE FROM reconciliation_scan_entries
              WHERE job_id = ? AND library_root_id = ?
                AND relative_path = ? AND entry_type = 'DIRECTORY'",
@@ -2467,18 +2515,19 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let total_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM reconciliation_scan_entries
+        let total_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM reconciliation_scan_entries
              WHERE job_id = ? AND entry_type = 'FILE'",
-        )
-        .bind(job_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        sqlx::query(
+            )
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
             "UPDATE scan_jobs
              SET discovery_completed = 1, total_count = ?, updated_at = unixepoch()
              WHERE id = ? AND status = 'RUNNING'",
@@ -2516,7 +2565,7 @@ impl Database {
                 source,
             })?;
         for entry in entries {
-            sqlx::query(
+            self.query(
                 "DELETE FROM reconciliation_scan_entries
                  WHERE job_id = ? AND library_root_id = ?
                    AND relative_path = ? AND entry_type = 'FILE'",
@@ -2531,7 +2580,7 @@ impl Database {
                 source,
             })?;
         }
-        sqlx::query(
+        self.query(
             "UPDATE scan_jobs
              SET cursor = ?, processed_count = ?, updated_at = unixepoch()
              WHERE id = ? AND status = 'RUNNING'",
@@ -2567,19 +2616,20 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let file_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM reconciliation_scan_entries
+        let file_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM reconciliation_scan_entries
              WHERE job_id = ? AND library_root_id = ? AND entry_type = 'FILE'",
-        )
-        .bind(job_id)
-        .bind(library_root_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        sqlx::query(
+            )
+            .bind(job_id)
+            .bind(library_root_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
             "DELETE FROM reconciliation_scan_entries
              WHERE job_id = ? AND library_root_id = ?",
         )
@@ -2605,7 +2655,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query("DELETE FROM reconciliation_scan_entries WHERE job_id = ?")
+        self.query("DELETE FROM reconciliation_scan_entries WHERE job_id = ?")
             .bind(job_id)
             .execute(&self.pool)
             .await
@@ -2617,7 +2667,7 @@ impl Database {
     }
 
     pub(crate) async fn list_active_strm_probe_job_ids(&self) -> Result<Vec<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT id FROM strm_probe_jobs
              WHERE status IN ('PENDING', 'RUNNING')
              ORDER BY created_at, id LIMIT 10000",
@@ -2631,7 +2681,7 @@ impl Database {
     }
 
     pub(crate) async fn claim_strm_probe_job(&self, id: &str) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE strm_probe_jobs
              SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
                  updated_at = unixepoch()
@@ -2653,7 +2703,7 @@ impl Database {
         cursor: Option<&str>,
         processed_count: i64,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE strm_probe_jobs
              SET cursor = ?, processed_count = ?, updated_at = unixepoch()
              WHERE id = ? AND status = 'RUNNING'",
@@ -2674,7 +2724,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar("SELECT cancel_requested FROM strm_probe_jobs WHERE id = ?")
+        self.query_scalar("SELECT cancel_requested FROM strm_probe_jobs WHERE id = ?")
             .bind(id)
             .fetch_one(&self.pool)
             .await
@@ -2686,7 +2736,7 @@ impl Database {
     }
 
     pub(crate) async fn request_strm_probe_job_cancel(&self, id: &str) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE strm_probe_jobs SET cancel_requested = 1, updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
@@ -2706,7 +2756,7 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE strm_probe_jobs
              SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
@@ -2727,7 +2777,7 @@ impl Database {
         &self,
         event: NewScanJobEvent<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO scan_job_events
              (id, job_id, level, event_code, message, details_json)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -2755,7 +2805,7 @@ impl Database {
     ) -> Result<i64, StorageError> {
         let count = match (level, event_code) {
             (Some(_), Some(_)) => {
-                sqlx::query_scalar(
+                self.query_scalar(
                     "SELECT COUNT(*) FROM scan_job_events
                      WHERE job_id = ? AND level = ? AND event_code = ?",
                 )
@@ -2766,7 +2816,7 @@ impl Database {
                 .await
             }
             (Some(_), None) => {
-                sqlx::query_scalar(
+                self.query_scalar(
                     "SELECT COUNT(*) FROM scan_job_events
                      WHERE job_id = ? AND level = ?",
                 )
@@ -2776,7 +2826,7 @@ impl Database {
                 .await
             }
             (None, Some(_)) => {
-                sqlx::query_scalar(
+                self.query_scalar(
                     "SELECT COUNT(*) FROM scan_job_events
                      WHERE job_id = ? AND event_code = ?",
                 )
@@ -2786,7 +2836,7 @@ impl Database {
                 .await
             }
             (None, None) => {
-                sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_events WHERE job_id = ?")
+                self.query_scalar("SELECT COUNT(*) FROM scan_job_events WHERE job_id = ?")
                     .bind(job_id)
                     .fetch_one(&self.pool)
                     .await
@@ -2808,7 +2858,7 @@ impl Database {
     ) -> Result<Vec<StoredScanJobEvent>, StorageError> {
         let rows = match (level, event_code) {
             (Some(_), Some(_)) => {
-                sqlx::query(
+                self.query(
                     "SELECT id, job_id, level, event_code, message, details_json, created_at
                      FROM scan_job_events
                      WHERE job_id = ? AND level = ? AND event_code = ?
@@ -2823,7 +2873,7 @@ impl Database {
                 .await
             }
             (Some(_), None) => {
-                sqlx::query(
+                self.query(
                     "SELECT id, job_id, level, event_code, message, details_json, created_at
                      FROM scan_job_events
                      WHERE job_id = ? AND level = ?
@@ -2837,7 +2887,7 @@ impl Database {
                 .await
             }
             (None, Some(_)) => {
-                sqlx::query(
+                self.query(
                     "SELECT id, job_id, level, event_code, message, details_json, created_at
                      FROM scan_job_events
                      WHERE job_id = ? AND event_code = ?
@@ -2851,7 +2901,7 @@ impl Database {
                 .await
             }
             (None, None) => {
-                sqlx::query(
+                self.query(
                     "SELECT id, job_id, level, event_code, message, details_json, created_at
                      FROM scan_job_events WHERE job_id = ?
                      ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -2884,7 +2934,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode)
              VALUES (?, 'QUEUED', ?, ?)",
         )
@@ -2898,7 +2948,7 @@ impl Database {
             source,
         })?;
         for item_id in item_ids {
-            sqlx::query(
+            self.query(
                 "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
                  VALUES (?, ?, 'PENDING')",
             )
@@ -2926,7 +2976,7 @@ impl Database {
         item_ids: &[String],
         mode: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode)
              VALUES (?, 'CANCELLED', ?, ?)",
         )
@@ -2950,7 +3000,7 @@ impl Database {
                     source,
                 })?;
             for item_id in chunk {
-                sqlx::query(
+                self.query(
                     "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
                      VALUES (?, ?, 'PENDING')",
                 )
@@ -2972,7 +3022,7 @@ impl Database {
                 })?;
         }
 
-        sqlx::query(
+        self.query(
             "UPDATE metadata_reidentify_jobs
              SET status = 'QUEUED', updated_at = unixepoch()
              WHERE id = ? AND status = 'CANCELLED'",
@@ -2991,7 +3041,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<Option<StoredMetadataReidentifyJob>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, status, processed_count, total_count, error,
                     created_at, updated_at, started_at, finished_at, mode,
                     cancel_requested
@@ -3014,7 +3064,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredMetadataReidentifyJob>, StorageError> {
         let rows = if let Some(status) = status {
-            sqlx::query(
+            self.query(
                 "SELECT id, status, processed_count, total_count, error,
                         created_at, updated_at, started_at, finished_at, mode,
                         cancel_requested
@@ -3027,7 +3077,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         } else {
-            sqlx::query(
+            self.query(
                 "SELECT id, status, processed_count, total_count, error,
                         created_at, updated_at, started_at, finished_at, mode,
                         cancel_requested
@@ -3054,7 +3104,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE metadata_reidentify_jobs
              SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
                  updated_at = unixepoch()
@@ -3074,7 +3124,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "WITH prioritized AS (
                  SELECT job_items.item_id, job_items.status,
                         CASE
@@ -3112,7 +3162,7 @@ impl Database {
         job_id: &str,
         item_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE metadata_reidentify_job_items
              SET status = 'RUNNING', updated_at = unixepoch()
              WHERE job_id = ? AND item_id = ? AND status = 'PENDING'
@@ -3150,7 +3200,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "UPDATE metadata_reidentify_job_items
              SET status = ?, candidate_count = ?, error = ?, updated_at = unixepoch()
              WHERE job_id = ? AND item_id = ? AND status = 'RUNNING'",
@@ -3166,7 +3216,7 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        sqlx::query(
+        self.query(
             "UPDATE metadata_reidentify_jobs
              SET processed_count = processed_count + 1, updated_at = unixepoch()
              WHERE id = ?",
@@ -3193,7 +3243,7 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE metadata_reidentify_jobs
              SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
                  error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
@@ -3216,7 +3266,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar("SELECT cancel_requested FROM metadata_reidentify_jobs WHERE id = ?")
+        self.query_scalar("SELECT cancel_requested FROM metadata_reidentify_jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(&self.pool)
             .await
@@ -3231,7 +3281,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE metadata_reidentify_jobs
              SET cancel_requested = 1, updated_at = unixepoch()
              WHERE id = ? AND status IN ('QUEUED', 'RUNNING')",
@@ -3258,8 +3308,9 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let result = sqlx::query(
-            "UPDATE metadata_reidentify_jobs
+        let result = self
+            .query(
+                "UPDATE metadata_reidentify_jobs
              SET status = 'QUEUED',
                  processed_count = (
                      SELECT COUNT(*) FROM metadata_reidentify_job_items
@@ -3268,17 +3319,17 @@ impl Database {
                  cancel_requested = 0, error = NULL, started_at = NULL, finished_at = NULL,
                  updated_at = unixepoch()
              WHERE id = ? AND status IN ('FAILED', 'CANCELLED')",
-        )
-        .bind(job_id)
-        .bind(job_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(job_id)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         if result.rows_affected() == 1 {
-            sqlx::query(
+            self.query(
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'PENDING', candidate_count = 0, error = NULL,
                      updated_at = unixepoch()
@@ -3308,7 +3359,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredMetadataReidentifyItem>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT job_id, item_id, status, candidate_count, error, updated_at
              FROM metadata_reidentify_job_items
              WHERE job_id = ? ORDER BY item_id LIMIT ? OFFSET ?",
@@ -3333,7 +3384,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<StoredScanJob>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
                     discovery_completed
@@ -3356,7 +3407,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredScanJob>, StorageError> {
         let rows = if let Some(status) = status {
-            sqlx::query(
+            self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
                         discovery_completed
@@ -3369,7 +3420,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         } else {
-            sqlx::query(
+            self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
                         discovery_completed
@@ -3392,15 +3443,16 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar(
-            "SELECT EXISTS(
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
                  SELECT 1 FROM metadata_reidentify_job_items
                  WHERE job_id = ? AND status = 'FAILED'
-             )",
+             ) THEN 1 ELSE 0 END",
         )
         .bind(job_id)
         .fetch_one(&self.pool)
         .await
+        .map(|value: i64| value != 0)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -3410,7 +3462,7 @@ impl Database {
     pub(crate) async fn list_active_metadata_reidentify_job_ids(
         &self,
     ) -> Result<Vec<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT id FROM metadata_reidentify_jobs
              WHERE status IN ('QUEUED', 'RUNNING')
              ORDER BY created_at, id LIMIT 10000",
@@ -3428,7 +3480,7 @@ impl Database {
         library_id: &str,
         job_type: &str,
     ) -> Result<Option<StoredScanJob>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
                     discovery_completed
@@ -3448,7 +3500,7 @@ impl Database {
     }
 
     pub(crate) async fn claim_scan_job(&self, id: &str) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE scan_jobs
              SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
                  updated_at = unixepoch()
@@ -3470,7 +3522,7 @@ impl Database {
         cursor: Option<&str>,
         processed_count: i64,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE scan_jobs
              SET cursor = ?, processed_count = ?, updated_at = unixepoch()
              WHERE id = ? AND status = 'RUNNING'",
@@ -3488,7 +3540,7 @@ impl Database {
     }
 
     pub(crate) async fn scan_job_cancel_requested(&self, id: &str) -> Result<bool, StorageError> {
-        sqlx::query_scalar("SELECT cancel_requested FROM scan_jobs WHERE id = ?")
+        self.query_scalar("SELECT cancel_requested FROM scan_jobs WHERE id = ?")
             .bind(id)
             .fetch_one(&self.pool)
             .await
@@ -3506,7 +3558,7 @@ impl Database {
         stream_index: i64,
     ) -> Result<Option<StoredExternalSubtitle>, StorageError> {
         let row = if let Some(media_source_id) = media_source_id {
-            sqlx::query(
+            self.query(
                 "SELECT ms.id AS media_source_id, ms.item_id, mt.external_path,
                         mt.language, mt.title, lr.canonical_path AS root_path
                  FROM media_streams mt
@@ -3525,7 +3577,7 @@ impl Database {
             .fetch_optional(&self.pool)
             .await
         } else {
-            sqlx::query(
+            self.query(
                 "SELECT ms.id AS media_source_id, ms.item_id, mt.external_path,
                         mt.language, mt.title, lr.canonical_path AS root_path
                  FROM media_streams mt
@@ -3571,28 +3623,29 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM media_streams mt
+        let exists = self
+            .query_scalar::<i64>(
+                "SELECT 1 FROM media_streams mt
              JOIN media_sources ms ON ms.id = mt.media_source_id
              WHERE ms.id = ? AND ms.item_id = ? AND mt.stream_index = ?
                AND mt.stream_type = 'SUBTITLE' AND mt.is_external = 1
              LIMIT 1",
-        )
-        .bind(update.media_source_id)
-        .bind(update.item_id)
-        .bind(update.stream_index)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
-        .is_some();
+            )
+            .bind(update.media_source_id)
+            .bind(update.item_id)
+            .bind(update.stream_index)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
         if !exists {
             return Ok(false);
         }
         if update.is_default {
-            sqlx::query(
+            self.query(
                 "UPDATE media_streams
                  SET is_default = 0, updated_at = unixepoch()
                  WHERE media_source_id = ? AND stream_type = 'SUBTITLE'
@@ -3606,7 +3659,7 @@ impl Database {
                 source,
             })?;
         }
-        sqlx::query(
+        self.query(
             "UPDATE media_streams
              SET title = ?, language = ?, is_default = ?, is_forced = ?,
                  updated_at = unixepoch()
@@ -3615,8 +3668,8 @@ impl Database {
         )
         .bind(update.title)
         .bind(update.language)
-        .bind(update.is_default)
-        .bind(update.is_forced)
+        .bind(database_flag(update.is_default))
+        .bind(database_flag(update.is_forced))
         .bind(update.media_source_id)
         .bind(update.stream_index)
         .execute(&mut *transaction)
@@ -3636,7 +3689,7 @@ impl Database {
     }
 
     pub(crate) async fn request_scan_job_cancel(&self, id: &str) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE scan_jobs SET cancel_requested = 1, updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
@@ -3656,7 +3709,7 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE scan_jobs
              SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
@@ -3677,7 +3730,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query("UPDATE libraries SET last_scan_at = unixepoch() WHERE id = ?")
+        self.query("UPDATE libraries SET last_scan_at = unixepoch() WHERE id = ?")
             .bind(library_id)
             .execute(&self.pool)
             .await
@@ -3693,7 +3746,7 @@ impl Database {
         root_id: &str,
         cursor: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query("UPDATE library_roots SET scan_cursor = ? WHERE id = ?")
+        self.query("UPDATE library_roots SET scan_cursor = ? WHERE id = ?")
             .bind(cursor)
             .bind(root_id)
             .execute(&self.pool)
@@ -3709,7 +3762,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<StoredLibraryRoot>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, library_id, canonical_path, display_path,
                     is_available, is_writable, last_checked_at,
                     unavailable_since, scan_cursor
@@ -3730,7 +3783,7 @@ impl Database {
         root_id: &str,
         is_available: bool,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE library_roots
              SET is_available = ?, last_checked_at = unixepoch(),
                  unavailable_since = CASE
@@ -3739,8 +3792,8 @@ impl Database {
                  END
              WHERE id = ?",
         )
-        .bind(is_available)
-        .bind(is_available)
+        .bind(database_flag(is_available))
+        .bind(database_flag(is_available))
         .bind(root_id)
         .execute(&self.pool)
         .await
@@ -3756,7 +3809,7 @@ impl Database {
         library_root_id: &str,
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
              FROM filesystem_entries fe
              LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
@@ -3777,7 +3830,7 @@ impl Database {
         &self,
         library_root_id: &str,
     ) -> Result<Vec<StoredFilesystemEntry>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
              FROM filesystem_entries fe
              LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
@@ -3810,21 +3863,21 @@ impl Database {
                 source,
             })?;
         for chunk in entry_ids.chunks(500) {
-            let mut query_builder = QueryBuilder::<sqlx::Any>::new(
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "UPDATE filesystem_entries
-                 SET last_seen_generation = ",
+                 SET last_seen_generation = ?, is_missing = 0, updated_at = unixepoch()
+                 WHERE id IN ({placeholders})"
             );
-            query_builder.push_bind(last_seen_generation).push(
-                ", is_missing = 0, updated_at = unixepoch()
-                       WHERE id IN (",
-            );
-            let mut separated = query_builder.separated(", ");
+            let mut statement = self
+                .query(sqlx::AssertSqlSafe(query))
+                .bind(last_seen_generation);
             for entry_id in chunk {
-                separated.push_bind(entry_id);
+                statement = statement.bind(entry_id);
             }
-            separated.push_unseparated(")");
-            query_builder
-                .build()
+            statement
                 .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
@@ -3849,7 +3902,7 @@ impl Database {
         fingerprint: &[u8],
         last_seen_generation: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE filesystem_entries
              SET size = ?, modified_at = ?, fingerprint = ?, last_seen_generation = ?,
                  is_missing = 0, updated_at = unixepoch()
@@ -3874,7 +3927,7 @@ impl Database {
         id: &str,
         last_seen_generation: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE filesystem_entries
              SET last_seen_generation = ?, is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
@@ -3895,7 +3948,7 @@ impl Database {
         library_root_id: &str,
         generation: &str,
     ) -> Result<u64, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE filesystem_entries
              SET is_missing = 1, updated_at = unixepoch()
              WHERE library_root_id = ? AND last_seen_generation != ? AND is_missing = 0",
@@ -3916,7 +3969,7 @@ impl Database {
         filesystem_entry_id: &str,
         size: i64,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE media_sources
              SET size = ?, probe_status = 'PENDING', probe_error = NULL,
                  updated_at = unixepoch()
@@ -3938,7 +3991,7 @@ impl Database {
         filesystem_entry_id: &str,
         external_url: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE media_sources
              SET external_url = ?, updated_at = unixepoch()
              WHERE filesystem_entry_id = ?",
@@ -3960,7 +4013,7 @@ impl Database {
         edition_name: Option<&str>,
         quality_label: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE media_sources
              SET edition_name = ?, quality_label = ?, updated_at = unixepoch()
              WHERE filesystem_entry_id = ?",
@@ -3982,8 +4035,8 @@ impl Database {
         filesystem_entry_id: &str,
         new_item_id: &str,
     ) -> Result<bool, StorageError> {
-        let Some((old_item_id, parent_id, series_id)) =
-            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        let Some((old_item_id, parent_id, series_id)) = self
+            .query_as::<(String, Option<String>, Option<String>)>(
                 "SELECT ms.item_id, old_item.parent_id, old_item.series_id
              FROM media_sources ms
              JOIN media_items old_item ON old_item.id = ms.item_id
@@ -4011,7 +4064,8 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        let max_function = self.scalar_max_function();
+        let query = format!(
             "INSERT INTO user_item_state (
                 user_id, item_id, position_ticks, is_played, is_favorite,
                 play_count, last_played_at, version
@@ -4021,22 +4075,15 @@ impl Database {
              FROM user_item_state
              WHERE item_id = ?
              ON CONFLICT(user_id, item_id) DO UPDATE SET
-                position_ticks = MAX(user_item_state.position_ticks, excluded.position_ticks),
-                is_played = MAX(user_item_state.is_played, excluded.is_played),
-                is_favorite = MAX(user_item_state.is_favorite, excluded.is_favorite),
-                play_count = MAX(user_item_state.play_count, excluded.play_count),
-                last_played_at = MAX(user_item_state.last_played_at, excluded.last_played_at),
-                version = MAX(user_item_state.version, excluded.version)",
-        )
-        .bind(new_item_id)
-        .bind(&old_item_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        sqlx::query("DELETE FROM user_item_state WHERE item_id = ?")
+                position_ticks = {max_function}(user_item_state.position_ticks, excluded.position_ticks),
+                is_played = {max_function}(user_item_state.is_played, excluded.is_played),
+                is_favorite = {max_function}(user_item_state.is_favorite, excluded.is_favorite),
+                play_count = {max_function}(user_item_state.play_count, excluded.play_count),
+                last_played_at = {max_function}(user_item_state.last_played_at, excluded.last_played_at),
+                version = {max_function}(user_item_state.version, excluded.version)"
+        );
+        self.query(sqlx::AssertSqlSafe(query))
+            .bind(new_item_id)
             .bind(&old_item_id)
             .execute(&mut *transaction)
             .await
@@ -4044,7 +4091,15 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query("DELETE FROM user_item_state WHERE item_id = ?")
+            .bind(&old_item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
             "UPDATE media_sources
              SET item_id = ?, updated_at = unixepoch()
              WHERE filesystem_entry_id = ?",
@@ -4062,7 +4117,7 @@ impl Database {
             .into_iter()
             .flatten()
         {
-            sqlx::query(
+            self.query(
                 "UPDATE media_items
                  SET removed_at = unixepoch()
                  WHERE id = ?
@@ -4099,8 +4154,8 @@ impl Database {
         item_id: &str,
         source_id: &str,
     ) -> Result<bool, StorageError> {
-        let Some((old_item_id, parent_id, series_id)) =
-            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        let Some((old_item_id, parent_id, series_id)) = self
+            .query_as::<(String, Option<String>, Option<String>)>(
                 "SELECT ms.item_id, old_item.parent_id, old_item.series_id
                  FROM media_sources ms
                  JOIN media_items old_item ON old_item.id = ms.item_id
@@ -4125,7 +4180,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query("DELETE FROM media_sources WHERE id = ? AND item_id = ?")
+        self.query("DELETE FROM media_sources WHERE id = ? AND item_id = ?")
             .bind(source_id)
             .bind(&old_item_id)
             .execute(&mut *transaction)
@@ -4138,7 +4193,7 @@ impl Database {
             .into_iter()
             .flatten()
         {
-            sqlx::query(
+            self.query(
                 "UPDATE media_items
                  SET removed_at = unixepoch()
                  WHERE id = ? AND removed_at IS NULL
@@ -4173,7 +4228,7 @@ impl Database {
         &self,
         entry: NewFilesystemEntry<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO filesystem_entries (
                 id, library_root_id, relative_path, entry_kind, size,
                 modified_at, fingerprint, last_seen_generation, is_missing
@@ -4216,7 +4271,7 @@ impl Database {
             })?;
         let mut created_items = 0;
         for file in files {
-            sqlx::query(
+            self.query(
                 "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
                     modified_at, fingerprint, last_seen_generation, is_missing
@@ -4238,7 +4293,7 @@ impl Database {
 
             let existing_item_id = match file.production_year {
                 Some(year) => {
-                    sqlx::query_scalar::<_, String>(
+                    self.query_scalar::<String>(
                         "SELECT id FROM media_items
                          WHERE library_id = ? AND sort_title = ? AND production_year = ?
                            AND removed_at IS NULL
@@ -4251,7 +4306,7 @@ impl Database {
                     .await
                 }
                 None => {
-                    sqlx::query_scalar::<_, String>(
+                    self.query_scalar::<String>(
                         "SELECT id FROM media_items
                          WHERE library_id = ? AND sort_title = ? AND production_year IS NULL
                            AND removed_at IS NULL
@@ -4271,7 +4326,7 @@ impl Database {
                 (item_id, false)
             } else {
                 let item_id = Uuid::now_v7().to_string();
-                sqlx::query(
+                self.query(
                     "INSERT INTO media_items (
                         id, library_id, item_type, title, sort_title,
                         original_title, production_year, identification_status
@@ -4293,7 +4348,7 @@ impl Database {
             };
             created_items += usize::from(is_new_item);
 
-            sqlx::query(
+            self.query(
                 "INSERT INTO media_sources (
                     id, item_id, source_kind, filesystem_entry_id,
                     edition_name, quality_label, container, size,
@@ -4309,7 +4364,7 @@ impl Database {
             .bind(&file.container)
             .bind(file.size)
             .bind(file.external_url.as_deref())
-            .bind(is_new_item)
+            .bind(database_flag(is_new_item))
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -4335,7 +4390,7 @@ impl Database {
     ) -> Result<Option<StoredMediaItem>, StorageError> {
         let row = match production_year {
             Some(year) => {
-                sqlx::query(
+                self.query(
                     "SELECT id
                      FROM media_items
                      WHERE library_id = ? AND sort_title = ? AND production_year = ?
@@ -4348,7 +4403,7 @@ impl Database {
                 .await
             }
             None => {
-                sqlx::query(
+                self.query(
                     "SELECT id
                      FROM media_items
                      WHERE library_id = ? AND sort_title = ? AND production_year IS NULL
@@ -4371,7 +4426,7 @@ impl Database {
         &self,
         identity_key: &str,
     ) -> Result<Option<StoredMediaItem>, StorageError> {
-        sqlx::query("SELECT id FROM media_items WHERE identity_key = ? AND removed_at IS NULL")
+        self.query("SELECT id FROM media_items WHERE identity_key = ? AND removed_at IS NULL")
             .bind(identity_key)
             .fetch_optional(&self.pool)
             .await
@@ -4386,7 +4441,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaMetadata>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT mi.item_type, mi.title, mi.original_title, mi.overview, mi.production_year,
                     mi.premiere_date, mi.last_air_date, mi.status, mi.original_language, mi.rating,
                     mi.provider_ids_json, mi.metadata_provenance_json, mi.locked_fields_json,
@@ -4446,17 +4501,18 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Vec<String>, StorageError> {
-        let item_type = sqlx::query_scalar::<_, String>(
-            "SELECT item_type FROM media_items
+        let item_type = self
+            .query_scalar::<String>(
+                "SELECT item_type FROM media_items
              WHERE id = ? AND removed_at IS NULL",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         let Some(item_type) = item_type else {
             return Ok(Vec::new());
         };
@@ -4475,7 +4531,7 @@ impl Database {
             }
             _ => "SELECT id FROM media_items WHERE id = ? AND removed_at IS NULL",
         };
-        let mut query = sqlx::query_scalar::<_, String>(query).bind(item_id);
+        let mut query = self.query_scalar::<String>(query).bind(item_id);
         if matches!(item_type.as_str(), "SERIES" | "SEASON") {
             query = query.bind(item_id);
         }
@@ -4492,7 +4548,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredImageIdentity>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT mi.item_type, mi.provider_ids_json,
                     series.provider_ids_json AS series_provider_ids_json,
                     mi.season_number, mi.episode_number,
@@ -4532,7 +4588,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMovieIdentity>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT mi.library_id, mi.provider_ids_json, l.scraper_id
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
@@ -4583,20 +4639,21 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let existing = sqlx::query(
-            "SELECT id, item_id
+        let existing = self
+            .query(
+                "SELECT id, item_id
              FROM collections
              WHERE library_id = ? AND lower(provider) = lower(?) AND provider_id = ?",
-        )
-        .bind(library_id)
-        .bind(provider)
-        .bind(provider_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(library_id)
+            .bind(provider)
+            .bind(provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         let (collection_id, item_id) = if let Some(row) = existing {
             (row.get::<String, _>("id"), row.get::<String, _>("item_id"))
         } else {
@@ -4607,7 +4664,7 @@ impl Database {
                 format!("{provider_key}Collection"): provider_id
             })
             .to_string();
-            sqlx::query(
+            self.query(
                 "INSERT INTO media_items (
                     id, library_id, item_type, title, sort_title, original_title,
                     overview, provider_ids_json, identification_status, identity_key
@@ -4627,7 +4684,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-            sqlx::query(
+            self.query(
                 "INSERT INTO collections (
                     id, item_id, library_id, provider, provider_id,
                     title, overview, poster_path, backdrop_path
@@ -4650,7 +4707,7 @@ impl Database {
             })?;
             (collection_id, item_id)
         };
-        sqlx::query(
+        self.query(
             "UPDATE collections
              SET title = ?, overview = ?, poster_path = ?, backdrop_path = ?,
                  updated_at = unixepoch()
@@ -4667,7 +4724,7 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        sqlx::query(
+        self.query(
             "UPDATE media_items
              SET title = ?, sort_title = ?, original_title = ?, overview = ?
              WHERE id = ?",
@@ -4683,7 +4740,7 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        sqlx::query("DELETE FROM collection_items WHERE collection_id = ?")
+        self.query("DELETE FROM collection_items WHERE collection_id = ?")
             .bind(&collection_id)
             .execute(&mut *transaction)
             .await
@@ -4693,8 +4750,9 @@ impl Database {
             })?;
         let mut member_count = 0_usize;
         for (member_provider, member_provider_id, sort_order) in member_provider_ids {
-            let Some(member_item_id) = sqlx::query_scalar::<_, String>(
-                "SELECT mi.id
+            let Some(member_item_id) = self
+                .query_scalar::<String>(
+                    "SELECT mi.id
                  FROM media_items mi
                  JOIN json_each(
                     CASE WHEN json_valid(mi.provider_ids_json)
@@ -4705,20 +4763,20 @@ impl Database {
                    AND lower(provider_id.key) = lower(?)
                    AND provider_id.value = ?
                  LIMIT 1",
-            )
-            .bind(library_id)
-            .bind(member_provider)
-            .bind(member_provider_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+                )
+                .bind(library_id)
+                .bind(member_provider)
+                .bind(member_provider_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
             else {
                 continue;
             };
-            sqlx::query(
+            self.query(
                 "INSERT INTO collection_items (collection_id, item_id, sort_order)
                  VALUES (?, ?, ?)",
             )
@@ -4750,7 +4808,7 @@ impl Database {
         &self,
         collection_item_id: &str,
     ) -> Result<Vec<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT ci.item_id
              FROM collection_items ci
              JOIN collections c ON c.id = ci.collection_id
@@ -4767,7 +4825,7 @@ impl Database {
     }
 
     pub(crate) async fn count_pending_metadata_candidates(&self) -> Result<i64, StorageError> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE status = 'PENDING'")
+        self.query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE status = 'PENDING'")
             .fetch_one(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -4780,7 +4838,7 @@ impl Database {
         &self,
         candidate: NewMetadataCandidate<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO metadata_candidates (
                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
             ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)",
@@ -4806,7 +4864,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredMetadataCandidate>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
                     mc.candidate_json, mc.score, mc.status, mc.expires_at,
                     mi.title AS item_title
@@ -4834,7 +4892,7 @@ impl Database {
     ) -> Result<i64, StorageError> {
         let count = if let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) {
             let pattern = format!("%{search}%");
-            sqlx::query_scalar::<_, i64>(
+            self.query_scalar::<i64>(
                 "SELECT COUNT(*) FROM metadata_candidates
                  WHERE item_id = ? AND status = 'PENDING'
                    AND (provider_id LIKE ? OR candidate_json LIKE ?)",
@@ -4845,7 +4903,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
         } else {
-            sqlx::query_scalar::<_, i64>(
+            self.query_scalar::<i64>(
                 "SELECT COUNT(*) FROM metadata_candidates
                  WHERE item_id = ? AND status = 'PENDING'",
             )
@@ -4868,7 +4926,7 @@ impl Database {
     ) -> Result<Vec<StoredMetadataCandidate>, StorageError> {
         let rows = if let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) {
             let pattern = format!("%{search}%");
-            sqlx::query(
+            self.query(
                 "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
                         mc.candidate_json, mc.score, mc.status, mc.expires_at,
                         mi.title AS item_title
@@ -4886,7 +4944,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         } else {
-            sqlx::query(
+            self.query(
                 "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
                         mc.candidate_json, mc.score, mc.status, mc.expires_at,
                         mi.title AS item_title
@@ -4913,7 +4971,7 @@ impl Database {
         item_id: &str,
         candidate_id: &str,
     ) -> Result<Option<StoredMetadataCandidate>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
                     mc.candidate_json, mc.score, mc.status, mc.expires_at,
                     mi.title AS item_title
@@ -4946,7 +5004,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "UPDATE media_items
              SET title = ?, original_title = ?, overview = ?, production_year = ?,
                  premiere_date = COALESCE(?, premiere_date),
@@ -4981,19 +5039,20 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        let selected = sqlx::query(
-            "UPDATE metadata_candidates
+        let selected = self
+            .query(
+                "UPDATE metadata_candidates
              SET status = 'SELECTED', updated_at = unixepoch()
              WHERE id = ? AND item_id = ? AND status = 'PENDING'",
-        )
-        .bind(update.candidate_id)
-        .bind(update.item_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            )
+            .bind(update.candidate_id)
+            .bind(update.item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         if selected.rows_affected() != 1 {
             transaction
                 .rollback()
@@ -5004,7 +5063,7 @@ impl Database {
                 })?;
             return Ok(false);
         }
-        sqlx::query(
+        self.query(
             "UPDATE metadata_candidates
              SET status = 'REJECTED', updated_at = unixepoch()
              WHERE item_id = ? AND status = 'PENDING' AND id <> ?",
@@ -5043,7 +5102,7 @@ impl Database {
                  WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}"
             ),
         };
-        let mut statement = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(query));
+        let mut statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(query));
         if let Some(library_id) = library_id {
             statement = statement.bind(library_id);
         }
@@ -5057,7 +5116,7 @@ impl Database {
     }
 
     pub(crate) async fn dashboard_stats(&self) -> Result<DashboardStats, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT
                 COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
                 COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
@@ -5232,7 +5291,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<String>, i64), StorageError> {
-        let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
         if let Some(fts_query) = fts_query {
             statement = statement.bind(fts_query);
             if let Some(library_ids) = library_ids {
@@ -5280,7 +5339,7 @@ impl Database {
              WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                AND mi.library_id IN ({placeholders})"
         );
-        let mut count_statement = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_query));
+        let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
         }
@@ -5301,7 +5360,7 @@ impl Database {
              ORDER BY mi.added_at DESC, mi.sort_title, mi.id
              LIMIT ? OFFSET ?"
         );
-        let mut list_statement = sqlx::query(sqlx::AssertSqlSafe(list_query));
+        let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
         }
@@ -5390,6 +5449,8 @@ impl Database {
         if library_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let max_function = self.scalar_max_function();
+        let min_function = self.scalar_min_function();
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -5404,9 +5465,9 @@ impl Database {
                             + CASE WHEN us.item_id IS NOT NULL
                                       AND COALESCE(us.is_played, 0) = 0 THEN 20 ELSE 0 END
                             + CASE WHEN COALESCE(us.is_played, 0) = 1 THEN -35 ELSE 0 END
-                            + MIN(30, MAX(0, 30 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
+                            + {min_function}(30, {max_function}(0, 30 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
                             + CASE WHEN us.last_played_at IS NULL THEN 0 ELSE
-                                MIN(30, MAX(0, 30 - CAST((unixepoch() - us.last_played_at) / 86400 AS INTEGER)))
+                                {min_function}(30, {max_function}(0, 30 - CAST((unixepoch() - us.last_played_at) / 86400 AS INTEGER)))
                               END
                         ) AS recommendation_score,
                         mi.added_at,
@@ -5474,7 +5535,7 @@ impl Database {
              WHERE mi.parent_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL
                {CATALOG_VISIBLE_PREDICATE}"
         );
-        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(query))
+        self.query_scalar::<i64>(sqlx::AssertSqlSafe(query))
             .bind(parent_id)
             .bind(item_type)
             .fetch_one(&self.pool)
@@ -5522,7 +5583,7 @@ impl Database {
                AND parent.removed_at IS NULL
              GROUP BY parent.id"
         );
-        let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
         for item_id in item_ids {
             statement = statement.bind(item_id);
         }
@@ -5629,8 +5690,9 @@ impl Database {
              WHERE resume_runtime_ticks > 0
                AND position_ticks * 100 < resume_runtime_ticks * ?"
         );
-        let mut statement =
-            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(statement_sql)).bind(user_id);
+        let mut statement = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(statement_sql))
+            .bind(user_id);
         for item_type in item_types {
             statement = statement.bind(*item_type);
         }
@@ -5755,7 +5817,9 @@ impl Database {
                AND us.is_played = 0 AND us.position_ticks > 0
                AND mi.library_id IN ({library_placeholders})"
         );
-        let mut statement = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(query)).bind(user_id);
+        let mut statement = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(query))
+            .bind(user_id);
         for item_type in item_types {
             statement = statement.bind(*item_type);
         }
@@ -5856,7 +5920,7 @@ impl Database {
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              {where_clause}"
         );
-        let mut count_statement = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_query));
+        let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
         for bind in &filter_binds {
             count_statement = match bind {
                 CatalogBind::Text(value) => count_statement.bind(*value),
@@ -6188,7 +6252,7 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
             );
-            let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for item_id in item_ids {
                 statement = statement.bind(item_id);
             }
@@ -6224,7 +6288,7 @@ impl Database {
         query: &str,
         binds: &[CatalogBind<'_>],
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
-        let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
         for bind in binds {
             statement = match bind {
                 CatalogBind::Text(value) => statement.bind(*value),
@@ -6298,7 +6362,7 @@ impl Database {
         &self,
         item: NewMediaItem<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO media_items (
                 id, library_id, item_type, title, sort_title,
                 original_title, production_year, identification_status
@@ -6323,7 +6387,7 @@ impl Database {
         &self,
         source: NewMediaSource<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO media_sources (
                 id, item_id, source_kind, filesystem_entry_id,
                 edition_name, quality_label, container, size,
@@ -6339,7 +6403,7 @@ impl Database {
         .bind(source.container)
         .bind(source.size)
         .bind(source.external_url)
-        .bind(source.is_default)
+        .bind(database_flag(source.is_default))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -6353,7 +6417,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -6388,7 +6452,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<Vec<StoredDanmakuSource>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.id AS source_id, ms.item_id,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -6421,7 +6485,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredDanmakuSource>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.id AS source_id, ms.item_id,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -6453,7 +6517,7 @@ impl Database {
         &self,
         track: NewDanmakuTrack<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO danmaku_tracks (
                 id, media_source_id, relative_path, format, provider,
                 provider_anime_id, provider_episode_id, fingerprint,
@@ -6502,7 +6566,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "INSERT INTO danmaku_match_jobs (
                 id, library_id, status, overwrite, concurrency, total_count
              ) VALUES (?, ?, 'PENDING', ?, ?, ?)",
@@ -6520,7 +6584,7 @@ impl Database {
         })?;
         for source_id in source_ids {
             let item_id = Uuid::now_v7().to_string();
-            sqlx::query(
+            self.query(
                 "INSERT INTO danmaku_match_job_items (
                     id, job_id, media_source_id, status
                  ) VALUES (?, ?, ?, 'PENDING')",
@@ -6548,11 +6612,11 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar(
-            "SELECT EXISTS(
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM danmaku_match_jobs
                 WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')
-            )",
+            ) THEN 1 ELSE 0 END",
         )
         .bind(library_id)
         .fetch_one(&self.pool)
@@ -6568,7 +6632,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<StoredDanmakuMatchJob>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, library_id, status, overwrite, concurrency,
                     total_count, processed_count, success_count,
                     skipped_count, failed_count, cancel_requested, error
@@ -6591,7 +6655,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredDanmakuMatchJob>, StorageError> {
         let rows = if let Some(status) = status {
-            sqlx::query(
+            self.query(
                 "SELECT id, library_id, status, overwrite, concurrency,
                         total_count, processed_count, success_count,
                         skipped_count, failed_count, cancel_requested, error
@@ -6605,7 +6669,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         } else {
-            sqlx::query(
+            self.query(
                 "SELECT id, library_id, status, overwrite, concurrency,
                         total_count, processed_count, success_count,
                         skipped_count, failed_count, cancel_requested, error
@@ -6627,7 +6691,7 @@ impl Database {
     pub(crate) async fn list_active_danmaku_match_job_ids(
         &self,
     ) -> Result<Vec<String>, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT id FROM danmaku_match_jobs
              WHERE status IN ('PENDING', 'RUNNING')
              ORDER BY created_at, id",
@@ -6641,7 +6705,7 @@ impl Database {
     }
 
     pub(crate) async fn claim_danmaku_match_job(&self, id: &str) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE danmaku_match_jobs
              SET status = 'RUNNING',
                  started_at = COALESCE(started_at, unixepoch()),
@@ -6662,7 +6726,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE danmaku_match_job_items
              SET status = 'PENDING', updated_at = unixepoch()
              WHERE job_id = ? AND status = 'RUNNING'",
@@ -6681,7 +6745,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE danmaku_match_job_items
              SET status = 'CANCELLED', updated_at = unixepoch()
              WHERE job_id = ? AND status = 'PENDING'",
@@ -6700,7 +6764,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, media_source_id
              FROM danmaku_match_job_items
              WHERE job_id = ? AND status = 'PENDING'
@@ -6724,7 +6788,7 @@ impl Database {
     }
 
     pub(crate) async fn claim_danmaku_match_item(&self, id: &str) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE danmaku_match_job_items
              SET status = 'RUNNING', attempts = attempts + 1, updated_at = unixepoch()
              WHERE id = ? AND status = 'PENDING'",
@@ -6748,7 +6812,7 @@ impl Database {
         error_code: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE danmaku_match_job_items
              SET status = ?, provider_anime_id = ?, provider_episode_id = ?,
                  error_code = ?, error_message = ?, updated_at = unixepoch()
@@ -6776,7 +6840,7 @@ impl Database {
         skipped: bool,
         failed: bool,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE danmaku_match_jobs
              SET processed_count = processed_count + 1,
                  success_count = success_count + ?,
@@ -6802,7 +6866,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar("SELECT cancel_requested FROM danmaku_match_jobs WHERE id = ?")
+        self.query_scalar("SELECT cancel_requested FROM danmaku_match_jobs WHERE id = ?")
             .bind(id)
             .fetch_one(&self.pool)
             .await
@@ -6817,7 +6881,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE danmaku_match_jobs
              SET cancel_requested = 1, updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
@@ -6838,7 +6902,7 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE danmaku_match_jobs
              SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
@@ -6859,7 +6923,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
                     ii.local_path AS thumbnail_path
              FROM media_sources ms
@@ -6897,7 +6961,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -6932,7 +6996,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<i64, StorageError> {
-        sqlx::query_scalar(
+        self.query_scalar(
             "SELECT COUNT(*)
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -6953,7 +7017,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredDownloadSource>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.source_kind,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -6984,7 +7048,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -7018,7 +7082,7 @@ impl Database {
         item_id: &str,
         source_id: Option<&str>,
     ) -> Result<Option<StoredPlaybackSource>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.source_kind, ms.external_url,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -7056,7 +7120,7 @@ impl Database {
         item_id: &str,
         source_id: &str,
     ) -> Result<Option<StoredDownloadSource>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.source_kind,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -7088,7 +7152,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -7121,7 +7185,7 @@ impl Database {
         item_id: &str,
         source_id: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -7155,7 +7219,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaItemKind>, StorageError> {
-        sqlx::query("SELECT item_type, season_number FROM media_items WHERE id = ?")
+        self.query("SELECT item_type, season_number FROM media_items WHERE id = ?")
             .bind(item_id)
             .fetch_optional(&self.pool)
             .await
@@ -7175,7 +7239,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ms.id AS source_id, episode.id AS item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_items episode
@@ -7218,7 +7282,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "UPDATE media_sources
              SET container = CASE
                      WHEN source_kind = 'STRM_URL' THEN COALESCE(?, container)
@@ -7241,7 +7305,7 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        sqlx::query("DELETE FROM media_streams WHERE media_source_id = ?")
+        self.query("DELETE FROM media_streams WHERE media_source_id = ?")
             .bind(update.source_id)
             .execute(&mut *transaction)
             .await
@@ -7250,7 +7314,7 @@ impl Database {
                 source,
             })?;
         for stream in update.streams {
-            sqlx::query(
+            self.query(
                 "INSERT INTO media_streams (
                     id, media_source_id, stream_index, stream_type,
                     codec, language, title, details_json, external_path,
@@ -7266,9 +7330,9 @@ impl Database {
             .bind(stream.title)
             .bind(stream.details_json)
             .bind(stream.external_path)
-            .bind(stream.is_external)
-            .bind(stream.is_default)
-            .bind(stream.is_forced)
+            .bind(database_flag(stream.is_external))
+            .bind(database_flag(stream.is_default))
+            .bind(database_flag(stream.is_forced))
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -7289,7 +7353,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT series.id AS series_id, season.id AS season_id,
                     episode.id AS episode_id, season.season_number,
                     lr.canonical_path AS root_path, fe.relative_path
@@ -7332,7 +7396,7 @@ impl Database {
         &self,
         item: NewHierarchyItem<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO media_items (
                 id, library_id, item_type, parent_id, series_id,
                 season_number, episode_number, absolute_number,
@@ -7371,7 +7435,7 @@ impl Database {
         original_title: Option<&str>,
         production_year: Option<i64>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE media_items
              SET title = ?, sort_title = ?, original_title = ?, production_year = ?
              WHERE id = ?
@@ -7399,7 +7463,7 @@ impl Database {
         status: &str,
         error: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE media_sources
              SET probe_status = ?, probe_error = ?, updated_at = unixepoch()
              WHERE id = ?",
@@ -7420,7 +7484,7 @@ impl Database {
         &self,
         update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE media_items
              SET title = ?,
                  original_title = ?,
@@ -7452,7 +7516,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+        self.query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
             .bind(item_id)
             .fetch_optional(&self.pool)
             .await
@@ -7467,7 +7531,7 @@ impl Database {
         item_id: &str,
         metadata_fingerprint: &[u8],
     ) -> Result<(), StorageError> {
-        sqlx::query("UPDATE media_items SET metadata_fingerprint = ? WHERE id = ?")
+        self.query("UPDATE media_items SET metadata_fingerprint = ? WHERE id = ?")
             .bind(metadata_fingerprint)
             .bind(item_id)
             .execute(&self.pool)
@@ -7487,7 +7551,7 @@ impl Database {
         file_size: i64,
     ) -> Result<bool, StorageError> {
         let id = Uuid::now_v7().to_string();
-        sqlx::query(
+        self.query(
             "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, file_size, source
             ) VALUES (?, ?, ?, 0, ?, ?, 'LOCAL')
@@ -7517,7 +7581,7 @@ impl Database {
         source: &str,
     ) -> Result<String, StorageError> {
         let id = Uuid::now_v7().to_string();
-        sqlx::query(
+        self.query(
             "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, file_size, content_tag, source
             ) VALUES (?, ?, ?, 0, ?, ?, ?, ?)
@@ -7551,7 +7615,7 @@ impl Database {
         image_type: &str,
         image_index: i64,
     ) -> Result<Vec<StoredItemImageCandidate>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ii.id, ii.local_path, lr.canonical_path AS root_path
              FROM item_images ii
              JOIN media_items mi ON mi.id = ii.item_id
@@ -7584,7 +7648,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Vec<StoredItemImage>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ii.id, ii.item_id, ii.image_type, ii.image_index,
                     ii.local_path, ii.file_size, ii.content_tag, ii.source,
                     MIN(lr.canonical_path) AS root_path
@@ -7610,7 +7674,7 @@ impl Database {
         library_id: &str,
         limit: i64,
     ) -> Result<Vec<StoredLibraryPoster>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ii.item_id, ii.local_path, lr.canonical_path AS root_path
              FROM item_images ii
              JOIN media_items mi ON mi.id = ii.item_id
@@ -7647,7 +7711,7 @@ impl Database {
         item_id: &str,
         image_id: &str,
     ) -> Result<Option<StoredItemImage>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ii.id, ii.item_id, ii.image_type, ii.image_index,
                     ii.local_path, ii.file_size, ii.content_tag, ii.source,
                     MIN(lr.canonical_path) AS root_path
@@ -7673,7 +7737,7 @@ impl Database {
         item_id: &str,
         image_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query("DELETE FROM item_images WHERE item_id = ? AND id = ?")
+        self.query("DELETE FROM item_images WHERE item_id = ? AND id = ?")
             .bind(item_id)
             .bind(image_id)
             .execute(&self.pool)
@@ -7689,7 +7753,7 @@ impl Database {
         &self,
         token: NewAccessToken<'_>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO access_tokens (
                 id, token_hash, user_id, device_id, client_name,
                 device_name, client_version
@@ -7712,7 +7776,7 @@ impl Database {
     }
 
     pub(crate) async fn revoke_access_token(&self, token_hash: &[u8]) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE access_tokens
              SET revoked_at = unixepoch(), updated_at = unixepoch()
              WHERE token_hash = ? AND revoked_at IS NULL",
@@ -7731,11 +7795,11 @@ impl Database {
         &self,
         token_hash: &[u8],
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar(
-            "SELECT EXISTS(
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM access_tokens
                 WHERE token_hash = ? AND revoked_at IS NULL
-            )",
+            ) THEN 1 ELSE 0 END",
         )
         .bind(token_hash)
         .fetch_one(&self.pool)
@@ -7755,7 +7819,7 @@ impl Database {
         csrf_token_hash: &[u8],
         lifetime_seconds: i64,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "INSERT INTO web_sessions (
                 id, user_id, session_token_hash, csrf_token_hash, expires_at
             ) VALUES (?, ?, ?, ?, unixepoch() + ?)",
@@ -7778,7 +7842,7 @@ impl Database {
         &self,
         session_token_hash: &[u8],
     ) -> Result<Option<StoredWebSession>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT ws.csrf_token_hash, u.id AS user_id,
                     u.username_normalized, u.display_name, u.is_disabled,
                     u.is_admin, u.can_manage_server, u.can_remote_access,
@@ -7815,7 +7879,7 @@ impl Database {
         &self,
         session_token_hash: &[u8],
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE web_sessions
              SET revoked_at = unixepoch(), updated_at = unixepoch()
              WHERE session_token_hash = ? AND revoked_at IS NULL",
@@ -7835,7 +7899,7 @@ impl Database {
         user_id: &str,
         current_session_token_hash: &[u8],
     ) -> Result<Vec<StoredWebSessionSummary>, StorageError> {
-        sqlx::query(
+        self.query(
             "SELECT id, created_at, updated_at, expires_at, last_seen_at,
                     session_token_hash = ? AS is_current
              FROM web_sessions
@@ -7869,7 +7933,7 @@ impl Database {
         user_id: &str,
         session_id: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query(
+        self.query(
             "UPDATE web_sessions
              SET revoked_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
@@ -7886,7 +7950,7 @@ impl Database {
     }
 
     pub async fn schema_version(&self) -> Result<i64, StorageError> {
-        sqlx::query("SELECT COALESCE(MAX(version), 0) AS version FROM _sqlx_migrations")
+        self.query("SELECT COALESCE(MAX(version), 0) AS version FROM _sqlx_migrations")
             .fetch_one(&self.pool)
             .await
             .map(|row| row.get::<i64, _>("version"))
@@ -7910,7 +7974,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        sqlx::query(
+        self.query(
             "INSERT INTO lux_meta (key, value)
              VALUES ('__lux_write_probe__', ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -7933,6 +7997,42 @@ impl Database {
 
     pub async fn close(self) {
         self.pool.close().await;
+    }
+
+    fn query(
+        &self,
+        sql: impl sqlx::SqlSafeStr,
+    ) -> sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments> {
+        sqlx::query(sqlx::AssertSqlSafe(adapt_sql_for_backend(
+            self.backend,
+            sql,
+        )))
+    }
+
+    fn query_as<O>(
+        &self,
+        sql: impl sqlx::SqlSafeStr,
+    ) -> sqlx::query::QueryAs<'static, sqlx::Any, O, sqlx::any::AnyArguments>
+    where
+        O: for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
+    {
+        sqlx::query_as(sqlx::AssertSqlSafe(adapt_sql_for_backend(
+            self.backend,
+            sql,
+        )))
+    }
+
+    fn query_scalar<O>(
+        &self,
+        sql: impl sqlx::SqlSafeStr,
+    ) -> sqlx::query::QueryScalar<'static, sqlx::Any, O, sqlx::any::AnyArguments>
+    where
+        (O,): for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
+    {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(adapt_sql_for_backend(
+            self.backend,
+            sql,
+        )))
     }
 }
 
@@ -9090,7 +9190,7 @@ pub(crate) struct MediaStreamUpdate<'a> {
     pub(crate) is_forced: bool,
 }
 
-async fn ensure_server_id(pool: &AnyPool) -> Result<String, sqlx::Error> {
+async fn ensure_server_id(pool: &AnyPool, backend: DatabaseBackend) -> Result<String, sqlx::Error> {
     let mut transaction = pool.begin().await?;
     let existing =
         sqlx::query_scalar::<_, String>("SELECT value FROM lux_meta WHERE key = 'server_id'")
@@ -9102,10 +9202,11 @@ async fn ensure_server_id(pool: &AnyPool) -> Result<String, sqlx::Error> {
     }
 
     let generated = Uuid::now_v7().to_string();
-    sqlx::query(
+    sqlx::query(sqlx::AssertSqlSafe(adapt_sql_for_backend(
+        backend,
         "INSERT INTO lux_meta (key, value) VALUES ('server_id', ?)
          ON CONFLICT(key) DO NOTHING",
-    )
+    )))
     .bind(generated)
     .execute(&mut *transaction)
     .await?;
@@ -9155,6 +9256,44 @@ impl std::fmt::Display for StorageError {
             }
         }
     }
+}
+
+fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -> String {
+    let sql = sql.into_sql_str();
+    if backend == DatabaseBackend::Sqlite {
+        return sql.as_str().to_owned();
+    }
+
+    let mut adapted = String::with_capacity(sql.as_str().len() + 8);
+    let mut parameter_index = 1;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut characters = sql.as_str().chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' if !in_double_quote => {
+                adapted.push(character);
+                if in_single_quote && characters.peek() == Some(&'\'') {
+                    if let Some(escaped_quote) = characters.next() {
+                        adapted.push(escaped_quote);
+                    }
+                } else {
+                    in_single_quote = !in_single_quote;
+                }
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                adapted.push(character);
+            }
+            '?' if !in_single_quote && !in_double_quote => {
+                adapted.push('$');
+                adapted.push_str(&parameter_index.to_string());
+                parameter_index += 1;
+            }
+            _ => adapted.push(character),
+        }
+    }
+    adapted
 }
 
 impl std::error::Error for StorageError {
@@ -9386,5 +9525,15 @@ mod tests {
             Some(("Tvdb".to_owned(), "456".to_owned()))
         );
         assert_eq!(first_provider_id(providers, None, Some("tmdb")), None);
+    }
+
+    #[test]
+    fn postgres_placeholder_adapter_preserves_quoted_question_marks() {
+        let sql = "SELECT ?, '?' AS literal, \"?\" AS identifier, ?";
+        assert_eq!(
+            adapt_sql_for_backend(DatabaseBackend::Postgres, sql),
+            "SELECT $1, '?' AS literal, \"?\" AS identifier, $2"
+        );
+        assert_eq!(adapt_sql_for_backend(DatabaseBackend::Sqlite, sql), sql);
     }
 }

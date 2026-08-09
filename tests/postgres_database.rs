@@ -4,7 +4,9 @@ use luxd::{
     application::{
         access::{AccessPrincipal, MediaAccessService},
         catalog::CatalogService,
+        setup::SetupService,
     },
+    auth::sessions::WebAuthService,
     config::{Config, DatabaseConfiguration, PostgresConnection},
     domain::ids::UserId,
     storage::Database,
@@ -35,12 +37,24 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
     assert!(database.schema_version().await? > 0);
 
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("postgres-admin", "PostgreSQL Admin", "test-password")
+        .await?;
+    let auth = WebAuthService::new(database.clone())?;
+    let login = auth
+        .login("postgres-admin", "test-password")
+        .await?
+        .ok_or("PostgreSQL admin login failed")?;
+    assert_eq!(login.user.username_normalized, "postgres-admin");
+    assert!(auth.resolve(&login.session_token).await?.is_some());
+
     let library_id = uuid::Uuid::now_v7().to_string();
     let inserted = sqlx::query(
         "INSERT INTO libraries (
             id, name, kind, is_enabled, realtime_watch_enabled,
             scan_concurrency, probe_concurrency
-        ) VALUES (?, ?, ?, 1, 1, 2, 1)",
+        ) VALUES ($1, $2, $3, 1, 1, 2, 1)",
     )
     .bind(&library_id)
     .bind("PostgreSQL Test Library")
@@ -49,7 +63,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .await?;
     assert_eq!(inserted.rows_affected(), 1);
 
-    let stored_name: String = sqlx::query_scalar("SELECT name FROM libraries WHERE id = ?")
+    let stored_name: String = sqlx::query_scalar("SELECT name FROM libraries WHERE id = $1")
         .bind(&library_id)
         .fetch_one(database.pool())
         .await?;
@@ -58,8 +72,8 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     let item_id = uuid::Uuid::now_v7().to_string();
     sqlx::query(
         "INSERT INTO media_items (
-            id, library_id, item_type, title, sort_title, identification_status
-        ) VALUES (?, ?, 'MOVIE', 'Postgres Search Movie', 'postgres search movie', 'LOCAL_CONFIRMED')",
+            id, library_id, item_type, title, sort_title, identification_status, has_available_source
+        ) VALUES ($1, $2, 'MOVIE', 'Postgres Search Movie', 'postgres search movie', 'LOCAL_CONFIRMED', 1)",
     )
     .bind(&item_id)
     .bind(&library_id)
@@ -67,7 +81,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .await?;
     sqlx::query(
         "INSERT INTO item_aliases (id, item_id, alias, language, alias_normalized)
-         VALUES (?, ?, '银河搜索电影', 'zh-CN', '银河搜索电影')",
+         VALUES ($1, $2, '银河搜索电影', 'zh-CN', '银河搜索电影')",
     )
     .bind(uuid::Uuid::now_v7().to_string())
     .bind(&item_id)
