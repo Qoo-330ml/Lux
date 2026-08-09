@@ -46,9 +46,9 @@
 - 三个第三方客户端通过服务器 URL 手动添加 Lux；局域网自动发现不是首版阻塞项。
 - 飞牛 NAS 向 Docker 暴露普通 Linux 目录，媒体路径可 bind mount。
 - 因为管理员要求回写 NFO 和图片，相关媒体目录将以读写方式挂载。
-- SQLite 数据库位于 /config 的本机持久化卷，不位于 SMB/NFS。
+- 默认 SQLite 数据库位于 /config 的本机持久化卷，不位于 SMB/NFS；首次引导也可以选择管理员已准备好的外部 PostgreSQL。
 - 兼容性只承诺实施时真实测试并记录版本的 VidHub、SenPlayer 和 Infuse；“对标 Emby”不等于实现 Emby 全部端点。
-- 首版运行单个 Lux 实例，不做多节点、高可用或共享数据库。
+- 首版运行单个 Lux 实例，不做多节点或高可用；外部 PostgreSQL 只作为可选的共享存储后端，不代表 Lux 首版承诺多节点部署。
 - 弹幕首版只面向支持弹幕接口的第三方客户端；不把 Emby 标准字幕端点当作弹幕协议，也不为其他客户端增加 ASS 或转码兜底。
 
 ---
@@ -423,20 +423,21 @@ Lux 的核心价值不是功能数量，而是：
 
 ### 6.3 数据库选择
 
-首版使用单文件 SQLite，开启 WAL、外键、busy_timeout，并在后台执行受控 checkpoint。
+首次安装引导允许管理员在以下两种后端中选择：
 
-选择原因：
+- 内置 SQLite：单文件 `/config/lux.db`，开启 WAL、外键、busy_timeout，并在后台执行受控 checkpoint。
+- 外部 PostgreSQL：管理员提供已运行的 PostgreSQL 连接信息，Lux 只负责验证连接、运行迁移和使用该数据库，不负责启动或管理 PostgreSQL 服务。
 
-- NAS 单机单实例部署。
-- 运维成本低，不需要附带 PostgreSQL。
-- 60,000 级媒体条目远低于 SQLite 的合理容量。
-- WAL 允许读写并行，适合“前台高读、后台短批量写”。
+默认仍推荐内置 SQLite，因为 Lux 首版是单实例、前台高读、后台短批量写入的 NAS 服务，60,000 级媒体条目在合理容量内。外部 PostgreSQL 面向需要更高并发写入、集中数据库管理或已有 PostgreSQL 基础设施的部署。
+
+数据库选择只发生在首次初始化、创建第一个用户之前。当前版本不支持已初始化实例在线切换后端，也不自动执行 SQLite 到 PostgreSQL 的数据迁移；后续如需迁移，必须提供显式导出、导入和回滚流程。
 
 限制：
 
-- 数据库文件必须位于容器本机持久化卷，不得放在 SMB/NFS 上。
-- 同一数据库只允许一个 Lux 实例写入。
-- SQLite 同时只有一个写者，因此扫描器必须批量、短事务、限制写入竞争。
+- SQLite 数据库文件必须位于容器本机持久化卷，不得放在 SMB/NFS 上。
+- PostgreSQL 地址、用户名和密码属于敏感配置，不得进入日志、普通 API 响应或错误详情。
+- PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
+- SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 
 ### 6.4 Docker
 
@@ -474,7 +475,7 @@ VidHub / SenPlayer / Infuse             Browser
                             |
         +-------------------+--------------------+
         |                   |                    |
-   SQLite Storage      Background Jobs       File Streaming
+       Configured Storage   Background Jobs       File Streaming
         |           scan / probe / TMDb /         |
         |             image / writeback            |
         +-------------------+--------------------+
@@ -1674,12 +1675,12 @@ services:
 - 原因：NAS 部署简单、事务清晰、Codex 分步开发更容易。
 - 否决：微服务会增加部署、网络和一致性成本。
 
-### ADR-002：SQLite WAL
+### ADR-002：SQLite WAL（默认后端）
 
 - 状态：建议接受。
-- 决定：首版 SQLite WAL，数据库必须位于本机卷。
+- 决定：内置数据库模式使用 SQLite WAL，数据库必须位于本机卷；它仍是默认后端，但不再是唯一允许的后端。
 - 原因：单机、高读低并发写、低运维。
-- 风险：单写者；通过短事务、批量和写入配额缓解。
+- 风险：单写者；通过短事务、批量和写入配额缓解。需要更高并发写入的部署可在首次引导选择外部 PostgreSQL。
 
 ### ADR-003：独立 Emby 兼容边界
 
