@@ -147,4 +147,59 @@ describe("HorizontalScrollRail", () => {
 
     expect(container.querySelector("[aria-label=\"向右滚动媒体库\"]")).not.toBeNull();
   });
+
+  it("reconciles the right arrow with the browser-clamped scroll position", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root?.render(
+        <HorizontalScrollRail ariaLabel="最近播放">
+          <div className="rail-content">
+            <div className="rail-card">第一张</div>
+            <div className="rail-card">第二张</div>
+          </div>
+        </HorizontalScrollRail>,
+      );
+    });
+
+    const rail = container.querySelector<HTMLDivElement>(".lux-horizontal-scroll-viewport");
+    const content = rail?.firstElementChild;
+    const firstCard = content?.firstElementChild;
+    const lastCard = content?.lastElementChild;
+    expect(rail).not.toBeNull();
+    expect(firstCard).not.toBeNull();
+    expect(lastCard).not.toBeNull();
+    Object.defineProperty(rail, "clientWidth", { configurable: true, value: 320 });
+    Object.defineProperty(rail, "scrollWidth", { configurable: true, value: 720 });
+    Object.defineProperty(rail, "scrollLeft", { configurable: true, writable: true, value: 200 });
+    const rect = (left: number, right: number) => ({ left, right, top: 0, bottom: 100, width: right - left, height: 100 });
+    Object.defineProperty(rail, "getBoundingClientRect", { configurable: true, value: () => rect(0, 320) });
+    Object.defineProperty(firstCard, "getBoundingClientRect", {
+      configurable: true,
+      value: () => rect(-rail.scrollLeft, 120 - rail.scrollLeft),
+    });
+    Object.defineProperty(lastCard, "getBoundingClientRect", {
+      configurable: true,
+      value: () => rect(120 - rail.scrollLeft, rail.scrollLeft >= 400 ? 320 : 600),
+    });
+    const scrollTo = vi.fn(({ left }: ScrollToOptions) => {
+      rail.scrollLeft = Math.min(left ?? 0, 400);
+    });
+    Object.defineProperty(rail, "scrollTo", { configurable: true, value: scrollTo });
+
+    await act(async () => {
+      rail?.dispatchEvent(new Event("scroll"));
+    });
+    expect(container.querySelector("[aria-label=\"向右滚动最近播放\"]")).not.toBeNull();
+
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("[aria-label=\"向右滚动最近播放\"]")?.click();
+    });
+
+    expect(scrollTo).toHaveBeenCalledWith({ behavior: "smooth", left: 456 });
+    expect(rail?.scrollLeft).toBe(400);
+    expect(container.querySelector("[aria-label=\"向右滚动最近播放\"]")).toBeNull();
+  });
 });

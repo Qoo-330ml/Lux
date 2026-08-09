@@ -99,10 +99,7 @@ export function HorizontalScrollRail({ ariaLabel, children, className }: Horizon
     } else {
       rail.scrollTo({ left: targetScrollLeft, behavior: "smooth" });
     }
-    setScrollState({
-      canScrollLeft: targetScrollLeft > 1,
-      canScrollRight: maxScrollLeft - targetScrollLeft > 1,
-    });
+    measureScroll();
   }
 
   return (
