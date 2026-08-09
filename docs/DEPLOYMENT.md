@@ -12,6 +12,19 @@ docker compose pull
 docker compose up -d
 ```
 
+上面的默认命令只启动 Lux，使用内置 SQLite。若希望由同一个 Compose 项目额外运行 PostgreSQL，先设置
+强密码，再启用 `postgres` profile：
+
+```bash
+export LUX_POSTGRES_PASSWORD='change-this-before-use'
+docker compose --profile postgres pull
+docker compose --profile postgres up -d
+```
+
+该 PostgreSQL 服务是独立容器，不是 Lux 容器内的子进程；它的数据保存在 Compose volume
+`postgres-data`。启用 profile 后，在 Lux 引导中选择 PostgreSQL，主机填写 Compose 服务名 `postgres`，
+端口填写 `5432`。也可以不启用 profile，连接外部已有的 PostgreSQL 服务。
+
 镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本会创建 `/config/plugins`，并将镜像内置的 TMDb 插件包复制到持久化配置目录；不会递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。项目自带的 TMDb 插件会在发现后自动标记为已安装、已启用。
 
 首次部署只在内网访问 `http://127.0.0.1:8097/` 完成初始化。初始化完成后再开放反向代理入口；不要把未初始化的 setup 页面直接暴露到公网。
@@ -21,7 +34,9 @@ docker compose up -d
 首次进入引导、创建第一个管理员之前，Lux 会让你选择数据库：
 
 - `SQLite`：默认的内置数据库，不需要额外容器；数据文件是 `/config/lux.db`。
-- `PostgreSQL`：连接已经在 Lux 之外运行的 PostgreSQL 服务。Lux 不会在自身容器内启动 PostgreSQL，也不会自动创建或管理 PostgreSQL 容器。
+- `PostgreSQL`：连接已经在 Lux 之外运行的 PostgreSQL 服务。可以使用本 Compose 文件的可选
+  `postgres` profile，也可以填写部署环境中已有的 PostgreSQL；无论哪种方式，PostgreSQL 都不在 Lux
+  容器内部运行。
 
 PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，然后在页面填写主机、端口、数据库名、用户名、密码和 SSL 模式并测试连接。选择成功后需要重启 Lux，重启时会在 PostgreSQL 空库上运行 schema migration，再继续管理员初始化。数据库密码只保存在受 `/config` 权限保护的 `/config/database.json` 中，不会返回 API、写入日志或审计事件；请将整个 `/config` 按敏感配置进行保护。
 

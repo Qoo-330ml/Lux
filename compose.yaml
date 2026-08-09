@@ -9,3 +9,24 @@ services:
       - ./config:/config:rw
       - ./media:/media:rw
     restart: unless-stopped
+
+  postgres:
+    image: ${LUX_POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: lux-postgres
+    profiles:
+      - postgres
+    environment:
+      POSTGRES_DB: ${LUX_POSTGRES_DB:-lux}
+      POSTGRES_USER: ${LUX_POSTGRES_USER:-lux}
+      POSTGRES_PASSWORD: ${LUX_POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

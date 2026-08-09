@@ -16,7 +16,16 @@ mkdir -p config media
 docker compose up -d
 ```
 
-首次启动后访问 `http://localhost:8097/` 完成初始化。首次引导会选择内置 SQLite 或外部 PostgreSQL；PostgreSQL 必须由部署环境提前运行，Lux 不会启动另一个数据库容器。Compose 默认把仓库旁的 `./config` 映射到容器 `/config`，把 `./media` 映射到 `/media`；这两个目录均为本地运行数据，不会提交到 Git。生产环境可直接修改 `compose.yaml` 中媒体挂载的宿主机路径，并应在反代 HTTPS 后使用。
+首次启动后访问 `http://localhost:8097/` 完成初始化。默认 Compose 启动只运行 Lux，首次引导使用内置 SQLite；Compose 也提供可选的 PostgreSQL profile，PostgreSQL 作为独立容器运行，不会被塞进 Lux 容器。Compose 默认把仓库旁的 `./config` 映射到容器 `/config`，把 `./media` 映射到 `/media`；这两个目录均为本地运行数据，不会提交到 Git。生产环境可直接修改 `compose.yaml` 中媒体挂载的宿主机路径，并应在反代 HTTPS 后使用。
+
+需要让 Compose 同时运行 PostgreSQL 时，先设置一个强密码，再启动 profile：
+
+```bash
+export LUX_POSTGRES_PASSWORD='change-this-before-use'
+docker compose --profile postgres up -d
+```
+
+随后在 Lux 引导中选择 PostgreSQL，主机填写 `postgres`，端口填写 `5432`；也可以不启用该 profile，改为填写部署环境中已有的 PostgreSQL 地址。
 
 数据库选择保存在 `/config/database.json`。选择 PostgreSQL 后需要重启 Lux 才会继续管理员初始化；数据库只能在首次初始化前选择，当前不支持在线切换或 SQLite 数据迁移。PostgreSQL 数据库需要单独备份，SQLite 随 `/config` 备份。
 
