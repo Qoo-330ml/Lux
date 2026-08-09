@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { readFileSync } from "node:fs";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -197,6 +198,34 @@ describe("AdminLibrariesPage library cards", () => {
     expect(createLibrary).toHaveBeenCalledWith({ name: "电影库", kind: "MOVIE", scraperId: null });
     expect(createLibrary.mock.invocationCallOrder[0]).toBeLessThan(addRoot.mock.invocationCallOrder[0]);
     expect(container.querySelector("#new-library-title")).toBeNull();
+  });
+
+  it("keeps the create dialog form scrollable when the directory picker is open", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      path: "/",
+      parentPath: null,
+      directories: [{ name: "media", path: "/media" }],
+      page: 1,
+      pageSize: 50,
+      hasMore: false,
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("新增媒体库"))
+        ?.click();
+    });
+    const dialog = container.querySelector('[role="dialog"]');
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>("[aria-label='浏览服务器目录']")?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const form = container.querySelector<HTMLFormElement>(".lux-library-create-dialog form");
+    expect(form).toBeTruthy();
+    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+    expect(stylesheet).toContain(".lux-library-create-dialog > .lux-library-dialog-form { min-height: 0; overflow-y: auto; }");
   });
 
   it("does not leave a retryable create form when folder addition is not completed", async () => {
