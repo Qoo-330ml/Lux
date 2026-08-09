@@ -4,7 +4,7 @@
 
 ## Docker Compose
 
-生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放 SQLite、插件和服务配置；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
+生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放 SQLite、插件、服务配置和按 UTC 日期滚动的 `logs/lux.YYYY-MM-DD.log`；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
 
 ```bash
 mkdir -p config media
@@ -15,6 +15,9 @@ docker compose up -d
 镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本会创建 `/config/plugins`，并将镜像内置的 TMDb 插件包复制到持久化配置目录；不会递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。项目自带的 TMDb 插件会在发现后自动标记为已安装、已启用。
 
 首次部署只在内网访问 `http://127.0.0.1:8097/` 完成初始化。初始化完成后再开放反向代理入口；不要把未初始化的 setup 页面直接暴露到公网。
+
+管理员可以在“任务与日志 → 系统日志”选择 UTC 起止日期并直接下载日志 ZIP；也可以在宿主机使用
+`docker compose logs --no-color --timestamps --since 1h lux` 查看容器 stdout。日志文件和导出内容可能包含媒体相对路径及请求诊断信息，不要公开发布；不要把 `/config` 整目录、Cookie、配置凭据或数据库文件作为日志附件发送。
 
 ### Docker Hub 镜像
 

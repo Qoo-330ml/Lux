@@ -27,7 +27,7 @@ impl LogDateRange {
         let from = from
             .map(parse_date)
             .transpose()?
-            .unwrap_or_else(|| subtract_days(today, DEFAULT_EXPORT_DAYS - 1));
+            .unwrap_or_else(|| subtract_days(to, DEFAULT_EXPORT_DAYS - 1));
         Self::new(from, to)
     }
 
@@ -59,6 +59,7 @@ pub enum LogExportError {
     InvalidDate,
     DateRangeReversed,
     DateRangeTooLarge,
+    ExportTooLarge,
     NoLogs,
     Io(io::Error),
     Archive(String),
@@ -71,6 +72,7 @@ impl fmt::Display for LogExportError {
             Self::InvalidDate => formatter.write_str("日志日期必须使用 YYYY-MM-DD 格式"),
             Self::DateRangeReversed => formatter.write_str("日志起止日期无效"),
             Self::DateRangeTooLarge => formatter.write_str("日志导出范围最多为 31 天"),
+            Self::ExportTooLarge => formatter.write_str("日志导出文件过大，请缩小日期范围"),
             Self::NoLogs => formatter.write_str("所选日期没有可导出的日志"),
             Self::Io(_) | Self::Archive(_) | Self::Worker(_) => {
                 formatter.write_str("日志文件暂时无法导出")
@@ -86,6 +88,7 @@ impl std::error::Error for LogExportError {
             Self::InvalidDate
             | Self::DateRangeReversed
             | Self::DateRangeTooLarge
+            | Self::ExportTooLarge
             | Self::NoLogs
             | Self::Archive(_)
             | Self::Worker(_) => None,
@@ -123,7 +126,7 @@ pub async fn export_logs(
         };
         let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
         if size > MAX_DAILY_LOG_BYTES || total_bytes.saturating_add(size) > MAX_EXPORT_BYTES {
-            return Err(LogExportError::DateRangeTooLarge);
+            return Err(LogExportError::ExportTooLarge);
         }
         total_bytes = total_bytes.saturating_add(size);
         files.push((name, contents));
