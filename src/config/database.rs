@@ -8,6 +8,7 @@ use uuid::Uuid;
 use super::Config;
 
 const DATABASE_CONFIG_FILE: &str = "database.json";
+const DATABASE_SELECTION_MARKER_FILE: &str = ".database-selection-required";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -166,7 +167,39 @@ impl Config {
     }
 
     pub async fn has_legacy_sqlite_database(&self) -> bool {
-        fs::metadata(self.config_dir.join("lux.db")).await.is_ok()
+        if fs::metadata(self.config_dir.join("lux.db")).await.is_err() {
+            return false;
+        }
+        fs::metadata(self.config_dir.join(DATABASE_SELECTION_MARKER_FILE))
+            .await
+            .is_err()
+    }
+
+    pub async fn mark_database_selection_pending(&self) -> Result<(), DatabaseConfigurationError> {
+        fs::create_dir_all(&self.config_dir)
+            .await
+            .map_err(|source| DatabaseConfigurationError::Io {
+                path: self.config_dir.clone(),
+                source,
+            })?;
+        let path = self.config_dir.join(DATABASE_SELECTION_MARKER_FILE);
+        fs::write(&path, b"pending")
+            .await
+            .map_err(|source| DatabaseConfigurationError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|source| DatabaseConfigurationError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
     }
 
     pub async fn save_database_configuration(
@@ -208,6 +241,7 @@ impl Config {
             let _ = fs::remove_file(&temporary_path).await;
             return Err(DatabaseConfigurationError::Io { path, source });
         }
+        let _ = fs::remove_file(self.config_dir.join(DATABASE_SELECTION_MARKER_FILE)).await;
         Ok(())
     }
 }

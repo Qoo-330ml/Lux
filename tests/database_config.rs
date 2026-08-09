@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use luxd::config::{Config, DatabaseConfiguration, PostgresConnection};
+use luxd::{
+    config::{Config, DatabaseConfiguration, PostgresConnection},
+    storage::Database,
+};
 
 fn config(config_dir: &Path) -> Config {
     Config {
@@ -54,6 +57,32 @@ async fn existing_sqlite_file_keeps_legacy_default() -> Result<(), Box<dyn std::
     tokio::fs::create_dir_all(&config.config_dir).await?;
     tokio::fs::write(config.config_dir.join("lux.db"), b"legacy marker").await?;
 
+    assert_eq!(
+        config.load_database_configuration().await?,
+        Some(DatabaseConfiguration::Sqlite)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_database_selection_does_not_turn_bootstrap_sqlite_into_legacy_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = config(temp_dir.path());
+    config.mark_database_selection_pending().await?;
+    let database = Database::connect(&config).await?;
+    database.close().await;
+
+    assert_eq!(config.load_database_configuration().await?, None);
+    config
+        .save_database_configuration(&DatabaseConfiguration::Sqlite)
+        .await?;
+    assert!(
+        !config
+            .config_dir
+            .join(".database-selection-required")
+            .exists()
+    );
     assert_eq!(
         config.load_database_configuration().await?,
         Some(DatabaseConfiguration::Sqlite)
