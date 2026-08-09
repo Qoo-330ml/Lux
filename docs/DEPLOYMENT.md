@@ -4,7 +4,7 @@
 
 ## Docker Compose
 
-生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放 SQLite、插件、服务配置和按 UTC 日期滚动的 `logs/lux.YYYY-MM-DD.log`；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
+生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放数据库选择文件、内置 SQLite（如使用）、插件、服务配置和按 UTC 日期滚动的 `logs/lux.YYYY-MM-DD.log`；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
 
 ```bash
 mkdir -p config media
@@ -15,6 +15,17 @@ docker compose up -d
 镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本会创建 `/config/plugins`，并将镜像内置的 TMDb 插件包复制到持久化配置目录；不会递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。项目自带的 TMDb 插件会在发现后自动标记为已安装、已启用。
 
 首次部署只在内网访问 `http://127.0.0.1:8097/` 完成初始化。初始化完成后再开放反向代理入口；不要把未初始化的 setup 页面直接暴露到公网。
+
+### 选择数据库
+
+首次进入引导、创建第一个管理员之前，Lux 会让你选择数据库：
+
+- `SQLite`：默认的内置数据库，不需要额外容器；数据文件是 `/config/lux.db`。
+- `PostgreSQL`：连接已经在 Lux 之外运行的 PostgreSQL 服务。Lux 不会在自身容器内启动 PostgreSQL，也不会自动创建或管理 PostgreSQL 容器。
+
+PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，然后在页面填写主机、端口、数据库名、用户名、密码和 SSL 模式并测试连接。选择成功后需要重启 Lux，重启时会在 PostgreSQL 空库上运行 schema migration，再继续管理员初始化。数据库密码只保存在受 `/config` 权限保护的 `/config/database.json` 中，不会返回 API、写入日志或审计事件；请将整个 `/config` 按敏感配置进行保护。
+
+数据库后端只能在首次初始化前选择，已初始化实例不支持在线切换，也不会自动把已有 SQLite 数据迁移到 PostgreSQL。已有 `/config/lux.db` 的旧版 SQLite 实例会继续使用 SQLite，不会显示选择页面。使用 PostgreSQL 时，PostgreSQL 数据库需要单独纳入备份、恢复、容量和升级计划；SQLite 则随 `/config` 一起备份。
 
 管理员可以在“任务与日志 → 系统日志”选择 UTC 起止日期并直接下载日志；选择单日会下载原始 `.log` 文件，跨日会下载 ZIP。也可以在宿主机使用
 `docker compose logs --no-color --timestamps --since 1h lux` 查看容器 stdout。日志文件和导出内容可能包含媒体相对路径及请求诊断信息，不要公开发布；不要把 `/config` 整目录、Cookie、配置凭据或数据库文件作为日志附件发送。
@@ -94,7 +105,7 @@ docker build --build-arg LUX_VERSION=0.1.2 -t lux:0.1.2 .
 docker compose up -d
 ```
 
-启动时会自动执行 SQLite migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。当前版本不提供应用内备份/恢复或跨数据库迁移工具，正式 NAS 发布前必须由运维侧完成两个目录的快照和恢复演练。
+启动时会自动执行当前已选择数据库的 migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。当前版本不提供应用内备份/恢复或跨数据库迁移工具，也不提供 SQLite 与 PostgreSQL 之间的数据迁移；正式 NAS 发布前必须由运维侧完成配置目录、媒体目录和（如使用）PostgreSQL 数据库的快照与恢复演练。
 
 升级后的验收最少包括：
 
