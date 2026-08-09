@@ -1,9 +1,10 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use sqlx::{
-    QueryBuilder, Row,
+    Executor, QueryBuilder, Row,
+    any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions},
+    AnyPool,
 };
 use tokio::fs;
 use uuid::Uuid;
@@ -16,7 +17,7 @@ pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
 
 #[derive(Clone)]
 pub struct Database {
-    pool: SqlitePool,
+    pool: AnyPool,
     path: PathBuf,
     server_id: String,
 }
@@ -31,14 +32,24 @@ impl Database {
             })?;
 
         let path = config.config_dir.join("lux.db");
-        let options = SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
+        sqlx::any::install_default_drivers();
+        let database_url = format!("sqlite://{}?mode=rwc", path.display());
+        let options = AnyConnectOptions::from_str(&database_url).map_err(|source| {
+            StorageError::Sqlx {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let pool = AnyPoolOptions::new()
             .max_connections(5)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    connection
+                        .execute("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -64,7 +75,7 @@ impl Database {
         })
     }
 
-    pub fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &AnyPool {
         &self.pool
     }
 
@@ -1435,7 +1446,7 @@ impl Database {
             if chunk.is_empty() {
                 continue;
             }
-            let mut query_builder = QueryBuilder::<sqlx::Sqlite>::new(
+            let mut query_builder = QueryBuilder::<sqlx::Any>::new(
                 "SELECT item_id, position_ticks, is_played, is_favorite, play_count,
                         last_played_at, version
                  FROM user_item_state WHERE user_id = ",
@@ -3709,7 +3720,7 @@ impl Database {
                 source,
             })?;
         for chunk in entry_ids.chunks(500) {
-            let mut query_builder = QueryBuilder::<sqlx::Sqlite>::new(
+            let mut query_builder = QueryBuilder::<sqlx::Any>::new(
                 "UPDATE filesystem_entries
                  SET last_seen_generation = ",
             );
@@ -7810,7 +7821,7 @@ pub(crate) struct StoredAccessTokenDevice {
     pub(crate) client_version: String,
 }
 
-fn stored_user(row: sqlx::sqlite::SqliteRow) -> StoredUser {
+fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
     StoredUser {
         id: row.get("id"),
         username_normalized: row.get("username_normalized"),
@@ -7918,7 +7929,7 @@ pub(crate) struct StoredLibraryRoot {
     pub(crate) scan_cursor: Option<String>,
 }
 
-fn stored_scheduled_task(row: sqlx::sqlite::SqliteRow) -> StoredScheduledTaskConfig {
+fn stored_scheduled_task(row: sqlx::any::AnyRow) -> StoredScheduledTaskConfig {
     StoredScheduledTaskConfig {
         owner_type: row.get("owner_type"),
         owner_id: row.get("owner_id"),
@@ -8010,7 +8021,7 @@ pub(crate) struct NewScanJobEvent<'a> {
     pub(crate) details_json: &'a str,
 }
 
-fn stored_scan_job(row: sqlx::sqlite::SqliteRow) -> StoredScanJob {
+fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
     StoredScanJob {
         id: row.get("id"),
         library_id: row.get("library_id"),
@@ -8026,7 +8037,7 @@ fn stored_scan_job(row: sqlx::sqlite::SqliteRow) -> StoredScanJob {
     }
 }
 
-fn stored_scan_job_path(row: sqlx::sqlite::SqliteRow) -> StoredScanJobPath {
+fn stored_scan_job_path(row: sqlx::any::AnyRow) -> StoredScanJobPath {
     StoredScanJobPath {
         library_root_id: row.get("library_root_id"),
         relative_path: row.get("relative_path"),
@@ -8034,14 +8045,14 @@ fn stored_scan_job_path(row: sqlx::sqlite::SqliteRow) -> StoredScanJobPath {
     }
 }
 
-fn stored_reconciliation_scan_entry(row: sqlx::sqlite::SqliteRow) -> StoredReconciliationScanEntry {
+fn stored_reconciliation_scan_entry(row: sqlx::any::AnyRow) -> StoredReconciliationScanEntry {
     StoredReconciliationScanEntry {
         library_root_id: row.get("library_root_id"),
         relative_path: row.get("relative_path"),
     }
 }
 
-fn stored_strm_probe_job(row: sqlx::sqlite::SqliteRow) -> StoredStrmProbeJob {
+fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
     StoredStrmProbeJob {
         id: row.get("id"),
         operation_id: row.get("operation_id"),
@@ -8058,7 +8069,7 @@ fn stored_strm_probe_job(row: sqlx::sqlite::SqliteRow) -> StoredStrmProbeJob {
     }
 }
 
-fn stored_scan_job_event(row: sqlx::sqlite::SqliteRow) -> StoredScanJobEvent {
+fn stored_scan_job_event(row: sqlx::any::AnyRow) -> StoredScanJobEvent {
     StoredScanJobEvent {
         id: row.get("id"),
         job_id: row.get("job_id"),
@@ -8070,7 +8081,7 @@ fn stored_scan_job_event(row: sqlx::sqlite::SqliteRow) -> StoredScanJobEvent {
     }
 }
 
-fn stored_library_root(row: sqlx::sqlite::SqliteRow) -> StoredLibraryRoot {
+fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
     StoredLibraryRoot {
         id: row.get("id"),
         library_id: row.get("library_id"),
@@ -8092,7 +8103,7 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) item_id: Option<String>,
 }
 
-fn stored_filesystem_entry(row: sqlx::sqlite::SqliteRow) -> StoredFilesystemEntry {
+fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
     StoredFilesystemEntry {
         id: row.get("id"),
         relative_path: row.get("relative_path"),
@@ -8196,7 +8207,7 @@ pub(crate) struct StoredMetadataReidentifyItem {
     pub(crate) updated_at: i64,
 }
 
-fn stored_metadata_reidentify_job(row: sqlx::sqlite::SqliteRow) -> StoredMetadataReidentifyJob {
+fn stored_metadata_reidentify_job(row: sqlx::any::AnyRow) -> StoredMetadataReidentifyJob {
     StoredMetadataReidentifyJob {
         id: row.get("id"),
         status: row.get("status"),
@@ -8212,7 +8223,7 @@ fn stored_metadata_reidentify_job(row: sqlx::sqlite::SqliteRow) -> StoredMetadat
     }
 }
 
-fn stored_metadata_reidentify_item(row: sqlx::sqlite::SqliteRow) -> StoredMetadataReidentifyItem {
+fn stored_metadata_reidentify_item(row: sqlx::any::AnyRow) -> StoredMetadataReidentifyItem {
     StoredMetadataReidentifyItem {
         job_id: row.get("job_id"),
         item_id: row.get("item_id"),
@@ -8223,7 +8234,7 @@ fn stored_metadata_reidentify_item(row: sqlx::sqlite::SqliteRow) -> StoredMetada
     }
 }
 
-fn stored_metadata_candidate(row: sqlx::sqlite::SqliteRow) -> StoredMetadataCandidate {
+fn stored_metadata_candidate(row: sqlx::any::AnyRow) -> StoredMetadataCandidate {
     StoredMetadataCandidate {
         id: row.get("id"),
         item_id: row.get("item_id"),
@@ -8237,7 +8248,7 @@ fn stored_metadata_candidate(row: sqlx::sqlite::SqliteRow) -> StoredMetadataCand
     }
 }
 
-fn stored_media_item(row: sqlx::sqlite::SqliteRow) -> StoredMediaItem {
+fn stored_media_item(row: sqlx::any::AnyRow) -> StoredMediaItem {
     StoredMediaItem { id: row.get("id") }
 }
 
@@ -8344,7 +8355,7 @@ pub(crate) struct StoredPlaybackSession {
     pub(crate) last_event_at: i64,
 }
 
-fn stored_playback_session(row: sqlx::sqlite::SqliteRow) -> StoredPlaybackSession {
+fn stored_playback_session(row: sqlx::any::AnyRow) -> StoredPlaybackSession {
     StoredPlaybackSession {
         id: row.get("id"),
         user_id: row.get("user_id"),
@@ -8403,7 +8414,7 @@ pub(crate) struct StoredLibraryPoster {
     pub(crate) root_path: String,
 }
 
-fn stored_item_image(row: sqlx::sqlite::SqliteRow) -> StoredItemImage {
+fn stored_item_image(row: sqlx::any::AnyRow) -> StoredItemImage {
     StoredItemImage {
         id: row.get("id"),
         item_id: row.get("item_id"),
@@ -8663,7 +8674,7 @@ pub(crate) struct StoredMovieIdentity {
     pub(crate) provider_id: String,
 }
 
-fn stored_danmaku_match_job(row: sqlx::sqlite::SqliteRow) -> StoredDanmakuMatchJob {
+fn stored_danmaku_match_job(row: sqlx::any::AnyRow) -> StoredDanmakuMatchJob {
     StoredDanmakuMatchJob {
         id: row.get("id"),
         library_id: row.get("library_id"),
@@ -8936,7 +8947,7 @@ pub(crate) struct MediaStreamUpdate<'a> {
     pub(crate) is_forced: bool,
 }
 
-async fn ensure_server_id(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+async fn ensure_server_id(pool: &AnyPool) -> Result<String, sqlx::Error> {
     let mut transaction = pool.begin().await?;
     let existing =
         sqlx::query_scalar::<_, String>("SELECT value FROM lux_meta WHERE key = 'server_id'")
@@ -9113,9 +9124,12 @@ mod tests {
 
     #[tokio::test]
     async fn write_probe_reports_a_query_only_sqlite_connection() {
-        let pool = SqlitePoolOptions::new()
+        let pool = AnyPoolOptions::new()
             .max_connections(1)
-            .connect_with(SqliteConnectOptions::new().filename(":memory:"))
+            .connect_with(
+                AnyConnectOptions::from_str("sqlite://?mode=memory")
+                    .expect("in-memory SQLite options"),
+            )
             .await
             .expect("in-memory SQLite connection");
         sqlx::query("CREATE TABLE lux_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -9138,9 +9152,12 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_jobs_process_series_before_seasons_and_episodes() {
-        let pool = SqlitePoolOptions::new()
+        let pool = AnyPoolOptions::new()
             .max_connections(1)
-            .connect_with(SqliteConnectOptions::new().filename(":memory:"))
+            .connect_with(
+                AnyConnectOptions::from_str("sqlite://?mode=memory")
+                    .expect("in-memory SQLite options"),
+            )
             .await
             .expect("in-memory SQLite connection");
         sqlx::query("CREATE TABLE media_items (id TEXT PRIMARY KEY, item_type TEXT NOT NULL)")

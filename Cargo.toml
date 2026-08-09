@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 sha2 = "0.10"
-sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "sqlite", "migrate"] }
+sqlx = { version = "0.9", default-features = false, features = ["any", "macros", "migrate", "postgres", "runtime-tokio", "sqlite"] }
 subtle = "2"
 tokio = { version = "1", features = ["io-std", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
