@@ -3854,6 +3854,40 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_existing_filesystem_paths(
+        &self,
+        library_root_id: &str,
+        relative_paths: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        let mut existing_paths = Vec::new();
+        for chunk in relative_paths.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT relative_path FROM filesystem_entries
+                 WHERE library_root_id = ? AND relative_path IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_root_id);
+            for relative_path in chunk {
+                statement = statement.bind(relative_path);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            existing_paths.extend(rows.into_iter().map(|row| row.get("relative_path")));
+        }
+        Ok(existing_paths)
+    }
+
     pub(crate) async fn mark_filesystem_entries_seen_batch(
         &self,
         entry_ids: &[String],

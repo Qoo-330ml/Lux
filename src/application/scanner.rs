@@ -13,6 +13,7 @@ use std::os::unix::fs::MetadataExt;
 use tokio::{
     fs,
     sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
 };
 use uuid::Uuid;
 
@@ -28,6 +29,7 @@ use crate::{
         watch::ChangeKind,
     },
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
+    observability::resources::ResourceMetrics,
     storage::{
         Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource, NewMovieFile,
         NewScanJobEvent, StorageError, StoredFilesystemEntry, StoredLibraryRoot,
@@ -1190,6 +1192,7 @@ pub struct ScanJobService {
     admin_events: AdminEventHub,
     scan_lock: Arc<Semaphore>,
     library_covers: Option<LibraryCoverService>,
+    resources: ResourceMetrics,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1207,6 +1210,7 @@ impl ScanJobService {
             admin_events: AdminEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
             library_covers: None,
+            resources: ResourceMetrics::new(),
         }
     }
 
@@ -1222,6 +1226,11 @@ impl ScanJobService {
 
     pub fn with_library_covers(mut self, library_covers: LibraryCoverService) -> Self {
         self.library_covers = Some(library_covers);
+        self
+    }
+
+    pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = resources;
         self
     }
 
@@ -1475,12 +1484,13 @@ impl ScanJobService {
         batch_size: usize,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let roots = self.database.list_library_roots(&job.library_id).await?;
-        let library_kind = self
-            .database
-            .find_library(&job.library_id)
-            .await?
-            .map(|library| library.kind)
-            .unwrap_or_else(|| "MOVIE".to_owned());
+        let library = self.database.find_library(&job.library_id).await?;
+        let library_kind = library
+            .as_ref()
+            .map_or("MOVIE", |library| library.kind.as_str());
+        let scan_concurrency = library
+            .as_ref()
+            .map_or(2, |library| library.scan_concurrency);
         let batch = self
             .database
             .list_reconciliation_scan_entries(
@@ -1529,6 +1539,12 @@ impl ScanJobService {
                 processed: 0,
                 completed: true,
             });
+        }
+
+        if library_kind == "MOVIE" {
+            return self
+                .run_movie_reconciliation_file_batch(job, &roots, &batch, scan_concurrency)
+                .await;
         }
 
         let mut processed = 0_usize;
@@ -1591,7 +1607,7 @@ impl ScanJobService {
                 completed_entries.push(entry.clone());
                 continue;
             }
-            let result = match library_kind.as_str() {
+            let result = match library_kind {
                 "MOVIE" => {
                     self.scanner
                         .scan_movie_file(
@@ -1660,10 +1676,234 @@ impl ScanJobService {
             processed = processed.saturating_add(1);
             completed_entries.push(entry.clone());
         }
+        self.finish_reconciliation_file_batch(job, completed_entries, processed, next_count, None)
+            .await
+    }
+
+    async fn run_movie_reconciliation_file_batch(
+        &self,
+        job: &StoredScanJob,
+        roots: &[StoredLibraryRoot],
+        batch: &[StoredReconciliationScanEntry],
+        configured_concurrency: i64,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        let mut processed = 0_usize;
+        let mut next_count = job.processed_count;
+        let mut completed_entries = Vec::<(usize, StoredReconciliationScanEntry)>::new();
+        let mut unavailable_root_ids = HashSet::<String>::new();
+        let mut existing_paths_by_root = HashMap::<String, HashSet<String>>::new();
+        let mut batch_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut new_files = Vec::<(
+            usize,
+            String,
+            PathBuf,
+            PathBuf,
+            StoredReconciliationScanEntry,
+        )>::new();
+
+        for entry in batch {
+            if roots.iter().any(|root| root.id == entry.library_root_id) {
+                batch_paths_by_root
+                    .entry(entry.library_root_id.clone())
+                    .or_default()
+                    .push(entry.relative_path.clone());
+            }
+        }
+        for (root_id, paths) in batch_paths_by_root {
+            let existing_paths = self
+                .database
+                .list_existing_filesystem_paths(&root_id, &paths)
+                .await?
+                .into_iter()
+                .collect();
+            existing_paths_by_root.insert(root_id, existing_paths);
+        }
+
+        for (index, entry) in batch.iter().enumerate() {
+            if unavailable_root_ids.contains(&entry.library_root_id) {
+                continue;
+            }
+            let Some(root) = roots.iter().find(|root| root.id == entry.library_root_id) else {
+                self.database
+                    .discard_reconciliation_root_entries(&job.id, &entry.library_root_id)
+                    .await?;
+                unavailable_root_ids.insert(entry.library_root_id.clone());
+                continue;
+            };
+            if !root.is_available {
+                unavailable_root_ids.insert(root.id.clone());
+                self.database
+                    .update_library_root_availability(&root.id, false)
+                    .await?;
+                let discarded = self
+                    .database
+                    .discard_reconciliation_root_entries(&job.id, &root.id)
+                    .await?;
+                next_count = next_count.saturating_add(discarded);
+                processed =
+                    processed.saturating_add(usize::try_from(discarded).unwrap_or(usize::MAX));
+                self.database
+                    .update_scan_job_progress(&job.id, None, next_count)
+                    .await?;
+                continue;
+            }
+
+            let path = Path::new(&root.canonical_path).join(&entry.relative_path);
+            if fs::metadata(&path).await.is_err() {
+                let root_is_available = fs::metadata(&root.canonical_path)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir());
+                if !root_is_available {
+                    unavailable_root_ids.insert(root.id.clone());
+                    self.database
+                        .update_library_root_availability(&root.id, false)
+                        .await?;
+                    let already_processed = completed_entries
+                        .iter()
+                        .filter(|(_, completed)| completed.library_root_id == root.id)
+                        .count();
+                    let discarded = self
+                        .database
+                        .discard_reconciliation_root_entries(&job.id, &root.id)
+                        .await?
+                        .saturating_sub(i64::try_from(already_processed).unwrap_or(i64::MAX));
+                    next_count = next_count.saturating_add(discarded);
+                    processed =
+                        processed.saturating_add(usize::try_from(discarded).unwrap_or(usize::MAX));
+                    self.database
+                        .update_scan_job_progress(&job.id, None, next_count)
+                        .await?;
+                    continue;
+                }
+                self.database
+                    .mark_filesystem_entry_missing_by_path(&root.id, &entry.relative_path)
+                    .await?;
+                next_count = next_count.saturating_add(1);
+                processed = processed.saturating_add(1);
+                completed_entries.push((index, entry.clone()));
+                continue;
+            }
+
+            if existing_paths_by_root
+                .get(&root.id)
+                .is_some_and(|paths| paths.contains(&entry.relative_path))
+            {
+                if let Err(error) = self
+                    .scanner
+                    .scan_movie_file(
+                        &job.library_id,
+                        root,
+                        Path::new(&root.canonical_path),
+                        &path,
+                        &job.generation,
+                    )
+                    .await
+                {
+                    return self.fail_reconciliation_job(job, error).await;
+                }
+                next_count = next_count.saturating_add(1);
+                processed = processed.saturating_add(1);
+                completed_entries.push((index, entry.clone()));
+                continue;
+            }
+
+            new_files.push((
+                index,
+                root.id.clone(),
+                root.canonical_path.clone().into(),
+                path,
+                entry.clone(),
+            ));
+        }
+
+        let concurrency = self
+            .effective_scan_concurrency(configured_concurrency)
+            .await;
+        let mut preparation_tasks: JoinSet<MoviePreparationTask> = JoinSet::new();
+        let mut active_tasks = 0_usize;
+        let mut prepared_files = HashMap::<String, Vec<NewMovieFile>>::new();
+        for (index, root_id, root_path, path, entry) in new_files {
+            if active_tasks >= concurrency {
+                let prepared = join_movie_preparation(&mut preparation_tasks).await;
+                let (index, root_id, entry, file) = match prepared {
+                    Ok(result) => result,
+                    Err(error) => return self.fail_reconciliation_job(job, error).await,
+                };
+                active_tasks = active_tasks.saturating_sub(1);
+                if let Some(file) = file {
+                    prepared_files.entry(root_id).or_default().push(file);
+                }
+                next_count = next_count.saturating_add(1);
+                processed = processed.saturating_add(1);
+                completed_entries.push((index, entry));
+            }
+            let scanner = self.scanner.clone();
+            preparation_tasks.spawn(async move {
+                let prepared = scanner.prepare_new_movie_file(&root_path, &path).await?;
+                Ok((index, root_id, entry, prepared))
+            });
+            active_tasks = active_tasks.saturating_add(1);
+        }
+        while active_tasks > 0 {
+            let prepared = join_movie_preparation(&mut preparation_tasks).await;
+            let (index, root_id, entry, file) = match prepared {
+                Ok(result) => result,
+                Err(error) => return self.fail_reconciliation_job(job, error).await,
+            };
+            active_tasks = active_tasks.saturating_sub(1);
+            if let Some(file) = file {
+                prepared_files.entry(root_id).or_default().push(file);
+            }
+            next_count = next_count.saturating_add(1);
+            processed = processed.saturating_add(1);
+            completed_entries.push((index, entry));
+        }
+
+        for root in roots {
+            let Some(files) = prepared_files.get(&root.id) else {
+                continue;
+            };
+            if let Err(error) = self
+                .database
+                .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
+                .await
+            {
+                return self.fail_reconciliation_job(job, error.into()).await;
+            }
+        }
+
+        completed_entries.sort_by_key(|(index, _)| *index);
+        let completed_entries = completed_entries
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect();
+        self.finish_reconciliation_file_batch(
+            job,
+            completed_entries,
+            processed,
+            next_count,
+            Some(concurrency),
+        )
+        .await
+    }
+
+    async fn finish_reconciliation_file_batch(
+        &self,
+        job: &StoredScanJob,
+        completed_entries: Vec<StoredReconciliationScanEntry>,
+        processed: usize,
+        next_count: i64,
+        effective_concurrency: Option<usize>,
+    ) -> Result<ScanBatchReport, ScanJobError> {
         self.database
             .complete_reconciliation_files(&job.id, &completed_entries, next_count)
             .await?;
-        let batch_details = format!(r#"{{"processed":{processed},"total":{next_count}}}"#);
+        let batch_details = match effective_concurrency {
+            Some(concurrency) => format!(
+                r#"{{"processed":{processed},"total":{next_count},"concurrency":{concurrency}}}"#
+            ),
+            None => format!(r#"{{"processed":{processed},"total":{next_count}}}"#),
+        };
         self.record_event(
             &job.id,
             "INFO",
@@ -1925,6 +2165,7 @@ impl ScanJobService {
         loop {
             let report = self.run_batch_unlocked(job_id, batch_size).await?;
             if !report.completed {
+                tokio::task::yield_now().await;
                 continue;
             }
             if report.status == "COMPLETED" {
@@ -2002,6 +2243,19 @@ impl ScanJobService {
             .acquire_owned()
             .await
             .map_err(|_| ScanJobError::ScanLockClosed)
+    }
+
+    async fn effective_scan_concurrency(&self, configured: i64) -> usize {
+        let available_parallelism = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1);
+        let container_cpu_limit = self.resources.cpu_limit_cores().await;
+        recommended_scan_concurrency(
+            configured,
+            available_parallelism,
+            self.resources.home_latency_p95_ms(),
+            container_cpu_limit,
+        )
     }
 
     async fn run_thumbnails_after_scan(
@@ -2296,6 +2550,78 @@ impl ScanJobService {
             })
             .await;
         self.admin_events.publish(AdminEventScope::Jobs);
+    }
+}
+
+const HOME_P95_DEGRADED_MS: u64 = 300;
+const HOME_P95_TARGET_MS: u64 = 400;
+
+fn recommended_scan_concurrency(
+    configured: i64,
+    available_parallelism: usize,
+    home_p95_ms: Option<u64>,
+    container_cpu_limit: Option<f64>,
+) -> usize {
+    let configured = usize::try_from(configured).unwrap_or(1).max(1);
+    let container_parallelism = container_cpu_limit
+        .filter(|limit| limit.is_finite() && *limit > 0.0)
+        .map_or(available_parallelism, |limit| {
+            limit.ceil().min(usize::MAX as f64) as usize
+        });
+    let cpu_cap = container_parallelism.saturating_sub(1).max(1);
+    let base = configured.min(cpu_cap);
+    match home_p95_ms {
+        Some(value) if value >= HOME_P95_TARGET_MS => 1,
+        Some(value) if value >= HOME_P95_DEGRADED_MS => base.div_ceil(2).max(1),
+        _ => base,
+    }
+}
+
+type MoviePreparationOutput = (
+    usize,
+    String,
+    StoredReconciliationScanEntry,
+    Option<NewMovieFile>,
+);
+type MoviePreparationTask = Result<MoviePreparationOutput, ScannerError>;
+
+async fn join_movie_preparation(
+    tasks: &mut JoinSet<MoviePreparationTask>,
+) -> Result<MoviePreparationOutput, ScannerError> {
+    match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(ScannerError::Io {
+            path: PathBuf::from("<scan-preparation-task>"),
+            source: std::io::Error::other(error.to_string()),
+        }),
+        None => Err(ScannerError::Io {
+            path: PathBuf::from("<scan-preparation-task>"),
+            source: std::io::Error::other("scan preparation task set is empty"),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::recommended_scan_concurrency;
+
+    #[test]
+    fn reserves_one_parallel_unit_for_foreground_requests() {
+        assert_eq!(recommended_scan_concurrency(8, 8, None, None), 7);
+        assert_eq!(recommended_scan_concurrency(8, 1, None, None), 1);
+    }
+
+    #[test]
+    fn slows_scan_when_home_latency_degrades() {
+        assert_eq!(recommended_scan_concurrency(8, 8, Some(300), None), 4);
+        assert_eq!(recommended_scan_concurrency(8, 8, Some(400), None), 1);
+        assert_eq!(recommended_scan_concurrency(1, 8, Some(300), None), 1);
+    }
+
+    #[test]
+    fn respects_the_container_cpu_limit() {
+        assert_eq!(recommended_scan_concurrency(8, 16, None, Some(4.0)), 3);
+        assert_eq!(recommended_scan_concurrency(8, 16, None, Some(0.5)), 1);
     }
 }
 

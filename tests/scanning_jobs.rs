@@ -65,6 +65,25 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     let first_batch = jobs.run_batch(&job.id, 1).await?;
     assert_eq!(first_batch.status, "RUNNING");
     assert_eq!(first_batch.processed, 1);
+    let visible_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE has_available_source = 1 AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        visible_items, 1,
+        "committed scan batches must be visible immediately"
+    );
+    let batch_details: String = sqlx::query_scalar(
+        "SELECT details_json FROM scan_job_events
+         WHERE job_id = ? AND event_code = 'BATCH_COMPLETED'
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(batch_details.contains("\"concurrency\":"));
     let persisted: (String, i64, Option<String>) =
         sqlx::query_as("SELECT status, processed_count, cursor FROM scan_jobs WHERE id = ?")
             .bind(&job.id)

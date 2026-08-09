@@ -163,6 +163,7 @@ impl AppState {
     ) -> Self {
         let server_id = database.server_id().to_owned();
         let config_dir = config.config_dir.clone();
+        let resources = ResourceMetrics::new();
         let database_setup = Some(DatabaseSetupService::new(
             config.clone(),
             database.backend(),
@@ -233,8 +234,9 @@ impl AppState {
             )),
             thumbnails: Some(ThumbnailService::new(database.clone())),
             scan_jobs: Some({
-                let service =
-                    ScanJobService::new(database.clone()).with_admin_events(admin_events.clone());
+                let service = ScanJobService::new(database.clone())
+                    .with_admin_events(admin_events.clone())
+                    .with_resource_metrics(resources.clone());
                 match library_covers.clone() {
                     Some(covers) => service.with_library_covers(covers),
                     None => service,
@@ -256,7 +258,7 @@ impl AppState {
             )),
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
-            resources: ResourceMetrics::new(),
+            resources,
             remote_access: RemoteAccessPolicy::from_env(),
             login_rate_limiter: LoginRateLimiter::default(),
         }
@@ -410,6 +412,7 @@ pub fn app() -> Router {
 
 pub fn app_with_state(state: AppState) -> Router {
     let web_root = web_root();
+    let resources = state.resources.clone();
     Router::new()
         .route("/logo.svg", get(web_logo))
         .route("/health/live", get(live))
@@ -694,6 +697,20 @@ pub fn app_with_state(state: AppState) -> Router {
         .layer(middleware::from_fn(trace_emby_media_stream_failure))
         .layer(middleware::from_fn(reject_unmatched_emby_video_path))
         .layer(middleware::from_fn(normalize_empty_api_service_unavailable))
+        .layer(middleware::from_fn(
+            move |request: Request<Body>, next: Next| {
+                let resources = resources.clone();
+                async move {
+                    let is_home = request.uri().path() == "/api/v1/home";
+                    let started = Instant::now();
+                    let response = next.run(request).await;
+                    if is_home {
+                        resources.record_home_latency(started.elapsed());
+                    }
+                    response
+                }
+            },
+        ))
         .layer(
             tower::ServiceBuilder::new()
                 .set_x_request_id(MakeRequestUuid)

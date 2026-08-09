@@ -1,7 +1,8 @@
 use std::{
+    collections::VecDeque,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -9,11 +10,13 @@ use tokio::{fs, process::Command};
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MEDIA_PATH: &str = "/media";
+const HOME_LATENCY_SAMPLE_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 pub struct ResourceMetrics {
     started_at: Instant,
     cpu_sample: Arc<Mutex<Option<CpuSample>>>,
+    home_latency_ms: Arc<Mutex<VecDeque<u64>>>,
 }
 
 impl Default for ResourceMetrics {
@@ -27,7 +30,38 @@ impl ResourceMetrics {
         Self {
             started_at: Instant::now(),
             cpu_sample: Arc::new(Mutex::new(None)),
+            home_latency_ms: Arc::new(Mutex::new(VecDeque::with_capacity(
+                HOME_LATENCY_SAMPLE_CAPACITY,
+            ))),
         }
+    }
+
+    pub fn record_home_latency(&self, duration: Duration) {
+        let Ok(mut samples) = self.home_latency_ms.lock() else {
+            return;
+        };
+        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        if samples.len() == HOME_LATENCY_SAMPLE_CAPACITY {
+            samples.pop_front();
+        }
+        samples.push_back(duration_ms);
+    }
+
+    pub fn home_latency_p95_ms(&self) -> Option<u64> {
+        let Ok(samples) = self.home_latency_ms.lock() else {
+            return None;
+        };
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        let index = (sorted.len() * 95).div_ceil(100).saturating_sub(1);
+        sorted.get(index).copied()
+    }
+
+    pub async fn cpu_limit_cores(&self) -> Option<f64> {
+        read_cpu_usage().await.and_then(|(_, limit)| limit)
     }
 
     pub async fn snapshot(&self) -> ResourceSnapshot {
@@ -370,9 +404,10 @@ fn calculate_storage_usage_percent(used_bytes: u64, total_bytes: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_cpu_usage_percent, memory_usage_percent, parse_cgroup_limit,
+        ResourceMetrics, calculate_cpu_usage_percent, memory_usage_percent, parse_cgroup_limit,
         parse_media_storage_values, process_is_member,
     };
+    use std::time::Duration;
 
     #[test]
     fn cgroup_max_is_an_unlimited_container_limit() {
@@ -412,5 +447,15 @@ mod tests {
             ),
             Some((102_400 * 1024, 20_480 * 1024, 81_920 * 1024))
         );
+    }
+
+    #[test]
+    fn home_latency_p95_keeps_only_the_recent_window() {
+        let metrics = ResourceMetrics::new();
+        for value in 1..=65 {
+            metrics.record_home_latency(Duration::from_millis(value));
+        }
+
+        assert_eq!(metrics.home_latency_p95_ms(), Some(62));
     }
 }
