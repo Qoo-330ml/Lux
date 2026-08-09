@@ -21,6 +21,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src ./src
 COPY assets ./assets
 COPY migrations ./migrations
+COPY migrations-postgres ./migrations-postgres
 COPY logo.svg ./logo.svg
 COPY web ./web
 COPY --from=web-builder /src/web/dist ./web/dist
