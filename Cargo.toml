@@ -36,7 +36,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["fs", "request-id", "trace", "util"] }
 tracing = "0.1"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }

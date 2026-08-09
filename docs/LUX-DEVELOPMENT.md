@@ -1503,10 +1503,12 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 ### 18.3 日志
 
 - JSON 结构化日志为默认容器输出。
+- Lux 同时将同一份 JSON 结构化日志按 UTC 日期写入配置目录的 `logs/lux.YYYY-MM-DD.log`；日志目录随 `/config` 持久化，容器重启后保留历史文件。
 - 字段包含 timestamp、level、target、requestId、jobId、libraryId、itemId、errorCode、durationMs。
 - 不记录密码、token、Cookie、完整外部 URL。
 - 路径在管理员日志中可显示相对路径；对普通用户不显示磁盘路径。
 - 登录失败以适合 Fail2Ban 或其他日志工具解析的稳定事件码记录。
+- 管理员可以按 UTC 起止日期导出日志 ZIP；导出最多覆盖 31 天，只包含已存在的日文件，不提供普通用户访问。
 
 ### 18.4 健康
 
@@ -1760,6 +1762,7 @@ services:
 | LUX-151 | src/application/ip_location.rs、src/api/mod.rs、tests/、web/src/features/admin/、web/src/lib/api/、docs/ |
 | LUX-153 | src/application/admin_events.rs、src/api/mod.rs、tests/admin_events.rs、web/src/features/admin/、web/tests/、docs/ |
 | LUX-154 | src/application/scanner.rs、src/storage/mod.rs、migrations/、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
+| LUX-156 | src/observability/、src/main.rs、src/api/mod.rs、Cargo.toml、Cargo.lock、tests/observability.rs、tests/log_export.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3270,6 +3273,41 @@ ip138，不再把它作为回退。Hiofd 插件显示名称为“IP归属地查�
 - 不实现 cron 解析、计划任务调度循环或跨库全局 worker pool；跨库串行化仅使用进程内扫描互斥锁。
 - 不改变 Lux/Emby 公共 API，不增加核心依赖。
 - 不在本任务拆分 ffprobe、NFO、缩略图或在线元数据后处理；这些资源队列另行实施和验证。
+
+#### LUX-156：持久化日志与管理员导出
+
+在保留 stdout JSON 容器日志的同时，将结构化日志写入配置目录下按 UTC 日期滚动的日文件，
+并提供仅管理员可用的日志 ZIP 导出接口与控制台日期选择入口，便于收集其他实例的扫描、图片
+和请求错误。日志文件不写入凭据、Cookie、token 或完整外部 URL；无法创建日志目录时必须保留
+stdout 日志并在启动阶段报告降级原因。
+
+验收：
+
+- [ ] 启动后在 `/config/logs` 生成 `lux.YYYY-MM-DD.log`，文件内容为 JSONL，stdout 日志行为不变。
+- [ ] UTC 日期变化后写入新日文件；文件日志使用独立后台 writer，不在 Tokio 核心 worker 上同步写文件。
+- [ ] `GET /api/v1/admin/logs/export` 只允许管理员，默认导出最近 7 个 UTC 日，显式日期范围最多 31 天，返回 ZIP 下载。
+- [ ] 非法日期、超过范围、无日志文件和日志目录读失败均返回稳定错误，不返回绝对配置路径或内部堆栈。
+- [ ] 管理员“任务与日志”页可以选择起止日期并直接下载 ZIP；移动端仍可操作，下载失败有可读错误提示。
+- [ ] 测试覆盖文件滚动命名、导出范围限制、管理员权限和 Web 下载入口。
+
+验证：
+
+- `cargo test --locked --test observability --test log_export`
+- `cargo build --locked`
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web install --frozen-lockfile`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+- `uname -m`
+
+依赖：LUX-105、LUX-135、LUX-155。
+
+明确不做：
+
+- 不在本任务增加自动历史清理策略；管理员或部署系统负责根据配置卷容量管理历史日文件。
+- 不提供普通用户日志读取，不修改现有 `/api/v1/admin/logs` 审计 JSON 合同，不改变 Emby API。
 
 ## 26. 风险与缓解
 

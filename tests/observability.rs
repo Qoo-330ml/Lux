@@ -126,4 +126,63 @@ mod unix {
         assert_eq!(error_log["span"]["statusCode"], 401);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn request_logs_are_persisted_as_daily_json_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path().join("config");
+        let probe_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = probe_listener.local_addr()?;
+        drop(probe_listener);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_luxd"))
+            .env("LUX_HTTP_ADDR", address.to_string())
+            .env("LUX_CONFIG_DIR", &config_dir)
+            .env("RUST_LOG", "luxd=debug,tower_http=debug")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pid = child.id().ok_or("luxd process has no pid")?;
+        let health_url = format!("http://{address}/health/live");
+        if let Err(error) = wait_for_http(&mut child, &health_url).await {
+            let _ = send_signal("KILL", pid).await;
+            return Err(error);
+        }
+
+        let response = reqwest::get(&health_url).await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        send_signal("TERM", pid).await?;
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .map_err(|_| "luxd did not exit after SIGTERM")??;
+        assert!(
+            output.status.success(),
+            "luxd exited with {}",
+            output.status
+        );
+
+        let mut entries = tokio::fs::read_dir(config_dir.join("logs")).await?;
+        let mut log_path = None;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let name = path.file_name().and_then(|value| value.to_str());
+            if name.is_some_and(|value| value.starts_with("lux.") && value.ends_with(".log")) {
+                log_path = Some(path);
+                break;
+            }
+        }
+        let log_path = log_path.ok_or("daily Lux log file was not created")?;
+        let contents = tokio::fs::read_to_string(log_path).await?;
+        let logs = contents
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(logs.iter().any(|value| {
+            value["fields"]["message"] == "luxd listening"
+                || value["fields"]["message"] == "database migrations applied"
+        }));
+        Ok(())
+    }
 }

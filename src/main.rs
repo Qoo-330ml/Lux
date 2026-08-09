@@ -15,7 +15,7 @@ use tracing::{error, info};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
-    observability::init();
+    let _logging_guard = observability::init(&config.config_dir).await;
     let explicit_database_configuration = config.load_explicit_database_configuration().await?;
     let legacy_sqlite_database = config.has_legacy_sqlite_database().await;
     let database_configuration = explicit_database_configuration
