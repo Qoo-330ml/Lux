@@ -93,7 +93,12 @@ const ERROR_LABELS: Record<string, string> = {
   CANDIDATE_ERROR: "候选搜索失败",
   LOW_CONFIDENCE: "匹配置信度不足，已转为待确认",
   METADATA_WRITE_FAILED: "元数据写回失败",
+  METADATA_NFO_WRITE_FAILED: "NFO 写回失败",
+  METADATA_IMAGE_WRITE_FAILED: "图片下载或写回失败",
+  METADATA_PEOPLE_WRITE_FAILED: "演员信息写回失败",
+  METADATA_STORAGE_FAILED: "元数据数据库写入失败",
   METADATA_WRITE_UNAVAILABLE: "元数据写回服务不可用",
+  WORKER_FAILED: "任务工作线程异常退出",
   STORAGE_ERROR: "数据库处理失败",
 };
 

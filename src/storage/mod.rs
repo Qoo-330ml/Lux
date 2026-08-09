@@ -3245,6 +3245,59 @@ impl Database {
             })
     }
 
+    pub(crate) async fn fail_running_metadata_reidentify_items(
+        &self,
+        job_id: &str,
+        error: &str,
+    ) -> Result<i64, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let result = self
+            .query(
+                "UPDATE metadata_reidentify_job_items
+                 SET status = 'FAILED', candidate_count = 0, error = ?, updated_at = unixepoch()
+                 WHERE job_id = ? AND status = 'RUNNING'",
+            )
+            .bind(error)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let affected = i64::try_from(result.rows_affected()).unwrap_or(i64::MAX);
+        if affected > 0 {
+            self.query(
+                "UPDATE metadata_reidentify_jobs
+                 SET processed_count = processed_count + ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(affected)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(affected)
+    }
+
     pub(crate) async fn finish_metadata_reidentify_job(
         &self,
         job_id: &str,
@@ -9638,6 +9691,95 @@ mod tests {
             database.next_metadata_reidentify_item("job").await.unwrap(),
             Some("season".to_owned())
         );
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_jobs_reconcile_items_left_running_by_workers() {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                AnyConnectOptions::from_str("sqlite://?mode=memory")
+                    .expect("in-memory SQLite options"),
+            )
+            .await
+            .expect("in-memory SQLite connection");
+        sqlx::query(
+            "CREATE TABLE metadata_reidentify_jobs (
+                id TEXT PRIMARY KEY,
+                processed_count INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata jobs table");
+        sqlx::query(
+            "CREATE TABLE metadata_reidentify_job_items (
+                job_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                candidate_count INTEGER NOT NULL,
+                error TEXT,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (job_id, item_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata job items table");
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_jobs (id, processed_count, updated_at)
+             VALUES ('job', 0, unixepoch())",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert metadata job");
+        for (item_id, status) in [
+            ("running-1", "RUNNING"),
+            ("running-2", "RUNNING"),
+            ("done", "COMPLETED"),
+        ] {
+            sqlx::query(
+                "INSERT INTO metadata_reidentify_job_items (
+                    job_id, item_id, status, candidate_count, error, updated_at
+                 ) VALUES ('job', ?, ?, 0, NULL, unixepoch())",
+            )
+            .bind(item_id)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("insert metadata job item");
+        }
+        let database = Database {
+            pool,
+            path: PathBuf::from("metadata-reconcile-test.db"),
+            server_id: "test".to_owned(),
+            backend: DatabaseBackend::Sqlite,
+        };
+
+        let reconciled = database
+            .fail_running_metadata_reidentify_items("job", "WORKER_FAILED")
+            .await
+            .expect("reconcile running items");
+
+        assert_eq!(reconciled, 2);
+        let failed_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id = 'job' AND status = 'FAILED' AND error = 'WORKER_FAILED'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("failed item count");
+        assert_eq!(failed_count, 2);
+        let processed_count: i64 = sqlx::query_scalar(
+            "SELECT processed_count FROM metadata_reidentify_jobs WHERE id = 'job'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("processed count");
+        assert_eq!(processed_count, 2);
         database.close().await;
     }
 

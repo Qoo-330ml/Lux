@@ -293,7 +293,15 @@ impl MetadataReidentifyService {
                 service.process_item(&job_id, &item_id, mode).await;
             });
         }
-        while workers.join_next().await.is_some() {
+        while let Some(worker_result) = workers.join_next().await {
+            if let Err(error) = worker_result {
+                tracing::error!(
+                    job_id,
+                    worker_cancelled = error.is_cancelled(),
+                    worker_panicked = error.is_panic(),
+                    "metadata refresh worker stopped before recording its result"
+                );
+            }
             while workers.len() < METADATA_MATCH_CONCURRENCY {
                 if self
                     .database
@@ -322,6 +330,25 @@ impl MetadataReidentifyService {
                 });
             }
         }
+        let reconciliation_failed = match self
+            .database
+            .fail_running_metadata_reidentify_items(job_id, "WORKER_FAILED")
+            .await
+        {
+            Ok(0) => false,
+            Ok(count) => {
+                tracing::error!(
+                    job_id,
+                    item_count = count,
+                    "metadata refresh reconciled items left running by workers"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::error!(job_id, "metadata refresh could not reconcile running items");
+                true
+            }
+        };
         let status = if self
             .database
             .metadata_reidentify_job_cancel_requested(job_id)
@@ -329,6 +356,8 @@ impl MetadataReidentifyService {
             .unwrap_or(true)
         {
             "CANCELLED"
+        } else if reconciliation_failed {
+            "FAILED"
         } else {
             match self
                 .database
@@ -340,14 +369,18 @@ impl MetadataReidentifyService {
                 Err(_) => "FAILED",
             }
         };
-        let _ = self
+        if self
             .database
             .finish_metadata_reidentify_job(
                 job_id,
                 status,
                 (status == "FAILED").then_some("ITEM_FAILED"),
             )
-            .await;
+            .await
+            .is_err()
+        {
+            tracing::error!(job_id, "metadata refresh job status could not be recorded");
+        }
         self.admin_events.publish(AdminEventScope::Jobs);
     }
 
@@ -408,12 +441,39 @@ impl MetadataReidentifyService {
                 self.admin_events.publish(AdminEventScope::Jobs);
                 self.admin_events.publish(AdminEventScope::Metadata);
             }
+            Err(MetadataReidentifyError::LowConfidence) => {
+                let code = MetadataReidentifyError::LowConfidence.code();
+                if self
+                    .database
+                    .finish_metadata_reidentify_item(job_id, item_id, "COMPLETED", 0, Some(code))
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        job_id,
+                        item_id,
+                        error_code = code,
+                        "metadata refresh item result could not be recorded"
+                    );
+                }
+                self.admin_events.publish(AdminEventScope::Jobs);
+                self.admin_events.publish(AdminEventScope::Metadata);
+            }
             Err(error) => {
                 let code = error.code();
-                let _ = self
+                if self
                     .database
                     .finish_metadata_reidentify_item(job_id, item_id, "FAILED", 0, Some(code))
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        job_id,
+                        item_id,
+                        error_code = code,
+                        "metadata refresh item result could not be recorded"
+                    );
+                }
                 self.admin_events.publish(AdminEventScope::Jobs);
                 self.admin_events.publish(AdminEventScope::Metadata);
             }
@@ -607,8 +667,15 @@ impl MetadataReidentifyError {
             Self::JobNotCancelable => "JOB_NOT_CANCELABLE",
             Self::Candidate(MetadataCandidateError::Tmdb(_)) => "TMDB_UNAVAILABLE",
             Self::Candidate(MetadataCandidateError::InvalidSearch) => "INVALID_SEARCH",
-            Self::Candidate(_) => "CANDIDATE_ERROR",
+            Self::Candidate(MetadataCandidateError::ItemNotFound) => "ITEM_NOT_FOUND",
+            Self::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => "CANDIDATE_ERROR",
+            Self::Candidate(MetadataCandidateError::Scraper(_)) => "SCRAPER_UNAVAILABLE",
+            Self::Candidate(MetadataCandidateError::Storage(_)) => "STORAGE_ERROR",
             Self::Scraper(_) => "SCRAPER_UNAVAILABLE",
+            Self::Selection(MetadataSelectionError::Nfo(_)) => "METADATA_NFO_WRITE_FAILED",
+            Self::Selection(MetadataSelectionError::Image(_)) => "METADATA_IMAGE_WRITE_FAILED",
+            Self::Selection(MetadataSelectionError::People(_)) => "METADATA_PEOPLE_WRITE_FAILED",
+            Self::Selection(MetadataSelectionError::Storage(_)) => "METADATA_STORAGE_FAILED",
             Self::Selection(_) => "METADATA_WRITE_FAILED",
             Self::SelectionUnavailable => "METADATA_WRITE_UNAVAILABLE",
             Self::LowConfidence => "LOW_CONFIDENCE",
