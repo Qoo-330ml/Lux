@@ -9091,6 +9091,13 @@ fn log_export_error_response(headers: &HeaderMap, error: LogExportError) -> Resp
             &error.to_string(),
         )
         .into_response(),
+        LogExportError::ExportTooLarge => api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            &error.to_string(),
+        )
+        .into_response(),
         LogExportError::NoLogs => api_error(
             headers,
             StatusCode::NOT_FOUND,
