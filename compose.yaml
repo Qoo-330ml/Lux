@@ -11,7 +11,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: ${LUX_POSTGRES_IMAGE:-postgres:16-alpine}
+    image: postgres:16-alpine
     container_name: lux-postgres
     profiles:
       - postgres
@@ -20,6 +20,8 @@ services:
       POSTGRES_USER: ${LUX_POSTGRES_USER:-lux}
       POSTGRES_PASSWORD: ${LUX_POSTGRES_PASSWORD:-}
     volumes:
+      # Docker-managed persistent storage for PostgreSQL data.
+      # `docker compose down` keeps it; `docker compose down -v` removes it.
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
