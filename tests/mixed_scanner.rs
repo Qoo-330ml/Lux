@@ -74,7 +74,7 @@ async fn mixed_scan_classifies_movies_series_and_unresolved_without_cross_contam
     assert_ne!(hierarchy.0, hierarchy.2);
     assert_eq!(hierarchy.1, hierarchy.2);
 
-    let ids_before: Vec<(String, String)> =
+    let ids_before: Vec<(Option<String>, String)> =
         sqlx::query_as("SELECT identity_key, id FROM media_items ORDER BY identity_key")
             .fetch_all(database.pool())
             .await?;
@@ -82,7 +82,7 @@ async fn mixed_scan_classifies_movies_series_and_unresolved_without_cross_contam
     assert_eq!(second.created_items, 0);
     assert_eq!(second.created_sources, 0);
     assert_eq!(second.skipped_files, 3);
-    let ids_after: Vec<(String, String)> =
+    let ids_after: Vec<(Option<String>, String)> =
         sqlx::query_as("SELECT identity_key, id FROM media_items ORDER BY identity_key")
             .fetch_all(database.pool())
             .await?;
