@@ -1,7 +1,12 @@
 use std::env;
 
 use luxd::{
+    application::{
+        access::{AccessPrincipal, MediaAccessService},
+        catalog::CatalogService,
+    },
     config::{Config, DatabaseConfiguration, PostgresConnection},
+    domain::ids::UserId,
     storage::Database,
 };
 
@@ -49,6 +54,38 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
         .fetch_one(database.pool())
         .await?;
     assert_eq!(stored_name, "PostgreSQL Test Library");
+
+    let item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+        ) VALUES (?, ?, 'MOVIE', 'Postgres Search Movie', 'postgres search movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, language, alias_normalized)
+         VALUES (?, ?, '银河搜索电影', 'zh-CN', '银河搜索电影')",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let page = catalog
+        .search_items(
+            AccessPrincipal::new(UserId::new(), true),
+            "银河",
+            "%银河%",
+            0,
+            10,
+        )
+        .await?;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].id, item_id);
     database.close().await;
     Ok(())
 }

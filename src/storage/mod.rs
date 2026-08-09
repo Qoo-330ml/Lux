@@ -108,6 +108,57 @@ impl Database {
         })
     }
 
+    pub async fn test_configuration(
+        configuration: &DatabaseConfiguration,
+    ) -> Result<(), StorageError> {
+        configuration
+            .validate()
+            .map_err(StorageError::Configuration)?;
+        if configuration.backend() == DatabaseBackend::Sqlite {
+            return Ok(());
+        }
+
+        sqlx::any::install_default_drivers();
+        let database_url = configuration
+            .postgres_url()
+            .map_err(StorageError::Configuration)?
+            .ok_or_else(|| {
+                StorageError::Configuration(DatabaseConfigurationError::Invalid(
+                    "PostgreSQL 连接配置缺失".to_owned(),
+                ))
+            })?;
+        let options =
+            AnyConnectOptions::from_str(&database_url).map_err(|source| StorageError::Sqlx {
+                path: PathBuf::from("external PostgreSQL"),
+                source,
+            })?;
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    connection
+                        .execute("SET TIME ZONE 'UTC'; SET application_name = 'lux';")
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: PathBuf::from("external PostgreSQL"),
+                source,
+            })?;
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: PathBuf::from("external PostgreSQL"),
+                source,
+            })?;
+        pool.close().await;
+        Ok(())
+    }
+
     pub fn pool(&self) -> &AnyPool {
         &self.pool
     }
@@ -5036,6 +5087,12 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<String>, i64), StorageError> {
+        if self.backend == DatabaseBackend::Postgres {
+            return self
+                .search_catalog_item_ids_postgres(like_query, library_ids, offset, limit)
+                .await;
+        }
+
         if let Some(library_ids) = library_ids
             && library_ids.is_empty()
         {
@@ -5113,6 +5170,51 @@ impl Database {
         self.fetch_catalog_search_page(
             &union_page_query,
             Some(query),
+            Some(like_query),
+            library_ids,
+            offset,
+            limit,
+        )
+        .await
+    }
+
+    async fn search_catalog_item_ids_postgres(
+        &self,
+        like_query: &str,
+        library_ids: Option<&[String]>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<String>, i64), StorageError> {
+        if let Some(library_ids) = library_ids
+            && library_ids.is_empty()
+        {
+            return Ok((Vec::new(), 0));
+        }
+        let library_filter = library_ids.map(|ids| {
+            format!(
+                " AND mi.library_id IN ({})",
+                std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+        let like_query_sql = format!(
+            "SELECT mi.id FROM media_search ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE (ms.title ILIKE ? ESCAPE '\\' OR ms.original_title ILIKE ? ESCAPE '\\'
+                    OR ms.aliases ILIKE ? ESCAPE '\\')
+               AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}{}",
+            library_filter.as_deref().unwrap_or_default()
+        );
+        let page_query = format!(
+            "SELECT matches.id, COUNT(*) OVER() AS total FROM ({like_query_sql}) matches
+             JOIN media_items mi ON mi.id = matches.id
+             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+        );
+        self.fetch_catalog_search_page(
+            &page_query,
+            None,
             Some(like_query),
             library_ids,
             offset,

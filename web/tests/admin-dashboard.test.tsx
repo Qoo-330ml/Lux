@@ -23,7 +23,7 @@ const dashboard: AdminDashboard = {
       memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: 4_294_967_296, usagePercent: 25 },
       mediaStorage: { available: true, source: "container-filesystem", path: "/media", totalBytes: 107_374_182_400, usedBytes: 10_737_418_240, availableBytes: 96_636_764_160, usagePercent: 10 },
     },
-    database: { status: "ok", journalMode: "wal", writable: true },
+    database: { status: "ok", backend: "SQLITE", journalMode: "wal", writable: true },
     config: { available: true, writable: true },
     ffprobe: { available: true },
     tmdb: { configured: true },
@@ -239,6 +239,36 @@ describe("AdminDashboardPage", () => {
     });
     const values = [...container.querySelectorAll(".lux-admin-overview-metric-value")].map((value) => value.textContent);
     expect(values.slice(3)).toEqual(["不可用", "不可用", "不可用"]);
+  });
+
+  it("labels PostgreSQL without displaying SQLite journal details", async () => {
+    const postgresDashboard: AdminDashboard = {
+      ...dashboard,
+      health: {
+        ...dashboard.health,
+        database: { status: "ok", backend: "POSTGRESQL", journalMode: "", writable: true },
+      },
+    };
+    vi.spyOn(api, "adminDashboard").mockResolvedValue(postgresDashboard);
+    vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminDashboardPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-card")).not.toBeNull());
+    });
+    const metadata = container.querySelector(".lux-admin-meta-row")?.textContent ?? "";
+    expect(metadata).toContain("POSTGRESQL");
+    expect(metadata).not.toContain("SQLite");
   });
 
   it("shows a movie kind once instead of repeating it across card metadata", async () => {

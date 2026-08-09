@@ -81,7 +81,7 @@ use crate::{
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
     },
-    config::{Config, DatabaseConfiguration, PostgresConnection},
+    config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
     network::{
         RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
@@ -9084,6 +9084,13 @@ fn log_export_error_response(headers: &HeaderMap, error: LogExportError) -> Resp
             &error.to_string(),
         )
         .into_response(),
+        LogExportError::ExportTooLarge => api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            &error.to_string(),
+        )
+        .into_response(),
         LogExportError::NoLogs => api_error(
             headers,
             StatusCode::NOT_FOUND,
@@ -9245,6 +9252,10 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
     } else {
         "degraded"
     };
+    let (database_backend, journal_mode) = match database.backend() {
+        DatabaseBackend::Sqlite => ("SQLITE", "wal"),
+        DatabaseBackend::Postgres => ("POSTGRESQL", ""),
+    };
     Ok(json!({
         "status": status,
         "schemaVersion": schema_version,
@@ -9252,7 +9263,8 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
         "resources": resources,
         "database": {
             "status": if database_writable { "ok" } else { "degraded" },
-            "journalMode": "wal",
+            "backend": database_backend,
+            "journalMode": journal_mode,
             "writable": database_writable,
         },
         "config": { "available": config_available, "writable": config_writable },

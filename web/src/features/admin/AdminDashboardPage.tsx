@@ -133,7 +133,7 @@ export function AdminDashboardPage() {
         <section className="lux-admin-panel">
           <div className="lux-admin-panel-heading"><div><h2>运行状态</h2></div><span className={status ? "lux-status-pill is-ok" : "lux-status-pill is-warn"}>{status ? "正常" : "降级"}</span></div>
           <div className="lux-admin-check-list">{checks.map((check) => <div className="lux-admin-check" key={check.label}><span className={check.ok ? "lux-check-icon is-ok" : "lux-check-icon is-warn"}>{check.ok ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}</span><span>{check.label}</span><small>{check.detail}</small></div>)}</div>
-          <div className="lux-admin-meta-row"><span>Schema {health.schemaVersion}</span><span>SQLite {health.database.journalMode.toUpperCase()}</span></div>
+          <div className="lux-admin-meta-row"><span>Schema {health.schemaVersion}</span><span>{health.database.backend === "SQLITE" ? `SQLite ${health.database.journalMode.toUpperCase()}` : health.database.backend}</span></div>
         </section>
         <section className="lux-admin-panel">
           <div className="lux-admin-panel-heading"><div><h2>管理入口</h2></div><HardDrive size={20} className="lux-admin-panel-icon" /></div>

@@ -270,7 +270,7 @@ export type AdminHealth = {
       usagePercent: number | null;
     };
   };
-  database: { status: string; journalMode: string; writable: boolean };
+  database: { status: string; backend: "SQLITE" | "POSTGRESQL" | string; journalMode: string; writable: boolean };
   config: { available: boolean; writable: boolean };
   ffprobe: { available: boolean };
   tmdb: { configured: boolean };
