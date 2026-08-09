@@ -692,6 +692,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .layer(middleware::from_fn(trace_emby_playback_callback))
         .layer(middleware::from_fn(trace_emby_playback_info))
         .layer(middleware::from_fn(trace_emby_media_stream_failure))
+        .layer(middleware::from_fn(reject_unmatched_emby_video_path))
         .layer(middleware::from_fn(normalize_empty_api_service_unavailable))
         .layer(
             tower::ServiceBuilder::new()
@@ -808,7 +809,9 @@ fn emby_playback_info_item_id(path: &str) -> Option<&str> {
 fn emby_media_stream_item_id(path: &str) -> Option<&str> {
     let path = path
         .strip_prefix("/Videos/")
-        .or_else(|| path.strip_prefix("/emby/Videos/"))?;
+        .or_else(|| path.strip_prefix("/emby/Videos/"))
+        .or_else(|| path.strip_prefix("/videos/"))
+        .or_else(|| path.strip_prefix("/emby/videos/"))?;
     let mut segments = path.split('/');
     let item_id = segments.next()?;
     let second_segment = segments.next()?;
@@ -913,6 +916,55 @@ async fn trace_emby_media_stream_failure(request: Request<Body>, next: Next) -> 
     response
 }
 
+fn is_emby_video_path(path: &str) -> bool {
+    path.starts_with("/Videos/")
+        || path.starts_with("/videos/")
+        || path.starts_with("/emby/Videos/")
+        || path.starts_with("/emby/videos/")
+}
+
+fn emby_path_without_prefix(path: &str) -> &str {
+    path.strip_prefix("/emby")
+        .unwrap_or(path)
+        .strip_prefix('/')
+        .unwrap_or(path)
+}
+
+fn is_emby_subtitle_path(path: &str) -> bool {
+    let path = emby_path_without_prefix(path);
+    let mut segments = path.split('/');
+    matches!(segments.next(), Some("Videos"))
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next() == Some("Subtitles")
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next() == Some("Stream")
+        && segments.next().is_none()
+}
+
+fn is_emby_legacy_strm_path(path: &str) -> bool {
+    let path = emby_path_without_prefix(path);
+    let mut segments = path.split('/');
+    matches!(segments.next(), Some("Videos" | "videos"))
+        && segments.next().is_some_and(|segment| !segment.is_empty())
+        && segments.next() == Some("original.strm")
+        && segments.next().is_none()
+}
+
+fn is_registered_emby_video_path(path: &str) -> bool {
+    emby_media_stream_item_id(path).is_some()
+        || is_emby_subtitle_path(path)
+        || is_emby_legacy_strm_path(path)
+}
+
+async fn reject_unmatched_emby_video_path(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path();
+    if is_emby_video_path(path) && !is_registered_emby_video_path(path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(request).await
+}
+
 fn web_root() -> PathBuf {
     if let Some(directory) = std::env::var_os("LUX_WEB_DIR") {
         return PathBuf::from(directory);
@@ -986,6 +1038,10 @@ fn emby_routes() -> Router<AppState> {
             get(emby_subtitle_with_source).head(emby_subtitle_with_source),
         )
         .route(
+            "/Videos/{item_id}/original.strm",
+            get(emby_stream).head(emby_stream),
+        )
+        .route(
             "/Items/{item_id}/Subtitles/{stream_index}/Stream",
             get(emby_subtitle_without_source).head(emby_subtitle_without_source),
         )
@@ -1007,6 +1063,10 @@ fn emby_routes() -> Router<AppState> {
         )
         .route(
             "/videos/{item_id}/stream",
+            get(emby_stream).head(emby_stream),
+        )
+        .route(
+            "/videos/{item_id}/original.strm",
             get(emby_stream).head(emby_stream),
         )
         .route(
@@ -1567,6 +1627,46 @@ fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
     filter
 }
 
+async fn emby_compat_item_ids(
+    state: &AppState,
+    ids: Option<&str>,
+) -> Result<Option<Vec<String>>, StatusCode> {
+    let Some(ids) = ids else {
+        return Ok(None);
+    };
+    let ids = ids
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(database) = state.database.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut resolved_ids = Vec::with_capacity(ids.len());
+    for id in ids {
+        match database.resolve_emby_item_id(id).await {
+            Ok(Some(item_id)) => resolved_ids.push(item_id),
+            Ok(None) => resolved_ids.push(id.to_owned()),
+            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+    Ok(Some(resolved_ids))
+}
+
+fn emby_compat_media_source_id<'a>(ids: Option<&'a str>, page: &CatalogPage) -> Option<&'a str> {
+    ids?.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .find(|id| {
+            page.items.iter().any(|item| {
+                item.id != *id && item.media_sources.iter().any(|source| source.id == *id)
+            })
+        })
+}
+
 async fn emby_user_views(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -1924,7 +2024,25 @@ async fn emby_catalog_page_for_user_with_fields(
     page: &CatalogPage,
     fields: Option<&str>,
 ) -> Response {
-    match emby_catalog_items_for_user(state, user_id, page, fields).await {
+    emby_catalog_page_for_user_with_preferred_source(state, user_id, page, fields, None).await
+}
+
+async fn emby_catalog_page_for_user_with_preferred_source(
+    state: &AppState,
+    user_id: &str,
+    page: &CatalogPage,
+    fields: Option<&str>,
+    preferred_source_id: Option<&str>,
+) -> Response {
+    match emby_catalog_items_for_user_with_preferred_source(
+        state,
+        user_id,
+        page,
+        fields,
+        preferred_source_id,
+    )
+    .await
+    {
         Ok(items) => Json(json!({
             "Items": items,
             "TotalRecordCount": page.total,
@@ -1941,6 +2059,16 @@ async fn emby_catalog_items_for_user(
     page: &CatalogPage,
     fields: Option<&str>,
 ) -> Result<Vec<Value>, StatusCode> {
+    emby_catalog_items_for_user_with_preferred_source(state, user_id, page, fields, None).await
+}
+
+async fn emby_catalog_items_for_user_with_preferred_source(
+    state: &AppState,
+    user_id: &str,
+    page: &CatalogPage,
+    fields: Option<&str>,
+    preferred_source_id: Option<&str>,
+) -> Result<Vec<Value>, StatusCode> {
     let Some(database) = state.database.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
@@ -1955,12 +2083,22 @@ async fn emby_catalog_items_for_user(
     };
     let mut items = Vec::with_capacity(page.items.len());
     for item in &page.items {
-        items.push(emby_catalog_item_json_with_state(
+        let mut value = emby_catalog_item_json_with_state(
             item,
             &state.server_id,
             user_states.get(&item.id),
             fields,
-        ));
+        );
+        if let Some(source_id) = preferred_source_id
+            && let Some(Value::Array(sources)) = value.get_mut("MediaSources")
+            && let Some(index) = sources
+                .iter()
+                .position(|source| source.get("Id").and_then(Value::as_str) == Some(source_id))
+        {
+            let source = sources.remove(index);
+            sources.insert(0, source);
+        }
+        items.push(value);
     }
     Ok(items)
 }
@@ -2008,11 +2146,13 @@ async fn emby_list_items(
 ) -> Response {
     match emby_catalog_page_from_query(state, principal, query).await {
         Ok(page) => {
-            emby_catalog_page_for_user_with_fields(
+            let preferred_source_id = emby_compat_media_source_id(query.ids.as_deref(), &page);
+            emby_catalog_page_for_user_with_preferred_source(
                 state,
                 &principal.user_id.to_string(),
                 &page,
                 query.fields.as_deref(),
+                preferred_source_id,
             )
             .await
         }
@@ -2032,7 +2172,11 @@ async fn emby_catalog_page_from_query(
     let Some(catalog) = state.catalog.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let filter = catalog_filter_from_emby(query);
+    let mut filter = catalog_filter_from_emby(query);
+    filter.item_ids = match emby_compat_item_ids(state, query.ids.as_deref()).await {
+        Ok(item_ids) => item_ids,
+        Err(status) => return Err(status),
+    };
     let page = match query.parent_id.as_deref() {
         Some(parent_id) => {
             let Ok(parent_id) = parent_id.parse::<crate::domain::ids::LibraryId>() else {
@@ -11985,9 +12129,11 @@ mod tests {
 
     use super::{
         build_cookie, emby_media_source_json, emby_media_stream_item_id,
-        emby_playback_info_item_id, is_emby_media_stream_segment, is_emby_playback_callback_path,
-        lux_catalog_source_json, playback_client_label, playback_identifier_prefix,
-        record_activity_event, safe_trace_path, secure_cookie_for_request,
+        emby_playback_info_item_id, is_emby_legacy_strm_path, is_emby_media_stream_segment,
+        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
+        is_registered_emby_video_path, lux_catalog_source_json, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        secure_cookie_for_request,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::catalog::{CatalogSource, CatalogStream};
@@ -12107,6 +12253,31 @@ mod tests {
             emby_media_stream_item_id("/Videos/item-123/stream?api_key=secret"),
             None
         );
+    }
+
+    #[test]
+    fn unmatched_emby_video_paths_are_not_registered_routes() {
+        assert!(is_emby_video_path("/Videos/item-123/original.strm"));
+        assert!(is_emby_video_path("/emby/videos/item-123/original.strm"));
+        assert!(is_emby_legacy_strm_path("/Videos/item-123/original.strm"));
+        assert!(is_registered_emby_video_path(
+            "/emby/videos/item-123/original.strm"
+        ));
+        assert!(!is_registered_emby_video_path(
+            "/Videos/item-123/unknown.strm"
+        ));
+        assert!(is_registered_emby_video_path(
+            "/Videos/item-123/source-456/stream.mkv"
+        ));
+        assert!(is_registered_emby_video_path(
+            "/emby/videos/item-123/stream.mkv"
+        ));
+        assert!(is_emby_subtitle_path(
+            "/emby/Videos/item-123/source-456/Subtitles/0/Stream"
+        ));
+        assert!(!is_emby_subtitle_path(
+            "/emby/videos/item-123/source-456/Subtitles/0/Stream"
+        ));
     }
 
     #[test]

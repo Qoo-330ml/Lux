@@ -118,6 +118,63 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         senplayer_stream.headers()[reqwest::header::LOCATION],
         "https://media.example.test/video?id=7&token=secret"
     );
+
+    let unmatched_video_path = no_redirect_client
+        .get(format!(
+            "http://{address}/Videos/{remote_item_id}/original.strm"
+        ))
+        .query(&[
+            ("MediaSourceId", remote_source_id.as_str()),
+            ("api_key", token.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(
+        unmatched_video_path.status(),
+        reqwest::StatusCode::TEMPORARY_REDIRECT
+    );
+    assert_eq!(
+        unmatched_video_path.headers()[reqwest::header::LOCATION],
+        "https://media.example.test/video?id=7&token=secret"
+    );
+
+    let missing_source_video_path = no_redirect_client
+        .get(format!(
+            "http://{address}/Videos/{remote_item_id}/original.strm"
+        ))
+        .query(&[
+            ("MediaSourceId", "00000000-0000-0000-0000-000000000000"),
+            ("api_key", token.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(
+        missing_source_video_path.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    let source_id_items = no_redirect_client
+        .get(format!("http://{address}/Items"))
+        .query(&[
+            ("Ids", remote_source_id.as_str()),
+            ("Fields", "Path,MediaSources"),
+            ("Limit", "1"),
+            ("api_key", token.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(source_id_items.status(), reqwest::StatusCode::OK);
+    let source_id_body = source_id_items.json::<Value>().await?;
+    assert_eq!(source_id_body["TotalRecordCount"], 1);
+    assert_eq!(source_id_body["Items"][0]["Id"], remote_item_id);
+    assert_eq!(
+        source_id_body["Items"][0]["MediaSources"][0]["Id"],
+        remote_source_id
+    );
+    assert_eq!(
+        source_id_body["Items"][0]["MediaSources"][0]["Path"],
+        "https://media.example.test/video?id=7&token=secret"
+    );
     server.abort();
     Ok(())
 }

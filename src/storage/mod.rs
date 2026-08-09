@@ -7160,6 +7160,37 @@ impl Database {
         })
     }
 
+    pub(crate) async fn resolve_emby_item_id(
+        &self,
+        emby_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query(
+            "SELECT item_id
+             FROM (
+                 SELECT mi.id AS item_id, 0 AS resolution_order
+                 FROM media_items mi
+                 WHERE mi.id = ? AND mi.removed_at IS NULL
+                 UNION ALL
+                 SELECT ms.item_id, 1 AS resolution_order
+                 FROM media_sources ms
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 WHERE ms.id = ? AND mi.removed_at IS NULL AND fe.is_missing = 0
+             )
+             ORDER BY resolution_order
+             LIMIT 1",
+        )
+        .bind(emby_id)
+        .bind(emby_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(|row| row.get("item_id")))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_download_source_by_id(
         &self,
         item_id: &str,
@@ -9512,6 +9543,21 @@ mod tests {
             .fetch_one(database.pool())
             .await
             .expect("item id");
+        assert_eq!(
+            database
+                .resolve_emby_item_id("source-1")
+                .await
+                .expect("source id should resolve")
+                .as_deref(),
+            Some(item_id.as_str())
+        );
+        assert_eq!(
+            database
+                .resolve_emby_item_id("missing-id")
+                .await
+                .expect("unknown id should be accepted"),
+            None
+        );
         let rows = database
             .list_catalog_rows_by_ids(std::slice::from_ref(&item_id))
             .await

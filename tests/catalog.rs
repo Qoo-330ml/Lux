@@ -330,25 +330,39 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         Some(2)
     );
 
-    for id in [
-        alpha_source_id,
-        "00000000-0000-0000-0000-000000000000".to_owned(),
-    ] {
-        let filtered_by_unknown_id = client
-            .get(format!("{base_url}/Items?Ids={id}&Limit=1"))
-            .header("X-Emby-Token", &admin_token)
-            .send()
-            .await?;
-        assert_eq!(filtered_by_unknown_id.status(), reqwest::StatusCode::OK);
-        let filtered_by_unknown_id_body: Value = filtered_by_unknown_id.json().await?;
-        assert_eq!(filtered_by_unknown_id_body["TotalRecordCount"], 0);
-        assert_eq!(
-            filtered_by_unknown_id_body["Items"]
-                .as_array()
-                .map(Vec::len),
-            Some(0)
-        );
-    }
+    let filtered_by_media_source_id = client
+        .get(format!("{base_url}/Items?Ids={alpha_source_id}&Limit=1"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        filtered_by_media_source_id.status(),
+        reqwest::StatusCode::OK
+    );
+    let filtered_by_media_source_id_body: Value = filtered_by_media_source_id.json().await?;
+    assert_eq!(filtered_by_media_source_id_body["TotalRecordCount"], 1);
+    assert_eq!(filtered_by_media_source_id_body["Items"][0]["Id"], item_id);
+    assert_eq!(
+        filtered_by_media_source_id_body["Items"][0]["MediaSources"][0]["Id"],
+        alpha_source_id
+    );
+
+    let filtered_by_unknown_id = client
+        .get(format!(
+            "{base_url}/Items?Ids=00000000-0000-0000-0000-000000000000&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(filtered_by_unknown_id.status(), reqwest::StatusCode::OK);
+    let filtered_by_unknown_id_body: Value = filtered_by_unknown_id.json().await?;
+    assert_eq!(filtered_by_unknown_id_body["TotalRecordCount"], 0);
+    assert_eq!(
+        filtered_by_unknown_id_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
 
     let emby_compact_page = client
         .get(format!(
