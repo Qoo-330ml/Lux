@@ -136,15 +136,24 @@ impl Config {
     pub async fn load_database_configuration(
         &self,
     ) -> Result<Option<DatabaseConfiguration>, DatabaseConfigurationError> {
+        let explicit = self.load_explicit_database_configuration().await?;
+        if explicit.is_some() {
+            return Ok(explicit);
+        }
+        Ok(self
+            .has_legacy_sqlite_database()
+            .await
+            .then_some(DatabaseConfiguration::Sqlite))
+    }
+
+    pub async fn load_explicit_database_configuration(
+        &self,
+    ) -> Result<Option<DatabaseConfiguration>, DatabaseConfigurationError> {
         let path = self.config_dir.join(DATABASE_CONFIG_FILE);
         let contents = match fs::read(&path).await {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let legacy_path = self.config_dir.join("lux.db");
-                return Ok(fs::metadata(legacy_path)
-                    .await
-                    .map(|_| DatabaseConfiguration::Sqlite)
-                    .ok());
+                return Ok(None);
             }
             Err(source) => return Err(DatabaseConfigurationError::Io { path, source }),
         };
@@ -154,6 +163,10 @@ impl Config {
             })?;
         configuration.validate()?;
         Ok(Some(configuration))
+    }
+
+    pub async fn has_legacy_sqlite_database(&self) -> bool {
+        fs::metadata(self.config_dir.join("lux.db")).await.is_ok()
     }
 
     pub async fn save_database_configuration(

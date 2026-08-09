@@ -4,6 +4,7 @@ pub mod candidates;
 pub mod catalog;
 pub mod collections;
 pub mod danmaku;
+pub mod database_setup;
 pub mod deletion;
 pub mod directory_browser;
 pub mod downloads;

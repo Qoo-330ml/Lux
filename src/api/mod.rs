@@ -32,6 +32,7 @@ use uuid::Uuid;
 use crate::{
     COMMIT, VERSION,
     application::danmaku::{DanmakuService, DanmakuServiceError, validate_provider_base_url},
+    application::database_setup::{DatabaseSetupError, DatabaseSetupService},
     application::deletion::{MediaDeleteError, MediaDeleteService},
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
     application::playback::{ByteRange, RangeError, parse_single_range},
@@ -80,7 +81,7 @@ use crate::{
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
     },
-    config::Config,
+    config::{Config, DatabaseConfiguration, PostgresConnection},
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
     network::{
         RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
@@ -102,6 +103,8 @@ use tokio::{
 pub struct AppState {
     database: Option<Database>,
     config_dir: Option<PathBuf>,
+    database_setup: Option<DatabaseSetupService>,
+    database_selection_required: bool,
     server_id: String,
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
@@ -157,6 +160,10 @@ impl AppState {
     ) -> Self {
         let server_id = database.server_id().to_owned();
         let config_dir = config.config_dir.clone();
+        let database_setup = Some(DatabaseSetupService::new(
+            config.clone(),
+            database.backend(),
+        ));
         let admin_events = AdminEventHub::new();
         let access = MediaAccessService::new(database.clone());
         let image_writes =
@@ -197,6 +204,8 @@ impl AppState {
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
+            database_setup,
+            database_selection_required: false,
             server_id,
             setup: Some(setup),
             auth: Some(auth),
@@ -385,6 +394,11 @@ impl AppState {
         self.remote_access = policy;
         self
     }
+
+    pub fn require_database_selection(mut self) -> Self {
+        self.database_selection_required = true;
+        self
+    }
 }
 
 pub fn app() -> Router {
@@ -399,6 +413,9 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/health/ready", get(ready))
         .route("/api/v1/version", get(version))
         .route("/api/v1/setup/status", get(setup_status))
+        .route("/api/v1/setup/database", get(setup_database_status))
+        .route("/api/v1/setup/database/test", post(setup_database_test))
+        .route("/api/v1/setup/database/select", post(setup_database_select))
         .route("/api/v1/setup/complete", post(setup_complete))
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
@@ -3207,6 +3224,174 @@ async fn setup_status(State(state): State<AppState>) -> (StatusCode, Json<Value>
     }
 }
 
+async fn setup_database_status(State(state): State<AppState>) -> Response {
+    let Some(database_setup) = state.database_setup.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
+        )
+            .into_response();
+    };
+
+    match database_setup.status().await {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(json!({
+                "configured": status.configured,
+                "backend": status.backend,
+                "currentBackend": status.current_backend,
+                "restartRequired": status.restart_required
+            })),
+        )
+            .into_response(),
+        Err(error) => database_setup_error(&HeaderMap::new(), error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "backend", rename_all = "SCREAMING_SNAKE_CASE")]
+enum SetupDatabaseRequest {
+    #[serde(rename = "SQLITE")]
+    Sqlite,
+    #[serde(rename = "POSTGRESQL")]
+    Postgres {
+        host: String,
+        port: u16,
+        database: String,
+        username: String,
+        password: String,
+        #[serde(default = "default_postgres_ssl_mode")]
+        ssl_mode: String,
+    },
+}
+
+fn default_postgres_ssl_mode() -> String {
+    "prefer".to_owned()
+}
+
+impl SetupDatabaseRequest {
+    fn into_configuration(self) -> DatabaseConfiguration {
+        match self {
+            Self::Sqlite => DatabaseConfiguration::Sqlite,
+            Self::Postgres {
+                host,
+                port,
+                database,
+                username,
+                password,
+                ssl_mode,
+            } => DatabaseConfiguration::Postgres(PostgresConnection {
+                host,
+                port,
+                database,
+                username,
+                password,
+                ssl_mode,
+            }),
+        }
+    }
+}
+
+async fn setup_database_test(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<SetupDatabaseRequest>,
+) -> Response {
+    let Some(database_setup) = state.database_setup.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let configuration = request.into_configuration();
+    match database_setup.test(&configuration).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "backend": configuration.backend() })),
+        )
+            .into_response(),
+        Err(error) => database_setup_error(&headers, error),
+    }
+}
+
+async fn setup_database_select(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<SetupDatabaseRequest>,
+) -> Response {
+    let Some(setup) = state.setup.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match setup.status().await {
+        Ok(true) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::SetupAlreadyCompleted,
+                "初始设置已经完成",
+            )
+            .into_response();
+        }
+        Ok(false) => {}
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "数据库不可用",
+            )
+            .into_response();
+        }
+    }
+    let Some(database_setup) = state.database_setup.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let configuration = request.into_configuration();
+    match database_setup.select(&configuration).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(json!({
+                "selected": true,
+                "backend": result.backend,
+                "restartRequired": result.restart_required
+            })),
+        )
+            .into_response(),
+        Err(error) => database_setup_error(&headers, error),
+    }
+}
+
+fn database_setup_error(headers: &HeaderMap, error: DatabaseSetupError) -> Response {
+    let (status, code, message) = match error {
+        DatabaseSetupError::Configuration(_) => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "数据库配置无效",
+        ),
+        DatabaseSetupError::Storage(_) => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::DatabaseConnectionFailed,
+            "无法连接数据库，请检查地址、端口、用户名和密码",
+        ),
+    };
+    api_error(headers, status, code, message).into_response()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetupCompleteRequest {
@@ -3248,6 +3433,48 @@ async fn setup_complete(
         )
         .into_response();
     };
+
+    if state.database_selection_required {
+        let Some(database_setup) = state.database_setup.as_ref() else {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "服务尚未就绪",
+            )
+            .into_response();
+        };
+        match database_setup.status().await {
+            Ok(status) if !status.configured => {
+                return api_error(
+                    &headers,
+                    StatusCode::CONFLICT,
+                    lux::ApiErrorCode::DatabaseConfigurationRequired,
+                    "请先选择数据库",
+                )
+                .into_response();
+            }
+            Ok(status) if status.restart_required => {
+                return api_error(
+                    &headers,
+                    StatusCode::CONFLICT,
+                    lux::ApiErrorCode::DatabaseRestartRequired,
+                    "数据库配置已保存，请重启 Lux 后继续",
+                )
+                .into_response();
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "数据库不可用",
+                )
+                .into_response();
+            }
+        }
+    }
 
     let setup_kind = match request
         .first_library
