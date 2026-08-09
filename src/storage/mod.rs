@@ -6456,6 +6456,42 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_movie_metadata_sources(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE mi.library_id = ? AND mi.item_type = 'MOVIE'
+               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
+             ORDER BY ms.item_id, fe.relative_path",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_local_danmaku_sources_for_library(
         &self,
         library_id: &str,

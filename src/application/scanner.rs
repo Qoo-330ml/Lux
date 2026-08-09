@@ -2164,6 +2164,7 @@ impl ScanJobService {
         let result = match library.kind.as_str() {
             "MOVIE" => enricher.enrich_movie_library(library_id).await,
             "SERIES" => enricher.enrich_series_library(library_id).await,
+            "MIXED" => enricher.enrich_mixed_library(library_id).await,
             _ => return Ok(()),
         };
         match result {

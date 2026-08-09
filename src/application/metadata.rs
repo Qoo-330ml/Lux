@@ -560,7 +560,7 @@ impl MetadataEnricher {
     ) -> Result<MetadataReport, MetadataError> {
         let sources = self
             .database
-            .list_media_sources_for_library(&library_id.to_string())
+            .list_movie_metadata_sources(&library_id.to_string())
             .await?;
         let mut report = MetadataReport::default();
         for source in sources {
@@ -588,6 +588,15 @@ impl MetadataEnricher {
                 }
             }
         }
+        Ok(report)
+    }
+
+    pub async fn enrich_mixed_library(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<MetadataReport, MetadataError> {
+        let mut report = self.enrich_movie_library(library_id).await?;
+        report.merge(self.enrich_series_library(library_id).await?);
         Ok(report)
     }
 

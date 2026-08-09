@@ -59,3 +59,71 @@ async fn completed_movie_scan_indexes_local_nfo_and_images()
     assert!(images.iter().all(|(_, path)| path.ends_with(".jpg")));
     Ok(())
 }
+
+#[tokio::test]
+async fn completed_mixed_scan_indexes_local_movie_and_series_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Mixed");
+    let movie_dir = media_root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(
+        movie_dir.join("Example.Movie.2020.strm"),
+        "https://example.invalid/media/movie",
+    )
+    .await?;
+    tokio::fs::write(movie_dir.join("poster.jpg"), b"movie-poster").await?;
+    tokio::fs::write(movie_dir.join("fanart.jpg"), b"movie-fanart").await?;
+
+    let series_dir = media_root.join("Example Show");
+    let season_dir = series_dir.join("Season 01");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    tokio::fs::write(
+        series_dir.join("tvshow.nfo"),
+        "<tvshow><title>Example Show</title></tvshow>",
+    )
+    .await?;
+    tokio::fs::write(
+        season_dir.join("Example.Show.S01E01.strm"),
+        "https://example.invalid/media/episode",
+    )
+    .await?;
+    tokio::fs::write(series_dir.join("poster.jpg"), b"series-poster").await?;
+    tokio::fs::write(series_dir.join("fanart.jpg"), b"series-fanart").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Mixed", LibraryKind::Mixed, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let images: Vec<(String, String)> = sqlx::query_as(
+        "SELECT media_items.item_type, item_images.image_type
+         FROM item_images
+         JOIN media_items ON media_items.id = item_images.item_id
+         ORDER BY media_items.item_type, item_images.image_type",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        images,
+        vec![
+            ("MOVIE".to_owned(), "FANART".to_owned()),
+            ("MOVIE".to_owned(), "POSTER".to_owned()),
+            ("SERIES".to_owned(), "FANART".to_owned()),
+            ("SERIES".to_owned(), "POSTER".to_owned()),
+        ]
+    );
+    Ok(())
+}
