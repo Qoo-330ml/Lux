@@ -1,17 +1,17 @@
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use sqlx::{
-    Executor, QueryBuilder, Row,
+    AnyPool, Executor, QueryBuilder, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
-    AnyPool,
 };
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::config::Config;
+use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
 
-static MIGRATOR: Migrator = sqlx::migrate!();
+static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
+static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
 pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
 
@@ -20,10 +20,22 @@ pub struct Database {
     pool: AnyPool,
     path: PathBuf,
     server_id: String,
+    backend: DatabaseBackend,
 }
 
 impl Database {
     pub async fn connect(config: &Config) -> Result<Self, StorageError> {
+        Self::connect_with_configuration(config, &DatabaseConfiguration::Sqlite).await
+    }
+
+    pub async fn connect_with_configuration(
+        config: &Config,
+        configuration: &DatabaseConfiguration,
+    ) -> Result<Self, StorageError> {
+        configuration
+            .validate()
+            .map_err(StorageError::Configuration)?;
+        let backend = configuration.backend();
         fs::create_dir_all(&config.config_dir)
             .await
             .map_err(|source| StorageError::Io {
@@ -31,22 +43,38 @@ impl Database {
                 source,
             })?;
 
-        let path = config.config_dir.join("lux.db");
+        let path = match backend {
+            DatabaseBackend::Sqlite => config.config_dir.join("lux.db"),
+            DatabaseBackend::Postgres => PathBuf::from("external PostgreSQL"),
+        };
         sqlx::any::install_default_drivers();
-        let database_url = format!("sqlite://{}?mode=rwc", path.display());
-        let options = AnyConnectOptions::from_str(&database_url).map_err(|source| {
-            StorageError::Sqlx {
+        let database_url = match configuration {
+            DatabaseConfiguration::Sqlite => format!("sqlite://{}?mode=rwc", path.display()),
+            DatabaseConfiguration::Postgres(_) => configuration
+                .postgres_url()
+                .map_err(StorageError::Configuration)?
+                .ok_or_else(|| {
+                    StorageError::Configuration(DatabaseConfigurationError::Invalid(
+                        "PostgreSQL 连接配置缺失".to_owned(),
+                    ))
+                })?,
+        };
+        let options =
+            AnyConnectOptions::from_str(&database_url).map_err(|source| StorageError::Sqlx {
                 path: path.clone(),
                 source,
+            })?;
+        let after_connect_sql = match backend {
+            DatabaseBackend::Sqlite => {
+                "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"
             }
-        })?;
+            DatabaseBackend::Postgres => "SET TIME ZONE 'UTC'; SET application_name = 'lux';",
+        };
         let pool = AnyPoolOptions::new()
             .max_connections(5)
-            .after_connect(|connection, _| {
+            .after_connect(move |connection, _| {
                 Box::pin(async move {
-                    connection
-                        .execute("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
-                        .await?;
+                    connection.execute(after_connect_sql).await?;
                     Ok(())
                 })
             })
@@ -57,7 +85,11 @@ impl Database {
                 source,
             })?;
 
-        if let Err(source) = MIGRATOR.run(&pool).await {
+        let migrator = match backend {
+            DatabaseBackend::Sqlite => &SQLITE_MIGRATOR,
+            DatabaseBackend::Postgres => &POSTGRES_MIGRATOR,
+        };
+        if let Err(source) = migrator.run(&pool).await {
             pool.close().await;
             return Err(StorageError::Migration { path, source });
         }
@@ -72,6 +104,7 @@ impl Database {
             pool,
             path,
             server_id,
+            backend,
         })
     }
 
@@ -81,6 +114,10 @@ impl Database {
 
     pub fn server_id(&self) -> &str {
         &self.server_id
+    }
+
+    pub fn backend(&self) -> DatabaseBackend {
+        self.backend
     }
 
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
@@ -832,7 +869,7 @@ impl Database {
         library_id: &str,
     ) -> Result<bool, StorageError> {
         sqlx::query(
-            "INSERT OR IGNORE INTO scheduled_task_configs (
+            "INSERT INTO scheduled_task_configs (
                 owner_type, owner_id, task_type, task_name, task_description,
                 source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
              ) VALUES (
@@ -840,7 +877,8 @@ impl Database {
                 '自动生成媒体库封面',
                 '首次达到至少 9 张海报后，随机选择 9 张海报生成带媒体库名称的旋转堆叠封面；自动仅执行一次，管理员可手动重跑。',
                 'SYSTEM', NULL, NULL, 0, '{\"oneShot\":true}'
-             )",
+             ) ON CONFLICT(owner_type, owner_id, task_type) DO NOTHING
+             ",
         )
         .bind(library_id)
         .execute(&self.pool)
@@ -2326,9 +2364,10 @@ impl Database {
         for (entry_type, paths) in [("DIRECTORY", child_directories), ("FILE", media_files)] {
             for path in paths {
                 sqlx::query(
-                    "INSERT OR IGNORE INTO reconciliation_scan_entries (
+                    "INSERT INTO reconciliation_scan_entries (
                         job_id, library_root_id, relative_path, entry_type
-                     ) VALUES (?, ?, ?, ?)",
+                     ) VALUES (?, ?, ?, ?)
+                     ON CONFLICT(job_id, library_root_id, entry_type, relative_path) DO NOTHING",
                 )
                 .bind(job_id)
                 .bind(library_root_id)
@@ -7347,9 +7386,10 @@ impl Database {
     ) -> Result<bool, StorageError> {
         let id = Uuid::now_v7().to_string();
         sqlx::query(
-            "INSERT OR IGNORE INTO item_images (
+            "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, file_size, source
-            ) VALUES (?, ?, ?, 0, ?, ?, 'LOCAL')",
+            ) VALUES (?, ?, ?, 0, ?, ?, 'LOCAL')
+            ON CONFLICT(item_id, image_type, image_index) DO NOTHING",
         )
         .bind(id)
         .bind(item_id)
@@ -7769,8 +7809,9 @@ impl Database {
                 source,
             })?;
         sqlx::query(
-            "INSERT OR REPLACE INTO lux_meta (key, value)
-             VALUES ('__lux_write_probe__', ?)",
+            "INSERT INTO lux_meta (key, value)
+             VALUES ('__lux_write_probe__', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(format!("lux-write-probe-{}", Uuid::now_v7()))
         .execute(&mut *transaction)
@@ -8959,10 +9000,13 @@ async fn ensure_server_id(pool: &AnyPool) -> Result<String, sqlx::Error> {
     }
 
     let generated = Uuid::now_v7().to_string();
-    sqlx::query("INSERT OR IGNORE INTO lux_meta (key, value) VALUES ('server_id', ?)")
-        .bind(generated)
-        .execute(&mut *transaction)
-        .await?;
+    sqlx::query(
+        "INSERT INTO lux_meta (key, value) VALUES ('server_id', ?)
+         ON CONFLICT(key) DO NOTHING",
+    )
+    .bind(generated)
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
     sqlx::query_scalar("SELECT value FROM lux_meta WHERE key = 'server_id'")
         .fetch_one(pool)
@@ -8971,6 +9015,7 @@ async fn ensure_server_id(pool: &AnyPool) -> Result<String, sqlx::Error> {
 
 #[derive(Debug)]
 pub enum StorageError {
+    Configuration(DatabaseConfigurationError),
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -8989,6 +9034,7 @@ pub enum StorageError {
 impl std::fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Configuration(source) => write!(formatter, "数据库配置无效: {source}"),
             Self::Io { path, source } => {
                 write!(formatter, "database path '{}': {source}", path.display())
             }
@@ -9012,6 +9058,7 @@ impl std::fmt::Display for StorageError {
 impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Configuration(source) => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Sqlx { source, .. } => Some(source),
             Self::Migration { source, .. } => Some(source),
@@ -9145,6 +9192,7 @@ mod tests {
             pool,
             path: PathBuf::from("query-only-test.db"),
             server_id: "test".to_owned(),
+            backend: DatabaseBackend::Sqlite,
         };
         assert!(database.probe_write().await.is_err());
         database.close().await;
@@ -9199,6 +9247,7 @@ mod tests {
             pool,
             path: PathBuf::from("metadata-order-test.db"),
             server_id: "test".to_owned(),
+            backend: DatabaseBackend::Sqlite,
         };
 
         assert_eq!(
