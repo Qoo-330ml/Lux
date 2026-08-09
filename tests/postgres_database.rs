@@ -4,11 +4,12 @@ use luxd::{
     application::{
         access::{AccessPrincipal, MediaAccessService},
         catalog::CatalogService,
+        libraries::{LibraryService, LibrarySettingsPatch},
         setup::SetupService,
     },
     auth::sessions::WebAuthService,
     config::{Config, DatabaseConfiguration, PostgresConnection},
-    domain::ids::UserId,
+    domain::ids::{LibraryId, UserId},
     storage::Database,
 };
 
@@ -69,6 +70,31 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
         .await?;
     assert_eq!(stored_name, "PostgreSQL Test Library");
 
+    let library_service = LibraryService::new(database.clone());
+    let library_id = library_id.parse::<LibraryId>()?;
+    let library = library_service
+        .update_settings(
+            library_id,
+            LibrarySettingsPatch {
+                is_enabled: Some(false),
+                realtime_watch_enabled: Some(true),
+                ..LibrarySettingsPatch::default()
+            },
+        )
+        .await?;
+    assert!(!library.library.is_enabled);
+    assert!(library.library.realtime_watch_enabled);
+    let library = library_service
+        .update_settings(
+            library_id,
+            LibrarySettingsPatch {
+                is_enabled: Some(true),
+                ..LibrarySettingsPatch::default()
+            },
+        )
+        .await?;
+    assert!(library.library.is_enabled);
+
     let item_id = uuid::Uuid::now_v7().to_string();
     sqlx::query(
         "INSERT INTO media_items (
@@ -76,7 +102,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
         ) VALUES ($1, $2, 'MOVIE', 'Postgres Search Movie', 'postgres search movie', 'LOCAL_CONFIRMED', 1)",
     )
     .bind(&item_id)
-    .bind(&library_id)
+    .bind(library_id.to_string())
     .execute(database.pool())
     .await?;
     sqlx::query(
