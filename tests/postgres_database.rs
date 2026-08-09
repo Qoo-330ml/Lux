@@ -34,6 +34,21 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
         ssl_mode: "disable".to_owned(),
     });
 
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let probe_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    sqlx::query("CREATE TABLE non_lux_application_table (id BIGINT PRIMARY KEY)")
+        .execute(&probe_pool)
+        .await?;
+    let non_lux_result = Database::test_configuration(&connection).await;
+    sqlx::query("DROP TABLE non_lux_application_table")
+        .execute(&probe_pool)
+        .await?;
+    probe_pool.close().await;
+    assert!(non_lux_result.is_err());
+
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
     assert!(database.schema_version().await? > 0);

@@ -92,6 +92,13 @@ impl Database {
                 source,
             })?;
 
+        if backend == DatabaseBackend::Postgres
+            && let Err(error) = validate_postgres_schema(&pool).await
+        {
+            pool.close().await;
+            return Err(error);
+        }
+
         let migrator = match backend {
             DatabaseBackend::Sqlite => &SQLITE_MIGRATOR,
             DatabaseBackend::Postgres => &POSTGRES_MIGRATOR,
@@ -155,6 +162,7 @@ impl Database {
                 path: PathBuf::from("external PostgreSQL"),
                 source,
             })?;
+        validate_postgres_schema(&pool).await?;
         sqlx::query_scalar::<_, i64>("SELECT 1")
             .fetch_one(&pool)
             .await
@@ -8038,6 +8046,41 @@ impl Database {
             sql,
         )))
     }
+}
+
+async fn validate_postgres_schema(pool: &AnyPool) -> Result<(), StorageError> {
+    let path = PathBuf::from("external PostgreSQL");
+    let application_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name <> '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.clone(),
+        source,
+    })?;
+    if application_table_count == 0 {
+        return Ok(());
+    }
+
+    let lux_meta_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'lux_meta'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|source| StorageError::Sqlx { path, source })?;
+    if lux_meta_count == 0 {
+        return Err(StorageError::Configuration(
+            DatabaseConfigurationError::Invalid(
+                "PostgreSQL 数据库必须为空或已经是 Lux 数据库".to_owned(),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Eq, PartialEq)]

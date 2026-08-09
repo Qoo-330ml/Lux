@@ -3301,6 +3301,36 @@ async fn setup_database_test(
     State(state): State<AppState>,
     Json(request): Json<SetupDatabaseRequest>,
 ) -> Response {
+    let Some(setup) = state.setup.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match setup.status().await {
+        Ok(false) => {}
+        Ok(true) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::SetupAlreadyCompleted,
+                "初始设置已经完成",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "数据库不可用",
+            )
+            .into_response();
+        }
+    }
     let Some(database_setup) = state.database_setup.as_ref() else {
         return api_error(
             &headers,

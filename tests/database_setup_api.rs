@@ -66,6 +66,17 @@ async fn setup_selects_sqlite_before_creating_the_first_admin()
         .await?;
     assert_eq!(complete.status(), StatusCode::CREATED);
     assert!(config.config_dir.join("database.json").is_file());
+
+    let probe_after_setup = client
+        .post(format!("{base_url}/api/v1/setup/database/test"))
+        .json(&json!({ "backend": "SQLITE" }))
+        .send()
+        .await?;
+    assert_eq!(probe_after_setup.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        probe_after_setup.json::<Value>().await?["error"]["code"],
+        "SETUP_ALREADY_COMPLETED"
+    );
     server.abort();
     Ok(())
 }
