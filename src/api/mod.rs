@@ -87,7 +87,10 @@ use crate::{
         RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
         redact_proxy_url,
     },
-    observability::resources::ResourceMetrics,
+    observability::{
+        logs::{LogDateRange, LogExportError, export_logs},
+        resources::ResourceMetrics,
+    },
     security::LoginRateLimiter,
     storage::{
         DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError,
@@ -616,6 +619,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
         .route("/api/v1/admin/events", get(admin_events))
         .route("/api/v1/admin/audit", get(admin_list_audit))
+        .route("/api/v1/admin/logs/export", get(admin_export_logs))
         .route("/api/v1/admin/logs", get(admin_list_logs))
         .route("/api/v1/libraries", get(lux_list_libraries))
         .route(
@@ -8143,6 +8147,12 @@ struct AdminJobEventsQuery {
 }
 
 #[derive(Deserialize, Default)]
+struct AdminLogExportQuery {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AdminScheduledTasksQuery {
     page: Option<i64>,
@@ -9031,6 +9041,61 @@ async fn admin_list_logs(
     State(state): State<AppState>,
 ) -> Response {
     admin_list_audit(headers, Query(query), State(state)).await
+}
+
+async fn admin_export_logs(
+    headers: HeaderMap,
+    Query(query): Query<AdminLogExportQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let range = match LogDateRange::from_query(query.from.as_deref(), query.to.as_deref()) {
+        Ok(range) => range,
+        Err(error) => return log_export_error_response(&headers, error),
+    };
+    let Some(config_dir) = state.config_dir.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match export_logs(config_dir, range).await {
+        Ok(export) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/zip")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", export.filename),
+            )
+            .header("Cache-Control", "no-store")
+            .body(Body::from(export.archive))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(error) => log_export_error_response(&headers, error),
+    }
+}
+
+fn log_export_error_response(headers: &HeaderMap, error: LogExportError) -> Response {
+    match error {
+        LogExportError::InvalidDate
+        | LogExportError::DateRangeReversed
+        | LogExportError::DateRangeTooLarge => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &error.to_string(),
+        )
+        .into_response(),
+        LogExportError::NoLogs => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            &error.to_string(),
+        )
+        .into_response(),
+        LogExportError::Io(_) | LogExportError::Archive(_) | LogExportError::Worker(_) => {
+            tracing::warn!(%error, "log export failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
 }
 
 async fn probe_directory_writable(path: &FsPath) -> bool {
