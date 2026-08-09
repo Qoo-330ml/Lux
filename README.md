@@ -43,8 +43,8 @@ docker compose --profile postgres up -d
 镜像名为 `docker.io/<DOCKERHUB_USERNAME>/lux`。例如发布版本：
 
 ```bash
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 ## 常用命令
