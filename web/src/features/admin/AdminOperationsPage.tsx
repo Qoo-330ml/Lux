@@ -180,7 +180,9 @@ export function AdminOperationsPage() {
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `lux-logs-${logExportFrom.replaceAll("-", "")}-${logExportTo.replaceAll("-", "")}.zip`;
+      link.download = logExportFrom === logExportTo
+        ? `lux.${logExportFrom}.log`
+        : `lux-logs-${logExportFrom.replaceAll("-", "")}-${logExportTo.replaceAll("-", "")}.zip`;
       document.body.append(link);
       link.click();
       link.remove();
@@ -390,13 +392,13 @@ function LogsSection({
   exportSuccess: boolean;
 }) {
   return <section className="lux-admin-panel lux-operations-section" aria-labelledby="logs-title">
-    <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">审计记录与诊断文件</span><h2 id="logs-title">系统日志</h2><p>管理员操作以脱敏事件形式记录；诊断文件按 UTC 日期保存，可直接打包带走分析。</p></div><FileClock size={20} className="lux-admin-panel-icon" /></div>
+    <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">审计记录与诊断文件</span><h2 id="logs-title">系统日志</h2><p>管理员操作以脱敏事件形式记录；诊断文件按 UTC 日期保存，可直接下载分析。</p></div><FileClock size={20} className="lux-admin-panel-icon" /></div>
     <div className="lux-log-export-panel">
-      <div className="lux-log-export-copy"><CalendarDays size={18} /><div><strong>导出运行日志</strong><span>最多选择 31 天，导出结果为 ZIP。</span></div></div>
+      <div className="lux-log-export-copy"><CalendarDays size={18} /><div><strong>导出运行日志</strong><span>单日下载原始 .log 文件，跨日自动打包 ZIP，最多选择 31 天。</span></div></div>
       <div className="lux-log-export-controls">
         <label>起始日期<input aria-label="日志起始日期" type="date" value={exportFrom} onChange={(event) => onExportFromChange(event.target.value)} /></label>
         <label>结束日期<input aria-label="日志结束日期" type="date" value={exportTo} onChange={(event) => onExportToChange(event.target.value)} /></label>
-        <button className="lux-button lux-button-secondary" type="button" aria-label="导出日志 ZIP" onClick={onExport} disabled={exporting}><Download size={15} />{exporting ? "打包中…" : "导出日志 ZIP"}</button>
+        <button className="lux-button lux-button-secondary" type="button" aria-label={exportFrom === exportTo ? "导出日志文件" : "导出日志 ZIP"} onClick={onExport} disabled={exporting}><Download size={15} />{exporting ? "准备中…" : exportFrom === exportTo ? "导出日志文件" : "导出日志 ZIP"}</button>
       </div>
       {exportError ? <p className="lux-error-copy" role="alert">{exportError}</p> : null}
       {exportSuccess ? <p className="lux-log-export-success" role="status">日志已导出。</p> : null}

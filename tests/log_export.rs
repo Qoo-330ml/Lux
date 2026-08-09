@@ -112,6 +112,35 @@ async fn admin_can_export_selected_daily_logs_but_viewer_cannot()
     assert!(contents.contains("current"));
     assert!(archive.by_name("not-a-lux-log.txt").is_err());
 
+    let daily_response = client
+        .get(format!(
+            "{base_url}/api/v1/admin/logs/export?from=2026-08-09&to=2026-08-09"
+        ))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(daily_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        daily_response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-ndjson")
+    );
+    assert!(
+        daily_response
+            .headers()
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("lux.2026-08-09.log"))
+    );
+    assert!(
+        daily_response
+            .text()
+            .await?
+            .contains(r#"{"message":"current"}"#)
+    );
+
     let invalid = client
         .get(format!(
             "{base_url}/api/v1/admin/logs/export?from=2026-01-01&to=2026-02-01"

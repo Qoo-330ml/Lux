@@ -579,7 +579,9 @@ export class LuxApiClient {
 
   async exportAdminLogs(from: string, to: string) {
     const params = new URLSearchParams({ from, to });
-    const headers = new Headers({ Accept: "application/zip" });
+    const headers = new Headers({
+      Accept: from === to ? "application/x-ndjson" : "application/zip",
+    });
     const response = await fetch(`/api/v1/admin/logs/export?${params}`, {
       credentials: "same-origin",
       headers,

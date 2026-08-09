@@ -102,6 +102,14 @@ describe("AdminOperationsPage", () => {
       await vi.waitFor(() => expect(exportLogs).toHaveBeenCalledWith(from?.value, to?.value));
     });
     expect(container.textContent).toContain("日志已导出");
+
+    act(() => {
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      valueSetter?.call(from, to?.value);
+      from?.dispatchEvent(new Event("input", { bubbles: true }));
+      from?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="导出日志文件"]')).not.toBeNull();
   });
 
   it("edits an existing registered task without exposing a task creation form", async () => {

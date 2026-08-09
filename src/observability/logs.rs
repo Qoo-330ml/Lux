@@ -49,9 +49,9 @@ impl LogDateRange {
 }
 
 #[derive(Debug)]
-pub struct LogExport {
-    pub archive: Vec<u8>,
-    pub filename: String,
+pub enum LogExport {
+    Daily { contents: Vec<u8>, filename: String },
+    Archive { contents: Vec<u8>, filename: String },
 }
 
 #[derive(Debug)]
@@ -135,6 +135,13 @@ pub async fn export_logs(
         return Err(LogExportError::NoLogs);
     }
 
+    if range.from == range.to {
+        return match files.into_iter().next() {
+            Some((filename, contents)) => Ok(LogExport::Daily { contents, filename }),
+            None => Err(LogExportError::NoLogs),
+        };
+    }
+
     let filename = format!(
         "lux-logs-{}-{}.zip",
         compact_date(range.from),
@@ -143,7 +150,10 @@ pub async fn export_logs(
     let archive = tokio::task::spawn_blocking(move || create_archive(files))
         .await
         .map_err(|error| LogExportError::Worker(error.to_string()))??;
-    Ok(LogExport { archive, filename })
+    Ok(LogExport::Archive {
+        contents: archive,
+        filename,
+    })
 }
 
 fn create_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, LogExportError> {

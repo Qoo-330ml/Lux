@@ -88,7 +88,7 @@ use crate::{
         redact_proxy_url,
     },
     observability::{
-        logs::{LogDateRange, LogExportError, export_logs},
+        logs::{LogDateRange, LogExport, LogExportError, export_logs},
         resources::ResourceMetrics,
     },
     security::LoginRateLimiter,
@@ -9059,16 +9059,26 @@ async fn admin_export_logs(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match export_logs(config_dir, range).await {
-        Ok(export) => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/zip")
-            .header(
-                "Content-Disposition",
-                format!("attachment; filename=\"{}\"", export.filename),
-            )
-            .header("Cache-Control", "no-store")
-            .body(Body::from(export.archive))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Ok(export) => {
+            let (content_type, filename, contents) = match export {
+                LogExport::Daily { contents, filename } => {
+                    ("application/x-ndjson", filename, contents)
+                }
+                LogExport::Archive { contents, filename } => {
+                    ("application/zip", filename, contents)
+                }
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type)
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{filename}\""),
+                )
+                .header("Cache-Control", "no-store")
+                .body(Body::from(contents))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
         Err(error) => log_export_error_response(&headers, error),
     }
 }
