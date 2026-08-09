@@ -8751,6 +8751,17 @@ const CATALOG_VISIBLE_PREDICATE: &str = " AND (
               AND visible_child.has_available_source = 1
               AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
         )
+        OR EXISTS (
+            SELECT 1
+            FROM collection_items visible_collection_item
+            JOIN collections visible_collection
+              ON visible_collection.id = visible_collection_item.collection_id
+            JOIN media_items visible_child
+              ON visible_child.id = visible_collection_item.item_id
+            WHERE visible_collection.item_id = mi.id
+              AND visible_child.removed_at IS NULL
+              AND visible_child.has_available_source = 1
+        )
     )
 )";
 
