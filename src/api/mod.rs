@@ -1529,6 +1529,7 @@ fn catalog_filter_from_values(
     CatalogFilter {
         item_types,
         item_ids: None,
+        media_source_ids: None,
         years,
         is_played,
         is_favorite,
@@ -1556,7 +1557,7 @@ fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
     );
-    filter.item_ids = query.ids.as_deref().map(|values| {
+    let ids = query.ids.as_deref().map(|values| {
         values
             .split(',')
             .map(str::trim)
@@ -1564,6 +1565,8 @@ fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
             .map(str::to_owned)
             .collect()
     });
+    filter.item_ids = ids.clone();
+    filter.media_source_ids = ids;
     filter
 }
 

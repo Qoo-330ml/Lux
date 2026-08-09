@@ -5915,15 +5915,7 @@ impl Database {
         if filter.library_ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        let (where_clause, filter_binds) = catalog_filter_where_clause(
-            filter.library_ids,
-            filter.user_id,
-            filter.item_types,
-            filter.item_ids,
-            filter.years,
-            filter.is_played,
-            filter.is_favorite,
-        );
+        let (where_clause, filter_binds) = catalog_filter_where_clause(filter);
         let count_query = format!(
             "SELECT COUNT(*) FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -8756,14 +8748,16 @@ fn stored_item_image(row: sqlx::any::AnyRow) -> StoredItemImage {
 }
 
 fn catalog_filter_where_clause<'a>(
-    library_ids: &'a [String],
-    user_id: &'a str,
-    item_types: &'a [String],
-    item_ids: Option<&'a [String]>,
-    years: &'a [i64],
-    is_played: Option<bool>,
-    is_favorite: Option<bool>,
+    filter: &CatalogFilterQuery<'a>,
 ) -> (String, Vec<CatalogBind<'a>>) {
+    let library_ids = filter.library_ids;
+    let user_id = filter.user_id;
+    let item_types = filter.item_types;
+    let item_ids = filter.item_ids;
+    let media_source_ids = filter.media_source_ids;
+    let years = filter.years;
+    let is_played = filter.is_played;
+    let is_favorite = filter.is_favorite;
     let mut where_clause = format!(
         "WHERE mi.removed_at IS NULL
          AND mi.library_id IN ({})",
@@ -8776,22 +8770,44 @@ fn catalog_filter_where_clause<'a>(
         .iter()
         .map(|library_id| CatalogBind::Text(library_id.as_str()))
         .collect::<Vec<_>>();
-    match item_ids {
-        Some([]) => where_clause.push_str(" AND 1 = 0"),
-        Some(item_ids) => {
-            where_clause.push_str(&format!(
-                " AND mi.id IN ({})",
-                std::iter::repeat_n("?", item_ids.len())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            binds.extend(
-                item_ids
-                    .iter()
-                    .map(|item_id| CatalogBind::Text(item_id.as_str())),
-            );
+    let mut id_predicates = Vec::new();
+    if let Some(item_ids) = item_ids
+        && !item_ids.is_empty()
+    {
+        id_predicates.push(format!(
+            "mi.id IN ({})",
+            std::iter::repeat_n("?", item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        binds.extend(
+            item_ids
+                .iter()
+                .map(|item_id| CatalogBind::Text(item_id.as_str())),
+        );
+    }
+    if let Some(media_source_ids) = media_source_ids
+        && !media_source_ids.is_empty()
+    {
+        id_predicates.push(format!(
+            "EXISTS (SELECT 1 FROM media_sources ms_filter
+                     WHERE ms_filter.item_id = mi.id AND ms_filter.id IN ({}))",
+            std::iter::repeat_n("?", media_source_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        binds.extend(
+            media_source_ids
+                .iter()
+                .map(|media_source_id| CatalogBind::Text(media_source_id.as_str())),
+        );
+    }
+    if item_ids.is_some() || media_source_ids.is_some() {
+        if id_predicates.is_empty() {
+            where_clause.push_str(" AND 1 = 0");
+        } else {
+            where_clause.push_str(&format!(" AND ({})", id_predicates.join(" OR ")));
         }
-        None => {}
     }
     if !item_types.is_empty() {
         where_clause.push_str(&format!(
@@ -8907,6 +8923,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) user_id: &'a str,
     pub(crate) item_types: &'a [String],
     pub(crate) item_ids: Option<&'a [String]>,
+    pub(crate) media_source_ids: Option<&'a [String]>,
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
