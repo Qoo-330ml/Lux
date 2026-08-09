@@ -2,6 +2,12 @@ use std::{env, net::SocketAddr, path::PathBuf};
 
 use crate::network::proxy_url_from_env;
 
+pub mod database;
+
+pub use database::{
+    DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError, PostgresConnection,
+};
+
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8097";
 const DEFAULT_CONFIG_DIR: &str = "./config";
 

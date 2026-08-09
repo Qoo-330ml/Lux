@@ -37,6 +37,7 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["fs", "request-id", "trace", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
 
