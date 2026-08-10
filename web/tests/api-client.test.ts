@@ -566,6 +566,7 @@ describe("LuxApiClient", () => {
           concurrency: 3,
           existingInfoPolicy: "SKIP",
           writeSidecars: true,
+          schedule: "6h",
         });
         return new Response(JSON.stringify({ plugin: { id: "org.lux.strm-media-info" } }), { status: 200 });
       }
@@ -584,6 +585,7 @@ describe("LuxApiClient", () => {
       concurrency: 3,
       existingInfoPolicy: "SKIP",
       writeSidecars: true,
+      schedule: "6h",
     })).resolves.toEqual({ plugin: { id: "org.lux.strm-media-info" } });
     await expect(client.runAdminPlugin("org.lux.strm-media-info")).resolves.toEqual({
       operationId: "operation-1",

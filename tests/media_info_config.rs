@@ -64,7 +64,16 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(task, ("STRM_MEDIA_INFO".to_owned(), Some("24h".to_owned()), 0, "PLUGIN".to_owned(), Some(MEDIA_INFO_PLUGIN_ID.to_owned())));
+    assert_eq!(
+        task,
+        (
+            "STRM_MEDIA_INFO".to_owned(),
+            Some("24h".to_owned()),
+            0,
+            "PLUGIN".to_owned(),
+            Some(MEDIA_INFO_PLUGIN_ID.to_owned())
+        )
+    );
 
     let page = plugins.list_installed(0, 20).await?;
     let plugin = page
@@ -138,10 +147,12 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
         ("writeSidecars".to_owned(), json!(true)),
         ("schedule".to_owned(), json!("59s")),
     ]);
-    assert!(plugins
-        .update_dynamic_config(MEDIA_INFO_PLUGIN_ID, invalid)
-        .await
-        .is_err());
+    assert!(
+        plugins
+            .update_dynamic_config(MEDIA_INFO_PLUGIN_ID, invalid)
+            .await
+            .is_err()
+    );
     Ok(())
 }
 

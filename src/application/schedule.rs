@@ -46,7 +46,10 @@ mod tests {
     fn parses_supported_interval_units() {
         assert_eq!(parse_interval("1m").unwrap(), Duration::from_secs(60));
         assert_eq!(parse_interval("6h").unwrap(), Duration::from_secs(21_600));
-        assert_eq!(parse_interval("365d").unwrap(), Duration::from_secs(31_536_000));
+        assert_eq!(
+            parse_interval("365d").unwrap(),
+            Duration::from_secs(31_536_000)
+        );
     }
 
     #[test]

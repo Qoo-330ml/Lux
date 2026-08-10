@@ -565,10 +565,7 @@ impl PluginService {
         let configured = validate_config_values(&fields, &values).is_ok()
             && self.media_info_settings().await.is_ok();
         self.database
-            .upsert_strm_media_info_task(
-                &schedule,
-                enabled && configured,
-            )
+            .upsert_strm_media_info_task(&schedule, enabled && configured)
             .await?;
         Ok(())
     }
