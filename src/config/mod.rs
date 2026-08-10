@@ -1,8 +1,4 @@
-use std::{
-    env,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-};
+use std::{env, net::SocketAddr, path::PathBuf};
 
 use crate::network::proxy_url_from_env;
 
@@ -14,7 +10,6 @@ pub use database::{
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8097";
 const DEFAULT_CONFIG_DIR: &str = "./config";
-const CRON_TOKEN_FILE: &str = "cron-token";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -41,14 +36,6 @@ impl Config {
             config_dir,
         })
     }
-}
-
-pub fn cron_token_from_env_or_file(config_dir: &Path) -> Option<String> {
-    let token = env::var("LUX_CRON_TOKEN")
-        .ok()
-        .or_else(|| std::fs::read_to_string(config_dir.join(CRON_TOKEN_FILE)).ok())?;
-    let token = token.trim();
-    (token.len() >= 32).then(|| token.to_owned())
 }
 
 #[derive(Debug)]
