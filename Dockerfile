@@ -18,6 +18,22 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+
+# Keep dependency compilation in a layer that is independent of application
+# source changes. The real sources are copied below and reuse this target dir.
+RUN mkdir -p src/bin \
+    && printf 'pub fn placeholder() {}\n' > src/lib.rs \
+    && for bin in \
+         luxd \
+         lux-plugin-tmdb \
+         lux-plugin-strm-media-info \
+         lux-plugin-ip-hiofd \
+         lux-plugin-qoo-ip138 \
+         lux-plugin-pack; do \
+         printf 'fn main() {}\n' > "src/bin/${bin}.rs"; \
+       done \
+    && cargo build --release --locked --bins
+
 COPY src ./src
 COPY assets ./assets
 COPY migrations ./migrations
