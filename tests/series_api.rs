@@ -152,6 +152,76 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(seasons_body["Items"][0]["Type"], "Season");
     assert_eq!(seasons_body["Items"][0]["IsFolder"], true);
     assert_eq!(seasons_body["Items"][0]["ParentId"], series_id);
+    assert_eq!(seasons_body["Items"][0]["ChildCount"], 3);
+
+    let children = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={series_id}&IncludeItemTypes=Season&Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(children.status(), reqwest::StatusCode::OK);
+    let children_body: Value = children.json().await?;
+    assert_eq!(children_body["TotalRecordCount"], 1);
+    assert_eq!(children_body["Items"][0]["Id"], season_id);
+
+    let episodes_by_parent = client
+        .get(format!(
+            "{base_url}/Items?ParentId={series_id}&IncludeItemTypes=Episode&Recursive=true&Limit=10"
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(episodes_by_parent.status(), reqwest::StatusCode::OK);
+    let episodes_by_parent_body: Value = episodes_by_parent.json().await?;
+    assert_eq!(episodes_by_parent_body["TotalRecordCount"], 3);
+    assert_eq!(episodes_by_parent_body["Items"][0]["Type"], "Episode");
+
+    let grouped_latest = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/Latest?IncludeItemTypes=Episode&GroupItems=true&Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(grouped_latest.status(), reqwest::StatusCode::OK);
+    let grouped_latest_body: Value = grouped_latest.json().await?;
+    assert_eq!(grouped_latest_body.as_array().map(Vec::len), Some(1));
+    assert_eq!(grouped_latest_body[0]["Id"], series_id);
+    assert_eq!(grouped_latest_body[0]["Type"], "Series");
+    assert_eq!(grouped_latest_body[0]["ChildCount"], 3);
+
+    let default_latest = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/Latest?Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(default_latest.status(), reqwest::StatusCode::OK);
+    let default_latest_body: Value = default_latest.json().await?;
+    assert!(default_latest_body.as_array().is_some_and(|items| {
+        items
+            .iter()
+            .all(|item| matches!(item["Type"].as_str(), Some("Movie" | "Series")))
+    }));
+
+    let latest_children = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/Latest?ParentId={series_id}&IncludeItemTypes=Episode&GroupItems=false&Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(latest_children.status(), reqwest::StatusCode::OK);
+    let latest_children_body: Value = latest_children.json().await?;
+    assert_eq!(latest_children_body.as_array().map(Vec::len), Some(3));
+    assert_eq!(latest_children_body[0]["Type"], "Episode");
 
     let episodes = client
         .get(format!(

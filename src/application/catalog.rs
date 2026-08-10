@@ -444,9 +444,13 @@ impl CatalogService {
             .filter(|item| item.item_type == "SERIES" || item.item_type == "SEASON")
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
-        let counts = self.database.list_episode_counts(&item_ids).await?;
+        let episode_counts = self.database.list_episode_counts(&item_ids).await?;
+        let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
         for item in items {
-            item.episode_count = counts.get(&item.id).copied();
+            if let Some(detail) = details.get(&item.id) {
+                item.season_count = Some(detail.season_count);
+            }
+            item.episode_count = episode_counts.get(&item.id).copied();
         }
         Ok(())
     }

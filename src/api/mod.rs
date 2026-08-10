@@ -1,7 +1,7 @@
 pub mod lux;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Component, Path as FsPath, PathBuf},
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -1554,6 +1554,10 @@ struct EmbyItemsQuery {
     sort_order: Option<String>,
     #[serde(rename = "Fields", default)]
     fields: Option<String>,
+    #[serde(rename = "GroupItems", default)]
+    group_items: Option<bool>,
+    #[serde(rename = "Recursive", default)]
+    recursive: Option<bool>,
 }
 
 fn emby_fields_include(fields: Option<&str>, field: &str) -> bool {
@@ -1831,6 +1835,10 @@ async fn emby_user_latest(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
+    let group_items = query.group_items.unwrap_or(true);
+    if group_items && query.parent_id.is_none() && query.include_item_types.is_none() {
+        query.include_item_types = Some("Movie,Series".to_owned());
+    }
     query.sort_by = Some("DateCreated".to_owned());
     query.sort_order = Some("Descending".to_owned());
     let principal = AccessPrincipal::new(user.id, user.is_admin);
@@ -1838,10 +1846,135 @@ async fn emby_user_latest(
         Ok(page) => page,
         Err(status) => return status.into_response(),
     };
+    if group_items && emby_latest_groups_children(&query) {
+        let (grouped_page, group_counts) =
+            match emby_group_latest_page(&state, principal, page).await {
+                Ok(result) => result,
+                Err(status) => return status.into_response(),
+            };
+        let mut items = match emby_catalog_items_for_user(
+            &state,
+            &user_id,
+            &grouped_page,
+            query.fields.as_deref(),
+        )
+        .await
+        {
+            Ok(items) => items,
+            Err(status) => return status.into_response(),
+        };
+        for item in &mut items {
+            let Some(item_id) = item.get("Id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(child_count) = group_counts.get(item_id) else {
+                continue;
+            };
+            if let Value::Object(object) = item {
+                object.insert("ChildCount".to_owned(), json!(child_count));
+                object.insert("RecursiveItemCount".to_owned(), json!(child_count));
+            }
+        }
+        return Json(items).into_response();
+    }
     match emby_catalog_items_for_user(&state, &user_id, &page, query.fields.as_deref()).await {
         Ok(items) => Json(items).into_response(),
         Err(status) => status.into_response(),
     }
+}
+
+fn emby_latest_groups_children(query: &EmbyItemsQuery) -> bool {
+    query.include_item_types.as_deref().is_some_and(|types| {
+        types.split(',').any(|item_type| {
+            matches!(
+                item_type.trim().to_ascii_lowercase().as_str(),
+                "episode" | "season"
+            )
+        })
+    })
+}
+
+async fn emby_group_latest_page(
+    state: &AppState,
+    principal: AccessPrincipal,
+    page: CatalogPage,
+) -> Result<(CatalogPage, HashMap<String, i64>), StatusCode> {
+    enum LatestGroup {
+        Series(String),
+        Item(Box<CatalogItem>),
+    }
+
+    let mut groups = Vec::new();
+    let mut group_counts = HashMap::new();
+    let mut series_ids = Vec::new();
+    for item in page.items {
+        let Some(series_id) = item
+            .series_id
+            .as_deref()
+            .filter(|_| matches!(item.item_type.as_str(), "EPISODE" | "SEASON"))
+        else {
+            groups.push(LatestGroup::Item(Box::new(item)));
+            continue;
+        };
+        if !group_counts.contains_key(series_id) {
+            series_ids.push(series_id.to_owned());
+            groups.push(LatestGroup::Series(series_id.to_owned()));
+        }
+        *group_counts.entry(series_id.to_owned()).or_insert(0) += 1;
+    }
+
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut series_by_id = HashMap::new();
+    if !series_ids.is_empty() {
+        let filter = CatalogFilter {
+            item_types: vec!["SERIES".to_owned()],
+            item_ids: Some(series_ids.clone()),
+            media_source_ids: None,
+            years: Vec::new(),
+            is_played: None,
+            is_favorite: None,
+            sort_by: CatalogSort::Name,
+            descending: false,
+        };
+        let series_page = catalog
+            .list_all_items_filtered(principal, &filter, 0, series_ids.len() as i64)
+            .await
+            .map_err(emby_catalog_error_status)?;
+        series_by_id.extend(
+            series_page
+                .items
+                .into_iter()
+                .map(|item| (item.id.clone(), item)),
+        );
+    }
+
+    let mut items = Vec::with_capacity(groups.len());
+    let mut resolved_group_counts = HashMap::new();
+    for group in groups {
+        match group {
+            LatestGroup::Series(series_id) => {
+                if let Some(item) = series_by_id.remove(&series_id) {
+                    if let Some(count) = group_counts.get(&series_id) {
+                        resolved_group_counts.insert(series_id, *count);
+                    }
+                    items.push(item);
+                }
+            }
+            LatestGroup::Item(item) => items.push(*item),
+        }
+    }
+    let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    Ok((
+        CatalogPage {
+            items,
+            total,
+            offset: page.offset,
+            limit: page.limit,
+        },
+        resolved_group_counts,
+    ))
 }
 
 async fn emby_user_next_up(
@@ -2169,18 +2302,32 @@ async fn emby_catalog_page_from_query(
     let filter = catalog_filter_from_emby(query);
     let page = match query.parent_id.as_deref() {
         Some(parent_id) => {
-            let Ok(parent_id) = parent_id.parse::<crate::domain::ids::LibraryId>() else {
-                return Err(StatusCode::BAD_REQUEST);
-            };
-            catalog
-                .list_library_items_filtered(
-                    principal,
-                    &parent_id.to_string(),
-                    &filter,
-                    offset,
-                    limit,
+            if let Ok(library_id) = parent_id.parse::<crate::domain::ids::LibraryId>() {
+                match catalog
+                    .list_library_items_filtered(
+                        principal,
+                        &library_id.to_string(),
+                        &filter,
+                        offset,
+                        limit,
+                    )
+                    .await
+                {
+                    Ok(page) => Ok(page),
+                    Err(CatalogError::LibraryNotFound) => {
+                        emby_catalog_page_for_item_parent(
+                            catalog, principal, parent_id, query, offset, limit,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                emby_catalog_page_for_item_parent(
+                    catalog, principal, parent_id, query, offset, limit,
                 )
                 .await
+            }
         }
         None => {
             catalog
@@ -2190,9 +2337,60 @@ async fn emby_catalog_page_from_query(
     };
     match page {
         Ok(page) => Ok(page),
-        Err(CatalogError::LibraryNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(CatalogError::AccessDenied) => Err(StatusCode::FORBIDDEN),
-        Err(CatalogError::Storage(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(error) => Err(emby_catalog_error_status(error)),
+    }
+}
+
+async fn emby_catalog_page_for_item_parent(
+    catalog: &CatalogService,
+    principal: AccessPrincipal,
+    parent_id: &str,
+    query: &EmbyItemsQuery,
+    offset: i64,
+    limit: i64,
+) -> Result<CatalogPage, CatalogError> {
+    let Some(parent) = catalog.find_item(principal, parent_id).await? else {
+        return Err(CatalogError::LibraryNotFound);
+    };
+    let requested_types = catalog_filter_from_emby(query).item_types;
+    let requested_type = requested_types.first().map(String::as_str);
+    if parent.item_type == "SERIES"
+        && requested_type == Some("EPISODE")
+        && (query.recursive.unwrap_or(false) || query.group_items == Some(false))
+    {
+        return catalog
+            .list_series_episodes(
+                principal,
+                parent_id,
+                query.season_id.as_deref(),
+                offset,
+                limit,
+            )
+            .await;
+    }
+    let child_type = match (parent.item_type.as_str(), requested_type) {
+        (_, Some(item_type)) => item_type,
+        ("SERIES", _) => "SEASON",
+        ("SEASON", _) => "EPISODE",
+        _ => {
+            return Ok(CatalogPage {
+                items: Vec::new(),
+                total: 0,
+                offset,
+                limit,
+            });
+        }
+    };
+    catalog
+        .list_children(principal, parent_id, child_type, offset, limit)
+        .await
+}
+
+fn emby_catalog_error_status(error: CatalogError) -> StatusCode {
+    match error {
+        CatalogError::LibraryNotFound => StatusCode::NOT_FOUND,
+        CatalogError::AccessDenied => StatusCode::FORBIDDEN,
+        CatalogError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -3096,6 +3294,15 @@ fn emby_catalog_item_json_with_state(
         image_tags.insert("Thumb".to_owned(), json!(tag));
     }
     let parent_id = item.parent_id.as_deref().unwrap_or(&item.library_id);
+    let child_count = match item.item_type.as_str() {
+        "SERIES" => item.season_count,
+        "SEASON" => item.episode_count,
+        _ => None,
+    };
+    let recursive_item_count = match item.item_type.as_str() {
+        "SERIES" | "SEASON" => item.episode_count,
+        _ => None,
+    };
     let mut value = json!({
         "Name": item.title,
         "OriginalTitle": item.original_title,
@@ -3123,6 +3330,8 @@ fn emby_catalog_item_json_with_state(
             .as_ref()
             .map(|tag| json!([tag]))
             .unwrap_or_else(|| json!([])),
+        "ChildCount": child_count,
+        "RecursiveItemCount": recursive_item_count,
         "UserData": {
             "PlaybackPositionTicks": user_state.map(|state| state.position_ticks).unwrap_or_default(),
             "PlayedPercentage": played_percentage,

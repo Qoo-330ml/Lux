@@ -138,12 +138,12 @@ Lux 电影查询要求有效 Web session：
 - `GET /api/v1/auth/sessions`、`DELETE /api/v1/auth/sessions/{sessionId}`：当前用户查看并撤销其他 Web 会话；删除要求 CSRF，当前会话必须通过退出登录撤销。
 - `GET|HEAD /api/v1/items/{itemId}/images/{type}`、`/{type}/{index}`：读取本地 poster/fanart，支持 ETag 和 `If-None-Match`。
 
-Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
+Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 - `GET /Users/{userId}/Views`：返回电影媒体库视图。
-- `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`StartIndex`、`Limit` 和 `IncludeItemTypes=Movie`，默认从 0 开始、每页 50 条，单页上限 100。
+- `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`Recursive`、`StartIndex`、`Limit` 和 `IncludeItemTypes=Movie`，`ParentId` 可指向媒体库、剧集或季度；默认从 0 开始、每页 50 条，单页上限 100。
 - `GET /Users/{userId}/Items`、`GET /Items`：另支持 `IsPlayed`、`IsFavorite`、`Years`、`SortBy` 和 `SortOrder`，筛选后再分页。
-- `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影详情 DTO；`UserData` 包含 `PlaybackPositionTicks`、`PlayedPercentage`、`Played`、`IsFavorite` 和 `PlayCount`。
+- `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影、剧集和季度详情 DTO；文件夹类型返回 `ChildCount`/`RecursiveItemCount`，`UserData` 包含 `PlaybackPositionTicks`、`PlayedPercentage`、`Played`、`IsFavorite` 和 `PlayCount`。
 - `GET /Shows/{seriesId}/Seasons`：按用户媒体库权限返回季度。
 - `GET /Shows/{seriesId}/Episodes?SeasonId={seasonId}&StartIndex=0&Limit=50`：返回剧集，可省略 `SeasonId` 获取整部剧集，支持分页。
 - `GET /Users/{userId}/Items/NextUp`：按该用户的播放状态返回未看完单集。
@@ -151,7 +151,7 @@ Emby 电影查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET /api/danmu/{itemId}`：返回旁车 XML 的兼容信息和读取地址；支持 `option=Refresh`、`option=GetJsonById` 别名，但不会在客户端请求中访问上游。
 - `GET /api/danmu/{itemId}/raw`：读取同目录同 basename 的有效 `.xml` 旁车，返回 `application/xml; charset=utf-8`；需要 `X-Emby-Token` 或 `api_key`，并执行媒体库 ACL。
 - `GET /Users/{userId}/Items/Resume`：按用户播放位置、已看状态和服务器 Resume 阈值返回继续观看列表。
-- `GET /Users/{userId}/Items/Latest`：按最近添加顺序返回当前用户可见媒体。
+- `GET /Users/{userId}/Items/Latest`：按最近添加顺序返回当前用户可见媒体；`GroupItems` 默认开启，剧集/季度结果按剧集聚合并返回 `ChildCount`，传 `GroupItems=false` 可通过 `ParentId` 获取剧集单集。
 - `GET /Search/Hints?SearchTerm=关键词&StartIndex=0&Limit=50`：返回 Emby 搜索提示，结果执行当前用户 ACL。
 - `GET|HEAD /api/v1/items/{itemId}/subtitles/{streamIndex}`：读取指定外挂字幕流；需要 Web session，并执行媒体库 ACL。
 - `GET|HEAD /api/v1/items/{itemId}/stream`：读取默认本地媒体源；可通过 `sourceId` 选择媒体源，需要 Web session 和媒体库 ACL。
