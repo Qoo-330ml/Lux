@@ -19,6 +19,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_XML_EVENTS: usize = 20_000;
+const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaProbeResult {
@@ -771,113 +772,126 @@ impl MediaProbeService {
         &self,
         library_id: LibraryId,
     ) -> Result<ProbeReport, ProbeServiceError> {
-        let sources = self
-            .database
-            .list_media_sources_for_library(&library_id.to_string())
-            .await?;
         let mut report = ProbeReport::default();
-        for source in sources {
-            if source.probe_status != "PENDING" {
-                report.skipped += 1;
-                continue;
-            }
-            report.attempted += 1;
-            let path = safe_media_path(&source.root_path, &source.relative_path)?;
-            match self.probe_source(&path).await {
-                Ok(Some(result)) => {
-                    let detail_json = result
-                        .streams
-                        .iter()
-                        .map(|stream| {
-                            if stream.details.is_empty() {
-                                None
-                            } else {
-                                serde_json::to_string(&stream.details).ok()
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let streams = result
-                        .streams
-                        .iter()
-                        .zip(detail_json.iter())
-                        .map(|(stream, details)| MediaStreamUpdate {
-                            stream_index: stream.stream_index,
-                            stream_type: stream.stream_type.as_str(),
-                            codec: stream.codec.as_deref(),
-                            language: stream.language.as_deref(),
-                            title: stream.title.as_deref(),
-                            details_json: details.as_deref(),
-                            external_path: None,
-                            is_external: false,
-                            is_default: stream.is_default,
-                            is_forced: stream.is_forced,
-                        })
-                        .collect::<Vec<_>>();
-                    let external_subtitles =
-                        discover_external_subtitles(&path, &source.root_path).await;
-                    let next_stream_index = result
-                        .streams
-                        .iter()
-                        .map(|stream| stream.stream_index)
-                        .max()
-                        .unwrap_or(-1)
-                        .saturating_add(1);
-                    let mut streams = streams;
-                    for (offset, subtitle) in external_subtitles.iter().enumerate() {
-                        streams.push(MediaStreamUpdate {
-                            stream_index: next_stream_index
-                                .saturating_add(i64::try_from(offset).unwrap_or(i64::MAX)),
-                            stream_type: "SUBTITLE",
-                            codec: subtitle.codec.as_deref(),
-                            language: subtitle.language.as_deref(),
-                            title: subtitle.title.as_deref(),
-                            details_json: None,
-                            external_path: Some(subtitle.relative_path.as_str()),
-                            is_external: true,
-                            is_default: subtitle.is_default,
-                            is_forced: subtitle.is_forced,
-                        });
+        let library_id = library_id.to_string();
+        let mut offset = 0_i64;
+        loop {
+            let sources = self
+                .database
+                .list_media_sources_for_library_page(
+                    &library_id,
+                    LIBRARY_SOURCE_PAGE_SIZE as i64,
+                    offset,
+                )
+                .await?;
+            let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
+            for source in sources {
+                if source.probe_status != "PENDING" {
+                    report.skipped += 1;
+                    continue;
+                }
+                report.attempted += 1;
+                let path = safe_media_path(&source.root_path, &source.relative_path)?;
+                match self.probe_source(&path).await {
+                    Ok(Some(result)) => {
+                        let detail_json = result
+                            .streams
+                            .iter()
+                            .map(|stream| {
+                                if stream.details.is_empty() {
+                                    None
+                                } else {
+                                    serde_json::to_string(&stream.details).ok()
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let streams = result
+                            .streams
+                            .iter()
+                            .zip(detail_json.iter())
+                            .map(|(stream, details)| MediaStreamUpdate {
+                                stream_index: stream.stream_index,
+                                stream_type: stream.stream_type.as_str(),
+                                codec: stream.codec.as_deref(),
+                                language: stream.language.as_deref(),
+                                title: stream.title.as_deref(),
+                                details_json: details.as_deref(),
+                                external_path: None,
+                                is_external: false,
+                                is_default: stream.is_default,
+                                is_forced: stream.is_forced,
+                            })
+                            .collect::<Vec<_>>();
+                        let external_subtitles =
+                            discover_external_subtitles(&path, &source.root_path).await;
+                        let next_stream_index = result
+                            .streams
+                            .iter()
+                            .map(|stream| stream.stream_index)
+                            .max()
+                            .unwrap_or(-1)
+                            .saturating_add(1);
+                        let mut streams = streams;
+                        for (offset, subtitle) in external_subtitles.iter().enumerate() {
+                            streams.push(MediaStreamUpdate {
+                                stream_index: next_stream_index
+                                    .saturating_add(i64::try_from(offset).unwrap_or(i64::MAX)),
+                                stream_type: "SUBTITLE",
+                                codec: subtitle.codec.as_deref(),
+                                language: subtitle.language.as_deref(),
+                                title: subtitle.title.as_deref(),
+                                details_json: None,
+                                external_path: Some(subtitle.relative_path.as_str()),
+                                is_external: true,
+                                is_default: subtitle.is_default,
+                                is_forced: subtitle.is_forced,
+                            });
+                        }
+                        self.database
+                            .save_media_probe(MediaProbeUpdate {
+                                source_id: &source.source_id,
+                                container: result.container.as_deref(),
+                                source_size: result.source_size,
+                                duration_ticks: result.duration_ticks,
+                                bitrate: result.bitrate,
+                                streams: &streams,
+                            })
+                            .await?;
+                        report.ready += 1;
                     }
-                    self.database
-                        .save_media_probe(MediaProbeUpdate {
-                            source_id: &source.source_id,
-                            container: result.container.as_deref(),
-                            source_size: result.source_size,
-                            duration_ticks: result.duration_ticks,
-                            bitrate: result.bitrate,
-                            streams: &streams,
-                        })
-                        .await?;
-                    report.ready += 1;
-                }
-                Ok(None) => {
-                    self.database
-                        .save_media_probe(MediaProbeUpdate {
-                            source_id: &source.source_id,
-                            container: None,
-                            source_size: None,
-                            duration_ticks: None,
-                            bitrate: None,
-                            streams: &[],
-                        })
-                        .await?;
-                    report.ready += 1;
-                }
-                Err(error) => {
-                    if matches!(error, ProbeError::Timeout) {
-                        report.timed_out += 1;
-                    } else {
-                        report.failed += 1;
+                    Ok(None) => {
+                        self.database
+                            .save_media_probe(MediaProbeUpdate {
+                                source_id: &source.source_id,
+                                container: None,
+                                source_size: None,
+                                duration_ticks: None,
+                                bitrate: None,
+                                streams: &[],
+                            })
+                            .await?;
+                        report.ready += 1;
                     }
-                    self.database
-                        .mark_media_probe_failed(
-                            &source.source_id,
-                            error.failure_status(),
-                            &error.to_string(),
-                        )
-                        .await?;
+                    Err(error) => {
+                        if matches!(error, ProbeError::Timeout) {
+                            report.timed_out += 1;
+                        } else {
+                            report.failed += 1;
+                        }
+                        self.database
+                            .mark_media_probe_failed(
+                                &source.source_id,
+                                error.failure_status(),
+                                &error.to_string(),
+                            )
+                            .await?;
+                    }
                 }
             }
+            if last_page {
+                break;
+            }
+            offset = offset.saturating_add(LIBRARY_SOURCE_PAGE_SIZE as i64);
         }
         Ok(report)
     }

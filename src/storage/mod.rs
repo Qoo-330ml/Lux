@@ -14,6 +14,7 @@ static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
 pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
+const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 
 fn database_flag(value: bool) -> i64 {
     i64::from(value)
@@ -6501,9 +6502,11 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_media_sources_for_library(
+    pub(crate) async fn list_media_sources_for_library_page(
         &self,
         library_id: &str,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
         self.query(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
@@ -6514,9 +6517,12 @@ impl Database {
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.library_id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
-             ORDER BY ms.item_id, fe.relative_path",
+             ORDER BY ms.item_id, fe.relative_path
+             LIMIT ? OFFSET ?",
         )
         .bind(library_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
@@ -9529,7 +9535,58 @@ impl std::error::Error for StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+    use crate::{
+        application::{libraries::LibraryService, scanner::LibraryScanner},
+        config::Config,
+        library::LibraryKind,
+    };
+
+    #[tokio::test]
+    async fn media_source_library_page_respects_limit_and_offset() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let root_path = temp_dir.path().join("media");
+        tokio::fs::create_dir_all(&root_path)
+            .await
+            .expect("media root");
+        tokio::fs::write(root_path.join("First.Movie.2024.mkv"), b"first")
+            .await
+            .expect("first movie");
+        tokio::fs::write(root_path.join("Second.Movie.2024.mkv"), b"second")
+            .await
+            .expect("second movie");
+        libraries
+            .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+            .await
+            .expect("library root");
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await
+            .expect("scan");
+
+        let first_page = database
+            .list_media_sources_for_library_page(&library.id.to_string(), 1, 0)
+            .await
+            .expect("first page");
+        let second_page = database
+            .list_media_sources_for_library_page(&library.id.to_string(), 1, 1)
+            .await
+            .expect("second page");
+
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(second_page.len(), 1);
+        assert_ne!(first_page[0].source_id, second_page[0].source_id);
+        database.close().await;
+    }
 
     #[tokio::test]
     async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
