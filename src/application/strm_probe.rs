@@ -28,6 +28,7 @@ use crate::{
 
 const MAX_LIBRARY_COUNT: usize = 64;
 const MAX_CONCURRENCY: i64 = 64;
+const SOURCE_PAGE_SIZE: i64 = 500;
 const JOB_ERROR: &str = "one or more STRM media sources failed";
 
 #[derive(Clone)]
@@ -220,10 +221,6 @@ impl StrmProbeService {
         let operation_semaphore = self
             .operation_semaphore(&job.operation_id, job.concurrency)
             .await;
-        let sources = self
-            .database
-            .list_strm_media_sources_for_library(&job.library_id)
-            .await?;
         let mut pending: JoinSet<SourceOutcome> = JoinSet::new();
         // A restarted RUNNING job re-enumerates sources. READY sources can be
         // skipped by probe_source, while failed/incomplete sources are retried;
@@ -231,36 +228,55 @@ impl StrmProbeService {
         let mut processed = 0_i64;
         let mut failed = 0_usize;
         let mut cancelled = false;
+        let mut after_source_id = None::<String>;
 
-        for source in sources {
-            if self
+        loop {
+            let sources = self
                 .database
-                .strm_probe_job_cancel_requested(&job.id)
-                .await?
-            {
-                cancelled = true;
+                .list_strm_media_sources_for_library_page(
+                    &job.library_id,
+                    after_source_id.as_deref(),
+                    SOURCE_PAGE_SIZE,
+                )
+                .await?;
+            let Some(last_source_id) = sources.last().map(|source| source.source_id.clone()) else {
+                break;
+            };
+            after_source_id = Some(last_source_id);
+            for source in sources {
+                if self
+                    .database
+                    .strm_probe_job_cancel_requested(&job.id)
+                    .await?
+                {
+                    cancelled = true;
+                    break;
+                }
+                while pending.len() >= concurrency {
+                    if let Some(result) = pending.join_next().await {
+                        let outcome = result.map_err(|_| StrmProbeError::WorkerFailed)?;
+                        let next_cursor = outcome.source_id.clone();
+                        failed += self.finish_source(&job, outcome).await?;
+                        processed += 1;
+                        self.database
+                            .update_strm_probe_job_progress(
+                                &job.id,
+                                Some(next_cursor.as_str()),
+                                processed,
+                            )
+                            .await?;
+                    }
+                }
+                let service = self.clone();
+                let semaphore = operation_semaphore.clone();
+                let include_ready = job.include_ready;
+                pending.spawn(async move {
+                    service.probe_source(source, semaphore, include_ready).await
+                });
+            }
+            if cancelled {
                 break;
             }
-            while pending.len() >= concurrency {
-                if let Some(result) = pending.join_next().await {
-                    let outcome = result.map_err(|_| StrmProbeError::WorkerFailed)?;
-                    let next_cursor = outcome.source_id.clone();
-                    failed += self.finish_source(&job, outcome).await?;
-                    processed += 1;
-                    self.database
-                        .update_strm_probe_job_progress(
-                            &job.id,
-                            Some(next_cursor.as_str()),
-                            processed,
-                        )
-                        .await?;
-                }
-            }
-            let service = self.clone();
-            let semaphore = operation_semaphore.clone();
-            let include_ready = job.include_ready;
-            pending
-                .spawn(async move { service.probe_source(source, semaphore, include_ready).await });
         }
         while let Some(result) = pending.join_next().await {
             let outcome = result.map_err(|_| StrmProbeError::WorkerFailed)?;

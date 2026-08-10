@@ -7243,25 +7243,49 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_strm_media_sources_for_library(
+    pub(crate) async fn list_strm_media_sources_for_library_page(
         &self,
         library_id: &str,
+        after_source_id: Option<&str>,
+        limit: i64,
     ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
-        self.query(
-            "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
-                    lr.canonical_path AS root_path, fe.relative_path
-             FROM media_sources ms
-             JOIN media_items mi ON mi.id = ms.item_id
-             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-             JOIN library_roots lr ON lr.id = fe.library_root_id
-             WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
-               AND fe.is_missing = 0
-             ORDER BY ms.id, fe.relative_path",
-        )
-        .bind(library_id)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
+        let rows = if let Some(after_source_id) = after_source_id {
+            self.query(
+                "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
+                        lr.canonical_path AS root_path, fe.relative_path
+                 FROM media_sources ms
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
+                   AND fe.is_missing = 0 AND ms.id > ?
+                 ORDER BY ms.id, fe.relative_path
+                 LIMIT ?",
+            )
+            .bind(library_id)
+            .bind(after_source_id)
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query(
+                "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
+                        lr.canonical_path AS root_path, fe.relative_path
+                 FROM media_sources ms
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
+                   AND fe.is_missing = 0
+                 ORDER BY ms.id, fe.relative_path
+                 LIMIT ?",
+            )
+            .bind(library_id)
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map(|rows| {
             rows.into_iter()
                 .map(|row| StoredStrmMediaSource {
                     source_id: row.get("source_id"),
@@ -9725,6 +9749,18 @@ mod tests {
         tokio::fs::write(root_path.join("Second.Movie.2024.mkv"), b"second")
             .await
             .expect("second movie");
+        tokio::fs::write(
+            root_path.join("First.Remote.2024.strm"),
+            b"https://media.example.invalid/first.mkv",
+        )
+        .await
+        .expect("first STRM");
+        tokio::fs::write(
+            root_path.join("Second.Remote.2024.strm"),
+            b"https://media.example.invalid/second.mkv",
+        )
+        .await
+        .expect("second STRM");
         libraries
             .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
             .await
@@ -9777,6 +9813,34 @@ mod tests {
                 .len(),
             1
         );
+        let first_strm_page = database
+            .list_strm_media_sources_for_library_page(&library.id.to_string(), None, 1)
+            .await
+            .expect("first STRM page");
+        let second_strm_page = database
+            .list_strm_media_sources_for_library_page(
+                &library.id.to_string(),
+                first_strm_page
+                    .first()
+                    .map(|source| source.source_id.as_str()),
+                1,
+            )
+            .await
+            .expect("second STRM page");
+        let final_strm_page = database
+            .list_strm_media_sources_for_library_page(
+                &library.id.to_string(),
+                second_strm_page
+                    .first()
+                    .map(|source| source.source_id.as_str()),
+                1,
+            )
+            .await
+            .expect("final STRM page");
+        assert_eq!(first_strm_page.len(), 1);
+        assert_eq!(second_strm_page.len(), 1);
+        assert_ne!(first_strm_page[0].source_id, second_strm_page[0].source_id);
+        assert!(final_strm_page.is_empty());
         database.close().await;
     }
 
