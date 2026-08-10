@@ -23,8 +23,8 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 # source changes. The real sources are copied below and reuse this target dir.
 RUN mkdir -p src/bin \
     && printf 'pub fn placeholder() {}\n' > src/lib.rs \
+    && printf 'fn main() {}\n' > src/main.rs \
     && for bin in \
-         luxd \
          lux-plugin-tmdb \
          lux-plugin-strm-media-info \
          lux-plugin-ip-hiofd \
