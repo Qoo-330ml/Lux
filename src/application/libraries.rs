@@ -15,7 +15,6 @@ use crate::{
 const DEFAULT_SCAN_CONCURRENCY: i64 = 2;
 const DEFAULT_PROBE_CONCURRENCY: i64 = 1;
 const MAX_LIBRARY_CONCURRENCY: i64 = 64;
-const MAX_SCHEDULE_LENGTH: usize = 128;
 
 #[derive(Clone)]
 pub struct LibraryService {
@@ -59,8 +58,6 @@ impl LibraryService {
                 scraper_id: scraper_id.as_deref(),
                 realtime_watch_enabled: true,
                 realtime_metadata_auto_match_enabled,
-                reconciliation_schedule: None,
-                metadata_schedule: None,
                 scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
                 probe_concurrency: DEFAULT_PROBE_CONCURRENCY,
             })
@@ -110,8 +107,6 @@ impl LibraryService {
     ) -> Result<LibraryView, LibraryServiceError> {
         validate_concurrency(settings.scan_concurrency)?;
         validate_concurrency(settings.probe_concurrency)?;
-        let reconciliation_schedule = normalize_schedule(settings.reconciliation_schedule)?;
-        let metadata_schedule = normalize_schedule(settings.metadata_schedule)?;
         let name = settings
             .name
             .as_deref()
@@ -131,10 +126,8 @@ impl LibraryService {
                     realtime_watch_enabled: settings.realtime_watch_enabled.map(|_| true),
                     realtime_metadata_auto_match_enabled: settings
                         .realtime_metadata_auto_match_enabled,
-                    reconciliation_schedule: reconciliation_schedule
-                        .as_ref()
-                        .map(|value| value.as_deref()),
-                    metadata_schedule: metadata_schedule.as_ref().map(|value| value.as_deref()),
+                    reconciliation_schedule: Some(None),
+                    metadata_schedule: Some(None),
                     scraper_id: scraper_id.as_ref().map(|value| value.as_deref()),
                     media_strategy_json: settings
                         .media_strategy_json
@@ -421,25 +414,6 @@ fn normalize_scraper_patch(
         Some(None) => Ok(Some(None)),
         Some(Some(value)) => normalize_scraper_id(Some(&value)).map(Some),
     }
-}
-
-fn normalize_schedule(
-    value: Option<Option<String>>,
-) -> Result<Option<Option<String>>, LibraryServiceError> {
-    value
-        .map(|schedule| {
-            schedule
-                .map(|schedule| {
-                    let schedule = schedule.trim().to_owned();
-                    if schedule.is_empty() || schedule.chars().count() > MAX_SCHEDULE_LENGTH {
-                        Err(LibraryServiceError::InvalidSchedule)
-                    } else {
-                        Ok(schedule)
-                    }
-                })
-                .transpose()
-        })
-        .transpose()
 }
 
 impl From<RootPathError> for LibraryServiceError {

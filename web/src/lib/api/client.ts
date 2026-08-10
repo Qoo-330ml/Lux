@@ -526,7 +526,6 @@ export class LuxApiClient {
     ownerType: "GLOBAL" | "LIBRARY";
     ownerId: string;
     taskType: string;
-    schedule: string | null;
     isEnabled?: boolean;
   }) {
     return this.request<{ scheduledTask: AdminScheduledTask }>(

@@ -302,14 +302,12 @@ describe("AdminPluginsPage plugin cards", () => {
         concurrency: 2,
         existingInfoPolicy: "SKIP",
         writeSidecars: true,
-        schedule: "6h",
       },
       configFields: [
         { key: "libraryIds", label: "媒体库", type: "select", required: true, sensitive: false, multiple: true, optionsSource: "media-libraries", options: [{ value: "library-1", label: "电影库" }, { value: "library-2", label: "剧集库" }] },
         { key: "concurrency", label: "并发数", type: "number", required: true, sensitive: false, defaultValue: 2, minimum: 1, maximum: 64 },
         { key: "existingInfoPolicy", label: "已有媒体信息处理方式", type: "select", required: false, sensitive: false, defaultValue: "SKIP", options: [{ value: "SKIP", label: "跳过已有媒体信息" }, { value: "OVERWRITE", label: "覆盖已有媒体信息" }] },
         { key: "writeSidecars", label: "写入 mediainfo.json", type: "toggle", required: false, sensitive: false },
-        { key: "schedule", label: "执行间隔", type: "text", required: true, sensitive: false, defaultValue: "24h" },
       ],
     };
     await renderPage();
@@ -334,7 +332,6 @@ describe("AdminPluginsPage plugin cards", () => {
       concurrency: 2,
       existingInfoPolicy: "SKIP",
       writeSidecars: true,
-      schedule: "6h",
     }));
     await act(async () => {
       container.querySelector<HTMLButtonElement>('[aria-label="开始提取"]')?.click();

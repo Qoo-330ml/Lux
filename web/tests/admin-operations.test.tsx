@@ -135,7 +135,6 @@ describe("AdminOperationsPage", () => {
         ownerName: "电影库",
         taskType: "RECONCILIATION_SCAN",
         name: "全量校验媒体库",
-        schedule: "interval:1h",
         isEnabled: true,
       },
     });
@@ -147,7 +146,7 @@ describe("AdminOperationsPage", () => {
         ownerName: "电影库",
         taskType: "RECONCILIATION_SCAN",
         name: "全量校验媒体库",
-        description: "按计划校验媒体库索引与文件系统的一致性。",
+        description: "由宿主机 crontab 入队后校验媒体库索引与文件系统的一致性。",
         sourceType: "SYSTEM",
         schedule: null,
         isEnabled: false,
@@ -162,17 +161,13 @@ describe("AdminOperationsPage", () => {
       await vi.waitFor(() => expect(container.textContent).toContain("全量校验媒体库"));
     });
     expect(container.textContent).toContain("系统注册");
-    expect(container.textContent).toContain("未配置计划");
+    expect(container.textContent).toContain("宿主机 crontab 管理执行时间");
     expect(container.textContent).not.toContain("新增任务");
 
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑全量校验媒体库"]')?.click());
-    const input = container.querySelector<HTMLInputElement>("input[id^='schedule-LIBRARY']");
     const enabled = container.querySelector<HTMLInputElement>("input[id^='enabled-LIBRARY']");
-    expect(input).not.toBeNull();
     expect(enabled).not.toBeNull();
     act(() => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "interval:1h");
-      input?.dispatchEvent(new Event("input", { bubbles: true }));
       enabled?.click();
     });
     await act(async () => {
@@ -181,7 +176,6 @@ describe("AdminOperationsPage", () => {
         ownerType: "LIBRARY",
         ownerId: "library-1",
         taskType: "RECONCILIATION_SCAN",
-        schedule: "interval:1h",
         isEnabled: true,
       }));
     });
@@ -224,7 +218,7 @@ describe("AdminOperationsPage", () => {
           ownerName: "电影库",
           taskType: "RECONCILIATION_SCAN",
           name: "全量校验媒体库",
-          description: "按计划校验媒体库索引与文件系统的一致性。",
+          description: "由宿主机 crontab 入队后校验媒体库索引与文件系统的一致性。",
           sourceType: "SYSTEM",
           schedule: null,
           isEnabled: false,

@@ -255,14 +255,6 @@ fn manifest_value(
                     "type": "toggle",
                     "defaultValue": true
                 },
-                {
-                    "key": "schedule",
-                    "label": "执行间隔",
-                    "type": "text",
-                    "required": true,
-                    "defaultValue": "24h",
-                    "description": "后台扫描间隔，支持 1m 到 365d，例如 6h 或 24h。"
-                }
             ],
             "permissions": {
                 "network": ["media-source"],

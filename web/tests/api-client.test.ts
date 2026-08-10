@@ -260,7 +260,7 @@ describe("LuxApiClient", () => {
     );
   });
 
-  it("lists and updates scheduled task configurations with CSRF protection", async () => {
+  it("lists and updates scheduled task enablement with CSRF protection", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
       if (!init?.method) {
@@ -273,7 +273,6 @@ describe("LuxApiClient", () => {
         ownerType: "LIBRARY",
         ownerId: "library-1",
         taskType: "RECONCILIATION_SCAN",
-        schedule: "interval:1h",
         isEnabled: true,
       });
       expect((init.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
@@ -290,7 +289,6 @@ describe("LuxApiClient", () => {
       ownerType: "LIBRARY",
       ownerId: "library-1",
       taskType: "RECONCILIATION_SCAN",
-      schedule: "interval:1h",
       isEnabled: true,
     })).resolves.toEqual({ scheduledTask: { ownerId: "library-1" } });
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -566,7 +564,6 @@ describe("LuxApiClient", () => {
           concurrency: 3,
           existingInfoPolicy: "SKIP",
           writeSidecars: true,
-          schedule: "6h",
         });
         return new Response(JSON.stringify({ plugin: { id: "org.lux.strm-media-info" } }), { status: 200 });
       }
@@ -585,7 +582,6 @@ describe("LuxApiClient", () => {
       concurrency: 3,
       existingInfoPolicy: "SKIP",
       writeSidecars: true,
-      schedule: "6h",
     })).resolves.toEqual({ plugin: { id: "org.lux.strm-media-info" } });
     await expect(client.runAdminPlugin("org.lux.strm-media-info")).resolves.toEqual({
       operationId: "operation-1",

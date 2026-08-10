@@ -565,7 +565,7 @@ async fn non_admin_cannot_manage_libraries() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
-async fn admin_can_update_independent_library_schedules_without_restart()
+async fn admin_can_update_independent_library_settings_without_internal_schedules()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -717,8 +717,8 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         .iter()
         .find(|library| library["id"] == library_ids[1])
         .ok_or("missing second library")?;
-    assert_eq!(first["reconciliationSchedule"], "0 3 * * *");
-    assert_eq!(first["metadataSchedule"], "interval:5m");
+    assert_eq!(first["reconciliationSchedule"], Value::Null);
+    assert_eq!(first["metadataSchedule"], Value::Null);
     assert_eq!(first["scanConcurrency"], 4);
     assert_eq!(first["probeConcurrency"], 3);
     assert_eq!(second["reconciliationSchedule"], Value::Null);
@@ -754,8 +754,8 @@ async fn admin_can_update_independent_library_schedules_without_restart()
             .any(|(owner, task, schedule, enabled, _)| {
                 owner == &library_ids[0]
                     && task == "METADATA_PARSE"
-                    && schedule.as_deref() == Some("interval:5m")
-                    && *enabled == 1
+                    && schedule.is_none()
+                    && *enabled == 0
             })
     );
     assert!(
@@ -764,8 +764,8 @@ async fn admin_can_update_independent_library_schedules_without_restart()
             .any(|(owner, task, schedule, enabled, _)| {
                 owner == &library_ids[0]
                     && task == "RECONCILIATION_SCAN"
-                    && schedule.as_deref() == Some("0 3 * * *")
-                    && *enabled == 1
+                    && schedule.is_none()
+                    && *enabled == 0
             })
     );
     assert!(scheduled_tasks
@@ -826,7 +826,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
 }
 
 #[tokio::test]
-async fn admin_can_list_and_update_library_schedules_from_operations_page()
+async fn admin_can_list_and_update_library_tasks_from_operations_page()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -928,8 +928,8 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .ok_or("missing reconciliation schedule")?;
     assert_eq!(reconciliation["ownerType"], "LIBRARY");
     assert_eq!(reconciliation["ownerName"], "Movies");
-    assert_eq!(reconciliation["schedule"], "interval:6h");
-    assert_eq!(reconciliation["isEnabled"], true);
+    assert_eq!(reconciliation["schedule"], Value::Null);
+    assert_eq!(reconciliation["isEnabled"], false);
 
     let missing_csrf = client
         .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
@@ -938,7 +938,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "METADATA_PARSE",
-            "schedule": "interval:2h"
+            "isEnabled": true
         }))
         .send()
         .await?;
@@ -952,13 +952,13 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "METADATA_PARSE",
-            "schedule": "interval:2h"
+            "isEnabled": true
         }))
         .send()
         .await?;
     assert_eq!(updated.status(), reqwest::StatusCode::OK);
     let updated_body: Value = updated.json().await?;
-    assert_eq!(updated_body["scheduledTask"]["schedule"], "interval:2h");
+    assert_eq!(updated_body["scheduledTask"]["schedule"], Value::Null);
     assert_eq!(updated_body["scheduledTask"]["isEnabled"], true);
 
     let global_schedule = client
@@ -983,7 +983,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "RECONCILIATION_SCAN",
-            "schedule": "interval:6h"
+            "isEnabled": true
         }))
         .send()
         .await?;
@@ -994,7 +994,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
     let updated_reconciliation = registered_reconciliation_task.json::<Value>().await?;
     assert_eq!(
         updated_reconciliation["scheduledTask"]["schedule"],
-        "interval:6h"
+        Value::Null
     );
     let incremental_task = client
         .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
@@ -1004,7 +1004,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "INCREMENTAL_SCAN",
-            "schedule": "interval:30s"
+            "isEnabled": true
         }))
         .send()
         .await?;
@@ -1020,7 +1020,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .as_array()
         .and_then(|libraries| libraries.iter().find(|library| library["id"] == library_id))
         .ok_or("missing library after scheduled task update")?;
-    assert_eq!(unchanged_library["reconciliationSchedule"], "interval:6h");
+    assert_eq!(unchanged_library["reconciliationSchedule"], Value::Null);
 
     let invalid_task = client
         .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
@@ -1030,7 +1030,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "REBUILD_SEARCH",
-            "schedule": "interval:2h"
+            "isEnabled": true
         }))
         .send()
         .await?;
@@ -1044,7 +1044,6 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "METADATA_PARSE",
-            "schedule": null,
             "isEnabled": false
         }))
         .send()
