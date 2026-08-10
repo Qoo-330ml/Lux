@@ -3040,8 +3040,9 @@ services:
 旧版本的 `org.lux.media-info` 作为迁移别名处理：已有插件配置会迁移到新的插件配置路径，
 新的 API、manifest 和插件进程只使用 `org.lux.strm-media-info`。
 
-插件 manifest 声明 `libraryIds`、`concurrency`、`existingInfoPolicy` 和 `writeSidecars` 配置项；
-其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
+插件 manifest 声明 `libraryIds`、`concurrency`、`existingInfoPolicy`、`writeSidecars` 和
+`schedule` 配置项；`schedule` 使用正整数加单位的间隔格式（`s`、`m`、`h`、`d`），范围为
+`1m` 到 `365d`，默认 `24h`。其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
 （覆盖已有媒体信息）。读取旧版本配置时，`includeReady: false` 迁移为 `SKIP`，
 `includeReady: true` 迁移为 `OVERWRITE`。
 Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理员通过
@@ -3050,6 +3051,10 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 和媒体库 `probeConcurrency` 的较小值限制并发；任务支持分页列表、详情、取消、重试，并在服务
 重启后恢复 PENDING/RUNNING 状态。探测结果保存到 `media_sources`/`media_streams`，旁车写回
 使用同目录 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。
+
+插件启用后，宿主自动登记一个全局 `STRM_MEDIA_INFO` 计划任务；任务读取同一份插件配置，首次
+执行在后台完成，后续按 `schedule` 间隔重复执行。插件禁用时任务保留但停用；服务重启后从已登记
+任务恢复调度。未完成有效配置时只登记未启用的任务，不创建探测作业。
 
 插件 manifest 必须声明 `type: "media_probe"`、`category: "MEDIA"` 和
 `capabilities: ["media.probe"]`。插件进程不能访问 Lux SQLite、媒体根目录或内部任务对象；
@@ -3063,10 +3068,11 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 验收：
 
 - [ ] 管理员只能选择已有媒体库，未选媒体库不创建任务、不发起插件 RPC；空选择、无效 ID、并发超范围均被拒绝。
-- [ ] 插件详情页展示并保存媒体库多选、并发数、已有媒体信息处理方式和旁车写回配置；配置文件原子保存且权限受限，插件列表回显非敏感值。
+- [ ] 插件详情页展示并保存媒体库多选、并发数、已有媒体信息处理方式、旁车写回和执行间隔配置；配置文件原子保存且权限受限，插件列表回显非敏感值。
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
+- [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` 周期执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
 - [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
 - [ ] 插件包、manifest、RPC 结果、URL 策略、超时、输出上限和无真实 URL 的 fake ffprobe 测试覆盖；插件异常不退出主进程。
 - [ ] 从空数据库执行迁移成功，ARM64 本机验证记录 `uname -m`，并通过 Rust 格式化、测试和 Clippy 检查。
@@ -3084,7 +3090,7 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 
 - 不改变 `.strm` 播放直连语义，不做代理、转码、缓存或 AList API 访问。
 - 不在普通扫描或用户请求路径中探测远程 `.strm`，不把插件权限扩展为媒体库/数据库访问。
-- 第一版不接入计划任务；配置和手动启动通过插件管理页及管理员 API 提供。
+- 不把计划任务执行放入普通扫描、播放或用户请求路径；计划任务只复用已有 STRM 后台作业服务。
 
 ---
 
