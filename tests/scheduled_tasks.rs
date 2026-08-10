@@ -2,7 +2,7 @@ use std::fs;
 
 use luxd::application::{
     plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
-    scheduled_tasks::ScheduledTaskService,
+    scheduled_tasks::{ScheduledTaskError, ScheduledTaskService},
     strm_probe::StrmProbeService,
 };
 use luxd::{config::Config, library::LibraryKind, storage::Database};
@@ -69,8 +69,17 @@ async fn enabled_strm_task_runs_once_until_its_interval_is_due()
         StrmProbeService::new(database.clone(), plugins),
     );
 
-    scheduler.run_once().await;
-    scheduler.run_once().await;
+    scheduler
+        .run_task("GLOBAL", "global", "STRM_MEDIA_INFO")
+        .await?;
+    assert!(matches!(
+        scheduler
+            .run_task("GLOBAL", "global", "STRM_MEDIA_INFO")
+            .await,
+        Err(ScheduledTaskError::Strm(
+            luxd::application::strm_probe::StrmProbeError::AlreadyActive
+        ))
+    ));
 
     let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strm_probe_jobs")
         .fetch_one(database.pool())

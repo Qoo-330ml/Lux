@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use subtle::ConstantTimeEq;
 use tokio::fs;
 use tower_http::{
     ServiceBuilderExt,
@@ -66,7 +67,7 @@ use crate::{
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJob, ScanJobError, ScanJobService},
-        scheduled_tasks::ScheduledTaskService,
+        scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::ScraperResolver,
         settings::{
             read_danmaku_provider_url_async, read_network_proxy_url_async,
@@ -83,7 +84,10 @@ use crate::{
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
     },
-    config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
+    config::{
+        Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection,
+        cron_token_from_env_or_file,
+    },
     library::{LibraryKind, LibraryRecord, LibraryRootRecord},
     network::{
         RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
@@ -143,6 +147,7 @@ pub struct AppState {
     resources: ResourceMetrics,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
+    cron_token: Option<String>,
 }
 
 impl AppState {
@@ -166,6 +171,7 @@ impl AppState {
     ) -> Self {
         let server_id = database.server_id().to_owned();
         let config_dir = config.config_dir.clone();
+        let cron_token = cron_token_from_env_or_file(&config_dir);
         let resources = ResourceMetrics::new();
         let database_setup = Some(DatabaseSetupService::new(
             config.clone(),
@@ -211,8 +217,28 @@ impl AppState {
         ));
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
+        let probe = Some(MediaProbeService::new(
+            database.clone(),
+            FfprobeRunner::default(),
+        ));
+        let thumbnails = Some(ThumbnailService::new(database.clone()));
+        let scan_jobs = {
+            let service = ScanJobService::new(database.clone())
+                .with_admin_events(admin_events.clone())
+                .with_resource_metrics(resources.clone());
+            match library_covers.clone() {
+                Some(covers) => service.with_library_covers(covers),
+                None => service,
+            }
+        };
         let scheduled_tasks =
-            ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone());
+            ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone())
+                .with_library_services(
+                    scan_jobs.clone(),
+                    metadata_reidentify.clone(),
+                    probe.clone(),
+                    thumbnails.clone(),
+                );
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -236,20 +262,9 @@ impl AppState {
                 .ok(),
             metadata_reidentify,
             deletion: Some(MediaDeleteService::new(database.clone())),
-            probe: Some(MediaProbeService::new(
-                database.clone(),
-                FfprobeRunner::default(),
-            )),
-            thumbnails: Some(ThumbnailService::new(database.clone())),
-            scan_jobs: Some({
-                let service = ScanJobService::new(database.clone())
-                    .with_admin_events(admin_events.clone())
-                    .with_resource_metrics(resources.clone());
-                match library_covers.clone() {
-                    Some(covers) => service.with_library_covers(covers),
-                    None => service,
-                }
-            }),
+            probe,
+            thumbnails,
+            scan_jobs: Some(scan_jobs),
             strm_probe: Some(strm_probe),
             scheduled_tasks: Some(scheduled_tasks),
             danmaku: Some(
@@ -273,7 +288,13 @@ impl AppState {
             resources,
             remote_access: RemoteAccessPolicy::from_env(),
             login_rate_limiter: LoginRateLimiter::default(),
+            cron_token,
         }
+    }
+
+    pub fn with_cron_token(mut self, token: impl Into<String>) -> Self {
+        self.cron_token = Some(token.into());
+        self
     }
 
     pub fn with_tmdb_client(mut self, tmdb: TmdbClient) -> Self {
@@ -396,14 +417,11 @@ impl AppState {
         }
     }
 
-    pub async fn start_scheduled_tasks(&self) {
+    pub async fn sync_scheduled_tasks(&self) {
         if let Some(plugins) = self.plugins.as_ref()
             && let Err(error) = plugins.sync_media_info_scheduled_task().await
         {
             tracing::error!(%error, "failed to synchronize STRM scheduled task");
-        }
-        if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
-            scheduled_tasks.spawn();
         }
     }
 
@@ -642,6 +660,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/scheduled-tasks",
             get(admin_list_scheduled_tasks).put(admin_upsert_scheduled_task),
+        )
+        .route(
+            "/api/v1/cron/tasks/{owner_type}/{owner_id}/{task_type}",
+            post(cron_enqueue_task),
         )
         .route(
             "/api/v1/admin/settings",
@@ -8656,6 +8678,132 @@ struct AdminLogExportQuery {
 struct AdminScheduledTasksQuery {
     page: Option<i64>,
     page_size: Option<i64>,
+}
+
+async fn cron_enqueue_task(
+    headers: HeaderMap,
+    Path((owner_type, owner_id, task_type)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_cron(&headers, &state) {
+        return response;
+    }
+    let Some(service) = state.scheduled_tasks.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.run_task(&owner_type, &owner_id, &task_type).await {
+        Ok(ScheduledTaskRun::Reconciliation { job }) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "taskType": ScheduledTaskRun::Reconciliation { job: job.clone() }.task_type(),
+                "job": scan_job_json(&job),
+            })),
+        )
+            .into_response(),
+        Ok(ScheduledTaskRun::Metadata { job }) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "taskType": ScheduledTaskRun::Metadata { job: job.clone() }.task_type(),
+                "job": metadata_reidentify_job_json(&job),
+            })),
+        )
+            .into_response(),
+        Ok(ScheduledTaskRun::StrmMediaInfo { operation_id, jobs }) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "taskType": ScheduledTaskRun::StrmMediaInfo {
+                    operation_id: operation_id.clone(),
+                    jobs: jobs.clone(),
+                }
+                .task_type(),
+                "operationId": operation_id,
+                "jobs": jobs,
+            })),
+        )
+            .into_response(),
+        Err(error) => scheduled_task_error(&headers, error),
+    }
+}
+
+fn require_cron(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
+    let Some(expected) = state.cron_token.as_deref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    let Some(authorization) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    };
+    let Some(provided) = authorization
+        .split_once(' ')
+        .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty())
+        .map(|(_, token)| token)
+    else {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    };
+    if !bool::from(expected.as_bytes().ct_eq(provided.as_bytes())) {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    }
+    Ok(())
+}
+
+fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskError) -> Response {
+    match error {
+        ScheduledTaskError::InvalidOwner | ScheduledTaskError::UnsupportedTask => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "计划任务参数无效",
+        )
+        .into_response(),
+        ScheduledTaskError::NotRegistered => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "计划任务未注册",
+        )
+        .into_response(),
+        ScheduledTaskError::Disabled => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "计划任务已停用",
+        )
+        .into_response(),
+        ScheduledTaskError::ServiceUnavailable | ScheduledTaskError::Storage(_) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        ScheduledTaskError::Scan(error) => match error {
+            ScanJobError::LibraryNotFound => api_error(
+                headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在",
+            )
+            .into_response(),
+            ScanJobError::AlreadyActive(_) => api_error(
+                headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库已有扫描任务运行",
+            )
+            .into_response(),
+            ScanJobError::InvalidBatchSize | ScanJobError::NoChanges => api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "扫描任务参数无效",
+            )
+            .into_response(),
+            ScanJobError::JobNotFound
+            | ScanJobError::ScanLockClosed
+            | ScanJobError::Scanner(_)
+            | ScanJobError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+        ScheduledTaskError::Metadata(error) => metadata_reidentify_error(headers, error),
+        ScheduledTaskError::Strm(error) => strm_probe_error(headers, error),
+    }
 }
 
 #[derive(Deserialize)]

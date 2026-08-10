@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app_state.resume_scan_jobs().await;
     app_state.start_realtime_watchers().await;
     app_state.resume_strm_probe_jobs().await;
-    app_state.start_scheduled_tasks().await;
+    app_state.sync_scheduled_tasks().await;
     app_state.resume_danmaku_match_jobs().await;
     app_state.resume_metadata_reidentify_jobs().await;
     let app = app_with_state(app_state);

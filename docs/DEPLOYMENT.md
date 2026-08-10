@@ -68,6 +68,30 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 管理员可以在“任务与日志 → 系统日志”选择 UTC 起止日期并直接下载日志；选择单日会下载原始 `.log` 文件，跨日会下载 ZIP。也可以在宿主机使用
 `docker compose logs --no-color --timestamps --since 1h lux` 查看容器 stdout。日志文件和导出内容可能包含媒体相对路径及请求诊断信息，不要公开发布；不要把 `/config` 整目录、Cookie、配置凭据或数据库文件作为日志附件发送。
 
+### 宿主机 crontab
+
+Lux 不运行内部定时轮询。需要定时执行全量校验、元数据刷新或 STRM 探测时，在宿主机 crontab
+调用 Lux 的 cron 入队接口。先生成一个只用于 cron 的高熵令牌，保存到 Lux 配置目录的
+`cron-token` 文件（权限建议为 `0600`），再将同一文件提供给 crontab：
+
+```bash
+openssl rand -hex 32 > /path/to/lux-config/cron-token
+chmod 600 /path/to/lux-config/cron-token
+```
+
+例如每天凌晨 3 点校验一个媒体库：
+
+```cron
+0 3 * * * curl --fail --silent --show-error -X POST \
+  -H "Authorization: Bearer $(cat /path/to/lux-config/cron-token)" \
+  http://127.0.0.1:8097/api/v1/cron/tasks/LIBRARY/<library-id>/RECONCILIATION_SCAN
+```
+
+元数据任务使用 `METADATA_PARSE`，全局 STRM 任务使用
+`GLOBAL/global/STRM_MEDIA_INFO`。任务必须先在 Lux 中注册并启用；crontab 只负责时间，Lux
+负责鉴权、去重、入队、进度、取消、重试和重启恢复。不要把管理员密码、Cookie 或完整令牌写进
+crontab 文件；不要让 crontab 直接操作 SQLite 或扫描媒体目录。
+
 ### Docker Hub 镜像
 
 `.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送或 `v*.*.*` 标签推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`。
