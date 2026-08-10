@@ -28,6 +28,7 @@ pub mod reidentify;
 pub mod remote_url_policy;
 pub mod scanner;
 pub mod scraper;
+pub mod schedule;
 pub mod settings;
 pub mod setup;
 pub mod strm_probe;
