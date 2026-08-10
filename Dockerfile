@@ -12,7 +12,9 @@ RUN pnpm build
 FROM rust:1.85-bookworm AS builder
 
 WORKDIR /src
-ARG LUX_PLUGIN_VERSION=1.0.0
+ARG LUX_TMDB_PLUGIN_VERSION=0.1.4
+ARG LUX_IP_LOCATION_PLUGIN_VERSION=0.1.0
+ARG LUX_STRM_MEDIA_INFO_PLUGIN_VERSION=0.1.0
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -46,6 +48,7 @@ COPY --from=web-builder /src/web/dist ./web/dist
 RUN cargo build --release --locked \
         --bin luxd \
         --bin lux-plugin-tmdb \
+        --bin lux-plugin-strm-media-info \
         --bin lux-plugin-ip-hiofd \
         --bin lux-plugin-qoo-ip138 \
         --bin lux-plugin-pack \
@@ -60,21 +63,28 @@ RUN cargo build --release --locked \
          --plugin tmdb \
          --binary /src/target/release/lux-plugin-tmdb \
          --output /src/dist/org.lux.tmdb.zip \
-         --version "$LUX_PLUGIN_VERSION" \
+         --version "$LUX_TMDB_PLUGIN_VERSION" \
+         --platform linux \
+         --arch "$plugin_arch" \
+    && /src/target/release/lux-plugin-pack \
+         --plugin strm-media-info \
+         --binary /src/target/release/lux-plugin-strm-media-info \
+         --output /src/dist/org.lux.strm-media-info.zip \
+         --version "$LUX_STRM_MEDIA_INFO_PLUGIN_VERSION" \
          --platform linux \
          --arch "$plugin_arch" \
     && /src/target/release/lux-plugin-pack \
          --plugin ip-hiofd \
          --binary /src/target/release/lux-plugin-ip-hiofd \
          --output /src/dist/org.lux.ip-hiofd.zip \
-         --version "$LUX_PLUGIN_VERSION" \
+         --version "$LUX_IP_LOCATION_PLUGIN_VERSION" \
          --platform linux \
          --arch "$plugin_arch" \
     && /src/target/release/lux-plugin-pack \
          --plugin qoo-ip138 \
          --binary /src/target/release/lux-plugin-qoo-ip138 \
          --output /src/dist/org.lux.qoo-ip138.zip \
-         --version "$LUX_PLUGIN_VERSION" \
+         --version "$LUX_IP_LOCATION_PLUGIN_VERSION" \
          --platform linux \
          --arch "$plugin_arch"
 
@@ -94,6 +104,7 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
 COPY --from=builder /src/assets/fonts/SmileySans-LICENSE.txt /usr/share/doc/lux/SmileySans-LICENSE.txt
 COPY --from=builder /src/dist/org.lux.tmdb.zip /usr/local/share/lux/plugins/org.lux.tmdb.zip
+COPY --from=builder /src/dist/org.lux.strm-media-info.zip /usr/local/share/lux/plugins/org.lux.strm-media-info.zip
 COPY --from=builder /src/dist/org.lux.ip-hiofd.zip /usr/local/share/lux/plugins/org.lux.ip-hiofd.zip
 COPY --from=builder /src/dist/org.lux.qoo-ip138.zip /usr/local/share/lux/plugins/org.lux.qoo-ip138.zip
 COPY --from=web-builder /src/web/dist /usr/local/share/lux/web
