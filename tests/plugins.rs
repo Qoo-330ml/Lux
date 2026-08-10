@@ -136,7 +136,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(catalog_body["total"], 1);
     assert_eq!(catalog_body["plugins"][0]["id"], "tmdb");
     assert_eq!(catalog_body["plugins"][0]["category"], "SCRAPER");
-    assert_eq!(catalog_body["plugins"][0]["version"], "1.0.0");
+    assert_eq!(catalog_body["plugins"][0]["version"], "0.1.4");
     assert_eq!(catalog_body["plugins"][0]["installed"], false);
     assert_eq!(catalog_body["plugins"][0]["configured"], true);
     assert_eq!(catalog_body["plugins"][0]["configurable"], true);

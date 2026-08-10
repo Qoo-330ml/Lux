@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${IP_LOCATION_PLUGIN_VERSION:-1.0.0}"
+VERSION="${IP_LOCATION_PLUGIN_VERSION:-0.1.0}"
 
 case "$(uname -s)" in
   Darwin) PLATFORM="darwin" ;;
