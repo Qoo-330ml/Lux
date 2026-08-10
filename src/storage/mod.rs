@@ -5861,8 +5861,7 @@ impl Database {
         let runtime_ticks = resume_runtime_ticks_sql();
         let statement_sql = format!(
             "WITH candidates AS (
-                 SELECT mi.id, mi.series_id, mi.season_number, mi.episode_number,
-                        us.position_ticks, us.last_played_at,
+                 SELECT mi.id, mi.sort_title, us.position_ticks, us.last_played_at,
                         {runtime_ticks} AS resume_runtime_ticks
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -5872,11 +5871,11 @@ impl Database {
                    AND mi.library_id IN ({library_placeholders})
              ),
              ranked AS (
-                 SELECT id, series_id, season_number, episode_number, last_played_at
+                 SELECT id, sort_title, last_played_at
                  FROM candidates
                  WHERE resume_runtime_ticks > 0
                    AND position_ticks * 100 < resume_runtime_ticks * ?
-                 ORDER BY last_played_at DESC, series_id, season_number, episode_number, id
+                 ORDER BY last_played_at DESC, sort_title, id
                  LIMIT ? OFFSET ?
              )
              SELECT mi.id AS item_id, mi.library_id, mi.item_type,
@@ -5909,8 +5908,7 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             ORDER BY ranked.last_played_at DESC, ranked.series_id,
-                      ranked.season_number, ranked.episode_number, ranked.id,
+             ORDER BY ranked.last_played_at DESC, ranked.sort_title, ranked.id,
                       ms.id, mt.stream_index"
         );
         let mut binds = Vec::with_capacity(query.item_types.len() + query.library_ids.len() + 5);

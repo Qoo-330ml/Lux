@@ -1742,84 +1742,18 @@ async fn emby_user_resume(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let page = match catalog.list_all_items(principal, 0, i64::MAX).await {
+    let page = match catalog
+        .list_continue_watching(principal, &user_id, offset, limit)
+        .await
+    {
         Ok(page) => page,
         Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
             return StatusCode::FORBIDDEN.into_response();
         }
     };
-    let (played_percent, minimum_ticks) = match database.resume_settings().await {
-        Ok(settings) => settings,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let item_ids = page
-        .items
-        .iter()
-        .map(|item| item.id.clone())
-        .collect::<Vec<_>>();
-    let user_states = match database.list_user_item_states(&user_id, &item_ids).await {
-        Ok(states) => states,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let mut resume_items = Vec::new();
-    for item in page.items {
-        if !matches!(item.item_type.as_str(), "MOVIE" | "EPISODE") {
-            continue;
-        }
-        let Some(item_state) = user_states.get(&item.id).cloned() else {
-            continue;
-        };
-        let runtime_ticks = item.runtime_ticks.or_else(|| {
-            item.media_sources
-                .iter()
-                .find(|source| source.is_default)
-                .or_else(|| item.media_sources.first())
-                .and_then(|source| source.duration_ticks)
-        });
-        let Some(runtime_ticks) = runtime_ticks.filter(|value| *value > 0) else {
-            continue;
-        };
-        let below_played_threshold = i128::from(item_state.position_ticks) * 100
-            < i128::from(runtime_ticks) * i128::from(played_percent);
-        if !item_state.is_played
-            && item_state.position_ticks >= minimum_ticks
-            && below_played_threshold
-        {
-            resume_items.push((item, item_state));
-        }
-    }
-    resume_items.sort_by(|(left, left_state), (right, right_state)| {
-        right_state
-            .last_played_at
-            .cmp(&left_state.last_played_at)
-            .then_with(|| left.sort_title.cmp(&right.sort_title))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    let total = resume_items.len();
-    let items = resume_items
-        .into_iter()
-        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-        .take(usize::try_from(limit).unwrap_or(0))
-        .map(|(item, item_state)| {
-            emby_catalog_item_json_with_state(
-                &item,
-                &state.server_id,
-                Some(&item_state),
-                query.fields.as_deref(),
-            )
-        })
-        .collect::<Vec<_>>();
-    Json(json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": offset,
-    }))
-    .into_response()
+    emby_catalog_page_for_user_with_fields(&state, &user_id, &page, query.fields.as_deref()).await
 }
 
 async fn emby_user_latest(

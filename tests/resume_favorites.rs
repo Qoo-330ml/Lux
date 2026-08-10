@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
@@ -57,7 +59,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     let admin_id = admin.id.to_string();
     sqlx::query(
         "INSERT INTO user_item_state (user_id, item_id, position_ticks, last_played_at)
-         VALUES (?, ?, ?, unixepoch() - 1), (?, ?, ?, unixepoch())",
+         VALUES (?, ?, ?, unixepoch()), (?, ?, ?, unixepoch())",
     )
     .bind(&admin_id)
     .bind(&eligible_id)
@@ -264,6 +266,8 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .await?;
     let relaxed_body = relaxed_resume.json::<Value>().await?;
     assert_eq!(relaxed_body["TotalRecordCount"], 2);
+    assert_eq!(relaxed_body["Items"][0]["Id"], almost_id);
+    assert_eq!(relaxed_body["Items"][1]["Id"], eligible_id);
 
     let played = client
         .post(format!(
@@ -352,6 +356,95 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .send()
         .await?;
     assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_page_does_not_materialize_unrelated_catalog_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Large catalog", LibraryKind::Movie, false)
+        .await?;
+
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < 20000
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, runtime_ticks,
+             identification_status, has_available_source
+         )
+         SELECT printf('bulk-%05d', value), ?, 'MOVIE',
+                printf('Bulk %05d', value), printf('Bulk %05d', value),
+                2000000000, 'LOCAL_CONFIRMED', 1
+         FROM sequence",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let admin_id = admin.id.to_string();
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, last_played_at
+         ) VALUES (?, 'bulk-20000', 1300000000, unixepoch())",
+    )
+    .bind(&admin_id)
+    .execute(database.pool())
+    .await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="ResumeTest", Device="Mac", DeviceId="resume-large", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing token")?
+        .to_owned();
+
+    let resume = tokio::time::timeout(Duration::from_secs(1), async {
+        client
+            .get(format!("{base_url}/Users/{admin_id}/Items/Resume"))
+            .query(&[
+                ("api_key", token.as_str()),
+                ("StartIndex", "0"),
+                ("Limit", "1"),
+            ])
+            .send()
+            .await
+    })
+    .await
+    .map_err(|_| "Resume request materialized the unrelated catalog")??;
+    assert_eq!(resume.status(), reqwest::StatusCode::OK);
+    let body = resume.json::<Value>().await?;
+    assert_eq!(body["TotalRecordCount"], 1);
+    assert_eq!(body["StartIndex"], 0);
+    assert_eq!(body["Items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["Items"][0]["Id"], "bulk-20000");
 
     server.abort();
     Ok(())
