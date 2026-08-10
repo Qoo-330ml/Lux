@@ -54,8 +54,17 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
     let library = LibraryService::new(database.clone())
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
-    let plugins = PluginService::new(database, config_dir);
+    let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(MEDIA_INFO_PLUGIN_ID).await?;
+
+    let task: (String, Option<String>, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT task_type, cron_or_interval, is_enabled, source_type, plugin_id
+         FROM scheduled_task_configs
+         WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = 'STRM_MEDIA_INFO'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(task, ("STRM_MEDIA_INFO".to_owned(), Some("24h".to_owned()), 0, "PLUGIN".to_owned(), Some(MEDIA_INFO_PLUGIN_ID.to_owned())));
 
     let page = plugins.list_installed(0, 20).await?;
     let plugin = page
@@ -87,6 +96,33 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
     assert!(updated.configured);
     assert_eq!(updated.config_values["concurrency"], 4);
     assert_eq!(updated.config_values["writeSidecars"], false);
+
+    let enabled: (Option<String>, i64) = sqlx::query_as(
+        "SELECT cron_or_interval, is_enabled
+         FROM scheduled_task_configs
+         WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = 'STRM_MEDIA_INFO'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(enabled, (Some("6h".to_owned()), 1));
+
+    plugins.set_enabled(MEDIA_INFO_PLUGIN_ID, false).await?;
+    let disabled: i64 = sqlx::query_scalar(
+        "SELECT is_enabled FROM scheduled_task_configs
+         WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = 'STRM_MEDIA_INFO'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(disabled, 0);
+
+    plugins.set_enabled(MEDIA_INFO_PLUGIN_ID, true).await?;
+    let reenabled: i64 = sqlx::query_scalar(
+        "SELECT is_enabled FROM scheduled_task_configs
+         WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = 'STRM_MEDIA_INFO'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(reenabled, 1);
 
     let settings = plugins.media_info_settings().await?;
     assert_eq!(settings.library_ids, vec![library.id]);

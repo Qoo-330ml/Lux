@@ -273,6 +273,9 @@ impl PluginService {
         self.ensure_known_plugin(&plugin_id)?;
         let was_installed = self.database.has_plugin_installation(&plugin_id).await?;
         self.database.install_plugin(&plugin_id).await?;
+        if plugin_id == MEDIA_INFO_PLUGIN_ID {
+            self.sync_media_info_scheduled_task().await?;
+        }
         let plugin = self.view_for_id(&plugin_id, true, true).await?;
         Ok(PluginInstall {
             plugin,
@@ -295,6 +298,9 @@ impl PluginService {
             .await?;
         if !enabled {
             self.supervisor.stop(&plugin_id).await;
+        }
+        if plugin_id == MEDIA_INFO_PLUGIN_ID {
+            self.sync_media_info_scheduled_task().await?;
         }
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
@@ -478,6 +484,9 @@ impl PluginService {
             media_info_schedule(&values)?;
         }
         self.write_plugin_config(&plugin_id, &values).await?;
+        if plugin_id == MEDIA_INFO_PLUGIN_ID {
+            self.sync_media_info_scheduled_task().await?;
+        }
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
     }
@@ -532,6 +541,36 @@ impl PluginService {
                 .ok_or(PluginServiceError::InvalidConfig)?,
             schedule,
         })
+    }
+
+    pub async fn sync_media_info_scheduled_task(&self) -> Result<(), PluginServiceError> {
+        let (installed, enabled) = self.plugin_state(MEDIA_INFO_PLUGIN_ID).await?;
+        if !installed {
+            return Ok(());
+        }
+        let plugin = self
+            .catalog
+            .get(MEDIA_INFO_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(MEDIA_INFO_PLUGIN_ID.to_owned()))?;
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let values = merge_default_config_values(
+            &fields,
+            normalize_plugin_config(
+                MEDIA_INFO_PLUGIN_ID,
+                self.read_plugin_config(MEDIA_INFO_PLUGIN_ID).await?,
+            ),
+        );
+        let schedule = media_info_schedule(&values)
+            .unwrap_or_else(|_| DEFAULT_STRM_MEDIA_INFO_INTERVAL.to_owned());
+        let configured = validate_config_values(&fields, &values).is_ok()
+            && self.media_info_settings().await.is_ok();
+        self.database
+            .upsert_strm_media_info_task(
+                &schedule,
+                enabled && configured,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn config_fields_for_plugin(

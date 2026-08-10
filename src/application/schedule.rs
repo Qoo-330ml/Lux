@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 pub const DEFAULT_STRM_MEDIA_INFO_INTERVAL: &str = "24h";
+pub const STRM_MEDIA_INFO_TASK_TYPE: &str = "STRM_MEDIA_INFO";
 const MIN_INTERVAL_SECONDS: u64 = 60;
 const MAX_INTERVAL_SECONDS: u64 = 365 * 24 * 60 * 60;
 
