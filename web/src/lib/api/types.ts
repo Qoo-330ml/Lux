@@ -405,6 +405,7 @@ export type AdminScheduledTaskPage = {
 
 export type AdminMetadataReidentifyJob = {
   id: string;
+  libraryId?: string | null;
   status: "QUEUED" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
   cancelRequested?: boolean;
   mode: "REIDENTIFY" | "FILL_MISSING" | "FULL_REFRESH" | string;

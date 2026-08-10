@@ -21,7 +21,15 @@ describe("AdminOperationsPage", () => {
   });
 
   it("separates registered tasks, runtime records, and redacted audit logs", async () => {
-    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
+      id: "scan-job-1",
+      libraryId: "library-1",
+      jobType: "INCREMENTAL_SCAN",
+      status: "COMPLETED",
+      processedCount: 1,
+      totalCount: 1,
+      createdAt: 1_700_000_001,
+    }] });
     const cancelMetadata = vi.spyOn(api, "cancelMetadataReidentify").mockResolvedValue(undefined);
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({
       jobs: [{
@@ -32,6 +40,7 @@ describe("AdminOperationsPage", () => {
         totalCount: 10,
         error: null,
         createdAt: 1_700_000_000,
+        libraryId: "library-1",
       }],
     });
     vi.spyOn(api, "adminLogs").mockResolvedValue({
@@ -55,6 +64,9 @@ describe("AdminOperationsPage", () => {
     act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
     expect(container.textContent).toContain("整库元数据匹配");
     expect(container.textContent).toContain("运行中");
+    const runList = container.querySelector<HTMLElement>(".lux-admin-job-list");
+    expect(runList?.textContent).toContain("媒体库：电影库");
+    expect(runList?.textContent).not.toContain("library-1");
     const cancelButton = container.querySelector<HTMLButtonElement>('button[aria-label="取消任务"]');
     expect(cancelButton).not.toBeNull();
     act(() => cancelButton?.click());
@@ -272,6 +284,16 @@ describe("AdminOperationsPage", () => {
   function renderPage() {
     container = document.createElement("div");
     document.body.append(container);
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [{
+        id: "library-1",
+        name: "电影库",
+        kind: "MOVIE",
+        isEnabled: true,
+        realtimeWatchEnabled: true,
+        roots: [],
+      }],
+    });
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     act(() => {
