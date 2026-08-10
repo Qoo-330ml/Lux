@@ -1,7 +1,5 @@
 fn main() {
     println!("cargo:rerun-if-changed=migrations");
-    println!("cargo:rerun-if-changed=web/dist");
-    println!("cargo:rerun-if-changed=web/src");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
     println!("cargo:rerun-if-changed=.git/packed-refs");

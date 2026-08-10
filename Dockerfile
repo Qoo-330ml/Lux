@@ -17,7 +17,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 
 # Keep dependency compilation in a layer that is independent of application
 # source changes. The real sources are copied below and reuse this target dir.
@@ -34,6 +34,7 @@ RUN mkdir -p src/bin \
        done \
     && cargo build --release --locked --bins
 
+COPY build.rs ./build.rs
 COPY src ./src
 COPY assets ./assets
 COPY migrations ./migrations
