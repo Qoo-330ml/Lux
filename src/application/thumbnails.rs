@@ -18,6 +18,7 @@ use crate::{
 
 const DEFAULT_FRAME: &str = "00:03:01";
 const MAX_THUMBNAIL_BYTES: u64 = 50 * 1024 * 1024;
+const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
 
 #[derive(Clone)]
 pub struct ThumbnailService {
@@ -47,34 +48,46 @@ impl ThumbnailService {
         &self,
         library_id: LibraryId,
     ) -> Result<ThumbnailReport, ThumbnailError> {
-        let candidates = self
-            .database
-            .list_local_thumbnail_sources_for_library(&library_id.to_string())
-            .await?;
         let mut seen_items = HashSet::new();
         let mut report = ThumbnailReport::default();
-
-        for candidate in candidates {
-            if !seen_items.insert(candidate.item_id.clone()) {
-                continue;
-            }
-            if is_strm_path(&candidate.relative_path) {
-                report.skipped_strm += 1;
-                continue;
-            }
-            report.considered += 1;
-            match self.generate_for_source(&candidate).await {
-                Ok(ThumbnailOutcome::Generated) => report.generated += 1,
-                Ok(ThumbnailOutcome::Reused) => report.reused += 1,
-                Err(error) => {
-                    report.failed += 1;
-                    tracing::warn!(
-                        item_id = %candidate.item_id,
-                        error = %error,
-                        "thumbnail generation failed"
-                    );
+        let library_id = library_id.to_string();
+        let mut offset = 0_i64;
+        loop {
+            let candidates = self
+                .database
+                .list_local_thumbnail_sources_for_library_page(
+                    &library_id,
+                    LIBRARY_SOURCE_PAGE_SIZE as i64,
+                    offset,
+                )
+                .await?;
+            let last_page = candidates.len() < LIBRARY_SOURCE_PAGE_SIZE;
+            for candidate in candidates {
+                if !seen_items.insert(candidate.item_id.clone()) {
+                    continue;
+                }
+                if is_strm_path(&candidate.relative_path) {
+                    report.skipped_strm += 1;
+                    continue;
+                }
+                report.considered += 1;
+                match self.generate_for_source(&candidate).await {
+                    Ok(ThumbnailOutcome::Generated) => report.generated += 1,
+                    Ok(ThumbnailOutcome::Reused) => report.reused += 1,
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::warn!(
+                            item_id = %candidate.item_id,
+                            error = %error,
+                            "thumbnail generation failed"
+                        );
+                    }
                 }
             }
+            if last_page {
+                break;
+            }
+            offset = offset.saturating_add(LIBRARY_SOURCE_PAGE_SIZE as i64);
         }
         Ok(report)
     }

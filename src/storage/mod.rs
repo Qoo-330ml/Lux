@@ -2311,6 +2311,26 @@ impl Database {
         })
     }
 
+    pub(crate) async fn has_active_strm_probe_jobs_for_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                SELECT 1 FROM strm_probe_jobs
+                WHERE operation_id = ? AND status IN ('PENDING', 'RUNNING')
+            ) THEN 1 ELSE 0 END",
+        )
+        .bind(operation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_strm_probe_job(
         &self,
         id: &str,
@@ -3872,7 +3892,7 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         self.query(
-            "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
+            "SELECT fe.id, fe.fingerprint, ms.item_id
              FROM filesystem_entries fe
              LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
              WHERE fe.library_root_id = ? AND fe.relative_path = ?",
@@ -3882,26 +3902,6 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_filesystem_entry))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn list_filesystem_entries_for_root(
-        &self,
-        library_root_id: &str,
-    ) -> Result<Vec<StoredFilesystemEntry>, StorageError> {
-        self.query(
-            "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
-             FROM filesystem_entries fe
-             LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
-             WHERE fe.library_root_id = ?",
-        )
-        .bind(library_root_id)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| rows.into_iter().map(stored_filesystem_entry).collect())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -6542,9 +6542,11 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_movie_metadata_sources(
+    pub(crate) async fn list_movie_metadata_sources_page(
         &self,
         library_id: &str,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
         self.query(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
@@ -6556,9 +6558,12 @@ impl Database {
              WHERE mi.library_id = ? AND mi.item_type = 'MOVIE'
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
-             ORDER BY ms.item_id, fe.relative_path",
+             ORDER BY ms.item_id, fe.relative_path
+             LIMIT ? OFFSET ?",
         )
         .bind(library_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
@@ -7049,9 +7054,11 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_local_thumbnail_sources_for_library(
+    pub(crate) async fn list_local_thumbnail_sources_for_library_page(
         &self,
         library_id: &str,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
             "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
@@ -7066,9 +7073,12 @@ impl Database {
               AND ii.image_index = 0
              WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
                AND fe.is_missing = 0
-             ORDER BY ms.item_id, ms.is_default DESC, ms.id",
+             ORDER BY ms.item_id, ms.is_default DESC, ms.id
+             LIMIT ? OFFSET ?",
         )
         .bind(library_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
@@ -7479,9 +7489,11 @@ impl Database {
             })
     }
 
-    pub(crate) async fn list_series_metadata_sources(
+    pub(crate) async fn list_series_metadata_sources_page(
         &self,
         library_id: &str,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
         self.query(
             "SELECT series.id AS series_id, season.id AS season_id,
@@ -7499,9 +7511,12 @@ impl Database {
                AND episode.library_id = ?
                AND episode.removed_at IS NULL
                AND fe.is_missing = 0
-             ORDER BY series.id, season.season_number, episode.id, fe.relative_path",
+             ORDER BY series.id, season.season_number, episode.id, fe.relative_path
+             LIMIT ? OFFSET ?",
         )
         .bind(library_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
@@ -8510,7 +8525,6 @@ fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
 #[derive(Debug)]
 pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
-    pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) item_id: Option<String>,
 }
@@ -8518,7 +8532,6 @@ pub(crate) struct StoredFilesystemEntry {
 fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
     StoredFilesystemEntry {
         id: row.get("id"),
-        relative_path: row.get("relative_path"),
         fingerprint: row.get("fingerprint"),
         item_id: row.get("item_id"),
     }
@@ -9585,6 +9598,22 @@ mod tests {
         assert_eq!(first_page.len(), 1);
         assert_eq!(second_page.len(), 1);
         assert_ne!(first_page[0].source_id, second_page[0].source_id);
+        assert_eq!(
+            database
+                .list_local_thumbnail_sources_for_library_page(&library.id.to_string(), 1, 0,)
+                .await
+                .expect("thumbnail page")
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .list_movie_metadata_sources_page(&library.id.to_string(), 1, 1)
+                .await
+                .expect("metadata page")
+                .len(),
+            1
+        );
         database.close().await;
     }
 

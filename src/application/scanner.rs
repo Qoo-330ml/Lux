@@ -32,10 +32,12 @@ use crate::{
     observability::resources::ResourceMetrics,
     storage::{
         Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource, NewMovieFile,
-        NewScanJobEvent, StorageError, StoredFilesystemEntry, StoredLibraryRoot,
-        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
+        NewScanJobEvent, StorageError, StoredLibraryRoot, StoredReconciliationScanEntry,
+        StoredScanJob, StoredScanJobPath,
     },
 };
+
+const FILE_BATCH_SIZE: usize = 500;
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -82,81 +84,34 @@ impl LibraryScanner {
                     .update_library_root_availability(&root.id, true)
                     .await?;
             }
-            let files = match collect_movie_files(&root_path).await {
-                Ok(files) => files,
-                Err(ScannerError::Io { .. }) => {
-                    self.database
-                        .update_library_root_availability(&root.id, false)
-                        .await?;
-                    report.unavailable_roots += 1;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let existing_entries = self
-                .database
-                .list_filesystem_entries_for_root(&root.id)
-                .await?
-                .into_iter()
-                .map(|entry| (entry.relative_path.clone(), entry))
-                .collect::<HashMap<_, _>>();
-            let mut seen_entry_ids = Vec::new();
-            let mut pending_new_files = Vec::with_capacity(500);
-            for path in files {
-                if let Some((entry_id, quick_report)) = self
-                    .scan_movie_file_if_unchanged(
-                        &library_id_text,
-                        &root_path,
-                        &path,
-                        &existing_entries,
-                    )
-                    .await?
-                {
-                    seen_entry_ids.push(entry_id);
-                    report.merge(quick_report);
-                } else if !existing_entries.contains_key(
-                    path.strip_prefix(&root_path)
-                        .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
-                        .to_str()
-                        .ok_or(ScannerError::NonUtf8Path)?,
-                ) {
-                    if let Some(file) = self.prepare_new_movie_file(&root_path, &path).await? {
-                        pending_new_files.push(file);
-                        if pending_new_files.len() == 500 {
-                            self.flush_new_movie_files(
+            let mut walker = FileBatchWalker::new(&root_path);
+            let mut seen_entry_ids = Vec::with_capacity(FILE_BATCH_SIZE);
+            while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
+                for path in files {
+                    if let Some((entry_id, quick_report)) = self
+                        .scan_movie_file_if_unchanged(&library_id_text, &root.id, &root_path, &path)
+                        .await?
+                    {
+                        seen_entry_ids.push(entry_id);
+                        report.merge(quick_report);
+                    } else {
+                        report.merge(
+                            self.scan_movie_file(
                                 &library_id_text,
                                 &root,
+                                &root_path,
+                                &path,
                                 &generation,
-                                &mut pending_new_files,
-                                &mut report,
                             )
-                            .await?;
-                        }
+                            .await?,
+                        );
                     }
-                } else {
-                    report.merge(
-                        self.scan_movie_file(
-                            &library_id_text,
-                            &root,
-                            &root_path,
-                            &path,
-                            &generation,
-                        )
-                        .await?,
-                    );
                 }
+                self.database
+                    .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
+                    .await?;
+                seen_entry_ids.clear();
             }
-            self.flush_new_movie_files(
-                &library_id_text,
-                &root,
-                &generation,
-                &mut pending_new_files,
-                &mut report,
-            )
-            .await?;
-            self.database
-                .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
-                .await?;
             report.marked_missing += usize::try_from(
                 self.database
                     .mark_missing_filesystem_entries(&root.id, &generation)
@@ -201,12 +156,20 @@ impl LibraryScanner {
                     .update_library_root_availability(&root.id, true)
                     .await?;
             }
-            let files = collect_series_files(&root_path).await?;
-            for path in files {
-                report.merge(
-                    self.scan_episode_file(&library_id_text, &root, &root_path, &path, &generation)
+            let mut walker = FileBatchWalker::new(&root_path);
+            while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
+                for path in files {
+                    report.merge(
+                        self.scan_episode_file(
+                            &library_id_text,
+                            &root,
+                            &root_path,
+                            &path,
+                            &generation,
+                        )
                         .await?,
-                );
+                    );
+                }
             }
             report.marked_missing += usize::try_from(
                 self.database
@@ -252,41 +215,44 @@ impl LibraryScanner {
                     .update_library_root_availability(&root.id, true)
                     .await?;
             }
-            for path in collect_series_files(&root_path).await? {
-                let classification = classify_mixed_file(&root_path, &path).await;
-                let result = match classification {
-                    MixedClassification::Movie => {
-                        self.scan_movie_file(
-                            &library_id_text,
-                            &root,
-                            &root_path,
-                            &path,
-                            &generation,
-                        )
-                        .await?
-                    }
-                    MixedClassification::Episode => {
-                        self.scan_episode_file(
-                            &library_id_text,
-                            &root,
-                            &root_path,
-                            &path,
-                            &generation,
-                        )
-                        .await?
-                    }
-                    MixedClassification::Unresolved => {
-                        self.scan_unresolved_file(
-                            &library_id_text,
-                            &root,
-                            &root_path,
-                            &path,
-                            &generation,
-                        )
-                        .await?
-                    }
-                };
-                report.merge(result);
+            let mut walker = FileBatchWalker::new(&root_path);
+            while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
+                for path in files {
+                    let classification = classify_mixed_file(&root_path, &path).await;
+                    let result = match classification {
+                        MixedClassification::Movie => {
+                            self.scan_movie_file(
+                                &library_id_text,
+                                &root,
+                                &root_path,
+                                &path,
+                                &generation,
+                            )
+                            .await?
+                        }
+                        MixedClassification::Episode => {
+                            self.scan_episode_file(
+                                &library_id_text,
+                                &root,
+                                &root_path,
+                                &path,
+                                &generation,
+                            )
+                            .await?
+                        }
+                        MixedClassification::Unresolved => {
+                            self.scan_unresolved_file(
+                                &library_id_text,
+                                &root,
+                                &root_path,
+                                &path,
+                                &generation,
+                            )
+                            .await?
+                        }
+                    };
+                    report.merge(result);
+                }
             }
             report.marked_missing += usize::try_from(
                 self.database
@@ -803,19 +769,21 @@ impl LibraryScanner {
         }
 
         let generation = Uuid::now_v7().to_string();
-        let files = collect_movie_files(&canonical_directory).await?;
         let mut report = ScanReport::default();
-        for path in files {
-            report.merge(
-                self.scan_movie_file(
-                    &library_id_text,
-                    &root,
-                    Path::new(&root.canonical_path),
-                    &path,
-                    &generation,
-                )
-                .await?,
-            );
+        let mut walker = FileBatchWalker::new(&canonical_directory);
+        while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
+            for path in files {
+                report.merge(
+                    self.scan_movie_file(
+                        &library_id_text,
+                        &root,
+                        Path::new(&root.canonical_path),
+                        &path,
+                        &generation,
+                    )
+                    .await?,
+                );
+            }
         }
         Ok(report)
     }
@@ -823,9 +791,9 @@ impl LibraryScanner {
     async fn scan_movie_file_if_unchanged(
         &self,
         library_id_text: &str,
+        root_id: &str,
         root_path: &Path,
         path: &Path,
-        existing_entries: &HashMap<String, StoredFilesystemEntry>,
     ) -> Result<Option<(String, ScanReport)>, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
@@ -839,7 +807,11 @@ impl LibraryScanner {
             .to_str()
             .ok_or(ScannerError::NonUtf8Path)?
             .to_owned();
-        let Some(existing_entry) = existing_entries.get(&relative_path) else {
+        let Some(existing_entry) = self
+            .database
+            .find_filesystem_entry(root_id, &relative_path)
+            .await?
+        else {
             return Ok(None);
         };
         let metadata = fs::metadata(path)
@@ -957,28 +929,6 @@ impl LibraryScanner {
             container,
             external_url,
         }))
-    }
-
-    async fn flush_new_movie_files(
-        &self,
-        library_id_text: &str,
-        root: &StoredLibraryRoot,
-        generation: &str,
-        files: &mut Vec<NewMovieFile>,
-        report: &mut ScanReport,
-    ) -> Result<(), ScannerError> {
-        if files.is_empty() {
-            return Ok(());
-        }
-        let file_count = files.len();
-        report.created_items += self
-            .database
-            .insert_movie_files_batch(library_id_text, &root.id, generation, files)
-            .await?;
-        report.discovered_files += file_count;
-        report.created_sources += file_count;
-        files.clear();
-        Ok(())
     }
 
     pub(crate) async fn scan_movie_file(
@@ -2074,55 +2024,59 @@ impl ScanJobService {
                 path: media_path.clone(),
                 source,
             })?;
-        let generation = &job.generation;
-        let files = if metadata.is_dir() {
-            if library_kind == "SERIES" {
-                collect_series_files(&media_path).await?
-            } else {
-                collect_movie_files(&media_path).await?
+        if metadata.is_dir() {
+            let mut walker = FileBatchWalker::new(&media_path);
+            while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
+                for file in files {
+                    self.process_incremental_file(library_kind, job, &root, root_path, &file)
+                        .await?;
+                }
             }
         } else if is_supported_movie_file(&media_path) {
-            vec![media_path]
-        } else {
-            Vec::new()
-        };
-        for file in files {
-            match library_kind {
-                "MOVIE" => {
-                    self.scanner
-                        .scan_movie_file(&job.library_id, &root, root_path, &file, generation)
-                        .await?;
-                }
-                "SERIES" => {
-                    self.scanner
-                        .scan_episode_file(&job.library_id, &root, root_path, &file, generation)
-                        .await?;
-                }
-                "MIXED" => match classify_mixed_file(root_path, &file).await {
-                    MixedClassification::Movie => {
-                        self.scanner
-                            .scan_movie_file(&job.library_id, &root, root_path, &file, generation)
-                            .await?;
-                    }
-                    MixedClassification::Episode => {
-                        self.scanner
-                            .scan_episode_file(&job.library_id, &root, root_path, &file, generation)
-                            .await?;
-                    }
-                    MixedClassification::Unresolved => {
-                        self.scanner
-                            .scan_unresolved_file(
-                                &job.library_id,
-                                &root,
-                                root_path,
-                                &file,
-                                generation,
-                            )
-                            .await?;
-                    }
-                },
-                _ => return Err(ScannerError::LibraryNotFound),
+            self.process_incremental_file(library_kind, job, &root, root_path, &media_path)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn process_incremental_file(
+        &self,
+        library_kind: &str,
+        job: &StoredScanJob,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        file: &Path,
+    ) -> Result<(), ScannerError> {
+        let generation = &job.generation;
+        match library_kind {
+            "MOVIE" => {
+                self.scanner
+                    .scan_movie_file(&job.library_id, root, root_path, file, generation)
+                    .await?;
             }
+            "SERIES" => {
+                self.scanner
+                    .scan_episode_file(&job.library_id, root, root_path, file, generation)
+                    .await?;
+            }
+            "MIXED" => match classify_mixed_file(root_path, file).await {
+                MixedClassification::Movie => {
+                    self.scanner
+                        .scan_movie_file(&job.library_id, root, root_path, file, generation)
+                        .await?;
+                }
+                MixedClassification::Episode => {
+                    self.scanner
+                        .scan_episode_file(&job.library_id, root, root_path, file, generation)
+                        .await?;
+                }
+                MixedClassification::Unresolved => {
+                    self.scanner
+                        .scan_unresolved_file(&job.library_id, root, root_path, file, generation)
+                        .await?;
+                }
+            },
+            _ => return Err(ScannerError::LibraryNotFound),
         }
         Ok(())
     }
@@ -2927,38 +2881,74 @@ fn parse_season_directory_name(value: &str) -> Option<u32> {
     digits.parse::<u32>().ok()
 }
 
-pub(crate) async fn collect_movie_files(root: &Path) -> Result<Vec<PathBuf>, ScannerError> {
-    let mut directories = vec![root.to_owned()];
-    let mut files = Vec::new();
-    while let Some(directory) = directories.pop() {
-        let mut entries = fs::read_dir(&directory)
-            .await
-            .map_err(|source| ScannerError::Io {
-                path: directory.clone(),
-                source,
-            })?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|source| ScannerError::Io {
-                path: directory.clone(),
-                source,
-            })?
-        {
-            let path = entry.path();
-            let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if file_type.is_file() && is_supported_movie_file(&path) {
-                files.push(path);
-            } else if file_type.is_dir() {
-                directories.push(path);
-            }
+struct FileBatchWalker {
+    directories: Vec<PathBuf>,
+    current: Option<(PathBuf, fs::ReadDir)>,
+}
+
+impl FileBatchWalker {
+    fn new(root: &Path) -> Self {
+        Self {
+            directories: vec![root.to_owned()],
+            current: None,
         }
     }
-    files.sort();
-    Ok(files)
+
+    async fn next_batch(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Option<Vec<PathBuf>>, ScannerError> {
+        if batch_size == 0 {
+            return Ok(None);
+        }
+        let mut files = Vec::with_capacity(batch_size);
+        while files.len() < batch_size {
+            if self.current.is_none() {
+                let Some(directory) = self.directories.pop() else {
+                    break;
+                };
+                let entries =
+                    fs::read_dir(&directory)
+                        .await
+                        .map_err(|source| ScannerError::Io {
+                            path: directory.clone(),
+                            source,
+                        })?;
+                self.current = Some((directory, entries));
+            }
+
+            let Some((directory, entries)) = self.current.as_mut() else {
+                continue;
+            };
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                    if file_type.is_file() && is_supported_movie_file(&path) {
+                        files.push(path);
+                    } else if file_type.is_dir() {
+                        self.directories.push(path);
+                    }
+                }
+                Ok(None) => self.current = None,
+                Err(source) => {
+                    return Err(ScannerError::Io {
+                        path: directory.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        if files.is_empty() {
+            Ok(None)
+        } else {
+            files.sort();
+            Ok(Some(files))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3027,40 +3017,6 @@ async fn discover_reconciliation_directory(
     discovered.directories.sort();
     discovered.media_files.sort();
     Ok(discovered)
-}
-
-async fn collect_series_files(root: &Path) -> Result<Vec<PathBuf>, ScannerError> {
-    let mut directories = vec![root.to_owned()];
-    let mut files = Vec::new();
-    while let Some(directory) = directories.pop() {
-        let mut entries = fs::read_dir(&directory)
-            .await
-            .map_err(|source| ScannerError::Io {
-                path: directory.clone(),
-                source,
-            })?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|source| ScannerError::Io {
-                path: directory.clone(),
-                source,
-            })?
-        {
-            let path = entry.path();
-            let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if file_type.is_file() && is_supported_movie_file(&path) {
-                files.push(path);
-            } else if file_type.is_dir() {
-                directories.push(path);
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
 }
 
 fn is_supported_movie_file(path: &Path) -> bool {
