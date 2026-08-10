@@ -84,10 +84,6 @@ impl StrmProbeService {
             return Err(StrmProbeError::InvalidLibraryCount);
         }
         let operation_id = Uuid::now_v7().to_string();
-        self.operations.lock().await.insert(
-            operation_id.clone(),
-            Arc::new(Semaphore::new(concurrency as usize)),
-        );
         let mut jobs = Vec::with_capacity(libraries.len());
         for (library_id, total_count) in libraries {
             let id = Uuid::now_v7().to_string();
@@ -133,9 +129,17 @@ impl StrmProbeService {
             return Ok(());
         }
         if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
+            self.cleanup_operation(&job.operation_id).await?;
             return Ok(());
         }
-        self.run_claimed(job).await
+        let operation_id = job.operation_id.clone();
+        let result = self.run_claimed(job).await;
+        let cleanup_result = self.cleanup_operation(&operation_id).await;
+        match (result, cleanup_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     pub async fn active_job_ids(&self) -> Result<Vec<String>, StrmProbeError> {
@@ -299,6 +303,18 @@ impl StrmProbeService {
             .clone()
     }
 
+    async fn cleanup_operation(&self, operation_id: &str) -> Result<(), StrmProbeError> {
+        if self
+            .database
+            .has_active_strm_probe_jobs_for_operation(operation_id)
+            .await?
+        {
+            return Ok(());
+        }
+        self.operations.lock().await.remove(operation_id);
+        Ok(())
+    }
+
     async fn probe_source(
         &self,
         source: StoredStrmMediaSource,
@@ -453,6 +469,37 @@ fn strm_probe_job(job: StoredStrmProbeJob) -> StrmProbeJob {
         total_count: job.total_count,
         cancel_requested: job.cancel_requested,
         error: job.error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn completed_operation_is_removed_from_registry() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+        service
+            .operations
+            .lock()
+            .await
+            .insert("operation".to_owned(), Arc::new(Semaphore::new(1)));
+
+        service
+            .cleanup_operation("operation")
+            .await
+            .expect("cleanup operation");
+
+        assert!(service.operations.lock().await.is_empty());
+        database.close().await;
     }
 }
 
