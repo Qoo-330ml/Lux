@@ -22,6 +22,7 @@ use crate::{
         settings::{read_danmaku_provider_url_async, read_network_proxy_url_async},
     },
     domain::ids::LibraryId,
+    observability::resources::ResourceMetrics,
     storage::{
         Database, NewDanmakuMatchJob, NewDanmakuTrack, StorageError, StoredDanmakuMatchJob,
         StoredDanmakuSource,
@@ -651,6 +652,7 @@ pub struct DanmakuService {
     database: Database,
     config_dir: PathBuf,
     proxy_url: Option<String>,
+    resources: ResourceMetrics,
 }
 
 impl DanmakuService {
@@ -659,7 +661,13 @@ impl DanmakuService {
             database,
             config_dir,
             proxy_url,
+            resources: ResourceMetrics::new(),
         }
+    }
+
+    pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = resources;
+        self
     }
 
     pub async fn create_job(
@@ -829,7 +837,10 @@ impl DanmakuService {
         self.database
             .reset_running_danmaku_match_items(&job.id)
             .await?;
-        let concurrency = effective_danmaku_concurrency(job.concurrency);
+        let concurrency = self
+            .resources
+            .background_concurrency(effective_danmaku_concurrency(job.concurrency))
+            .await;
         let mut workers: JoinSet<Result<Option<WorkerResult>, StorageError>> = JoinSet::new();
         let mut cancelled = false;
 

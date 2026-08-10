@@ -243,12 +243,18 @@ impl AppState {
                     None => service,
                 }
             }),
-            strm_probe: Some(StrmProbeService::new(database.clone(), plugins.clone())),
-            danmaku: Some(DanmakuService::new(
-                database.clone(),
-                config_dir.clone(),
-                network_proxy_url.clone(),
-            )),
+            strm_probe: Some(
+                StrmProbeService::new(database.clone(), plugins.clone())
+                    .with_resource_metrics(resources.clone()),
+            ),
+            danmaku: Some(
+                DanmakuService::new(
+                    database.clone(),
+                    config_dir.clone(),
+                    network_proxy_url.clone(),
+                )
+                .with_resource_metrics(resources.clone()),
+            ),
             plugins: Some(plugins.clone()),
             scraper_resolver: Some(scraper_resolver),
             tmdb: Some(tmdb),

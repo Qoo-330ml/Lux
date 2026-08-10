@@ -70,11 +70,13 @@ impl ResourceMetrics {
         let available_parallelism = std::thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(1);
+        let (cpu_limit, memory) = tokio::join!(self.cpu_limit_cores(), memory_snapshot());
         recommended_background_concurrency(
             configured,
             available_parallelism,
             self.home_latency_p95_ms(),
-            self.cpu_limit_cores().await,
+            cpu_limit,
+            memory.usage_percent,
         )
     }
 
@@ -420,6 +422,7 @@ pub fn recommended_background_concurrency(
     available_parallelism: usize,
     home_p95_ms: Option<u64>,
     container_cpu_limit: Option<f64>,
+    container_memory_usage_percent: Option<f64>,
 ) -> usize {
     let configured = configured.max(1);
     let container_parallelism = container_cpu_limit
@@ -429,10 +432,15 @@ pub fn recommended_background_concurrency(
         });
     let cpu_cap = container_parallelism.saturating_sub(1).max(1);
     let base = configured.min(cpu_cap);
-    match home_p95_ms {
+    let latency_adjusted = match home_p95_ms {
         Some(value) if value >= HOME_P95_TARGET_MS => 1,
         Some(value) if value >= HOME_P95_DEGRADED_MS => base.div_ceil(2).max(1),
         _ => base,
+    };
+    match container_memory_usage_percent {
+        Some(value) if value >= 85.0 => 1,
+        Some(value) if value >= 70.0 => latency_adjusted.div_ceil(2).max(1),
+        _ => latency_adjusted,
     }
 }
 
@@ -496,11 +504,25 @@ mod tests {
 
     #[test]
     fn background_concurrency_reserves_home_capacity_and_honors_limits() {
-        assert_eq!(recommended_background_concurrency(8, 8, None, None), 7);
-        assert_eq!(recommended_background_concurrency(8, 8, Some(400), None), 1);
         assert_eq!(
-            recommended_background_concurrency(8, 16, None, Some(4.0)),
+            recommended_background_concurrency(8, 8, None, None, None),
+            7
+        );
+        assert_eq!(
+            recommended_background_concurrency(8, 8, Some(400), None, None),
+            1
+        );
+        assert_eq!(
+            recommended_background_concurrency(8, 16, None, Some(4.0), None),
             3
+        );
+        assert_eq!(
+            recommended_background_concurrency(8, 8, None, None, Some(70.0)),
+            4
+        );
+        assert_eq!(
+            recommended_background_concurrency(8, 8, None, None, Some(85.0)),
+            1
         );
     }
 }

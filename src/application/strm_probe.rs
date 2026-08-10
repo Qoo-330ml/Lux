@@ -20,6 +20,7 @@ use crate::{
         strm_probe_policy::validate_remote_media_url,
     },
     domain::ids::LibraryId,
+    observability::resources::ResourceMetrics,
     storage::{
         Database, MediaProbeUpdate, MediaStreamUpdate, StorageError, StoredStrmMediaSource,
         StoredStrmProbeJob,
@@ -36,6 +37,7 @@ pub struct StrmProbeService {
     database: Database,
     plugins: PluginService,
     operations: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    resources: ResourceMetrics,
 }
 
 impl StrmProbeService {
@@ -44,7 +46,13 @@ impl StrmProbeService {
             database,
             plugins,
             operations: Arc::new(Mutex::new(HashMap::new())),
+            resources: ResourceMetrics::new(),
         }
+    }
+
+    pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = resources;
+        self
     }
 
     pub async fn create_jobs(
@@ -217,7 +225,10 @@ impl StrmProbeService {
             Ok(value) => value.clamp(1, MAX_CONCURRENCY as usize),
             Err(_) => 1,
         };
-        let concurrency = per_library.min(requested).max(1);
+        let concurrency = self
+            .resources
+            .background_concurrency(per_library.min(requested).max(1))
+            .await;
         let operation_semaphore = self
             .operation_semaphore(&job.operation_id, job.concurrency)
             .await;
