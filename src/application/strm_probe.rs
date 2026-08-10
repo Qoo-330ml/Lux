@@ -230,7 +230,7 @@ impl StrmProbeService {
             .background_concurrency(per_library.min(requested).max(1))
             .await;
         let operation_semaphore = self
-            .operation_semaphore(&job.operation_id, job.concurrency)
+            .operation_semaphore(&job.operation_id, concurrency)
             .await;
         let mut pending: JoinSet<SourceOutcome> = JoinSet::new();
         // A restarted RUNNING job re-enumerates sources. READY sources can be
@@ -318,15 +318,15 @@ impl StrmProbeService {
         Ok(())
     }
 
-    async fn operation_semaphore(&self, operation_id: &str, concurrency: i64) -> Arc<Semaphore> {
+    async fn operation_semaphore(
+        &self,
+        operation_id: &str,
+        effective_concurrency: usize,
+    ) -> Arc<Semaphore> {
         let mut operations = self.operations.lock().await;
-        let value = match usize::try_from(concurrency) {
-            Ok(value) => value.clamp(1, MAX_CONCURRENCY as usize),
-            Err(_) => 1,
-        };
         operations
             .entry(operation_id.to_owned())
-            .or_insert_with(|| Arc::new(Semaphore::new(value)))
+            .or_insert_with(|| Arc::new(Semaphore::new(effective_concurrency.max(1))))
             .clone()
     }
 
@@ -526,6 +526,26 @@ mod tests {
             .expect("cleanup operation");
 
         assert!(service.operations.lock().await.is_empty());
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn operation_semaphore_uses_the_effective_worker_limit() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+        let effective_limit: usize = 2;
+
+        let semaphore = service
+            .operation_semaphore("operation", effective_limit)
+            .await;
+
+        assert_eq!(semaphore.available_permits(), effective_limit);
         database.close().await;
     }
 }
