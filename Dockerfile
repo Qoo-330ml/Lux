@@ -39,21 +39,21 @@ RUN cargo build --release --locked \
          *) echo "unsupported plugin architecture: $plugin_arch" >&2; exit 1 ;; \
        esac \
     && mkdir -p /src/dist \
-    && cargo run --release --locked --bin lux-plugin-pack -- \
+    && /src/target/release/lux-plugin-pack \
          --plugin tmdb \
          --binary /src/target/release/lux-plugin-tmdb \
          --output /src/dist/org.lux.tmdb.zip \
          --version "$LUX_PLUGIN_VERSION" \
          --platform linux \
          --arch "$plugin_arch" \
-    && cargo run --release --locked --bin lux-plugin-pack -- \
+    && /src/target/release/lux-plugin-pack \
          --plugin ip-hiofd \
          --binary /src/target/release/lux-plugin-ip-hiofd \
          --output /src/dist/org.lux.ip-hiofd.zip \
          --version "$LUX_PLUGIN_VERSION" \
          --platform linux \
          --arch "$plugin_arch" \
-    && cargo run --release --locked --bin lux-plugin-pack -- \
+    && /src/target/release/lux-plugin-pack \
          --plugin qoo-ip138 \
          --binary /src/target/release/lux-plugin-qoo-ip138 \
          --output /src/dist/org.lux.qoo-ip138.zip \
