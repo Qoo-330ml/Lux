@@ -2,9 +2,9 @@
 
 ![Lux logo](logo.svg)
 
-Lux 是面向 NAS 的个人媒体服务端：用 Rust 提供高效、可诊断的媒体索引与播放服务，用 React + TypeScript 提供同源 Web 客户端，并通过 Emby 兼容 API 连接 VidHub、SenPlayer 等第三方客户端。
+Lux 是面向 NAS 的个人媒体服务端：用 Rust 提供高效、可诊断的媒体索引与播放服务，用 React + TypeScript 提供同源 Web 客户端（暂不支持web播放），并通过 Emby 兼容 API 连接 VidHub、SenPlayer 等第三方客户端。
 
-Lux 目前处于 `0.1.x` 快速迭代阶段。功能边界、任务进度和验收标准以 [`docs/LUX-DEVELOPMENT.md`](docs/LUX-DEVELOPMENT.md) 为准；第三方客户端的实测结果以 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) 为准。
+Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、加载慢等痛点。虽然Emby的第三方客户端开发环境很好，大批量的第三方播放器涌现弥补了Emby的一些问题，但指标不治本，作为一个媒体管理者，打开emby网页对于我来说真的变成了一件很痛苦的事情。于是本项目因运而生，Lux兼容了Emby的大部分接口，可以直接使用第三方emby客户端进行连接Lux，获得很好的播放体验，同时媒体库的占用也大大降低，流畅性得到了提高。
 
 ## 特性
 
