@@ -205,7 +205,7 @@ impl CatalogService {
         if !self.access.can_view_item(principal, series_id).await? {
             return Err(CatalogError::AccessDenied);
         }
-        let season_ids = if let Some(season_id) = season_id {
+        if let Some(season_id) = season_id {
             let season = self
                 .database
                 .find_catalog_rows(season_id)
@@ -219,35 +219,21 @@ impl CatalogService {
             let Some(_) = season else {
                 return Err(CatalogError::LibraryNotFound);
             };
-            vec![season_id.to_owned()]
-        } else {
-            let rows = self
-                .database
-                .list_catalog_children(series_id, "SEASON", 0, i64::MAX)
-                .await?;
-            rows.into_iter().map(|row| row.item_id).collect::<Vec<_>>()
-        };
-        let mut items = Vec::new();
-        for season_id in season_ids {
-            let rows = self
-                .database
-                .list_catalog_children(&season_id, "EPISODE", 0, i64::MAX)
-                .await?;
-            items.extend(assemble_items(rows));
         }
-        items.sort_by(|left, right| {
-            left.season_number
-                .cmp(&right.season_number)
-                .then_with(|| left.episode_number.cmp(&right.episode_number))
-                .then_with(|| left.sort_title.cmp(&right.sort_title))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
-        let items = items
+
+        let (item_ids, total) = self
+            .database
+            .list_series_episode_ids(series_id, season_id, offset, limit)
+            .await?;
+        let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
+        let items_by_id = assemble_items(rows)
             .into_iter()
-            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-            .take(usize::try_from(limit).unwrap_or(0))
-            .collect();
+            .map(|item| (item.id.clone(), item))
+            .collect::<HashMap<_, _>>();
+        let items = item_ids
+            .iter()
+            .filter_map(|item_id| items_by_id.get(item_id).cloned())
+            .collect::<Vec<_>>();
         Ok(CatalogPage {
             items,
             total,
@@ -471,50 +457,6 @@ impl CatalogService {
             apply_catalog_detail(&mut item, &detail);
         }
         Ok(Some(item))
-    }
-
-    pub async fn list_all_items(
-        &self,
-        principal: AccessPrincipal,
-        offset: i64,
-        limit: i64,
-    ) -> Result<CatalogPage, CatalogError> {
-        if principal.is_admin {
-            let total = self.database.count_catalog_items(None).await?;
-            let rows = self.database.list_catalog_rows(None, offset, limit).await?;
-            return Ok(CatalogPage {
-                items: assemble_items(rows),
-                total,
-                offset,
-                limit,
-            });
-        }
-        let library_ids = self.access.accessible_library_ids(principal).await?;
-        let mut items = Vec::new();
-        for library_id in library_ids {
-            let rows = self
-                .database
-                .list_catalog_rows(Some(&library_id), 0, i64::MAX)
-                .await?;
-            items.extend(assemble_items(rows));
-        }
-        items.sort_by(|left, right| {
-            left.sort_title
-                .cmp(&right.sort_title)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
-        let items = items
-            .into_iter()
-            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-            .take(usize::try_from(limit).unwrap_or(0))
-            .collect();
-        Ok(CatalogPage {
-            items,
-            total,
-            offset,
-            limit,
-        })
     }
 
     pub async fn search_items(

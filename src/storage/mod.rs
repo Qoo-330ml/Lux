@@ -5792,6 +5792,66 @@ impl Database {
         .await
     }
 
+    pub(crate) async fn list_series_episode_ids(
+        &self,
+        series_id: &str,
+        season_id: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<String>, i64), StorageError> {
+        let season_filter = if season_id.is_some() {
+            " AND mi.parent_id = ?"
+        } else {
+            ""
+        };
+        let count_sql = format!(
+            "SELECT COUNT(*)
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.series_id = ? AND mi.item_type = 'EPISODE'
+               AND mi.removed_at IS NULL{season_filter}
+               {CATALOG_VISIBLE_PREDICATE}"
+        );
+        let mut count_statement = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql))
+            .bind(series_id);
+        if let Some(season_id) = season_id {
+            count_statement = count_statement.bind(season_id);
+        }
+        let total = count_statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let list_sql = format!(
+            "SELECT mi.id
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.series_id = ? AND mi.item_type = 'EPISODE'
+               AND mi.removed_at IS NULL{season_filter}
+               {CATALOG_VISIBLE_PREDICATE}
+             ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id
+             LIMIT ? OFFSET ?"
+        );
+        let mut list_statement = self.query(sqlx::AssertSqlSafe(list_sql)).bind(series_id);
+        if let Some(season_id) = season_id {
+            list_statement = list_statement.bind(season_id);
+        }
+        let rows = list_statement
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
+    }
+
     pub(crate) async fn count_resume_items(
         &self,
         user_id: &str,

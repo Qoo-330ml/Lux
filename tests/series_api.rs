@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use luxd::{
     api::{AppState, app_with_state},
     application::{
@@ -422,6 +424,45 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .send()
         .await?;
     assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < 20000
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id,
+             season_number, episode_number, title, sort_title,
+             identification_status, identity_key, has_available_source
+         )
+         SELECT printf('bulk-episode-%05d', value), ?, 'EPISODE', ?, ?,
+                2, value, printf('Bulk Episode %05d', value),
+                printf('Bulk Episode %05d', value), 'LOCAL_CONFIRMED',
+                printf('bulk-episode:%05d', value), 1
+         FROM sequence",
+    )
+    .bind(library.id.to_string())
+    .bind(&season_id)
+    .bind(&series_id)
+    .execute(database.pool())
+    .await?;
+    let large_page = tokio::time::timeout(Duration::from_secs(1), async {
+        client
+            .get(format!(
+                "{base_url}/Shows/{series_id}/Episodes?StartIndex=3&Limit=1"
+            ))
+            .header("X-Emby-Token", &token)
+            .send()
+            .await
+    })
+    .await
+    .map_err(|_| "episode page materialized the complete series")??;
+    assert_eq!(large_page.status(), reqwest::StatusCode::OK);
+    let large_page_body = large_page.json::<Value>().await?;
+    assert_eq!(large_page_body["TotalRecordCount"], 20003);
+    assert_eq!(large_page_body["Items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(large_page_body["Items"][0]["Id"], "bulk-episode-00001");
 
     server.abort();
     assert_ne!(admin.id, viewer.id);
