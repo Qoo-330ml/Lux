@@ -221,6 +221,7 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
         .to_owned();
     assert_eq!(started_body["job"]["totalCount"], 1);
     assert_eq!(started_body["job"]["mode"], "REIDENTIFY");
+    assert_eq!(started_body["job"]["libraryId"], library.id.to_string());
 
     let mut job = Value::Null;
     for _ in 0..80 {
@@ -443,6 +444,7 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
             job["mode"] == "REIDENTIFY"
                 && job["status"] == "COMPLETED"
                 && job["processedCount"] == 1
+                && job["libraryId"] == library.id.to_string()
         })
     }));
 

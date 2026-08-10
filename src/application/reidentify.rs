@@ -569,6 +569,7 @@ impl MetadataReidentifyService {
             finished_at: job.finished_at,
             items: items.into_iter().map(metadata_reidentify_item).collect(),
             cancel_requested: job.cancel_requested,
+            library_id: job.library_id,
         })
     }
 
@@ -625,6 +626,7 @@ pub struct MetadataReidentifyJob {
     pub mode: String,
     pub items: Vec<MetadataReidentifyItem>,
     pub cancel_requested: bool,
+    pub library_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

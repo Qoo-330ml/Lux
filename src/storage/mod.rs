@@ -3073,7 +3073,14 @@ impl Database {
         self.query(
             "SELECT id, status, processed_count, total_count, error,
                     created_at, updated_at, started_at, finished_at, mode,
-                    cancel_requested
+                    cancel_requested,
+                    (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
+                            THEN MIN(media_items.library_id)
+                            ELSE NULL END
+                     FROM metadata_reidentify_job_items
+                     JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
+                     WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
+                    ) AS library_id
              FROM metadata_reidentify_jobs WHERE id = ?",
         )
         .bind(job_id)
@@ -3096,7 +3103,14 @@ impl Database {
             self.query(
                 "SELECT id, status, processed_count, total_count, error,
                         created_at, updated_at, started_at, finished_at, mode,
-                        cancel_requested
+                        cancel_requested,
+                        (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
+                                THEN MIN(media_items.library_id)
+                                ELSE NULL END
+                         FROM metadata_reidentify_job_items
+                         JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
+                         WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
+                        ) AS library_id
                  FROM metadata_reidentify_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -3109,7 +3123,14 @@ impl Database {
             self.query(
                 "SELECT id, status, processed_count, total_count, error,
                         created_at, updated_at, started_at, finished_at, mode,
-                        cancel_requested
+                        cancel_requested,
+                        (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
+                                THEN MIN(media_items.library_id)
+                                ELSE NULL END
+                         FROM metadata_reidentify_job_items
+                         JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
+                         WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
+                        ) AS library_id
                  FROM metadata_reidentify_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -8786,6 +8807,7 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) finished_at: Option<i64>,
     pub(crate) mode: String,
     pub(crate) cancel_requested: bool,
+    pub(crate) library_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -8811,6 +8833,7 @@ fn stored_metadata_reidentify_job(row: sqlx::any::AnyRow) -> StoredMetadataReide
         finished_at: row.get("finished_at"),
         mode: row.get("mode"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
+        library_id: row.get("library_id"),
     }
 }
 

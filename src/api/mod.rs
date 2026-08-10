@@ -10966,6 +10966,7 @@ fn metadata_reidentify_job_json(
         "startedAt": job.started_at,
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
+        "libraryId": job.library_id,
         "items": job.items.iter().map(|item| json!({
             "jobId": item.job_id,
             "itemId": item.item_id,
@@ -10992,6 +10993,7 @@ fn metadata_reidentify_job_summary_json(
         "startedAt": job.started_at,
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
+        "libraryId": job.library_id,
     })
 }
 
