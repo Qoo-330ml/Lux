@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -14,7 +14,11 @@ use notify::{
     event::{ModifyKind, RenameMode},
 };
 use tokio::sync::mpsc;
-use tokio::{sync::Mutex, task::JoinSet, time::sleep};
+use tokio::{
+    sync::Mutex,
+    task::{AbortHandle, JoinSet},
+    time::sleep,
+};
 
 use crate::{
     application::scanner::{IncrementalScanChange, ScanJobService},
@@ -118,6 +122,21 @@ impl LibraryWatcher {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WatcherToken(u64);
+
+#[derive(Debug)]
+struct ActiveWatcher {
+    token: WatcherToken,
+    abort_handle: AbortHandle,
+}
+
+#[derive(Debug)]
+struct WatcherTaskResult {
+    root_id: String,
+    token: WatcherToken,
+}
+
 #[derive(Clone)]
 pub struct LibraryWatchService {
     database: Database,
@@ -144,20 +163,30 @@ impl LibraryWatchService {
     }
 
     async fn run(self) {
-        let mut active_roots = HashSet::<String>::new();
+        let mut active_roots = HashMap::<String, ActiveWatcher>::new();
         let mut watcher_tasks = JoinSet::new();
         let running_jobs = Arc::new(Mutex::new(HashSet::<String>::new()));
-        self.refresh_roots(&mut active_roots, &mut watcher_tasks, &running_jobs)
-            .await;
+        let mut next_token = 0;
+        self.refresh_roots(
+            &mut active_roots,
+            &mut watcher_tasks,
+            &running_jobs,
+            &mut next_token,
+        )
+        .await;
         loop {
             tokio::select! {
                 _ = sleep(Duration::from_secs(1)) => {
-                    self.refresh_roots(&mut active_roots, &mut watcher_tasks, &running_jobs)
-                        .await;
+                    self.refresh_roots(
+                        &mut active_roots,
+                        &mut watcher_tasks,
+                        &running_jobs,
+                        &mut next_token,
+                    ).await;
                 }
-                Some(result) = watcher_tasks.join_next(), if !active_roots.is_empty() => {
-                    if let Ok(root_id) = result {
-                        active_roots.remove(&root_id);
+                Some(result) = watcher_tasks.join_next() => {
+                    if let Ok(result) = result {
+                        remove_completed_watcher(&mut active_roots, result);
                     }
                 }
             }
@@ -166,23 +195,38 @@ impl LibraryWatchService {
 
     async fn refresh_roots(
         &self,
-        active_roots: &mut HashSet<String>,
-        watcher_tasks: &mut JoinSet<String>,
+        active_roots: &mut HashMap<String, ActiveWatcher>,
+        watcher_tasks: &mut JoinSet<WatcherTaskResult>,
         running_jobs: &Arc<Mutex<HashSet<String>>>,
+        next_token: &mut u64,
     ) {
         match self.database.list_enabled_library_roots().await {
             Ok(roots) => {
+                let enabled_root_ids = roots
+                    .iter()
+                    .map(|root| root.id.clone())
+                    .collect::<HashSet<_>>();
+                reconcile_active_roots(active_roots, &enabled_root_ids);
                 for root in roots {
-                    if !active_roots.insert(root.id.clone()) {
+                    if active_roots.contains_key(&root.id) {
                         continue;
                     }
                     let service = self.clone();
                     let running_jobs = Arc::clone(running_jobs);
-                    watcher_tasks.spawn(async move {
+                    let root_id = root.id.clone();
+                    let token = next_watcher_token(next_token);
+                    let watcher_handle = watcher_tasks.spawn(async move {
                         let root_id = root.id.clone();
                         service.watch_root(root, running_jobs).await;
-                        root_id
+                        WatcherTaskResult { root_id, token }
                     });
+                    active_roots.insert(
+                        root_id,
+                        ActiveWatcher {
+                            token,
+                            abort_handle: watcher_handle,
+                        },
+                    );
                 }
             }
             Err(error) => {
@@ -256,6 +300,40 @@ impl LibraryWatchService {
                 }
             }
         }
+    }
+}
+
+fn reconcile_active_roots(
+    active_roots: &mut HashMap<String, ActiveWatcher>,
+    enabled_root_ids: &HashSet<String>,
+) {
+    let stale_root_ids = active_roots
+        .keys()
+        .filter(|root_id| !enabled_root_ids.contains(*root_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for root_id in stale_root_ids {
+        if let Some(active_watcher) = active_roots.remove(&root_id) {
+            active_watcher.abort_handle.abort();
+        }
+    }
+}
+
+fn next_watcher_token(next_token: &mut u64) -> WatcherToken {
+    let token = WatcherToken(*next_token);
+    *next_token = next_token.wrapping_add(1);
+    token
+}
+
+fn remove_completed_watcher(
+    active_roots: &mut HashMap<String, ActiveWatcher>,
+    completed: WatcherTaskResult,
+) {
+    if active_roots
+        .get(&completed.root_id)
+        .is_some_and(|active| active.token == completed.token)
+    {
+        active_roots.remove(&completed.root_id);
     }
 }
 
@@ -367,5 +445,91 @@ impl std::error::Error for WatchError {
             Self::Io { source, .. } => Some(source),
             Self::Notify(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{HashMap, HashSet},
+        future::pending,
+    };
+
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn disabled_root_aborts_its_watch_task() {
+        let mut watcher_tasks = JoinSet::new();
+        let watcher_handle = watcher_tasks.spawn(async { pending::<WatcherTaskResult>().await });
+        let mut active_roots = HashMap::from([(
+            String::from("root-1"),
+            ActiveWatcher {
+                token: WatcherToken(1),
+                abort_handle: watcher_handle,
+            },
+        )]);
+
+        reconcile_active_roots(&mut active_roots, &HashSet::from([String::from("root-2")]));
+
+        assert!(active_roots.is_empty());
+        let result = watcher_tasks
+            .join_next()
+            .await
+            .expect("aborted watcher should be joinable")
+            .expect_err("aborted watcher must not return normally");
+        assert!(result.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn old_watcher_result_does_not_remove_replacement() {
+        let mut watcher_tasks = JoinSet::new();
+        let (complete_old_tx, complete_old_rx) = oneshot::channel();
+        let old_result = WatcherTaskResult {
+            root_id: String::from("root-1"),
+            token: WatcherToken(1),
+        };
+        let old_handle = watcher_tasks.spawn(async move {
+            let _ = complete_old_rx.await;
+            old_result
+        });
+        let mut active_roots = HashMap::from([(
+            String::from("root-1"),
+            ActiveWatcher {
+                token: WatcherToken(1),
+                abort_handle: old_handle.clone(),
+            },
+        )]);
+        complete_old_tx
+            .send(())
+            .expect("old watcher should still be waiting");
+        while !old_handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        reconcile_active_roots(&mut active_roots, &HashSet::new());
+
+        let replacement_handle =
+            watcher_tasks.spawn(async { pending::<WatcherTaskResult>().await });
+        active_roots.insert(
+            String::from("root-1"),
+            ActiveWatcher {
+                token: WatcherToken(2),
+                abort_handle: replacement_handle,
+            },
+        );
+
+        let completed = watcher_tasks
+            .join_next()
+            .await
+            .expect("old watcher result should be available")
+            .expect("old watcher should finish normally");
+        remove_completed_watcher(&mut active_roots, completed);
+
+        assert_eq!(
+            active_roots.get("root-1").map(|active| active.token),
+            Some(WatcherToken(2))
+        );
+        watcher_tasks.abort_all();
     }
 }
