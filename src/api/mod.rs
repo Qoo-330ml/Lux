@@ -3,6 +3,7 @@ pub mod lux;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Component, Path as FsPath, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -422,6 +423,7 @@ pub fn app() -> Router {
 pub fn app_with_state(state: AppState) -> Router {
     let web_root = web_root();
     let resources = state.resources.clone();
+    let catalog_requests = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
     Router::new()
         .route("/logo.svg", get(web_logo))
         .route("/health/live", get(live))
@@ -700,6 +702,24 @@ pub fn app_with_state(state: AppState) -> Router {
                 .fallback(ServeFile::new(web_root.join("index.html"))),
         )
         .with_state(state)
+        .layer(middleware::from_fn(
+            move |request: Request<Body>, next: Next| {
+                let catalog_requests = catalog_requests.clone();
+                async move {
+                    let permit = if is_catalog_aggregation_path(request.uri().path()) {
+                        match catalog_requests.try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        }
+                    } else {
+                        None
+                    };
+                    let response = next.run(request).await;
+                    drop(permit);
+                    response
+                }
+            },
+        ))
         .layer(middleware::from_fn(attach_peer_address))
         .layer(middleware::from_fn(trace_emby_playback_callback))
         .layer(middleware::from_fn(trace_emby_playback_info))
@@ -758,6 +778,30 @@ pub fn app_with_state(state: AppState) -> Router {
                 )
                 .propagate_x_request_id(),
         )
+}
+
+const MAX_CONCURRENT_CATALOG_REQUESTS: usize = 16;
+
+fn is_catalog_aggregation_path(path: &str) -> bool {
+    let route = path
+        .strip_prefix("/emby/")
+        .or_else(|| path.strip_prefix('/'))
+        .unwrap_or(path);
+    let segments = route.split('/').collect::<Vec<_>>();
+
+    matches!(
+        segments.as_slice(),
+        ["api", "v1", "favorites" | "search" | "home"]
+            | ["api", "v1", "libraries", _, "items"]
+            | ["api", "v1", "items", _, "children"]
+            | ["api", "v1", "collections", _]
+            | ["Users", _, "Items"]
+            | ["Users", _, "Items", "Resume" | "Latest" | "NextUp"]
+            | ["Shows", _, "Seasons" | "Episodes"]
+            | ["Items"]
+            | ["Search", "Hints"]
+            | ["Items", _, "Children"]
+    )
 }
 
 async fn normalize_empty_api_service_unavailable(request: Request<Body>, next: Next) -> Response {
@@ -12319,10 +12363,10 @@ mod tests {
     use super::{
         MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby,
         emby_media_source_json, emby_media_stream_item_id, emby_playback_info_item_id,
-        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
-        is_emby_subtitle_path, is_emby_video_path, is_registered_emby_video_path,
-        lux_catalog_source_json, metadata_candidate_failure_kind, playback_client_label,
-        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
+        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
+        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
+        playback_client_label, playback_identifier_prefix, record_activity_event, safe_trace_path,
         secure_cookie_for_request,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
@@ -12337,6 +12381,31 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri};
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn catalog_concurrency_guard_excludes_streaming_paths() {
+        for path in [
+            "/api/v1/home",
+            "/api/v1/libraries/library-1/items",
+            "/api/v1/collections/collection-1",
+            "/Users/user-1/Items/Resume",
+            "/emby/Shows/show-1/Episodes",
+            "/Items/collection-1/Children",
+        ] {
+            assert!(is_catalog_aggregation_path(path), "{path}");
+        }
+
+        for path in [
+            "/api/v1/items/item-1/stream",
+            "/api/v1/items/item-1/download",
+            "/Videos/item-1/stream.mkv",
+            "/emby/Videos/item-1/source-1/stream",
+            "/Items/item-1/Download",
+            "/Items/item-1/PlaybackInfo",
+        ] {
+            assert!(!is_catalog_aggregation_path(path), "{path}");
+        }
+    }
 
     #[test]
     fn metadata_candidate_errors_have_fixed_diagnostic_categories() {
