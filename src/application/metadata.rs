@@ -460,10 +460,46 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
+    collect_local_images(paths, None)
+}
+
+pub(crate) fn find_local_images_for_media<I, P>(paths: I, media_stem: &str) -> Vec<LocalImage>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    collect_local_images(paths, Some(media_stem))
+}
+
+fn collect_local_images<I, P>(paths: I, media_stem: Option<&str>) -> Vec<LocalImage>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let paths = paths
+        .into_iter()
+        .map(|path| path.as_ref().to_owned())
+        .collect::<Vec<_>>();
     let mut images = Vec::new();
+    if let Some(media_stem) = media_stem {
+        for path in &paths {
+            let Some(image_type) = image_type_for_media(path, media_stem) else {
+                continue;
+            };
+            if images
+                .iter()
+                .any(|image: &LocalImage| image.image_type == image_type)
+            {
+                continue;
+            }
+            images.push(LocalImage {
+                image_type,
+                path: path.to_owned(),
+            });
+        }
+    }
     for path in paths {
-        let path = path.as_ref();
-        let Some(image_type) = image_type_for(path) else {
+        let Some(image_type) = image_type_for(&path) else {
             continue;
         };
         if images
@@ -472,21 +508,50 @@ where
         {
             continue;
         }
-        images.push(LocalImage {
-            image_type,
-            path: path.to_owned(),
-        });
+        images.push(LocalImage { image_type, path });
     }
     images
 }
 
 fn image_type_for(path: &Path) -> Option<ImageType> {
-    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
         return None;
     }
-    match stem.as_str() {
+    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+    image_type_for_stem(&stem)
+}
+
+fn image_type_for_media(path: &Path, media_stem: &str) -> Option<ImageType> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    [
+        ("poster", ImageType::Poster),
+        ("fanart", ImageType::Fanart),
+        ("backdrop", ImageType::Fanart),
+        ("logo", ImageType::Logo),
+        ("clearlogo", ImageType::Logo),
+        ("thumb", ImageType::Thumb),
+        ("thumbnail", ImageType::Thumb),
+        ("banner", ImageType::Banner),
+        ("disc", ImageType::Disc),
+        ("discart", ImageType::Disc),
+        ("art", ImageType::Art),
+        ("artwork", ImageType::Art),
+        ("wallpaper", ImageType::Wallpaper),
+    ]
+    .into_iter()
+    .find_map(|(suffix, image_type)| {
+        let expected = format!("{media_stem}-{suffix}");
+        stem.eq_ignore_ascii_case(&expected).then_some(image_type)
+    })
+}
+
+fn image_type_for_stem(stem: &str) -> Option<ImageType> {
+    match stem {
         "poster" => Some(ImageType::Poster),
         "fanart" | "backdrop" => Some(ImageType::Fanart),
         "logo" | "clearlogo" => Some(ImageType::Logo),
@@ -693,8 +758,14 @@ impl MetadataEnricher {
     ) -> Result<usize, MetadataError> {
         let image_paths =
             read_directory_paths(media_path.parent().unwrap_or(Path::new("."))).await?;
+        let images =
+            if let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) {
+                find_local_images_for_media(image_paths, media_stem)
+            } else {
+                find_local_images(image_paths)
+            };
         let mut inserted_count = 0;
-        for image in find_local_images(image_paths) {
+        for image in images {
             let file_size = match fs::metadata(&image.path).await {
                 Ok(metadata) => metadata.len(),
                 Err(error) => {

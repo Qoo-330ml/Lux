@@ -184,9 +184,14 @@ impl ImageWriteService {
     ) -> Result<bool, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
-        let (_, directory, episode_stem) = self.writeback_paths(item_id).await?;
-        let Some(path) =
-            find_any_image_path(&directory, image_type, episode_stem.as_deref()).await?
+        let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let Some(path) = find_any_image_path(
+            &directory,
+            image_type,
+            movie_stem.as_deref(),
+            episode_stem.as_deref(),
+        )
+        .await?
         else {
             return Ok(false);
         };
@@ -281,8 +286,15 @@ impl ImageWriteService {
         }
         validate_image_payload(format, &body)?;
 
-        let (root, directory, episode_stem) = self.writeback_paths(item_id).await?;
-        let target = image_target(&directory, image_type, format, episode_stem.as_deref()).await?;
+        let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let target = image_target(
+            &directory,
+            image_type,
+            format,
+            movie_stem.as_deref(),
+            episode_stem.as_deref(),
+        )
+        .await?;
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
         }
@@ -381,7 +393,7 @@ impl ImageWriteService {
     async fn writeback_paths(
         &self,
         item_id: &str,
-    ) -> Result<(PathBuf, PathBuf, Option<String>), ImageWriteError> {
+    ) -> Result<(PathBuf, PathBuf, Option<String>, Option<String>), ImageWriteError> {
         let kind = self
             .database
             .find_media_item_kind(item_id)
@@ -434,7 +446,16 @@ impl ImageWriteService {
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("episode-{item_id}"))
         });
-        Ok((root, directory, episode_stem))
+        let movie_stem = (item_type == "MOVIE")
+            .then(|| {
+                media_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+            .flatten();
+        Ok((root, directory, movie_stem, episode_stem))
     }
 }
 
@@ -731,62 +752,53 @@ async fn image_target(
     directory: &Path,
     image_type: &str,
     format: ImageFormat,
+    movie_stem: Option<&str>,
     episode_stem: Option<&str>,
 ) -> Result<PathBuf, ImageWriteError> {
-    let image_stem = match image_type {
-        "POSTER" => "poster",
-        "FANART" => "fanart",
-        "LOGO" => "logo",
-        "THUMB" => "thumb",
-        "BANNER" => "banner",
-        "DISC" => "disc",
-        "ART" => "art",
-        "WALLPAPER" => "wallpaper",
-        _ => return Err(ImageWriteError::InvalidImageType(image_type.to_owned())),
-    };
-    let stem = image_file_stem(image_stem, episode_stem);
-    let mut candidates = Vec::new();
-    let mut entries = fs::read_dir(directory)
-        .await
-        .map_err(|source| image_io_error(directory, source))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|source| image_io_error(directory, source))?
-    {
-        let path = entry.path();
-        let matches_stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case(&stem));
-        let known_extension = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "jpg" | "jpeg" | "png" | "webp"
-                )
-            });
-        if matches_stem && known_extension {
-            candidates.push(path);
-        }
+    let (prefixed_stem, generic_stem) = image_file_stems(image_type, movie_stem, episode_stem)?;
+    let mut stems = Vec::with_capacity(2);
+    if let Some(prefixed_stem) = prefixed_stem.as_ref() {
+        stems.push(prefixed_stem.clone());
     }
-    candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-    if let Some(existing) = candidates
-        .into_iter()
-        .find(|path| format.matches_path(path))
-    {
+    stems.push(generic_stem.clone());
+    if let Some(existing) = find_existing_image_path(directory, &stems, Some(format)).await? {
         return Ok(existing);
     }
-    Ok(directory.join(format!("{stem}.{}", format.extension())))
+    let target_stem = if let Some(prefixed_stem) = prefixed_stem {
+        let prefixed_exists = find_existing_image_path(directory, &[prefixed_stem.clone()], None)
+            .await?
+            .is_some();
+        if prefixed_exists || directory_has_multiple_media_files(directory).await? {
+            prefixed_stem
+        } else {
+            generic_stem
+        }
+    } else {
+        generic_stem
+    };
+    Ok(directory.join(format!("{target_stem}.{}", format.extension())))
 }
 
 async fn find_any_image_path(
     directory: &Path,
     image_type: &str,
+    movie_stem: Option<&str>,
     episode_stem: Option<&str>,
 ) -> Result<Option<PathBuf>, ImageWriteError> {
+    let (prefixed_stem, generic_stem) = image_file_stems(image_type, movie_stem, episode_stem)?;
+    if let Some(prefixed_stem) = prefixed_stem {
+        if let Some(path) = find_existing_image_path(directory, &[prefixed_stem], None).await? {
+            return Ok(Some(path));
+        }
+    }
+    find_existing_image_path(directory, &[generic_stem], None).await
+}
+
+fn image_file_stems(
+    image_type: &str,
+    movie_stem: Option<&str>,
+    episode_stem: Option<&str>,
+) -> Result<(Option<String>, String), ImageWriteError> {
     let image_stem = match image_type {
         "POSTER" => "poster",
         "FANART" => "fanart",
@@ -798,7 +810,23 @@ async fn find_any_image_path(
         "WALLPAPER" => "wallpaper",
         _ => return Err(ImageWriteError::InvalidImageType(image_type.to_owned())),
     };
-    let stem = image_file_stem(image_stem, episode_stem);
+    let image_stem = if episode_stem.is_some() && image_stem == "fanart" {
+        "thumb"
+    } else {
+        image_stem
+    };
+    let generic_stem = episode_stem
+        .map(|episode_stem| format!("{episode_stem}-{image_stem}"))
+        .unwrap_or_else(|| image_stem.to_owned());
+    let prefixed_stem = movie_stem.map(|movie_stem| format!("{movie_stem}-{image_stem}"));
+    Ok((prefixed_stem, generic_stem))
+}
+
+async fn find_existing_image_path(
+    directory: &Path,
+    stems: &[String],
+    format: Option<ImageFormat>,
+) -> Result<Option<PathBuf>, ImageWriteError> {
     let mut candidates = Vec::new();
     let mut entries = fs::read_dir(directory)
         .await
@@ -812,7 +840,7 @@ async fn find_any_image_path(
         let matches_stem = path
             .file_stem()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case(&stem));
+            .is_some_and(|value| stems.iter().any(|stem| value.eq_ignore_ascii_case(stem)));
         let known_extension = path
             .extension()
             .and_then(|value| value.to_str())
@@ -822,23 +850,54 @@ async fn find_any_image_path(
                     "jpg" | "jpeg" | "png" | "webp"
                 )
             });
-        if matches_stem && known_extension {
+        let matching_format = format.is_none_or(|format| format.matches_path(&path));
+        if matches_stem && known_extension && matching_format {
             candidates.push(path);
         }
     }
     candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-    Ok(candidates.into_iter().next())
+    for stem in stems {
+        if let Some(path) = candidates.iter().find(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(stem))
+        }) {
+            return Ok(Some(path.clone()));
+        }
+    }
+    Ok(None)
 }
 
-fn image_file_stem(image_stem: &str, episode_stem: Option<&str>) -> String {
-    let image_stem = if episode_stem.is_some() && image_stem == "fanart" {
-        "thumb"
-    } else {
-        image_stem
-    };
-    episode_stem
-        .map(|episode_stem| format!("{episode_stem}-{image_stem}"))
-        .unwrap_or_else(|| image_stem.to_owned())
+async fn directory_has_multiple_media_files(directory: &Path) -> Result<bool, ImageWriteError> {
+    let mut entries = fs::read_dir(directory)
+        .await
+        .map_err(|source| image_io_error(directory, source))?;
+    let mut media_count = 0;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| image_io_error(directory, source))?
+    {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|source| image_io_error(&path, source))?;
+        if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "mkv" | "mp4" | "strm")
+                })
+        {
+            media_count += 1;
+            if media_count > 1 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub async fn write_image_atomically(target: &Path, bytes: &[u8]) -> Result<(), ImageWriteError> {

@@ -96,6 +96,53 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
 }
 
 #[tokio::test]
+async fn downloads_flat_movie_images_to_distinct_media_prefixed_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_ids, _root, media_root) = prepared_flat_movies().await?;
+    let app = Router::new().route(
+        "/poster",
+        get(|| async {
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(PNG_1X1.to_vec()))
+                .expect("test image response should be valid")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let service = ImageWriteService::new(database.clone())?;
+    let first = service
+        .download_item_image(&item_ids[0], "poster", &format!("http://{address}/poster"))
+        .await?;
+    let second = service
+        .download_item_image(&item_ids[1], "poster", &format!("http://{address}/poster"))
+        .await?;
+    let canonical_media_root = tokio::fs::canonicalize(&media_root).await?;
+
+    assert_eq!(
+        first.path,
+        canonical_media_root.join("Flat.One.2020-poster.png")
+    );
+    assert_eq!(
+        second.path,
+        canonical_media_root.join("Flat.Two.2021-poster.png")
+    );
+    assert_ne!(first.path, second.path);
+    assert_eq!(tokio::fs::read(&first.path).await?, PNG_1X1);
+    assert_eq!(tokio::fs::read(&second.path).await?, PNG_1X1);
+
+    let skipped = service
+        .download_item_image_if_missing(&item_ids[0], "poster", &format!("http://{address}/poster"))
+        .await?;
+    assert!(skipped.is_none());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn episode_images_use_distinct_paths_and_ignore_season_artwork()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, episodes, season_dir) = prepared_episodes().await?;
@@ -283,6 +330,41 @@ async fn prepared_movie() -> Result<(Database, String, PathBuf, PathBuf), Box<dy
         .fetch_one(database.pool())
         .await?;
     Ok((database, item_id, root, movie_dir))
+}
+
+async fn prepared_flat_movies()
+-> Result<(Database, Vec<String>, PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let root = temp_dir.keep().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    for stem in ["Flat.One.2020", "Flat.Two.2021"] {
+        tokio::fs::write(
+            root.join(format!("{stem}.strm")),
+            "https://example.invalid/flat",
+        )
+        .await?;
+    }
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: root.join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' ORDER BY sort_title",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    Ok((database, item_ids, root.clone(), root))
 }
 
 async fn prepared_episodes() -> Result<(Database, Vec<String>, PathBuf), Box<dyn std::error::Error>>

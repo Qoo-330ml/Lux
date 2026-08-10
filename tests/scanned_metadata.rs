@@ -61,6 +61,68 @@ async fn completed_movie_scan_indexes_local_nfo_and_images()
 }
 
 #[tokio::test]
+async fn completed_flat_movie_scan_indexes_media_prefixed_images_per_item()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root).await?;
+    for (stem, poster, backdrop) in [
+        ("Flat.One.2020", "poster.png", "fanart.jpg"),
+        ("Flat.Two.2021", "poster.png", "backdrop.jpg"),
+    ] {
+        tokio::fs::write(
+            media_root.join(format!("{stem}.strm")),
+            "https://example.invalid/media/flat",
+        )
+        .await?;
+        tokio::fs::write(media_root.join(format!("{stem}-{poster}")), b"poster").await?;
+        tokio::fs::write(media_root.join(format!("{stem}-{backdrop}")), b"backdrop").await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let images: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT media_items.sort_title, item_images.image_type, item_images.local_path
+         FROM item_images
+         JOIN media_items ON media_items.id = item_images.item_id
+         ORDER BY media_items.sort_title, item_images.image_type",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(images.len(), 4);
+    assert!(images.iter().any(|(title, image_type, path)| {
+        title == "flat one" && image_type == "POSTER" && path.ends_with("Flat.One.2020-poster.png")
+    }));
+    assert!(images.iter().any(|(title, image_type, path)| {
+        title == "flat one" && image_type == "FANART" && path.ends_with("Flat.One.2020-fanart.jpg")
+    }));
+    assert!(images.iter().any(|(title, image_type, path)| {
+        title == "flat two" && image_type == "POSTER" && path.ends_with("Flat.Two.2021-poster.png")
+    }));
+    assert!(images.iter().any(|(title, image_type, path)| {
+        title == "flat two"
+            && image_type == "FANART"
+            && path.ends_with("Flat.Two.2021-backdrop.jpg")
+    }));
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_mixed_scan_indexes_local_movie_and_series_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
