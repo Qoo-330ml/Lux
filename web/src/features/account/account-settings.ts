@@ -81,6 +81,11 @@ export function moveLibrary(
   return next;
 }
 
+export function orderLibraries<T extends { id: string }>(libraries: T[], savedOrder: string[]): T[] {
+  const positions = new Map(savedOrder.map((id, index) => [id, index]));
+  return [...libraries].sort((left, right) => (positions.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (positions.get(right.id) ?? Number.MAX_SAFE_INTEGER));
+}
+
 export function applyAccountTheme(theme: LuxTheme): void {
   if (typeof document !== "undefined") {
     document.documentElement.dataset.luxTheme = theme;

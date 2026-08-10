@@ -63,7 +63,7 @@ function AuthenticatedRoutes({ user }: { user: LuxUser }) {
   return (
     <Routes>
       <Route element={<LuxShell user={user} />}>
-        <Route index element={<HomePage />} />
+        <Route index element={<HomePage user={user} />} />
         <Route path="libraries" element={<LibrariesPage />} />
         <Route path="libraries/:libraryId" element={<LibraryPage />} />
         <Route path="items/:itemId" element={<MediaDetailPage />} />

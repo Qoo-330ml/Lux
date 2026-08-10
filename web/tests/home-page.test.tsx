@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HomePage } from "../src/features/home/HomePage";
+import { accountSettingsStorageKey } from "../src/features/account/account-settings";
 import { api } from "../src/lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 
@@ -14,8 +15,10 @@ import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 describe("HomePage shelves", () => {
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
+  const user = { id: "user-1", usernameNormalized: "viewer" };
 
   beforeEach(() => {
+    localStorage.clear();
     vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
   });
 
@@ -54,7 +57,7 @@ describe("HomePage shelves", () => {
       root?.render(
         <QueryClientProvider client={queryClient}>
           <MemoryRouter>
-            <HomePage />
+            <HomePage user={user} />
           </MemoryRouter>
         </QueryClientProvider>,
       );
@@ -75,6 +78,41 @@ describe("HomePage shelves", () => {
       .toBe(queryRefreshIntervals.mediaSurface);
     expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影");
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
+  });
+
+  it("renders homepage library shelves in the current account's saved order", async () => {
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({ libraryOrder: ["library-2", "library-1"] }));
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [
+        { id: "library-1", name: "电影库", kind: "MOVIE", latest: [{ id: "movie-latest", title: "电影最新", itemType: "MOVIE" }] },
+        { id: "library-2", name: "剧集库", kind: "SERIES", latest: [{ id: "series-latest", title: "剧集最新", itemType: "SERIES" }] },
+      ],
+      recommended: [],
+      continueWatching: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect([...container.querySelectorAll('[aria-label="我的媒体库"] .lux-library-card strong')].map((name) => name.textContent))
+      .toEqual(["剧集库", "电影库"]);
+    expect([...container.querySelectorAll(".lux-home-content .lux-section h2")].map((heading) => heading.textContent))
+      .toEqual(["我的媒体库", "最新剧集库", "最新电影库"]);
   });
 
   it("renders every returned continue-watching item and shows the server total", async () => {
@@ -99,7 +137,7 @@ describe("HomePage shelves", () => {
       root?.render(
         <QueryClientProvider client={queryClient}>
           <MemoryRouter>
-            <HomePage />
+            <HomePage user={user} />
           </MemoryRouter>
         </QueryClientProvider>,
       );
@@ -133,7 +171,7 @@ describe("HomePage shelves", () => {
       root?.render(
         <QueryClientProvider client={queryClient}>
           <MemoryRouter>
-            <HomePage />
+            <HomePage user={user} />
           </MemoryRouter>
         </QueryClientProvider>,
       );
@@ -175,7 +213,7 @@ describe("HomePage shelves", () => {
       root?.render(
         <QueryClientProvider client={queryClient}>
           <MemoryRouter>
-            <HomePage />
+            <HomePage user={user} />
           </MemoryRouter>
         </QueryClientProvider>,
       );

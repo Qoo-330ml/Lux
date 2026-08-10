@@ -22,6 +22,7 @@ import {
   applyAccountTheme,
   applyAccountAccent,
   moveLibrary,
+  orderLibraries,
   readAccountSettings,
   saveAccountSettings,
   type AccountSettings,
@@ -319,11 +320,6 @@ function AccentOption({ color, label, selected, onSelect }: { color: string; lab
       <span>{label}</span>
     </button>
   );
-}
-
-function orderLibraries(libraries: Library[], savedOrder: string[]): Library[] {
-  const positions = new Map(savedOrder.map((id, index) => [id, index]));
-  return [...libraries].sort((left, right) => (positions.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (positions.get(right.id) ?? Number.MAX_SAFE_INTEGER));
 }
 
 function libraryKindLabel(kind: Library["kind"]): string {

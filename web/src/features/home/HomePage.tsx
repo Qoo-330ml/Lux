@@ -4,13 +4,14 @@ import { ChevronLeft, ChevronRight, Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
+import { orderLibraries, readAccountSettings } from "../account/account-settings";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { MediaItem } from "../../lib/api/types";
+import type { LuxUser, MediaItem } from "../../lib/api/types";
 import { HERO_CAROUSEL_INTERVAL_MS, heroSlides } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 
-export function HomePage() {
+export function HomePage({ user }: { user: LuxUser }) {
   const home = useQuery({
     queryKey: queryKeys.home,
     queryFn: () => api.home(),
@@ -21,21 +22,22 @@ export function HomePage() {
   if (home.error) return <section className="lux-page-state"><h1>首页加载失败</h1><p>{home.error.message}</p></section>;
 
   const data = home.data;
+  const libraries = orderLibraries(data.libraries ?? [], readAccountSettings(user.id).libraryOrder);
   const slides = heroSlides(data);
   return (
     <div className="lux-home">
       <HeroCarousel items={slides} />
       <div className="lux-home-content">
         <section className="lux-section lux-library-section" aria-label="我的媒体库">
-          <div className="lux-section-heading"><h2>我的媒体库</h2><span>{data.libraries?.length ?? 0} 个库</span></div>
+          <div className="lux-section-heading"><h2>我的媒体库</h2><span>{libraries.length} 个库</span></div>
           <HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">
             <div className="lux-library-rail">
-              {data.libraries?.length ? data.libraries.map((library) => <LibraryCard key={library.id} library={library} />) : <EmptyLibraries />}
+              {libraries.length ? libraries.map((library) => <LibraryCard key={library.id} library={library} />) : <EmptyLibraries />}
             </div>
           </HorizontalScrollRail>
         </section>
         <ContinueWatchingRail items={data.continueWatching ?? []} total={data.continueWatchingTotal} />
-        {data.libraries?.map((library) => <MediaRail key={`latest-${library.id}`} title={`最新${library.name}`} items={library.latest ?? []} />)}
+        {libraries.map((library) => <MediaRail key={`latest-${library.id}`} title={`最新${library.name}`} items={library.latest ?? []} />)}
       </div>
     </div>
   );
