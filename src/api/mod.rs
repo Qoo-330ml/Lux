@@ -10853,7 +10853,57 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataCandidateFailureKind {
+    ItemNotFound,
+    InvalidSearch,
+    InvalidCandidateJson,
+    TmdbInvalidRequest,
+    TmdbUnavailable,
+    ScraperUnavailable,
+    StorageUnavailable,
+}
+
+impl MetadataCandidateFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ItemNotFound => "ITEM_NOT_FOUND",
+            Self::InvalidSearch => "INVALID_SEARCH",
+            Self::InvalidCandidateJson => "INVALID_CANDIDATE_JSON",
+            Self::TmdbInvalidRequest => "TMDB_INVALID_REQUEST",
+            Self::TmdbUnavailable => "TMDB_UNAVAILABLE",
+            Self::ScraperUnavailable => "SCRAPER_UNAVAILABLE",
+            Self::StorageUnavailable => "STORAGE_UNAVAILABLE",
+        }
+    }
+}
+
+fn metadata_candidate_failure_kind(error: &MetadataCandidateError) -> MetadataCandidateFailureKind {
+    match error {
+        MetadataCandidateError::ItemNotFound => MetadataCandidateFailureKind::ItemNotFound,
+        MetadataCandidateError::InvalidSearch => MetadataCandidateFailureKind::InvalidSearch,
+        MetadataCandidateError::InvalidCandidateJson(_) => {
+            MetadataCandidateFailureKind::InvalidCandidateJson
+        }
+        MetadataCandidateError::Tmdb(TmdbError::InvalidRequest(_)) => {
+            MetadataCandidateFailureKind::TmdbInvalidRequest
+        }
+        MetadataCandidateError::Tmdb(_) => MetadataCandidateFailureKind::TmdbUnavailable,
+        MetadataCandidateError::Scraper(_) => MetadataCandidateFailureKind::ScraperUnavailable,
+        MetadataCandidateError::Storage(_) => MetadataCandidateFailureKind::StorageUnavailable,
+    }
+}
+
 fn metadata_candidate_error(headers: &HeaderMap, error: MetadataCandidateError) -> Response {
+    let failure_kind = metadata_candidate_failure_kind(&error);
+    let request_id = header_str(headers, "x-request-id").unwrap_or("unknown");
+    tracing::warn!(
+        event = "metadata_candidate_request_failed",
+        error_kind = failure_kind.as_str(),
+        request_id = %request_id,
+        "metadata candidate request failed"
+    );
+
     match error {
         MetadataCandidateError::ItemNotFound => api_error(
             headers,
@@ -12118,22 +12168,74 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        build_cookie, catalog_filter_from_emby, emby_media_source_json, emby_media_stream_item_id,
-        emby_playback_info_item_id, is_emby_legacy_strm_path, is_emby_media_stream_segment,
-        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
-        is_registered_emby_video_path, lux_catalog_source_json, playback_client_label,
+        MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby,
+        emby_media_source_json, emby_media_stream_item_id, emby_playback_info_item_id,
+        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
+        is_emby_subtitle_path, is_emby_video_path, is_registered_emby_video_path,
+        lux_catalog_source_json, metadata_candidate_failure_kind, playback_client_label,
         playback_identifier_prefix, record_activity_event, safe_trace_path,
         secure_cookie_for_request,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
+    use crate::application::candidates::MetadataCandidateError;
     use crate::application::catalog::{CatalogSource, CatalogStream};
+    use crate::application::scraper::ScraperError;
     use crate::application::setup::SetupService;
+    use crate::application::tmdb::TmdbError;
     use crate::config::Config;
     use crate::network::RemoteAccessPolicy;
-    use crate::storage::Database;
+    use crate::storage::{Database, StorageError};
     use axum::http::{HeaderMap, HeaderValue, Uri};
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn metadata_candidate_errors_have_fixed_diagnostic_categories() {
+        let cases = [
+            (
+                MetadataCandidateError::ItemNotFound,
+                MetadataCandidateFailureKind::ItemNotFound,
+                "ITEM_NOT_FOUND",
+            ),
+            (
+                MetadataCandidateError::InvalidSearch,
+                MetadataCandidateFailureKind::InvalidSearch,
+                "INVALID_SEARCH",
+            ),
+            (
+                MetadataCandidateError::InvalidCandidateJson("secret detail".to_owned()),
+                MetadataCandidateFailureKind::InvalidCandidateJson,
+                "INVALID_CANDIDATE_JSON",
+            ),
+            (
+                MetadataCandidateError::Tmdb(TmdbError::InvalidRequest("secret detail".to_owned())),
+                MetadataCandidateFailureKind::TmdbInvalidRequest,
+                "TMDB_INVALID_REQUEST",
+            ),
+            (
+                MetadataCandidateError::Tmdb(TmdbError::Timeout),
+                MetadataCandidateFailureKind::TmdbUnavailable,
+                "TMDB_UNAVAILABLE",
+            ),
+            (
+                MetadataCandidateError::Scraper(ScraperError::Provider("secret detail".to_owned())),
+                MetadataCandidateFailureKind::ScraperUnavailable,
+                "SCRAPER_UNAVAILABLE",
+            ),
+            (
+                MetadataCandidateError::Storage(StorageError::LastManager),
+                MetadataCandidateFailureKind::StorageUnavailable,
+                "STORAGE_UNAVAILABLE",
+            ),
+        ];
+
+        for (error, expected_kind, expected_label) in cases {
+            let kind = metadata_candidate_failure_kind(&error);
+            assert_eq!(kind, expected_kind);
+            assert_eq!(kind.as_str(), expected_label);
+            assert!(!kind.as_str().contains("secret detail"));
+        }
+    }
 
     #[test]
     fn emby_ids_filter_preserves_item_and_media_source_candidates() {
