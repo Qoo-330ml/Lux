@@ -117,13 +117,12 @@ impl LibraryScanner {
                     } else {
                         let relative_path = path
                             .strip_prefix(&root_path)
-                            .map_err(|error| {
-                                ScannerError::InvalidRelativePath(error.to_string())
-                            })?
+                            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
                             .to_str()
                             .ok_or(ScannerError::NonUtf8Path)?;
                         if !existing_entries.contains_key(relative_path) {
-                            if let Some(file) = self.prepare_new_movie_file(&root_path, &path).await?
+                            if let Some(file) =
+                                self.prepare_new_movie_file(&root_path, &path).await?
                             {
                                 pending_new_files.push(file);
                                 if pending_new_files.len() == FILE_BATCH_SIZE {
