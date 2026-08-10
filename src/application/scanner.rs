@@ -32,8 +32,8 @@ use crate::{
     observability::resources::ResourceMetrics,
     storage::{
         Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource, NewMovieFile,
-        NewScanJobEvent, StorageError, StoredLibraryRoot, StoredReconciliationScanEntry,
-        StoredScanJob, StoredScanJobPath,
+        NewScanJobEvent, StorageError, StoredFilesystemEntry, StoredLibraryRoot,
+        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
     },
 };
 
@@ -87,9 +87,28 @@ impl LibraryScanner {
             let mut walker = FileBatchWalker::new(&root_path);
             let mut seen_entry_ids = Vec::with_capacity(FILE_BATCH_SIZE);
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
+                let relative_paths = files
+                    .iter()
+                    .map(|path| {
+                        path.strip_prefix(&root_path)
+                            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                            .to_str()
+                            .map(str::to_owned)
+                            .ok_or(ScannerError::NonUtf8Path)
+                    })
+                    .collect::<Result<Vec<_>, ScannerError>>()?;
+                let existing_entries = self
+                    .database
+                    .list_filesystem_entries_for_paths(&root.id, &relative_paths)
+                    .await?;
                 for path in files {
                     if let Some((entry_id, quick_report)) = self
-                        .scan_movie_file_if_unchanged(&library_id_text, &root.id, &root_path, &path)
+                        .scan_movie_file_if_unchanged(
+                            &library_id_text,
+                            &root_path,
+                            &path,
+                            &existing_entries,
+                        )
                         .await?
                     {
                         seen_entry_ids.push(entry_id);
@@ -791,9 +810,9 @@ impl LibraryScanner {
     async fn scan_movie_file_if_unchanged(
         &self,
         library_id_text: &str,
-        root_id: &str,
         root_path: &Path,
         path: &Path,
+        existing_entries: &HashMap<String, StoredFilesystemEntry>,
     ) -> Result<Option<(String, ScanReport)>, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
@@ -807,11 +826,7 @@ impl LibraryScanner {
             .to_str()
             .ok_or(ScannerError::NonUtf8Path)?
             .to_owned();
-        let Some(existing_entry) = self
-            .database
-            .find_filesystem_entry(root_id, &relative_path)
-            .await?
-        else {
+        let Some(existing_entry) = existing_entries.get(&relative_path) else {
             return Ok(None);
         };
         let metadata = fs::metadata(path)

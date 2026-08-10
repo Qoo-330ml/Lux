@@ -3892,7 +3892,7 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         self.query(
-            "SELECT fe.id, fe.fingerprint, ms.item_id
+            "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
              FROM filesystem_entries fe
              LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
              WHERE fe.library_root_id = ? AND fe.relative_path = ?",
@@ -3906,6 +3906,45 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_filesystem_entries_for_paths(
+        &self,
+        library_root_id: &str,
+        relative_paths: &[String],
+    ) -> Result<HashMap<String, StoredFilesystemEntry>, StorageError> {
+        let mut entries = HashMap::new();
+        for chunk in relative_paths.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
+                 FROM filesystem_entries fe
+                 LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                 WHERE fe.library_root_id = ? AND fe.relative_path IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_root_id);
+            for relative_path in chunk {
+                statement = statement.bind(relative_path);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let entry = stored_filesystem_entry(row);
+                entries.insert(entry.relative_path.clone(), entry);
+            }
+        }
+        Ok(entries)
     }
 
     pub(crate) async fn list_existing_filesystem_paths(
@@ -8525,6 +8564,7 @@ fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
 #[derive(Debug)]
 pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
+    pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) item_id: Option<String>,
 }
@@ -8532,6 +8572,7 @@ pub(crate) struct StoredFilesystemEntry {
 fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
     StoredFilesystemEntry {
         id: row.get("id"),
+        relative_path: row.get("relative_path"),
         fingerprint: row.get("fingerprint"),
         item_id: row.get("item_id"),
     }
@@ -9598,6 +9639,21 @@ mod tests {
         assert_eq!(first_page.len(), 1);
         assert_eq!(second_page.len(), 1);
         assert_ne!(first_page[0].source_id, second_page[0].source_id);
+        let existing_entries = database
+            .list_filesystem_entries_for_paths(
+                &database
+                    .list_library_roots(&library.id.to_string())
+                    .await
+                    .expect("roots")
+                    .into_iter()
+                    .next()
+                    .expect("root")
+                    .id,
+                &["First.Movie.2024.mkv".to_owned()],
+            )
+            .await
+            .expect("existing entries");
+        assert_eq!(existing_entries.len(), 1);
         assert_eq!(
             database
                 .list_local_thumbnail_sources_for_library_page(&library.id.to_string(), 1, 0,)
