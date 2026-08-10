@@ -423,7 +423,9 @@ pub fn app() -> Router {
 pub fn app_with_state(state: AppState) -> Router {
     let web_root = web_root();
     let resources = state.resources.clone();
-    let catalog_requests = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
+    let catalog_request_slots =
+        Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_CATALOG_REQUESTS));
+    let catalog_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
     Router::new()
         .route("/logo.svg", get(web_logo))
         .route("/health/live", get(live))
@@ -704,10 +706,19 @@ pub fn app_with_state(state: AppState) -> Router {
         .with_state(state)
         .layer(middleware::from_fn(
             move |request: Request<Body>, next: Next| {
-                let catalog_requests = catalog_requests.clone();
+                let catalog_request_slots = catalog_request_slots.clone();
+                let catalog_workers = catalog_workers.clone();
                 async move {
-                    let permit = if is_catalog_aggregation_path(request.uri().path()) {
-                        match catalog_requests.try_acquire_owned() {
+                    let request_slot = if is_catalog_aggregation_path(request.uri().path()) {
+                        match catalog_request_slots.try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        }
+                    } else {
+                        None
+                    };
+                    let worker_permit = if request_slot.is_some() {
+                        match catalog_workers.acquire_owned().await {
                             Ok(permit) => Some(permit),
                             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
                         }
@@ -715,7 +726,8 @@ pub fn app_with_state(state: AppState) -> Router {
                         None
                     };
                     let response = next.run(request).await;
-                    drop(permit);
+                    drop(worker_permit);
+                    drop(request_slot);
                     response
                 }
             },
@@ -781,6 +793,7 @@ pub fn app_with_state(state: AppState) -> Router {
 }
 
 const MAX_CONCURRENT_CATALOG_REQUESTS: usize = 16;
+const MAX_IN_FLIGHT_CATALOG_REQUESTS: usize = 64;
 
 fn is_catalog_aggregation_path(path: &str) -> bool {
     let route = path
