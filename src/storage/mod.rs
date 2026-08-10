@@ -6729,39 +6729,6 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_local_danmaku_sources_for_library(
-        &self,
-        library_id: &str,
-    ) -> Result<Vec<StoredDanmakuSource>, StorageError> {
-        self.query(
-            "SELECT ms.id AS source_id, ms.item_id,
-                    lr.canonical_path AS root_path, fe.relative_path
-             FROM media_sources ms
-             JOIN media_items mi ON mi.id = ms.item_id
-             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-             JOIN library_roots lr ON lr.id = fe.library_root_id
-             WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
-               AND fe.is_missing = 0
-             ORDER BY ms.is_default DESC, ms.item_id, fe.relative_path",
-        )
-        .bind(library_id)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredDanmakuSource {
-                    source_id: row.get("source_id"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
     pub(crate) async fn find_local_danmaku_source_for_item(
         &self,
         item_id: &str,
@@ -6836,9 +6803,7 @@ impl Database {
     pub(crate) async fn create_danmaku_match_job(
         &self,
         job: NewDanmakuMatchJob<'_>,
-        source_ids: &[String],
     ) -> Result<(), StorageError> {
-        let total_count = i64::try_from(source_ids.len()).unwrap_or(i64::MAX);
         let mut transaction = self
             .pool
             .begin()
@@ -6856,30 +6821,48 @@ impl Database {
         .bind(job.library_id)
         .bind(job.overwrite)
         .bind(job.concurrency)
-        .bind(total_count)
+        .bind(0_i64)
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        for source_id in source_ids {
-            let item_id = Uuid::now_v7().to_string();
-            self.query(
+        let inserted = self
+            .query(
                 "INSERT INTO danmaku_match_job_items (
                     id, job_id, media_source_id, status
-                 ) VALUES (?, ?, ?, 'PENDING')",
+                 )
+                 SELECT ? || ':' || ms.id, ?, ms.id, 'PENDING'
+                 FROM media_sources ms
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
+                   AND fe.is_missing = 0",
             )
-            .bind(item_id)
             .bind(job.id)
-            .bind(source_id)
+            .bind(job.id)
+            .bind(job.library_id)
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        }
+        let total_count = i64::try_from(inserted.rows_affected()).unwrap_or(i64::MAX);
+        self.query(
+            "UPDATE danmaku_match_jobs
+             SET total_count = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(total_count)
+        .bind(job.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         transaction
             .commit()
             .await
@@ -7044,14 +7027,23 @@ impl Database {
     pub(crate) async fn list_pending_danmaku_match_items(
         &self,
         job_id: &str,
+        limit: i64,
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
         self.query(
-            "SELECT id, media_source_id
-             FROM danmaku_match_job_items
-             WHERE job_id = ? AND status = 'PENDING'
-             ORDER BY id",
+            "SELECT ji.id, ji.media_source_id,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM danmaku_match_job_items ji
+             LEFT JOIN media_sources ms
+               ON ms.id = ji.media_source_id AND ms.source_kind = 'LOCAL_FILE'
+             LEFT JOIN filesystem_entries fe
+               ON fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+             LEFT JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE ji.job_id = ? AND ji.status = 'PENDING'
+             ORDER BY ji.id
+             LIMIT ?",
         )
         .bind(job_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
@@ -7059,6 +7051,8 @@ impl Database {
                 .map(|row| StoredDanmakuMatchItem {
                     id: row.get("id"),
                     media_source_id: row.get("media_source_id"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
                 })
                 .collect()
         })
@@ -9284,6 +9278,8 @@ pub(crate) struct StoredDanmakuMatchJob {
 pub(crate) struct StoredDanmakuMatchItem {
     pub(crate) id: String,
     pub(crate) media_source_id: String,
+    pub(crate) root_path: Option<String>,
+    pub(crate) relative_path: Option<String>,
 }
 
 pub(crate) struct NewDanmakuMatchJob<'a> {

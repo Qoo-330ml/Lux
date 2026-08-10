@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use axum::{
     Router,
@@ -296,6 +296,74 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
         .fetch_one(database.pool())
         .await?;
     assert_eq!(track_status, "READY");
+
+    let root_id: String = sqlx::query_scalar("SELECT id FROM library_roots WHERE library_id = ?")
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < 10000
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title,
+             identification_status, identity_key
+         )
+         SELECT printf('bulk-danmaku-item-%05d', value), ?, 'MOVIE',
+                printf('Bulk Danmaku %05d', value),
+                printf('Bulk Danmaku %05d', value), 'LOCAL_CONFIRMED',
+                printf('bulk-danmaku:%05d', value)
+         FROM sequence",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < 10000
+         )
+         INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size,
+             modified_at, last_seen_generation, is_missing
+         )
+         SELECT printf('bulk-danmaku-entry-%05d', value), ?,
+                printf('Bulk.Danmaku.%05d.mkv', value), 'FILE', 1, 1,
+                'bulk-danmaku', 0
+         FROM sequence",
+    )
+    .bind(root_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < 10000
+         )
+         INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id,
+             container, size, is_default, probe_status
+         )
+         SELECT printf('bulk-danmaku-source-%05d', value),
+                printf('bulk-danmaku-item-%05d', value), 'LOCAL_FILE',
+                printf('bulk-danmaku-entry-%05d', value),
+                'mkv', 1, 1, 'PENDING'
+         FROM sequence",
+    )
+    .execute(database.pool())
+    .await?;
+    let large_job = tokio::time::timeout(
+        Duration::from_millis(250),
+        service.create_job(library.id, 64, false),
+    )
+    .await
+    .map_err(|_| "danmaku job creation materialized every source")??;
+    assert_eq!(large_job.total_count, 10001);
+
     server.abort();
     Ok(())
 }

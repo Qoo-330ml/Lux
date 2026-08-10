@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -34,6 +33,8 @@ const MAX_PROVIDER_BASE_URL_CHARS: usize = 4096;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_CONCURRENCY: i64 = 64;
+const MAX_EFFECTIVE_CONCURRENCY: usize = 4;
+const WORK_PAGE_SIZE: i64 = 100;
 const DANMAKU_PROVIDER: &str = "dandanplay";
 
 #[derive(Clone, Eq, PartialEq)]
@@ -687,25 +688,14 @@ impl DanmakuService {
             .ok_or(DanmakuServiceError::ProviderNotConfigured)?;
         validate_provider_base_url(&provider_url)
             .map_err(DanmakuServiceError::InvalidProviderUrl)?;
-        let sources = self
-            .database
-            .list_local_danmaku_sources_for_library(&library_id)
-            .await?;
-        let source_ids = sources
-            .into_iter()
-            .map(|source| source.source_id)
-            .collect::<Vec<_>>();
         let id = Uuid::now_v7().to_string();
         self.database
-            .create_danmaku_match_job(
-                NewDanmakuMatchJob {
-                    id: &id,
-                    library_id: &library_id,
-                    overwrite,
-                    concurrency,
-                },
-                &source_ids,
-            )
+            .create_danmaku_match_job(NewDanmakuMatchJob {
+                id: &id,
+                library_id: &library_id,
+                overwrite,
+                concurrency,
+            })
             .await?;
         self.get(&id).await
     }
@@ -839,59 +829,65 @@ impl DanmakuService {
         self.database
             .reset_running_danmaku_match_items(&job.id)
             .await?;
-        let sources = self
-            .database
-            .list_local_danmaku_sources_for_library(&job.library_id)
-            .await?
-            .into_iter()
-            .map(|source| (source.source_id.clone(), source))
-            .collect::<HashMap<_, _>>();
-        let items = self
-            .database
-            .list_pending_danmaku_match_items(&job.id)
-            .await?;
-        let concurrency = usize::try_from(job.concurrency)
-            .unwrap_or(1)
-            .clamp(1, MAX_CONCURRENCY as usize);
+        let concurrency = effective_danmaku_concurrency(job.concurrency);
         let mut workers: JoinSet<Result<Option<WorkerResult>, StorageError>> = JoinSet::new();
         let mut cancelled = false;
 
-        for item in items {
-            if self
+        loop {
+            let items = self
                 .database
-                .danmaku_match_job_cancel_requested(&job.id)
-                .await?
-            {
-                cancelled = true;
+                .list_pending_danmaku_match_items(&job.id, WORK_PAGE_SIZE)
+                .await?;
+            if items.is_empty() {
                 break;
             }
-            while workers.len() >= concurrency {
-                self.finish_worker(&job.id, workers.join_next().await, &sources)
+            for item in items {
+                if self
+                    .database
+                    .danmaku_match_job_cancel_requested(&job.id)
+                    .await?
+                {
+                    cancelled = true;
+                    break;
+                }
+                while workers.len() >= concurrency {
+                    self.finish_worker(&job.id, workers.join_next().await)
+                        .await?;
+                }
+                let source = match (item.root_path, item.relative_path) {
+                    (Some(root_path), Some(relative_path)) => Some(StoredDanmakuSource {
+                        source_id: item.media_source_id,
+                        root_path,
+                        relative_path,
+                    }),
+                    _ => None,
+                };
+                let database = self.database.clone();
+                let provider = provider.clone();
+                let overwrite = job.overwrite;
+                workers.spawn(async move {
+                    if !database.claim_danmaku_match_item(&item.id).await? {
+                        return Ok::<_, StorageError>(None);
+                    }
+                    let Some(source) = source else {
+                        return Ok(Some(WorkerResult::failed(
+                            item.id,
+                            "SOURCE_NOT_FOUND",
+                            "media source is no longer available",
+                        )));
+                    };
+                    Ok(Some(
+                        process_danmaku_source(source, provider, overwrite, item.id).await,
+                    ))
+                });
+            }
+            while !workers.is_empty() {
+                self.finish_worker(&job.id, workers.join_next().await)
                     .await?;
             }
-            let database = self.database.clone();
-            let provider = provider.clone();
-            let source = sources.get(&item.media_source_id).cloned();
-            let overwrite = job.overwrite;
-            workers.spawn(async move {
-                if !database.claim_danmaku_match_item(&item.id).await? {
-                    return Ok::<_, StorageError>(None);
-                }
-                let Some(source) = source else {
-                    return Ok(Some(WorkerResult::failed(
-                        item.id,
-                        "SOURCE_NOT_FOUND",
-                        "media source is no longer available",
-                    )));
-                };
-                Ok(Some(
-                    process_danmaku_source(source, provider, overwrite, item.id).await,
-                ))
-            });
-        }
-        while !workers.is_empty() {
-            self.finish_worker(&job.id, workers.join_next().await, &sources)
-                .await?;
+            if cancelled {
+                break;
+            }
         }
         if cancelled
             || self
@@ -928,7 +924,6 @@ impl DanmakuService {
         &self,
         job_id: &str,
         result: Option<Result<Result<Option<WorkerResult>, StorageError>, tokio::task::JoinError>>,
-        sources: &HashMap<String, StoredDanmakuSource>,
     ) -> Result<(), DanmakuServiceError> {
         let Some(result) = result else {
             return Ok(());
@@ -942,9 +937,6 @@ impl DanmakuService {
             }
         };
         if let Some(track) = result.track.as_ref() {
-            let source = sources
-                .get(&track.media_source_id)
-                .ok_or(DanmakuServiceError::SourceNotFound)?;
             self.database
                 .upsert_danmaku_track(NewDanmakuTrack {
                     id: &track.id,
@@ -959,7 +951,6 @@ impl DanmakuService {
                 })
                 .await
                 .map_err(DanmakuServiceError::Storage)?;
-            let _ = source;
         }
         self.database
             .finish_danmaku_match_item(
@@ -1056,6 +1047,12 @@ impl From<StorageError> for DanmakuServiceError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
+}
+
+fn effective_danmaku_concurrency(configured: i64) -> usize {
+    usize::try_from(configured)
+        .unwrap_or(1)
+        .clamp(1, MAX_EFFECTIVE_CONCURRENCY)
 }
 
 struct TrackWrite {
@@ -1283,5 +1280,17 @@ fn provider_error_code(error: &DanmakuProviderError) -> &'static str {
         DanmakuProviderError::ResponseTooLarge => "PROVIDER_RESPONSE_TOO_LARGE",
         DanmakuProviderError::InvalidResponse => "PROVIDER_INVALID_RESPONSE",
         DanmakuProviderError::InvalidXml(_) => "PROVIDER_INVALID_XML",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_danmaku_concurrency;
+
+    #[test]
+    fn worker_concurrency_has_a_memory_safe_ceiling() {
+        assert_eq!(effective_danmaku_concurrency(1), 1);
+        assert_eq!(effective_danmaku_concurrency(2), 2);
+        assert_eq!(effective_danmaku_concurrency(64), 4);
     }
 }
