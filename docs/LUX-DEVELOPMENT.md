@@ -3045,8 +3045,8 @@ services:
 新的 API、manifest 和插件进程只使用 `org.lux.strm-media-info`。
 
 插件 manifest 声明 `libraryIds`、`concurrency`、`existingInfoPolicy`、`writeSidecars` 和
-`schedule` 配置项；`schedule` 使用正整数加单位的间隔格式（`s`、`m`、`h`、`d`），范围为
-`1m` 到 `365d`，默认 `24h`。其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
+`schedule` 配置项；`schedule` 使用标准五段式 cron（分 时 日 月 周），按 UTC 解释，默认
+`0 3 * * *`。其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
 （覆盖已有媒体信息）。读取旧版本配置时，`includeReady: false` 迁移为 `SKIP`，
 `includeReady: true` 迁移为 `OVERWRITE`。
 Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理员通过
@@ -3057,7 +3057,7 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 使用同目录 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。
 
 插件启用后，宿主自动登记一个全局 `STRM_MEDIA_INFO` 计划任务；任务读取同一份插件配置，首次
-执行在后台完成，后续按 `schedule` 间隔重复执行。插件禁用时任务保留但停用；服务重启后从已登记
+执行在后台完成，后续按 `schedule` cron 表达式重复执行。插件禁用时任务保留但停用；服务重启后从已登记
 任务恢复调度。未完成有效配置时只登记未启用的任务，不创建探测作业。
 
 插件 manifest 必须声明 `type: "media_probe"`、`category: "MEDIA"` 和
@@ -3072,11 +3072,11 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 验收：
 
 - [ ] 管理员只能选择已有媒体库，未选媒体库不创建任务、不发起插件 RPC；空选择、无效 ID、并发超范围均被拒绝。
-- [ ] 插件详情页展示并保存媒体库多选、并发数、已有媒体信息处理方式、旁车写回和执行间隔配置；配置文件原子保存且权限受限，插件列表回显非敏感值。
+- [ ] 插件详情页展示并保存媒体库多选、并发数、已有媒体信息处理方式、旁车写回和五段式 cron 配置；配置文件原子保存且权限受限，插件列表回显非敏感值。
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
-- [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` 周期执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
+- [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
 - [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
 - [ ] 插件包、manifest、RPC 结果、URL 策略、超时、输出上限和无真实 URL 的 fake ffprobe 测试覆盖；插件异常不退出主进程。
 - [ ] 从空数据库执行迁移成功，ARM64 本机验证记录 `uname -m`，并通过 Rust 格式化、测试和 Clippy 检查。
@@ -3282,7 +3282,7 @@ ip138，不再把它作为回退。Hiofd 插件显示名称为“IP归属地查�
 
 明确不做：
 
-- 不实现 cron 解析、计划任务调度循环或跨库全局 worker pool；跨库串行化仅使用进程内扫描互斥锁。
+- 不把实时增量扫描纳入 cron 调度；全量校验、元数据和 STRM 任务使用持久化的五段式 cron，跨库串行化仅使用进程内扫描互斥锁。
 - 不改变 Lux/Emby 公共 API，不增加核心依赖。
 - 不在本任务拆分 ffprobe、NFO、缩略图或在线元数据后处理；这些资源队列另行实施和验证。
 

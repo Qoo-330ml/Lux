@@ -26,9 +26,9 @@
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - ARM64 本机验证两个媒体库设置互不影响，更新后无需重启可查询。
 
-实现记录：schema 12 新增独立任务配置表；`PATCH /api/v1/admin/libraries/{libraryId}` 使用事务更新库兼容字段和两类计划任务配置。计划不解析 cron，资源配额仅做 1-64 的配置校验；集成测试在同一个运行中的服务进程内验证两个库互不覆盖，并验证 `null` 清空计划。
+实现记录：schema 12 新增独立任务配置表；`PATCH /api/v1/admin/libraries/{libraryId}` 使用事务更新库兼容字段和两类计划任务配置。计划使用标准五段式 cron 并按 UTC 解释，资源配额仅做 1-64 的配置校验；集成测试在同一个运行中的服务进程内验证两个库互不覆盖，并验证 `null` 清空计划。
 
 ## 明确不做
 
-- 不为媒体库系统任务实现 cron 解析器；本次 STRM 插件只支持受限的 interval 格式和独立后台调度。
+- 不把实时增量扫描注册为 cron 任务；全量校验、元数据和 STRM 任务使用独立的五段式 cron 配置。
 - 不实现跨库全局 worker pool；具体任务执行器后续继续复用这些配额。

@@ -257,11 +257,11 @@ fn manifest_value(
                 },
                 {
                     "key": "schedule",
-                    "label": "执行间隔",
+                    "label": "执行计划",
                     "type": "text",
                     "required": true,
-                    "defaultValue": "24h",
-                    "description": "后台扫描间隔，支持 1m 到 365d，例如 6h 或 24h。"
+                    "defaultValue": "0 3 * * *",
+                    "description": "标准五段式 cron 表达式，按 UTC 执行，例如每天 03:00 使用 0 3 * * *。"
                 }
             ],
             "permissions": {

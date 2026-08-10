@@ -135,7 +135,7 @@ describe("AdminOperationsPage", () => {
         ownerName: "电影库",
         taskType: "RECONCILIATION_SCAN",
         name: "全量校验媒体库",
-        schedule: "interval:1h",
+        schedule: "0 * * * *",
         isEnabled: true,
       },
     });
@@ -171,7 +171,7 @@ describe("AdminOperationsPage", () => {
     expect(input).not.toBeNull();
     expect(enabled).not.toBeNull();
     act(() => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "interval:1h");
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "0 * * * *");
       input?.dispatchEvent(new Event("input", { bubbles: true }));
       enabled?.click();
     });
@@ -181,7 +181,7 @@ describe("AdminOperationsPage", () => {
         ownerType: "LIBRARY",
         ownerId: "library-1",
         taskType: "RECONCILIATION_SCAN",
-        schedule: "interval:1h",
+        schedule: "0 * * * *",
         isEnabled: true,
       }));
     });

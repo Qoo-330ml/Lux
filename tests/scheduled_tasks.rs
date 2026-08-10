@@ -10,7 +10,7 @@ use serde_json::Map;
 use serde_json::json;
 
 #[tokio::test]
-async fn enabled_strm_task_runs_once_until_its_interval_is_due()
+async fn enabled_strm_task_runs_once_per_matching_cron_minute()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
@@ -34,7 +34,7 @@ async fn enabled_strm_task_runs_once_until_its_interval_is_due()
                 {"key": "concurrency", "label": "并发数", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 64},
                 {"key": "existingInfoPolicy", "label": "已有媒体信息处理方式", "type": "select", "defaultValue": "SKIP", "options": [{"value": "SKIP", "label": "跳过已有媒体信息"}, {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}]},
                 {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": true},
-                {"key": "schedule", "label": "执行间隔", "type": "text", "required": true, "defaultValue": "24h"}
+                {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 3 * * *"}
             ],
             "permissions": {"network": ["media-source"], "filesystem": []},
             "files": []
@@ -59,7 +59,7 @@ async fn enabled_strm_task_runs_once_until_its_interval_is_due()
                 ("concurrency".to_owned(), json!(2)),
                 ("existingInfoPolicy".to_owned(), json!("SKIP")),
                 ("writeSidecars".to_owned(), json!(true)),
-                ("schedule".to_owned(), json!("1m")),
+                ("schedule".to_owned(), json!("* * * * *")),
             ]),
         )
         .await?;

@@ -211,8 +211,28 @@ impl AppState {
         ));
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
+        let probe = Some(MediaProbeService::new(
+            database.clone(),
+            FfprobeRunner::default(),
+        ));
+        let thumbnails = Some(ThumbnailService::new(database.clone()));
+        let scan_jobs = {
+            let service = ScanJobService::new(database.clone())
+                .with_admin_events(admin_events.clone())
+                .with_resource_metrics(resources.clone());
+            match library_covers.clone() {
+                Some(covers) => service.with_library_covers(covers),
+                None => service,
+            }
+        };
         let scheduled_tasks =
-            ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone());
+            ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone())
+                .with_library_services(
+                    scan_jobs.clone(),
+                    metadata_reidentify.clone(),
+                    probe.clone(),
+                    thumbnails.clone(),
+                );
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -236,20 +256,9 @@ impl AppState {
                 .ok(),
             metadata_reidentify,
             deletion: Some(MediaDeleteService::new(database.clone())),
-            probe: Some(MediaProbeService::new(
-                database.clone(),
-                FfprobeRunner::default(),
-            )),
-            thumbnails: Some(ThumbnailService::new(database.clone())),
-            scan_jobs: Some({
-                let service = ScanJobService::new(database.clone())
-                    .with_admin_events(admin_events.clone())
-                    .with_resource_metrics(resources.clone());
-                match library_covers.clone() {
-                    Some(covers) => service.with_library_covers(covers),
-                    None => service,
-                }
-            }),
+            probe,
+            thumbnails,
+            scan_jobs: Some(scan_jobs),
             strm_probe: Some(strm_probe),
             scheduled_tasks: Some(scheduled_tasks),
             danmaku: Some(

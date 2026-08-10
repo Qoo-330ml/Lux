@@ -1,6 +1,7 @@
 use std::{fmt, path::Path};
 
 use crate::{
+    application::schedule::validate_cron,
     domain::ids::{LibraryId, LibraryRootId},
     library::{
         LibraryKind, LibraryRecord, LibraryRootRecord, RootOverlap, RootPathError,
@@ -328,7 +329,7 @@ impl fmt::Display for LibraryServiceError {
         match self {
             Self::InvalidName => formatter.write_str("library name must be 1-128 characters"),
             Self::InvalidSchedule => {
-                formatter.write_str("library schedule must be 1-128 non-whitespace characters")
+                formatter.write_str("library schedule must be a valid five-field cron expression")
             }
             Self::InvalidConcurrency => {
                 write!(
@@ -431,7 +432,10 @@ fn normalize_schedule(
             schedule
                 .map(|schedule| {
                     let schedule = schedule.trim().to_owned();
-                    if schedule.is_empty() || schedule.chars().count() > MAX_SCHEDULE_LENGTH {
+                    if schedule.is_empty()
+                        || schedule.chars().count() > MAX_SCHEDULE_LENGTH
+                        || validate_cron(&schedule).is_err()
+                    {
                         Err(LibraryServiceError::InvalidSchedule)
                     } else {
                         Ok(schedule)

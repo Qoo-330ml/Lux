@@ -20,7 +20,7 @@ use crate::{
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
-        schedule::{DEFAULT_STRM_MEDIA_INFO_INTERVAL, parse_interval},
+        schedule::{DEFAULT_STRM_MEDIA_INFO_SCHEDULE, validate_cron},
         settings::{
             TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, TmdbSettings, read_tmdb_settings,
             tmdb_api_base_url_options, tmdb_language_options, write_tmdb_api_key,
@@ -561,7 +561,7 @@ impl PluginService {
             ),
         );
         let schedule = media_info_schedule(&values)
-            .unwrap_or_else(|_| DEFAULT_STRM_MEDIA_INFO_INTERVAL.to_owned());
+            .unwrap_or_else(|_| DEFAULT_STRM_MEDIA_INFO_SCHEDULE.to_owned());
         let configured = validate_config_values(&fields, &values).is_ok()
             && self.media_info_settings().await.is_ok();
         self.database
@@ -945,9 +945,9 @@ fn media_info_schedule(values: &Map<String, Value>) -> Result<String, PluginServ
     let schedule = values
         .get("schedule")
         .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_STRM_MEDIA_INFO_INTERVAL)
+        .unwrap_or(DEFAULT_STRM_MEDIA_INFO_SCHEDULE)
         .trim();
-    parse_interval(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+    validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
     Ok(schedule.to_owned())
 }
 

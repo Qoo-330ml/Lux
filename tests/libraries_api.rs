@@ -618,7 +618,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
             "realtimeMetadataAutoMatchEnabled": true,
             "incrementalSchedule": "interval:30s",
             "reconciliationSchedule": "0 3 * * *",
-            "metadataSchedule": "interval:5m",
+            "metadataSchedule": "*/5 * * * *",
             "scanConcurrency": 4,
             "probeConcurrency": 3
         }))
@@ -718,7 +718,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         .find(|library| library["id"] == library_ids[1])
         .ok_or("missing second library")?;
     assert_eq!(first["reconciliationSchedule"], "0 3 * * *");
-    assert_eq!(first["metadataSchedule"], "interval:5m");
+    assert_eq!(first["metadataSchedule"], "*/5 * * * *");
     assert_eq!(first["scanConcurrency"], 4);
     assert_eq!(first["probeConcurrency"], 3);
     assert_eq!(second["reconciliationSchedule"], Value::Null);
@@ -754,7 +754,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
             .any(|(owner, task, schedule, enabled, _)| {
                 owner == &library_ids[0]
                     && task == "METADATA_PARSE"
-                    && schedule.as_deref() == Some("interval:5m")
+                    && schedule.as_deref() == Some("*/5 * * * *")
                     && *enabled == 1
             })
     );
@@ -904,7 +904,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
         .header(COOKIE, &cookies)
         .header("x-csrf-token", &csrf)
-        .json(&json!({ "reconciliationSchedule": "interval:6h" }))
+        .json(&json!({ "reconciliationSchedule": "0 */6 * * *" }))
         .send()
         .await?;
     assert_eq!(seeded.status(), reqwest::StatusCode::OK);
@@ -928,7 +928,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .ok_or("missing reconciliation schedule")?;
     assert_eq!(reconciliation["ownerType"], "LIBRARY");
     assert_eq!(reconciliation["ownerName"], "Movies");
-    assert_eq!(reconciliation["schedule"], "interval:6h");
+    assert_eq!(reconciliation["schedule"], "0 */6 * * *");
     assert_eq!(reconciliation["isEnabled"], true);
 
     let missing_csrf = client
@@ -938,7 +938,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "METADATA_PARSE",
-            "schedule": "interval:2h"
+            "schedule": "0 */2 * * *"
         }))
         .send()
         .await?;
@@ -952,13 +952,13 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "METADATA_PARSE",
-            "schedule": "interval:2h"
+            "schedule": "0 */2 * * *"
         }))
         .send()
         .await?;
     assert_eq!(updated.status(), reqwest::StatusCode::OK);
     let updated_body: Value = updated.json().await?;
-    assert_eq!(updated_body["scheduledTask"]["schedule"], "interval:2h");
+    assert_eq!(updated_body["scheduledTask"]["schedule"], "0 */2 * * *");
     assert_eq!(updated_body["scheduledTask"]["isEnabled"], true);
 
     let global_schedule = client
@@ -969,7 +969,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "GLOBAL",
             "ownerId": "global",
             "taskType": "RECONCILIATION_SCAN",
-            "schedule": "interval:6h"
+            "schedule": "0 */6 * * *"
         }))
         .send()
         .await?;
@@ -983,7 +983,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "RECONCILIATION_SCAN",
-            "schedule": "interval:6h"
+            "schedule": "0 */6 * * *"
         }))
         .send()
         .await?;
@@ -994,7 +994,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
     let updated_reconciliation = registered_reconciliation_task.json::<Value>().await?;
     assert_eq!(
         updated_reconciliation["scheduledTask"]["schedule"],
-        "interval:6h"
+        "0 */6 * * *"
     );
     let incremental_task = client
         .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
@@ -1004,7 +1004,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "INCREMENTAL_SCAN",
-            "schedule": "interval:30s"
+            "schedule": "0 0 * * *"
         }))
         .send()
         .await?;
@@ -1020,7 +1020,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .as_array()
         .and_then(|libraries| libraries.iter().find(|library| library["id"] == library_id))
         .ok_or("missing library after scheduled task update")?;
-    assert_eq!(unchanged_library["reconciliationSchedule"], "interval:6h");
+    assert_eq!(unchanged_library["reconciliationSchedule"], "0 */6 * * *");
 
     let invalid_task = client
         .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
@@ -1030,7 +1030,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
             "ownerType": "LIBRARY",
             "ownerId": library_id,
             "taskType": "REBUILD_SEARCH",
-            "schedule": "interval:2h"
+            "schedule": "0 */2 * * *"
         }))
         .send()
         .await?;
