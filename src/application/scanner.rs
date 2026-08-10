@@ -101,6 +101,7 @@ impl LibraryScanner {
                     .database
                     .list_filesystem_entries_for_paths(&root.id, &relative_paths)
                     .await?;
+                let mut pending_new_files = Vec::with_capacity(FILE_BATCH_SIZE);
                 for path in files {
                     if let Some((entry_id, quick_report)) = self
                         .scan_movie_file_if_unchanged(
@@ -114,18 +115,50 @@ impl LibraryScanner {
                         seen_entry_ids.push(entry_id);
                         report.merge(quick_report);
                     } else {
-                        report.merge(
-                            self.scan_movie_file(
-                                &library_id_text,
-                                &root,
-                                &root_path,
-                                &path,
-                                &generation,
-                            )
-                            .await?,
-                        );
+                        let relative_path = path
+                            .strip_prefix(&root_path)
+                            .map_err(|error| {
+                                ScannerError::InvalidRelativePath(error.to_string())
+                            })?
+                            .to_str()
+                            .ok_or(ScannerError::NonUtf8Path)?;
+                        if !existing_entries.contains_key(relative_path) {
+                            if let Some(file) = self.prepare_new_movie_file(&root_path, &path).await?
+                            {
+                                pending_new_files.push(file);
+                                if pending_new_files.len() == FILE_BATCH_SIZE {
+                                    self.flush_new_movie_files(
+                                        &library_id_text,
+                                        &root,
+                                        &generation,
+                                        &mut pending_new_files,
+                                        &mut report,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        } else {
+                            report.merge(
+                                self.scan_movie_file(
+                                    &library_id_text,
+                                    &root,
+                                    &root_path,
+                                    &path,
+                                    &generation,
+                                )
+                                .await?,
+                            );
+                        }
                     }
                 }
+                self.flush_new_movie_files(
+                    &library_id_text,
+                    &root,
+                    &generation,
+                    &mut pending_new_files,
+                    &mut report,
+                )
+                .await?;
                 self.database
                     .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
                     .await?;
@@ -944,6 +977,28 @@ impl LibraryScanner {
             container,
             external_url,
         }))
+    }
+
+    async fn flush_new_movie_files(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        generation: &str,
+        files: &mut Vec<NewMovieFile>,
+        report: &mut ScanReport,
+    ) -> Result<(), ScannerError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let file_count = files.len();
+        report.created_items += self
+            .database
+            .insert_movie_files_batch(library_id_text, &root.id, generation, files)
+            .await?;
+        report.discovered_files += file_count;
+        report.created_sources += file_count;
+        files.clear();
+        Ok(())
     }
 
     pub(crate) async fn scan_movie_file(
