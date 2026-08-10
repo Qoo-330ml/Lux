@@ -249,6 +249,52 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     let children_body = children.json::<Value>().await?;
     assert_eq!(children_body["Items"].as_array().map(Vec::len), Some(1));
 
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < 5000
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title,
+             identification_status, identity_key, has_available_source
+         )
+         SELECT printf('bulk-collection-%05d', value), ?, 'MOVIE',
+                printf('Bulk Collection %05d', value),
+                printf('Bulk Collection %05d', value), 'LOCAL_CONFIRMED',
+                printf('bulk-collection:%05d', value), 1
+         FROM sequence",
+    )
+    .bind(first.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO collection_items (collection_id, item_id, sort_order)
+         SELECT c.id, mi.id, 1 + CAST(substr(mi.id, -5) AS INTEGER)
+         FROM collections c
+         JOIN media_items mi ON mi.id LIKE 'bulk-collection-%'
+         WHERE c.item_id = ?",
+    )
+    .bind(&collection_item_id)
+    .execute(database.pool())
+    .await?;
+    let large_page = tokio::time::timeout(Duration::from_secs(1), async {
+        client
+            .get(format!(
+                "{base_url}/Items/{collection_item_id}/Children?StartIndex=1&Limit=1"
+            ))
+            .header("X-Emby-Token", &viewer_token)
+            .send()
+            .await
+    })
+    .await
+    .map_err(|_| "collection page loaded every member")??;
+    assert_eq!(large_page.status(), reqwest::StatusCode::OK);
+    let large_page_body = large_page.json::<Value>().await?;
+    assert_eq!(large_page_body["TotalRecordCount"], 5001);
+    assert_eq!(large_page_body["Items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(large_page_body["Items"][0]["Id"], "bulk-collection-00001");
+
     server.abort();
     tmdb_server.abort();
     assert_ne!(admin.id, viewer.id);

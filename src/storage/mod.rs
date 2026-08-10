@@ -4939,24 +4939,73 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_collection_member_ids(
+    pub(crate) async fn list_collection_member_ids_page(
         &self,
         collection_item_id: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        self.query_scalar(
-            "SELECT ci.item_id
-             FROM collection_items ci
+        library_ids: Option<&[String]>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<String>, i64), StorageError> {
+        if library_ids.is_some_and(|library_ids| library_ids.is_empty()) {
+            return Ok((Vec::new(), 0));
+        }
+        let library_filter = library_ids
+            .map(|library_ids| {
+                let placeholders = std::iter::repeat_n("?", library_ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" AND mi.library_id IN ({placeholders})")
+            })
+            .unwrap_or_default();
+        let from_where = format!(
+            "FROM collection_items ci
              JOIN collections c ON c.id = ci.collection_id
-             WHERE c.item_id = ?
-             ORDER BY ci.sort_order, ci.item_id",
-        )
-        .bind(collection_item_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+             JOIN media_items mi ON mi.id = ci.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE c.item_id = ? AND mi.removed_at IS NULL
+               {CATALOG_VISIBLE_PREDICATE}{library_filter}"
+        );
+        let mut count_statement = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {from_where}")))
+            .bind(collection_item_id);
+        if let Some(library_ids) = library_ids {
+            for library_id in library_ids {
+                count_statement = count_statement.bind(library_id);
+            }
+        }
+        let total = count_statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let mut list_statement = self
+            .query(sqlx::AssertSqlSafe(format!(
+                "SELECT ci.item_id {from_where}
+                 ORDER BY ci.sort_order, ci.item_id
+                 LIMIT ? OFFSET ?"
+            )))
+            .bind(collection_item_id);
+        if let Some(library_ids) = library_ids {
+            for library_id in library_ids {
+                list_statement = list_statement.bind(library_id);
+            }
+        }
+        let rows = list_statement
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((
+            rows.into_iter().map(|row| row.get("item_id")).collect(),
+            total,
+        ))
     }
 
     pub(crate) async fn count_pending_metadata_candidates(&self) -> Result<i64, StorageError> {

@@ -256,22 +256,38 @@ impl CatalogService {
         {
             return Err(CatalogError::AccessDenied);
         }
-        let member_ids = self
+        let library_ids = if principal.is_admin {
+            None
+        } else {
+            Some(self.access.accessible_library_ids(principal).await?)
+        };
+        let (member_ids, total) = self
             .database
-            .list_collection_member_ids(collection_item_id)
+            .list_collection_member_ids_page(
+                collection_item_id,
+                library_ids.as_deref(),
+                offset,
+                limit,
+            )
             .await?;
-        let mut items = Vec::new();
+        let rows = self.database.list_catalog_rows_by_ids(&member_ids).await?;
+        let mut items_by_id = assemble_items(rows)
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<HashMap<_, _>>();
+        let details = self
+            .database
+            .list_catalog_details_by_ids(&member_ids)
+            .await?;
+        let mut items = Vec::with_capacity(member_ids.len());
         for member_id in member_ids {
-            if let Some(item) = self.find_item(principal, &member_id).await? {
+            if let Some(mut item) = items_by_id.remove(&member_id) {
+                if let Some(detail) = details.get(&member_id) {
+                    apply_catalog_detail(&mut item, detail);
+                }
                 items.push(item);
             }
         }
-        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
-        let items = items
-            .into_iter()
-            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-            .take(usize::try_from(limit).unwrap_or(0))
-            .collect();
         Ok(CatalogPage {
             items,
             total,
