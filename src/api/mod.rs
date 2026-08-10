@@ -198,7 +198,8 @@ impl AppState {
                 scraper_resolver.clone(),
                 metadata_selection.clone(),
             )
-            .with_admin_events(admin_events.clone()),
+            .with_admin_events(admin_events.clone())
+            .with_resource_metrics(resources.clone()),
         );
         let image_candidates = Some(ImageCandidateService::with_resolver(
             database.clone(),
@@ -283,7 +284,8 @@ impl AppState {
                     resolver.clone(),
                     self.metadata_selection.clone(),
                 )
-                .with_admin_events(self.admin_events.clone()),
+                .with_admin_events(self.admin_events.clone())
+                .with_resource_metrics(self.resources.clone()),
             );
             self.image_candidates = Some(ImageCandidateService::with_resolver(
                 database, tmdb, resolver,
@@ -296,7 +298,8 @@ impl AppState {
                     tmdb.clone(),
                     self.metadata_selection.clone(),
                 )
-                .with_admin_events(self.admin_events.clone()),
+                .with_admin_events(self.admin_events.clone())
+                .with_resource_metrics(self.resources.clone()),
             );
             self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
         }

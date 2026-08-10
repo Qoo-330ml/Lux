@@ -2246,16 +2246,9 @@ impl ScanJobService {
     }
 
     async fn effective_scan_concurrency(&self, configured: i64) -> usize {
-        let available_parallelism = std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(1);
-        let container_cpu_limit = self.resources.cpu_limit_cores().await;
-        recommended_scan_concurrency(
-            configured,
-            available_parallelism,
-            self.resources.home_latency_p95_ms(),
-            container_cpu_limit,
-        )
+        self.resources
+            .background_concurrency(usize::try_from(configured).unwrap_or(1))
+            .await
     }
 
     async fn run_thumbnails_after_scan(
@@ -2553,30 +2546,6 @@ impl ScanJobService {
     }
 }
 
-const HOME_P95_DEGRADED_MS: u64 = 300;
-const HOME_P95_TARGET_MS: u64 = 400;
-
-fn recommended_scan_concurrency(
-    configured: i64,
-    available_parallelism: usize,
-    home_p95_ms: Option<u64>,
-    container_cpu_limit: Option<f64>,
-) -> usize {
-    let configured = usize::try_from(configured).unwrap_or(1).max(1);
-    let container_parallelism = container_cpu_limit
-        .filter(|limit| limit.is_finite() && *limit > 0.0)
-        .map_or(available_parallelism, |limit| {
-            limit.ceil().min(usize::MAX as f64) as usize
-        });
-    let cpu_cap = container_parallelism.saturating_sub(1).max(1);
-    let base = configured.min(cpu_cap);
-    match home_p95_ms {
-        Some(value) if value >= HOME_P95_TARGET_MS => 1,
-        Some(value) if value >= HOME_P95_DEGRADED_MS => base.div_ceil(2).max(1),
-        _ => base,
-    }
-}
-
 type MoviePreparationOutput = (
     usize,
     String,
@@ -2598,30 +2567,6 @@ async fn join_movie_preparation(
             path: PathBuf::from("<scan-preparation-task>"),
             source: std::io::Error::other("scan preparation task set is empty"),
         }),
-    }
-}
-
-#[cfg(test)]
-mod resource_tests {
-    use super::recommended_scan_concurrency;
-
-    #[test]
-    fn reserves_one_parallel_unit_for_foreground_requests() {
-        assert_eq!(recommended_scan_concurrency(8, 8, None, None), 7);
-        assert_eq!(recommended_scan_concurrency(8, 1, None, None), 1);
-    }
-
-    #[test]
-    fn slows_scan_when_home_latency_degrades() {
-        assert_eq!(recommended_scan_concurrency(8, 8, Some(300), None), 4);
-        assert_eq!(recommended_scan_concurrency(8, 8, Some(400), None), 1);
-        assert_eq!(recommended_scan_concurrency(1, 8, Some(300), None), 1);
-    }
-
-    #[test]
-    fn respects_the_container_cpu_limit() {
-        assert_eq!(recommended_scan_concurrency(8, 16, None, Some(4.0)), 3);
-        assert_eq!(recommended_scan_concurrency(8, 16, None, Some(0.5)), 1);
     }
 }
 

@@ -13,6 +13,7 @@ use crate::{
         scraper::{ScraperError, ScraperResolver},
         tmdb_plugin::TmdbProvider,
     },
+    observability::resources::ResourceMetrics,
     storage::{Database, StorageError, StoredMetadataReidentifyItem},
 };
 
@@ -44,6 +45,7 @@ pub struct MetadataReidentifyService {
     tmdb: TmdbProvider,
     resolver: Option<ScraperResolver>,
     admin_events: AdminEventHub,
+    resources: ResourceMetrics,
 }
 
 impl MetadataReidentifyService {
@@ -58,6 +60,7 @@ impl MetadataReidentifyService {
             tmdb: tmdb.into(),
             resolver: None,
             admin_events: AdminEventHub::new(),
+            resources: ResourceMetrics::new(),
         }
     }
 
@@ -83,6 +86,7 @@ impl MetadataReidentifyService {
             tmdb: tmdb.into(),
             resolver: None,
             admin_events: AdminEventHub::new(),
+            resources: ResourceMetrics::new(),
         }
     }
 
@@ -102,11 +106,17 @@ impl MetadataReidentifyService {
             tmdb: tmdb.into(),
             resolver: Some(resolver),
             admin_events: AdminEventHub::new(),
+            resources: ResourceMetrics::new(),
         }
     }
 
     pub fn with_admin_events(mut self, admin_events: AdminEventHub) -> Self {
         self.admin_events = admin_events;
+        self
+    }
+
+    pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = resources;
         self
     }
 
@@ -266,43 +276,21 @@ impl MetadataReidentifyService {
             _ => MetadataRefreshMode::Reidentify,
         };
         let mut workers = JoinSet::new();
-        while workers.len() < METADATA_MATCH_CONCURRENCY {
-            if self
-                .database
-                .metadata_reidentify_job_cancel_requested(job_id)
-                .await
-                .unwrap_or(true)
-            {
-                break;
-            }
-            let Ok(Some(item_id)) = self.database.next_metadata_reidentify_item(job_id).await
-            else {
-                break;
-            };
-            if !self
-                .database
-                .claim_metadata_reidentify_item(job_id, &item_id)
-                .await
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let service = self.clone();
-            let job_id = job_id.to_owned();
-            workers.spawn(async move {
-                service.process_item(&job_id, &item_id, mode).await;
-            });
-        }
-        while let Some(worker_result) = workers.join_next().await {
-            if let Err(error) = worker_result {
-                tracing::error!(
+        let mut last_concurrency = None;
+        loop {
+            let concurrency = self
+                .resources
+                .background_concurrency(METADATA_MATCH_CONCURRENCY)
+                .await;
+            if last_concurrency != Some(concurrency) {
+                tracing::info!(
                     job_id,
-                    worker_cancelled = error.is_cancelled(),
-                    worker_panicked = error.is_panic(),
-                    "metadata refresh worker stopped before recording its result"
+                    concurrency,
+                    "metadata refresh worker concurrency adjusted"
                 );
+                last_concurrency = Some(concurrency);
             }
-            while workers.len() < METADATA_MATCH_CONCURRENCY {
+            while workers.len() < concurrency {
                 if self
                     .database
                     .metadata_reidentify_job_cancel_requested(job_id)
@@ -328,6 +316,17 @@ impl MetadataReidentifyService {
                 workers.spawn(async move {
                     service.process_item(&job_id, &item_id, mode).await;
                 });
+            }
+            let Some(worker_result) = workers.join_next().await else {
+                break;
+            };
+            if let Err(error) = worker_result {
+                tracing::error!(
+                    job_id,
+                    worker_cancelled = error.is_cancelled(),
+                    worker_panicked = error.is_panic(),
+                    "metadata refresh worker stopped before recording its result"
+                );
             }
         }
         let reconciliation_failed = match self

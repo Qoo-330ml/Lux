@@ -11,6 +11,8 @@ use tokio::{fs, process::Command};
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MEDIA_PATH: &str = "/media";
 const HOME_LATENCY_SAMPLE_CAPACITY: usize = 64;
+const HOME_P95_DEGRADED_MS: u64 = 300;
+const HOME_P95_TARGET_MS: u64 = 400;
 
 #[derive(Clone)]
 pub struct ResourceMetrics {
@@ -62,6 +64,18 @@ impl ResourceMetrics {
 
     pub async fn cpu_limit_cores(&self) -> Option<f64> {
         read_cpu_usage().await.and_then(|(_, limit)| limit)
+    }
+
+    pub async fn background_concurrency(&self, configured: usize) -> usize {
+        let available_parallelism = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1);
+        recommended_background_concurrency(
+            configured,
+            available_parallelism,
+            self.home_latency_p95_ms(),
+            self.cpu_limit_cores().await,
+        )
     }
 
     pub async fn snapshot(&self) -> ResourceSnapshot {
@@ -401,11 +415,32 @@ fn calculate_storage_usage_percent(used_bytes: u64, total_bytes: u64) -> Option<
     (total_bytes > 0).then(|| (used_bytes as f64 * 100.0 / total_bytes as f64).min(100.0))
 }
 
+pub fn recommended_background_concurrency(
+    configured: usize,
+    available_parallelism: usize,
+    home_p95_ms: Option<u64>,
+    container_cpu_limit: Option<f64>,
+) -> usize {
+    let configured = configured.max(1);
+    let container_parallelism = container_cpu_limit
+        .filter(|limit| limit.is_finite() && *limit > 0.0)
+        .map_or(available_parallelism, |limit| {
+            limit.ceil().min(usize::MAX as f64) as usize
+        });
+    let cpu_cap = container_parallelism.saturating_sub(1).max(1);
+    let base = configured.min(cpu_cap);
+    match home_p95_ms {
+        Some(value) if value >= HOME_P95_TARGET_MS => 1,
+        Some(value) if value >= HOME_P95_DEGRADED_MS => base.div_ceil(2).max(1),
+        _ => base,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ResourceMetrics, calculate_cpu_usage_percent, memory_usage_percent, parse_cgroup_limit,
-        parse_media_storage_values, process_is_member,
+        parse_media_storage_values, process_is_member, recommended_background_concurrency,
     };
     use std::time::Duration;
 
@@ -457,5 +492,15 @@ mod tests {
         }
 
         assert_eq!(metrics.home_latency_p95_ms(), Some(62));
+    }
+
+    #[test]
+    fn background_concurrency_reserves_home_capacity_and_honors_limits() {
+        assert_eq!(recommended_background_concurrency(8, 8, None, None), 7);
+        assert_eq!(recommended_background_concurrency(8, 8, Some(400), None), 1);
+        assert_eq!(
+            recommended_background_concurrency(8, 16, None, Some(4.0)),
+            3
+        );
     }
 }

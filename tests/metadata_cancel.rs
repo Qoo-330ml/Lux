@@ -1,6 +1,12 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
-use axum::{Json, Router, routing::any};
+use axum::{Json, Router, extract::State, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
@@ -49,6 +55,20 @@ async fn delayed_tmdb_search() -> Json<Value> {
             "original_language": "en"
         }]
     }))
+}
+
+#[derive(Clone)]
+struct RequestCounter {
+    active: Arc<AtomicUsize>,
+    maximum: Arc<AtomicUsize>,
+}
+
+async fn counted_tmdb_search(State(counter): State<RequestCounter>) -> Json<Value> {
+    let active = counter.active.fetch_add(1, Ordering::SeqCst) + 1;
+    counter.maximum.fetch_max(active, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    counter.active.fetch_sub(1, Ordering::SeqCst);
+    delayed_tmdb_search().await
 }
 
 #[tokio::test]
@@ -131,6 +151,71 @@ async fn metadata_job_can_be_cancelled_while_running() -> Result<(), Box<dyn std
     assert!(cancelled.processed_count < cancelled.total_count);
     let retried = metadata.retry_job(&job_id).await?;
     assert_eq!(retried.status, "QUEUED");
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_job_reduces_workers_when_home_latency_is_degraded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for index in 0..24 {
+        let movie_dir = root.join(format!("Movie {index} (2024)"));
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Movie.{index}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let counter = RequestCounter {
+        active: Arc::new(AtomicUsize::new(0)),
+        maximum: Arc::new(AtomicUsize::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(counted_tmdb_search))
+        .with_state(counter.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let resources = luxd::observability::resources::ResourceMetrics::new();
+    resources.record_home_latency(Duration::from_millis(400));
+    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb))
+        .with_resource_metrics(resources);
+    let job = metadata.create_library_job(&library.id.to_string()).await?;
+    metadata.run(&job.id).await;
+
+    assert_eq!(metadata.get_job(&job.id).await?.status, "COMPLETED");
+    assert_eq!(counter.maximum.load(Ordering::SeqCst), 1);
     tmdb_server.abort();
     Ok(())
 }
