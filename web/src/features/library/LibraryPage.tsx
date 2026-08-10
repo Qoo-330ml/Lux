@@ -7,6 +7,18 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { Library } from "../../lib/api/types";
 import { MediaCard } from "../home/media";
 
+const LIBRARY_SORT_STORAGE_KEY = "lux.library.sort";
+
+type LibrarySortPreference = {
+  sortBy: LibrarySortBy;
+  sortOrder: LibrarySortOrder;
+};
+
+const DEFAULT_LIBRARY_SORT_PREFERENCE: LibrarySortPreference = {
+  sortBy: "Name",
+  sortOrder: "Ascending",
+};
+
 export function libraryItemTypeFilter(kind?: Library["kind"]) {
   if (kind === "SERIES") return "SERIES";
   if (kind === "MOVIE") return "MOVIE";
@@ -14,10 +26,61 @@ export function libraryItemTypeFilter(kind?: Library["kind"]) {
   return undefined;
 }
 
+function readLibrarySortPreference(libraryId: string): LibrarySortPreference {
+  const storage = getStorage();
+  if (!storage) return DEFAULT_LIBRARY_SORT_PREFERENCE;
+
+  try {
+    const stored = JSON.parse(storage.getItem(librarySortStorageKey(libraryId)) ?? "null") as Partial<LibrarySortPreference> | null;
+    return {
+      sortBy: isLibrarySortBy(stored?.sortBy) ? stored.sortBy : DEFAULT_LIBRARY_SORT_PREFERENCE.sortBy,
+      sortOrder: isLibrarySortOrder(stored?.sortOrder) ? stored.sortOrder : DEFAULT_LIBRARY_SORT_PREFERENCE.sortOrder,
+    };
+  } catch {
+    return DEFAULT_LIBRARY_SORT_PREFERENCE;
+  }
+}
+
+function saveLibrarySortPreference(libraryId: string, preference: LibrarySortPreference): void {
+  const storage = getStorage();
+  if (!storage) return;
+
+  try {
+    storage.setItem(librarySortStorageKey(libraryId), JSON.stringify(preference));
+  } catch {
+    // Sort preferences are best-effort when browser storage is unavailable or full.
+  }
+}
+
+function librarySortStorageKey(libraryId: string): string {
+  return `${LIBRARY_SORT_STORAGE_KEY}:${encodeURIComponent(libraryId)}`;
+}
+
+function isLibrarySortBy(value: unknown): value is LibrarySortBy {
+  return value === "Name" || value === "DateCreated" || value === "PremiereDate" || value === "CommunityRating";
+}
+
+function isLibrarySortOrder(value: unknown): value is LibrarySortOrder {
+  return value === "Ascending" || value === "Descending";
+}
+
+function getStorage(): Storage | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
 export function LibraryPage() {
   const { libraryId = "" } = useParams();
-  const [sortBy, setSortBy] = useState<LibrarySortBy>("Name");
-  const [sortOrder, setSortOrder] = useState<LibrarySortOrder>("Ascending");
+  const [sortState, setSortState] = useState(() => ({
+    libraryId,
+    preference: readLibrarySortPreference(libraryId),
+  }));
+  const sortPreference = sortState.libraryId === libraryId ? sortState.preference : readLibrarySortPreference(libraryId);
+  const { sortBy, sortOrder } = sortPreference;
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
   const itemTypes = libraryItemTypeFilter(library?.kind);
@@ -67,8 +130,17 @@ export function LibraryPage() {
 
   function changeSortBy(value: string) {
     const nextSortBy = value as LibrarySortBy;
-    setSortBy(nextSortBy);
-    setSortOrder(nextSortBy === "Name" ? "Ascending" : "Descending");
+    const nextSortOrder: LibrarySortOrder = nextSortBy === "Name" ? "Ascending" : "Descending";
+    const preference = { sortBy: nextSortBy, sortOrder: nextSortOrder };
+    setSortState({ libraryId, preference });
+    saveLibrarySortPreference(libraryId, preference);
+  }
+
+  function changeSortOrder(value: string) {
+    const nextSortOrder = value as LibrarySortOrder;
+    const preference = { sortBy, sortOrder: nextSortOrder };
+    setSortState({ libraryId, preference });
+    saveLibrarySortPreference(libraryId, preference);
   }
 
   return (
@@ -76,7 +148,7 @@ export function LibraryPage() {
       <div className="lux-page-heading"><h1>{library?.name || "媒体库"}</h1><p>{total} 项内容</p></div>
       <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
-        <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={(value) => setSortOrder(value as LibrarySortOrder)} aria-label="排序顺序" /></div>
+        <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div>
       <div className="lux-poster-grid">
         {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} />)}

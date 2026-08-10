@@ -32,6 +32,7 @@ describe("LibraryPage infinite scroll", () => {
   afterEach(() => {
     if (root) act(() => root?.unmount());
     container?.remove();
+    localStorage.clear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     triggerIntersection = undefined;
@@ -245,5 +246,73 @@ describe("LibraryPage infinite scroll", () => {
         sortOrder: "Descending",
       }));
     });
+  });
+
+  it("restores the selected sorting after the library page is reloaded", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "movie-1", title: "电影", itemType: "MOVIE" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    const renderLibraryPage = async () => {
+      root = createRoot(container as HTMLDivElement);
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      await act(async () => {
+        root?.render(createElement(
+          QueryClientProvider,
+          { client: queryClient },
+          createElement(
+            MemoryRouter,
+            { initialEntries: ["/libraries/library-1"] },
+            createElement(
+              Routes,
+              null,
+              createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+            ),
+          ),
+        ));
+      });
+    };
+
+    await renderLibraryPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector("[role='combobox'][aria-label='排序方式']")).toBeTruthy());
+    });
+
+    const sortBy = container.querySelector<HTMLButtonElement>("[role='combobox'][aria-label='排序方式']");
+    await act(async () => {
+      if (!sortBy) throw new Error("sort selector was not rendered");
+      sortBy.click();
+    });
+    await act(async () => {
+      const releaseDateOption = document.querySelector<HTMLButtonElement>("[role='option'][data-value='PremiereDate']");
+      if (!releaseDateOption) throw new Error("release-date sort option was not rendered");
+      releaseDateOption.click();
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+        sortBy: "PremiereDate",
+        sortOrder: "Descending",
+      }));
+    });
+
+    await act(async () => root?.unmount());
+    root = undefined;
+    container.replaceChildren();
+    libraryItems.mockClear();
+
+    await renderLibraryPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+        sortBy: "PremiereDate",
+        sortOrder: "Descending",
+      }));
+    });
+    expect(container.querySelector("[role='combobox'][aria-label='排序方式']")?.textContent).toContain("发行日期");
   });
 });
