@@ -12,6 +12,27 @@ docker compose pull
 docker compose up -d
 ```
 
+Compose 默认把 Lux 容器的内存硬上限设为 `2g`。这不是正常内存预算；Lux 的默认扫描常驻内存目标仍是
+750 MB 以下。有限的 cgroup 上限让 Lux 能读取真实的容器内存压力：使用率达到 70% 时后台 worker
+并发减半，达到 85% 时降为单 worker；若进程仍越过硬上限，Docker 会终止并按重启策略拉起容器，
+避免耗尽 NAS 宿主机内存。可按部署容量在 `.env` 中覆盖，但不建议取消上限：
+
+```dotenv
+LUX_MEMORY_LIMIT=2g
+LUX_MALLOC_ARENA_MAX=2
+```
+
+`LUX_MALLOC_ARENA_MAX` 限制 Debian/glibc 为多线程分配的堆 arena 数，减少任务结束后每线程 arena
+保留大量匿名页的概率；镜像默认值同样为 `2`。该设置可覆盖，但应先在相同 NAS 架构和媒体库上比较
+任务耗时、RSS 峰值和任务结束后的 RSS，再提高数值。修改后需重建容器，单纯重启旧容器不会应用新的
+Compose 配置：
+
+```bash
+docker compose up -d --force-recreate lux
+docker inspect --format '{{.HostConfig.Memory}}' lux
+docker exec lux sh -c 'cat /sys/fs/cgroup/memory.max; printf "%s\n" "$MALLOC_ARENA_MAX"'
+```
+
 上面的默认命令只启动 Lux，使用内置 SQLite。若希望由同一个 Compose 项目额外运行 PostgreSQL，先设置
 强密码，再启用 `postgres` profile：
 

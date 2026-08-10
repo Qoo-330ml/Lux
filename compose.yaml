@@ -3,6 +3,9 @@ services:
     image: pdzhou/lux:latest
     container_name: lux
     user: "0:0"
+    mem_limit: ${LUX_MEMORY_LIMIT:-2g}
+    environment:
+      MALLOC_ARENA_MAX: ${LUX_MALLOC_ARENA_MAX:-2}
     ports:
       - "8097:8097"
     volumes:
