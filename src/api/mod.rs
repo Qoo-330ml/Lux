@@ -66,6 +66,7 @@ use crate::{
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{ScanJob, ScanJobError, ScanJobService},
+        scheduled_tasks::ScheduledTaskService,
         scraper::ScraperResolver,
         settings::{
             read_danmaku_provider_url_async, read_network_proxy_url_async,
@@ -130,6 +131,7 @@ pub struct AppState {
     thumbnails: Option<ThumbnailService>,
     scan_jobs: Option<ScanJobService>,
     strm_probe: Option<StrmProbeService>,
+    scheduled_tasks: Option<ScheduledTaskService>,
     danmaku: Option<DanmakuService>,
     plugins: Option<PluginService>,
     scraper_resolver: Option<ScraperResolver>,
@@ -207,6 +209,10 @@ impl AppState {
             tmdb.clone(),
             scraper_resolver.clone(),
         ));
+        let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
+            .with_resource_metrics(resources.clone());
+        let scheduled_tasks =
+            ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone());
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -244,10 +250,8 @@ impl AppState {
                     None => service,
                 }
             }),
-            strm_probe: Some(
-                StrmProbeService::new(database.clone(), plugins.clone())
-                    .with_resource_metrics(resources.clone()),
-            ),
+            strm_probe: Some(strm_probe),
+            scheduled_tasks: Some(scheduled_tasks),
             danmaku: Some(
                 DanmakuService::new(
                     database.clone(),
@@ -389,6 +393,17 @@ impl AppState {
                     tracing::error!(job_id = %job_id, %error, "resumed STRM probe job stopped");
                 }
             });
+        }
+    }
+
+    pub async fn start_scheduled_tasks(&self) {
+        if let Some(plugins) = self.plugins.as_ref()
+            && let Err(error) = plugins.sync_media_info_scheduled_task().await
+        {
+            tracing::error!(%error, "failed to synchronize STRM scheduled task");
+        }
+        if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
+            scheduled_tasks.spawn();
         }
     }
 
