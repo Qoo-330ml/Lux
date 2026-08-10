@@ -298,13 +298,14 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
   const [editing, setEditing] = useState(false);
   const [schedule, setSchedule] = useState(task.schedule ?? "");
   const [enabled, setEnabled] = useState(task.isEnabled);
+  const pluginSchedule = isPluginScheduledTask(task);
   const update = useMutation({
     mutationFn: () => api.updateAdminScheduledTask({
       ownerType: task.ownerType === "GLOBAL" ? "GLOBAL" : "LIBRARY",
       ownerId: task.ownerType === "GLOBAL" ? "global" : task.ownerId,
       taskType: task.taskType,
       schedule: schedule.trim() || null,
-      isEnabled: enabled && Boolean(schedule.trim()),
+      isEnabled: pluginSchedule ? undefined : enabled && Boolean(schedule.trim()),
     }),
     onSuccess: () => {
       setEditing(false);
@@ -344,7 +345,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
         <div className="lux-registered-task-heading"><strong>{name}</strong><span className={`lux-registered-task-status ${task.isEnabled && configured ? "is-enabled" : configured ? "is-disabled" : "is-unconfigured"}`}>{stateLabel}</span></div>
         <p>{task.description || "由后台注册的任务。"}</p>
         <div className="lux-registered-task-meta"><span>{task.ownerName || (task.ownerType === "GLOBAL" ? "全局" : "指定媒体库")}</span><span>{task.sourceType === "PLUGIN" ? `插件注册${task.pluginId ? ` · ${task.pluginId}` : ""}` : "系统注册"}</span><code>{task.taskType}</code></div>
-        {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><label htmlFor={`schedule-${task.id ?? task.taskType}`}>Cron 执行计划<input id={`schedule-${task.id ?? task.taskType}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} /><small>标准五段式：分 时 日 月 周，按 UTC 执行</small></label><label className="lux-admin-toggle" htmlFor={`enabled-${task.id ?? task.taskType}`}><input id={`enabled-${task.id ?? task.taskType}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此任务</span></label><div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></button></div>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.schedule || "尚未配置执行计划"}</span>}
+        {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><label htmlFor={`schedule-${task.id ?? task.taskType}`}>Cron 执行计划<input id={`schedule-${task.id ?? task.taskType}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} required={pluginSchedule} /><small>标准五段式：分 时 日 月 周，按 UTC 执行</small></label>{pluginSchedule ? null : <label className="lux-admin-toggle" htmlFor={`enabled-${task.id ?? task.taskType}`}><input id={`enabled-${task.id ?? task.taskType}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此任务</span></label>}<div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></button></div>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.schedule || "尚未配置执行计划"}</span>}
       </div>
       {!editing ? <div className="lux-registered-task-actions">
         {canRunNow ? <button className="lux-button lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button> : null}
@@ -478,7 +479,12 @@ function isRunnableTask(task: AdminScheduledTask) {
 }
 
 function isSchedulableTask(task: AdminScheduledTask) {
-  return task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE"].includes(task.taskType);
+  return isPluginScheduledTask(task)
+    || (task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE"].includes(task.taskType));
+}
+
+function isPluginScheduledTask(task: AdminScheduledTask) {
+  return task.ownerType === "GLOBAL" && task.taskType === "STRM_MEDIA_INFO";
 }
 
 async function runRegisteredTask(task: AdminScheduledTask) {

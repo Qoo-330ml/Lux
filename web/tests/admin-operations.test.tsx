@@ -187,6 +187,64 @@ describe("AdminOperationsPage", () => {
     });
   });
 
+  it("edits the global STRM task schedule without exposing a task toggle", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    const updateSchedule = vi.spyOn(api, "updateAdminScheduledTask").mockResolvedValue({
+      scheduledTask: {
+        ownerType: "GLOBAL",
+        ownerId: "global",
+        ownerName: "全局",
+        taskType: "STRM_MEDIA_INFO",
+        name: "STRM 媒体信息扫描",
+        schedule: "0 4 * * *",
+        isEnabled: true,
+      },
+    });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({
+      scheduledTasks: [{
+        id: "GLOBAL:global:STRM_MEDIA_INFO",
+        ownerType: "GLOBAL",
+        ownerId: "global",
+        ownerName: "全局",
+        taskType: "STRM_MEDIA_INFO",
+        name: "STRM 媒体信息扫描",
+        description: "按插件配置扫描选定媒体库的 STRM 外部媒体信息。",
+        sourceType: "PLUGIN",
+        pluginId: "org.lux.strm-media-info",
+        schedule: "0 3 * * *",
+        isEnabled: true,
+      }],
+      total: 1,
+      page: 1,
+      pageSize: 100,
+    });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("STRM 媒体信息扫描"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑STRM 媒体信息扫描"]')?.click());
+    const input = container.querySelector<HTMLInputElement>("input[id^='schedule-GLOBAL']");
+    expect(input).not.toBeNull();
+    expect(container.querySelector<HTMLInputElement>("input[id^='enabled-GLOBAL']")).toBeNull();
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "0 4 * * *");
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".lux-registered-task-editor button[type='submit']")?.click();
+      await vi.waitFor(() => expect(updateSchedule).toHaveBeenCalledWith({
+        ownerType: "GLOBAL",
+        ownerId: "global",
+        taskType: "STRM_MEDIA_INFO",
+        schedule: "0 4 * * *",
+        isEnabled: undefined,
+      }));
+    });
+  });
+
   it("runs a registered task immediately with its task-specific worker", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });

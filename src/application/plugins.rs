@@ -491,6 +491,32 @@ impl PluginService {
         self.view_for_id(&plugin_id, installed, enabled).await
     }
 
+    pub async fn update_media_info_schedule(
+        &self,
+        schedule: &str,
+    ) -> Result<(), PluginServiceError> {
+        let schedule = schedule.trim();
+        validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+        let plugin = self
+            .catalog
+            .get(MEDIA_INFO_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(MEDIA_INFO_PLUGIN_ID.to_owned()))?;
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let mut values = merge_default_config_values(
+            &fields,
+            normalize_plugin_config(
+                MEDIA_INFO_PLUGIN_ID,
+                self.read_plugin_config(MEDIA_INFO_PLUGIN_ID).await?,
+            ),
+        );
+        values.insert("schedule".to_owned(), Value::String(schedule.to_owned()));
+        let values = validate_config_values(&fields, &values)?;
+        media_info_schedule(&values)?;
+        self.write_plugin_config(MEDIA_INFO_PLUGIN_ID, &values)
+            .await?;
+        self.sync_media_info_scheduled_task().await
+    }
+
     pub async fn media_info_settings(&self) -> Result<MediaInfoSettings, PluginServiceError> {
         let plugin = self
             .catalog

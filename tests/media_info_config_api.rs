@@ -35,7 +35,8 @@ async fn media_info_plugin_config_api_drives_a_background_run()
                 {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "required": true, "optionsSource": "media-libraries"},
                 {"key": "concurrency", "label": "并发数", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 64},
                 {"key": "existingInfoPolicy", "label": "已有媒体信息处理方式", "type": "select", "defaultValue": "SKIP", "options": [{"value": "SKIP", "label": "跳过已有媒体信息"}, {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}]},
-                {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": true}
+                {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": true},
+                {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 3 * * *"}
             ],
             "permissions": {"network": ["media-source"], "filesystem": []},
             "files": []
@@ -116,6 +117,42 @@ async fn media_info_plugin_config_api_drives_a_background_run()
         updated.json::<Value>().await?["plugin"]["configValues"]["concurrency"],
         3
     );
+
+    let scheduled = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "GLOBAL",
+            "ownerId": "global",
+            "taskType": "STRM_MEDIA_INFO",
+            "schedule": "0 4 * * *"
+        }))
+        .send()
+        .await?;
+    assert_eq!(scheduled.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        scheduled.json::<Value>().await?["scheduledTask"]["schedule"],
+        "0 4 * * *"
+    );
+
+    let plugins = client
+        .get(format!(
+            "{base_url}/api/v1/admin/plugins/installed?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    let plugin = plugins.json::<Value>().await?["plugins"]
+        .as_array()
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .find(|plugin| plugin["id"] == "org.lux.strm-media-info")
+        })
+        .cloned()
+        .ok_or("missing STRM plugin")?;
+    assert_eq!(plugin["configValues"]["schedule"], "0 4 * * *");
 
     let run = client
         .post(format!(

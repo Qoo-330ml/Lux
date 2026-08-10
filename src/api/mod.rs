@@ -8733,7 +8733,9 @@ async fn admin_upsert_scheduled_task(
         .into_response();
     }
     let task_type = request.task_type.trim().to_ascii_uppercase();
-    if !SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) {
+    let is_global_strm = owner_type == "GLOBAL"
+        && task_type == crate::application::schedule::STRM_MEDIA_INFO_TASK_TYPE;
+    if !SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) && !is_global_strm {
         return api_error(
             &headers,
             StatusCode::BAD_REQUEST,
@@ -8751,6 +8753,77 @@ async fn admin_upsert_scheduled_task(
                 "全局计划的 ownerId 必须是 global",
             )
             .into_response();
+        }
+        if is_global_strm {
+            let Some(database) = state.database.as_ref() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            match database
+                .find_scheduled_task_config("GLOBAL", "global", &task_type)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::NOT_FOUND,
+                        lux::ApiErrorCode::NotFound,
+                        "任务尚未注册",
+                    )
+                    .into_response();
+                }
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+            let Some(schedule) = request
+                .schedule
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "STRM 媒体信息任务必须保留 Cron 执行计划",
+                )
+                .into_response();
+            };
+            let Some(plugins) = state.plugins.as_ref() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            if let Err(error) = plugins.update_media_info_schedule(schedule).await {
+                return plugin_error(&headers, error);
+            }
+            let task = match database
+                .find_scheduled_task_config("GLOBAL", "global", &task_type)
+                .await
+            {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::NOT_FOUND,
+                        lux::ApiErrorCode::NotFound,
+                        "任务尚未注册",
+                    )
+                    .into_response();
+                }
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            record_audit_event(
+                &state,
+                &headers,
+                "SCHEDULE_UPDATED",
+                Some("scheduled_task"),
+                Some("global:STRM_MEDIA_INFO"),
+                "{}",
+            )
+            .await;
+            return (
+                StatusCode::OK,
+                Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
+            )
+                .into_response();
         }
         let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
         let schedule = if enabled {
