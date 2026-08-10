@@ -8685,8 +8685,8 @@ async fn cron_enqueue_task(
     Path((owner_type, owner_id, task_type)): Path<(String, String, String)>,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(status) = require_cron(&headers, &state) {
-        return status.into_response();
+    if let Err(response) = require_cron(&headers, &state) {
+        return response;
     }
     let Some(service) = state.scheduled_tasks.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -8725,25 +8725,25 @@ async fn cron_enqueue_task(
     }
 }
 
-fn require_cron(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
+fn require_cron(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
     let Some(expected) = state.cron_token.as_deref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
     let Some(authorization) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
     else {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED.into_response());
     };
     let Some(provided) = authorization
         .split_once(' ')
         .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty())
         .map(|(_, token)| token)
     else {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED.into_response());
     };
     if !bool::from(expected.as_bytes().ct_eq(provided.as_bytes())) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED.into_response());
     }
     Ok(())
 }
@@ -8812,8 +8812,6 @@ struct AdminScheduledTaskRequest {
     owner_type: String,
     owner_id: String,
     task_type: String,
-    #[allow(dead_code)]
-    /// Legacy clients may send this value; host crontab is the only schedule source.
     schedule: Option<String>,
     is_enabled: Option<bool>,
 }
@@ -8893,12 +8891,17 @@ async fn admin_upsert_scheduled_task(
             )
             .into_response();
         }
-        let enabled = request.is_enabled.unwrap_or(false);
+        let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
+        let schedule = if enabled {
+            request.schedule.as_deref().map(str::trim)
+        } else {
+            None
+        };
         let Some(database) = state.database.as_ref() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
         let task = match database
-            .upsert_scheduled_task_config("GLOBAL", "global", &task_type, None, enabled)
+            .upsert_scheduled_task_config("GLOBAL", "global", &task_type, schedule, enabled)
             .await
         {
             Ok(Some(task)) => task,
@@ -8942,6 +8945,9 @@ async fn admin_upsert_scheduled_task(
             );
         }
     };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -8961,15 +8967,31 @@ async fn admin_upsert_scheduled_task(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let enabled = request.is_enabled.unwrap_or(false);
+    let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
+    let schedule = if enabled {
+        request.schedule.map(|value| value.trim().to_owned())
+    } else {
+        None
+    };
+    let mut settings = LibrarySettingsPatch::default();
+    match task_type.as_str() {
+        "RECONCILIATION_SCAN" => settings.reconciliation_schedule = Some(schedule),
+        "METADATA_PARSE" => settings.metadata_schedule = Some(schedule),
+        _ => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "任务类型无效",
+            )
+            .into_response();
+        }
+    }
+    if let Err(error) = libraries.update_settings(library_id, settings).await {
+        return library_error(&headers, error);
+    }
     let task = match database
-        .upsert_scheduled_task_config(
-            "LIBRARY",
-            &library_id.to_string(),
-            &task_type,
-            None,
-            enabled,
-        )
+        .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
         .await
     {
         Ok(Some(task)) => task,

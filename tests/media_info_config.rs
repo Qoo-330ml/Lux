@@ -34,7 +34,8 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
             {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "required": true, "optionsSource": "media-libraries"},
             {"key": "concurrency", "label": "并发数", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 64},
             {"key": "existingInfoPolicy", "label": "已有媒体信息处理方式", "type": "select", "defaultValue": "SKIP", "options": [{"value": "SKIP", "label": "跳过已有媒体信息"}, {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}]},
-            {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": true}
+            {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": true},
+            {"key": "schedule", "label": "执行间隔", "type": "text", "required": true, "defaultValue": "24h"}
         ],
         "permissions": {"network": ["media-source"], "filesystem": []},
         "files": []
@@ -67,7 +68,7 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
         task,
         (
             "STRM_MEDIA_INFO".to_owned(),
-            None,
+            Some("24h".to_owned()),
             0,
             "PLUGIN".to_owned(),
             Some(MEDIA_INFO_PLUGIN_ID.to_owned())
@@ -96,6 +97,7 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
             Value::String("OVERWRITE".to_owned()),
         ),
         ("writeSidecars".to_owned(), Value::Bool(false)),
+        ("schedule".to_owned(), Value::String("6h".to_owned())),
     ]);
     let updated = plugins
         .update_dynamic_config(MEDIA_INFO_PLUGIN_ID, values)
@@ -111,7 +113,7 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(enabled, (None, 1));
+    assert_eq!(enabled, (Some("6h".to_owned()), 1));
 
     plugins.set_enabled(MEDIA_INFO_PLUGIN_ID, false).await?;
     let disabled: i64 = sqlx::query_scalar(
@@ -136,17 +138,21 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
     assert_eq!(settings.concurrency, 4);
     assert!(settings.include_ready);
     assert!(!settings.write_sidecars);
-    let legacy_schedule = Map::from_iter([
+    assert_eq!(settings.schedule, "6h");
+
+    let invalid = Map::from_iter([
         ("libraryIds".to_owned(), json!([library.id.to_string()])),
         ("concurrency".to_owned(), json!(4)),
         ("existingInfoPolicy".to_owned(), json!("SKIP")),
         ("writeSidecars".to_owned(), json!(true)),
-        ("schedule".to_owned(), json!("0 3 * * *")),
+        ("schedule".to_owned(), json!("59s")),
     ]);
-    let legacy_updated = plugins
-        .update_dynamic_config(MEDIA_INFO_PLUGIN_ID, legacy_schedule)
-        .await?;
-    assert!(!legacy_updated.config_values.contains_key("schedule"));
+    assert!(
+        plugins
+            .update_dynamic_config(MEDIA_INFO_PLUGIN_ID, invalid)
+            .await
+            .is_err()
+    );
     Ok(())
 }
 
@@ -222,5 +228,6 @@ async fn media_info_plugin_migrates_legacy_include_ready_configuration()
     assert_eq!(settings.library_ids, vec![library.id]);
     assert!(settings.include_ready);
     assert!(!settings.write_sidecars);
+    assert_eq!(settings.schedule, "24h");
     Ok(())
 }

@@ -64,6 +64,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   const [concurrency, setConcurrency] = useState(2);
   const [existingInfoPolicy, setExistingInfoPolicy] = useState("SKIP");
   const [writeSidecars, setWriteSidecars] = useState(true);
+  const [schedule, setSchedule] = useState("24h");
   const closeRef = useRef<HTMLButtonElement>(null);
   const isMediaInfo = plugin.id === "org.lux.strm-media-info";
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
@@ -76,6 +77,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   const concurrencyField = plugin.configFields.find((field) => field.key === "concurrency");
   const existingInfoPolicyField = plugin.configFields.find((field) => field.key === "existingInfoPolicy");
   const writeSidecarsField = plugin.configFields.find((field) => field.key === "writeSidecars");
+  const scheduleField = plugin.configFields.find((field) => field.key === "schedule");
   const customApiBaseUrlOption = apiBaseUrlField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
   const canConfigure = plugin.installed && plugin.configurable && plugin.configFields.length > 0;
   const toggleBlockedByProvider = plugin.unavailableReason === "OTHER_IP_LOCATION_PLUGIN_INSTALLED";
@@ -87,6 +89,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
           concurrency,
           existingInfoPolicy,
           writeSidecars,
+          ...(scheduleField ? { schedule: schedule.trim() } : {}),
         })
       : api.updateAdminPluginConfig(plugin.id, {
           ...(apiKeyDirty ? { apiKey } : {}),
@@ -155,9 +158,10 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
       : String(existingInfoPolicyField?.defaultValue ?? "SKIP");
     setExistingInfoPolicy(configuredExistingInfoPolicy);
     setWriteSidecars(values.writeSidecars !== false);
+    setSchedule(typeof values.schedule === "string" ? values.schedule : String(scheduleField?.defaultValue ?? "24h"));
     setApiKey("");
     setApiKeyDirty(false);
-  }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options]);
+  }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue]);
 
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
@@ -199,7 +203,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
                 {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
                 {existingInfoPolicyField ? <label htmlFor={"plugin-config-" + plugin.id + "-existing-info-policy"}>{existingInfoPolicyField.label}<select id={"plugin-config-" + plugin.id + "-existing-info-policy"} value={existingInfoPolicy} onChange={(event) => setExistingInfoPolicy(event.target.value)}>{(existingInfoPolicyField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{existingInfoPolicyField.description}</small></label> : null}
                 {writeSidecarsField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={writeSidecars} onChange={(event) => setWriteSidecars(event.target.checked)} /> <span><strong>{writeSidecarsField.label}</strong><small>{writeSidecarsField.description}</small></span></label> : null}
-                <small>执行时间由宿主机 crontab 管理；插件配置只保存探测参数。</small>
+                {scheduleField ? <label htmlFor={"plugin-config-" + plugin.id + "-schedule"}>{scheduleField.label}<input id={"plugin-config-" + plugin.id + "-schedule"} type="text" required={scheduleField.required} pattern="[1-9][0-9]*[smhd]" value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="24h" /><small>{scheduleField.description}</small></label> : null}
               </> : <>
                 {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空可恢复内置 Key" autoComplete="new-password" /></label> : null}
                 {preferredLanguageField ? <label htmlFor={"plugin-config-" + plugin.id + "-preferred-language"}>{preferredLanguageField.label}<select id={"plugin-config-" + plugin.id + "-preferred-language"} value={preferredLanguage} onChange={(event) => setPreferredLanguage(event.target.value)}>{(preferredLanguageField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label> : null}

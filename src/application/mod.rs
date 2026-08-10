@@ -27,6 +27,7 @@ pub mod recommendations;
 pub mod reidentify;
 pub mod remote_url_policy;
 pub mod scanner;
+pub mod schedule;
 pub mod scheduled_tasks;
 pub mod scraper;
 pub mod settings;

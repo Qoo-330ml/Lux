@@ -149,6 +149,7 @@ fn packages_a_media_info_zip_with_the_media_probe_manifest()
             "concurrency",
             "existingInfoPolicy",
             "writeSidecars",
+            "schedule"
         ]
     );
     assert_eq!(

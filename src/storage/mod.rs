@@ -801,8 +801,8 @@ impl Database {
         .bind(library.kind)
         .bind(database_flag(library.realtime_watch_enabled))
         .bind(database_flag(library.realtime_metadata_auto_match_enabled))
-        .bind(Option::<&str>::None)
-        .bind(Option::<&str>::None)
+        .bind(library.reconciliation_schedule)
+        .bind(library.metadata_schedule)
         .bind(library.scan_concurrency)
         .bind(library.probe_concurrency)
         .bind(library.scraper_id)
@@ -817,9 +817,10 @@ impl Database {
             (
                 "RECONCILIATION_SCAN",
                 "全量校验媒体库",
-                "由宿主机 crontab 入队后校验媒体库索引与文件系统的一致性。",
+                "按计划校验媒体库索引与文件系统的一致性。",
                 "SYSTEM",
                 None,
+                library.reconciliation_schedule,
             ),
             (
                 "METADATA_PARSE",
@@ -831,9 +832,12 @@ impl Database {
                     "SYSTEM"
                 },
                 library.scraper_id,
+                library.metadata_schedule,
             ),
         ];
-        for (task_type, task_name, task_description, source_type, plugin_id) in registrations {
+        for (task_type, task_name, task_description, source_type, plugin_id, schedule) in
+            registrations
+        {
             self.query(
                 "INSERT INTO scheduled_task_configs (
                     owner_type, owner_id, task_type, task_name, task_description,
@@ -846,8 +850,8 @@ impl Database {
             .bind(task_description)
             .bind(source_type)
             .bind(plugin_id)
-            .bind(Option::<&str>::None)
-            .bind(false)
+            .bind(schedule)
+            .bind(database_flag(schedule.is_some()))
             .bind(if task_type == "RECONCILIATION_SCAN" {
                 format!(
                     "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
@@ -1224,9 +1228,10 @@ impl Database {
             })?;
         }
 
-        let current: (i64, i64, Option<String>) = self
+        let current: (Option<String>, Option<String>, i64, i64, Option<String>) = self
             .query_as(
-                "SELECT scan_concurrency, probe_concurrency, scraper_id
+                "SELECT reconciliation_schedule, metadata_schedule,
+                    scan_concurrency, probe_concurrency, scraper_id
              FROM libraries WHERE id = ?",
             )
             .bind(library_id)
@@ -1239,16 +1244,21 @@ impl Database {
 
         let resources = format!(
             "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
-            current.0, current.1
+            current.2, current.3
         );
         let task_configs = [
-            ("RECONCILIATION_SCAN", resources.as_str()),
-            ("METADATA_PARSE", "{}"),
+            (
+                "RECONCILIATION_SCAN",
+                current.0.as_deref(),
+                resources.as_str(),
+            ),
+            ("METADATA_PARSE", current.1.as_deref(), "{}"),
         ];
-        for (task_type, resource_limit_json) in task_configs {
+        for (task_type, schedule, resource_limit_json) in task_configs {
             self.query(
                 "UPDATE scheduled_task_configs
-                 SET cron_or_interval = NULL,
+                 SET cron_or_interval = ?,
+                     is_enabled = ?,
                      resource_limit_json = ?,
                      source_type = CASE
                          WHEN task_type = 'METADATA_PARSE' AND ? IS NOT NULL THEN 'PLUGIN'
@@ -1261,9 +1271,11 @@ impl Database {
                      updated_at = unixepoch()
                  WHERE owner_type = 'LIBRARY' AND owner_id = ? AND task_type = ?",
             )
+            .bind(schedule)
+            .bind(database_flag(schedule.is_some()))
             .bind(resource_limit_json)
-            .bind(current.2.as_deref())
-            .bind(current.2.as_deref())
+            .bind(current.4.as_deref())
+            .bind(current.4.as_deref())
             .bind(library_id)
             .bind(task_type)
             .execute(&mut *transaction)
@@ -1326,7 +1338,7 @@ impl Database {
         owner_type: &str,
         owner_id: &str,
         task_type: &str,
-        _schedule: Option<&str>,
+        schedule: Option<&str>,
         is_enabled: bool,
     ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
         let result = self
@@ -1335,7 +1347,7 @@ impl Database {
              SET cron_or_interval = ?, is_enabled = ?, updated_at = unixepoch()
              WHERE owner_type = ? AND owner_id = ? AND task_type = ?",
             )
-            .bind(Option::<&str>::None)
+            .bind(schedule)
             .bind(database_flag(is_enabled))
             .bind(owner_type)
             .bind(owner_id)
@@ -1355,6 +1367,7 @@ impl Database {
 
     pub(crate) async fn upsert_strm_media_info_task(
         &self,
+        schedule: &str,
         is_enabled: bool,
     ) -> Result<(), StorageError> {
         self.query(
@@ -1363,18 +1376,19 @@ impl Database {
                 source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
              ) VALUES (
                 'GLOBAL', 'global', 'STRM_MEDIA_INFO', 'STRM 媒体信息扫描',
-                '由宿主机 crontab 入队后按插件配置扫描选定媒体库的 STRM 外部媒体信息并写入 JSON 旁车。',
-                'PLUGIN', 'org.lux.strm-media-info', NULL, ?, '{}'
+                '按插件配置周期扫描选定媒体库的 STRM 外部媒体信息并写入 JSON 旁车。',
+                'PLUGIN', 'org.lux.strm-media-info', ?, ?, '{}'
              )
              ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
                 task_name = excluded.task_name,
                 task_description = excluded.task_description,
                 source_type = excluded.source_type,
                 plugin_id = excluded.plugin_id,
-                cron_or_interval = NULL,
+                cron_or_interval = excluded.cron_or_interval,
                 is_enabled = excluded.is_enabled,
                 updated_at = unixepoch()",
         )
+        .bind(schedule)
         .bind(database_flag(is_enabled))
         .execute(&self.pool)
         .await
@@ -9544,6 +9558,8 @@ pub(crate) struct NewLibrary<'a> {
     pub(crate) kind: &'a str,
     pub(crate) realtime_watch_enabled: bool,
     pub(crate) realtime_metadata_auto_match_enabled: bool,
+    pub(crate) reconciliation_schedule: Option<&'a str>,
+    pub(crate) metadata_schedule: Option<&'a str>,
     pub(crate) scan_concurrency: i64,
     pub(crate) probe_concurrency: i64,
     pub(crate) scraper_id: Option<&'a str>,

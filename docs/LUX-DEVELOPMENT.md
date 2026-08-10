@@ -780,8 +780,8 @@ pub async fn get_item(
 - is_enabled
 - realtime_watch_enabled
 - incremental_schedule（兼容保留，始终为空，不参与调度）
-- reconciliation_schedule（兼容保留，始终为空，不参与调度）
-- metadata_schedule（兼容保留，始终为空，不参与调度）
+- reconciliation_schedule
+- metadata_schedule，首版可为空或手动
 - realtime_metadata_auto_match_enabled，默认关闭；仅控制实时增量扫描完成后的受影响条目 `FILL_MISSING` 自动补全，不控制实时监听本身
 - scan_concurrency
 - probe_concurrency
@@ -2663,8 +2663,8 @@ services:
 - 运行记录显示所属媒体库名称；名称无法解析时保留媒体库 ID，跨多个媒体库的批量任务不伪造单一名称。
 - 过滤失败类型。
 - 日志脱敏。
-- 已注册任务区分页查看任务，只能修改已注册项的启停和资源配置；页面不提供任意新增任务类型或全局未注册任务的入口，执行时间由宿主机 crontab 管理。
-- 任务注册项明确显示是否允许宿主机 crontab 入队，不伪造宿主机 crontab 是否实际安装的状态。
+- 已注册任务区分页查看任务，只能修改已注册项的计划、启停和资源配置；页面不提供任意新增任务类型或全局未注册任务的入口。
+- 任务注册项缺少执行计划时明确显示“未配置”，不伪造调度状态。
 
 验证：Playwright。
 
@@ -3063,8 +3063,9 @@ services:
 旧版本的 `org.lux.media-info` 作为迁移别名处理：已有插件配置会迁移到新的插件配置路径，
 新的 API、manifest 和插件进程只使用 `org.lux.strm-media-info`。
 
-插件 manifest 声明 `libraryIds`、`concurrency`、`existingInfoPolicy` 和 `writeSidecars` 配置项。
-其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
+插件 manifest 声明 `libraryIds`、`concurrency`、`existingInfoPolicy`、`writeSidecars` 和
+`schedule` 配置项；`schedule` 使用正整数加单位的间隔格式（`s`、`m`、`h`、`d`），范围为
+`1m` 到 `365d`，默认 `24h`。其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
 （覆盖已有媒体信息）。读取旧版本配置时，`includeReady: false` 迁移为 `SKIP`，
 `includeReady: true` 迁移为 `OVERWRITE`。
 Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理员通过
@@ -3094,7 +3095,7 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
-- [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；宿主机 crontab 通过 cron 入队接口触发，禁用插件后不再领取新作业，重启服务后仍可恢复。
+- [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` 周期执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
 - [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
 - [ ] 插件包、manifest、RPC 结果、URL 策略、超时、输出上限和无真实 URL 的 fake ffprobe 测试覆盖；插件异常不退出主进程。
 - [ ] 从空数据库执行迁移成功，ARM64 本机验证记录 `uname -m`，并通过 Rust 格式化、测试和 Clippy 检查。

@@ -17,9 +17,9 @@ Accepted
 ## Decision
 
 - `INCREMENTAL_SCAN` 只表示实时文件事件触发的内部任务，不注册到计划任务列表，也不接受计划配置。
-- `RECONCILIATION_SCAN` 是管理员可启停的全量校验注册项，负责遍历文件系统并与索引对账；执行时间由宿主机 crontab 提供。
-- `RECONCILIATION_SCAN` 注册项继续映射到内部的 `RECONCILE_LIBRARY` 扫描 job；两个名称分别属于宿主机 cron 入队类型和执行 job，保持现有边界。
-- `METADATA_PARSE` 继续作为独立的可启停注册项，由宿主机 crontab 触发。
+- `RECONCILIATION_SCAN` 是管理员可配置的全量校验计划，负责遍历文件系统并与索引对账。
+- `RECONCILIATION_SCAN` 计划注册项继续映射到内部的 `RECONCILE_LIBRARY` 扫描 job；两个名称分别属于计划配置和执行 job，保持现有边界。
+- `METADATA_PARSE` 继续作为独立的可配置计划任务。
 - 旧 `incrementalSchedule` API 字段保留作为兼容字段，但迁移后清空、请求值忽略、响应固定为 `null`。
 - 数据库保留历史 `incremental_schedule` 列，避免破坏已有数据库迁移链；该列不再参与任务注册或执行。
 
@@ -38,4 +38,4 @@ Accepted
 - 计划任务页只展示全量校验和元数据刮削，职责更清晰。
 - 实时增量任务仍保留持久化 job、去重、取消和恢复能力。
 - 历史数据库升级时会清理增量计划，并为每个媒体库补注册全量校验任务。
-- 当前版本仍不实现 cron 解析或后台调度循环；全量校验和元数据任务由宿主机 crontab 通过受保护入队接口触发。
+- 当前版本仍不实现 cron 解析或后台调度循环；计划配置由后续调度器消费。

@@ -20,6 +20,7 @@ use crate::{
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
+        schedule::{DEFAULT_STRM_MEDIA_INFO_INTERVAL, parse_interval},
         settings::{
             TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, TmdbSettings, read_tmdb_settings,
             tmdb_api_base_url_options, tmdb_language_options, write_tmdb_api_key,
@@ -66,6 +67,7 @@ pub struct MediaInfoSettings {
     pub concurrency: i64,
     pub include_ready: bool,
     pub write_sidecars: bool,
+    pub schedule: String,
 }
 
 fn tmdb_config_fields() -> Vec<PluginConfigField> {
@@ -478,6 +480,9 @@ impl PluginService {
         let values = merge_default_config_values(&fields, values);
         let values = normalize_plugin_config(&plugin_id, values);
         let values = validate_config_values(&fields, &values)?;
+        if plugin_id == MEDIA_INFO_PLUGIN_ID {
+            media_info_schedule(&values)?;
+        }
         self.write_plugin_config(&plugin_id, &values).await?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
@@ -522,6 +527,7 @@ impl PluginService {
             MEDIA_INFO_EXISTING_INFO_POLICY_OVERWRITE => true,
             _ => return Err(PluginServiceError::InvalidConfig),
         };
+        let schedule = media_info_schedule(&values)?;
         Ok(MediaInfoSettings {
             library_ids,
             concurrency: values
@@ -533,6 +539,7 @@ impl PluginService {
                 .get("writeSidecars")
                 .and_then(Value::as_bool)
                 .ok_or(PluginServiceError::InvalidConfig)?,
+            schedule,
         })
     }
 
@@ -553,10 +560,12 @@ impl PluginService {
                 self.read_plugin_config(MEDIA_INFO_PLUGIN_ID).await?,
             ),
         );
+        let schedule = media_info_schedule(&values)
+            .unwrap_or_else(|_| DEFAULT_STRM_MEDIA_INFO_INTERVAL.to_owned());
         let configured = validate_config_values(&fields, &values).is_ok()
             && self.media_info_settings().await.is_ok();
         self.database
-            .upsert_strm_media_info_task(enabled && configured)
+            .upsert_strm_media_info_task(&schedule, enabled && configured)
             .await?;
         Ok(())
     }
@@ -915,7 +924,6 @@ fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> M
     if plugin_id != MEDIA_INFO_PLUGIN_ID {
         return values;
     }
-    values.remove("schedule");
     let legacy_include_ready = values.remove("includeReady");
     if !values.contains_key(MEDIA_INFO_EXISTING_INFO_POLICY_KEY) {
         if let Some(include_ready) = legacy_include_ready.and_then(|value| value.as_bool()) {
@@ -931,6 +939,16 @@ fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> M
         }
     }
     values
+}
+
+fn media_info_schedule(values: &Map<String, Value>) -> Result<String, PluginServiceError> {
+    let schedule = values
+        .get("schedule")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_STRM_MEDIA_INFO_INTERVAL)
+        .trim();
+    parse_interval(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+    Ok(schedule.to_owned())
 }
 
 async fn secret_file_configured(config_dir: &std::path::Path, file_name: &str) -> bool {

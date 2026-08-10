@@ -175,7 +175,7 @@ export function AdminOperationsPage() {
 
   const runningCount = jobItems.filter((job) => isActiveJob(job.status)).length;
   const failedCount = jobItems.filter((job) => job.status === "FAILED").length;
-  const enabledCount = registeredTasks.filter((task) => task.isEnabled).length;
+  const enabledCount = registeredTasks.filter((task) => task.isEnabled && Boolean(task.schedule)).length;
   const libraryNames = new Map((libraries.data?.libraries ?? []).map((library) => [library.id, library.name]));
   async function exportLogs() {
     setLogExportError("");
@@ -212,7 +212,7 @@ export function AdminOperationsPage() {
 
       <section className="lux-operations-summary" aria-label="任务概览">
         <OperationsStat label="已注册任务" value={tasks.data?.total ?? registeredTasks.length} detail="系统与插件提供" icon={<ClipboardList size={18} />} />
-        <OperationsStat label="已启用" value={enabledCount} detail="允许 crontab 入队" icon={<CheckCircle2 size={18} />} />
+        <OperationsStat label="已启用" value={enabledCount} detail="已配置执行计划" icon={<CheckCircle2 size={18} />} />
         <OperationsStat label="正在运行" value={runningCount} detail="实时运行记录" icon={<RefreshCw size={18} />} />
         <OperationsStat label="失败记录" value={failedCount} detail="需要关注" icon={<AlertTriangle size={18} />} tone={failedCount ? "warn" : "default"} />
       </section>
@@ -282,7 +282,7 @@ function RegisteredTasksSection({
 }) {
   return (
     <section className="lux-admin-panel lux-operations-section" aria-labelledby="registered-tasks-title">
-      <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">任务注册</span><h2 id="registered-tasks-title">已注册任务</h2><p>这里显示由 Lux 系统或插件注册的任务。执行时间由宿主机 crontab 管理，实时增量扫描由文件系统监听触发。</p></div><span className="lux-operations-source-note">注册项自动持久化</span></div>
+      <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">任务注册</span><h2 id="registered-tasks-title">已注册任务</h2><p>这里显示由 Lux 系统或插件注册的计划任务。实时增量扫描由文件系统监听触发，不在此配置。</p></div><span className="lux-operations-source-note">注册项自动持久化</span></div>
       {tasks.length === 0 ? <RegisteredTasksEmpty /> : <div className="lux-registered-task-list">{tasks.map((task) => <RegisteredTaskRow key={task.id ?? `${task.ownerType}:${task.ownerId}:${task.taskType}`} task={task} onSaved={onRefresh} />)}</div>}
       {tasks.length > 0 && total > pageSize ? <Pagination page={page} pageSize={pageSize} total={total} onPageChange={onPageChange} /> : null}
     </section>
@@ -296,13 +296,15 @@ function RegisteredTasksEmpty() {
 function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSaved: () => void }) {
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
+  const [schedule, setSchedule] = useState(task.schedule ?? "");
   const [enabled, setEnabled] = useState(task.isEnabled);
   const update = useMutation({
     mutationFn: () => api.updateAdminScheduledTask({
       ownerType: task.ownerType === "GLOBAL" ? "GLOBAL" : "LIBRARY",
       ownerId: task.ownerType === "GLOBAL" ? "global" : task.ownerId,
       taskType: task.taskType,
-      isEnabled: enabled,
+      schedule: schedule.trim() || null,
+      isEnabled: enabled && Boolean(schedule.trim()),
     }),
     onSuccess: () => {
       setEditing(false);
@@ -320,11 +322,13 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
     },
   });
   const name = task.name || taskLabel(task.taskType);
-  const stateLabel = task.isEnabled ? "已启用" : "已停用";
+  const configured = Boolean(task.schedule);
+  const stateLabel = task.isEnabled && configured ? "已启用" : configured ? "已停用" : "未配置计划";
   const canRunNow = isRunnableTask(task);
   const canEdit = isSchedulableTask(task);
 
   const beginEditing = () => {
+    setSchedule(task.schedule ?? "");
     setEnabled(task.isEnabled);
     setEditing(true);
   };
@@ -337,10 +341,10 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
     <article className={`lux-registered-task-row${editing ? " is-editing" : ""}`}>
       <div className="lux-registered-task-icon"><ClipboardList size={18} /></div>
       <div className="lux-registered-task-copy">
-        <div className="lux-registered-task-heading"><strong>{name}</strong><span className={`lux-registered-task-status ${task.isEnabled ? "is-enabled" : "is-disabled"}`}>{stateLabel}</span></div>
+        <div className="lux-registered-task-heading"><strong>{name}</strong><span className={`lux-registered-task-status ${task.isEnabled && configured ? "is-enabled" : configured ? "is-disabled" : "is-unconfigured"}`}>{stateLabel}</span></div>
         <p>{task.description || "由后台注册的任务。"}</p>
         <div className="lux-registered-task-meta"><span>{task.ownerName || (task.ownerType === "GLOBAL" ? "全局" : "指定媒体库")}</span><span>{task.sourceType === "PLUGIN" ? `插件注册${task.pluginId ? ` · ${task.pluginId}` : ""}` : "系统注册"}</span><code>{task.taskType}</code></div>
-        {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><p className="lux-admin-muted">执行时间由宿主机 crontab 管理。</p><label className="lux-admin-toggle" htmlFor={`enabled-${task.id ?? task.taskType}`}><input id={`enabled-${task.id ?? task.taskType}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>允许此任务入队</span></label><div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></button></div>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.taskType === "AUTO_LIBRARY_COVER" ? "按条件执行或手动运行" : "宿主机 crontab 管理执行时间"}</span>}
+        {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><label htmlFor={`schedule-${task.id ?? task.taskType}`}>执行计划<input id={`schedule-${task.id ?? task.taskType}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 interval:1h" maxLength={128} /></label><label className="lux-admin-toggle" htmlFor={`enabled-${task.id ?? task.taskType}`}><input id={`enabled-${task.id ?? task.taskType}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此任务</span></label><div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></button></div>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.schedule || "尚未配置执行计划"}</span>}
       </div>
       {!editing ? <div className="lux-registered-task-actions">
         {canRunNow ? <button className="lux-button lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button> : null}

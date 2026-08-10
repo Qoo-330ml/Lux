@@ -44,18 +44,11 @@ impl Config {
 }
 
 pub fn cron_token_from_env_or_file(config_dir: &Path) -> Option<String> {
-    let valid_token = |token: String| {
-        let token = token.trim();
-        (token.len() >= 32).then(|| token.to_owned())
-    };
-    env::var("LUX_CRON_TOKEN")
+    let token = env::var("LUX_CRON_TOKEN")
         .ok()
-        .and_then(valid_token)
-        .or_else(|| {
-            std::fs::read_to_string(config_dir.join(CRON_TOKEN_FILE))
-                .ok()
-                .and_then(valid_token)
-        })
+        .or_else(|| std::fs::read_to_string(config_dir.join(CRON_TOKEN_FILE)).ok())?;
+    let token = token.trim();
+    (token.len() >= 32).then(|| token.to_owned())
 }
 
 #[derive(Debug)]
