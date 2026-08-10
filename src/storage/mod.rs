@@ -1340,6 +1340,40 @@ impl Database {
             .await
     }
 
+    pub(crate) async fn upsert_strm_media_info_task(
+        &self,
+        schedule: &str,
+        is_enabled: bool,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO scheduled_task_configs (
+                owner_type, owner_id, task_type, task_name, task_description,
+                source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
+             ) VALUES (
+                'GLOBAL', 'global', 'STRM_MEDIA_INFO', 'STRM 媒体信息扫描',
+                '按插件配置周期扫描选定媒体库的 STRM 外部媒体信息并写入 JSON 旁车。',
+                'PLUGIN', 'org.lux.strm-media-info', ?, ?, '{}'
+             )
+             ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                task_name = excluded.task_name,
+                task_description = excluded.task_description,
+                source_type = excluded.source_type,
+                plugin_id = excluded.plugin_id,
+                cron_or_interval = excluded.cron_or_interval,
+                is_enabled = excluded.is_enabled,
+                updated_at = unixepoch()",
+        )
+        .bind(schedule)
+        .bind(database_flag(is_enabled))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_scheduled_task_config(
         &self,
         owner_type: &str,
