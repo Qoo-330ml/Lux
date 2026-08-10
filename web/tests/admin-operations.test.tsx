@@ -291,6 +291,7 @@ describe("AdminOperationsPage", () => {
         kind: "MOVIE",
         isEnabled: true,
         realtimeWatchEnabled: true,
+        realtimeMetadataAutoMatchEnabled: false,
         roots: [],
       }],
     });

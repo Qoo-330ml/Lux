@@ -791,14 +791,16 @@ impl Database {
         self.query(
             "INSERT INTO libraries (
                 id, name, kind, is_enabled, realtime_watch_enabled,
+                realtime_metadata_auto_match_enabled,
                 reconciliation_schedule, metadata_schedule,
                 scan_concurrency, probe_concurrency, scraper_id
-            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(library.id)
         .bind(library.name)
         .bind(library.kind)
         .bind(database_flag(library.realtime_watch_enabled))
+        .bind(database_flag(library.realtime_metadata_auto_match_enabled))
         .bind(library.reconciliation_schedule)
         .bind(library.metadata_schedule)
         .bind(library.scan_concurrency)
@@ -877,6 +879,7 @@ impl Database {
     pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
         self.query(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
+                    realtime_metadata_auto_match_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
@@ -893,6 +896,9 @@ impl Database {
                     kind: row.get("kind"),
                     is_enabled: row.get::<i64, _>("is_enabled") != 0,
                     realtime_watch_enabled: row.get::<i64, _>("realtime_watch_enabled") != 0,
+                    realtime_metadata_auto_match_enabled: row
+                        .get::<i64, _>("realtime_metadata_auto_match_enabled")
+                        != 0,
                     incremental_schedule: row.get("incremental_schedule"),
                     reconciliation_schedule: row.get("reconciliation_schedule"),
                     metadata_schedule: row.get("metadata_schedule"),
@@ -920,6 +926,7 @@ impl Database {
     ) -> Result<Option<StoredLibrary>, StorageError> {
         self.query(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
+                    realtime_metadata_auto_match_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
@@ -936,6 +943,9 @@ impl Database {
                 kind: row.get("kind"),
                 is_enabled: row.get::<i64, _>("is_enabled") != 0,
                 realtime_watch_enabled: row.get::<i64, _>("realtime_watch_enabled") != 0,
+                realtime_metadata_auto_match_enabled: row
+                    .get::<i64, _>("realtime_metadata_auto_match_enabled")
+                    != 0,
                 incremental_schedule: row.get("incremental_schedule"),
                 reconciliation_schedule: row.get("reconciliation_schedule"),
                 metadata_schedule: row.get("metadata_schedule"),
@@ -1101,6 +1111,21 @@ impl Database {
             self.query(
                 "UPDATE libraries
                  SET realtime_watch_enabled = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(database_flag(value))
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        if let Some(value) = settings.realtime_metadata_auto_match_enabled {
+            self.query(
+                "UPDATE libraries
+                 SET realtime_metadata_auto_match_enabled = ?, updated_at = unixepoch()
                  WHERE id = ?",
             )
             .bind(database_flag(value))
@@ -2116,16 +2141,19 @@ impl Database {
         job_type: &str,
         generation: &str,
         total_count: i64,
+        auto_metadata_match: bool,
     ) -> Result<(), StorageError> {
         self.query(
-            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, total_count)
-             VALUES (?, ?, ?, 'PENDING', ?, ?)",
+            "INSERT INTO scan_jobs (
+                id, library_id, job_type, status, generation, total_count, auto_metadata_match
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?)",
         )
         .bind(id)
         .bind(library_id)
         .bind(job_type)
         .bind(generation)
         .bind(total_count)
+        .bind(database_flag(auto_metadata_match))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -2221,6 +2249,37 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_media_item_ids_for_incremental_scan(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT DISTINCT ms.item_id
+             FROM scan_job_paths sjp
+             JOIN filesystem_entries fe
+               ON fe.library_root_id = sjp.library_root_id
+              AND (
+                    fe.relative_path = sjp.relative_path
+                    OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                       = sjp.relative_path || '/'
+                  )
+             JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE sjp.job_id = ?
+               AND sjp.processed_at IS NOT NULL
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+             ORDER BY ms.item_id",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -2396,6 +2455,7 @@ impl Database {
         library_id: &str,
         generation: &str,
         library_root_ids: &[String],
+        auto_metadata_match: bool,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -2408,12 +2468,13 @@ impl Database {
         self.query(
             "INSERT INTO scan_jobs (
                 id, library_id, job_type, status, generation, total_count,
-                discovery_completed
-             ) VALUES (?, ?, 'RECONCILE_LIBRARY', 'PENDING', ?, 0, 0)",
+                discovery_completed, auto_metadata_match
+             ) VALUES (?, ?, 'RECONCILE_LIBRARY', 'PENDING', ?, 0, 0, ?)",
         )
         .bind(id)
         .bind(library_id)
         .bind(generation)
+        .bind(database_flag(auto_metadata_match))
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -3490,7 +3551,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
-                    discovery_completed
+                    discovery_completed, auto_metadata_match
              FROM scan_jobs WHERE id = ?",
         )
         .bind(id)
@@ -3513,7 +3574,7 @@ impl Database {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
-                        discovery_completed
+                        discovery_completed, auto_metadata_match
                  FROM scan_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -3526,7 +3587,7 @@ impl Database {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
-                        discovery_completed
+                        discovery_completed, auto_metadata_match
                  FROM scan_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -3586,7 +3647,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
-                    discovery_completed
+                    discovery_completed, auto_metadata_match
              FROM scan_jobs
              WHERE library_id = ? AND job_type = ? AND status IN ('PENDING', 'RUNNING')
              ORDER BY created_at DESC LIMIT 1",
@@ -8497,6 +8558,7 @@ pub(crate) struct StoredLibrary {
     pub(crate) kind: String,
     pub(crate) is_enabled: bool,
     pub(crate) realtime_watch_enabled: bool,
+    pub(crate) realtime_metadata_auto_match_enabled: bool,
     pub(crate) incremental_schedule: Option<String>,
     pub(crate) reconciliation_schedule: Option<String>,
     pub(crate) metadata_schedule: Option<String>,
@@ -8572,6 +8634,7 @@ pub(crate) struct StoredScanJob {
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
     pub(crate) discovery_completed: bool,
+    pub(crate) auto_metadata_match: bool,
 }
 
 #[derive(Debug)]
@@ -8646,6 +8709,7 @@ fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
         discovery_completed: row.get::<i64, _>("discovery_completed") != 0,
+        auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
     }
 }
 
@@ -9459,6 +9523,7 @@ pub(crate) struct NewLibrary<'a> {
     pub(crate) name: &'a str,
     pub(crate) kind: &'a str,
     pub(crate) realtime_watch_enabled: bool,
+    pub(crate) realtime_metadata_auto_match_enabled: bool,
     pub(crate) reconciliation_schedule: Option<&'a str>,
     pub(crate) metadata_schedule: Option<&'a str>,
     pub(crate) scan_concurrency: i64,
@@ -9511,6 +9576,7 @@ pub(crate) struct LibrarySettingsUpdate<'a> {
     pub(crate) kind: Option<&'a str>,
     pub(crate) is_enabled: Option<bool>,
     pub(crate) realtime_watch_enabled: Option<bool>,
+    pub(crate) realtime_metadata_auto_match_enabled: Option<bool>,
     pub(crate) reconciliation_schedule: Option<Option<&'a str>>,
     pub(crate) metadata_schedule: Option<Option<&'a str>>,
     pub(crate) scan_concurrency: Option<i64>,

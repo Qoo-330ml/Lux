@@ -146,6 +146,14 @@ impl MetadataReidentifyService {
         self.create_job_with_mode(item_ids, mode).await
     }
 
+    pub async fn create_fill_missing_job(
+        &self,
+        item_ids: Vec<String>,
+    ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
+        self.create_job_with_mode(item_ids, MetadataRefreshMode::FillMissing)
+            .await
+    }
+
     async fn create_job_with_mode(
         &self,
         item_ids: Vec<String>,

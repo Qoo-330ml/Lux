@@ -33,7 +33,7 @@ impl LibraryService {
         kind: LibraryKind,
         realtime_watch_enabled: bool,
     ) -> Result<LibraryRecord, LibraryServiceError> {
-        self.create_library_with_scraper(name, kind, realtime_watch_enabled, None)
+        self.create_library_with_scraper(name, kind, realtime_watch_enabled, None, false)
             .await
     }
 
@@ -43,6 +43,7 @@ impl LibraryService {
         kind: LibraryKind,
         _realtime_watch_enabled: bool,
         scraper_id: Option<&str>,
+        realtime_metadata_auto_match_enabled: bool,
     ) -> Result<LibraryRecord, LibraryServiceError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 128 {
@@ -57,6 +58,7 @@ impl LibraryService {
                 kind: kind.as_str(),
                 scraper_id: scraper_id.as_deref(),
                 realtime_watch_enabled: true,
+                realtime_metadata_auto_match_enabled,
                 reconciliation_schedule: None,
                 metadata_schedule: None,
                 scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
@@ -127,6 +129,8 @@ impl LibraryService {
                     kind,
                     is_enabled: settings.is_enabled,
                     realtime_watch_enabled: settings.realtime_watch_enabled.map(|_| true),
+                    realtime_metadata_auto_match_enabled: settings
+                        .realtime_metadata_auto_match_enabled,
                     reconciliation_schedule: reconciliation_schedule
                         .as_ref()
                         .map(|value| value.as_deref()),
@@ -276,6 +280,7 @@ pub struct LibrarySettingsPatch {
     pub kind: Option<LibraryKind>,
     pub is_enabled: Option<bool>,
     pub realtime_watch_enabled: Option<bool>,
+    pub realtime_metadata_auto_match_enabled: Option<bool>,
     pub reconciliation_schedule: Option<Option<String>>,
     pub metadata_schedule: Option<Option<String>>,
     pub scraper_id: Option<Option<String>>,
@@ -471,6 +476,7 @@ fn stored_library(stored: StoredLibrary) -> Result<LibraryRecord, LibraryService
         cover_image_tag: stored.cover_image_tag,
         is_enabled: stored.is_enabled,
         realtime_watch_enabled: stored.realtime_watch_enabled,
+        realtime_metadata_auto_match_enabled: stored.realtime_metadata_auto_match_enabled,
         incremental_schedule: stored.incremental_schedule,
         reconciliation_schedule: stored.reconciliation_schedule,
         metadata_schedule: stored.metadata_schedule,

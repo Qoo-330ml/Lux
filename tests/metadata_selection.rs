@@ -629,7 +629,9 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         Some(selection),
     );
     let scan_jobs = luxd::application::scanner::ScanJobService::new(fixture.database.clone());
-    let scan_job = scan_jobs.create_movie_scan_job(library_id.parse()?).await?;
+    let scan_job = scan_jobs
+        .create_movie_scan_job_with_metadata(library_id.parse()?, true)
+        .await?;
     scan_jobs
         .run_to_completion_with_metadata(&scan_job.id, 100, None, Some(metadata))
         .await?;

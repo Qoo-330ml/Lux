@@ -2,13 +2,14 @@
 
 ## 范围
 
-为每个媒体库提供默认开启的实时监听、全量调和/元数据计划和扫描/探测并发配额。实时监听不再是可关闭的运行时开关；历史 `realtimeWatchEnabled` 与 `incrementalSchedule` 字段仍保留在库详情/API 中以兼容旧客户端，但后者始终为空且不参与调度。局部增量扫描由实时文件事件触发，不作为计划配置持久化。
+为每个媒体库提供默认开启的实时监听、全量调和/元数据计划和扫描/探测并发配额。实时监听不再是可关闭的运行时开关；历史 `realtimeWatchEnabled` 与 `incrementalSchedule` 字段仍保留在库详情/API 中以兼容旧客户端，但后者始终为空且不参与调度。局部增量扫描由实时文件事件触发，不作为计划配置持久化。实时监听之外，媒体库可以单独开启实时新资源 `FILL_MISSING` 元数据自动补全。
 
 ## 规则
 
 - 计划属于具体 library，两个库互不覆盖。
 - `reconciliationSchedule`、`metadataSchedule` 可独立设置或清空；实时增量扫描不提供计划字段。
 - 计划配置不要求重启；下一次 watcher/job 读取数据库最新值。
+- `realtimeMetadataAutoMatchEnabled` 默认关闭，不改变 watcher 的持续运行；开启后只处理实时增量任务影响的媒体条目。
 - `scanConcurrency`、`probeConcurrency` 必须为正数，服务端限制合理上限。
 - 资源配额只限制配置；插件计划任务复用已登记的全局任务，由宿主调度循环执行。
 

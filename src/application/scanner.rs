@@ -1289,7 +1289,14 @@ impl ScanJobService {
             let id = Uuid::now_v7().to_string();
             let generation = Uuid::now_v7().to_string();
             self.database
-                .create_scan_job(&id, &library_id_text, "INCREMENTAL_SCAN", &generation, 0)
+                .create_scan_job(
+                    &id,
+                    &library_id_text,
+                    "INCREMENTAL_SCAN",
+                    &generation,
+                    0,
+                    false,
+                )
                 .await?;
             self.database
                 .find_scan_job(&id)
@@ -1321,6 +1328,15 @@ impl ScanJobService {
         &self,
         library_id: LibraryId,
     ) -> Result<ScanJob, ScanJobError> {
+        self.create_movie_scan_job_with_metadata(library_id, false)
+            .await
+    }
+
+    pub async fn create_movie_scan_job_with_metadata(
+        &self,
+        library_id: LibraryId,
+        auto_metadata_match: bool,
+    ) -> Result<ScanJob, ScanJobError> {
         let library_id_text = library_id.to_string();
         let Some(library) = self.database.find_library(&library_id_text).await? else {
             return Err(ScanJobError::LibraryNotFound);
@@ -1340,7 +1356,13 @@ impl ScanJobService {
         let generation = Uuid::now_v7().to_string();
         let root_ids = roots.into_iter().map(|root| root.id).collect::<Vec<_>>();
         self.database
-            .create_reconciliation_scan_job(&id, &library_id_text, &generation, &root_ids)
+            .create_reconciliation_scan_job(
+                &id,
+                &library_id_text,
+                &generation,
+                &root_ids,
+                auto_metadata_match,
+            )
             .await?;
         self.record_event(&id, "INFO", "JOB_CREATED", "任务已创建", "{}")
             .await;
@@ -2192,12 +2214,17 @@ impl ScanJobService {
                 continue;
             }
             if report.status == "COMPLETED" {
-                let incremental = self
+                let completed_job = self
                     .database
                     .find_scan_job(job_id)
                     .await?
-                    .is_some_and(|job| job.job_type == "INCREMENTAL_SCAN");
+                    .ok_or(ScanJobError::JobNotFound)?;
+                let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
                 if incremental {
+                    if let Some(metadata) = metadata {
+                        self.schedule_online_metadata_after_incremental_scan(job_id, metadata)
+                            .await;
+                    }
                     self.run_auto_library_cover_after_scan(job_id).await?;
                     return Ok(());
                 }
@@ -2205,9 +2232,11 @@ impl ScanJobService {
                 self.run_metadata_after_scan(job_id).await?;
                 self.run_thumbnails_after_scan(job_id, thumbnails).await?;
                 self.run_auto_library_cover_after_scan(job_id).await?;
-                if let Some(metadata) = metadata {
-                    self.schedule_online_metadata_after_scan(job_id, metadata)
-                        .await;
+                if completed_job.auto_metadata_match {
+                    if let Some(metadata) = metadata {
+                        self.schedule_online_metadata_after_scan(job_id, metadata)
+                            .await;
+                    }
                 }
             }
             return Ok(());
@@ -2419,6 +2448,84 @@ impl ScanJobService {
         .await;
     }
 
+    async fn schedule_online_metadata_after_incremental_scan(
+        &self,
+        scan_job_id: &str,
+        metadata: MetadataReidentifyService,
+    ) {
+        let Some(scan_job) = self
+            .database
+            .find_scan_job(scan_job_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let Some(library) = self
+            .database
+            .find_library(&scan_job.library_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        if !library.realtime_metadata_auto_match_enabled || library.scraper_id.as_deref().is_none()
+        {
+            return;
+        }
+        let Ok(item_ids) = self
+            .database
+            .list_media_item_ids_for_incremental_scan(scan_job_id)
+            .await
+        else {
+            tracing::warn!(
+                scan_job_id,
+                "incremental scan completed but affected media items could not be found"
+            );
+            return;
+        };
+        for item_ids in item_ids.chunks(100) {
+            let job = match metadata.create_fill_missing_job(item_ids.to_vec()).await {
+                Ok(job) => job,
+                Err(_) => {
+                    tracing::warn!(
+                        scan_job_id,
+                        item_count = item_ids.len(),
+                        "incremental scan completed but automatic metadata matching could not be queued"
+                    );
+                    self.record_event(
+                        scan_job_id,
+                        "ERROR",
+                        "METADATA_AUTO_MATCH_QUEUE_FAILED",
+                        "自动元数据匹配任务创建失败",
+                        "{}",
+                    )
+                    .await;
+                    continue;
+                }
+            };
+            let job_id = job.id.clone();
+            let worker = metadata.clone();
+            tokio::spawn(async move {
+                worker.run(&job_id).await;
+            });
+            let details = format!(
+                r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
+                job.total_count, job.id
+            );
+            self.record_event(
+                scan_job_id,
+                "INFO",
+                "METADATA_AUTO_MATCH_QUEUED",
+                "已提交自动元数据匹配任务",
+                &details,
+            )
+            .await;
+        }
+    }
+
     async fn run_metadata_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Err(ScanJobError::JobNotFound);
@@ -2534,7 +2641,8 @@ impl ScanJobService {
         let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
             return Err(ScanJobError::LibraryNotFound);
         };
-        self.create_movie_scan_job(library_id).await
+        self.create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
+            .await
     }
 
     async fn get_job(&self, id: &str) -> Result<ScanJob, ScanJobError> {

@@ -366,7 +366,12 @@ impl AppState {
         let Some(scan_jobs) = self.scan_jobs.clone() else {
             return;
         };
-        LibraryWatchService::with_scan_jobs(database, scan_jobs).spawn();
+        LibraryWatchService::with_scan_jobs_and_metadata(
+            database,
+            scan_jobs,
+            self.metadata_reidentify.clone(),
+        )
+        .spawn();
     }
 
     pub async fn resume_strm_probe_jobs(&self) {
@@ -6821,6 +6826,8 @@ struct CreateLibraryRequest {
     kind: String,
     #[serde(default = "default_realtime_watch_enabled")]
     realtime_watch_enabled: bool,
+    #[serde(default)]
+    realtime_metadata_auto_match_enabled: bool,
     scraper_id: Option<String>,
 }
 
@@ -6840,6 +6847,7 @@ struct UpdateLibraryRequest {
     kind: Option<String>,
     is_enabled: Option<bool>,
     realtime_watch_enabled: Option<bool>,
+    realtime_metadata_auto_match_enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     #[allow(dead_code)]
     /// Accepted for legacy clients; realtime incremental scanning has no schedule.
@@ -7791,7 +7799,10 @@ async fn spawn_library_scan(
     let Some(scan_jobs) = state.scan_jobs.as_ref() else {
         return Ok(None);
     };
-    let job = match scan_jobs.create_movie_scan_job(library_id).await {
+    let job = match scan_jobs
+        .create_movie_scan_job_with_metadata(library_id, true)
+        .await
+    {
         Ok(job) => job,
         Err(ScanJobError::AlreadyActive(_)) => return Ok(None),
         Err(error) => return Err(error),
@@ -11465,6 +11476,7 @@ async fn admin_create_library(
             kind,
             request.realtime_watch_enabled,
             request.scraper_id.as_deref(),
+            request.realtime_metadata_auto_match_enabled,
         )
         .await
     {
@@ -11565,6 +11577,7 @@ async fn admin_update_library(
         kind,
         is_enabled: request.is_enabled,
         realtime_watch_enabled: request.realtime_watch_enabled,
+        realtime_metadata_auto_match_enabled: request.realtime_metadata_auto_match_enabled,
         reconciliation_schedule: request.reconciliation_schedule,
         metadata_schedule: request.metadata_schedule,
         scraper_id: request.scraper_id.clone(),
@@ -12257,6 +12270,7 @@ fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
         "coverImageUrl": library_cover_url(library),
         "isEnabled": library.is_enabled,
         "realtimeWatchEnabled": library.realtime_watch_enabled,
+        "realtimeMetadataAutoMatchEnabled": library.realtime_metadata_auto_match_enabled,
         "incrementalSchedule": library.incremental_schedule,
         "reconciliationSchedule": library.reconciliation_schedule,
         "metadataSchedule": library.metadata_schedule,

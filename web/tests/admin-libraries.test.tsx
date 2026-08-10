@@ -20,6 +20,7 @@ const library = {
   itemCount: 12,
   isEnabled: true,
   realtimeWatchEnabled: true,
+  realtimeMetadataAutoMatchEnabled: false,
   roots: [{
     id: "root-1",
     libraryId: "library-1",
@@ -195,7 +196,12 @@ describe("AdminLibrariesPage library cards", () => {
       await vi.waitFor(() => expect(addRoot).toHaveBeenCalledWith("library-2", "/media"));
     });
 
-    expect(createLibrary).toHaveBeenCalledWith({ name: "电影库", kind: "MOVIE", scraperId: null });
+    expect(createLibrary).toHaveBeenCalledWith({
+      name: "电影库",
+      kind: "MOVIE",
+      scraperId: null,
+      realtimeMetadataAutoMatchEnabled: false,
+    });
     expect(createLibrary.mock.invocationCallOrder[0]).toBeLessThan(addRoot.mock.invocationCallOrder[0]);
     expect(container.querySelector("#new-library-title")).toBeNull();
   });
@@ -321,6 +327,27 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("增量扫描");
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("全量校验");
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("元数据任务");
+  });
+
+  it("updates the realtime metadata auto-match switch", async () => {
+    const updateLibrary = vi.spyOn(api, "updateAdminLibrary").mockResolvedValue({ library });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+    const toggle = container.querySelector<HTMLInputElement>("[aria-label='01每日更新 实时新增资源自动刮削']");
+    expect(toggle?.checked).toBe(false);
+
+    await act(async () => {
+      toggle?.click();
+      await vi.waitFor(() => expect(updateLibrary).toHaveBeenCalledWith("library-1", { realtimeMetadataAutoMatchEnabled: true }));
+    });
   });
 
   it("adds a selected server directory as a library root", async () => {

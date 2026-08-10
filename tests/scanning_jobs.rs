@@ -6,7 +6,10 @@ use luxd::{
         catalog::{CatalogFilter, CatalogService},
         libraries::LibraryService,
         probe::{FfprobeRunner, MediaProbeService},
+        reidentify::MetadataReidentifyService,
         scanner::{IncrementalScanChange, ScanJobError, ScanJobService},
+        tmdb::{TmdbClient, TmdbClientConfig},
+        tmdb_plugin::TmdbProvider,
         watch::ChangeKind,
     },
     config::Config,
@@ -521,6 +524,118 @@ async fn incremental_scan_processes_only_queued_file() -> Result<(), Box<dyn std
     .fetch_one(database.pool())
     .await?;
     assert_eq!(queued_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_scan_only_queues_metadata_when_library_switch_is_enabled()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library_with_scraper("Movies", LibraryKind::Movie, false, Some("tmdb"), false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Existing.Movie.2023.mkv"), b"existing").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: "http://127.0.0.1:9".to_owned(),
+        proxy_url: None,
+        api_key: Some("test-token".to_owned()),
+        read_access_token: None,
+        timeout: Duration::from_millis(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+
+    let disabled_path = "Disabled.Movie.2024.mkv";
+    tokio::fs::write(root.join(disabled_path), b"disabled").await?;
+    let disabled_job = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: disabled_path.to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion_with_metadata(&disabled_job.id, 100, None, Some(metadata.clone()))
+        .await?;
+    let disabled_metadata_jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(disabled_metadata_jobs, 0);
+
+    libraries
+        .update_settings(
+            library.id,
+            luxd::application::libraries::LibrarySettingsPatch {
+                realtime_metadata_auto_match_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let enabled_path = "Enabled.Movie.2025.mkv";
+    tokio::fs::write(root.join(enabled_path), b"enabled").await?;
+    let enabled_job = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: enabled_path.to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion_with_metadata(&enabled_job.id, 100, None, Some(metadata.clone()))
+        .await?;
+
+    let metadata_job: (String, i64) = sqlx::query_as(
+        "SELECT mode, total_count FROM metadata_reidentify_jobs ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(metadata_job, ("FILL_MISSING".to_owned(), 1));
+
+    let sidecar_path = "Enabled.Movie.2025.nfo";
+    tokio::fs::write(root.join(sidecar_path), b"<movie />").await?;
+    let sidecar_job = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: sidecar_path.to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion_with_metadata(&sidecar_job.id, 100, None, Some(metadata))
+        .await?;
+    let metadata_job_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(metadata_job_count, 1);
     Ok(())
 }
 

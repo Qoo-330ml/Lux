@@ -29,6 +29,7 @@ pub struct LibraryRecord {
     pub cover_image_tag: Option<String>,
     pub is_enabled: bool,
     pub realtime_watch_enabled: bool,
+    pub realtime_metadata_auto_match_enabled: bool,
     /// Legacy compatibility field; realtime incremental scans are event-driven.
     pub incremental_schedule: Option<String>,
     pub reconciliation_schedule: Option<String>,

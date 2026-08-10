@@ -38,6 +38,7 @@ export function AdminLibrariesPage() {
   const [name, setName] = useState("");
   const [kind, setKind] = useState("MOVIE");
   const [scraperId, setScraperId] = useState("");
+  const [createRealtimeMetadataAutoMatch, setCreateRealtimeMetadataAutoMatch] = useState(false);
   const [createRootPath, setCreateRootPath] = useState("");
   const [createDirectoryPickerOpen, setCreateDirectoryPickerOpen] = useState(false);
   const [formError, setFormError] = useState("");
@@ -73,8 +74,13 @@ export function AdminLibrariesPage() {
     },
   });
   const create = useMutation({
-    mutationFn: async (values: { name: string; kind: string; scraperId: string | null; rootPath: string }) => {
-      const response = await api.createAdminLibrary({ name: values.name, kind: values.kind, scraperId: values.scraperId });
+    mutationFn: async (values: { name: string; kind: string; scraperId: string | null; rootPath: string; realtimeMetadataAutoMatchEnabled: boolean }) => {
+      const response = await api.createAdminLibrary({
+        name: values.name,
+        kind: values.kind,
+        scraperId: values.scraperId,
+        realtimeMetadataAutoMatchEnabled: values.realtimeMetadataAutoMatchEnabled,
+      });
       if (!values.rootPath) return { ...response, rootError: "" };
       try {
         await api.addAdminLibraryRoot(response.library.id, values.rootPath);
@@ -86,6 +92,7 @@ export function AdminLibrariesPage() {
     onSuccess: ({ rootError }) => {
       setName("");
       setScraperId("");
+      setCreateRealtimeMetadataAutoMatch(false);
       setCreateRootPath("");
       setCreateDirectoryPickerOpen(false);
       setFormError("");
@@ -100,6 +107,7 @@ export function AdminLibrariesPage() {
     setName("");
     setKind("MOVIE");
     setScraperId("");
+    setCreateRealtimeMetadataAutoMatch(false);
     setCreateRootPath("");
     setCreateDirectoryPickerOpen(false);
     setFormError("");
@@ -118,7 +126,13 @@ export function AdminLibrariesPage() {
       setFormError("请输入媒体库名称");
       return;
     }
-    create.mutate({ name: name.trim(), kind, scraperId: scraperId || null, rootPath: createRootPath.trim() });
+    create.mutate({
+      name: name.trim(),
+      kind,
+      scraperId: scraperId || null,
+      rootPath: createRootPath.trim(),
+      realtimeMetadataAutoMatchEnabled: createRealtimeMetadataAutoMatch,
+    });
   }
 
   return (
@@ -154,6 +168,8 @@ export function AdminLibrariesPage() {
             <label htmlFor="new-library-name">名称<input id="new-library-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：电影" /></label>
             <label htmlFor="new-library-kind">类型<LuxSelect id="new-library-kind" value={kind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setKind} aria-label="媒体库类型" /></label>
             <ScraperSelect id="new-library-scraper" value={scraperId} plugins={pluginItems} onChange={setScraperId} />
+            <label className="lux-admin-toggle"><input type="checkbox" aria-label="新媒体库实时新增资源自动刮削" checked={createRealtimeMetadataAutoMatch} onChange={(event) => setCreateRealtimeMetadataAutoMatch(event.target.checked)} /><span>实时新增资源自动刮削</span></label>
+            <p className="lux-library-create-root-help">开启后，实时索引完成会为受影响的新资源提交元数据和图片补全任务。</p>
             <section className="lux-library-dialog-section lux-library-create-root-section">
               <div className="lux-library-dialog-section-heading"><div><h3>文件夹</h3><span>创建后自动开始扫描</span></div><Folder size={18} aria-hidden="true" /></div>
               <div className="lux-library-root-form"><input id="new-library-root-path" value={createRootPath} onChange={(event) => { setCreateRootPath(event.target.value); setFormError(""); }} placeholder="输入 Docker 内的媒体路径" aria-label="新媒体库根路径" /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setCreateDirectoryPickerOpen(true)}><Folder size={17} /></button></div>
@@ -381,7 +397,7 @@ function LibraryAdminCard({ library, plugins, globalStrategy }: { library: Admin
           <div className="lux-library-dialog-scroll">
             <p className="lux-library-warning">如果更改了元数据或媒体图片下载的设置，只适用于之后添加到媒体库的新内容。要将更改应用于现有项目，您需要手动刷新其元数据。</p>
             <section className="lux-library-dialog-section"><div className="lux-library-dialog-section-heading"><h3>文件夹</h3><button className="lux-library-toolbar-button" type="button" onClick={() => document.getElementById(`library-root-path-${library.id}`)?.focus()}><Plus size={16} /> 添加</button></div>{library.roots.length === 0 ? <p className="lux-admin-muted">尚未配置根路径。</p> : <div className="lux-library-dialog-root-list">{library.roots.map((root) => <div className="lux-library-dialog-root-row" key={root.id}><span title={root.displayPath}>{root.displayPath}</span><button className="lux-library-dialog-icon" type="button" aria-label={`编辑路径 ${root.displayPath}`} disabled><Pencil size={17} /></button><button className="lux-library-dialog-icon" type="button" aria-label={`删除路径 ${root.displayPath}`} onClick={() => removeRoot.mutate(root.id)} disabled={removeRoot.isPending}><MinusCircle size={18} /></button></div>)}</div>}<div className="lux-library-root-form"><input id={`library-root-path-${library.id}`} value={rootPath} onChange={(event) => setRootPath(event.target.value)} placeholder="输入 Docker 内的媒体路径" aria-label={`${library.name} 新根路径`} /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setDirectoryPickerOpen(true)}><Folder size={17} /></button></div>{directoryPickerOpen ? <DirectoryPicker initialPath={rootPath.trim()} isSubmitting={addRoot.isPending} onClose={() => setDirectoryPickerOpen(false)} onSelect={(path) => { setRootPath(path); setRootError(""); addRoot.mutate(path); }} /> : null}{rootError ? <p className="lux-error-copy">{rootError}</p> : null}</section>
-            <form className="lux-library-dialog-section lux-library-settings-form" onSubmit={saveDetails}><h3>媒体库设置</h3><label htmlFor={`library-name-${library.id}`}>媒体库名称<input id={`library-name-${library.id}`} aria-label={`${library.name} 媒体库名称`} value={editName} onChange={(event) => setEditName(event.target.value)} /></label><label htmlFor={`library-kind-${library.id}`}>媒体库类型<LuxSelect id={`library-kind-${library.id}`} value={editKind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setEditKind} aria-label={`${library.name} 媒体库类型`} /></label><label className="lux-admin-toggle"><input type="checkbox" checked={library.isEnabled} onChange={(event) => update.mutate({ values: { isEnabled: event.target.checked } })} /><span>启用媒体库</span></label><ScraperSelect id={`library-scraper-${library.id}`} value={scraperId} plugins={plugins} onChange={updateScraper} />{editError ? <p className="lux-error-copy">{editError}</p> : null}<div className="lux-library-dialog-actions"><button className="lux-library-toolbar-button is-primary" type="submit" disabled={update.isPending}><Save size={15} /> 保存修改</button><button className="lux-library-toolbar-button" type="button" onClick={() => setEditOpen(false)}>取消</button></div></form>
+            <form className="lux-library-dialog-section lux-library-settings-form" onSubmit={saveDetails}><h3>媒体库设置</h3><label htmlFor={`library-name-${library.id}`}>媒体库名称<input id={`library-name-${library.id}`} aria-label={`${library.name} 媒体库名称`} value={editName} onChange={(event) => setEditName(event.target.value)} /></label><label htmlFor={`library-kind-${library.id}`}>媒体库类型<LuxSelect id={`library-kind-${library.id}`} value={editKind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setEditKind} aria-label={`${library.name} 媒体库类型`} /></label><label className="lux-admin-toggle"><input type="checkbox" checked={library.isEnabled} onChange={(event) => update.mutate({ values: { isEnabled: event.target.checked } })} /><span>启用媒体库</span></label><label className="lux-admin-toggle"><input type="checkbox" aria-label={`${library.name} 实时新增资源自动刮削`} checked={library.realtimeMetadataAutoMatchEnabled} onChange={(event) => update.mutate({ values: { realtimeMetadataAutoMatchEnabled: event.target.checked } })} /><span>实时新增资源自动刮削</span></label><p className="lux-library-create-root-help">实时索引完成后，仅为本次受影响的媒体条目提交元数据和图片补全任务。</p><ScraperSelect id={`library-scraper-${library.id}`} value={scraperId} plugins={plugins} onChange={updateScraper} />{editError ? <p className="lux-error-copy">{editError}</p> : null}<div className="lux-library-dialog-actions"><button className="lux-library-toolbar-button is-primary" type="submit" disabled={update.isPending}><Save size={15} /> 保存修改</button><button className="lux-library-toolbar-button" type="button" onClick={() => setEditOpen(false)}>取消</button></div></form>
             {globalStrategy ? <LibraryStrategyOverride library={library} globalStrategy={globalStrategy} onSave={(value) => update.mutateAsync({ values: { mediaStrategy: value } })} /> : null}
             <section className="lux-library-dialog-section"><div className="lux-library-dialog-section-heading"><h3>媒体库图像</h3><span>JPEG、PNG、WebP，最大 5 MiB</span></div><div className="lux-library-cover-editor"><div className="lux-library-cover-preview">{library.coverImageUrl ? <img src={library.coverImageUrl} alt="" /> : <Image size={24} aria-hidden="true" />}</div><input ref={coverInputRef} className="lux-visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label={`${library.name} 封面图片`} onChange={selectCover} /><button className="lux-library-toolbar-button" type="button" onClick={() => coverInputRef.current?.click()} disabled={uploadCover.isPending}><Upload size={15} /> {uploadCover.isPending ? "上传中…" : library.coverImageUrl ? "替换封面" : "上传封面"}</button>{coverError ? <p className="lux-error-copy">{coverError}</p> : null}</div></section>
           </div>

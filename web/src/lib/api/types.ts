@@ -189,6 +189,7 @@ export type AdminLibrary = Library & {
   scraperId?: string | null;
   isEnabled: boolean;
   realtimeWatchEnabled: boolean;
+  realtimeMetadataAutoMatchEnabled: boolean;
   /** @deprecated Realtime incremental scans are event-driven and have no schedule. */
   incrementalSchedule?: string | null;
   reconciliationSchedule?: string | null;

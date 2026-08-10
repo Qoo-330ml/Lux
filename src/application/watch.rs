@@ -21,7 +21,10 @@ use tokio::{
 };
 
 use crate::{
-    application::scanner::{IncrementalScanChange, ScanJobService},
+    application::{
+        reidentify::MetadataReidentifyService,
+        scanner::{IncrementalScanChange, ScanJobService},
+    },
     domain::ids::LibraryId,
     storage::{Database, StoredLibraryRoot},
 };
@@ -141,6 +144,7 @@ struct WatcherTaskResult {
 pub struct LibraryWatchService {
     database: Database,
     scan_jobs: ScanJobService,
+    metadata: Option<MetadataReidentifyService>,
 }
 
 impl LibraryWatchService {
@@ -150,9 +154,18 @@ impl LibraryWatchService {
     }
 
     pub fn with_scan_jobs(database: Database, scan_jobs: ScanJobService) -> Self {
+        Self::with_scan_jobs_and_metadata(database, scan_jobs, None)
+    }
+
+    pub fn with_scan_jobs_and_metadata(
+        database: Database,
+        scan_jobs: ScanJobService,
+        metadata: Option<MetadataReidentifyService>,
+    ) -> Self {
         Self {
             scan_jobs,
             database,
+            metadata,
         }
     }
 
@@ -286,10 +299,14 @@ impl LibraryWatchService {
                     }
                     drop(running);
                     let scan_jobs = self.scan_jobs.clone();
+                    let metadata = self.metadata.clone();
                     let running_jobs = Arc::clone(&running_jobs);
                     let job_id = job.id.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = scan_jobs.run_to_completion(&job_id, 100, None).await {
+                        if let Err(error) = scan_jobs
+                            .run_to_completion_with_metadata(&job_id, 100, None, metadata)
+                            .await
+                        {
                             tracing::error!(job_id = %job_id, %error, "realtime incremental scan stopped");
                         }
                         running_jobs.lock().await.remove(&job_id);

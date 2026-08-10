@@ -615,6 +615,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         .header("x-csrf-token", &csrf)
         .json(&json!({
             "realtimeWatchEnabled": true,
+            "realtimeMetadataAutoMatchEnabled": true,
             "incrementalSchedule": "interval:30s",
             "reconciliationSchedule": "0 3 * * *",
             "metadataSchedule": "interval:5m",
@@ -627,6 +628,10 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     let first_body: Value = first_update.json().await?;
     assert_eq!(first_body["library"]["incrementalSchedule"], Value::Null);
     assert_eq!(first_body["library"]["scanConcurrency"], 4);
+    assert_eq!(
+        first_body["library"]["realtimeMetadataAutoMatchEnabled"],
+        true
+    );
 
     let second_update = client
         .patch(format!(
@@ -641,6 +646,12 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         .send()
         .await?;
     assert_eq!(second_update.status(), reqwest::StatusCode::OK);
+
+    let second_body: Value = second_update.json().await?;
+    assert_eq!(
+        second_body["library"]["realtimeMetadataAutoMatchEnabled"],
+        false
+    );
 
     let library_strategy = json!({
         "metadataLanguage": "ja-JP",
