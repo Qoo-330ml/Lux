@@ -765,9 +765,10 @@ async fn image_target(
         return Ok(existing);
     }
     let target_stem = if let Some(prefixed_stem) = prefixed_stem {
-        let prefixed_exists = find_existing_image_path(directory, &[prefixed_stem.clone()], None)
-            .await?
-            .is_some();
+        let prefixed_exists =
+            find_existing_image_path(directory, std::slice::from_ref(&prefixed_stem), None)
+                .await?
+                .is_some();
         if prefixed_exists || directory_has_multiple_media_files(directory).await? {
             prefixed_stem
         } else {
