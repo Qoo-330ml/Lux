@@ -43,3 +43,12 @@ test("series cards render the episode count in the poster upper-right corner", (
   assert.match(episodeCountRule, /top:\s*9px/);
   assert.match(episodeCountRule, /right:\s*9px/);
 });
+
+test("homepage library cards wrap into an adaptive grid instead of one horizontal row", () => {
+  const libraryRailRule = stylesheet.match(/\.lux-library-rail\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(libraryRailRule, /display:\s*grid/);
+  assert.match(libraryRailRule, /grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(min\(180px,\s*100%\),\s*1fr\)\)/);
+  assert.match(libraryRailRule, /width:\s*100%/);
+  assert.match(libraryRailRule, /min-width:\s*0/);
+});
