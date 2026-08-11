@@ -177,6 +177,18 @@ export class LuxApiClient {
     return this.request<{ user: LuxUser }>("/api/v1/auth/me").then((response) => response.user);
   }
 
+  avatarUrl(cacheKey?: string) {
+    return `/api/v1/auth/avatar${cacheKey ? `?v=${encodeURIComponent(cacheKey)}` : ""}`;
+  }
+
+  uploadAvatar(file: File) {
+    return this.request<{ avatarUrl: string }>("/api/v1/auth/avatar", {
+      method: "PUT",
+      headers: { "Content-Type": file.type },
+      body: file,
+    });
+  }
+
   home() {
     return this.request<HomeResponse>("/api/v1/home");
   }

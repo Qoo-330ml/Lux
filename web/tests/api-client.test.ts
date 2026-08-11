@@ -23,6 +23,23 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
   });
 
+  it("uploads an avatar as an image body instead of JSON", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ avatarUrl: "/api/v1/auth/avatar" }), { status: 200 }),
+    );
+    const file = new File(["avatar"], "avatar.png", { type: "image/png" });
+
+    await expect(new LuxApiClient().uploadAvatar(file)).resolves.toEqual({
+      avatarUrl: "/api/v1/auth/avatar",
+    });
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/auth/avatar");
+    expect(options?.method).toBe("PUT");
+    expect(options?.body).toBe(file);
+    expect((options?.headers as Headers).get("Content-Type")).toBe("image/png");
+  });
+
   it("checks and selects the configured database backend without changing the setup API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

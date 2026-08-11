@@ -23,9 +23,7 @@ import {
   applyAccountAccent,
   moveLibrary,
   orderLibraries,
-  readAccountAvatar,
   readAccountSettings,
-  saveAccountAvatar,
   saveAccountSettings,
   type AccountSettings,
 } from "./account-settings";
@@ -36,8 +34,10 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const [settings, setSettings] = useState<AccountSettings>(() => readAccountSettings(user.id));
   const [draggedLibraryId, setDraggedLibraryId] = useState<string | null>(null);
-  const [avatarUrl, setAvatarUrl] = useState<string | null>(() => readAccountAvatar(user.id));
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(() => api.avatarUrl());
+  const [avatarImageFailed, setAvatarImageFailed] = useState(false);
   const [pendingAvatarUrl, setPendingAvatarUrl] = useState<string | null>(null);
+  const [pendingAvatarFile, setPendingAvatarFile] = useState<File | null>(null);
   const [avatarReading, setAvatarReading] = useState(false);
   const [avatarNotice, setAvatarNotice] = useState<string | null>(null);
   const [accountNotice, setAccountNotice] = useState<string | null>(null);
@@ -71,6 +71,20 @@ export function AccountPage({ user }: { user: LuxUser }) {
     },
   });
 
+  const avatarUpload = useMutation({
+    mutationFn: (file: File) => api.uploadAvatar(file),
+    onSuccess: () => {
+      setAvatarUrl(api.avatarUrl(String(Date.now())));
+      setAvatarImageFailed(false);
+      setPendingAvatarUrl(null);
+      setPendingAvatarFile(null);
+      setAvatarNotice("头像已保存");
+    },
+    onError: (error) => {
+      setAvatarNotice(error instanceof Error ? `头像保存失败：${error.message}` : "头像保存失败，请重试。");
+    },
+  });
+
   const updateSettings = (patch: Partial<AccountSettings>) => {
     setSettings((current) => ({ ...current, ...patch }));
   };
@@ -96,16 +110,21 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const selectAvatar = (file: File | undefined) => {
     if (!file) return;
     setAvatarNotice(null);
+    setPendingAvatarFile(file);
     setAvatarReading(true);
     const reader = new FileReader();
     reader.onload = () => {
       const result = typeof reader.result === "string" ? reader.result : null;
       setPendingAvatarUrl(result);
       setAvatarReading(false);
-      if (!result) setAvatarNotice("头像读取失败，请重试。");
+      if (!result) {
+        setPendingAvatarFile(null);
+        setAvatarNotice("头像读取失败，请重试。");
+      }
     };
     reader.onerror = () => {
       setPendingAvatarUrl(null);
+      setPendingAvatarFile(null);
       setAvatarReading(false);
       setAvatarNotice("头像读取失败，请重试。");
     };
@@ -113,19 +132,13 @@ export function AccountPage({ user }: { user: LuxUser }) {
   };
 
   const saveAvatar = () => {
-    if (!pendingAvatarUrl) return;
-    if (!saveAccountAvatar(pendingAvatarUrl, user.id)) {
-      setAvatarNotice("头像保存失败，请更换较小图片后重试。");
-      return;
-    }
-    setAvatarUrl(pendingAvatarUrl);
-    setPendingAvatarUrl(null);
-    setAvatarNotice("头像已保存");
+    if (!pendingAvatarFile || !pendingAvatarUrl || avatarReading || avatarUpload.isPending) return;
+    avatarUpload.mutate(pendingAvatarFile);
   };
 
   const displayName = user.displayName || user.usernameNormalized;
   const initials = displayName.slice(0, 1).toUpperCase();
-  const displayedAvatarUrl = pendingAvatarUrl ?? avatarUrl;
+  const displayedAvatarUrl = pendingAvatarUrl ?? (avatarImageFailed ? null : avatarUrl);
 
   return (
     <section className="lux-page lux-account-page">
@@ -141,7 +154,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
         <aside className="lux-account-settings-sidebar" aria-label="账户设置导航">
           <div className="lux-account-profile-card">
             <div className="lux-settings-avatar" aria-hidden="true">
-              {displayedAvatarUrl ? <img src={displayedAvatarUrl} alt="" /> : initials}
+              {displayedAvatarUrl ? <img src={displayedAvatarUrl} alt="" onError={() => setAvatarImageFailed(true)} /> : initials}
             </div>
             <div>
               <strong>{displayName}</strong>
@@ -276,7 +289,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
           <SettingsSection id="account" icon={<UserRound size={18} />} title="账户">
             <div className="lux-account-profile-editor">
               <div className="lux-settings-avatar lux-settings-avatar-large">
-                {displayedAvatarUrl ? <img src={displayedAvatarUrl} alt={`${displayName} 的头像`} /> : <UserRound size={27} />}
+                {displayedAvatarUrl ? <img src={displayedAvatarUrl} alt={`${displayName} 的头像`} onError={() => setAvatarImageFailed(true)} /> : <UserRound size={27} />}
               </div>
               <div>
                 <strong>头像</strong>
@@ -294,9 +307,9 @@ export function AccountPage({ user }: { user: LuxUser }) {
                     className="lux-button lux-button-secondary"
                     type="button"
                     onClick={saveAvatar}
-                    disabled={!pendingAvatarUrl || avatarReading}
+                    disabled={!pendingAvatarFile || !pendingAvatarUrl || avatarReading || avatarUpload.isPending}
                   >
-                    {avatarReading ? "读取中…" : "保存头像"}
+                    {avatarUpload.isPending ? "保存中…" : avatarReading ? "读取中…" : "保存头像"}
                   </button>
                 </div>
                 {avatarNotice ? <p className="lux-account-notice" role="status">{avatarNotice}</p> : null}

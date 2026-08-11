@@ -104,8 +104,11 @@ describe("account settings", () => {
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
   });
 
-  it("persists an avatar only after the user explicitly saves it", async () => {
+  it("uploads an avatar to the server only after the user explicitly saves it", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ avatarUrl: "/api/v1/auth/avatar" }), { status: 200 }),
+    );
 
     await act(async () => {
       root.render(
@@ -138,7 +141,11 @@ describe("account settings", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(localStorage.getItem("lux.account.avatar:user-1")).toMatch(/^data:image\/png;base64,/);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/auth/avatar",
+      expect.objectContaining({ method: "PUT", credentials: "same-origin" }),
+    );
+    expect(localStorage.getItem("lux.account.avatar:user-1")).toBeNull();
     expect(container.textContent).toContain("头像已保存");
   });
 

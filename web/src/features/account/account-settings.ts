@@ -14,7 +14,6 @@ export type AccountSettings = {
 };
 
 export const ACCOUNT_SETTINGS_STORAGE_KEY = "lux.account.settings";
-export const ACCOUNT_AVATAR_STORAGE_KEY = "lux.account.avatar";
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   theme: "dark",
@@ -29,34 +28,6 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
 
 export function accountSettingsStorageKey(userId?: string): string {
   return userId ? `${ACCOUNT_SETTINGS_STORAGE_KEY}:${encodeURIComponent(userId)}` : ACCOUNT_SETTINGS_STORAGE_KEY;
-}
-
-export function accountAvatarStorageKey(userId?: string): string {
-  return userId ? `${ACCOUNT_AVATAR_STORAGE_KEY}:${encodeURIComponent(userId)}` : ACCOUNT_AVATAR_STORAGE_KEY;
-}
-
-export function readAccountAvatar(userId?: string): string | null {
-  const storage = getStorage();
-  if (!storage) return null;
-
-  try {
-    const avatar = storage.getItem(accountAvatarStorageKey(userId));
-    return avatar && isAvatarDataUrl(avatar) ? avatar : null;
-  } catch {
-    return null;
-  }
-}
-
-export function saveAccountAvatar(dataUrl: string, userId?: string): boolean {
-  const storage = getStorage();
-  if (!storage || !isAvatarDataUrl(dataUrl)) return false;
-
-  try {
-    storage.setItem(accountAvatarStorageKey(userId), dataUrl);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 export function readAccountSettings(userId?: string): AccountSettings {
@@ -129,10 +100,6 @@ export function applyAccountAccent(accentColor: LuxAccentColor): void {
 
 function isAccentColor(value: unknown): value is LuxAccentColor {
   return value === "berry" || value === "ocean" || value === "amber" || value === "mint";
-}
-
-function isAvatarDataUrl(value: string): boolean {
-  return /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/.test(value);
 }
 
 function getStorage(): Storage | null {
