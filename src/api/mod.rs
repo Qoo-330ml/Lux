@@ -13,7 +13,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode,
-        header::{COOKIE, SET_COOKIE},
+        header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -77,6 +77,7 @@ use crate::{
         thumbnails::ThumbnailService,
         tmdb::{TmdbClient, TmdbError},
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
+        user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
@@ -139,6 +140,7 @@ pub struct AppState {
     tmdb: Option<TmdbProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
+    user_avatars: Option<UserAvatarService>,
     ip_location: Option<IpLocationService>,
     admin_events: AdminEventHub,
     resources: ResourceMetrics,
@@ -167,6 +169,7 @@ impl AppState {
     ) -> Self {
         let server_id = database.server_id().to_owned();
         let config_dir = config.config_dir.clone();
+        let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
         let resources = ResourceMetrics::new();
         let database_setup = Some(DatabaseSetupService::new(
             config.clone(),
@@ -275,9 +278,10 @@ impl AppState {
             tmdb: Some(tmdb),
             collections,
             people: Some(PeopleService::new_with_proxy(
-                config_dir,
+                config_dir.clone(),
                 network_proxy_url.clone(),
             )),
+            user_avatars,
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
             resources,
@@ -469,6 +473,12 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/me", get(auth_me))
+        .route(
+            "/api/v1/auth/avatar",
+            get(auth_avatar)
+                .put(auth_update_avatar)
+                .layer(DefaultBodyLimit::max(MAX_USER_AVATAR_BYTES as usize)),
+        )
         .route("/api/v1/auth/sessions", get(auth_sessions))
         .route(
             "/api/v1/auth/sessions/{session_id}",
@@ -4599,6 +4609,57 @@ async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response 
             "认证暂时不可用",
         )
         .into_response(),
+    }
+}
+
+async fn auth_avatar(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(avatars) = state.user_avatars.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match avatars.load(user.id).await {
+        Ok(Some(avatar)) => match Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, avatar.content_type)
+            .header(CACHE_CONTROL, "private, no-cache")
+            .body(Body::from(avatar.bytes))
+        {
+            Ok(response) => response,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => user_avatar_error(&headers, error),
+    }
+}
+
+async fn auth_update_avatar(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(avatars) = state.user_avatars.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    match avatars.store(user.id, content_type, &body).await {
+        Ok(()) => Json(json!({
+            "avatarUrl": "/api/v1/auth/avatar",
+        }))
+        .into_response(),
+        Err(error) => user_avatar_error(&headers, error),
     }
 }
 
@@ -12788,6 +12849,32 @@ fn api_error(
             }
         })),
     )
+}
+
+fn user_avatar_error(headers: &HeaderMap, error: UserAvatarError) -> Response {
+    match error {
+        UserAvatarError::UnsupportedContentType | UserAvatarError::InvalidContent => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "头像格式无效，仅支持 JPEG、PNG 或 WebP",
+        )
+        .into_response(),
+        UserAvatarError::TooLarge { .. } => api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            "头像不能超过 5 MiB",
+        )
+        .into_response(),
+        UserAvatarError::InvalidPath(_) | UserAvatarError::Io { .. } => api_error(
+            headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            "头像暂时无法保存",
+        )
+        .into_response(),
+    }
 }
 
 fn request_cookie(headers: &HeaderMap, name: &str) -> Option<String> {

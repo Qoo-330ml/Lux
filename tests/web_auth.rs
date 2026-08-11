@@ -1,3 +1,6 @@
+use std::io::Cursor;
+
+use image::{DynamicImage, ImageFormat};
 use luxd::{
     api::{AppState, app_with_state},
     application::setup::SetupService,
@@ -5,7 +8,7 @@ use luxd::{
     config::Config,
     storage::Database,
 };
-use reqwest::header::{COOKIE, SET_COOKIE};
+use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -193,4 +196,96 @@ async fn expired_web_sessions_are_rejected() -> Result<(), Box<dyn std::error::E
 
     assert!(auth.resolve(&session.session_token).await?.is_none());
     Ok(())
+}
+
+#[tokio::test]
+async fn avatar_upload_requires_csrf_and_survives_a_second_login()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server) = test_server(config).await?;
+    let client = reqwest::Client::new();
+    let avatar = png_fixture()?;
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(
+            &json!({ "username": "Admin", "displayName": "Admin", "password": "correct password" }),
+        )
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let session_cookie = cookie_value(login.headers(), "lux_session");
+    let csrf_cookie = cookie_value(login.headers(), "lux_csrf");
+    let cookie_header = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
+
+    let missing_csrf = client
+        .put(format!("{base_url}/api/v1/auth/avatar"))
+        .header(COOKIE, &cookie_header)
+        .header(CONTENT_TYPE, "image/png")
+        .body(avatar.clone())
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let upload = client
+        .put(format!("{base_url}/api/v1/auth/avatar"))
+        .header(COOKIE, &cookie_header)
+        .header("x-csrf-token", &csrf_cookie)
+        .header(CONTENT_TYPE, "image/png")
+        .body(avatar.clone())
+        .send()
+        .await?;
+    assert_eq!(upload.status(), reqwest::StatusCode::OK);
+
+    let first_read = client
+        .get(format!("{base_url}/api/v1/auth/avatar"))
+        .header(COOKIE, &cookie_header)
+        .send()
+        .await?;
+    assert_eq!(first_read.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        first_read
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    assert_eq!(first_read.bytes().await?.as_ref(), avatar.as_slice());
+
+    let second_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let second_cookie = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(second_login.headers(), "lux_session"),
+        cookie_value(second_login.headers(), "lux_csrf")
+    );
+    let second_read = client
+        .get(format!("{base_url}/api/v1/auth/avatar"))
+        .header(COOKIE, second_cookie)
+        .send()
+        .await?;
+    assert_eq!(second_read.status(), reqwest::StatusCode::OK);
+    assert_eq!(second_read.bytes().await?.as_ref(), avatar.as_slice());
+
+    server.abort();
+    Ok(())
+}
+
+fn png_fixture() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut output = Cursor::new(Vec::new());
+    DynamicImage::new_rgba8(1, 1).write_to(&mut output, ImageFormat::Png)?;
+    Ok(output.into_inner())
 }
