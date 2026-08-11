@@ -94,7 +94,7 @@ Lux 的核心价值不是功能数量，而是：
 - 管理员可以编辑已有媒体库的名称和类型。
 - 单个媒体库可包含多个本地路径。
 - 同一媒体库可同时包含真实媒体文件和 .strm 文件。
-- `.strm` 默认只作为外部播放地址记录；普通扫描、PlaybackInfo 和播放请求不得主动读取其指向的视频源的容器信息、索引或媒体轨。下载请求按 LUX-091 的远程资源流式转发规则读取字节，不进行媒体信息探测。管理员显式创建 STRM 探测任务后，允许通过受监督的 `media_probe` 插件在后台读取远程媒体信息。
+- `.strm` 默认只作为不透明播放目标记录；目标可以是 HTTP(S) URL、路径或其他由外部解析器理解的格式。普通扫描、PlaybackInfo 和播放请求不得主动读取其指向的视频源的容器信息、索引或媒体轨。下载请求按目标类型和 LUX-091 的远程资源流式转发规则处理，不进行媒体信息探测。管理员显式创建 STRM 探测任务后，允许通过受监督的 `media_probe` 插件在后台读取已校验的远程媒体信息。
 - `.strm` 若存在同名 `-mediainfo.json` 旁车，可在后台读取旁车填充已声明的媒体信息；没有旁车时保持媒体信息为空，不因缺少探测结果阻止播放。
 - 每个媒体库可设置一个可选的自定义封面图；仅管理员可以上传或替换，普通用户只能在拥有该媒体库访问权限时读取。
 - 媒体库封面图首版只接受 JPEG、PNG、WebP，大小上限为 5 MiB，并通过 Lux 的受保护图片接口提供。
@@ -111,15 +111,16 @@ Lux 的核心价值不是功能数量，而是：
 ### 3.2 媒体来源
 
 - 本地媒体来自 NAS Docker 绑定挂载目录。
-- .strm 文件的第一个非空文本内容被视为外部播放地址。
-- .strm 地址在播放路径中直接交给客户端，不校验、不探测、不做代理、不访问 AList API；独立的管理员 STRM 探测任务可以在目标输入校验通过后将地址交给 `org.lux.strm-media-info` 插件。
-- Lux 不负责保护 .strm URL 中可能包含的令牌；管理员应理解该 URL 会暴露给有播放权限的客户端。
+- `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
+- Lux 对目标做有限的词法分类：HTTP(S) URL、路径和未知/其他目标；分类不访问网络、不把路径当作本地文件路径，也不猜测目标所属的外部服务。
+- HTTP(S) 目标沿用直接播放语义；路径和其他目标交给后续路径转发或解析器任务处理，未配置处理方式时不得伪造可播放 URL。
+- Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
 ### 3.3 播放
 
 - 首版仅支持直接播放，不支持音视频转码、容器转换或字幕转换。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。
-- .strm 返回外部播放地址。
+- URL 型 `.strm` 返回外部播放地址；路径型和其他目标返回其目标类型对应的播放计划。
 - 浏览器无法原生播放的编码直接显示不支持，不提供转码兜底。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -1189,10 +1190,10 @@ locked local value
 
 ### 14.2 .strm
 
-- 读取文件的首个非空行并 trim BOM 与首尾空白。
-- 播放路径不执行 URL 合法性检查或 HEAD 请求；下载路径按 LUX-091 使用独立的 URL 安全策略和上游流式转发，二者语义分离。
-- PlaybackInfo 将其作为直接媒体源返回。
-- 播放不通过 Lux 转发数据；下载不会把 `.strm` 文本直接交给客户端。
+- 读取文件的首个非空行并 trim BOM 与首尾空白，保存为原始播放目标。
+- 目标只做词法分类：HTTP(S) URL、路径、未知/其他目标；不在扫描或 PlaybackInfo 请求中访问目标。
+- URL 型目标沿用直接媒体源返回；路径型和其他目标不得被标记为已解析的 HTTP URL，需由路径转发或解析器策略决定播放方式。
+- 下载路径按 LUX-091 使用独立的 URL 安全策略和上游流式转发，不能把路径型目标直接当作远程 URL 请求。
 
 ### 14.3 PlaybackInfo
 
@@ -1768,6 +1769,7 @@ services:
 | LUX-153 | src/application/admin_events.rs、src/api/mod.rs、tests/admin_events.rs、web/src/features/admin/、web/tests/、docs/ |
 | LUX-154 | src/application/scanner.rs、src/storage/mod.rs、migrations/、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
 | LUX-156 | src/observability/、src/main.rs、src/api/mod.rs、Cargo.toml、Cargo.lock、tests/observability.rs、tests/log_export.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
+| LUX-158 | src/application/strm_target.rs、src/application/、tests/strm_target.rs、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2373,7 +2375,7 @@ services:
 验收：
 
 - 读取首个非空行并处理 BOM。
-- 播放和 PlaybackInfo 不校验、不请求、不代理；下载端点的远程请求按 LUX-091 单独执行。
+- URL 型目标的播放和 PlaybackInfo 不校验、不请求、不代理；下载端点的远程请求按 LUX-091 单独执行。
 - URL 不进入日志。
 
 验证：http、https、含查询令牌和空文件 fixtures。
@@ -3328,6 +3330,24 @@ stdout 日志并在启动阶段报告降级原因。
 
 - 不在本任务增加自动历史清理策略；管理员或部署系统负责根据配置卷容量管理历史日文件。
 - 不提供普通用户日志读取，不修改现有 `/api/v1/admin/logs` 审计 JSON 合同，不改变 Emby API。
+
+#### LUX-158：路径型 `.strm` 目标分类
+
+验收：
+
+- 读取并保存 `.strm` 首个非空目标，保留中文、空格、括号和路径分隔符。
+- 纯词法分类覆盖 HTTP(S) URL、POSIX/UNC/相对路径和未知/其他目标；分类不产生网络请求、不访问本地路径。
+- URL 型目标保持现有兼容行为；路径型和未知目标不会被误标记为 HTTP URL，也不会伪造直链。
+
+验证：`cargo test --locked --test strm`、目标分类单测、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+依赖：LUX-072。
+
+明确不做：
+
+- 不新增数据库字段或 migration。
+- 不修改 Emby `MediaSource` 输出，不调用外部解析器，不请求路径，不代理媒体字节。
+- 不把任何具体第三方工具写入 Lux 核心。
 
 ## 26. 风险与缓解
 

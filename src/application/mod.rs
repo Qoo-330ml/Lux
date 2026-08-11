@@ -34,6 +34,7 @@ pub mod settings;
 pub mod setup;
 pub mod strm_probe;
 pub mod strm_probe_policy;
+pub mod strm_target;
 pub mod thumbnails;
 pub mod tmdb;
 pub mod tmdb_plugin;
