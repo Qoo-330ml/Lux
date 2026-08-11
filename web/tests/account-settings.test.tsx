@@ -104,6 +104,44 @@ describe("account settings", () => {
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
   });
 
+  it("persists an avatar only after the user explicitly saves it", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const file = new File(["avatar"], "avatar.png", { type: "image/png" });
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent?.includes("保存头像"))).toBe(true);
+    Object.defineProperty(input, "files", { configurable: true, value: [file] });
+
+    await act(async () => {
+      input?.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const saveButton = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("保存头像"));
+    expect(saveButton).toBeTruthy();
+
+    await act(async () => {
+      saveButton?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(localStorage.getItem("lux.account.avatar:user-1")).toMatch(/^data:image\/png;base64,/);
+    expect(container.textContent).toContain("头像已保存");
+  });
+
   it("persists a changed theme and reorders libraries from an accessible control", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 

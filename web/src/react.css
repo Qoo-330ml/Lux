@@ -1302,7 +1302,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-setting-field input[readonly] { color: var(--lux-subtle); cursor: not-allowed; }
 .lux-account-profile-editor { display: flex; align-items: center; gap: 15px; padding: 17px 0; }
 .lux-settings-avatar-large { width: 68px; height: 68px; font-size: 1.4rem; }
+.lux-account-avatar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .lux-upload-button { display: inline-flex; align-items: center; min-height: 33px; margin-top: 10px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-settings-line); border-radius: 7px; color: var(--lux-text); background: rgba(255,255,255,.06); font-size: .72rem; cursor: pointer; transition: background .2s ease, border-color .2s ease; }
+.lux-account-avatar-actions .lux-upload-button { margin-top: 0; }
+.lux-account-avatar-actions .lux-button { min-height: 33px; font-size: .72rem; }
 .lux-upload-button:hover { border-color: rgba(255,255,255,.38); background: rgba(255,255,255,.1); }
 .lux-upload-button input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
 .lux-account-form-grid { padding-top: 4px; }
