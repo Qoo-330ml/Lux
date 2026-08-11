@@ -386,12 +386,15 @@ impl CatalogService {
             .database
             .list_recent_catalog_item_ids(&library_ids, offset, limit)
             .await?;
-        let mut items = Vec::with_capacity(item_ids.len());
-        for item_id in item_ids {
-            if let Some(item) = self.find_item(principal, &item_id).await? {
-                items.push(item);
+        let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
+        let mut items = assemble_items(rows);
+        let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
+        for item in &mut items {
+            if let Some(detail) = details.get(&item.id) {
+                apply_catalog_detail(item, detail);
             }
         }
+        let items = reorder_catalog_items(items, &item_ids);
         Ok(CatalogPage {
             items,
             total,
@@ -717,6 +720,17 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
     items
 }
 
+fn reorder_catalog_items(items: Vec<CatalogItem>, item_ids: &[String]) -> Vec<CatalogItem> {
+    let mut items_by_id = items
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    item_ids
+        .iter()
+        .filter_map(|item_id| items_by_id.remove(item_id))
+        .collect()
+}
+
 fn apply_catalog_detail(item: &mut CatalogItem, detail: &StoredCatalogDetail) {
     item.premiere_date = detail.premiere_date.clone();
     item.last_air_date = detail.last_air_date.clone();
@@ -790,7 +804,59 @@ impl From<AccessError> for CatalogError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::application::recommendations::daily_recommendation_items;
+
+    use super::{CatalogItem, reorder_catalog_items};
+
+    fn catalog_item(id: &str) -> CatalogItem {
+        CatalogItem {
+            id: id.to_owned(),
+            library_id: "library-1".to_owned(),
+            item_type: "MOVIE".to_owned(),
+            parent_id: None,
+            series_id: None,
+            season_number: None,
+            episode_number: None,
+            title: id.to_owned(),
+            sort_title: id.to_owned(),
+            original_title: None,
+            overview: None,
+            premiere_date: None,
+            last_air_date: None,
+            status: None,
+            original_language: None,
+            provider_ids: BTreeMap::new(),
+            season_count: None,
+            episode_count: None,
+            production_year: None,
+            rating: None,
+            rating_source: None,
+            runtime_ticks: None,
+            poster_image_tag: None,
+            fanart_image_tag: None,
+            thumb_image_tag: None,
+            logo_image_tag: None,
+            media_sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn batched_recent_items_keep_recent_order() {
+        let requested_ids = ["recent-1".to_owned(), "recent-2".to_owned()];
+        let items = vec![catalog_item("recent-2"), catalog_item("recent-1")];
+
+        let ordered = reorder_catalog_items(items, &requested_ids);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recent-1", "recent-2"]
+        );
+    }
 
     #[test]
     fn daily_recommendations_are_stable_for_one_day_and_change_next_day() {
