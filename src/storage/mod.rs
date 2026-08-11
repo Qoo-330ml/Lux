@@ -7373,6 +7373,7 @@ impl Database {
         let rows = if let Some(after_source_id) = after_source_id {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
+                        mi.thumbnail_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -7402,6 +7403,7 @@ impl Database {
         } else {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
+                        mi.thumbnail_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -7433,6 +7435,8 @@ impl Database {
                 .map(|row| StoredStrmMediaSource {
                     source_id: row.get("source_id"),
                     item_id: row.get("item_id"),
+                    thumbnail_fallback_required: row.get::<i64, _>("thumbnail_fallback_required")
+                        != 0,
                     has_media_info: row.get::<i64, _>("has_media_info") != 0,
                     external_url: row.get("external_url"),
                     root_path: row.get("root_path"),
@@ -8035,6 +8039,27 @@ impl Database {
         })
     }
 
+    pub(crate) async fn set_thumbnail_fallback_required(
+        &self,
+        item_id: &str,
+        required: bool,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_items
+             SET thumbnail_fallback_required = ?
+             WHERE id = ?",
+        )
+        .bind(database_flag(required))
+        .bind(item_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn upsert_item_image(
         &self,
         item_id: &str,
@@ -8127,6 +8152,26 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_item_image).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_item_image_source(
+        &self,
+        item_id: &str,
+        image_type: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT source
+             FROM item_images
+             WHERE item_id = ? AND image_type = ? AND image_index = 0",
+        )
+        .bind(item_id)
+        .bind(image_type)
+        .fetch_optional(&self.pool)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -9481,6 +9526,7 @@ pub(crate) struct StoredThumbnailSource {
 pub(crate) struct StoredStrmMediaSource {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
+    pub(crate) thumbnail_fallback_required: bool,
     pub(crate) has_media_info: bool,
     pub(crate) external_url: Option<String>,
     pub(crate) root_path: String,

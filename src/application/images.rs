@@ -113,6 +113,18 @@ impl ImageWriteService {
         source: &str,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
         if self.local_image_exists(item_id, image_type).await? {
+            if image_type.eq_ignore_ascii_case("THUMB")
+                && self
+                    .database
+                    .find_item_image_source(item_id, "THUMB")
+                    .await?
+                    .is_some_and(|value| value.eq_ignore_ascii_case("STRM_FFMPEG"))
+            {
+                return self
+                    .download_item_image_from_scraper(item_id, image_type, image_url, source)
+                    .await
+                    .map(Some);
+            }
             return Ok(None);
         }
         self.download_item_image_from_scraper(item_id, image_type, image_url, source)
@@ -222,6 +234,7 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
         source: &str,
+        reuse_existing_path: bool,
     ) -> Result<ImageWriteReport, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
@@ -293,6 +306,7 @@ impl ImageWriteService {
             format,
             movie_stem.as_deref(),
             episode_stem.as_deref(),
+            reuse_existing_path,
         )
         .await?;
         if !target.starts_with(&root) {
@@ -375,7 +389,7 @@ impl ImageWriteService {
                 "scraper image URL must be a valid HTTPS URL".to_owned(),
             ));
         }
-        self.download_item_image_with_source(item_id, image_type, image_url, source)
+        self.download_item_image_impl(item_id, image_type, image_url, source, true)
             .await
     }
 
@@ -386,7 +400,7 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
-        self.download_item_image_impl(item_id, image_type, image_url, source)
+        self.download_item_image_impl(item_id, image_type, image_url, source, false)
             .await
     }
 
@@ -754,6 +768,7 @@ async fn image_target(
     format: ImageFormat,
     movie_stem: Option<&str>,
     episode_stem: Option<&str>,
+    reuse_existing_path: bool,
 ) -> Result<PathBuf, ImageWriteError> {
     let (prefixed_stem, generic_stem) = image_file_stems(image_type, movie_stem, episode_stem)?;
     let mut stems = Vec::with_capacity(2);
@@ -761,6 +776,11 @@ async fn image_target(
         stems.push(prefixed_stem.clone());
     }
     stems.push(generic_stem.clone());
+    if reuse_existing_path {
+        if let Some(existing) = find_existing_image_path(directory, &stems, None).await? {
+            return Ok(existing);
+        }
+    }
     if let Some(existing) = find_existing_image_path(directory, &stems, Some(format)).await? {
         return Ok(existing);
     }

@@ -415,6 +415,7 @@ impl StrmProbeService {
             );
         }
         let thumbnail_needed = thumbnail_enabled
+            && source.thumbnail_fallback_required
             && usable_strm_thumbnail(&path, &source.root_path, source.thumbnail_path.as_deref())
                 .await
                 .is_none();
@@ -610,6 +611,10 @@ impl StrmProbeService {
                     .await?;
                 return Ok(1);
             }
+            self.database
+                .set_thumbnail_fallback_required(&outcome.item_id, false)
+                .await
+                .map_err(StrmProbeError::Storage)?;
         }
         Ok(0)
     }

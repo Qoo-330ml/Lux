@@ -3069,6 +3069,13 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 JPEG。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生库；缩略图只补全缺失或无效文件，不
 覆盖已有缩略图。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
 
+STRM 缩略图采用“刮削器优先、视频截图兜底”的顺序：数据库按媒体条目持久化
+`thumbnail_fallback_required` 标记，默认值为 false。元数据刮削成功获得 THUMB 图片时清除该标记；
+刮削任务已完成但没有获得 THUMB 图片时才将标记设为 true。STRM 缩略图阶段只处理该标记为 true
+且没有有效缩略图的 STRM 来源；未完成刮削的条目不得提前读取远程视频。FFmpeg 截图成功后清除
+标记并将图片来源登记为 `STRM_FFMPEG`。后续刮削器获得真实 THUMB 图片时允许替换
+`STRM_FFMPEG` 兜底图，并再次将图片来源登记为刮削器。
+
 插件启用后，宿主自动登记一个全局 `STRM_MEDIA_INFO` 计划任务；任务读取同一份插件配置，首次
 执行在后台完成，后续按 `schedule` cron 表达式重复执行。管理员可以在“任务与日志”中直接修改该任务的
 执行时间，修改会同步回插件配置。插件禁用时任务保留但停用；服务重启后从已登记任务恢复调度。未完成
@@ -3092,6 +3099,7 @@ JPEG。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生�
 - [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
 - [ ] `mediaInfoEnabled` 和 `thumbnailEnabled` 可以独立生效；缩略图缺失时先由 ffprobe 获取 duration，再由 ffmpeg 在 `thumbnailPositionPercent` 指定的位置生成同目录 `*-thumb.jpg`，默认位置为 30%，已有有效缩略图不会被覆盖。
+- [ ] STRM 缩略图遵循刮削器优先顺序：刮削器获得 THUMB 时不调用 ffmpeg，刮削完成且没有 THUMB 时持久化 `thumbnail_fallback_required`，ffmpeg 只消费该标记；截图成功后清除标记，后续刮削器获得图片时可替换 `STRM_FFMPEG` 兜底图。
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
 - [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
 - [ ] 插件包、manifest、RPC 结果、STRM 探测目标策略、ffprobe/ffmpeg 超时、输出上限和无真实目标的 fake ffprobe/fake ffmpeg 测试覆盖；插件异常不退出主进程。

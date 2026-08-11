@@ -159,6 +159,38 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
         Some(2)
     );
 
+    fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 9\n")?;
+    let unmarked_thumbnail_jobs = service
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: false,
+                write_sidecars: false,
+                media_info_enabled: false,
+                thumbnail_enabled: true,
+                thumbnail_position_percent: 50,
+            },
+        )
+        .await?;
+    service.run(&unmarked_thumbnail_jobs[0].id).await?;
+    assert_eq!(
+        service.get(&unmarked_thumbnail_jobs[0].id).await?.status,
+        "COMPLETED"
+    );
+    assert!(!movie_dir.join("Plugin.Movie.2024-thumb.jpg").exists());
+
+    sqlx::query(
+        "UPDATE media_items
+         SET thumbnail_fallback_required = 1
+         WHERE id = (SELECT item_id FROM media_sources)",
+    )
+    .execute(database.pool())
+    .await?;
+    fs::write(
+        &fake_ffmpeg,
+        "#!/bin/sh\nprintf '\\377\\330\\377fake-thumb\\377\\331'\n",
+    )?;
     let thumbnail_jobs = service
         .create_jobs(
             &[library.id],

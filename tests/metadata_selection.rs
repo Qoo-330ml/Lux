@@ -44,6 +44,19 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(true).await?;
     let (image_url, image_server) = start_image_stub().await?;
+    let fallback_path = fixture.movie_dir.join("Example.Movie.2020-thumb.jpg");
+    tokio::fs::write(&fallback_path, b"ffmpeg-fallback").await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'THUMB', 0, ?, ?, 'fallback', 'STRM_FFMPEG')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&fixture.item_id)
+    .bind(fallback_path.to_string_lossy().as_ref())
+    .bind(14_i64)
+    .execute(fixture.database.pool())
+    .await?;
     let candidate_id = insert_candidate(
         &fixture.database,
         &fixture.item_id,
@@ -52,8 +65,11 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
             "overview": "Online Overview",
             "productionYear": 2025,
             "rating": 8.6,
-            "posterUrl": format!("{image_url}/poster"),
-            "fanartUrl": format!("{image_url}/fanart")
+            "images": {
+                "POSTER": [format!("{image_url}/poster")],
+                "FANART": [format!("{image_url}/fanart")],
+                "THUMB": [format!("{image_url}/thumb")]
+            }
         }),
     )
     .await?;
@@ -75,13 +91,14 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     let body: Value = response.json().await?;
     assert_eq!(body["status"], "ONLINE_CONFIRMED");
     assert_eq!(body["mode"], "fillMissing");
-    assert_eq!(body["imageTypes"], json!(["POSTER", "FANART"]));
+    assert_eq!(body["imageTypes"], json!(["POSTER", "FANART", "THUMB"]));
 
     let nfo = tokio::fs::read_to_string(&fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<title>本地标题</title>"));
     assert!(nfo.contains("<plot>Online Overview</plot>"));
     assert!(fixture.movie_dir.join("poster.png").exists());
     assert!(fixture.movie_dir.join("fanart.webp").exists());
+    assert_eq!(tokio::fs::read(&fallback_path).await?, PNG_1X1);
     let status: String =
         sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
             .bind(&item_id)
@@ -120,7 +137,13 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     .bind(&item_id)
     .fetch_one(fixture.database.pool())
     .await?;
-    assert_eq!(image_count, 2);
+    assert_eq!(image_count, 3);
+    let fallback_required: i64 =
+        sqlx::query_scalar("SELECT thumbnail_fallback_required FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(fallback_required, 0);
 
     lux_server.abort();
     image_server.abort();
@@ -167,6 +190,12 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
         tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
         PNG_1X1
     );
+    let fallback_required: i64 =
+        sqlx::query_scalar("SELECT thumbnail_fallback_required FROM media_items WHERE id = ?")
+            .bind(&fixture.item_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(fallback_required, 1);
 
     image_server.abort();
     Ok(())

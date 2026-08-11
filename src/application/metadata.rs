@@ -778,6 +778,9 @@ impl MetadataEnricher {
             } else {
                 find_local_images(image_paths)
             };
+        let has_thumbnail = images
+            .iter()
+            .any(|image| image.image_type == ImageType::Thumb);
         let mut inserted_count = 0;
         for image in images {
             let file_size = match fs::metadata(&image.path).await {
@@ -820,6 +823,11 @@ impl MetadataEnricher {
                     );
                 }
             }
+        }
+        if has_thumbnail {
+            self.database
+                .set_thumbnail_fallback_required(item_id, false)
+                .await?;
         }
         Ok(inserted_count)
     }
@@ -1021,6 +1029,9 @@ impl MetadataEnricher {
         item_id: &str,
         images: Vec<LocalImage>,
     ) -> Result<usize, MetadataError> {
+        let has_thumbnail = images
+            .iter()
+            .any(|image| image.image_type == ImageType::Thumb);
         let mut inserted_count = 0;
         for image in images {
             let file_size = fs::metadata(&image.path)
@@ -1042,6 +1053,11 @@ impl MetadataEnricher {
             {
                 inserted_count += 1;
             }
+        }
+        if has_thumbnail {
+            self.database
+                .set_thumbnail_fallback_required(item_id, false)
+                .await?;
         }
         Ok(inserted_count)
     }
