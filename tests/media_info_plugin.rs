@@ -9,7 +9,7 @@ use tokio::{
 
 #[cfg(unix)]
 #[tokio::test]
-async fn media_info_plugin_probes_a_remote_source_and_rejects_local_urls()
+async fn media_info_plugin_probes_a_remote_source_and_accepts_opaque_targets()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -55,12 +55,29 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     assert_eq!(result["streams"][0]["streamType"], "VIDEO");
     assert_eq!(result["streams"][1]["language"], "eng");
 
+    for url in [
+        "http://192.168.1.10/video.mkv",
+        "http://127.0.0.1/video.mkv",
+        "http://localhost/video.mkv",
+        "/media/library/Video.mkv",
+    ] {
+        let target_result = call(
+            &mut stdin,
+            &mut stdout,
+            "private",
+            "media.probe",
+            json!({"url":url}),
+        )
+        .await?;
+        assert_eq!(target_result["container"], "matroska");
+    }
+
     let error = call_error(
         &mut stdin,
         &mut stdout,
-        "local",
+        "empty",
         "media.probe",
-        json!({"url":"file:///etc/passwd"}),
+        json!({"url":"   "}),
     )
     .await?;
     assert_eq!(error["code"], "MEDIA_PROBE_INVALID_URL");

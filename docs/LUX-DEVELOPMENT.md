@@ -112,7 +112,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - .strm 文件的第一个非空文本内容被视为外部播放地址。
-- .strm 地址在播放路径中直接交给客户端，不校验、不探测、不做代理、不访问 AList API；独立的管理员 STRM 探测任务可以在 URL 安全策略通过后将地址交给 `org.lux.strm-media-info` 插件。
+- .strm 地址在播放路径中直接交给客户端，不校验、不探测、不做代理、不访问 AList API；独立的管理员 STRM 探测任务可以在目标输入校验通过后将地址交给 `org.lux.strm-media-info` 插件。
 - Lux 不负责保护 .strm URL 中可能包含的令牌；管理员应理解该 URL 会暴露给有播放权限的客户端。
 
 ### 3.3 播放
@@ -302,7 +302,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - Lux 提供安全的插件注册表；插件以标准 `.zip` 插件包放入 `/config/plugins`，服务重启时扫描并加载。插件代码运行在受监督的独立进程中，不直接注入 Lux Rust 主进程。
 - 首个独立插件为 `org.lux.tmdb`。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
-- SDK v1 同时支持 `media_probe` 插件类型。`org.lux.strm-media-info` 只接收 Lux 宿主按单个任务提交的已校验 URL，调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
+- SDK v1 同时支持 `media_probe` 插件类型。`org.lux.strm-media-info` 只接收 Lux 宿主按单个任务提交的已校验 STRM 探测目标，按原始字符串调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
 - 只有已安装、已启用且有可用凭据的插件才能被媒体库选择。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用服务端内置的默认 API Key；任何凭据都不返回 API 或写入日志。
 - 媒体库的 `scraperId` 为空表示不进行在线刮削、只使用本地元数据；插件安装状态与媒体库选择均持久化，服务重启后保持不变。
 - 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
@@ -3038,8 +3038,9 @@ services:
 
 范围：将 MediaInfoKeeper 的 `.strm` 远程媒体信息提取能力改写为 Lux Plugin SDK v1 的独立
 `media_probe` 插件和 Lux 宿主后台任务。插件 ID 固定为 `org.lux.strm-media-info`，能力为
-`media.probe`；插件只负责接收单个已校验 URL、调用 `ffprobe` 并返回受限的 format/stream
-结果。媒体库选择、任务、并发、URL 安全、数据库写入和兼容旁车写回均由 Lux 宿主负责。
+`media.probe`；插件只负责接收单个已校验的 STRM 探测目标、调用 `ffprobe` 并返回受限的
+format/stream 结果。探测目标按原始字符串传递，不解析其 URL、IP 或网段类型。媒体库选择、
+任务、并发、目标输入校验、数据库写入和兼容旁车写回均由 Lux 宿主负责。
 
 旧版本的 `org.lux.media-info` 作为迁移别名处理：已有插件配置会迁移到新的插件配置路径，
 新的 API、manifest 和插件进程只使用 `org.lux.strm-media-info`。
@@ -3066,9 +3067,10 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 插件错误、超时、异常退出和超限输出不能导致 Lux 主进程退出。RPC、任务事件、错误消息和旁车
 不得包含完整 URL、认证信息或原始 `ffprobe` JSON。
 
-当前 URL 策略只允许 HTTP/HTTPS，拒绝凭据、fragment、localhost、云实例元数据主机和字面量
-回环/私网/链路本地/未指定/多播/共享地址。DNS 解析后的私网 rebinding、ffprobe 重定向逐跳
-校验和管理员局域网 allowlist 属于后续生产化增强；未完成前不得声称支持任意 NAS/AList 内网地址。
+当前 STRM 探测目标策略只校验非空和长度，不解析 STRM 内容，也不根据 HTTP/HTTPS、localhost、
+云实例元数据主机、回环、私网、链路本地、未指定、多播、共享地址、域名或路径做拒绝，不要求
+管理员指定 IP 或网段。STRM 探测目标只作为插件探测输入，不进入日志、任务事件、旁车或 API
+响应；普通扫描、播放和 PlaybackInfo 仍不主动读取 STRM 指向的内容。
 
 验收：
 
@@ -3079,7 +3081,7 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
 - [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
-- [ ] 插件包、manifest、RPC 结果、URL 策略、超时、输出上限和无真实 URL 的 fake ffprobe 测试覆盖；插件异常不退出主进程。
+- [ ] 插件包、manifest、RPC 结果、STRM 探测目标策略、超时、输出上限和无真实目标的 fake ffprobe 测试覆盖；插件异常不退出主进程。
 - [ ] 从空数据库执行迁移成功，ARM64 本机验证记录 `uname -m`，并通过 Rust 格式化、测试和 Clippy 检查。
 
 验证：
