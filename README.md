@@ -1,5 +1,10 @@
 # Lux
 
+[![GitHub Stars](https://img.shields.io/github/stars/Qoo-330ml/Lux?style=flat-square)](https://github.com/Qoo-330ml/Lux/stargazers)
+[![Docker Pulls](https://img.shields.io/docker/pulls/pdzhou/lux?style=flat-square)](https://hub.docker.com/r/pdzhou/lux)
+[![Docker Image Version](https://img.shields.io/docker/v/pdzhou/lux?sort=semver&style=flat-square)](https://hub.docker.com/r/pdzhou/lux/tags)
+[![Docker Build](https://img.shields.io/github/actions/workflow/status/Qoo-330ml/Lux/dockerhub.yml?branch=main&style=flat-square&label=docker%20build)](https://github.com/Qoo-330ml/Lux/actions/workflows/dockerhub.yml)
+
 ![Lux logo](logo.svg)
 
 Lux 是面向 NAS 的个人媒体服务端：用 Rust 提供高效、可诊断的媒体索引与播放服务，用 React + TypeScript 提供同源 Web 客户端（暂不支持web播放），并通过 Emby 兼容 API 连接 VidHub、SenPlayer 等第三方客户端。
