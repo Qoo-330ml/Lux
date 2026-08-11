@@ -62,6 +62,8 @@ describe("AdminPluginsPage plugin cards", () => {
     currentPlugin = configuredPlugin;
     vi.spyOn(api, "adminPlugins").mockImplementation(async () => ({ plugins: [currentPlugin], total: 1 }));
     vi.spyOn(api, "adminInstalledPlugins").mockImplementation(async () => ({ plugins: currentPlugin.installed ? [currentPlugin] : [], total: currentPlugin.installed ? 1 : 0 }));
+    vi.spyOn(api, "adminPluginStore").mockResolvedValue({ url: "https://github.com/Qoo-330ml/Lux-plugins", defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins" });
+    vi.spyOn(api, "updateAdminPluginStore").mockResolvedValue({ url: "https://github.com/Qoo-330ml/Lux-plugins", defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins" });
     vi.spyOn(api, "updateAdminPluginConfig").mockResolvedValue({ plugin: configuredPlugin });
     vi.spyOn(api, "updateAdminPluginEnabled").mockImplementation(async (_pluginId, enabled) => ({ plugin: { ...currentPlugin, enabled, available: enabled } }));
     vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
@@ -106,6 +108,15 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(card?.textContent).not.toContain("metadata.search");
     expect(card?.textContent).not.toContain("BUILT_IN_COMPATIBILITY");
     expect(card?.querySelector('[aria-label="配置 TMDb 元数据插件"]')).toBeTruthy();
+  });
+
+  it("renders the configurable plugin store source", async () => {
+    await renderPage();
+
+    const input = container.querySelector<HTMLInputElement>("#lux-plugin-store-url");
+    expect(input?.value).toBe("https://github.com/Qoo-330ml/Lux-plugins");
+    expect(container.querySelector(".lux-admin-plugin-store")?.textContent).toContain("插件商店来源");
+    expect(container.querySelector<HTMLButtonElement>('.lux-admin-plugin-store button[type="submit"]')?.disabled).toBe(false);
   });
 
   it("lays out plugin cards two per row on desktop", async () => {

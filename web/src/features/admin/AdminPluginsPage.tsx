@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Download, PackageOpen, Save, Settings2, X } from "lucide-react";
+import { CheckCircle2, Download, Globe2, PackageOpen, Save, Settings2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -11,6 +11,16 @@ export function AdminPluginsPage() {
   const [mode, setMode] = useState<"store" | "installed">("store");
   const plugins = useQuery({ queryKey: queryKeys.adminPlugins, queryFn: () => api.adminPlugins() });
   const installedPlugins = useQuery({ queryKey: queryKeys.adminInstalledPlugins, queryFn: () => api.adminInstalledPlugins() });
+  const store = useQuery({ queryKey: queryKeys.adminPluginStore, queryFn: () => api.adminPluginStore() });
+  const [storeUrl, setStoreUrl] = useState("");
+  const updateStore = useMutation({
+    mutationFn: () => api.updateAdminPluginStore(storeUrl.trim()),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminPluginStore });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
+    },
+  });
   const install = useMutation({
     mutationFn: (pluginId: string) => api.installAdminPlugin(pluginId),
     onSuccess: () => {
@@ -28,8 +38,12 @@ export function AdminPluginsPage() {
     },
   });
 
-  if (plugins.isPending || installedPlugins.isPending) return <AdminPluginsState label="正在读取插件库…" />;
-  if (plugins.error || installedPlugins.error) return <AdminPluginsState label={plugins.error?.message || installedPlugins.error?.message || "插件库加载失败"} error />;
+  useEffect(() => {
+    if (store.data?.url) setStoreUrl(store.data.url);
+  }, [store.data?.url]);
+
+  if (plugins.isPending || installedPlugins.isPending || store.isPending) return <AdminPluginsState label="正在读取插件库…" />;
+  if (plugins.error || installedPlugins.error || store.error) return <AdminPluginsState label={plugins.error?.message || installedPlugins.error?.message || store.error?.message || "插件库加载失败"} error />;
 
   const items = (mode === "store" ? plugins.data.plugins : installedPlugins.data.plugins) ?? [];
   return (
@@ -37,6 +51,12 @@ export function AdminPluginsPage() {
       <header className="lux-admin-page-heading">
         <div><h1>插件库</h1><p>安装已内置并经过验证的元数据插件，再为媒体库选择刮削器。</p></div>
       </header>
+      <form className="lux-admin-plugin-store" onSubmit={(event) => { event.preventDefault(); updateStore.mutate(); }}>
+        <div className="lux-admin-plugin-store-heading"><Globe2 size={18} aria-hidden="true" /><div><h2>插件商店来源</h2><p>填写插件目录地址；GitHub 仓库地址会自动读取其 main/index.json。</p></div></div>
+        <label htmlFor="lux-plugin-store-url">目录地址<input id="lux-plugin-store-url" type="url" value={storeUrl} onChange={(event) => setStoreUrl(event.target.value)} placeholder={store.data?.defaultUrl} required /></label>
+        <button className="lux-button lux-button-primary" type="submit" disabled={updateStore.isPending || !storeUrl.trim()}>{updateStore.isPending ? "保存中…" : "保存来源"}</button>
+        {updateStore.error ? <span className="lux-error-copy" role="alert">{updateStore.error.message}</span> : null}
+      </form>
       <nav className="lux-admin-plugin-tabs" aria-label="插件库视图">
         <button className={mode === "store" ? "is-active" : ""} type="button" aria-pressed={mode === "store"} onClick={() => setMode("store")}>插件商店<span>{plugins.data.total ?? plugins.data.plugins?.length ?? 0}</span></button>
         <button className={mode === "installed" ? "is-active" : ""} type="button" aria-pressed={mode === "installed"} onClick={() => setMode("installed")}>已安装管理<span>{installedPlugins.data.total ?? installedPlugins.data.plugins?.length ?? 0}</span></button>

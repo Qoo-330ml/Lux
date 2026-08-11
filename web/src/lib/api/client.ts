@@ -16,6 +16,7 @@ import type {
   AdminMetadataCandidate,
   AdminMetadataReidentifyStart,
   AdminPlugin,
+  AdminPluginStore,
   ApiErrorBody,
   DatabaseSetupInput,
   HomeResponse,
@@ -363,6 +364,17 @@ export class LuxApiClient {
     return this.request<{ plugins?: AdminPlugin[]; total?: number; page?: number; pageSize?: number }>(
       "/api/v1/admin/plugins?page=1&pageSize=50",
     );
+  }
+
+  adminPluginStore() {
+    return this.request<AdminPluginStore>("/api/v1/admin/plugin-store");
+  }
+
+  updateAdminPluginStore(url: string) {
+    return this.request<AdminPluginStore>("/api/v1/admin/plugin-store", {
+      method: "PUT",
+      body: JSON.stringify({ url }),
+    });
   }
 
   adminInstalledPlugins() {

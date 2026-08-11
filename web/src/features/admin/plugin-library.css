@@ -8,6 +8,56 @@
   background: rgba(255, 255, 255, .045);
 }
 
+.lux-admin-plugin-store {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 0.75rem 1rem;
+  margin: 1rem 0 1.25rem;
+  padding: 1rem;
+  border: 1px solid var(--lux-border, #2c3340);
+  background: var(--lux-surface, #171b22);
+}
+
+.lux-admin-plugin-store-heading {
+  display: flex;
+  grid-column: 1 / -1;
+  gap: 0.6rem;
+  align-items: flex-start;
+}
+
+.lux-admin-plugin-store-heading h2,
+.lux-admin-plugin-store-heading p {
+  margin: 0;
+}
+
+.lux-admin-plugin-store-heading p {
+  margin-top: 0.25rem;
+  color: var(--lux-text-muted, #9aa4b2);
+  font-size: 0.85rem;
+}
+
+.lux-admin-plugin-store label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--lux-text-muted, #9aa4b2);
+  font-size: 0.85rem;
+}
+
+.lux-admin-plugin-store input {
+  min-width: 0;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--lux-border, #2c3340);
+  color: inherit;
+  background: var(--lux-background, #0e1117);
+}
+
+@media (max-width: 640px) {
+  .lux-admin-plugin-store {
+    grid-template-columns: 1fr;
+  }
+}
+
 .lux-admin-plugin-tabs button {
   display: inline-flex;
   align-items: center;

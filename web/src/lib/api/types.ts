@@ -223,6 +223,11 @@ export type AdminPlugin = {
   configSource: "BUILT_IN" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
 };
 
+export type AdminPluginStore = {
+  url: string;
+  defaultUrl: string;
+};
+
 export type AdminPluginConfigField = {
   key: string;
   label: string;
