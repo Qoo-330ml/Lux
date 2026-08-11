@@ -79,7 +79,7 @@ org.lux.tmdb-1.0.0.zip
 
 `formatVersion` 是包格式；`apiVersion` 是 RPC 契约；`version` 是插件自身版本。三者不能混用。
 
-`type` 当前允许 `metadata`、`media_probe` 和 `ip_location`。媒体探测插件必须同时声明
+`type` 当前允许 `metadata`、`media_probe`、`ip_location` 和 `strm_resolver`。媒体探测插件必须同时声明
 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。例如内置的
 `org.lux.strm-media-info` 使用以下 manifest 核心字段：
 
@@ -226,6 +226,22 @@ IP 归属地插件必须声明 `type: "ip_location"`、`category: "NETWORK"` 和
 `ip_location` 插件，Lux 会停用 ip138，并只使用其他已安装的归属地插件；Hiofd 显示名称为“IP归属地查询增强”。
 成功结果只放在进程内 24 小时缓存，失败结果只放 5 分钟；不写入 SQLite、不提供公开查询接口。
 插件负责第三方 HTTP/HTML/JSON 解析，不得返回凭据、完整第三方响应、签名字段或完整上游 URL。
+
+### `.strm` 目标解析调用约定
+
+`.strm` 解析插件必须声明 `type: "strm_resolver"`、`category: "MEDIA"` 和
+`capabilities: ["strm.resolve"]`。Lux 只把路径型或其他非 HTTP(S) 原始目标发送给该能力，
+请求格式为：
+
+```json
+{"target":"/library/movie.mp4"}
+```
+
+插件成功时返回 `{"status":"RESOLVED","url":"https://media.example.invalid/movie.mkv"}`；
+不支持该目标时返回 `{"status":"UNSUPPORTED"}`。Lux 按插件 ID 稳定顺序尝试已安装、启用且
+配置有效的解析器，插件可以自行判断目标是否适用。宿主会再次校验返回地址必须是无凭据、无
+fragment、无控制字符且长度受限的 HTTP(S) URL；不合格结果不会下发给客户端。播放请求只在
+解析成功后临时重定向到结果地址，Lux 不代理媒体字节，插件也不能访问 Lux 数据库或媒体根目录。
 
 ### 媒体探测调用约定
 

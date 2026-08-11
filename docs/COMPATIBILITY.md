@@ -36,6 +36,7 @@
 - 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - 播放会话失活保护：若第三方客户端异常退出、网络中断或未发送 `Stopped`，`PLAYING`/`PAUSED` 会话在连续 90 秒没有事件后从 Emby `GET /Sessions`、管理员控制台和 Web 播放状态中隐藏；显式 `Stopped` 仍立即清理活动会话。
 - LUX-091 下载回归已覆盖 Lux/Emby 的 GET/HEAD 单资源响应、Range/文件名响应，以及 `.strm` 远程资源流式转发；尚未完成第三方客户端的真实下载 UI 实测，因此不据此宣称 Infuse、VidHub 或 SenPlayer 下载兼容。
+- LUX-160 通用 `.strm` 解析回归已覆盖路径目标的 `PlaybackInfo` Lux 入口、受监督解析器 RPC 和 307 转发；尚未完成目标客户端现场配置与播放实测，不据此宣称客户端兼容。
 - LUX-151 IP 归属地只扩展 Lux 管理员 Web 仪表盘的 `nowPlaying` 数据，不改变 VidHub、SenPlayer 或 Infuse 的 Emby 兼容接口；Hiofd 出站可用性和归属地准确性尚未做目标 NAS 现场验证。
 
 ## LUX-025 本机探针进度（2026-08-02）
