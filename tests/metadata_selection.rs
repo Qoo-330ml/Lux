@@ -64,8 +64,28 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
         json!({
             "title": "Online Title",
             "overview": "Online Overview",
+            "tagline": "速度与信念",
+            "website": "https://example.invalid/movie",
             "productionYear": 2025,
+            "status": "Released",
+            "originalLanguage": "zh",
+            "setName": "飞驰人生",
+            "setId": "1281825",
+            "posterUrl": "https://image.tmdb.org/t/p/original/poster.jpg",
+            "backdropUrl": "https://image.tmdb.org/t/p/original/backdrop.jpg",
             "rating": 8.6,
+            "votes": 123,
+            "runtime": 126,
+            "certification": "PG-13",
+            "premiereDate": "2025-02-17",
+            "countries": ["China"],
+            "genres": ["剧情", "喜剧"],
+            "studios": ["Stub Films"],
+            "providerIds": {"Tmdb": "7", "Imdb": "tt0000007"},
+            "directors": [{"providerId": "11", "name": "导演甲"}],
+            "writers": [{"providerId": "12", "name": "编剧甲"}],
+            "actors": [{"id": "9", "name": "演员甲", "character": "角色甲", "order": 0}],
+            "trailers": ["https://www.youtube.com/watch?v=abc123"],
             "images": {
                 "POSTER": [format!("{image_url}/poster")],
                 "FANART": [format!("{image_url}/fanart")],
@@ -97,6 +117,22 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     let nfo = tokio::fs::read_to_string(&fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<title>本地标题</title>"));
     assert!(nfo.contains("<plot>Online Overview</plot>"));
+    assert!(nfo.contains("<tagline>速度与信念</tagline>"));
+    assert!(nfo.contains("<website>https://example.invalid/movie</website>"));
+    assert!(nfo.contains("<status>Released</status>"));
+    assert!(nfo.contains("<language>zh</language>"));
+    assert!(nfo.contains("<set>飞驰人生</set>"));
+    assert!(nfo.contains("<setid>1281825</setid>"));
+    assert!(nfo.contains("<rating>8.6</rating>"));
+    assert!(nfo.contains("<runtime>126</runtime>"));
+    assert!(nfo.contains("<mpaa>PG-13</mpaa>"));
+    assert!(nfo.contains("<genre>剧情</genre>"));
+    assert!(nfo.contains("<country>China</country>"));
+    assert!(nfo.contains("<studio>Stub Films</studio>"));
+    assert!(nfo.contains("<director tmdbid=\"11\">导演甲</director>"));
+    assert!(nfo.contains("<actor>"));
+    assert!(nfo.contains("<name>演员甲</name>"));
+    assert!(nfo.contains("<trailer>https://www.youtube.com/watch?v=abc123</trailer>"));
     let metadata_item_dir = tokio::fs::canonicalize(library_item_directory(
         &fixture.config.config_dir,
         &item_id,

@@ -460,6 +460,16 @@ impl TmdbClient {
         self.external_ids("movie", movie_id).await
     }
 
+    pub async fn movie_release_dates(
+        &self,
+        movie_id: i64,
+    ) -> Result<TmdbReleaseDatesResponse, TmdbError> {
+        validate_id(movie_id, "movie")?;
+        let endpoint = format!("3/movie/{movie_id}/release_dates");
+        self.request_json(&endpoint, &[] as &[(String, String)])
+            .await
+    }
+
     pub async fn tv_external_ids(&self, series_id: i64) -> Result<TmdbExternalIds, TmdbError> {
         self.external_ids("tv", series_id).await
     }
@@ -867,16 +877,49 @@ pub struct TmdbMovieDetails {
     pub title: Option<String>,
     pub original_title: Option<String>,
     pub overview: Option<String>,
+    pub tagline: Option<String>,
+    pub homepage: Option<String>,
     pub release_date: Option<String>,
+    pub status: Option<String>,
     pub original_language: Option<String>,
     pub vote_average: Option<f64>,
+    pub vote_count: Option<i64>,
+    pub popularity: Option<f64>,
+    pub adult: Option<bool>,
+    pub budget: Option<i64>,
+    pub revenue: Option<i64>,
+    pub runtime: Option<i32>,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    #[serde(default)]
+    pub genres: Vec<TmdbNamedValue>,
+    #[serde(default)]
+    pub production_countries: Vec<TmdbProductionCountry>,
+    #[serde(default)]
+    pub production_companies: Vec<TmdbNamedValue>,
+    #[serde(skip)]
+    pub certification: Option<String>,
     pub belongs_to_collection: Option<TmdbCollectionReference>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbNamedValue {
+    pub id: i64,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbProductionCountry {
+    pub iso_3166_1: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct TmdbCreditsResponse {
     #[serde(default)]
     pub cast: Vec<TmdbCastMember>,
+    #[serde(default)]
+    pub crew: Vec<TmdbCrewMember>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -886,6 +929,15 @@ pub struct TmdbCastMember {
     pub character: Option<String>,
     pub profile_path: Option<String>,
     pub order: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TmdbCrewMember {
+    pub id: i64,
+    pub name: Option<String>,
+    pub job: Option<String>,
+    pub department: Option<String>,
+    pub profile_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1028,6 +1080,56 @@ pub struct TmdbExternalIds {
     pub facebook_id: Option<String>,
     pub instagram_id: Option<String>,
     pub twitter_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbReleaseDatesResponse {
+    #[serde(default)]
+    pub results: Vec<TmdbReleaseDateCountry>,
+}
+
+impl TmdbReleaseDatesResponse {
+    pub fn certification(&self, preferred_region: &str) -> Option<&str> {
+        let preferred_region = preferred_region.trim();
+        let preferred = self
+            .results
+            .iter()
+            .find(|country| {
+                country
+                    .iso_3166_1
+                    .as_deref()
+                    .is_some_and(|region| region.eq_ignore_ascii_case(preferred_region))
+            })
+            .and_then(|country| {
+                country
+                    .release_dates
+                    .iter()
+                    .find_map(|release| non_empty(release.certification.as_deref()))
+            });
+        preferred.or_else(|| {
+            self.results.iter().find_map(|country| {
+                country
+                    .release_dates
+                    .iter()
+                    .find_map(|release| non_empty(release.certification.as_deref()))
+            })
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbReleaseDateCountry {
+    pub iso_3166_1: Option<String>,
+    #[serde(default)]
+    pub release_dates: Vec<TmdbReleaseDate>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct TmdbReleaseDate {
+    pub certification: Option<String>,
+    pub release_date: Option<String>,
+    #[serde(rename = "type")]
+    pub release_type: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

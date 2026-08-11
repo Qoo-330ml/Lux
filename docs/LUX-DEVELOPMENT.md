@@ -1793,6 +1793,7 @@ services:
 | LUX-165 | src/application/images.rs、src/application/library_covers.rs、src/api/mod.rs、tests/、docs/ |
 | LUX-166 | src/application/metadata_paths.rs、tests/metadata_paths.rs、docs/ |
 | LUX-167 | src/application/metadata_objects.rs、src/application/collections.rs、src/api/mod.rs、tests/、docs/ |
+| LUX-168 | src/application/metadata.rs、src/application/nfo.rs、src/application/scraper.rs、src/application/tmdb.rs、src/application/tmdb_plugin.rs、src/application/candidates.rs、src/bin/lux-plugin-tmdb.rs、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3589,6 +3590,37 @@ Web 插件商店中填写其他 HTTPS 目录地址。目录项必须包含稳定
 
 - 不改变合集数据库关系、成员 ACL 或客户端 API 合同。
 - 不实现 genres、studios、tags 的抓取、索引、筛选或详情 API。
+
+#### LUX-168：TMDb 电影丰富 NFO 写回
+
+范围：在现有电影候选匹配链路中补充 TMDb 电影详情、演员与 crew、外部 ID、认证和预告片，
+并将这些在线结果按稳定的 Lux 电影 NFO 子集写回媒体目录。首版只覆盖电影；剧集、季度和单集
+继续使用现有字段。已有未知 XML 字段必须保留；Douban ID、入库时间和媒体技术信息不由 TMDb
+伪造，分别留给其他数据源或本地服务。
+
+首版写回字段：`rating`、`premiered`、`releasedate`、`mpaa`、重复的 `country`、`genre`、
+`studio`、`tmdbid`/`imdbid`/`uniqueid`、`director`、`writer`、最多 30 个 `actor` 和 `trailer`。
+Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续沿用；新增的重复字段与 crew
+信息先作为候选和 NFO 数据处理，不增加 genres/studios 的数据库关系或筛选 API。
+
+可选补充字段：`tagline`、`website`、`status`、`language`、`set`/`setid`、TMDb 海报和背景图
+引用。TMDb 没有值时不写入空字段；预算、热度、Douban、入库时间和媒体流信息不映射到首版 NFO。
+
+验收：
+
+- [x] TMDb 电影详情候选包含类型、国家、制片公司和可用认证；认证缺失时不写入伪造值。
+- [x] TMDb credits 的 cast 与 crew 能分别映射为演员、导演和编剧；坏 ID 或空姓名被丢弃。
+- [x] 电影候选选择后，NFO 原子写回上述可用字段，并保留未知 XML。
+- [x] 已有本地字段和锁定字段仍遵守 LUX-050/LUX-054 的优先级与保护规则。
+- [x] 现有 TMDb stub、候选选择、NFO 写回和插件 RPC 测试覆盖新字段；不调用真实 TMDb。
+
+明确不做：
+
+- 不扩展剧集/季度/单集 NFO 字段。
+- 不增加 Douban、dateadded、fileinfo 或 streamdetails 的假数据。
+- 不增加 genres、studios、导演或编剧的数据库关系、筛选 API 或深度浏览 API。
+
+依赖：LUX-050、LUX-051、LUX-054、LUX-055、LUX-056、LUX-142。
 
 ## 26. 风险与缓解
 

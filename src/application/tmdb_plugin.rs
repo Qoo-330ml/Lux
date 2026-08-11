@@ -6,9 +6,10 @@ use serde_json::{Value, json};
 use crate::application::{
     plugins::{PluginService, TMDB_DYNAMIC_PLUGIN_ID},
     scraper::{
-        ScraperCreditsResponse, ScraperError, ScraperGetRequest, ScraperImage, ScraperImageRequest,
-        ScraperImagesResponse, ScraperItemType, ScraperMetadata, ScraperPluginClient,
-        ScraperSearchRequest, ScraperSearchResponse, ScraperSearchResult,
+        ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse, ScraperGetRequest,
+        ScraperImage, ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
+        ScraperPluginClient, ScraperSearchRequest, ScraperSearchResponse, ScraperSearchResult,
+        ScraperTrailer, ScraperTrailersResponse,
     },
     tmdb::{
         TmdbClient, TmdbCollectionDetails, TmdbCreditsResponse, TmdbEpisodeDetails, TmdbError,
@@ -61,6 +62,20 @@ impl TmdbPluginClient {
         request: ScraperGetRequest,
     ) -> Result<ScraperCreditsResponse, ScraperError> {
         self.scraper.credits(request).await
+    }
+
+    pub async fn external_ids_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperExternalIdsResponse, ScraperError> {
+        self.scraper.external_ids(request).await
+    }
+
+    pub async fn trailers_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperTrailersResponse, ScraperError> {
+        self.scraper.trailers(request).await
     }
 
     async fn request<T: DeserializeOwned>(
@@ -505,16 +520,53 @@ fn normalize_metadata(value: Value, _item_type: &str) -> Result<Value, TmdbError
             })
         })
         .unwrap_or(Value::Null);
+    let genres = metadata
+        .get("Genres")
+        .or_else(|| metadata.get("genres"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| json!({"id": 0, "name": name}))
+        .collect::<Vec<_>>();
+    let countries = metadata
+        .get("Countries")
+        .or_else(|| metadata.get("countries"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| json!({"iso_3166_1": null, "name": name}))
+        .collect::<Vec<_>>();
+    let companies = metadata
+        .get("Studios")
+        .or_else(|| metadata.get("studios"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| json!({"id": 0, "name": name}))
+        .collect::<Vec<_>>();
     Ok(json!({
         "id": provider_id,
         "title": metadata.get("Name").cloned().unwrap_or(Value::Null),
         "original_title": metadata.get("OriginalTitle").cloned().unwrap_or(Value::Null),
         "overview": metadata.get("Overview").cloned().unwrap_or(Value::Null),
+        "tagline": metadata.get("Tagline").cloned().unwrap_or(Value::Null),
+        "homepage": metadata.get("Website").cloned().unwrap_or(Value::Null),
         "premiere_date": premiere_date,
         "last_air_date": metadata.get("EndDate").cloned().unwrap_or(Value::Null),
         "status": metadata.get("Status").cloned().unwrap_or(Value::Null),
         "original_language": metadata.get("OriginalLanguage").cloned().unwrap_or(Value::Null),
         "vote_average": metadata.get("Rating").cloned().unwrap_or(Value::Null),
+        "vote_count": metadata.get("Votes").cloned().unwrap_or(Value::Null),
+        "runtime": metadata.get("Runtime").cloned().unwrap_or(Value::Null),
+        "certification": metadata.get("OfficialRating").cloned().unwrap_or(Value::Null),
+        "genres": genres,
+        "production_countries": countries,
+        "production_companies": companies,
+        "poster_path": image_path(metadata.get("PosterUrl")),
+        "backdrop_path": image_path(metadata.get("BackdropUrl")),
         "belongs_to_collection": collection,
     }))
 }
@@ -598,7 +650,23 @@ fn normalize_credits(value: Value) -> Result<Value, TmdbError> {
             }))
         })
         .collect::<Result<Vec<_>, TmdbError>>()?;
-    Ok(json!({"cast": cast}))
+    let crew = value
+        .get("crew")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|credit| {
+            Ok(json!({
+                "id": provider_id(&credit)?,
+                "name": credit.get("Name").cloned().unwrap_or(Value::Null),
+                "job": credit.get("Job").cloned().unwrap_or(Value::Null),
+                "department": credit.get("Department").cloned().unwrap_or(Value::Null),
+                "profile_path": image_path(credit.get("ProfileUrl")),
+            }))
+        })
+        .collect::<Result<Vec<_>, TmdbError>>()?;
+    Ok(json!({"cast": cast, "crew": crew}))
 }
 
 fn parameter<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -921,6 +989,28 @@ impl ScraperProvider {
         }
     }
 
+    pub async fn external_ids_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperExternalIdsResponse, ScraperError> {
+        match self {
+            Self::Direct(client) => direct_external_ids_generic(client, request).await,
+            Self::Plugin(client) => client.external_ids_generic(request).await,
+            Self::Generic(client) => client.external_ids(request).await,
+        }
+    }
+
+    pub async fn trailers_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperTrailersResponse, ScraperError> {
+        match self {
+            Self::Direct(client) => direct_trailers_generic(client, request).await,
+            Self::Plugin(client) => client.trailers_generic(request).await,
+            Self::Generic(client) => client.trailers(request).await,
+        }
+    }
+
     pub async fn set_api_key(&self, api_key: Option<&str>) {
         if let Self::Direct(client) = self {
             client.set_api_key(api_key).await;
@@ -959,11 +1049,9 @@ async fn direct_get_generic(
         .parse::<i64>()
         .map_err(|_| ScraperError::Provider("TMDb provider ID is invalid".to_owned()))?;
     match request.item_type {
-        ScraperItemType::Movie => client
-            .movie_details(id, &request.language)
-            .await
-            .map(movie_metadata_generic)
-            .map_err(|error| ScraperError::Provider(error.to_string())),
+        ScraperItemType::Movie => {
+            direct_movie_metadata_generic(client, id, &request.language).await
+        }
         ScraperItemType::Series => client
             .series_details(id, &request.language)
             .await
@@ -1004,6 +1092,28 @@ async fn direct_get_generic(
             item_type.as_str()
         ))),
     }
+}
+
+async fn direct_movie_metadata_generic(
+    client: &TmdbClient,
+    id: i64,
+    language: &str,
+) -> Result<ScraperMetadata, ScraperError> {
+    let mut details = client
+        .movie_details(id, language)
+        .await
+        .map_err(|error| ScraperError::Provider(error.to_string()))?;
+    let preferred_region = if language.trim().starts_with("zh") {
+        "CN"
+    } else {
+        "US"
+    };
+    if let Ok(release_dates) = client.movie_release_dates(id).await {
+        details.certification = release_dates
+            .certification(preferred_region)
+            .map(str::to_owned);
+    }
+    Ok(movie_metadata_generic(details))
 }
 
 async fn direct_images_generic(
@@ -1084,6 +1194,91 @@ async fn direct_credits_generic(
                 profile_url: actor.profile_path.map(|path| tmdb_image_url(&path)),
             })
             .collect(),
+        crew: response
+            .crew
+            .into_iter()
+            .map(|credit| crate::application::scraper::ScraperCrewCredit {
+                provider_id: credit.id.to_string(),
+                name: credit.name,
+                job: credit.job,
+                department: credit.department,
+            })
+            .collect(),
+    })
+}
+
+async fn direct_external_ids_generic(
+    client: &TmdbClient,
+    request: ScraperGetRequest,
+) -> Result<ScraperExternalIdsResponse, ScraperError> {
+    let id = request
+        .provider_id
+        .parse::<i64>()
+        .map_err(|_| ScraperError::Provider("TMDb provider ID is invalid".to_owned()))?;
+    let ids = match request.item_type {
+        ScraperItemType::Movie => client.movie_external_ids(id).await,
+        ScraperItemType::Series => client.tv_external_ids(id).await,
+        ScraperItemType::Person => client.person_external_ids(id).await,
+        item_type => {
+            return Err(ScraperError::Provider(format!(
+                "TMDb direct scraper does not support external IDs for {}",
+                item_type.as_str()
+            )));
+        }
+    }
+    .map_err(|error| ScraperError::Provider(error.to_string()))?;
+    let mut provider_ids = BTreeMap::from([("Tmdb".to_owned(), id.to_string())]);
+    if let Some(imdb_id) = ids.imdb_id {
+        provider_ids.insert("Imdb".to_owned(), imdb_id);
+    }
+    if let Some(tvdb_id) = ids.tvdb_id {
+        provider_ids.insert("Tvdb".to_owned(), tvdb_id.to_string());
+    }
+    if let Some(wikidata_id) = ids.wikidata_id {
+        provider_ids.insert("Wikidata".to_owned(), wikidata_id);
+    }
+    Ok(ScraperExternalIdsResponse { provider_ids })
+}
+
+async fn direct_trailers_generic(
+    client: &TmdbClient,
+    request: ScraperGetRequest,
+) -> Result<ScraperTrailersResponse, ScraperError> {
+    let id = request
+        .provider_id
+        .parse::<i64>()
+        .map_err(|_| ScraperError::Provider("TMDb provider ID is invalid".to_owned()))?;
+    let videos = match request.item_type {
+        ScraperItemType::Movie => client.movie_videos(id, &request.language).await,
+        ScraperItemType::Series => client.tv_videos(id, &request.language).await,
+        item_type => {
+            return Err(ScraperError::Provider(format!(
+                "TMDb direct scraper does not support trailers for {}",
+                item_type.as_str()
+            )));
+        }
+    }
+    .map_err(|error| ScraperError::Provider(error.to_string()))?;
+    Ok(ScraperTrailersResponse {
+        trailers: videos
+            .results
+            .into_iter()
+            .filter_map(|video| {
+                let key = video.key?;
+                let url = match video.site.as_deref()? {
+                    "YouTube" => format!("https://www.youtube.com/watch?v={key}"),
+                    "Vimeo" => format!("https://vimeo.com/{key}"),
+                    _ => return None,
+                };
+                Some(ScraperTrailer {
+                    name: video.name,
+                    url: Some(url),
+                    video_type: video.video_type,
+                    official: video.official,
+                    published_at: video.published_at,
+                })
+            })
+            .collect(),
     })
 }
 
@@ -1134,15 +1329,48 @@ fn series_search_generic(response: TmdbTvSearchResponse) -> ScraperSearchRespons
 }
 
 fn movie_metadata_generic(details: TmdbMovieDetails) -> ScraperMetadata {
+    let set_name = details
+        .belongs_to_collection
+        .as_ref()
+        .and_then(|collection| collection.name.clone());
+    let set_id = details
+        .belongs_to_collection
+        .as_ref()
+        .map(|collection| collection.id.to_string());
     ScraperMetadata {
         item_type: Some("Movie".to_owned()),
         title: details.title,
         original_title: details.original_title,
         overview: details.overview,
+        tagline: details.tagline,
+        website: details.homepage,
         production_year: details.release_date.as_deref().and_then(parse_year),
         premiere_date: details.release_date,
+        status: details.status,
         original_language: details.original_language,
         rating: details.vote_average,
+        votes: details.vote_count,
+        runtime: details.runtime,
+        certification: details.certification,
+        set_name,
+        set_id,
+        poster_url: details.poster_path.map(|path| tmdb_image_url(&path)),
+        backdrop_url: details.backdrop_path.map(|path| tmdb_image_url(&path)),
+        genres: details
+            .genres
+            .into_iter()
+            .filter_map(|genre| genre.name)
+            .collect(),
+        countries: details
+            .production_countries
+            .into_iter()
+            .filter_map(|country| country.name)
+            .collect(),
+        studios: details
+            .production_companies
+            .into_iter()
+            .filter_map(|company| company.name)
+            .collect(),
         provider_ids: BTreeMap::from([("Tmdb".to_owned(), details.id.to_string())]),
         collection: details.belongs_to_collection.map(|collection| {
             crate::application::scraper::ScraperCollectionReference {

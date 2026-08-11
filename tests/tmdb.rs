@@ -128,14 +128,24 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
         && !request.uri().path().contains("/videos")
         && !request.uri().path().contains("/images")
         && !request.uri().path().contains("/credits")
+        && !request.uri().path().contains("/release_dates")
     {
         return axum::Json(json!({
             "id": 7,
             "title": "Stub title",
             "original_title": "Original title",
             "overview": "Stub overview",
+            "tagline": "Stub tagline",
+            "homepage": "https://example.invalid/stub",
             "release_date": "2020-01-01",
+            "status": "Released",
             "original_language": "en",
+            "runtime": 126,
+            "vote_average": 7.167,
+            "vote_count": 42,
+            "genres": [{"id": 18, "name": "Drama"}, {"id": 35, "name": "Comedy"}],
+            "production_countries": [{"iso_3166_1": "CN", "name": "China"}],
+            "production_companies": [{"id": 100, "name": "Stub Films"}],
             "belongs_to_collection": {
                 "id": 10,
                 "name": "Stub Collection"
@@ -151,6 +161,33 @@ async fn stub_response(State(state): State<StubState>, request: Request<Body>) -
                 "character": "主角",
                 "profile_path": "/profile.jpg",
                 "order": 0
+            }],
+            "crew": [{
+                "id": 11,
+                "name": "Stub Director",
+                "job": "Director",
+                "department": "Directing",
+                "profile_path": "/director.jpg"
+            }, {
+                "id": 12,
+                "name": "Stub Writer",
+                "job": "Writer",
+                "department": "Writing",
+                "profile_path": null
+            }]
+        }))
+        .into_response();
+    }
+    if request.uri().path().contains("/3/movie/7/release_dates") {
+        return axum::Json(json!({
+            "id": 7,
+            "results": [{
+                "iso_3166_1": "CN",
+                "release_dates": [{
+                    "certification": "PG-13",
+                    "release_date": "2020-01-01T00:00:00.000Z",
+                    "type": 3
+                }]
             }]
         }))
         .into_response();
@@ -584,8 +621,7 @@ async fn tmdb_client_falls_back_for_tv_per_missing_field() -> Result<(), Box<dyn
 
 #[tokio::test]
 async fn tmdb_client_reads_collection_details() -> Result<(), Box<dyn std::error::Error>> {
-    let (base_url, _, server) =
-        start_stub(vec![StatusCode::OK, StatusCode::OK], None, false, false).await;
+    let (base_url, _, server) = start_stub(vec![StatusCode::OK; 3], None, false, false).await;
     let client = TmdbClient::new(client_config(base_url, Duration::from_secs(1), 0))?;
 
     let movie = client.movie_details(7, "zh-CN").await?;
@@ -593,6 +629,22 @@ async fn tmdb_client_reads_collection_details() -> Result<(), Box<dyn std::error
         movie.belongs_to_collection.as_ref().map(|item| item.id),
         Some(10)
     );
+    assert_eq!(movie.runtime, Some(126));
+    assert_eq!(movie.vote_count, Some(42));
+    assert_eq!(movie.tagline.as_deref(), Some("Stub tagline"));
+    assert_eq!(
+        movie.homepage.as_deref(),
+        Some("https://example.invalid/stub")
+    );
+    assert_eq!(movie.status.as_deref(), Some("Released"));
+    assert_eq!(movie.genres[0].name.as_deref(), Some("Drama"));
+    assert_eq!(movie.production_countries[0].name.as_deref(), Some("China"));
+    assert_eq!(
+        movie.production_companies[0].name.as_deref(),
+        Some("Stub Films")
+    );
+    let release_dates = client.movie_release_dates(7).await?;
+    assert_eq!(release_dates.certification("CN"), Some("PG-13"));
     let collection = client.collection_details(10, "zh-CN").await?;
     assert_eq!(collection.id, 10);
     assert_eq!(collection.parts[0].id, 7);
@@ -627,6 +679,8 @@ async fn tmdb_client_reads_tv_people_images_external_ids_and_videos()
     let credits = client.movie_credits(7, "zh-CN").await?;
     assert_eq!(credits.cast[0].id, 9);
     assert_eq!(credits.cast[0].character.as_deref(), Some("主角"));
+    assert_eq!(credits.crew[0].id, 11);
+    assert_eq!(credits.crew[0].job.as_deref(), Some("Director"));
     let series_credits = client.tv_credits(8, "zh-CN").await?;
     assert_eq!(series_credits.cast[0].id, 10);
     assert_eq!(

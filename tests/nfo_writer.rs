@@ -2,7 +2,11 @@ use luxd::{
     application::{
         libraries::LibraryService,
         metadata::NfoMetadata,
-        nfo::{NfoWriteService, rewrite_nfo, write_nfo_atomically},
+        nfo::{
+            MovieNfoCredit, MovieNfoMetadata, NfoWriteService, rewrite_movie_nfo, rewrite_nfo,
+            write_nfo_atomically,
+        },
+        people::ActorCredit,
         scanner::LibraryScanner,
     },
     config::Config,
@@ -46,6 +50,123 @@ fn nfo_rewrite_creates_a_movie_document_when_target_is_missing() {
     let text = String::from_utf8(rewritten).expect("utf8 nfo");
     assert!(text.starts_with("<movie>"));
     assert!(text.contains("<title>新电影</title>"));
+}
+
+#[test]
+fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
+-> Result<(), Box<dyn std::error::Error>> {
+    let original = r#"<movie><title>旧标题</title><rating>1</rating><genre>旧类型</genre><actor><name>旧演员</name></actor><custom><keep>保留</keep></custom></movie>"#;
+    let rewritten = rewrite_movie_nfo(
+        original.as_bytes(),
+        &MovieNfoMetadata {
+            base: NfoMetadata {
+                title: Some("新标题".to_owned()),
+                overview: Some("简介".to_owned()),
+                production_year: Some(2026),
+                ..NfoMetadata::default()
+            },
+            rating: Some(7.167),
+            votes: Some(42),
+            tagline: Some("速度与信念".to_owned()),
+            premiered: Some("2026-02-17".to_owned()),
+            releasedate: Some("2026-02-17".to_owned()),
+            runtime: Some(126),
+            status: Some("Released".to_owned()),
+            original_language: Some("zh".to_owned()),
+            website: Some("https://example.com/movie".to_owned()),
+            set_name: Some("飞驰人生".to_owned()),
+            set_id: Some("1281825".to_owned()),
+            poster_url: Some("https://image.tmdb.org/t/p/original/poster.jpg".to_owned()),
+            fanart_url: Some("https://image.tmdb.org/t/p/original/backdrop.jpg".to_owned()),
+            certification: Some("PG-13".to_owned()),
+            countries: vec!["中国".to_owned()],
+            genres: vec!["剧情".to_owned(), "喜剧".to_owned()],
+            studios: vec!["中国电影股份有限公司".to_owned()],
+            provider_ids: [
+                ("Tmdb".to_owned(), "1462229".to_owned()),
+                ("Imdb".to_owned(), "tt38035835".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            directors: vec![MovieNfoCredit {
+                provider_id: "18899".to_owned(),
+                name: "韩寒".to_owned(),
+            }],
+            writers: vec![MovieNfoCredit {
+                provider_id: "18899".to_owned(),
+                name: "韩寒".to_owned(),
+            }],
+            actors: vec![ActorCredit {
+                id: "124".to_owned(),
+                name: "沈腾".to_owned(),
+                character: Some("张驰".to_owned()),
+                order: Some(0),
+                profile_url: None,
+            }],
+            trailers: vec!["https://www.youtube.com/watch?v=test".to_owned()],
+        },
+    )?;
+    let text = String::from_utf8(rewritten)?;
+    assert!(text.contains("<title>新标题</title>"));
+    assert!(text.contains("<plot>简介</plot>"));
+    assert!(text.contains("<rating>7.167</rating>"));
+    assert!(text.contains("<votes>42</votes>"));
+    assert!(text.contains("<tagline>速度与信念</tagline>"));
+    assert!(text.contains("<premiered>2026-02-17</premiered>"));
+    assert!(text.contains("<releasedate>2026-02-17</releasedate>"));
+    assert!(text.contains("<runtime>126</runtime>"));
+    assert!(text.contains("<status>Released</status>"));
+    assert!(text.contains("<language>zh</language>"));
+    assert!(text.contains("<website>https://example.com/movie</website>"));
+    assert!(text.contains("<set>飞驰人生</set>"));
+    assert!(text.contains("<setid>1281825</setid>"));
+    assert!(text.contains(
+        "<thumb aspect=\"poster\">https://image.tmdb.org/t/p/original/poster.jpg</thumb>"
+    ));
+    assert!(text.contains(
+        "<fanart><thumb>https://image.tmdb.org/t/p/original/backdrop.jpg</thumb></fanart>"
+    ));
+    assert!(text.contains("<mpaa>PG-13</mpaa>"));
+    assert!(text.contains("<country>中国</country>"));
+    assert!(text.contains("<genre>剧情</genre>"));
+    assert!(text.contains("<genre>喜剧</genre>"));
+    assert!(text.contains("<studio>中国电影股份有限公司</studio>"));
+    assert!(text.contains("<uniqueid type=\"tmdb\" default=\"true\">1462229</uniqueid>"));
+    assert!(text.contains("<uniqueid type=\"imdb\">tt38035835</uniqueid>"));
+    assert!(text.contains("<director tmdbid=\"18899\">韩寒</director>"));
+    assert!(text.contains("<writer tmdbid=\"18899\">韩寒</writer>"));
+    assert!(text.contains("<credits tmdbid=\"18899\">韩寒</credits>"));
+    assert!(text.contains("<name>沈腾</name>"));
+    assert!(text.contains("<role>张驰</role>"));
+    assert!(text.contains("<tmdbid>124</tmdbid>"));
+    assert!(text.contains("<trailer>https://www.youtube.com/watch?v=test</trailer>"));
+    assert!(text.contains("<custom><keep>保留</keep></custom>"));
+    assert!(!text.contains("<rating>1</rating>"));
+    assert!(!text.contains("<genre>旧类型</genre>"));
+    assert!(!text.contains("<name>旧演员</name>"));
+    Ok(())
+}
+
+#[test]
+fn movie_nfo_rewrite_keeps_existing_rich_fields_when_patch_is_partial()
+-> Result<(), Box<dyn std::error::Error>> {
+    let original = r#"<movie><title>旧标题</title><rating>8</rating><genre>旧类型</genre><actor><name>旧演员</name></actor></movie>"#;
+    let rewritten = rewrite_movie_nfo(
+        original.as_bytes(),
+        &MovieNfoMetadata {
+            base: NfoMetadata {
+                title: Some("新标题".to_owned()),
+                ..NfoMetadata::default()
+            },
+            ..MovieNfoMetadata::default()
+        },
+    )?;
+    let text = String::from_utf8(rewritten)?;
+    assert!(text.contains("<title>新标题</title>"));
+    assert!(text.contains("<rating>8</rating>"));
+    assert!(text.contains("<genre>旧类型</genre>"));
+    assert!(text.contains("<name>旧演员</name>"));
+    Ok(())
 }
 
 #[tokio::test]

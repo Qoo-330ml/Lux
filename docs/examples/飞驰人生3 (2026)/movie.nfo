@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<movie>
+  <title>飞驰人生3</title>
+  <originaltitle>飞驰人生3</originaltitle>
+  <plot>巴音布鲁克最后一站收官后，张驰（沈腾 饰）受邀作为车队主教练征战全新赛事“沐尘100拉力赛”，“野生车手”走上国际舞台！面对高手如云的全新赛道，孙宇强（尹正 饰）、记星（张本煜 饰）一如既往协同作战，林臻东（黄景瑜 饰）等实力车手应邀强势集结，一支凝聚了顶配速度与信念的车队就此成立。然而，张驰发现真正的挑战仿佛并非来自比赛本身，赛场之外暗流涌动，让他们飞驰之路充满变数……</plot>
+  <tagline>Let's lay out the road and race ahead.</tagline>
+  <year>2026</year>
+  <premiered>2026-02-17</premiered>
+  <releasedate>2026-02-17</releasedate>
+  <runtime>126</runtime>
+  <status>Released</status>
+  <rating>7.167</rating>
+  <votes>42</votes>
+  <mpaa>PG</mpaa>
+  <language>zh</language>
+  <country>China</country>
+  <genre>Drama</genre>
+  <genre>Comedy</genre>
+  <set>飞驰人生</set>
+  <setid>1281825</setid>
+
+  <actor>
+    <name>沈腾</name><role>张驰</role><type>Actor</type><tmdbid>1519026</tmdbid><order>0</order>
+  </actor>
+  <actor>
+    <name>尹正</name><role>孙宇强</role><type>Actor</type><tmdbid>1519030</tmdbid><order>1</order>
+  </actor>
+  <actor>
+    <name>黄景瑜</name><role>林臻东</role><type>Actor</type><tmdbid>1816461</tmdbid><order>2</order>
+  </actor>
+  <actor>
+    <name>张本煜</name><role>记星</role><type>Actor</type><tmdbid>1759993</tmdbid><order>3</order>
+  </actor>
+  <actor>
+    <name>魏翔</name><role>叶经理</role><type>Actor</type><tmdbid>2093326</tmdbid><order>4</order>
+  </actor>
+  <actor>
+    <name>沙溢</name><role>白强</role><type>Actor</type><tmdbid>235518</tmdbid><order>5</order>
+  </actor>
+  <actor>
+    <name>范丞丞</name><role>厉小海</role><type>Actor</type><tmdbid>1948101</tmdbid><order>6</order>
+  </actor>
+  <actor>
+    <name>孙艺洲</name><role>刘显德</role><type>Actor</type><tmdbid>1258617</tmdbid><order>7</order>
+  </actor>
+  <actor>
+    <name>段奕宏</name><role>安先生</role><type>Actor</type><tmdbid>126736</tmdbid><order>8</order>
+  </actor>
+  <actor>
+    <name>张新成</name><type>Actor</type><tmdbid>2027708</tmdbid><order>9</order>
+  </actor>
+  <actor>
+    <name>胡先煦</name><type>Actor</type><tmdbid>1989460</tmdbid><order>10</order>
+  </actor>
+  <actor>
+    <name>李鸿其</name><role>Aarif Rahman</role><type>Actor</type><tmdbid>148881</tmdbid><order>11</order>
+  </actor>
+  <actor>
+    <name>白宇帆</name><type>Actor</type><tmdbid>2973248</tmdbid><order>12</order>
+  </actor>
+  <actor>
+    <name>高至霆</name><role>Zack Gao</role><type>Actor</type><tmdbid>1748885</tmdbid><order>13</order>
+  </actor>
+  <actor>
+    <name>贾冰</name><role>辛导演</role><type>Actor</type><tmdbid>2295882</tmdbid><order>14</order>
+  </actor>
+  <actor>
+    <name>王安宇</name><type>Actor</type><tmdbid>2482605</tmdbid><order>15</order>
+  </actor>
+  <actor>
+    <name>陈永胜</name><type>Actor</type><tmdbid>3091063</tmdbid><order>16</order>
+  </actor>
+  <actor>
+    <name>冯绍峰</name><role>William Feng</role><type>Actor</type><tmdbid>936431</tmdbid><order>17</order>
+  </actor>
+  <actor>
+    <name>周政杰</name><type>Actor</type><tmdbid>4062369</tmdbid><order>18</order>
+  </actor>
+  <actor>
+    <name>Marvin Bouvet</name><role>FourWing Racing Team 导演</role><type>Actor</type><tmdbid>6085679</tmdbid><order>19</order>
+  </actor>
+  <actor>
+    <name>Daichi Harashima</name><type>Actor</type><tmdbid>945973</tmdbid><order>20</order>
+  </actor>
+  <actor>
+    <name>韩昊</name><role>Hao Han</role><type>Actor</type><tmdbid>4686906</tmdbid><order>21</order>
+  </actor>
+  <actor>
+    <name>刘巴特尔</name><type>Actor</type><tmdbid>2870320</tmdbid><order>22</order>
+  </actor>
+  <actor>
+    <name>何澳</name><type>Actor</type><tmdbid>3159919</tmdbid><order>23</order>
+  </actor>
+  <actor>
+    <name>周冠宇</name><type>Actor</type><tmdbid>3633206</tmdbid><order>24</order>
+  </actor>
+
+  <director tmdbid="1326036">韩寒</director>
+  <writer tmdbid="1326036">韩寒</writer>
+  <writer tmdbid="6010797">孟文宇</writer>
+  <writer tmdbid="2780089">周云海</writer>
+  <credits tmdbid="1326036">韩寒</credits>
+  <credits tmdbid="6010797">孟文宇</credits>
+  <credits tmdbid="2780089">周云海</credits>
+
+  <uniqueid type="tmdb" default="true">1462229</uniqueid>
+  <uniqueid type="imdb">tt38035835</uniqueid>
+  <uniqueid type="wikidata">Q138315492</uniqueid>
+  <tmdbid>1462229</tmdbid>
+  <imdbid>tt38035835</imdbid>
+
+  <thumb aspect="poster">https://image.tmdb.org/t/p/original/fzkfI2LWgPEHiFOFW2JveqlAY3h.jpg</thumb>
+  <fanart><thumb>https://image.tmdb.org/t/p/original/rLHFufd3gALwHay1Sxl3MjbGQ7E.jpg</thumb></fanart>
+  <trailer>https://www.youtube.com/watch?v=zNu476xN6Ao</trailer>
+  <trailer>https://www.youtube.com/watch?v=R2TrSn8yKJA</trailer>
+</movie>

@@ -266,6 +266,16 @@ pub struct ScraperMetadata {
     pub original_title: Option<String>,
     #[serde(rename = "Overview", alias = "overview", default)]
     pub overview: Option<String>,
+    #[serde(rename = "Tagline", alias = "tagline", default)]
+    pub tagline: Option<String>,
+    #[serde(
+        rename = "Website",
+        alias = "website",
+        alias = "Homepage",
+        alias = "homepage",
+        default
+    )]
+    pub website: Option<String>,
     #[serde(rename = "ProductionYear", alias = "productionYear", default)]
     pub production_year: Option<i32>,
     #[serde(
@@ -276,6 +286,16 @@ pub struct ScraperMetadata {
         default
     )]
     pub rating: Option<f64>,
+    #[serde(
+        rename = "Votes",
+        alias = "votes",
+        alias = "VoteCount",
+        alias = "voteCount",
+        default
+    )]
+    pub votes: Option<i64>,
+    #[serde(rename = "Runtime", alias = "runtime", default)]
+    pub runtime: Option<i32>,
     #[serde(rename = "PremiereDate", alias = "premiereDate", default)]
     pub premiere_date: Option<String>,
     #[serde(rename = "OriginalLanguage", alias = "originalLanguage", default)]
@@ -284,6 +304,28 @@ pub struct ScraperMetadata {
     pub end_date: Option<String>,
     #[serde(rename = "Status", alias = "status", default)]
     pub status: Option<String>,
+    #[serde(rename = "SetName", alias = "setName", default)]
+    pub set_name: Option<String>,
+    #[serde(rename = "SetId", alias = "setId", default)]
+    pub set_id: Option<String>,
+    #[serde(rename = "PosterUrl", alias = "posterUrl", default)]
+    pub poster_url: Option<String>,
+    #[serde(rename = "BackdropUrl", alias = "backdropUrl", default)]
+    pub backdrop_url: Option<String>,
+    #[serde(
+        rename = "OfficialRating",
+        alias = "officialRating",
+        alias = "Certification",
+        alias = "certification",
+        default
+    )]
+    pub certification: Option<String>,
+    #[serde(rename = "Genres", alias = "genres", default)]
+    pub genres: Vec<String>,
+    #[serde(rename = "Countries", alias = "countries", default)]
+    pub countries: Vec<String>,
+    #[serde(rename = "Studios", alias = "studios", default)]
+    pub studios: Vec<String>,
     #[serde(rename = "ProviderIds", alias = "providerIds", default)]
     pub provider_ids: BTreeMap<String, String>,
     #[serde(rename = "BelongsToCollection", alias = "belongsToCollection", default)]
@@ -353,6 +395,8 @@ pub struct ScraperImage {
 pub struct ScraperCreditsResponse {
     #[serde(default)]
     pub cast: Vec<ScraperActorCredit>,
+    #[serde(default)]
+    pub crew: Vec<ScraperCrewCredit>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -367,6 +411,44 @@ pub struct ScraperActorCredit {
     pub order: Option<i32>,
     #[serde(rename = "ProfileUrl", alias = "profileUrl", default)]
     pub profile_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct ScraperCrewCredit {
+    #[serde(rename = "Id", alias = "id", default)]
+    pub provider_id: String,
+    #[serde(rename = "Name", alias = "name", default)]
+    pub name: Option<String>,
+    #[serde(rename = "Job", alias = "job", default)]
+    pub job: Option<String>,
+    #[serde(rename = "Department", alias = "department", default)]
+    pub department: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct ScraperExternalIdsResponse {
+    #[serde(rename = "ProviderIds", alias = "providerIds", default)]
+    pub provider_ids: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct ScraperTrailersResponse {
+    #[serde(default)]
+    pub trailers: Vec<ScraperTrailer>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct ScraperTrailer {
+    #[serde(rename = "Name", alias = "name", default)]
+    pub name: Option<String>,
+    #[serde(rename = "Url", alias = "url", default)]
+    pub url: Option<String>,
+    #[serde(rename = "Type", alias = "type", default)]
+    pub video_type: Option<String>,
+    #[serde(rename = "Official", alias = "official", default)]
+    pub official: Option<bool>,
+    #[serde(rename = "PublishedAt", alias = "publishedAt", default)]
+    pub published_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -414,6 +496,24 @@ impl ScraperPluginClient {
     ) -> Result<ScraperCreditsResponse, ScraperError> {
         let value = self.call("metadata.credits", request).await?;
         decode_credits_response(value)
+    }
+
+    pub async fn external_ids(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperExternalIdsResponse, ScraperError> {
+        let value = self.call("metadata.externalIds", request).await?;
+        serde_json::from_value(value)
+            .map_err(|error| ScraperError::InvalidResponse(error.to_string()))
+    }
+
+    pub async fn trailers(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperTrailersResponse, ScraperError> {
+        let value = self.call("metadata.trailers", request).await?;
+        serde_json::from_value(value)
+            .map_err(|error| ScraperError::InvalidResponse(error.to_string()))
     }
 
     async fn call<T: Serialize>(&self, method: &str, params: T) -> Result<Value, ScraperError> {

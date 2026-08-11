@@ -12,7 +12,7 @@ use crate::{
         images::{ImageWriteError, ImageWriteService},
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
-        nfo::{NfoWriteError, NfoWriteService},
+        nfo::{MovieNfoCredit, MovieNfoMetadata, NfoWriteError, NfoWriteService},
         people::{ActorCredit, PeopleError},
         scraper::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
@@ -28,6 +28,8 @@ use crate::{
 
 #[cfg(test)]
 use crate::application::tmdb::TmdbCastMember;
+
+const MAX_MOVIE_NFO_ACTORS: usize = 30;
 
 #[derive(Clone)]
 pub struct MetadataCandidateService {
@@ -150,7 +152,8 @@ impl MetadataCandidateService {
             let provider_id = provider_id.to_owned();
             let details = if matches!(
                 item_type,
-                crate::application::scraper::ScraperItemType::Series
+                crate::application::scraper::ScraperItemType::Movie
+                    | crate::application::scraper::ScraperItemType::Series
             ) {
                 tmdb.get_generic(crate::application::scraper::ScraperGetRequest::new(
                     item_type,
@@ -176,7 +179,7 @@ impl MetadataCandidateService {
                 ))
                 .await
                 .unwrap_or_default();
-            let actors = if matches!(
+            let credits = if matches!(
                 item_type,
                 crate::application::scraper::ScraperItemType::Movie
                     | crate::application::scraper::ScraperItemType::Series
@@ -187,7 +190,46 @@ impl MetadataCandidateService {
                     "zh-CN",
                 ))
                 .await
-                .map(|credits| generic_candidate_actors(&credits.cast))
+                .unwrap_or_default()
+            } else {
+                crate::application::scraper::ScraperCreditsResponse::default()
+            };
+            let actors = generic_candidate_actors(&credits.cast);
+            let mut provider_ids = details
+                .as_ref()
+                .map(|value| value.provider_ids.clone())
+                .unwrap_or_default();
+            provider_ids
+                .entry("Tmdb".to_owned())
+                .or_insert_with(|| provider_id.clone());
+            let external_ids = if item_type == ScraperItemType::Movie {
+                tmdb.external_ids_generic(ScraperGetRequest::new(
+                    item_type,
+                    provider_id.clone(),
+                    "zh-CN",
+                ))
+                .await
+                .ok()
+            } else {
+                None
+            };
+            if let Some(external_ids) = external_ids {
+                provider_ids.extend(external_ids.provider_ids);
+            }
+            let trailers = if item_type == ScraperItemType::Movie {
+                tmdb.trailers_generic(ScraperGetRequest::new(
+                    item_type,
+                    provider_id.clone(),
+                    "zh-CN",
+                ))
+                .await
+                .map(|response| {
+                    response
+                        .trailers
+                        .into_iter()
+                        .filter_map(|trailer| trailer.url)
+                        .collect()
+                })
                 .unwrap_or_default()
             } else {
                 Vec::new()
@@ -205,12 +247,20 @@ impl MetadataCandidateService {
                         .as_ref()
                         .and_then(|value| value.overview.clone())
                         .or(result.overview),
+                    tagline: details.as_ref().and_then(|value| value.tagline.clone()),
+                    website: details.as_ref().and_then(|value| value.website.clone()),
                     release_date: details
                         .as_ref()
                         .and_then(|value| value.premiere_date.clone())
                         .or(result.premiere_date),
                     end_date: details.as_ref().and_then(|value| value.end_date.clone()),
                     status: details.as_ref().and_then(|value| value.status.clone()),
+                    set_name: details.as_ref().and_then(|value| value.set_name.clone()),
+                    set_id: details.as_ref().and_then(|value| value.set_id.clone()),
+                    poster_url: details.as_ref().and_then(|value| value.poster_url.clone()),
+                    backdrop_url: details
+                        .as_ref()
+                        .and_then(|value| value.backdrop_url.clone()),
                     production_year: details
                         .as_ref()
                         .and_then(|value| value.production_year)
@@ -223,6 +273,27 @@ impl MetadataCandidateService {
                         .as_ref()
                         .and_then(|value| value.original_language.clone())
                         .or(result.original_language),
+                    runtime: details.as_ref().and_then(|value| value.runtime),
+                    votes: details.as_ref().and_then(|value| value.votes),
+                    certification: details
+                        .as_ref()
+                        .and_then(|value| value.certification.clone()),
+                    countries: details
+                        .as_ref()
+                        .map(|value| value.countries.clone())
+                        .unwrap_or_default(),
+                    genres: details
+                        .as_ref()
+                        .map(|value| value.genres.clone())
+                        .unwrap_or_default(),
+                    studios: details
+                        .as_ref()
+                        .map(|value| value.studios.clone())
+                        .unwrap_or_default(),
+                    provider_ids,
+                    directors: generic_candidate_crew(&credits.crew, CrewRole::Director),
+                    writers: generic_candidate_crew(&credits.crew, CrewRole::Writer),
+                    trailers,
                     provider,
                     provider_id,
                     images: generic_candidate_images(&images.images, item_type),
@@ -349,6 +420,22 @@ impl MetadataCandidateService {
                     production_year: metadata.production_year,
                     rating: metadata.rating,
                     original_language: metadata.original_language,
+                    tagline: metadata.tagline,
+                    website: metadata.website,
+                    set_name: metadata.set_name,
+                    set_id: metadata.set_id,
+                    poster_url: metadata.poster_url,
+                    backdrop_url: metadata.backdrop_url,
+                    runtime: metadata.runtime,
+                    votes: metadata.votes,
+                    certification: metadata.certification,
+                    countries: metadata.countries,
+                    genres: metadata.genres,
+                    studios: metadata.studios,
+                    provider_ids: metadata.provider_ids,
+                    directors: Vec::new(),
+                    writers: Vec::new(),
+                    trailers: Vec::new(),
                     provider: parent.provider,
                     provider_id,
                     images: generic_candidate_images(&images.images, item_type),
@@ -444,12 +531,28 @@ impl MetadataCandidateService {
             "title": candidate.title,
             "originalTitle": candidate.original_title,
             "overview": candidate.overview,
+            "tagline": candidate.tagline,
+            "website": candidate.website,
             "releaseDate": candidate.release_date,
             "premiereDate": candidate.release_date,
             "endDate": candidate.end_date,
             "status": candidate.status,
+            "setName": candidate.set_name,
+            "setId": candidate.set_id,
+            "posterUrl": candidate.poster_url,
+            "backdropUrl": candidate.backdrop_url,
             "productionYear": candidate.production_year,
             "rating": candidate.rating,
+            "votes": candidate.votes,
+            "runtime": candidate.runtime,
+            "certification": candidate.certification,
+            "countries": candidate.countries,
+            "genres": candidate.genres,
+            "studios": candidate.studios,
+            "providerIds": candidate.provider_ids,
+            "directors": candidate.directors,
+            "writers": candidate.writers,
+            "trailers": candidate.trailers,
             "originalLanguage": candidate.original_language,
             "images": candidate.images,
             "actors": candidate.actors,
@@ -476,12 +579,28 @@ struct CandidateMetadata {
     title: String,
     original_title: Option<String>,
     overview: Option<String>,
+    tagline: Option<String>,
+    website: Option<String>,
     release_date: Option<String>,
     end_date: Option<String>,
     status: Option<String>,
+    set_name: Option<String>,
+    set_id: Option<String>,
+    poster_url: Option<String>,
+    backdrop_url: Option<String>,
     production_year: Option<i32>,
     rating: Option<f64>,
     original_language: Option<String>,
+    runtime: Option<i32>,
+    votes: Option<i64>,
+    certification: Option<String>,
+    countries: Vec<String>,
+    genres: Vec<String>,
+    studios: Vec<String>,
+    provider_ids: BTreeMap<String, String>,
+    directors: Vec<MovieNfoCredit>,
+    writers: Vec<MovieNfoCredit>,
+    trailers: Vec<String>,
     provider: String,
     provider_id: String,
     images: BTreeMap<String, Vec<String>>,
@@ -681,7 +800,7 @@ fn generic_candidate_actors(
     cast: &[crate::application::scraper::ScraperActorCredit],
 ) -> Vec<ActorCredit> {
     cast.iter()
-        .take(12)
+        .take(MAX_MOVIE_NFO_ACTORS)
         .filter_map(|member| {
             let id = member.provider_id.trim();
             if id.is_empty()
@@ -707,6 +826,53 @@ fn generic_candidate_actors(
             })
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+enum CrewRole {
+    Director,
+    Writer,
+}
+
+fn generic_candidate_crew(
+    crew: &[crate::application::scraper::ScraperCrewCredit],
+    role: CrewRole,
+) -> Vec<MovieNfoCredit> {
+    crew.iter()
+        .filter(|credit| {
+            let department = credit.department.as_deref().unwrap_or_default();
+            let job = credit.job.as_deref().unwrap_or_default();
+            match role {
+                CrewRole::Director => {
+                    department.eq_ignore_ascii_case("Directing")
+                        && job.eq_ignore_ascii_case("Director")
+                }
+                CrewRole::Writer => {
+                    department.eq_ignore_ascii_case("Writing")
+                        && matches!(
+                            job.to_ascii_lowercase().as_str(),
+                            "writer" | "screenplay" | "story" | "author"
+                        )
+                }
+            }
+        })
+        .filter_map(|credit| {
+            let id = credit.provider_id.trim();
+            let name = credit.name.as_deref()?.trim();
+            (valid_person_id(id) && !name.is_empty()).then(|| MovieNfoCredit {
+                provider_id: id.to_owned(),
+                name: name.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn valid_person_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -823,6 +989,8 @@ impl MetadataSelectionService {
                 state.apply_refresh_unlocked(&metadata_candidate)
             }
         }
+        let mut movie_nfo = payload.movie_nfo.clone();
+        movie_nfo.base = state.metadata.clone();
         let mut image_types = Vec::new();
         if payload.typed_images_present {
             for image_type in image_policy.enabled_types() {
@@ -861,9 +1029,18 @@ impl MetadataSelectionService {
             .people
             .persist_item_actors(item_id, &candidate.provider, &payload.actors)
             .await?;
-        let nfo_report = self.nfo.write_item_nfo(item_id, &state.metadata).await?;
-        let provider_ids_json =
-            json!({ candidate.provider.to_ascii_lowercase(): candidate.provider_id }).to_string();
+        let nfo_report = if current.item_type == "MOVIE" {
+            self.nfo.write_item_movie_nfo(item_id, &movie_nfo).await?
+        } else {
+            self.nfo.write_item_nfo(item_id, &state.metadata).await?
+        };
+        let mut provider_ids = movie_nfo.provider_ids.clone();
+        provider_ids.insert(
+            candidate.provider.to_ascii_lowercase(),
+            candidate.provider_id.clone(),
+        );
+        let provider_ids_json = serde_json::to_string(&provider_ids)
+            .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))?;
         let selected = self
             .database
             .select_metadata_candidate(SelectedMetadataUpdate {
@@ -1093,6 +1270,7 @@ impl From<PeopleError> for MetadataSelectionError {
 
 struct CandidatePayload {
     metadata: NfoMetadata,
+    movie_nfo: MovieNfoMetadata,
     premiere_date: Option<String>,
     end_date: Option<String>,
     status: Option<String>,
@@ -1208,14 +1386,42 @@ fn candidate_payload(
         overview: candidate_text(&value, &["overview", "plot"]),
         production_year: candidate_year(&value)?,
     };
+    let tagline = candidate_text(&value, &["tagline", "Tagline"]);
+    let website = candidate_text(&value, &["website", "Website", "homepage", "Homepage"]);
     let premiere_date = candidate_text(&value, &["premiereDate", "releaseDate", "release_date"]);
     let end_date = candidate_text(
         &value,
         &["endDate", "end_date", "lastAirDate", "last_air_date"],
     );
     let status = candidate_text(&value, &["status", "Status"]);
+    let set_name = candidate_text(&value, &["setName", "set_name", "SetName"]);
+    let set_id = candidate_text(&value, &["setId", "set_id", "SetId"]);
     let original_language = candidate_text(&value, &["originalLanguage", "original_language"]);
     let rating = candidate_rating(&value)?;
+    let votes = candidate_integer(&value, &["votes", "Votes", "voteCount", "vote_count"])?;
+    let runtime = candidate_integer(&value, &["runtime", "Runtime"])?
+        .and_then(|value| i32::try_from(value).ok());
+    let certification = candidate_text(
+        &value,
+        &[
+            "certification",
+            "Certification",
+            "officialRating",
+            "OfficialRating",
+            "mpaa",
+        ],
+    );
+    let countries = candidate_string_array(&value, &["countries", "Countries", "country"]);
+    let genres = candidate_string_array(&value, &["genres", "Genres", "genre"]);
+    let studios = candidate_string_array(&value, &["studios", "Studios", "studio"]);
+    let provider_ids = candidate_provider_ids(&value)?;
+    let directors = candidate_credits(&value, "directors")?;
+    let writers = candidate_credits(&value, "writers")?;
+    let trailers: Vec<String> =
+        candidate_string_array(&value, &["trailers", "Trailers", "trailer"])
+            .into_iter()
+            .filter(|url| is_http_url(url))
+            .collect();
     let (images, typed_images_present) = candidate_images(&value);
     let poster_url = candidate_url(&value, &["posterUrl", "poster_url", "poster"]);
     let fanart_url = candidate_url(
@@ -1234,17 +1440,61 @@ fn candidate_payload(
         && metadata.overview.is_none()
         && metadata.production_year.is_none()
         && rating.is_none()
+        && tagline.is_none()
+        && website.is_none()
+        && premiere_date.is_none()
+        && end_date.is_none()
+        && status.is_none()
+        && set_name.is_none()
+        && set_id.is_none()
+        && original_language.is_none()
+        && votes.is_none()
+        && runtime.is_none()
+        && certification.is_none()
         && images.values().all(Vec::is_empty)
         && poster_url.is_none()
         && fanart_url.is_none()
         && actors.is_empty()
+        && directors.is_empty()
+        && writers.is_empty()
+        && countries.is_empty()
+        && genres.is_empty()
+        && studios.is_empty()
+        && provider_ids.is_empty()
+        && trailers.is_empty()
     {
         return Err(MetadataSelectionError::InvalidCandidate(
             "candidate contains no writable metadata or images".to_owned(),
         ));
     }
+    let movie_nfo = MovieNfoMetadata {
+        base: metadata.clone(),
+        rating,
+        votes,
+        tagline,
+        premiered: premiere_date.clone(),
+        releasedate: premiere_date.clone(),
+        runtime,
+        status: status.clone(),
+        original_language: original_language.clone(),
+        website,
+        set_name,
+        set_id,
+        poster_url: poster_url.clone(),
+        fanart_url: fanart_url.clone(),
+        certification,
+        countries,
+        genres,
+        studios,
+        provider_ids,
+        directors,
+        writers,
+        actors: actors.clone(),
+        trailers,
+    };
     Ok(CandidatePayload {
         metadata,
+        movie_nfo,
         premiere_date,
         end_date,
         status,
@@ -1256,6 +1506,87 @@ fn candidate_payload(
         fanart_url,
         actors,
     })
+}
+
+fn candidate_integer(
+    value: &Value,
+    fields: &[&str],
+) -> Result<Option<i64>, MetadataSelectionError> {
+    let Some(raw) = fields.iter().find_map(|field| value.get(*field)) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    raw.as_i64().map(Some).ok_or_else(|| {
+        MetadataSelectionError::InvalidCandidate("integer metadata field is invalid".to_owned())
+    })
+}
+
+fn candidate_string_array(value: &Value, fields: &[&str]) -> Vec<String> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field))
+        .map(candidate_values)
+        .unwrap_or_default()
+}
+
+fn candidate_provider_ids(
+    value: &Value,
+) -> Result<BTreeMap<String, String>, MetadataSelectionError> {
+    let Some(raw) = value
+        .get("providerIds")
+        .or_else(|| value.get("provider_ids"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let object = raw.as_object().ok_or_else(|| {
+        MetadataSelectionError::InvalidCandidate("providerIds must be an object".to_owned())
+    })?;
+    Ok(object
+        .iter()
+        .filter_map(|(provider, value)| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| (provider.to_owned(), value.to_owned()))
+        })
+        .collect())
+}
+
+fn candidate_credits(
+    value: &Value,
+    field: &str,
+) -> Result<Vec<MovieNfoCredit>, MetadataSelectionError> {
+    let Some(raw) = value.get(field) else {
+        return Ok(Vec::new());
+    };
+    let credits = raw.as_array().ok_or_else(|| {
+        MetadataSelectionError::InvalidCandidate(format!("{field} must be an array"))
+    })?;
+    Ok(credits
+        .iter()
+        .filter_map(|credit| {
+            let object = credit.as_object()?;
+            let id = object
+                .get("providerId")
+                .or_else(|| object.get("provider_id"))
+                .or_else(|| object.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)?;
+            let name = object.get("name").and_then(Value::as_str)?.trim();
+            (valid_person_id(id) && !name.is_empty()).then(|| MovieNfoCredit {
+                provider_id: id.to_owned(),
+                name: name.to_owned(),
+            })
+        })
+        .collect())
+}
+
+fn is_http_url(value: &str) -> bool {
+    let value = value.trim();
+    (value.starts_with("https://") || value.starts_with("http://")) && value.len() <= 2048
 }
 
 fn candidate_rating(value: &Value) -> Result<Option<f64>, MetadataSelectionError> {
@@ -1282,7 +1613,7 @@ fn candidate_rating(value: &Value) -> Result<Option<f64>, MetadataSelectionError
 #[cfg(test)]
 fn tmdb_candidate_actors(cast: &[TmdbCastMember]) -> Vec<ActorCredit> {
     cast.iter()
-        .take(12)
+        .take(MAX_MOVIE_NFO_ACTORS)
         .filter_map(|member| {
             let name = member.name.as_deref()?.trim();
             if member.id <= 0 || name.is_empty() {
@@ -1317,7 +1648,7 @@ fn candidate_actors(value: &Value) -> Result<Vec<ActorCredit>, MetadataSelection
     })?;
     actors
         .iter()
-        .take(12)
+        .take(MAX_MOVIE_NFO_ACTORS)
         .map(|actor| {
             let actor = serde_json::from_value::<ActorCredit>(actor.clone()).map_err(|error| {
                 MetadataSelectionError::InvalidCandidate(format!("actor is invalid: {error}"))
@@ -1419,7 +1750,7 @@ fn candidate_url(value: &Value, fields: &[&str]) -> Option<String> {
         .iter()
         .find_map(|field| value.get(*field).and_then(Value::as_str))
         .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| is_http_url(value))
         .map(str::to_owned)
 }
 

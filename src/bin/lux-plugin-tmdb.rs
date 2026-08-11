@@ -378,9 +378,22 @@ async fn localized_movie_details(
         fill_if_empty(&mut details.overview, &fallback.overview);
         fill_if_empty(&mut details.release_date, &fallback.release_date);
         fill_if_empty(&mut details.original_language, &fallback.original_language);
+        fill_if_empty(&mut details.tagline, &fallback.tagline);
+        fill_if_empty(&mut details.homepage, &fallback.homepage);
+        fill_if_empty(&mut details.status, &fallback.status);
         if details.belongs_to_collection.is_none() {
             details.belongs_to_collection = fallback.belongs_to_collection;
         }
+    }
+    let preferred_region = if languages[0].starts_with("zh") {
+        "CN"
+    } else {
+        "US"
+    };
+    if let Ok(release_dates) = client.movie_release_dates(movie_id).await {
+        details.certification = release_dates
+            .certification(preferred_region)
+            .map(str::to_owned);
     }
     Ok(details)
 }
@@ -736,8 +749,21 @@ fn movie_details(details: TmdbMovieDetails) -> Value {
         "Name": details.title,
         "OriginalTitle": details.original_title,
         "Overview": details.overview,
+        "Tagline": details.tagline,
+        "Website": details.homepage,
         "ProductionYear": details.release_date.as_deref().and_then(parse_year),
+        "Status": details.status,
         "Rating": details.vote_average,
+        "Votes": details.vote_count,
+        "Runtime": details.runtime,
+        "OfficialRating": details.certification,
+        "Genres": details.genres.into_iter().filter_map(|genre| genre.name).collect::<Vec<_>>(),
+        "Countries": details.production_countries.into_iter().filter_map(|country| country.name).collect::<Vec<_>>(),
+        "Studios": details.production_companies.into_iter().filter_map(|company| company.name).collect::<Vec<_>>(),
+        "SetName": details.belongs_to_collection.as_ref().and_then(|collection| collection.name.clone()),
+        "SetId": details.belongs_to_collection.as_ref().map(|collection| collection.id.to_string()),
+        "PosterUrl": details.poster_path.as_deref().map(image_url),
+        "BackdropUrl": details.backdrop_path.as_deref().map(image_url),
         "ProviderIds": {"Tmdb": details.id.to_string()},
         "OriginalLanguage": details.original_language,
         "BelongsToCollection": details.belongs_to_collection.map(|collection| json!({
@@ -902,6 +928,13 @@ async fn credits(params: Value) -> Result<Value, PluginRpcError> {
             "Character": actor.character,
             "Order": actor.order,
             "ProfileUrl": actor.profile_path.as_deref().map(image_url)
+        })).collect::<Vec<_>>(),
+        "crew": response.crew.into_iter().map(|credit| json!({
+            "Id": credit.id.to_string(),
+            "Name": credit.name,
+            "Job": credit.job,
+            "Department": credit.department,
+            "ProfileUrl": credit.profile_path.as_deref().map(image_url)
         })).collect::<Vec<_>>()
     }))
 }

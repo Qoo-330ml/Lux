@@ -19,9 +19,12 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
             "results": [{
                 "id": 157336,
                 "title": "Interstellar",
-                "original_title": "Interstellar",
-                "overview": "A test overview",
-                "release_date": "2014-11-07",
+            "original_title": "Interstellar",
+            "overview": "A test overview",
+            "tagline": "Test tagline",
+            "homepage": "https://example.invalid/interstellar",
+            "release_date": "2014-11-07",
+            "status": "Released",
                 "original_language": "en",
                 "vote_average": 8.6
             }]
@@ -79,11 +82,27 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
             "title": if preferred_is_incomplete { Value::Null } else { json!("Interstellar") },
             "original_title": "Interstellar",
             "overview": if preferred_is_incomplete { Value::Null } else { json!("A test overview") },
+            "tagline": "Test tagline",
+            "homepage": "https://example.invalid/interstellar",
             "release_date": "2014-11-07",
+            "status": "Released",
             "original_language": "en",
             "poster_path": "/movie-poster.jpg",
             "backdrop_path": "/movie-backdrop.jpg",
-            "vote_average": 8.6
+            "vote_average": 8.6,
+            "vote_count": 123,
+            "runtime": 169,
+            "genres": [{"id": 12, "name": "Adventure"}],
+            "production_countries": [{"iso_3166_1": "US", "name": "United States of America"}],
+            "production_companies": [{"id": 1, "name": "Stub Studios"}]
+        }))
+    } else if path == "/3/movie/157336/release_dates" {
+        json_response(json!({
+            "id": 157336,
+            "results": [{
+                "iso_3166_1": "US",
+                "release_dates": [{"certification": "PG-13", "release_date": "2014-11-07T00:00:00.000Z", "type": 3}]
+            }]
         }))
     } else if path == "/3/tv/8" {
         json_response(json!({
@@ -118,6 +137,23 @@ async fn tmdb_stub(request: Request<Body>) -> Response<Body> {
                 "character": "Series Character",
                 "profile_path": "/series-profile.jpg",
                 "order": 0
+            }]
+        }))
+    } else if path == "/3/movie/157336/credits" {
+        json_response(json!({
+            "cast": [{
+                "id": 9,
+                "name": "Test Person",
+                "character": "Cooper",
+                "profile_path": "/profile.jpg",
+                "order": 0
+            }],
+            "crew": [{
+                "id": 10,
+                "name": "Test Director",
+                "job": "Director",
+                "department": "Directing",
+                "profile_path": null
             }]
         }))
     } else if path == "/3/tv/8/season/1" {
@@ -432,6 +468,41 @@ async fn standalone_tmdb_plugin_maps_emby_media_types_and_provider_data()
     assert_eq!(series["metadata"]["EndDate"], "2021-02-03");
     assert_eq!(series["metadata"]["Status"], "Ended");
     assert_eq!(series["metadata"]["OriginalLanguage"], "en");
+
+    let movie = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "movie-get",
+        "metadata.get",
+        json!({"itemType": "Movie", "tmdbId": 157336}),
+    )
+    .await?;
+    assert_eq!(movie["metadata"]["Runtime"], 169);
+    assert_eq!(movie["metadata"]["Votes"], 123);
+    assert_eq!(movie["metadata"]["Tagline"], "Test tagline");
+    assert_eq!(
+        movie["metadata"]["Website"],
+        "https://example.invalid/interstellar"
+    );
+    assert_eq!(movie["metadata"]["Status"], "Released");
+    assert_eq!(movie["metadata"]["OfficialRating"], "PG-13");
+    assert_eq!(movie["metadata"]["Genres"][0], "Adventure");
+    assert_eq!(
+        movie["metadata"]["Countries"][0],
+        "United States of America"
+    );
+    assert_eq!(movie["metadata"]["Studios"][0], "Stub Studios");
+
+    let movie_credits = rpc_call(
+        &mut stdin,
+        &mut stdout,
+        "movie-credits",
+        "metadata.credits",
+        json!({"itemType": "Movie", "tmdbId": 157336}),
+    )
+    .await?;
+    assert_eq!(movie_credits["crew"][0]["Id"], "10");
+    assert_eq!(movie_credits["crew"][0]["Job"], "Director");
 
     let series_credits = rpc_call(
         &mut stdin,
