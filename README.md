@@ -6,6 +6,8 @@ Lux 是面向 NAS 的个人媒体服务端：用 Rust 提供高效、可诊断�
 
 Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、加载慢等痛点。虽然Emby的第三方客户端开发环境很好，大批量的第三方播放器涌现弥补了Emby的一些问题，但指标不治本，作为一个媒体管理者，打开emby网页对于我来说真的变成了一件很痛苦的事情。于是本项目因运而生，Lux兼容了Emby的大部分接口，可以直接使用第三方emby客户端进行连接Lux，获得很好的播放体验，同时媒体库的占用也大大降低，流畅性得到了提高。
 
+当然，还要说在前面的是，Lux现在不支持web播放，本身web播放，浏览器解码能力不行，体验只会差，可以配合比如harbor、vidhub、hills等优秀第三方emby客户端来连接Lux。
+
 ## 特性
 
 - 电影、电视剧和混合媒体库，支持一个媒体库配置多个根路径。
@@ -26,12 +28,16 @@ Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、�
 需要 Docker Engine 和 Docker Compose v2：
 
 ```bash
-git clone https://github.com/Qoo-330ml/Lux.git
-cd Lux
-
-mkdir -p config media
-docker compose pull
-docker compose up -d
+services:
+  lux:
+    image: pdzhou/lux:latest
+    container_name: lux
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./config:/config:rw
+      - ./media:/media:rw
+    restart: unless-stopped
 ```
 
 打开 <http://localhost:8097/>，按引导完成数据库选择和第一个管理员创建。
@@ -52,13 +58,38 @@ docker compose up -d
 PostgreSQL 不是 Lux 容器内的子进程。可以使用 Compose 的 `postgres` profile，也可以填写部署环境中已有的 PostgreSQL：
 
 ```bash
-export LUX_POSTGRES_PASSWORD='请替换为强密码'
-docker compose --profile postgres up -d
+services:
+  lux:
+    image: pdzhou/lux:latest
+    container_name: lux
+    user: "0:0"
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./config:/config:rw
+      - ./media:/media:rw
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lux-postgres
+    environment:
+      POSTGRES_DB: ${LUX_POSTGRES_DB:-lux}
+      POSTGRES_USER: ${LUX_POSTGRES_USER:-lux}
+      POSTGRES_PASSWORD: ${LUX_POSTGRES_PASSWORD:-}  #-后面填写密码
+    volumes:
+      # Store PostgreSQL data directly in the project directory.
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 ```
 
 在首次引导中选择 PostgreSQL 时，若使用本 Compose 提供的数据库，主机填写 `postgres`，端口填写 `5432`。数据库后端只能在创建第一个管理员之前选择；当前不支持已初始化实例在线切换，也不会自动执行 SQLite 到 PostgreSQL 的迁移。
 
-更多生产部署、HTTPS 反向代理、Tailscale、升级和备份建议见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
 ## 第一次使用
 
@@ -71,121 +102,6 @@ docker compose --profile postgres up -d
 
 Lux 首版以直放为主，不提供音视频转码、HLS 转码或字幕格式转换。客户端是否能播放某种编码和渲染某种字幕，取决于客户端本身。
 
-## 本地开发
-
-### 环境要求
-
-- Rust stable；仓库通过 [`rust-toolchain.toml`](rust-toolchain.toml) 固定工具链频道。
-- Node.js 与 pnpm；Web 构建使用 pnpm 11。
-- FFmpeg/`ffprobe`；本地媒体信息探测需要它。
-- Docker；仅在需要验证镜像或 Compose 时使用。
-
-安装 Web 依赖：
-
-```bash
-corepack enable
-corepack prepare pnpm@11.9.0 --activate
-pnpm --dir web install --frozen-lockfile
-```
-
-启动 Rust 服务和 Vite 开发服务器：
-
-```bash
-# 终端一：默认监听 127.0.0.1:8097
-cargo run --bin luxd
-
-# 终端二：Vite 监听 127.0.0.1:5173，并把 API 代理到 Rust 服务
-pnpm --dir web dev
-```
-
-开发时访问 <http://127.0.0.1:5173/>。若希望由 Rust 服务直接提供 Web 静态资源，先运行 `pnpm --dir web build`，再访问 <http://127.0.0.1:8097/>。
-
-常用环境变量如下；基础配置可从 [`.env.example`](.env.example) 开始：
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `LUX_HTTP_ADDR` | `127.0.0.1:8097` | HTTP 监听地址；容器中使用 `0.0.0.0:8097` |
-| `LUX_CONFIG_DIR` | `./config` | 配置、SQLite 和日志目录 |
-| `LUX_WEB_DIR` | 自动选择 | 指定已经构建好的 Web 静态资源目录 |
-| `LUX_PROXY_URL` | 空 | Lux 发起外部请求时使用的代理 |
-| `RUST_LOG` | `luxd=info,tower_http=info` | 日志过滤规则 |
-| `TZ` | 系统/镜像默认值 | 日志和界面使用的时区 |
-
-## 检查与构建
-
-Rust 检查：
-
-```bash
-cargo build --locked
-cargo test --locked --all-targets
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-```
-
-Web 检查：
-
-```bash
-pnpm --dir web install --frozen-lockfile
-pnpm --dir web test
-pnpm --dir web build
-```
-
-完整检查：
-
-```bash
-./scripts/check-all.sh
-```
-
-本地 ARM 验证请记录 `uname -m`。开发机上的 `arm64`/`aarch64-apple-darwin` 结果不能替代目标 x86_64 NAS 的性能结论。
-
-## 发布 Docker 镜像（维护者）
-
-`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证；推送到 `main` 或推送 `v*.*.*` 标签时，使用原生 amd64/ARM64 runner 构建并发布 `linux/amd64`、`linux/arm64` manifest。
-
-在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中配置：
-
-- `DOCKERHUB_USERNAME`：Docker Hub 用户名。
-- `DOCKERHUB_TOKEN`：Docker Hub Access Token，不要使用账户密码。
-
-镜像名为 `docker.io/<DOCKERHUB_USERNAME>/lux`。发布版本示例：
-
-```bash
-git tag v0.1.13
-git push origin v0.1.13
-```
-
-## 架构概览
-
-Lux 首版是一个模块化单体：一个 Rust 进程、一个数据库、一个 Web 静态资源目录，以及多个有界的后台 worker。
-
-```text
-VidHub / SenPlayer / Infuse / Lux Web
-                  │
-        Axum HTTP + Emby 兼容层
-                  │
-       application services / domain
-                  │
-       storage（SQLite / PostgreSQL）
-                  │
-     扫描、元数据、播放、插件后台任务
-```
-
-主要目录：
-
-| 目录 | 职责 |
-|---|---|
-| `src/api/` | Lux API、Emby 兼容 API、认证、播放和 DTO 映射 |
-| `src/application/` | 扫描、目录、元数据、插件、播放、任务等应用服务 |
-| `src/domain/` | 领域 ID、时间和核心类型 |
-| `src/storage/` | SQL、迁移和数据库访问 |
-| `src/auth/` | 用户、密码、会话和 Emby 认证 |
-| `src/observability/` | 结构化日志、资源和健康信息 |
-| `web/` | React + TypeScript Web 客户端 |
-| `plugins/` | 插件 manifest 与插件包相关资源 |
-| `tests/` | Rust 集成、协议、播放和管理测试 |
-| `docs/` | 产品规格、部署、兼容性、性能和 ADR |
-
-Emby 路由、DTO 和认证兼容逻辑与 Lux 自有 API 保持边界，不直接污染内部领域模型。扫描、NFO 解析、媒体探测和在线刮削都在后台执行，不进入登录、浏览、搜索和播放请求路径。
 
 ## 当前兼容性
 
@@ -197,9 +113,9 @@ Emby 路由、DTO 和认证兼容逻辑与 Lux 自有 API 保持边界，不直�
 | SenPlayer | 6.0.6（macOS arm64） | 添加、登录、首页、电影列表和 `.strm` 直连播放已验证；其余能力持续补测 |
 | Harbor | 1.4.6（macOS arm64） | 添加、登录、进入媒体库并显示条目已验证 |
 | Lux Web | Chrome 150 smoke | 登录、筛选、详情、MP4 直放、收藏、账户、管理流程和多 viewport smoke 已验证 |
-| Infuse | 未测试 | 尚未形成可发布的兼容性结论 |
+| 网易爆米花 | 2.15.3（ios26） | 添加、登录、浏览、详情、本地直放、播放状态 |
 
-完整请求序列、版本、证据和已知差异见 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)。
+如果遇到有问题的第三方emby播放器，欢迎提issue。
 
 ## 已知限制
 
@@ -209,27 +125,6 @@ Emby 路由、DTO 和认证兼容逻辑与 Lux 自有 API 保持边界，不直�
 - 当前 Docker 镜像和 Compose 以 root 运行 Lux，以兼容不同 NAS bind mount 的 UID/GID；请保护 `/config`，不要把管理入口未经反向代理安全措施直接暴露到公网。
 - 首版不包含音乐库、照片库、直播电视、DVR、DLNA、内置备份恢复或多节点高可用。
 
-## 文档
-
-- [`docs/LUX-DEVELOPMENT.md`](docs/LUX-DEVELOPMENT.md)：产品规格、架构边界、任务清单和验收标准，项目事实来源。
-- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)：Docker、反向代理、Tailscale、升级、备份和故障排查。
-- [`docs/API.md`](docs/API.md)：Lux API 与 Emby 兼容 API 说明。
-- [`docs/PLUGIN-SDK.md`](docs/PLUGIN-SDK.md)：独立插件包、manifest 和运行时协议。
-- [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)：第三方客户端兼容性矩阵与实测证据。
-- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)：性能基准和资源记录。
-- [`docs/decisions/`](docs/decisions/)：架构决策记录（ADR）。
-
-## 参与开发
-
-开始前请阅读 [`AGENTS.md`](AGENTS.md) 和 [`docs/LUX-DEVELOPMENT.md`](docs/LUX-DEVELOPMENT.md)。开发遵循以下约束：
-
-- 一次只处理一个 `LUX-*` 任务，不提前实现后续阶段。
-- 行为变化采用测试驱动开发，保持小步、可编译、可独立回滚。
-- SQL 留在 `storage`，HTTP handler 只负责协议解析、校验、服务调用和 DTO 映射。
-- 不提交密码、token、Cookie、真实 `.strm` URL 或用户数据。
-- 提交 PR 前运行与改动范围相关的检查，并在描述中说明改动文件、验收结果、测试结果和剩余风险。
-
-欢迎提交 issue 和 pull request；如果是客户端兼容性问题，请同时提供客户端版本、平台、脱敏后的请求路径、状态码和关键响应字段。
 
 ## License
 
