@@ -3051,9 +3051,10 @@ IP 或网段类型。媒体库选择、任务、并发、目标输入校验、�
 新的 API、manifest 和插件进程只使用 `org.lux.strm-media-info`。
 
 插件 manifest 声明 `libraryIds`、`concurrency`、`mediaInfoEnabled`、`thumbnailEnabled`、
-`existingInfoPolicy`、`writeSidecars` 和 `schedule` 配置项；`schedule` 使用标准五段式 cron
+`thumbnailPositionPercent`、`existingInfoPolicy`、`writeSidecars` 和 `schedule` 配置项；`schedule` 使用标准五段式 cron
 （分 时 日 月 周），按 UTC 解释，默认 `0 3 * * *`。`mediaInfoEnabled` 默认开启，
-`thumbnailEnabled` 默认关闭，两个开关互相独立。其中 `existingInfoPolicy` 的选项为 `SKIP`
+`thumbnailEnabled` 默认关闭，两个开关互相独立；`thumbnailPositionPercent` 默认 30，范围为 1-99，
+表示按视频时长百分比选择截图位置。其中 `existingInfoPolicy` 的选项为 `SKIP`
 （跳过已有媒体信息）和 `OVERWRITE`（覆盖已有媒体信息）。读取旧版本配置时，
 `includeReady: false` 迁移为 `SKIP`，`includeReady: true` 迁移为 `OVERWRITE`。
 Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理员通过
@@ -3062,7 +3063,7 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 和媒体库 `probeConcurrency` 的较小值限制并发；任务支持分页列表、详情、取消、重试，并在服务
 重启后恢复 PENDING/RUNNING 状态。探测结果保存到 `media_sources`/`media_streams`，旁车写回使用同目录
 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。缩略图只针对 STRM，使用同目录
-`*-thumb.jpg`；截图前先用 `ffprobe` 获取 duration，再调用 `ffmpeg` 在 30% 位置输出一张受限尺寸的
+`*-thumb.jpg`；截图前先用 `ffprobe` 获取 duration，再调用 `ffmpeg` 在 `thumbnailPositionPercent` 指定的百分比位置输出一张受限尺寸的
 JPEG。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生库；缩略图只补全缺失或无效文件，不
 覆盖已有缩略图。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
 
@@ -3084,11 +3085,11 @@ JPEG。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生�
 验收：
 
 - [ ] 管理员只能选择已有媒体库，未选媒体库不创建任务、不发起插件 RPC；空选择、无效 ID、并发超范围均被拒绝。
-- [ ] 插件详情页展示并保存媒体库多选、并发数、媒体信息开关、缩略图开关、已有媒体信息处理方式、旁车写回和五段式 cron 配置；配置文件原子保存且权限受限，插件列表回显非敏感值；任务与日志页可以修改同一份 STRM 计划。
+- [ ] 插件详情页展示并保存媒体库多选、并发数、媒体信息开关、缩略图开关、缩略图位置百分比、已有媒体信息处理方式、旁车写回和五段式 cron 配置；配置文件原子保存且权限受限，插件列表回显非敏感值；任务与日志页可以修改同一份 STRM 计划。
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
-- [ ] `mediaInfoEnabled` 和 `thumbnailEnabled` 可以独立生效；缩略图缺失时先由 ffprobe 获取 duration，再由 ffmpeg 在 30% 位置生成同目录 `*-thumb.jpg`，已有有效缩略图不会被覆盖。
+- [ ] `mediaInfoEnabled` 和 `thumbnailEnabled` 可以独立生效；缩略图缺失时先由 ffprobe 获取 duration，再由 ffmpeg 在 `thumbnailPositionPercent` 指定的位置生成同目录 `*-thumb.jpg`，默认位置为 30%，已有有效缩略图不会被覆盖。
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
 - [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
 - [ ] 插件包、manifest、RPC 结果、STRM 探测目标策略、ffprobe/ffmpeg 超时、输出上限和无真实目标的 fake ffprobe/fake ffmpeg 测试覆盖；插件异常不退出主进程。

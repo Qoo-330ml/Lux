@@ -118,6 +118,7 @@ org.lux.tmdb-1.0.0.zip
     },
     {"key": "mediaInfoEnabled", "label": "提取媒体信息", "type": "toggle", "defaultValue": true},
     {"key": "thumbnailEnabled", "label": "补全 STRM 缩略图", "type": "toggle", "defaultValue": false},
+    {"key": "thumbnailPositionPercent", "label": "缩略图位置", "type": "number", "required": true, "defaultValue": 30, "minimum": 1, "maximum": 99},
     {"key": "writeSidecars", "label": "写入 mediainfo.json", "type": "toggle", "defaultValue": true}
   ],
   "permissions": {
@@ -154,9 +155,9 @@ manifest、格式版本、协议版本、平台入口和声明文件 SHA-256 校
 - `metadata.credits`：返回演员/人物的 provider-neutral cast 列表。
 - `metadata.externalIds`：返回 `ProviderIds`。
 - `metadata.trailers`：返回预告片候选。
-- `media.probe`：接收一个已由 Lux 宿主校验的媒体地址，以及 `includeMediaInfo` 和
-  `includeThumbnail` 两个独立开关。媒体信息由 `ffprobe` 返回受限的 format/stream 信息；
-  缩略图由 `ffmpeg` 在 duration 的 30% 位置生成 JPEG，并通过受限的
+- `media.probe`：接收一个已由 Lux 宿主校验的媒体地址，以及 `includeMediaInfo`、
+  `includeThumbnail` 和 `thumbnailPositionPercent`。媒体信息由 `ffprobe` 返回受限的 format/stream 信息；
+  缩略图由 `ffmpeg` 在 duration 的 `thumbnailPositionPercent` 百分比位置生成 JPEG（缺省为 30），并通过受限的
   `thumbnailJpegBase64` 返回。插件不解析 `.strm` 内容，也不因地址类型拒绝输入。
 - `ip.location`：接收一个已由 Lux 宿主校验的公网 IP，返回统一的归属地字段；第三方供应商协议只存在于插件进程。
 - `plugin.shutdown`：请求插件优雅退出。

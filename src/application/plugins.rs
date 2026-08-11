@@ -55,6 +55,9 @@ const MEDIA_INFO_EXISTING_INFO_POLICY_KEY: &str = "existingInfoPolicy";
 const MEDIA_INFO_EXISTING_INFO_POLICY_SKIP: &str = "SKIP";
 const MEDIA_INFO_EXISTING_INFO_POLICY_OVERWRITE: &str = "OVERWRITE";
 const MAX_MEDIA_PROBE_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 30;
+pub const MIN_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 1;
+pub const MAX_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 99;
 
 pub struct TmdbConfigUpdate<'a> {
     pub api_key: Option<&'a str>,
@@ -73,6 +76,7 @@ pub struct MediaInfoSettings {
     pub write_sidecars: bool,
     pub media_info_enabled: bool,
     pub thumbnail_enabled: bool,
+    pub thumbnail_position_percent: i64,
     pub schedule: String,
 }
 
@@ -663,6 +667,13 @@ impl PluginService {
                 .ok_or(PluginServiceError::InvalidConfig)?,
             media_info_enabled: optional_bool_config(&values, "mediaInfoEnabled", true)?,
             thumbnail_enabled: optional_bool_config(&values, "thumbnailEnabled", false)?,
+            thumbnail_position_percent: optional_i64_config(
+                &values,
+                "thumbnailPositionPercent",
+                DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT,
+                MIN_STRM_THUMBNAIL_POSITION_PERCENT,
+                MAX_STRM_THUMBNAIL_POSITION_PERCENT,
+            )?,
             schedule,
         })
     }
@@ -801,7 +812,7 @@ impl PluginService {
     }
 
     pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult, PluginServiceError> {
-        self.probe_media_with_options(url, true, false)
+        self.probe_media_with_options(url, true, false, DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT)
             .await
             .map(|output| output.media)
     }
@@ -811,6 +822,7 @@ impl PluginService {
         url: &str,
         include_media_info: bool,
         include_thumbnail: bool,
+        thumbnail_position_percent: i64,
     ) -> Result<MediaProbeOutput, PluginServiceError> {
         let plugin = self
             .catalog
@@ -839,6 +851,7 @@ impl PluginService {
                     "url": url,
                     "includeMediaInfo": include_media_info,
                     "includeThumbnail": include_thumbnail,
+                    "thumbnailPositionPercent": thumbnail_position_percent,
                 }),
             )
             .await
@@ -1099,6 +1112,23 @@ fn optional_bool_config(
         .get(key)
         .map(Value::as_bool)
         .unwrap_or(Some(default))
+        .ok_or(PluginServiceError::InvalidConfig)
+}
+
+fn optional_i64_config(
+    values: &Map<String, Value>,
+    key: &str,
+    default: i64,
+    minimum: i64,
+    maximum: i64,
+) -> Result<i64, PluginServiceError> {
+    let value = match values.get(key) {
+        Some(value) => value.as_i64().ok_or(PluginServiceError::InvalidConfig)?,
+        None => default,
+    };
+    (minimum..=maximum)
+        .contains(&value)
+        .then_some(value)
         .ok_or(PluginServiceError::InvalidConfig)
 }
 

@@ -150,6 +150,7 @@ fn packages_a_media_info_zip_with_the_media_probe_manifest()
             "existingInfoPolicy",
             "mediaInfoEnabled",
             "thumbnailEnabled",
+            "thumbnailPositionPercent",
             "writeSidecars",
             "schedule"
         ]
@@ -160,6 +161,8 @@ fn packages_a_media_info_zip_with_the_media_probe_manifest()
     );
     assert_eq!(manifest.config_fields[1].minimum, Some(1));
     assert_eq!(manifest.config_fields[1].maximum, Some(64));
+    assert_eq!(manifest.config_fields[5].minimum, Some(1));
+    assert_eq!(manifest.config_fields[5].maximum, Some(99));
     assert_eq!(manifest.config_fields[2].input_type, "select");
     assert_eq!(manifest.config_fields[2].default_value, Some(json!("SKIP")));
     assert_eq!(

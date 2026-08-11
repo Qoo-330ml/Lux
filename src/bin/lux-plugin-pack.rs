@@ -264,6 +264,16 @@ fn manifest_value(
                     "description": "仅为缺失或无效的 STRM 缩略图使用 ffmpeg 截图。"
                 },
                 {
+                    "key": "thumbnailPositionPercent",
+                    "label": "缩略图位置",
+                    "type": "number",
+                    "required": true,
+                    "defaultValue": 30,
+                    "minimum": 1,
+                    "maximum": 99,
+                    "description": "按视频时长百分比截图，例如 30 表示在 30% 位置。"
+                },
+                {
                     "key": "writeSidecars",
                     "label": "写入 mediainfo.json",
                     "type": "toggle",

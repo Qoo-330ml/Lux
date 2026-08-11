@@ -2371,8 +2371,8 @@ impl Database {
             "INSERT INTO strm_probe_jobs (
                 id, operation_id, library_id, status, concurrency,
                 include_ready, write_sidecars, media_info_enabled,
-                thumbnail_enabled, total_count
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)",
+                thumbnail_enabled, thumbnail_position_percent, total_count
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(job.operation_id)
@@ -2382,6 +2382,7 @@ impl Database {
         .bind(job.write_sidecars)
         .bind(job.media_info_enabled)
         .bind(job.thumbnail_enabled)
+        .bind(job.thumbnail_position_percent)
         .bind(job.total_count)
         .execute(&self.pool)
         .await
@@ -2434,7 +2435,7 @@ impl Database {
         self.query(
             "SELECT id, operation_id, library_id, status, concurrency,
                     include_ready, write_sidecars, media_info_enabled,
-                    thumbnail_enabled, cursor, processed_count,
+                    thumbnail_enabled, thumbnail_position_percent, cursor, processed_count,
                     total_count, cancel_requested, error
              FROM strm_probe_jobs WHERE id = ?",
         )
@@ -2458,7 +2459,7 @@ impl Database {
             self.query(
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
-                        thumbnail_enabled, cursor, processed_count,
+                        thumbnail_enabled, thumbnail_position_percent, cursor, processed_count,
                         total_count, cancel_requested, error
                  FROM strm_probe_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -2472,7 +2473,7 @@ impl Database {
             self.query(
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
-                        thumbnail_enabled, cursor, processed_count,
+                        thumbnail_enabled, thumbnail_position_percent, cursor, processed_count,
                         total_count, cancel_requested, error
                  FROM strm_probe_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -8729,6 +8730,7 @@ pub(crate) struct StoredStrmProbeJob {
     pub(crate) write_sidecars: bool,
     pub(crate) media_info_enabled: bool,
     pub(crate) thumbnail_enabled: bool,
+    pub(crate) thumbnail_position_percent: i64,
     pub(crate) cursor: Option<String>,
     pub(crate) processed_count: i64,
     pub(crate) total_count: i64,
@@ -8745,6 +8747,7 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) write_sidecars: bool,
     pub(crate) media_info_enabled: bool,
     pub(crate) thumbnail_enabled: bool,
+    pub(crate) thumbnail_position_percent: i64,
     pub(crate) total_count: i64,
 }
 
@@ -8811,6 +8814,7 @@ fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
         write_sidecars: row.get::<i64, _>("write_sidecars") != 0,
         media_info_enabled: row.get::<i64, _>("media_info_enabled") != 0,
         thumbnail_enabled: row.get::<i64, _>("thumbnail_enabled") != 0,
+        thumbnail_position_percent: row.get("thumbnail_position_percent"),
         cursor: row.get("cursor"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),

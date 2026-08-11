@@ -26,7 +26,7 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     fs::set_permissions(&ffprobe, permissions)?;
 
     let ffmpeg = temp_dir.path().join("ffmpeg");
-    let ffmpeg_args = temp_dir.path().join("ffmpeg.args");
+    let ffmpeg_args_path = temp_dir.path().join("ffmpeg.args");
     fs::write(
         &ffmpeg,
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LUX_FFMPEG_ARGS\"\nprintf '\\377\\330\\377fake-thumb\\377\\331'\n",
@@ -39,7 +39,7 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     let mut child = Command::new(binary)
         .env("LUX_FFPROBE_BINARY", &ffprobe)
         .env("LUX_FFMPEG_BINARY", &ffmpeg)
-        .env("LUX_FFMPEG_ARGS", &ffmpeg_args)
+        .env("LUX_FFMPEG_ARGS", &ffmpeg_args_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -86,13 +86,36 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
             .as_str()
             .is_some_and(|value| value.starts_with("/9j"))
     );
-    let ffmpeg_args = fs::read_to_string(&ffmpeg_args)?;
+    let ffmpeg_args = fs::read_to_string(&ffmpeg_args_path)?;
     assert!(
         ffmpeg_args
             .lines()
             .collect::<Vec<_>>()
             .windows(2)
             .any(|pair| { pair == ["-ss", "3.750"] })
+    );
+
+    let configured_thumbnail = call(
+        &mut stdin,
+        &mut stdout,
+        "thumbnail-configured",
+        "media.probe",
+        json!({
+            "url": "/media/library/Video.mkv",
+            "includeMediaInfo": false,
+            "includeThumbnail": true,
+            "thumbnailPositionPercent": 50
+        }),
+    )
+    .await?;
+    assert!(configured_thumbnail["thumbnailJpegBase64"].is_string());
+    let ffmpeg_args = fs::read_to_string(&ffmpeg_args_path)?;
+    assert!(
+        ffmpeg_args
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| { pair == ["-ss", "6.250"] })
     );
 
     for url in [

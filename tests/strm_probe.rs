@@ -5,7 +5,7 @@ use luxd::{
         plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
         probe::{FfprobeRunner, MediaProbeService},
         scanner::LibraryScanner,
-        strm_probe::StrmProbeService,
+        strm_probe::{StrmProbeOptions, StrmProbeService},
     },
     config::Config,
     library::LibraryKind,
@@ -111,11 +111,22 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     plugins.install(MEDIA_INFO_PLUGIN_ID).await?;
     let service = StrmProbeService::new(database.clone(), plugins);
     let jobs = service
-        .create_jobs(&[library.id], 2, false, true, true, false)
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: false,
+                write_sidecars: true,
+                media_info_enabled: true,
+                thumbnail_enabled: false,
+                thumbnail_position_percent: 30,
+            },
+        )
         .await?;
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].media_info_enabled);
     assert!(!jobs[0].thumbnail_enabled);
+    assert_eq!(jobs[0].thumbnail_position_percent, 30);
     service.run(&jobs[0].id).await?;
 
     let job = service.get(&jobs[0].id).await?;
@@ -149,10 +160,21 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     );
 
     let thumbnail_jobs = service
-        .create_jobs(&[library.id], 2, false, false, false, true)
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: false,
+                write_sidecars: false,
+                media_info_enabled: false,
+                thumbnail_enabled: true,
+                thumbnail_position_percent: 50,
+            },
+        )
         .await?;
     assert!(!thumbnail_jobs[0].media_info_enabled);
     assert!(thumbnail_jobs[0].thumbnail_enabled);
+    assert_eq!(thumbnail_jobs[0].thumbnail_position_percent, 50);
     service.run(&thumbnail_jobs[0].id).await?;
     assert_eq!(
         service.get(&thumbnail_jobs[0].id).await?.status,
@@ -176,7 +198,17 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
 
     fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 9\n")?;
     let skip_thumbnail_jobs = service
-        .create_jobs(&[library.id], 2, false, false, false, true)
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: false,
+                write_sidecars: false,
+                media_info_enabled: false,
+                thumbnail_enabled: true,
+                thumbnail_position_percent: 50,
+            },
+        )
         .await?;
     service.run(&skip_thumbnail_jobs[0].id).await?;
     assert_eq!(
@@ -186,7 +218,17 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
 
     fs::write(&fake_ffprobe, "#!/bin/sh\nexit 9\n")?;
     let skip_jobs = service
-        .create_jobs(&[library.id], 2, false, false, true, false)
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: false,
+                write_sidecars: false,
+                media_info_enabled: true,
+                thumbnail_enabled: false,
+                thumbnail_position_percent: 30,
+            },
+        )
         .await?;
     service.run(&skip_jobs[0].id).await?;
     let skipped_codec: String = sqlx::query_scalar(
@@ -203,7 +245,17 @@ printf '%s' '{"format":{"format_name":"matroska"},"streams":[{"index":0,"codec_t
 "#,
     )?;
     let overwrite_jobs = service
-        .create_jobs(&[library.id], 2, true, false, true, false)
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: true,
+                write_sidecars: false,
+                media_info_enabled: true,
+                thumbnail_enabled: false,
+                thumbnail_position_percent: 30,
+            },
+        )
         .await?;
     service.run(&overwrite_jobs[0].id).await?;
     let overwritten_codec: String = sqlx::query_scalar(

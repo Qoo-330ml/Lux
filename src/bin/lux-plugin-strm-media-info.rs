@@ -6,6 +6,7 @@ use luxd::application::{
         MediaProbeRpcResult, MediaProbeRpcStream, MediaProbeRpcStreamType, PluginRequest,
         PluginResponse, PluginRpcError,
     },
+    plugins::DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT,
     probe::{MediaProbeResult, ProbeError, StreamType, parse_probe_json},
     strm_probe_policy::validate_remote_media_url,
 };
@@ -34,10 +35,16 @@ struct MediaProbeRequest {
     include_media_info: bool,
     #[serde(default)]
     include_thumbnail: bool,
+    #[serde(default = "default_thumbnail_position_percent")]
+    thumbnail_position_percent: i64,
 }
 
 fn default_media_info_enabled() -> bool {
     true
+}
+
+fn default_thumbnail_position_percent() -> i64 {
+    DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT
 }
 
 #[tokio::main]
@@ -114,6 +121,12 @@ async fn probe(params: Value) -> Result<Value, PluginRpcError> {
     if !validate_remote_media_url(&request.url) {
         return Err(invalid_url());
     }
+    if !(1..=99).contains(&request.thumbnail_position_percent) {
+        return Err(PluginRpcError {
+            code: "MEDIA_PROBE_INVALID_REQUEST".to_owned(),
+            message: "thumbnail position percent is invalid".to_owned(),
+        });
+    }
     let result = if request.include_media_info {
         run_ffprobe(&request.url).await?
     } else {
@@ -132,7 +145,8 @@ async fn probe(params: Value) -> Result<Value, PluginRpcError> {
         Some(
             run_ffmpeg_thumbnail(
                 &request.url,
-                &thumbnail_timestamp(duration_ticks).ok_or_else(duration_error)?,
+                &thumbnail_timestamp(duration_ticks, request.thumbnail_position_percent)
+                    .ok_or_else(duration_error)?,
             )
             .await?,
         )
@@ -434,11 +448,13 @@ fn parse_duration_ticks(value: &str) -> Option<i64> {
     seconds.checked_mul(TICKS_PER_SECOND)?.checked_add(fraction)
 }
 
-fn thumbnail_timestamp(duration_ticks: i64) -> Option<String> {
+fn thumbnail_timestamp(duration_ticks: i64, position_percent: i64) -> Option<String> {
     if duration_ticks < 0 {
         return None;
     }
-    let target = duration_ticks.checked_mul(30)?.checked_div(100)?;
+    let target = duration_ticks
+        .checked_mul(position_percent)?
+        .checked_div(100)?;
     let seconds = target / TICKS_PER_SECOND;
     let millis = (target % TICKS_PER_SECOND) / 10_000;
     Some(format!("{seconds}.{millis:03}"))

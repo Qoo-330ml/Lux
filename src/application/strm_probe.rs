@@ -18,7 +18,10 @@ use crate::{
     application::{
         images::write_image_atomically,
         plugin_runtime::PluginRuntimeError,
-        plugins::{MediaProbeOutput, PluginService, PluginServiceError},
+        plugins::{
+            MAX_STRM_THUMBNAIL_POSITION_PERCENT, MIN_STRM_THUMBNAIL_POSITION_PERCENT,
+            MediaProbeOutput, PluginService, PluginServiceError,
+        },
         probe::{safe_media_path, write_media_info_sidecar},
         strm_probe_policy::validate_remote_media_url,
     },
@@ -35,6 +38,16 @@ const MAX_CONCURRENCY: i64 = 64;
 const SOURCE_PAGE_SIZE: i64 = 500;
 const JOB_ERROR: &str = "one or more STRM media sources failed";
 const MAX_STRM_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct StrmProbeOptions {
+    pub concurrency: i64,
+    pub include_ready: bool,
+    pub write_sidecars: bool,
+    pub media_info_enabled: bool,
+    pub thumbnail_enabled: bool,
+    pub thumbnail_position_percent: i64,
+}
 
 #[derive(Clone)]
 pub struct StrmProbeService {
@@ -62,17 +75,18 @@ impl StrmProbeService {
     pub async fn create_jobs(
         &self,
         library_ids: &[LibraryId],
-        concurrency: i64,
-        include_ready: bool,
-        write_sidecars: bool,
-        media_info_enabled: bool,
-        thumbnail_enabled: bool,
+        options: StrmProbeOptions,
     ) -> Result<Vec<StrmProbeJob>, StrmProbeError> {
         if library_ids.is_empty() || library_ids.len() > MAX_LIBRARY_COUNT {
             return Err(StrmProbeError::InvalidLibraryCount);
         }
-        if !(1..=MAX_CONCURRENCY).contains(&concurrency) {
+        if !(1..=MAX_CONCURRENCY).contains(&options.concurrency) {
             return Err(StrmProbeError::InvalidConcurrency);
+        }
+        if !(MIN_STRM_THUMBNAIL_POSITION_PERCENT..=MAX_STRM_THUMBNAIL_POSITION_PERCENT)
+            .contains(&options.thumbnail_position_percent)
+        {
+            return Err(StrmProbeError::InvalidThumbnailPosition);
         }
         if self.database.has_active_strm_probe_jobs().await? {
             return Err(StrmProbeError::AlreadyActive);
@@ -107,11 +121,12 @@ impl StrmProbeService {
                     id: &id,
                     operation_id: &operation_id,
                     library_id: &library_id,
-                    concurrency,
-                    include_ready,
-                    write_sidecars,
-                    media_info_enabled,
-                    thumbnail_enabled,
+                    concurrency: options.concurrency,
+                    include_ready: options.include_ready,
+                    write_sidecars: options.write_sidecars,
+                    media_info_enabled: options.media_info_enabled,
+                    thumbnail_enabled: options.thumbnail_enabled,
+                    thumbnail_position_percent: options.thumbnail_position_percent,
                     total_count,
                 })
                 .await?;
@@ -129,11 +144,14 @@ impl StrmProbeService {
         let settings = self.plugins.media_info_settings().await?;
         self.create_jobs(
             &settings.library_ids,
-            settings.concurrency,
-            settings.include_ready,
-            settings.write_sidecars,
-            settings.media_info_enabled,
-            settings.thumbnail_enabled,
+            StrmProbeOptions {
+                concurrency: settings.concurrency,
+                include_ready: settings.include_ready,
+                write_sidecars: settings.write_sidecars,
+                media_info_enabled: settings.media_info_enabled,
+                thumbnail_enabled: settings.thumbnail_enabled,
+                thumbnail_position_percent: settings.thumbnail_position_percent,
+            },
         )
         .await
     }
@@ -211,11 +229,14 @@ impl StrmProbeService {
             .map_err(|_| StrmProbeError::LibraryNotFound)?;
         self.create_jobs(
             &[library_id],
-            job.concurrency,
-            job.include_ready,
-            job.write_sidecars,
-            job.media_info_enabled,
-            job.thumbnail_enabled,
+            StrmProbeOptions {
+                concurrency: job.concurrency,
+                include_ready: job.include_ready,
+                write_sidecars: job.write_sidecars,
+                media_info_enabled: job.media_info_enabled,
+                thumbnail_enabled: job.thumbnail_enabled,
+                thumbnail_position_percent: job.thumbnail_position_percent,
+            },
         )
         .await?
         .into_iter()
@@ -295,6 +316,7 @@ impl StrmProbeService {
                 let include_ready = job.include_ready;
                 let media_info_enabled = job.media_info_enabled;
                 let thumbnail_enabled = job.thumbnail_enabled;
+                let thumbnail_position_percent = job.thumbnail_position_percent;
                 pending.spawn(async move {
                     service
                         .probe_source(
@@ -303,6 +325,7 @@ impl StrmProbeService {
                             include_ready,
                             media_info_enabled,
                             thumbnail_enabled,
+                            thumbnail_position_percent,
                         )
                         .await
                 });
@@ -371,6 +394,7 @@ impl StrmProbeService {
         include_ready: bool,
         media_info_enabled: bool,
         thumbnail_enabled: bool,
+        thumbnail_position_percent: i64,
     ) -> SourceOutcome {
         let path = match safe_media_path(&source.root_path, &source.relative_path) {
             Ok(path) => path,
@@ -423,7 +447,12 @@ impl StrmProbeService {
         };
         let result = self
             .plugins
-            .probe_media_with_options(&url, media_info_needed, thumbnail_needed)
+            .probe_media_with_options(
+                &url,
+                media_info_needed,
+                thumbnail_needed,
+                thumbnail_position_percent,
+            )
             .await;
         drop(permit);
         match result {
@@ -668,6 +697,7 @@ pub struct StrmProbeJob {
     pub write_sidecars: bool,
     pub media_info_enabled: bool,
     pub thumbnail_enabled: bool,
+    pub thumbnail_position_percent: i64,
     pub cursor: Option<String>,
     pub processed_count: i64,
     pub total_count: i64,
@@ -686,6 +716,7 @@ fn strm_probe_job(job: StoredStrmProbeJob) -> StrmProbeJob {
         write_sidecars: job.write_sidecars,
         media_info_enabled: job.media_info_enabled,
         thumbnail_enabled: job.thumbnail_enabled,
+        thumbnail_position_percent: job.thumbnail_position_percent,
         cursor: job.cursor,
         processed_count: job.processed_count,
         total_count: job.total_count,
@@ -832,6 +863,7 @@ fn failure_status(error: &PluginServiceError) -> &'static str {
 pub enum StrmProbeError {
     InvalidLibraryCount,
     InvalidConcurrency,
+    InvalidThumbnailPosition,
     AlreadyActive,
     LibraryNotFound,
     JobNotFound,
@@ -846,6 +878,9 @@ impl fmt::Display for StrmProbeError {
         match self {
             Self::InvalidLibraryCount => formatter.write_str("invalid STRM library selection"),
             Self::InvalidConcurrency => formatter.write_str("invalid STRM probe concurrency"),
+            Self::InvalidThumbnailPosition => {
+                formatter.write_str("invalid STRM thumbnail position percent")
+            }
             Self::AlreadyActive => formatter.write_str("a STRM probe operation is already active"),
             Self::LibraryNotFound => formatter.write_str("library not found"),
             Self::JobNotFound => formatter.write_str("STRM probe job not found"),

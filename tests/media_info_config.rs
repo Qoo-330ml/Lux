@@ -35,6 +35,7 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
             {"key": "concurrency", "label": "并发数", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 64},
             {"key": "mediaInfoEnabled", "label": "提取媒体信息", "type": "toggle", "defaultValue": true},
             {"key": "thumbnailEnabled", "label": "补全 STRM 缩略图", "type": "toggle", "defaultValue": false},
+            {"key": "thumbnailPositionPercent", "label": "缩略图位置", "type": "number", "required": true, "defaultValue": 30, "minimum": 1, "maximum": 99},
             {"key": "existingInfoPolicy", "label": "已有媒体信息处理方式", "type": "select", "defaultValue": "SKIP", "options": [{"value": "SKIP", "label": "跳过已有媒体信息"}, {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}]},
             {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": true},
             {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 3 * * *"}
@@ -96,6 +97,7 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
         ("concurrency".to_owned(), json!(4)),
         ("mediaInfoEnabled".to_owned(), Value::Bool(false)),
         ("thumbnailEnabled".to_owned(), Value::Bool(true)),
+        ("thumbnailPositionPercent".to_owned(), json!(50)),
         (
             "existingInfoPolicy".to_owned(),
             Value::String("OVERWRITE".to_owned()),
@@ -142,9 +144,19 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
     assert_eq!(settings.concurrency, 4);
     assert!(!settings.media_info_enabled);
     assert!(settings.thumbnail_enabled);
+    assert_eq!(settings.thumbnail_position_percent, 50);
     assert!(settings.include_ready);
     assert!(!settings.write_sidecars);
     assert_eq!(settings.schedule, "0 4 * * *");
+
+    let mut invalid_position = updated.config_values.clone();
+    invalid_position.insert("thumbnailPositionPercent".to_owned(), json!(100));
+    assert!(
+        plugins
+            .update_dynamic_config(MEDIA_INFO_PLUGIN_ID, invalid_position)
+            .await
+            .is_err()
+    );
 
     let invalid = Map::from_iter([
         ("libraryIds".to_owned(), json!([library.id.to_string()])),
@@ -234,6 +246,7 @@ async fn media_info_plugin_migrates_legacy_include_ready_configuration()
     assert_eq!(settings.library_ids, vec![library.id]);
     assert!(settings.include_ready);
     assert!(!settings.write_sidecars);
+    assert_eq!(settings.thumbnail_position_percent, 30);
     assert_eq!(settings.schedule, "0 3 * * *");
     Ok(())
 }

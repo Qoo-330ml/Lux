@@ -12547,7 +12547,9 @@ fn danmaku_service_error(headers: &HeaderMap, error: DanmakuServiceError) -> Res
 
 fn strm_probe_error(headers: &HeaderMap, error: StrmProbeError) -> Response {
     match error {
-        StrmProbeError::InvalidLibraryCount | StrmProbeError::InvalidConcurrency => api_error(
+        StrmProbeError::InvalidLibraryCount
+        | StrmProbeError::InvalidConcurrency
+        | StrmProbeError::InvalidThumbnailPosition => api_error(
             headers,
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,

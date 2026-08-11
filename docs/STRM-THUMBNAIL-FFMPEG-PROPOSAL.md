@@ -1,6 +1,6 @@
 # STRM 缩略图补全方案（ffprobe + ffmpeg 两步式）
 
-状态：待确认，尚未实现。
+状态：已实现。
 
 ## 1. 目标
 
@@ -34,17 +34,17 @@ STRM 的外部媒体地址沿用扫描阶段已经登记到 media_sources.extern
 
 1. 后台任务检查同目录 *-thumb.jpg 以及数据库登记的缩略图是否有效。
 2. 缺失时调用一次轻量 ffprobe，只获取视频时长。
-3. 按 duration × 30% 计算截图时间点。
+3. 按 duration × thumbnailPositionPercent% 计算截图时间点，默认 30%。
 4. 调用一次 ffmpeg，从该时间点输出一张 JPEG。
 5. 原子写入缩略图并登记 item_images。
 6. 不保存完整媒体信息。
 
-这里仍然是两个独立工具各司其职；因为 ffmpeg 的 -ss 需要具体时间值，不能直接可靠地把“30%”作为输入。
+这里仍然是两个独立工具各司其职；因为 ffmpeg 的 -ss 需要具体时间值，不能直接可靠地把百分比作为输入。
 
 ### 3.3 同时开启媒体信息和缩略图
 
 1. ffprobe 一次输出完整媒体信息，同时复用其中的 duration。
-2. ffmpeg 根据 duration 的 30% 截取一张 JPEG。
+2. ffmpeg 根据 duration 的 thumbnailPositionPercent% 截取一张 JPEG。
 3. 分别保存媒体信息和缩略图。
 
 因此，同一个 STRM 同时开启两个功能时会有一次 ffprobe 和一次 ffmpeg。如果缩略图已存在且有效，则跳过 ffmpeg；如果媒体信息也已存在且任务不是覆盖模式，则可只执行缩略图相关流程或直接跳过。
@@ -59,7 +59,7 @@ ffmpeg
   -loglevel error
   -nostdin
   -y
-  -ss <duration * 0.30>
+  -ss <duration * thumbnailPositionPercent / 100>
   -i <external_media_address>
   -frames:v 1
   -an
@@ -68,7 +68,7 @@ ffmpeg
   <temporary-jpeg>
 ~~~
 
-- 时间点固定为视频时长的 30%。
+- 时间点由 `thumbnailPositionPercent` 配置，默认是视频时长的 30%，允许范围为 1-99。
 - 输出最长边限制为 1024，避免生成过大的图片。
 - 先写随机临时文件，再用原子替换写入正式文件。
 - 校验 JPEG 头尾、文件类型和大小上限。
@@ -77,7 +77,7 @@ ffmpeg
 
 ## 5. 配置和任务模型
 
-插件 manifest 增加两个独立 toggle：
+插件 manifest 增加两个独立 toggle 和一个截图位置 number：
 
 ~~~json
 {
@@ -90,9 +90,16 @@ ffmpeg
   "type": "toggle",
   "defaultValue": false
 }
+{
+  "key": "thumbnailPositionPercent",
+  "type": "number",
+  "defaultValue": 30,
+  "minimum": 1,
+  "maximum": 99
+}
 ~~~
 
-STRM 任务记录这两个开关的快照，确保手动执行、定时执行、重试任务使用同一组配置。旧配置没有这两个字段时分别按 true 和 false 兼容。
+STRM 任务记录两个开关和 `thumbnailPositionPercent` 的快照，确保手动执行、定时执行、重试任务使用同一组配置。旧配置没有这些字段时分别按 true、false 和 30 兼容。
 
 缩略图补全只针对“缺失或无效”的缩略图，不因媒体信息的覆盖选项而自动覆盖已有缩略图；如后续需要覆盖缩略图，应增加单独的覆盖选项。
 
@@ -140,11 +147,8 @@ cargo test --locked --all-targets
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ~~~
 
-## 9. 待确认项
-
-实现前只需要确认以下两点：
+## 9. 已确认行为
 
 1. duration 无法获取时，按方案标记失败，不回退到视频开头截图。
 2. thumbnailEnabled 只补全缺失缩略图，不覆盖已有缩略图。
-
-以上两点确认后，再按本方案拆分协议、任务持久化、插件命令调用、缩略图登记和测试几个小增量实现。
+3. `thumbnailPositionPercent` 缺失时使用 30，超出 1-99 时拒绝配置。
