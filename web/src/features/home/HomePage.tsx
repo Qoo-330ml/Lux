@@ -37,7 +37,7 @@ export function HomePage({ user }: { user: LuxUser }) {
           </HorizontalScrollRail>
         </section>
         <ContinueWatchingRail items={data.continueWatching ?? []} total={data.continueWatchingTotal} />
-        {libraries.map((library) => <MediaRail key={`latest-${library.id}`} title={`最新${library.name}`} items={library.latest ?? []} />)}
+        {libraries.map((library) => <MediaRail key={`latest-${library.id}`} title={`最新${library.name}`} items={library.latest ?? []} linkTo={`/libraries/${library.id}`} />)}
       </div>
     </div>
   );

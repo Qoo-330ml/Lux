@@ -72,6 +72,8 @@ describe("HomePage shelves", () => {
     expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
       .toContain("最新华语片");
     expect(container.querySelector('[aria-label="最新华语电影"] .lux-horizontal-scroll-viewport')).not.toBeNull();
+    expect(container.querySelector<HTMLAnchorElement>('[aria-label="最新华语电影"] .lux-section-heading h2 a'))
+      .toMatchObject({ href: `${window.location.origin}/libraries/library-1` });
     expect([...container.querySelectorAll(".lux-home-content .lux-section h2")].map((heading) => heading.textContent))
       .toEqual(["我的媒体库", "继续观看", "最新华语电影"]);
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.home })?.options.refetchInterval)

@@ -209,11 +209,11 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
   );
 }
 
-export function MediaRail({ title, items, landscape = false }: { title: string; items: MediaItem[]; landscape?: boolean }) {
+export function MediaRail({ title, items, landscape = false, linkTo }: { title: string; items: MediaItem[]; landscape?: boolean; linkTo?: string }) {
   if (!items.length) return null;
   return (
     <section className="lux-section" aria-label={title}>
-      <div className="lux-section-heading"><h2>{title}</h2><span>{items.length} 项</span></div>
+      <div className="lux-section-heading"><h2>{linkTo ? <Link className="lux-section-title-link" to={linkTo}>{title}</Link> : title}</h2><span>{items.length} 项</span></div>
       <HorizontalScrollRail className="lux-home-rail" ariaLabel={title}>
         <div className={landscape ? "lux-media-rail lux-media-rail-landscape" : "lux-media-rail"}>
           {items.map((item) => <MediaCard item={item} landscape={landscape} compactRating key={item.id} />)}
