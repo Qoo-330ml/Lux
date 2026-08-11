@@ -859,7 +859,7 @@ impl MetadataSelectionService {
         }
         let actor_count = self
             .people
-            .persist_item_actors(item_id, &payload.actors)
+            .persist_item_actors(item_id, &candidate.provider, &payload.actors)
             .await?;
         let nfo_report = self.nfo.write_item_nfo(item_id, &state.metadata).await?;
         let provider_ids_json =

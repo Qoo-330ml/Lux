@@ -14,6 +14,7 @@ use luxd::{
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
+        metadata_paths::{library_item_directory, people_directory},
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
         setup::SetupService,
@@ -241,13 +242,13 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let selected_body: Value = selected.json().await?;
     assert_eq!(selected_body["actorCount"], 1);
 
-    let people_file = fixture
-        .config
-        .config_dir
-        .join("people/items")
-        .join(format!("{}.json", fixture.item_id));
+    let people_file =
+        library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
     let people: Value = serde_json::from_slice(&tokio::fs::read(people_file).await?)?;
     assert_eq!(people[0]["name"], "演员甲");
+    assert_eq!(people[0]["provider"], "tmdb");
+    let person_dir = people_directory(&fixture.config.config_dir, "演员甲", "tmdb", "9")?;
+    assert!(person_dir.join("person.nfo").exists());
 
     let detail = client
         .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))

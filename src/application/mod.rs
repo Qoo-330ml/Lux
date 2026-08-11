@@ -15,6 +15,7 @@ pub mod libraries;
 pub mod library_covers;
 pub mod media_matching;
 pub mod metadata;
+pub mod metadata_paths;
 pub mod network_diagnostics;
 pub mod nfo;
 pub mod people;

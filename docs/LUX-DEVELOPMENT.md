@@ -1447,7 +1447,8 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 媒体库列表：类型、年份、已看、收藏筛选；名称、最近添加、发行日期、评分排序。
 - 搜索结果。
 - 电影详情：海报、背景、简介、年份、时长、版本、字幕信息、播放、收藏。
-- 电影和剧集详情显示所选刮削器匹配得到的主要演员；演员资料和头像缓存到 `/config/people`，无头像时显示姓名首字母占位。
+- 电影和剧集详情显示所选刮削器匹配得到的主要演员；演员资料和头像缓存到
+  `/config/metadata/people/<bucket>/<display-name>-<provider>-<provider-id>/`，无头像时显示姓名首字母占位。
 - 剧集详情：季度、单集、下一集、进度。
 - 合集详情。
 - Web 播放页。
@@ -1719,6 +1720,13 @@ services:
 - 原因：浏览器生态与开发效率。
 - 替代：Leptos/Yew，全 Rust 但前端生态和调试成本更高。
 
+### ADR-014：统一元数据资源目录
+
+- 状态：已由本任务接受。
+- 决定：Lux 管理的图片、人物资料和后续对象资源统一放入 `/config/metadata`；数据库继续负责
+  关系和查询，媒体目录中的 NFO/本地图片仍按 ADR-005 作为字段级来源。
+- 后果：新布局必须支持旧 `/config/people` 只读兼容、原子写入、路径校验和可重建迁移。
+
 ---
 
 ## 24. 全局完成标准
@@ -1776,6 +1784,7 @@ services:
 | LUX-158 | src/application/strm_target.rs、src/application/、tests/strm_target.rs、docs/ |
 | LUX-160 | src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、tests/、docs/ |
 | LUX-162 | src/application/plugin_store.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
+| LUX-164 | src/application/metadata_paths.rs、src/application/people.rs、migrations/（后续对象关系）、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2710,7 +2719,8 @@ services:
 验收：
 
 - 显示 poster、fanart、简介、季度/单集、合集和 UserData。
-- 元数据匹配确认时通过所选刮削器抓取主要演员及角色名；详情页以圆形头像卡片展示演员，头像使用 `/config/people` 中的本地缓存。
+- 元数据匹配确认时通过所选刮削器抓取主要演员及角色名；详情页以圆形头像卡片展示演员，头像使用
+  `/config/metadata/people` 中的本地缓存。
 - 详情页存在本地 logo/clearlogo 时显示在标题前；没有徽标时仅显示标题。
 - 多版本选择。
 
@@ -3478,6 +3488,32 @@ Web 插件商店中填写其他 HTTPS 目录地址。目录项必须包含稳定
 
 - 不实现任意 URL 的插件包安装，不放宽现有独立进程和包校验边界。
 - 不把插件仓库改造成代码执行平台；仓库只提供已打包插件和目录索引。
+
+#### LUX-164：统一元数据资源目录与人物布局
+
+范围：建立 `/config/metadata` 的统一资源路径合同。媒体条目资源使用
+`library/<shard>/<item-id>/`，人物资源使用
+`people/<bucket>/<display-name>-<provider>-<provider-id>/`，人物目录保存 `folder.<ext>` 和
+`person.nfo`，人物与媒体条目的当前关系快照保存为媒体条目目录下的 `people.json`。新布局优先写入，
+旧 `/config/people/items` 和 `/config/people/profiles` 只读兼容。媒体目录中的 NFO、海报和背景图不
+在本任务迁移，继续遵守 ADR-005。
+
+验收：
+
+- [x] 人物头像、人物 NFO 和人物关系快照写入新目录。
+- [x] 旧人物目录可读取，升级不会删除旧文件。
+- [x] 路径清洗、稳定分片、符号链接拒绝和原子写入有自动化测试。
+- [x] 关系查询不扫描整个 metadata 目录，外部图片完整 URL 不进入日志。
+
+验证：参见 `docs/LUX-164-PLAN.md`。
+
+依赖：LUX-050、LUX-051、LUX-056。
+
+明确不做：
+
+- 不新增人物数据库关系或详情公共 API。
+- 不实现 genres、studios、tags、views、livetv 或音乐库对象。
+- 不迁移或删除媒体目录中的 NFO、海报和背景图。
 
 ## 26. 风险与缓解
 
