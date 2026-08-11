@@ -22,6 +22,31 @@ org.lux.tmdb-1.0.0.zip
 
 开发时可以把同样的内容解压为 `/config/plugins/org.lux.tmdb/`。生产包的入口必须是 manifest 中的相对路径，禁止绝对路径和 `..` 路径。
 
+## 插件商店目录
+
+Lux 默认从 `https://github.com/Qoo-330ml/Lux-plugins` 读取插件目录；GitHub 仓库地址解析为
+`main/index.json`。管理员也可以配置其他 HTTPS `index.json` 地址。目录使用以下 v1 格式：
+
+```json
+{
+  "formatVersion": 1,
+  "plugins": [{
+    "id": "org.lux.example",
+    "name": "Example",
+    "description": "Example plugin",
+    "category": "UTILITY",
+    "version": "1.0.0",
+    "runtime": "process",
+    "capabilities": ["utility.example"],
+    "package": "packages/org.lux.example-1.0.0.zip",
+    "sha256": "<64 lowercase hexadecimal characters>"
+  }]
+}
+```
+
+`package` 可以是相对目录地址或 HTTPS 地址；Lux 只下载目录声明的 ZIP，并在安装前执行包大小、路径、
+manifest、平台入口和 SHA-256 校验。目录项的插件 ID、版本和包哈希必须唯一且符合格式限制。
+
 ## Manifest
 
 ```json

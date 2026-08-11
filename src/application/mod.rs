@@ -21,6 +21,7 @@ pub mod people;
 pub mod playback;
 pub mod plugin_protocol;
 pub mod plugin_runtime;
+pub mod plugin_store;
 pub mod plugins;
 pub mod probe;
 pub mod recommendations;

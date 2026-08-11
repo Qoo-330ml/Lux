@@ -345,6 +345,19 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(next_up_body["Items"][0]["UserData"]["IsFavorite"], true);
 
+    let shows_next_up = client
+        .get(format!(
+            "{base_url}/Shows/NextUp?UserId={}&Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(shows_next_up.status(), reqwest::StatusCode::OK);
+    let shows_next_up_body: Value = shows_next_up.json().await?;
+    assert_eq!(shows_next_up_body["TotalRecordCount"], 1);
+    assert_eq!(shows_next_up_body["Items"][0]["Id"], episode_id);
+
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))

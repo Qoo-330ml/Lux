@@ -112,7 +112,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     };
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(30))
         .build()?;
 
     let unauthenticated = client
@@ -133,7 +133,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
         .await?;
     assert_eq!(catalog.status(), reqwest::StatusCode::OK);
     let catalog_body: Value = catalog.json().await?;
-    assert_eq!(catalog_body["total"], 1);
+    assert_eq!(catalog_body["total"], 4);
     assert_eq!(catalog_body["plugins"][0]["id"], "tmdb");
     assert_eq!(catalog_body["plugins"][0]["category"], "SCRAPER");
     assert_eq!(catalog_body["plugins"][0]["version"], "0.1.4");
@@ -205,7 +205,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(managed.status(), reqwest::StatusCode::OK);
     let managed_body: Value = managed.json().await?;
     assert_eq!(managed_body["total"], 1);
-    assert_eq!(managed_body["plugins"][0]["id"], "tmdb");
+    assert_eq!(managed_body["plugins"][0]["id"], "org.lux.tmdb");
 
     let created = client
         .post(format!("{base_url}/api/v1/admin/libraries"))
@@ -236,6 +236,56 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(
         cleared.json::<Value>().await?["library"]["scraperId"],
         Value::Null
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_read_and_update_plugin_store_source() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = admin_session(&client, &base_url).await?;
+
+    let initial = client
+        .get(format!("{base_url}/api/v1/admin/plugin-store"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(initial.status(), reqwest::StatusCode::OK);
+    let initial_body: Value = initial.json().await?;
+    assert_eq!(
+        initial_body["url"],
+        "https://github.com/Qoo-330ml/Lux-plugins"
+    );
+    assert_eq!(initial_body["defaultUrl"], initial_body["url"]);
+
+    let invalid = client
+        .put(format!("{base_url}/api/v1/admin/plugin-store"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "url": "http://example.com/index.json" }))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let updated = client
+        .put(format!("{base_url}/api/v1/admin/plugin-store"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "url": "https://example.com/lux/index.json" }))
+        .send()
+        .await?;
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        updated.json::<Value>().await?["url"],
+        "https://example.com/lux/index.json"
     );
 
     server.abort();
@@ -455,7 +505,7 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
         .await?
         .json::<Value>()
         .await?;
-    assert_eq!(catalog["total"], 1);
+    assert_eq!(catalog["total"], 4);
     assert_eq!(catalog["plugins"][0]["id"], "org.lux.tmdb");
     assert_eq!(catalog["plugins"][0]["category"], "SCRAPER");
     assert_eq!(catalog["plugins"][0]["version"], "1.0.0");

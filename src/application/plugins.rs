@@ -3,11 +3,12 @@ use std::{
     env, fmt, io,
     net::IpAddr,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Map, Value, json};
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, io::AsyncWriteExt, sync::RwLock};
 use uuid::Uuid;
 
 use crate::network::is_public_address;
@@ -22,6 +23,7 @@ use crate::{
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
+        plugin_store::{PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex},
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
         schedule::{DEFAULT_STRM_MEDIA_INFO_SCHEDULE, validate_cron},
         settings::{
@@ -191,8 +193,9 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
 pub struct PluginService {
     database: Database,
     config_dir: PathBuf,
-    catalog: PluginCatalog,
+    catalog: Arc<RwLock<PluginCatalog>>,
     supervisor: PluginSupervisor,
+    store: Option<PluginStore>,
 }
 
 impl PluginService {
@@ -205,15 +208,19 @@ impl PluginService {
         config_dir: PathBuf,
         proxy_url: Option<String>,
     ) -> Self {
-        let catalog = PluginCatalog::discover(&config_dir.join("plugins"));
-        let supervisor = PluginSupervisor::new(catalog.clone())
+        let catalog = Arc::new(RwLock::new(PluginCatalog::discover(
+            &config_dir.join("plugins"),
+        )));
+        let supervisor = PluginSupervisor::new_with_shared_catalog(catalog.clone())
             .with_config_dir(config_dir.clone())
-            .with_network_proxy_url(proxy_url);
+            .with_network_proxy_url(proxy_url.clone());
+        let store = PluginStore::new(config_dir.clone(), proxy_url).ok();
         Self {
             database,
             config_dir,
             catalog,
             supervisor,
+            store,
         }
     }
 
@@ -236,19 +243,39 @@ impl PluginService {
         installed_only: bool,
     ) -> Result<PluginPage, PluginServiceError> {
         self.ensure_builtin_plugins_installed().await?;
-        let mut views = Vec::with_capacity(self.catalog.plugins.len() + 1);
-        let has_tmdb_package = self
-            .catalog
-            .plugins
-            .iter()
-            .any(|plugin| is_tmdb_plugin_id(&plugin.manifest.id));
-        if !has_tmdb_package {
-            let status = self
-                .database
-                .plugin_installation_status(TMDB_PLUGIN_ID)
-                .await?;
-            let installed = status.is_some();
-            let enabled = status == Some(true);
+        let catalog = self.catalog_snapshot().await;
+        let store_index = self.store_index().await;
+        let mut views = Vec::with_capacity(catalog.plugins.len() + store_index.plugins.len() + 1);
+        let mut listed_ids = HashSet::new();
+        for entry in &store_index.plugins {
+            let local_plugin = catalog.get(&entry.id);
+            let status_id = if is_tmdb_plugin_id(&entry.id) {
+                TMDB_DYNAMIC_PLUGIN_ID
+            } else {
+                entry.id.as_str()
+            };
+            let status = self.database.plugin_installation_status(status_id).await?;
+            let installed = local_plugin.is_some() && status.is_some();
+            let enabled = installed && status == Some(true);
+            if installed_only && !installed {
+                continue;
+            }
+            if let Some(plugin) = local_plugin {
+                views.push(self.dynamic_view(plugin, installed, enabled).await?);
+            } else if is_tmdb_plugin_id(&entry.id) {
+                views.push(self.remote_tmdb_view(entry, installed, enabled).await);
+            } else {
+                views.push(remote_plugin_view(entry, installed, enabled));
+            }
+            listed_ids.insert(entry.id.clone());
+        }
+        let legacy_tmdb_status = self
+            .database
+            .plugin_installation_status(TMDB_PLUGIN_ID)
+            .await?;
+        if !listed_ids.iter().any(|id| is_tmdb_plugin_id(id)) {
+            let installed = legacy_tmdb_status.is_some();
+            let enabled = legacy_tmdb_status == Some(true);
             if !installed_only || installed {
                 views.push(
                     legacy_tmdb_view(
@@ -261,7 +288,10 @@ impl PluginService {
                 );
             }
         }
-        for plugin in &self.catalog.plugins {
+        for plugin in &catalog.plugins {
+            if listed_ids.contains(&plugin.manifest.id) || is_tmdb_plugin_id(&plugin.manifest.id) {
+                continue;
+            }
             let status = self
                 .database
                 .plugin_installation_status(&plugin.manifest.id)
@@ -284,9 +314,32 @@ impl PluginService {
     }
 
     pub async fn install(&self, plugin_id: &str) -> Result<PluginInstall, PluginServiceError> {
-        let plugin_id = self.canonical_plugin_id(plugin_id);
-        self.ensure_known_plugin(&plugin_id)?;
+        let requested_id = plugin_id.trim().to_owned();
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = if requested_id == TMDB_PLUGIN_ID
+            && catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_none()
+            && self
+                .store_index()
+                .await
+                .plugins
+                .iter()
+                .any(|entry| entry.id == TMDB_DYNAMIC_PLUGIN_ID)
+        {
+            TMDB_DYNAMIC_PLUGIN_ID.to_owned()
+        } else {
+            self.canonical_plugin_id(&requested_id, &catalog)
+        };
         let was_installed = self.database.has_plugin_installation(&plugin_id).await?;
+        if plugin_id != TMDB_PLUGIN_ID && catalog.get(&plugin_id).is_none() {
+            let entry = self
+                .store_index()
+                .await
+                .plugins
+                .into_iter()
+                .find(|entry| entry.id == plugin_id)
+                .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+            self.install_remote_package(&entry).await?;
+        }
         self.database.install_plugin(&plugin_id).await?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
@@ -303,8 +356,9 @@ impl PluginService {
         plugin_id: &str,
         enabled: bool,
     ) -> Result<PluginView, PluginServiceError> {
-        let plugin_id = self.canonical_plugin_id(plugin_id);
-        self.ensure_known_plugin(&plugin_id)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
         if !self.database.has_plugin_installation(&plugin_id).await? {
             return Err(PluginServiceError::Unavailable(plugin_id));
         }
@@ -326,8 +380,10 @@ impl PluginService {
         plugin_id: &str,
         update: TmdbConfigUpdate<'_>,
     ) -> Result<PluginView, PluginServiceError> {
-        self.ensure_known_plugin(plugin_id)?;
-        if !is_tmdb_plugin_id(plugin_id) {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
+        if !is_tmdb_plugin_id(&plugin_id) {
             return Err(PluginServiceError::InvalidConfig);
         }
         if update
@@ -374,8 +430,8 @@ impl PluginService {
                     PluginServiceError::InvalidConfig
                 }
             })?;
-        let (installed, enabled) = self.plugin_state(plugin_id).await?;
-        self.view_for_id(plugin_id, installed, enabled).await
+        let (installed, enabled) = self.plugin_state(&plugin_id).await?;
+        self.view_for_id(&plugin_id, installed, enabled).await
     }
 
     pub async fn validate_selection(
@@ -385,8 +441,9 @@ impl PluginService {
         let Some(scraper_id) = scraper_id.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(());
         };
-        let scraper_id = self.canonical_plugin_id(scraper_id);
-        self.ensure_known_plugin(&scraper_id)?;
+        let catalog = self.catalog_snapshot().await;
+        let scraper_id = self.canonical_plugin_id(scraper_id, &catalog);
+        self.ensure_known_plugin(&scraper_id, &catalog)?;
         self.ensure_builtin_plugins_installed().await?;
         if !self.database.is_plugin_installed(&scraper_id).await? {
             return Err(PluginServiceError::Unavailable(scraper_id));
@@ -404,8 +461,9 @@ impl PluginService {
         method: &str,
         params: Value,
     ) -> Result<Value, PluginServiceError> {
-        let plugin_id = self.canonical_plugin_id(plugin_id);
-        self.ensure_known_plugin(&plugin_id)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
         self.supervisor
             .call(&plugin_id, method, params)
             .await
@@ -427,8 +485,9 @@ impl PluginService {
         } else {
             other_plugins
         };
+        let catalog = self.catalog_snapshot().await;
         for plugin_id in plugin_ids {
-            let Some(plugin) = self.catalog.get(&plugin_id) else {
+            let Some(plugin) = catalog.get(&plugin_id) else {
                 continue;
             };
             if !is_ip_location_plugin(plugin) {
@@ -545,7 +604,8 @@ impl PluginService {
 
     async fn available_strm_resolver_ids(&self) -> Result<Vec<String>, PluginServiceError> {
         let mut plugin_ids = Vec::new();
-        for plugin in &self.catalog.plugins {
+        let catalog = self.catalog_snapshot().await;
+        for plugin in &catalog.plugins {
             if !is_strm_resolver_plugin(plugin)
                 || !self
                     .database
@@ -567,13 +627,13 @@ impl PluginService {
         plugin_id: &str,
         values: Map<String, Value>,
     ) -> Result<PluginView, PluginServiceError> {
-        let plugin_id = self.canonical_plugin_id(plugin_id);
-        self.ensure_known_plugin(&plugin_id)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
         if is_tmdb_plugin_id(&plugin_id) {
             return Err(PluginServiceError::InvalidConfig);
         }
-        let plugin = self
-            .catalog
+        let plugin = catalog
             .get(&plugin_id)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
@@ -597,8 +657,8 @@ impl PluginService {
     ) -> Result<(), PluginServiceError> {
         let schedule = schedule.trim();
         validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
-        let plugin = self
-            .catalog
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
             .get(MEDIA_INFO_PLUGIN_ID)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(MEDIA_INFO_PLUGIN_ID.to_owned()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
@@ -618,8 +678,8 @@ impl PluginService {
     }
 
     pub async fn media_info_settings(&self) -> Result<MediaInfoSettings, PluginServiceError> {
-        let plugin = self
-            .catalog
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
             .get(MEDIA_INFO_PLUGIN_ID)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(MEDIA_INFO_PLUGIN_ID.to_owned()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
@@ -683,8 +743,8 @@ impl PluginService {
         if !installed {
             return Ok(());
         }
-        let plugin = self
-            .catalog
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
             .get(MEDIA_INFO_PLUGIN_ID)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(MEDIA_INFO_PLUGIN_ID.to_owned()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
@@ -824,8 +884,8 @@ impl PluginService {
         include_thumbnail: bool,
         thumbnail_position_percent: i64,
     ) -> Result<MediaProbeOutput, PluginServiceError> {
-        let plugin = self
-            .catalog
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
             .get(MEDIA_INFO_PLUGIN_ID)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(MEDIA_INFO_PLUGIN_ID.to_owned()))?;
         if !plugin
@@ -865,8 +925,9 @@ impl PluginService {
         &self,
         scraper_id: &str,
     ) -> Result<crate::application::scraper::ScraperPluginClient, PluginServiceError> {
-        let plugin_id = self.canonical_plugin_id(scraper_id);
-        self.ensure_known_plugin(&plugin_id)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(scraper_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
         self.ensure_builtin_plugins_installed().await?;
         if plugin_id == TMDB_PLUGIN_ID {
             return Err(PluginServiceError::Unavailable(plugin_id));
@@ -883,12 +944,91 @@ impl PluginService {
     }
 
     pub async fn restart(&self, plugin_id: &str) {
-        let plugin_id = self.canonical_plugin_id(plugin_id);
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
         self.supervisor.stop(&plugin_id).await;
     }
 
     pub async fn stop_all(&self) {
         self.supervisor.stop_all().await;
+    }
+
+    pub async fn plugin_store_source(&self) -> String {
+        if let Some(store) = self.store.as_ref() {
+            store.source().await
+        } else {
+            crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL.to_owned()
+        }
+    }
+
+    pub async fn update_plugin_store_source(
+        &self,
+        source: &str,
+    ) -> Result<String, PluginServiceError> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(PluginServiceError::Store(PluginStoreError::InvalidSource));
+        };
+        store
+            .save_source(source)
+            .await
+            .map_err(PluginServiceError::Store)
+    }
+
+    async fn catalog_snapshot(&self) -> PluginCatalog {
+        self.catalog.read().await.clone()
+    }
+
+    async fn store_index(&self) -> PluginStoreIndex {
+        let Some(store) = self.store.as_ref() else {
+            return PluginStoreIndex {
+                format_version: 1,
+                plugins: Vec::new(),
+            };
+        };
+        let source = store.source().await;
+        match store.fetch_catalog().await {
+            Ok(index) => index,
+            Err(_) if source == crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL => {
+                PluginStore::default_index().unwrap_or(PluginStoreIndex {
+                    format_version: 1,
+                    plugins: Vec::new(),
+                })
+            }
+            Err(_) => PluginStoreIndex {
+                format_version: 1,
+                plugins: Vec::new(),
+            },
+        }
+    }
+
+    async fn install_remote_package(
+        &self,
+        entry: &PluginStoreEntry,
+    ) -> Result<(), PluginServiceError> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
+        };
+        let archive = store
+            .download_package(entry)
+            .await
+            .map_err(PluginServiceError::Store)?;
+        let plugin_dir = self.config_dir.join("plugins");
+        if let Err(error) = fs::create_dir_all(&plugin_dir).await {
+            let _ = fs::remove_file(&archive).await;
+            return Err(PluginServiceError::ConfigIo(error));
+        }
+        let destination = plugin_dir.join(format!("{}-{}.zip", entry.id, entry.version));
+        if let Err(error) = fs::rename(&archive, &destination).await {
+            let _ = fs::remove_file(&archive).await;
+            return Err(PluginServiceError::ConfigIo(error));
+        }
+        let catalog = PluginCatalog::discover(&plugin_dir);
+        if catalog.get(&entry.id).is_none() {
+            let _ = fs::remove_file(&destination).await;
+            return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
+        }
+        *self.catalog.write().await = catalog;
+        Ok(())
     }
 
     async fn view_for_id(
@@ -906,10 +1046,32 @@ impl PluginService {
             )
             .await);
         }
-        let Some(plugin) = self.catalog.get(plugin_id) else {
+        let catalog = self.catalog_snapshot().await;
+        let Some(plugin) = catalog.get(plugin_id) else {
             return Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()));
         };
         self.dynamic_view(plugin, installed, enabled).await
+    }
+
+    async fn remote_tmdb_view(
+        &self,
+        entry: &PluginStoreEntry,
+        installed: bool,
+        enabled: bool,
+    ) -> PluginView {
+        let mut view = legacy_tmdb_view(
+            installed,
+            enabled,
+            self.tmdb_config_source().await,
+            &self.config_dir,
+        )
+        .await;
+        view.name = entry.name.clone();
+        view.description = entry.description.clone();
+        view.version = Some(entry.version.clone());
+        view.runtime = (!entry.runtime.is_empty()).then(|| entry.runtime.clone());
+        view.capabilities = entry.capabilities.clone();
+        view
     }
 
     async fn plugin_state(&self, plugin_id: &str) -> Result<(bool, bool), PluginServiceError> {
@@ -918,8 +1080,9 @@ impl PluginService {
     }
 
     async fn ensure_builtin_plugins_installed(&self) -> Result<(), PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
         for plugin_id in [TMDB_DYNAMIC_PLUGIN_ID, IP138_PLUGIN_ID] {
-            if self.catalog.get(plugin_id).is_some()
+            if catalog.get(plugin_id).is_some()
                 && !self.database.has_plugin_installation(plugin_id).await?
             {
                 self.database.install_plugin(plugin_id).await?;
@@ -930,15 +1093,16 @@ impl PluginService {
 
     async fn installed_other_ip_location_plugins(&self) -> Result<Vec<String>, PluginServiceError> {
         let mut plugin_ids = Vec::new();
+        let catalog = self.catalog_snapshot().await;
         for plugin_id in [IP_HIOFD_PLUGIN_ID] {
-            if let Some(plugin) = self.catalog.get(plugin_id)
+            if let Some(plugin) = catalog.get(plugin_id)
                 && is_ip_location_plugin(plugin)
                 && self.database.is_plugin_installed(plugin_id).await?
             {
                 plugin_ids.push(plugin_id.to_owned());
             }
         }
-        for plugin in &self.catalog.plugins {
+        for plugin in &catalog.plugins {
             if plugin.manifest.id == IP138_PLUGIN_ID
                 || plugin.manifest.id == IP_HIOFD_PLUGIN_ID
                 || !is_ip_location_plugin(plugin)
@@ -1035,20 +1199,23 @@ impl PluginService {
         })
     }
 
-    fn ensure_known_plugin(&self, plugin_id: &str) -> Result<(), PluginServiceError> {
-        if plugin_id == TMDB_PLUGIN_ID || self.catalog.get(plugin_id).is_some() {
+    fn ensure_known_plugin(
+        &self,
+        plugin_id: &str,
+        catalog: &PluginCatalog,
+    ) -> Result<(), PluginServiceError> {
+        if plugin_id == TMDB_PLUGIN_ID || catalog.get(plugin_id).is_some() {
             Ok(())
         } else {
             Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()))
         }
     }
 
-    fn canonical_plugin_id(&self, plugin_id: &str) -> String {
+    fn canonical_plugin_id(&self, plugin_id: &str, catalog: &PluginCatalog) -> String {
         let plugin_id = plugin_id.trim();
         if plugin_id == MEDIA_INFO_LEGACY_PLUGIN_ID {
             MEDIA_INFO_PLUGIN_ID.to_owned()
-        } else if plugin_id == TMDB_PLUGIN_ID && self.catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some()
-        {
+        } else if plugin_id == TMDB_PLUGIN_ID && catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some() {
             TMDB_DYNAMIC_PLUGIN_ID.to_owned()
         } else {
             plugin_id.to_owned()
@@ -1147,6 +1314,43 @@ fn has_environment_value(name: &str) -> bool {
 
 fn is_tmdb_plugin_id(plugin_id: &str) -> bool {
     plugin_id == TMDB_PLUGIN_ID || plugin_id == TMDB_DYNAMIC_PLUGIN_ID
+}
+
+fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) -> PluginView {
+    let enabled = installed && enabled;
+    PluginView {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        description: entry.description.clone(),
+        category: entry.category.clone(),
+        version: Some(entry.version.clone()),
+        runtime: (!entry.runtime.is_empty()).then(|| entry.runtime.clone()),
+        capabilities: entry.capabilities.clone(),
+        status: if enabled {
+            "READY".to_owned()
+        } else if installed {
+            "DISABLED".to_owned()
+        } else {
+            "AVAILABLE".to_owned()
+        },
+        running: false,
+        last_error: None,
+        installed,
+        enabled,
+        configured: true,
+        available: enabled,
+        unavailable_reason: if !installed {
+            Some("NOT_INSTALLED".to_owned())
+        } else if !enabled {
+            Some("DISABLED".to_owned())
+        } else {
+            None
+        },
+        configurable: false,
+        config_fields: Vec::new(),
+        config_source: CONFIG_SOURCE_NONE.to_owned(),
+        config_values: Map::new(),
+    }
 }
 
 fn plugin_config_path(config_dir: &Path, plugin_id: &str) -> PathBuf {
@@ -1304,6 +1508,7 @@ pub enum PluginServiceError {
     InvalidResponse,
     ConfigIo(io::Error),
     Runtime(PluginRuntimeError),
+    Store(PluginStoreError),
     Storage(StorageError),
 }
 
@@ -1318,6 +1523,7 @@ impl fmt::Display for PluginServiceError {
             Self::InvalidResponse => formatter.write_str("plugin returned an invalid response"),
             Self::ConfigIo(error) => write!(formatter, "plugin configuration IO error: {error}"),
             Self::Runtime(error) => error.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -1328,6 +1534,7 @@ impl std::error::Error for PluginServiceError {
         match self {
             Self::ConfigIo(error) => Some(error),
             Self::Runtime(error) => Some(error),
+            Self::Store(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::UnknownPlugin(_)
             | Self::Unavailable(_)

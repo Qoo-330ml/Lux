@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::timeout,
 };
 use uuid::Uuid;
@@ -148,7 +148,7 @@ const DEFAULT_PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct PluginSupervisor {
-    catalog: Arc<PluginCatalog>,
+    catalog: Arc<RwLock<PluginCatalog>>,
     processes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<PluginProcess>>>>>,
     last_errors: Arc<Mutex<HashMap<String, String>>>,
     call_timeout: Duration,
@@ -158,8 +158,12 @@ pub struct PluginSupervisor {
 
 impl PluginSupervisor {
     pub fn new(catalog: PluginCatalog) -> Self {
+        Self::new_with_shared_catalog(Arc::new(RwLock::new(catalog)))
+    }
+
+    pub fn new_with_shared_catalog(catalog: Arc<RwLock<PluginCatalog>>) -> Self {
         Self {
-            catalog: Arc::new(catalog),
+            catalog,
             processes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             last_errors: Arc::new(Mutex::new(HashMap::new())),
             call_timeout: DEFAULT_PLUGIN_CALL_TIMEOUT,
@@ -183,8 +187,8 @@ impl PluginSupervisor {
         self
     }
 
-    pub fn catalog(&self) -> &PluginCatalog {
-        &self.catalog
+    pub async fn catalog(&self) -> PluginCatalog {
+        self.catalog.read().await.clone()
     }
 
     pub async fn call(
@@ -195,7 +199,10 @@ impl PluginSupervisor {
     ) -> Result<serde_json::Value, PluginRuntimeError> {
         let plugin = self
             .catalog
+            .read()
+            .await
             .get(plugin_id)
+            .cloned()
             .ok_or_else(|| PluginRuntimeError::UnknownPlugin(plugin_id.to_owned()))?;
         let process = {
             let mut processes = self.processes.lock().await;
@@ -203,7 +210,7 @@ impl PluginSupervisor {
                 process.clone()
             } else {
                 let process = match spawn_process(
-                    plugin,
+                    &plugin,
                     self.config_dir.as_deref(),
                     self.network_proxy_url.as_deref(),
                 ) {
@@ -246,10 +253,13 @@ impl PluginSupervisor {
     ) -> Result<serde_json::Value, PluginRuntimeError> {
         let plugin = self
             .catalog
+            .read()
+            .await
             .get(plugin_id)
+            .cloned()
             .ok_or_else(|| PluginRuntimeError::UnknownPlugin(plugin_id.to_owned()))?;
         let mut process = match spawn_process(
-            plugin,
+            &plugin,
             self.config_dir.as_deref(),
             self.network_proxy_url.as_deref(),
         ) {
