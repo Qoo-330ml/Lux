@@ -17,7 +17,10 @@ fn rejects_unsafe_or_malformed_resolver_urls() {
         " https://media.example.test/video.mkv",
         "https://media.example.test/video\n.mkv",
     ] {
-        assert!(!validate_strm_resolver_url(value), "URL should be rejected: {value:?}");
+        assert!(
+            !validate_strm_resolver_url(value),
+            "URL should be rejected: {value:?}"
+        );
     }
 }
 

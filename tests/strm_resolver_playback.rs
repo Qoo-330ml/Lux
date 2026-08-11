@@ -1,14 +1,13 @@
 #[cfg(unix)]
 #[tokio::test]
-async fn path_strm_playback_uses_a_generic_resolver_plugin() -> Result<(), Box<dyn std::error::Error>> {
+async fn path_strm_playback_uses_a_generic_resolver_plugin()
+-> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     use luxd::{
         api::{AppState, app_with_state},
         application::{
-            libraries::LibraryService,
-            plugins::PluginService,
-            scanner::LibraryScanner,
+            libraries::LibraryService, plugins::PluginService, scanner::LibraryScanner,
             setup::SetupService,
         },
         auth::{emby::EmbyAuthService, sessions::WebAuthService},
@@ -96,13 +95,7 @@ fi
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(
-        config,
-        database,
-        setup,
-        auth,
-        emby_auth,
-    ));
+    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -138,14 +131,13 @@ fi
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let stream = no_redirect_client
-        .get(format!("http://{address}/Videos/{item_id}/{source_id}/stream"))
+        .get(format!(
+            "http://{address}/Videos/{item_id}/{source_id}/stream"
+        ))
         .query(&[("api_key", token.as_str())])
         .send()
         .await?;
-    assert_eq!(
-        stream.status(),
-        reqwest::StatusCode::TEMPORARY_REDIRECT
-    );
+    assert_eq!(stream.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(
         stream.headers()[reqwest::header::LOCATION],
         "https://media.example.test/resolved.mkv"

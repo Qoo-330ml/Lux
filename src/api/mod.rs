@@ -12830,12 +12830,11 @@ mod tests {
     use super::{
         MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby,
         emby_media_source_json, emby_media_source_json_with_resolver, emby_media_stream_item_id,
-        emby_playback_info_item_id,
-        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
-        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        playback_client_label, playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request,
+        emby_playback_info_item_id, is_catalog_aggregation_path, is_emby_legacy_strm_path,
+        is_emby_media_stream_segment, is_emby_playback_callback_path, is_emby_subtitle_path,
+        is_emby_video_path, is_registered_emby_video_path, lux_catalog_source_json,
+        metadata_candidate_failure_kind, playback_client_label, playback_identifier_prefix,
+        record_activity_event, safe_trace_path, secure_cookie_for_request,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;

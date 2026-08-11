@@ -17,10 +17,9 @@ use crate::{
             CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, IP_LOCATION_CAPABILITY, IpLocationRpcRequest,
             IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
             MediaProbeRpcStreamType, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_SCRAPER,
-            PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, STRM_RESOLVE_CAPABILITY,
-            STRM_RESOLVE_METHOD,
-            StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus, PluginConfigField,
-            PluginConfigOption,
+            PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, PluginConfigField,
+            PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
+            StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
@@ -487,7 +486,8 @@ impl PluginService {
             let request = StrmResolveRpcRequest {
                 target: target.to_owned(),
             };
-            let params = serde_json::to_value(request).map_err(|_| PluginServiceError::InvalidResponse)?;
+            let params =
+                serde_json::to_value(request).map_err(|_| PluginServiceError::InvalidResponse)?;
             let value = match self
                 .supervisor
                 .call_isolated(&plugin_id, STRM_RESOLVE_METHOD, params)
