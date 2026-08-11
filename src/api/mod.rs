@@ -524,6 +524,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_run_plugin),
         )
         .route(
+            "/api/v1/admin/plugin-store",
+            get(admin_plugin_store).put(admin_update_plugin_store),
+        )
+        .route(
             "/api/v1/admin/users",
             get(admin_list_users).post(admin_create_user),
         )
@@ -11703,6 +11707,67 @@ async fn admin_list_plugins(
     admin_list_plugins_with_scope(headers, query, state, false).await
 }
 
+async fn admin_plugin_store(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    Json(json!({
+        "url": plugins.plugin_store_source().await,
+        "defaultUrl": crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginStoreUpdateRequest {
+    url: String,
+}
+
+async fn admin_update_plugin_store(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<PluginStoreUpdateRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match plugins.update_plugin_store_source(&request.url).await {
+        Ok(url) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PLUGIN_STORE_UPDATED",
+                Some("plugin_store"),
+                None,
+                "{}",
+            )
+            .await;
+            Json(json!({
+                "url": url,
+                "defaultUrl": crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL,
+            }))
+            .into_response()
+        }
+        Err(crate::application::plugins::PluginServiceError::Store(
+            crate::application::plugin_store::PluginStoreError::InvalidSource,
+        )) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "插件商店地址无效",
+        )
+        .into_response(),
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
 async fn admin_list_installed_plugins(
     headers: HeaderMap,
     Query(query): Query<LuxPageQuery>,
@@ -12564,6 +12629,13 @@ fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::PluginUnavailable,
             "插件进程暂时不可用",
+        )
+        .into_response(),
+        PluginServiceError::Store(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            "插件商店暂时不可用",
         )
         .into_response(),
         PluginServiceError::InvalidResponse => api_error(
