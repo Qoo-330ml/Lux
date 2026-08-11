@@ -1631,6 +1631,8 @@ struct EmbyItemsQuery {
     ids: Option<String>,
     #[serde(rename = "IncludeItemTypes", default)]
     include_item_types: Option<String>,
+    #[serde(rename = "ExcludeItemTypes", default)]
+    exclude_item_types: Option<String>,
     #[serde(rename = "SeasonId", default)]
     season_id: Option<String>,
     #[serde(rename = "StartIndex", default)]
@@ -1664,6 +1666,17 @@ fn emby_fields_include(fields: Option<&str>, field: &str) -> bool {
     })
 }
 
+fn normalize_emby_item_type(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "movie" => Some("MOVIE".to_owned()),
+        "series" | "show" => Some("SERIES".to_owned()),
+        "season" => Some("SEASON".to_owned()),
+        "episode" => Some("EPISODE".to_owned()),
+        "boxset" | "box_set" => Some("BOX_SET".to_owned()),
+        _ => None,
+    }
+}
+
 fn catalog_filter_from_values(
     item_types: Option<&str>,
     years: Option<&str>,
@@ -1681,14 +1694,7 @@ fn catalog_filter_from_values(
                 .collect::<Vec<_>>();
             let normalized = raw_values
                 .iter()
-                .filter_map(|value| match value.to_ascii_lowercase().as_str() {
-                    "movie" => Some("MOVIE".to_owned()),
-                    "series" | "show" => Some("SERIES".to_owned()),
-                    "season" => Some("SEASON".to_owned()),
-                    "episode" => Some("EPISODE".to_owned()),
-                    "boxset" | "box_set" => Some("BOX_SET".to_owned()),
-                    _ => None,
-                })
+                .filter_map(|value| normalize_emby_item_type(value))
                 .collect::<Vec<_>>();
             if raw_values.is_empty() || !normalized.is_empty() {
                 normalized
@@ -1707,6 +1713,7 @@ fn catalog_filter_from_values(
         .unwrap_or_default();
     CatalogFilter {
         item_types,
+        excluded_item_types: Vec::new(),
         item_ids: None,
         media_source_ids: None,
         years,
@@ -1746,6 +1753,16 @@ fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
     });
     filter.item_ids = ids.clone();
     filter.media_source_ids = ids;
+    filter.excluded_item_types = query
+        .exclude_item_types
+        .as_deref()
+        .map(|values| {
+            values
+                .split(',')
+                .filter_map(normalize_emby_item_type)
+                .collect()
+        })
+        .unwrap_or_default();
     filter
 }
 
@@ -1946,7 +1963,14 @@ async fn emby_user_resume(
             return StatusCode::FORBIDDEN.into_response();
         }
     };
-    emby_catalog_page_for_user_with_fields(&state, &user_id, &page, query.fields.as_deref()).await
+    emby_catalog_page_for_user_with_fields(
+        &state,
+        &user_id,
+        &page,
+        query.fields.as_deref(),
+        user.can_download,
+    )
+    .await
 }
 
 async fn emby_user_latest(
@@ -1991,6 +2015,7 @@ async fn emby_user_latest(
             &user_id,
             &grouped_page,
             query.fields.as_deref(),
+            user.can_download,
         )
         .await
         {
@@ -2011,7 +2036,15 @@ async fn emby_user_latest(
         }
         return Json(items).into_response();
     }
-    match emby_catalog_items_for_user(&state, &user_id, &page, query.fields.as_deref()).await {
+    match emby_catalog_items_for_user(
+        &state,
+        &user_id,
+        &page,
+        query.fields.as_deref(),
+        user.can_download,
+    )
+    .await
+    {
         Ok(items) => Json(items).into_response(),
         Err(status) => status.into_response(),
     }
@@ -2077,6 +2110,7 @@ async fn emby_group_latest_page(
     if !series_ids.is_empty() {
         let filter = CatalogFilter {
             item_types: vec!["SERIES".to_owned()],
+            excluded_item_types: Vec::new(),
             item_ids: Some(series_ids.clone()),
             media_source_ids: None,
             years: Vec::new(),
@@ -2154,8 +2188,14 @@ async fn emby_user_next_up(
         .await
     {
         Ok(page) => {
-            emby_catalog_page_for_user_with_fields(&state, &user_id, &page, query.fields.as_deref())
-                .await
+            emby_catalog_page_for_user_with_fields(
+                &state,
+                &user_id,
+                &page,
+                query.fields.as_deref(),
+                user.can_download,
+            )
+            .await
         }
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::FORBIDDEN.into_response()
@@ -2197,6 +2237,7 @@ async fn emby_show_seasons(
                 &user.id.to_string(),
                 &page,
                 query.fields.as_deref(),
+                user.can_download,
             )
             .await
         }
@@ -2240,6 +2281,7 @@ async fn emby_show_episodes(
                 &user.id.to_string(),
                 &page,
                 query.fields.as_deref(),
+                user.can_download,
             )
             .await
         }
@@ -2282,6 +2324,7 @@ async fn emby_collection_children(
                 &user.id.to_string(),
                 &page,
                 query.fields.as_deref(),
+                user.can_download,
             )
             .await
         }
@@ -2297,8 +2340,17 @@ async fn emby_catalog_page_for_user_with_fields(
     user_id: &str,
     page: &CatalogPage,
     fields: Option<&str>,
+    can_download: bool,
 ) -> Response {
-    emby_catalog_page_for_user_with_preferred_source(state, user_id, page, fields, None).await
+    emby_catalog_page_for_user_with_preferred_source(
+        state,
+        user_id,
+        page,
+        fields,
+        can_download,
+        None,
+    )
+    .await
 }
 
 async fn emby_catalog_page_for_user_with_preferred_source(
@@ -2306,6 +2358,7 @@ async fn emby_catalog_page_for_user_with_preferred_source(
     user_id: &str,
     page: &CatalogPage,
     fields: Option<&str>,
+    can_download: bool,
     preferred_source_id: Option<&str>,
 ) -> Response {
     match emby_catalog_items_for_user_with_preferred_source(
@@ -2313,6 +2366,7 @@ async fn emby_catalog_page_for_user_with_preferred_source(
         user_id,
         page,
         fields,
+        can_download,
         preferred_source_id,
     )
     .await
@@ -2332,8 +2386,17 @@ async fn emby_catalog_items_for_user(
     user_id: &str,
     page: &CatalogPage,
     fields: Option<&str>,
+    can_download: bool,
 ) -> Result<Vec<Value>, StatusCode> {
-    emby_catalog_items_for_user_with_preferred_source(state, user_id, page, fields, None).await
+    emby_catalog_items_for_user_with_preferred_source(
+        state,
+        user_id,
+        page,
+        fields,
+        can_download,
+        None,
+    )
+    .await
 }
 
 async fn emby_catalog_items_for_user_with_preferred_source(
@@ -2341,6 +2404,7 @@ async fn emby_catalog_items_for_user_with_preferred_source(
     user_id: &str,
     page: &CatalogPage,
     fields: Option<&str>,
+    can_download: bool,
     preferred_source_id: Option<&str>,
 ) -> Result<Vec<Value>, StatusCode> {
     let Some(database) = state.database.as_ref() else {
@@ -2361,6 +2425,7 @@ async fn emby_catalog_items_for_user_with_preferred_source(
             item,
             &state.server_id,
             user_states.get(&item.id),
+            can_download,
             fields,
         );
         if let Some(source_id) = preferred_source_id
@@ -2391,7 +2456,7 @@ async fn emby_user_items(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_list_items(&headers, &state, principal, &query).await
+    emby_list_items(&headers, &state, principal, user.can_download, &query).await
 }
 
 async fn emby_items(
@@ -2409,13 +2474,14 @@ async fn emby_items(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_list_items(&headers, &state, principal, &query).await
+    emby_list_items(&headers, &state, principal, user.can_download, &query).await
 }
 
 async fn emby_list_items(
     _headers: &HeaderMap,
     state: &AppState,
     principal: AccessPrincipal,
+    can_download: bool,
     query: &EmbyItemsQuery,
 ) -> Response {
     let root_id = principal.user_id.to_string();
@@ -2438,6 +2504,7 @@ async fn emby_list_items(
                 &principal.user_id.to_string(),
                 &page,
                 query.fields.as_deref(),
+                can_download,
                 preferred_source_id,
             )
             .await
@@ -2472,7 +2539,14 @@ async fn emby_catalog_page_from_query(
     let Some(catalog) = state.catalog.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let filter = catalog_filter_from_emby(query);
+    let mut filter = catalog_filter_from_emby(query);
+    let root_scope = match query.parent_id.as_deref() {
+        Some(parent_id) => emby_parent_is_library(state, parent_id).await,
+        None => true,
+    };
+    if root_scope && !query.recursive.unwrap_or(false) && query.include_item_types.is_none() {
+        filter.item_types = vec!["MOVIE".to_owned(), "SERIES".to_owned()];
+    }
     let page = match query.parent_id.as_deref() {
         Some(parent_id) => {
             if let Ok(library_id) = parent_id.parse::<crate::domain::ids::LibraryId>() {
@@ -2578,7 +2652,7 @@ async fn emby_item(
         Err(status) => return status.into_response(),
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_item_response(&state, principal, &item_id).await
+    emby_item_response(&state, principal, &item_id, user.can_download).await
 }
 
 async fn emby_user_item(
@@ -2595,13 +2669,14 @@ async fn emby_user_item(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_item_response(&state, principal, &item_id).await
+    emby_item_response(&state, principal, &item_id, user.can_download).await
 }
 
 async fn emby_item_response(
     state: &AppState,
     principal: AccessPrincipal,
     item_id: &str,
+    can_download: bool,
 ) -> Response {
     if item_id == principal.user_id.to_string() {
         return emby_user_root_response(state, principal).await;
@@ -2655,6 +2730,7 @@ async fn emby_item_response(
                 &item,
                 &state.server_id,
                 user_state.as_ref(),
+                can_download,
                 None,
             ))
             .into_response()
@@ -3440,6 +3516,7 @@ fn emby_catalog_item_json_with_state(
     item: &CatalogItem,
     server_id: &str,
     user_state: Option<&crate::storage::StoredUserItemState>,
+    can_download: bool,
     fields: Option<&str>,
 ) -> Value {
     let default_source = item
@@ -3513,6 +3590,7 @@ fn emby_catalog_item_json_with_state(
         "Container": default_source.and_then(|source| source.container.clone()),
         "Size": default_source.and_then(|source| source.size),
         "Bitrate": default_source.and_then(|source| source.bitrate),
+        "CanDownload": can_download,
         "ImageTags": image_tags,
         "BackdropImageTags": item
             .fanart_image_tag
@@ -3547,6 +3625,11 @@ fn emby_catalog_item_json_with_state(
                     .collect(),
             ),
         );
+    }
+    if emby_fields_include(fields, "Chapters")
+        && let Value::Object(object) = &mut value
+    {
+        object.insert("Chapters".to_owned(), Value::Array(Vec::new()));
     }
     value
 }

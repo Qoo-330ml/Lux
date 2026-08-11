@@ -224,6 +224,47 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
             .all(|item| matches!(item["Type"].as_str(), Some("Movie" | "Series")))
     }));
 
+    let homepage_items = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ExcludeItemTypes=Audio,Book,MusicVideo,Game,MusicAlbum,Photo&StartIndex=0&Limit=50&Fields=PremiereDate,ProductionYear,CommunityRating,ChildCount,CanDownload,Chapters",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(homepage_items.status(), reqwest::StatusCode::OK);
+    let homepage_items_body: Value = homepage_items.json().await?;
+    assert_eq!(homepage_items_body["TotalRecordCount"], 1);
+    assert!(
+        homepage_items_body["Items"]
+            .as_array()
+            .is_some_and(|items| {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| matches!(item["Type"].as_str(), Some("Movie" | "Series")))
+                    && items.iter().all(|item| item["CanDownload"].is_boolean())
+                    && items.iter().all(|item| item["Chapters"].is_array())
+            })
+    );
+
+    let recursive_filtered_items = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?Recursive=true&ExcludeItemTypes=Season,Episode&StartIndex=0&Limit=50",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(recursive_filtered_items.status(), reqwest::StatusCode::OK);
+    let recursive_filtered_body: Value = recursive_filtered_items.json().await?;
+    assert_eq!(recursive_filtered_body["TotalRecordCount"], 1);
+    assert!(
+        recursive_filtered_body["Items"]
+            .as_array()
+            .is_some_and(|items| { items.iter().all(|item| item["Type"] == "Series") })
+    );
+
     let library_latest = client
         .get(format!(
             "{base_url}/Users/{}/Items/Latest?ParentId={}&Limit=10",

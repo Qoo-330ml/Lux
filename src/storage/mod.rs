@@ -9163,6 +9163,7 @@ fn catalog_filter_where_clause<'a>(
     let item_types = filter.item_types;
     let item_ids = filter.item_ids;
     let media_source_ids = filter.media_source_ids;
+    let excluded_item_types = filter.excluded_item_types;
     let years = filter.years;
     let is_played = filter.is_played;
     let is_favorite = filter.is_favorite;
@@ -9226,6 +9227,19 @@ fn catalog_filter_where_clause<'a>(
         ));
         binds.extend(
             item_types
+                .iter()
+                .map(|item_type| CatalogBind::Text(item_type.as_str())),
+        );
+    }
+    if !excluded_item_types.is_empty() {
+        where_clause.push_str(&format!(
+            " AND mi.item_type NOT IN ({})",
+            std::iter::repeat_n("?", excluded_item_types.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        binds.extend(
+            excluded_item_types
                 .iter()
                 .map(|item_type| CatalogBind::Text(item_type.as_str())),
         );
@@ -9330,6 +9344,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) library_ids: &'a [String],
     pub(crate) user_id: &'a str,
     pub(crate) item_types: &'a [String],
+    pub(crate) excluded_item_types: &'a [String],
     pub(crate) item_ids: Option<&'a [String]>,
     pub(crate) media_source_ids: Option<&'a [String]>,
     pub(crate) years: &'a [i64],
