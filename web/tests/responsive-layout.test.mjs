@@ -38,3 +38,15 @@ test("large-display page surfaces do not keep fixed pixel width caps", () => {
     assert.doesNotMatch(rule(selector), fixedPixelWidth, selector);
   }
 });
+
+test("the global header stays fixed while page content scrolls", () => {
+  assert.match(rule(".lux-header"), /position:\s*fixed/);
+  assert.match(rule(".lux-header"), /(?:top:\s*0|inset:\s*0\s+0\s+auto)/);
+});
+
+test("mobile navigation stays attached below the fixed header", () => {
+  const fixedMobileNavRule = stylesheet.match(/\.lux-mobile-nav\s*\{\s*position:\s*fixed[^}]*\}/)?.[0] ?? "";
+
+  assert.match(fixedMobileNavRule, /position:\s*fixed/);
+  assert.match(fixedMobileNavRule, /top:\s*var\(--lux-header-height\)/);
+});
