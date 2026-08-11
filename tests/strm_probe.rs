@@ -32,6 +32,13 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     )?;
     make_executable(&fake_ffprobe)?;
 
+    let fake_ffmpeg = temp_dir.path().join("ffmpeg");
+    fs::write(
+        &fake_ffmpeg,
+        "#!/bin/sh\nprintf '\\377\\330\\377fake-thumb\\377\\331'\n",
+    )?;
+    make_executable(&fake_ffmpeg)?;
+
     let plugin_binary = std::env::var_os("CARGO_BIN_EXE_lux-plugin-strm-media-info")
         .or_else(|| std::env::var_os("CARGO_BIN_EXE_lux_plugin_strm_media_info"))
         .ok_or("strm-media-info plugin binary path is missing")?;
@@ -39,8 +46,9 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nLUX_FFPROBE_BINARY={} exec {} \"$@\"\n",
+            "#!/bin/sh\nLUX_FFPROBE_BINARY={} LUX_FFMPEG_BINARY={} exec {} \"$@\"\n",
             shell_quote(&fake_ffprobe),
+            shell_quote(&fake_ffmpeg),
             shell_quote(Path::new(&plugin_binary)),
         ),
     )?;
@@ -102,8 +110,12 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(MEDIA_INFO_PLUGIN_ID).await?;
     let service = StrmProbeService::new(database.clone(), plugins);
-    let jobs = service.create_jobs(&[library.id], 2, false, true).await?;
+    let jobs = service
+        .create_jobs(&[library.id], 2, false, true, true, false)
+        .await?;
     assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].media_info_enabled);
+    assert!(!jobs[0].thumbnail_enabled);
     service.run(&jobs[0].id).await?;
 
     let job = service.get(&jobs[0].id).await?;
@@ -136,8 +148,46 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
         Some(2)
     );
 
+    let thumbnail_jobs = service
+        .create_jobs(&[library.id], 2, false, false, false, true)
+        .await?;
+    assert!(!thumbnail_jobs[0].media_info_enabled);
+    assert!(thumbnail_jobs[0].thumbnail_enabled);
+    service.run(&thumbnail_jobs[0].id).await?;
+    assert_eq!(
+        service.get(&thumbnail_jobs[0].id).await?.status,
+        "COMPLETED"
+    );
+    let thumbnail_path = movie_dir.join("Plugin.Movie.2024-thumb.jpg");
+    let thumbnail = fs::read(&thumbnail_path)?;
+    assert_eq!(thumbnail, b"\xff\xd8\xfffake-thumb\xff\xd9");
+    let image: (String, String, i64) = sqlx::query_as(
+        "SELECT local_path, source, file_size FROM item_images
+         WHERE item_id = (SELECT item_id FROM media_sources) AND image_type = 'THUMB'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        fs::canonicalize(&image.0)?,
+        fs::canonicalize(&thumbnail_path)?
+    );
+    assert_eq!(image.1, "STRM_FFMPEG");
+    assert_eq!(image.2, i64::try_from(thumbnail.len())?);
+
+    fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 9\n")?;
+    let skip_thumbnail_jobs = service
+        .create_jobs(&[library.id], 2, false, false, false, true)
+        .await?;
+    service.run(&skip_thumbnail_jobs[0].id).await?;
+    assert_eq!(
+        fs::read(&thumbnail_path)?,
+        b"\xff\xd8\xfffake-thumb\xff\xd9"
+    );
+
     fs::write(&fake_ffprobe, "#!/bin/sh\nexit 9\n")?;
-    let skip_jobs = service.create_jobs(&[library.id], 2, false, false).await?;
+    let skip_jobs = service
+        .create_jobs(&[library.id], 2, false, false, true, false)
+        .await?;
     service.run(&skip_jobs[0].id).await?;
     let skipped_codec: String = sqlx::query_scalar(
         "SELECT codec FROM media_streams WHERE media_source_id = (SELECT id FROM media_sources)\n         AND stream_type = 'VIDEO'",
@@ -152,7 +202,9 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
 printf '%s' '{"format":{"format_name":"matroska"},"streams":[{"index":0,"codec_type":"video","codec_name":"vp9"}]}'
 "#,
     )?;
-    let overwrite_jobs = service.create_jobs(&[library.id], 2, true, false).await?;
+    let overwrite_jobs = service
+        .create_jobs(&[library.id], 2, true, false, true, false)
+        .await?;
     service.run(&overwrite_jobs[0].id).await?;
     let overwritten_codec: String = sqlx::query_scalar(
         "SELECT codec FROM media_streams WHERE media_source_id = (SELECT id FROM media_sources)\n         AND stream_type = 'VIDEO'",

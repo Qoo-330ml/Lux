@@ -25,9 +25,21 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     permissions.set_mode(0o700);
     fs::set_permissions(&ffprobe, permissions)?;
 
+    let ffmpeg = temp_dir.path().join("ffmpeg");
+    let ffmpeg_args = temp_dir.path().join("ffmpeg.args");
+    fs::write(
+        &ffmpeg,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LUX_FFMPEG_ARGS\"\nprintf '\\377\\330\\377fake-thumb\\377\\331'\n",
+    )?;
+    let mut permissions = fs::metadata(&ffmpeg)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&ffmpeg, permissions)?;
+
     let binary = plugin_binary()?;
     let mut child = Command::new(binary)
         .env("LUX_FFPROBE_BINARY", &ffprobe)
+        .env("LUX_FFMPEG_BINARY", &ffmpeg)
+        .env("LUX_FFMPEG_ARGS", &ffmpeg_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -54,6 +66,34 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     assert_eq!(result["durationTicks"], 125000000);
     assert_eq!(result["streams"][0]["streamType"], "VIDEO");
     assert_eq!(result["streams"][1]["language"], "eng");
+
+    let thumbnail = call(
+        &mut stdin,
+        &mut stdout,
+        "thumbnail",
+        "media.probe",
+        json!({
+            "url": "http://192.168.1.10/video.mkv",
+            "includeMediaInfo": false,
+            "includeThumbnail": true
+        }),
+    )
+    .await?;
+    assert!(thumbnail["container"].is_null());
+    assert!(thumbnail["streams"].as_array().is_some_and(Vec::is_empty));
+    assert!(
+        thumbnail["thumbnailJpegBase64"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("/9j"))
+    );
+    let ffmpeg_args = fs::read_to_string(&ffmpeg_args)?;
+    assert!(
+        ffmpeg_args
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| { pair == ["-ss", "3.750"] })
+    );
 
     for url in [
         "http://192.168.1.10/video.mkv",

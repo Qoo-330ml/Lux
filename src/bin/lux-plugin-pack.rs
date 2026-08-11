@@ -210,7 +210,7 @@ fn manifest_value(
             "formatVersion": 1,
             "id": "org.lux.strm-media-info",
             "name": "strm媒体信息提取",
-            "description": "使用 ffprobe 提取 STRM 外部媒体的技术信息。",
+            "description": "使用 ffprobe 提取媒体信息，并使用 ffmpeg 补全 STRM 缩略图。",
             "version": version,
             "apiVersion": 1,
             "runtime": {"kind": "process", "entrypoint": relative_binary},
@@ -248,6 +248,20 @@ fn manifest_value(
                         {"value": "SKIP", "label": "跳过已有媒体信息"},
                         {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}
                     ]
+                },
+                {
+                    "key": "mediaInfoEnabled",
+                    "label": "提取媒体信息",
+                    "type": "toggle",
+                    "defaultValue": true,
+                    "description": "使用 ffprobe 提取媒体格式、轨道和时长信息。"
+                },
+                {
+                    "key": "thumbnailEnabled",
+                    "label": "补全 STRM 缩略图",
+                    "type": "toggle",
+                    "defaultValue": false,
+                    "description": "仅为缺失或无效的 STRM 缩略图使用 ffmpeg 截图。"
                 },
                 {
                     "key": "writeSidecars",

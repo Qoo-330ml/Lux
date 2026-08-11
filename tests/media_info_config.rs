@@ -33,6 +33,8 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
         "configFields": [
             {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "required": true, "optionsSource": "media-libraries"},
             {"key": "concurrency", "label": "并发数", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 64},
+            {"key": "mediaInfoEnabled", "label": "提取媒体信息", "type": "toggle", "defaultValue": true},
+            {"key": "thumbnailEnabled", "label": "补全 STRM 缩略图", "type": "toggle", "defaultValue": false},
             {"key": "existingInfoPolicy", "label": "已有媒体信息处理方式", "type": "select", "defaultValue": "SKIP", "options": [{"value": "SKIP", "label": "跳过已有媒体信息"}, {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}]},
             {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": true},
             {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 3 * * *"}
@@ -92,6 +94,8 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
     let values = Map::from_iter([
         ("libraryIds".to_owned(), json!([library.id.to_string()])),
         ("concurrency".to_owned(), json!(4)),
+        ("mediaInfoEnabled".to_owned(), Value::Bool(false)),
+        ("thumbnailEnabled".to_owned(), Value::Bool(true)),
         (
             "existingInfoPolicy".to_owned(),
             Value::String("OVERWRITE".to_owned()),
@@ -136,6 +140,8 @@ async fn media_info_plugin_config_exposes_libraries_and_drives_settings()
     let settings = plugins.media_info_settings().await?;
     assert_eq!(settings.library_ids, vec![library.id]);
     assert_eq!(settings.concurrency, 4);
+    assert!(!settings.media_info_enabled);
+    assert!(settings.thumbnail_enabled);
     assert!(settings.include_ready);
     assert!(!settings.write_sidecars);
     assert_eq!(settings.schedule, "0 4 * * *");

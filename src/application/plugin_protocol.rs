@@ -409,6 +409,8 @@ pub struct MediaProbeRpcResult {
     pub duration_ticks: Option<i64>,
     pub bitrate: Option<i64>,
     pub streams: Vec<MediaProbeRpcStream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_jpeg_base64: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

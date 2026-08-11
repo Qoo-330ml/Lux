@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::{
+    fs,
     sync::{Mutex, Semaphore},
     task::JoinSet,
 };
@@ -14,9 +16,10 @@ use uuid::Uuid;
 
 use crate::{
     application::{
+        images::write_image_atomically,
         plugin_runtime::PluginRuntimeError,
-        plugins::{PluginService, PluginServiceError},
-        probe::{MediaProbeResult, safe_media_path, write_media_info_sidecar},
+        plugins::{MediaProbeOutput, PluginService, PluginServiceError},
+        probe::{safe_media_path, write_media_info_sidecar},
         strm_probe_policy::validate_remote_media_url,
     },
     domain::ids::LibraryId,
@@ -31,6 +34,7 @@ const MAX_LIBRARY_COUNT: usize = 64;
 const MAX_CONCURRENCY: i64 = 64;
 const SOURCE_PAGE_SIZE: i64 = 500;
 const JOB_ERROR: &str = "one or more STRM media sources failed";
+const MAX_STRM_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct StrmProbeService {
@@ -61,6 +65,8 @@ impl StrmProbeService {
         concurrency: i64,
         include_ready: bool,
         write_sidecars: bool,
+        media_info_enabled: bool,
+        thumbnail_enabled: bool,
     ) -> Result<Vec<StrmProbeJob>, StrmProbeError> {
         if library_ids.is_empty() || library_ids.len() > MAX_LIBRARY_COUNT {
             return Err(StrmProbeError::InvalidLibraryCount);
@@ -104,6 +110,8 @@ impl StrmProbeService {
                     concurrency,
                     include_ready,
                     write_sidecars,
+                    media_info_enabled,
+                    thumbnail_enabled,
                     total_count,
                 })
                 .await?;
@@ -124,6 +132,8 @@ impl StrmProbeService {
             settings.concurrency,
             settings.include_ready,
             settings.write_sidecars,
+            settings.media_info_enabled,
+            settings.thumbnail_enabled,
         )
         .await
     }
@@ -204,6 +214,8 @@ impl StrmProbeService {
             job.concurrency,
             job.include_ready,
             job.write_sidecars,
+            job.media_info_enabled,
+            job.thumbnail_enabled,
         )
         .await?
         .into_iter()
@@ -281,8 +293,18 @@ impl StrmProbeService {
                 let service = self.clone();
                 let semaphore = operation_semaphore.clone();
                 let include_ready = job.include_ready;
+                let media_info_enabled = job.media_info_enabled;
+                let thumbnail_enabled = job.thumbnail_enabled;
                 pending.spawn(async move {
-                    service.probe_source(source, semaphore, include_ready).await
+                    service
+                        .probe_source(
+                            source,
+                            semaphore,
+                            include_ready,
+                            media_info_enabled,
+                            thumbnail_enabled,
+                        )
+                        .await
                 });
             }
             if cancelled {
@@ -347,26 +369,44 @@ impl StrmProbeService {
         source: StoredStrmMediaSource,
         semaphore: Arc<Semaphore>,
         include_ready: bool,
+        media_info_enabled: bool,
+        thumbnail_enabled: bool,
     ) -> SourceOutcome {
         let path = match safe_media_path(&source.root_path, &source.relative_path) {
             Ok(path) => path,
             Err(error) => {
-                return SourceOutcome::failed(source.source_id, "FAILED", error.to_string());
+                return SourceOutcome::failed(&source.source_id, "FAILED", error.to_string());
             }
         };
-        if source.probe_status == "READY" && !include_ready && source.has_media_info {
+        let media_info_needed = media_info_enabled && (include_ready || !source.has_media_info);
+        if thumbnail_enabled
+            && safe_strm_thumbnail_target(&path, &source.root_path)
+                .await
+                .is_none()
+        {
+            return SourceOutcome::failed(
+                &source.source_id,
+                "FAILED",
+                "STRM thumbnail path is outside the library root".to_owned(),
+            );
+        }
+        let thumbnail_needed = thumbnail_enabled
+            && usable_strm_thumbnail(&path, &source.root_path, source.thumbnail_path.as_deref())
+                .await
+                .is_none();
+        if !media_info_needed && !thumbnail_needed {
             return SourceOutcome::skipped(source.source_id);
         }
         let Some(url) = source.external_url else {
             return SourceOutcome::failed(
-                source.source_id,
+                &source.source_id,
                 "FAILED",
                 "STRM source has no external URL".to_owned(),
             );
         };
         if !validate_remote_media_url(&url) {
             return SourceOutcome::failed(
-                source.source_id,
+                &source.source_id,
                 "FAILED",
                 "STRM source URL is not allowed".to_owned(),
             );
@@ -375,18 +415,29 @@ impl StrmProbeService {
             Ok(permit) => permit,
             Err(_) => {
                 return SourceOutcome::failed(
-                    source.source_id,
+                    &source.source_id,
                     "FAILED",
                     "STRM probe concurrency is unavailable".to_owned(),
                 );
             }
         };
-        let result = self.plugins.probe_media(&url).await;
+        let result = self
+            .plugins
+            .probe_media_with_options(&url, media_info_needed, thumbnail_needed)
+            .await;
         drop(permit);
         match result {
-            Ok(result) => SourceOutcome::ready(source.source_id, path, result),
+            Ok(result) => SourceOutcome::ready(
+                source.source_id,
+                source.item_id,
+                source.root_path,
+                path,
+                result,
+                media_info_needed,
+                thumbnail_needed,
+            ),
             Err(error) => {
-                SourceOutcome::failed(source.source_id, failure_status(&error), error.to_string())
+                SourceOutcome::failed(&source.source_id, failure_status(&error), error.to_string())
             }
         }
     }
@@ -409,60 +460,200 @@ impl StrmProbeService {
                 .await?;
             return Ok(1);
         };
-        let details = result
-            .streams
-            .iter()
-            .map(|stream| {
-                if stream.details.is_empty() {
-                    None
-                } else {
-                    serde_json::to_string(&stream.details).ok()
+        if outcome.media_info_needed {
+            let details = result
+                .media
+                .streams
+                .iter()
+                .map(|stream| {
+                    if stream.details.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&stream.details).ok()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let streams = result
+                .media
+                .streams
+                .iter()
+                .zip(details.iter())
+                .map(|(stream, details)| MediaStreamUpdate {
+                    stream_index: stream.stream_index,
+                    stream_type: stream.stream_type.as_str(),
+                    codec: stream.codec.as_deref(),
+                    language: stream.language.as_deref(),
+                    title: stream.title.as_deref(),
+                    details_json: details.as_deref(),
+                    external_path: None,
+                    is_external: false,
+                    is_default: stream.is_default,
+                    is_forced: stream.is_forced,
+                })
+                .collect::<Vec<_>>();
+            self.database
+                .save_media_probe(MediaProbeUpdate {
+                    source_id: &outcome.source_id,
+                    container: result.media.container.as_deref(),
+                    source_size: result.media.source_size,
+                    duration_ticks: result.media.duration_ticks,
+                    bitrate: result.media.bitrate,
+                    streams: &streams,
+                })
+                .await?;
+            if job.write_sidecars
+                && write_media_info_sidecar(&outcome.path, &result.media)
+                    .await
+                    .is_err()
+            {
+                self.database
+                    .mark_media_probe_failed(
+                        &outcome.source_id,
+                        "FAILED",
+                        "media info sidecar write failed",
+                    )
+                    .await?;
+                return Ok(1);
+            }
+        }
+        if outcome.thumbnail_needed {
+            let Some(thumbnail) = result.thumbnail_jpeg.as_deref() else {
+                self.database
+                    .mark_media_probe_failed(
+                        &outcome.source_id,
+                        "FAILED",
+                        "thumbnail output is missing",
+                    )
+                    .await?;
+                return Ok(1);
+            };
+            if !is_valid_jpeg(thumbnail) {
+                self.database
+                    .mark_media_probe_failed(
+                        &outcome.source_id,
+                        "FAILED",
+                        "thumbnail output is invalid",
+                    )
+                    .await?;
+                return Ok(1);
+            }
+            let target = match safe_strm_thumbnail_target(&outcome.path, &outcome.root_path).await {
+                Some(path) => path,
+                None => {
+                    self.database
+                        .mark_media_probe_failed(
+                            &outcome.source_id,
+                            "FAILED",
+                            "STRM path has no valid thumbnail name",
+                        )
+                        .await?;
+                    return Ok(1);
                 }
-            })
-            .collect::<Vec<_>>();
-        let streams = result
-            .streams
-            .iter()
-            .zip(details.iter())
-            .map(|(stream, details)| MediaStreamUpdate {
-                stream_index: stream.stream_index,
-                stream_type: stream.stream_type.as_str(),
-                codec: stream.codec.as_deref(),
-                language: stream.language.as_deref(),
-                title: stream.title.as_deref(),
-                details_json: details.as_deref(),
-                external_path: None,
-                is_external: false,
-                is_default: stream.is_default,
-                is_forced: stream.is_forced,
-            })
-            .collect::<Vec<_>>();
-        self.database
-            .save_media_probe(MediaProbeUpdate {
-                source_id: &outcome.source_id,
-                container: result.container.as_deref(),
-                source_size: result.source_size,
-                duration_ticks: result.duration_ticks,
-                bitrate: result.bitrate,
-                streams: &streams,
-            })
-            .await?;
-        if job.write_sidecars
-            && write_media_info_sidecar(&outcome.path, &result)
+            };
+            if write_image_atomically(&target, thumbnail).await.is_err() {
+                self.database
+                    .mark_media_probe_failed(&outcome.source_id, "FAILED", "thumbnail write failed")
+                    .await?;
+                return Ok(1);
+            }
+            let file_size =
+                i64::try_from(thumbnail.len()).map_err(|_| StrmProbeError::WorkerFailed)?;
+            let content_tag = hex_sha256(thumbnail);
+            if self
+                .database
+                .upsert_item_image(
+                    &outcome.item_id,
+                    "THUMB",
+                    &target,
+                    file_size,
+                    &content_tag,
+                    "STRM_FFMPEG",
+                )
                 .await
                 .is_err()
-        {
-            self.database
-                .mark_media_probe_failed(
-                    &outcome.source_id,
-                    "FAILED",
-                    "media info sidecar write failed",
-                )
-                .await?;
-            return Ok(1);
+            {
+                self.database
+                    .mark_media_probe_failed(
+                        &outcome.source_id,
+                        "FAILED",
+                        "thumbnail registration failed",
+                    )
+                    .await?;
+                return Ok(1);
+            }
         }
         Ok(0)
     }
+}
+
+fn is_valid_jpeg(bytes: &[u8]) -> bool {
+    bytes.len() >= 4
+        && bytes.len() <= MAX_STRM_THUMBNAIL_BYTES
+        && bytes.starts_with(&[0xff, 0xd8])
+        && bytes.ends_with(&[0xff, 0xd9])
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn strm_thumbnail_path(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(path.with_file_name(format!("{stem}-thumb.jpg")))
+}
+
+async fn safe_strm_thumbnail_target(media_path: &Path, root_path: &str) -> Option<PathBuf> {
+    let target = strm_thumbnail_path(media_path)?;
+    let root = fs::canonicalize(root_path).await.ok()?;
+    let parent = target.parent()?;
+    let canonical_parent = fs::canonicalize(parent).await.ok()?;
+    canonical_parent.starts_with(root).then_some(target)
+}
+
+async fn usable_strm_thumbnail(
+    media_path: &Path,
+    root_path: &str,
+    registered_path: Option<&str>,
+) -> Option<PathBuf> {
+    let root = fs::canonicalize(root_path).await.ok()?;
+    let expected = strm_thumbnail_path(media_path)?;
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(registered_path) = registered_path {
+        candidates.push(PathBuf::from(registered_path));
+    }
+    candidates.push(expected);
+    for candidate in candidates {
+        let Ok(metadata) = fs::symlink_metadata(&candidate).await else {
+            continue;
+        };
+        let file_type = metadata.file_type();
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let Ok(canonical) = fs::canonicalize(&candidate).await else {
+            continue;
+        };
+        if !canonical.starts_with(&root) {
+            continue;
+        }
+        let Ok(metadata) = fs::metadata(&canonical).await else {
+            continue;
+        };
+        let Ok(size) = usize::try_from(metadata.len()) else {
+            continue;
+        };
+        if size == 0 || size > MAX_STRM_THUMBNAIL_BYTES {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&canonical).await else {
+            continue;
+        };
+        if is_valid_jpeg(&bytes) {
+            return Some(canonical);
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -475,6 +666,8 @@ pub struct StrmProbeJob {
     pub concurrency: i64,
     pub include_ready: bool,
     pub write_sidecars: bool,
+    pub media_info_enabled: bool,
+    pub thumbnail_enabled: bool,
     pub cursor: Option<String>,
     pub processed_count: i64,
     pub total_count: i64,
@@ -491,6 +684,8 @@ fn strm_probe_job(job: StoredStrmProbeJob) -> StrmProbeJob {
         concurrency: job.concurrency,
         include_ready: job.include_ready,
         write_sidecars: job.write_sidecars,
+        media_info_enabled: job.media_info_enabled,
+        thumbnail_enabled: job.thumbnail_enabled,
         cursor: job.cursor,
         processed_count: job.processed_count,
         total_count: job.total_count,
@@ -552,20 +747,36 @@ mod tests {
 
 struct SourceOutcome {
     source_id: String,
+    item_id: String,
+    root_path: String,
     path: PathBuf,
-    result: Option<MediaProbeResult>,
+    result: Option<MediaProbeOutput>,
+    media_info_needed: bool,
+    thumbnail_needed: bool,
     skipped: bool,
     failure_status: String,
     error: String,
 }
 
 impl SourceOutcome {
-    fn ready(source_id: String, path: PathBuf, result: MediaProbeResult) -> Self {
+    fn ready(
+        source_id: String,
+        item_id: String,
+        root_path: String,
+        path: PathBuf,
+        result: MediaProbeOutput,
+        media_info_needed: bool,
+        thumbnail_needed: bool,
+    ) -> Self {
         Self {
             source_id,
+            item_id,
+            root_path,
             path,
             result: Some(result),
             skipped: false,
+            media_info_needed,
+            thumbnail_needed,
             failure_status: String::new(),
             error: String::new(),
         }
@@ -574,20 +785,28 @@ impl SourceOutcome {
     fn skipped(source_id: String) -> Self {
         Self {
             source_id,
+            item_id: String::new(),
+            root_path: String::new(),
             path: PathBuf::new(),
             result: None,
             skipped: true,
+            media_info_needed: false,
+            thumbnail_needed: false,
             failure_status: String::new(),
             error: String::new(),
         }
     }
 
-    fn failed(source_id: String, status: &str, error: String) -> Self {
+    fn failed(source_id: &str, status: &str, error: String) -> Self {
         Self {
-            source_id,
+            source_id: source_id.to_owned(),
+            item_id: String::new(),
+            root_path: String::new(),
             path: PathBuf::new(),
             result: None,
             skipped: false,
+            media_info_needed: false,
+            thumbnail_needed: false,
             failure_status: status.to_owned(),
             error,
         }
@@ -598,7 +817,10 @@ fn failure_status(error: &PluginServiceError) -> &'static str {
     match error {
         PluginServiceError::Runtime(PluginRuntimeError::Timeout) => "TIMEOUT",
         PluginServiceError::Runtime(PluginRuntimeError::Plugin { code, .. })
-            if code == "MEDIA_PROBE_TIMEOUT" =>
+            if matches!(
+                code.as_str(),
+                "MEDIA_PROBE_TIMEOUT" | "MEDIA_THUMBNAIL_TIMEOUT"
+            ) =>
         {
             "TIMEOUT"
         }

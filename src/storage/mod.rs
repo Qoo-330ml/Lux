@@ -2370,8 +2370,9 @@ impl Database {
         self.query(
             "INSERT INTO strm_probe_jobs (
                 id, operation_id, library_id, status, concurrency,
-                include_ready, write_sidecars, total_count
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?)",
+                include_ready, write_sidecars, media_info_enabled,
+                thumbnail_enabled, total_count
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(job.operation_id)
@@ -2379,6 +2380,8 @@ impl Database {
         .bind(job.concurrency)
         .bind(job.include_ready)
         .bind(job.write_sidecars)
+        .bind(job.media_info_enabled)
+        .bind(job.thumbnail_enabled)
         .bind(job.total_count)
         .execute(&self.pool)
         .await
@@ -2430,7 +2433,8 @@ impl Database {
     ) -> Result<Option<StoredStrmProbeJob>, StorageError> {
         self.query(
             "SELECT id, operation_id, library_id, status, concurrency,
-                    include_ready, write_sidecars, cursor, processed_count,
+                    include_ready, write_sidecars, media_info_enabled,
+                    thumbnail_enabled, cursor, processed_count,
                     total_count, cancel_requested, error
              FROM strm_probe_jobs WHERE id = ?",
         )
@@ -2453,7 +2457,8 @@ impl Database {
         let rows = if let Some(status) = status {
             self.query(
                 "SELECT id, operation_id, library_id, status, concurrency,
-                        include_ready, write_sidecars, cursor, processed_count,
+                        include_ready, write_sidecars, media_info_enabled,
+                        thumbnail_enabled, cursor, processed_count,
                         total_count, cancel_requested, error
                  FROM strm_probe_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -2466,7 +2471,8 @@ impl Database {
         } else {
             self.query(
                 "SELECT id, operation_id, library_id, status, concurrency,
-                        include_ready, write_sidecars, cursor, processed_count,
+                        include_ready, write_sidecars, media_info_enabled,
+                        thumbnail_enabled, cursor, processed_count,
                         total_count, cancel_requested, error
                  FROM strm_probe_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -7365,19 +7371,23 @@ impl Database {
     ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
         let rows = if let Some(after_source_id) = after_source_id {
             self.query(
-                "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
+                "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
                         ) OR ms.duration_ticks IS NOT NULL
                             OR ms.bitrate IS NOT NULL
                             OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
-                            THEN 1 ELSE 0 END AS has_media_info,
-                        lr.canonical_path AS root_path, fe.relative_path
+                        THEN 1 ELSE 0 END AS has_media_info,
+                        lr.canonical_path AS root_path, fe.relative_path,
+                        ii.local_path AS thumbnail_path
                  FROM media_sources ms
                  JOIN media_items mi ON mi.id = ms.item_id
                  JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                  JOIN library_roots lr ON lr.id = fe.library_root_id
+                 LEFT JOIN item_images ii
+                   ON ii.item_id = ms.item_id AND ii.image_type = 'THUMB'
+                  AND ii.image_index = 0
                  WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
                    AND fe.is_missing = 0 AND ms.id > ?
                  ORDER BY ms.id, fe.relative_path
@@ -7390,19 +7400,23 @@ impl Database {
             .await
         } else {
             self.query(
-                "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
+                "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
                         ) OR ms.duration_ticks IS NOT NULL
                             OR ms.bitrate IS NOT NULL
                             OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
-                            THEN 1 ELSE 0 END AS has_media_info,
-                        lr.canonical_path AS root_path, fe.relative_path
+                        THEN 1 ELSE 0 END AS has_media_info,
+                        lr.canonical_path AS root_path, fe.relative_path,
+                        ii.local_path AS thumbnail_path
                  FROM media_sources ms
                  JOIN media_items mi ON mi.id = ms.item_id
                  JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                  JOIN library_roots lr ON lr.id = fe.library_root_id
+                 LEFT JOIN item_images ii
+                   ON ii.item_id = ms.item_id AND ii.image_type = 'THUMB'
+                  AND ii.image_index = 0
                  WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
                    AND fe.is_missing = 0
                  ORDER BY ms.id, fe.relative_path
@@ -7417,11 +7431,12 @@ impl Database {
             rows.into_iter()
                 .map(|row| StoredStrmMediaSource {
                     source_id: row.get("source_id"),
-                    probe_status: row.get("probe_status"),
+                    item_id: row.get("item_id"),
                     has_media_info: row.get::<i64, _>("has_media_info") != 0,
                     external_url: row.get("external_url"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
+                    thumbnail_path: row.get("thumbnail_path"),
                 })
                 .collect()
         })
@@ -8712,6 +8727,8 @@ pub(crate) struct StoredStrmProbeJob {
     pub(crate) concurrency: i64,
     pub(crate) include_ready: bool,
     pub(crate) write_sidecars: bool,
+    pub(crate) media_info_enabled: bool,
+    pub(crate) thumbnail_enabled: bool,
     pub(crate) cursor: Option<String>,
     pub(crate) processed_count: i64,
     pub(crate) total_count: i64,
@@ -8726,6 +8743,8 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) concurrency: i64,
     pub(crate) include_ready: bool,
     pub(crate) write_sidecars: bool,
+    pub(crate) media_info_enabled: bool,
+    pub(crate) thumbnail_enabled: bool,
     pub(crate) total_count: i64,
 }
 
@@ -8790,6 +8809,8 @@ fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
         concurrency: row.get("concurrency"),
         include_ready: row.get::<i64, _>("include_ready") != 0,
         write_sidecars: row.get::<i64, _>("write_sidecars") != 0,
+        media_info_enabled: row.get::<i64, _>("media_info_enabled") != 0,
+        thumbnail_enabled: row.get::<i64, _>("thumbnail_enabled") != 0,
         cursor: row.get("cursor"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),
@@ -9455,11 +9476,12 @@ pub(crate) struct StoredThumbnailSource {
 #[derive(Debug)]
 pub(crate) struct StoredStrmMediaSource {
     pub(crate) source_id: String,
-    pub(crate) probe_status: String,
+    pub(crate) item_id: String,
     pub(crate) has_media_info: bool,
     pub(crate) external_url: Option<String>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+    pub(crate) thumbnail_path: Option<String>,
 }
 
 #[derive(Debug)]

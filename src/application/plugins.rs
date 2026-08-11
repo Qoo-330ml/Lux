@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Map, Value, json};
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
@@ -51,6 +52,7 @@ const PLUGIN_CONFIG_DIR: &str = "plugin-config";
 const MEDIA_INFO_EXISTING_INFO_POLICY_KEY: &str = "existingInfoPolicy";
 const MEDIA_INFO_EXISTING_INFO_POLICY_SKIP: &str = "SKIP";
 const MEDIA_INFO_EXISTING_INFO_POLICY_OVERWRITE: &str = "OVERWRITE";
+const MAX_MEDIA_PROBE_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct TmdbConfigUpdate<'a> {
     pub api_key: Option<&'a str>,
@@ -67,9 +69,16 @@ pub struct MediaInfoSettings {
     pub concurrency: i64,
     pub include_ready: bool,
     pub write_sidecars: bool,
+    pub media_info_enabled: bool,
+    pub thumbnail_enabled: bool,
     pub schedule: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaProbeOutput {
+    pub media: MediaProbeResult,
+    pub thumbnail_jpeg: Option<Vec<u8>>,
+}
 fn tmdb_config_fields() -> Vec<PluginConfigField> {
     let options = tmdb_language_options()
         .into_iter()
@@ -565,6 +574,8 @@ impl PluginService {
                 .get("writeSidecars")
                 .and_then(Value::as_bool)
                 .ok_or(PluginServiceError::InvalidConfig)?,
+            media_info_enabled: optional_bool_config(&values, "mediaInfoEnabled", true)?,
+            thumbnail_enabled: optional_bool_config(&values, "thumbnailEnabled", false)?,
             schedule,
         })
     }
@@ -703,6 +714,17 @@ impl PluginService {
     }
 
     pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult, PluginServiceError> {
+        self.probe_media_with_options(url, true, false)
+            .await
+            .map(|output| output.media)
+    }
+
+    pub async fn probe_media_with_options(
+        &self,
+        url: &str,
+        include_media_info: bool,
+        include_thumbnail: bool,
+    ) -> Result<MediaProbeOutput, PluginServiceError> {
         let plugin = self
             .catalog
             .get(MEDIA_INFO_PLUGIN_ID)
@@ -726,13 +748,17 @@ impl PluginService {
             .call_isolated(
                 MEDIA_INFO_PLUGIN_ID,
                 "media.probe",
-                serde_json::json!({ "url": url }),
+                serde_json::json!({
+                    "url": url,
+                    "includeMediaInfo": include_media_info,
+                    "includeThumbnail": include_thumbnail,
+                }),
             )
             .await
             .map_err(PluginServiceError::Runtime)?;
         let response: MediaProbeRpcResult =
             serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
-        media_probe_result(response).ok_or(PluginServiceError::InvalidResponse)
+        media_probe_output(response).ok_or(PluginServiceError::InvalidResponse)
     }
 
     pub async fn scraper_client(
@@ -977,6 +1003,18 @@ fn media_info_schedule(values: &Map<String, Value>) -> Result<String, PluginServ
     Ok(schedule.to_owned())
 }
 
+fn optional_bool_config(
+    values: &Map<String, Value>,
+    key: &str,
+    default: bool,
+) -> Result<bool, PluginServiceError> {
+    values
+        .get(key)
+        .map(Value::as_bool)
+        .unwrap_or(Some(default))
+        .ok_or(PluginServiceError::InvalidConfig)
+}
+
 async fn secret_file_configured(config_dir: &std::path::Path, file_name: &str) -> bool {
     tokio::fs::read_to_string(config_dir.join(file_name))
         .await
@@ -1182,7 +1220,7 @@ impl std::error::Error for PluginServiceError {
     }
 }
 
-fn media_probe_result(response: MediaProbeRpcResult) -> Option<MediaProbeResult> {
+fn media_probe_output(response: MediaProbeRpcResult) -> Option<MediaProbeOutput> {
     if response
         .container
         .as_ref()
@@ -1230,13 +1268,38 @@ fn media_probe_result(response: MediaProbeRpcResult) -> Option<MediaProbeResult>
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(MediaProbeResult {
-        container: response.container,
-        source_size: response.source_size,
-        duration_ticks: response.duration_ticks,
-        bitrate: response.bitrate,
-        streams,
+    let thumbnail_jpeg = match response.thumbnail_jpeg_base64 {
+        Some(value)
+            if value.len() <= (MAX_MEDIA_PROBE_THUMBNAIL_BYTES * 4 / 3).saturating_add(4) =>
+        {
+            Some(BASE64.decode(value).ok()?)
+        }
+        Some(_) => return None,
+        None => None,
+    };
+    if thumbnail_jpeg
+        .as_ref()
+        .is_some_and(|value| !is_valid_jpeg(value))
+    {
+        return None;
+    }
+    Some(MediaProbeOutput {
+        media: MediaProbeResult {
+            container: response.container,
+            source_size: response.source_size,
+            duration_ticks: response.duration_ticks,
+            bitrate: response.bitrate,
+            streams,
+        },
+        thumbnail_jpeg,
     })
+}
+
+fn is_valid_jpeg(bytes: &[u8]) -> bool {
+    bytes.len() <= MAX_MEDIA_PROBE_THUMBNAIL_BYTES
+        && bytes.len() >= 4
+        && bytes.starts_with(&[0xff, 0xd8])
+        && bytes.ends_with(&[0xff, 0xd9])
 }
 
 const MAX_IP_LOCATION_FIELD_CHARS: usize = 256;

@@ -1,6 +1,7 @@
 use luxd::application::plugin_protocol::{
-    IP_LOCATION_CAPABILITY, IpLocationRpcResult, PLUGIN_API_VERSION, PLUGIN_CATEGORY_NETWORK,
-    PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_IP_LOCATION, PluginManifest, PluginRequest,
+    IP_LOCATION_CAPABILITY, IpLocationRpcResult, MediaProbeRpcResult, PLUGIN_API_VERSION,
+    PLUGIN_CATEGORY_NETWORK, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_IP_LOCATION, PluginManifest,
+    PluginRequest,
 };
 use serde_json::json;
 
@@ -113,6 +114,20 @@ fn accepts_a_media_probe_plugin_manifest() {
     );
     assert_eq!(manifest.config_fields[1].input_type, "number");
     assert_eq!(manifest.config_fields[1].default_value, Some(json!(2)));
+}
+
+#[test]
+fn media_probe_result_can_carry_a_thumbnail() {
+    let result = MediaProbeRpcResult {
+        container: Some("matroska".to_owned()),
+        source_size: None,
+        duration_ticks: Some(10_000_000),
+        bitrate: None,
+        streams: Vec::new(),
+        thumbnail_jpeg_base64: Some("/9j/test".to_owned()),
+    };
+    let value = serde_json::to_value(result).expect("media probe result should serialize");
+    assert_eq!(value["thumbnailJpegBase64"], "/9j/test");
 }
 
 #[test]
