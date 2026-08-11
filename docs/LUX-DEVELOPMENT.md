@@ -1794,6 +1794,7 @@ services:
 | LUX-166 | src/application/metadata_paths.rs、tests/metadata_paths.rs、docs/ |
 | LUX-167 | src/application/metadata_objects.rs、src/application/collections.rs、src/api/mod.rs、tests/、docs/ |
 | LUX-168 | src/application/metadata.rs、src/application/nfo.rs、src/application/scraper.rs、src/application/tmdb.rs、src/application/tmdb_plugin.rs、src/application/candidates.rs、src/bin/lux-plugin-tmdb.rs、tests/、docs/ |
+| LUX-169 | plugins/org.lux.tmdb/manifest.json、src/application/plugins.rs、src/application/plugin_store.rs、scripts/package-tmdb-plugin.sh、Dockerfile、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3621,6 +3622,28 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 - 不增加 genres、studios、导演或编剧的数据库关系、筛选 API 或深度浏览 API。
 
 依赖：LUX-050、LUX-051、LUX-054、LUX-055、LUX-056、LUX-142。
+
+#### LUX-169：TMDb 插件版本与本地包更新
+
+范围：将独立 `org.lux.tmdb` 插件从 `0.1.4` 升级到 `0.1.5`，同步内置插件目录、打包脚本、Docker
+默认参数和本地 Lux 插件包。该任务只更新版本和包产物，不改变插件 RPC 方法名、协议版本或凭据行为。
+
+验收：
+
+- [x] 源码 manifest、内置目录、打包脚本和 Docker 默认值统一为 `0.1.5`。
+- [x] 本地 `config/plugins` 使用包含当前 TMDb 刮削代码的 `org.lux.tmdb-0.1.5.zip`，旧包不再作为活动包。
+- [x] 包 manifest、SHA-256、平台入口和插件 RPC 健康/hello 校验通过。
+- [ ] Rust 构建、相关插件测试、格式和 Clippy 检查通过。
+
+验证备注：Rust 构建、格式、Clippy 和相关插件测试已通过；全量测试唯一失败项读取了默认 GitHub
+插件目录当前仍声明的 `0.1.4`，属于外部目录尚未同步到 `0.1.5`，不是本地包校验失败。
+
+明确不做：
+
+- 不升级 Lux 主程序 Cargo 版本。
+- 不改变插件协议、API Key 优先级、TMDb 请求限流或元数据字段。
+
+依赖：LUX-142、LUX-144、LUX-168。
 
 ## 26. 风险与缓解
 
