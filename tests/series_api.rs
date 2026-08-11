@@ -224,6 +224,23 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
             .all(|item| matches!(item["Type"].as_str(), Some("Movie" | "Series")))
     }));
 
+    let library_latest = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/Latest?ParentId={}&Limit=10",
+            admin.id, library.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(library_latest.status(), reqwest::StatusCode::OK);
+    let library_latest_body: Value = library_latest.json().await?;
+    assert!(library_latest_body.as_array().is_some_and(|items| {
+        !items.is_empty()
+            && items
+                .iter()
+                .all(|item| matches!(item["Type"].as_str(), Some("Movie" | "Series")))
+    }));
+
     let latest_children = client
         .get(format!(
             "{base_url}/Users/{}/Items/Latest?ParentId={series_id}&IncludeItemTypes=Episode&GroupItems=false&Limit=10",

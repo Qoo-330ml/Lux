@@ -225,6 +225,57 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(shows_view["CollectionType"], "tvshows");
     assert_eq!(shows_view["ChildCount"], 0);
 
+    let root = client
+        .get(format!("{base_url}/Users/{}/Items/Root", admin.id))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(root.status(), reqwest::StatusCode::OK);
+    let root_body: Value = root.json().await?;
+    assert_eq!(root_body["Id"], admin.id.to_string());
+    assert_eq!(root_body["Type"], "Folder");
+    assert_eq!(root_body["IsFolder"], true);
+    assert_eq!(root_body["ChildCount"], 2);
+
+    let modern_root = client
+        .get(format!("{base_url}/Items/Root?userId={}", admin.id))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(modern_root.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        modern_root.json::<Value>().await?["Id"],
+        admin.id.to_string()
+    );
+
+    let root_children = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&IncludeItemTypes=CollectionFolder&Limit=10",
+            admin.id, admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(root_children.status(), reqwest::StatusCode::OK);
+    let root_children_body: Value = root_children.json().await?;
+    assert_eq!(root_children_body["TotalRecordCount"], 2);
+    assert_eq!(root_children_body["Items"][0]["Type"], "CollectionFolder");
+    assert_eq!(root_children_body["Items"][0]["IsFolder"], true);
+
+    let filtered_root_children = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?IncludeItemTypes=CollectionFolder&Limit=10",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(filtered_root_children.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        filtered_root_children.json::<Value>().await?["TotalRecordCount"],
+        2
+    );
+
     let emby_library_detail = client
         .get(format!(
             "{base_url}/Users/{}/Items/{}?EnableUserData=true&Fields=CollectionType,ChildCount",

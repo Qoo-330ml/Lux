@@ -838,9 +838,10 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
             | ["api", "v1", "items", _, "children"]
             | ["api", "v1", "collections", _]
             | ["Users", _, "Items"]
-            | ["Users", _, "Items", "Resume" | "Latest" | "NextUp"]
+            | ["Users", _, "Items", "Root" | "Resume" | "Latest" | "NextUp"]
             | ["Shows", _, "Seasons" | "Episodes"]
             | ["Items"]
+            | ["Items", "Root"]
             | ["Search", "Hints"]
             | ["Items", _, "Children"]
     )
@@ -1124,6 +1125,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/{user_id}", get(emby_user))
         .route("/Users/{user_id}/Views", get(emby_user_views))
+        .route("/Users/{user_id}/Items/Root", get(emby_user_root))
         .route("/Users/{user_id}/Items/Resume", get(emby_user_resume))
         .route("/Users/{user_id}/Items/Latest", get(emby_user_latest))
         .route("/Users/{user_id}/Items/NextUp", get(emby_user_next_up))
@@ -1132,6 +1134,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Shows/{series_id}/Seasons", get(emby_show_seasons))
         .route("/Shows/{series_id}/Episodes", get(emby_show_episodes))
         .route("/Items", get(emby_items))
+        .route("/Items/Root", get(emby_items_root))
         .route("/Search/Hints", get(emby_search_hints))
         .route("/Items/{item_id}", get(emby_item))
         .route("/Items/{item_id}/Children", get(emby_collection_children))
@@ -1620,7 +1623,7 @@ async fn emby_logout(
 struct EmbyItemsQuery {
     #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey", default)]
     api_key: Option<String>,
-    #[serde(rename = "UserId", default)]
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
     user_id: Option<String>,
     #[serde(rename = "ParentId", default)]
     parent_id: Option<String>,
@@ -1770,48 +1773,146 @@ async fn emby_user_views(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    match libraries.list_libraries().await {
-        Ok(views) => {
-            let mut items = Vec::new();
-            for view in views {
-                let can_view = match access
-                    .can_view_library(principal, &view.library.id.to_string())
-                    .await
-                {
-                    Ok(can_view) => can_view,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
-                if view.library.is_enabled && can_view {
-                    let child_count = match database
-                        .count_catalog_items(Some(&view.library.id.to_string()))
-                        .await
-                    {
-                        Ok(count) => count,
-                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                    };
-                    items.push(emby_library_view_json(
-                        &view.library,
-                        &state.server_id,
-                        child_count,
-                    ));
-                }
-            }
+    match emby_visible_library_items(&state, principal).await {
+        Ok(items) => {
             let total = items.len();
-            Json(json!({ "Items": items, "TotalRecordCount": total, "StartIndex": 0 }))
-                .into_response()
+            Json(json!({
+                "Items": items,
+                "TotalRecordCount": total,
+                "StartIndex": 0,
+            }))
+            .into_response()
         }
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(status) => status.into_response(),
     }
+}
+
+async fn emby_user_root(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    emby_user_root_response(&state, AccessPrincipal::new(user.id, user.is_admin)).await
+}
+
+async fn emby_items_root(
+    headers: HeaderMap,
+    Query(query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let requested_user_id = query.user_id.unwrap_or_else(|| user.id.to_string());
+    if let Err(status) = ensure_emby_user_scope(&user, &requested_user_id) {
+        return status.into_response();
+    }
+    emby_user_root_response(&state, AccessPrincipal::new(user.id, user.is_admin)).await
+}
+
+async fn emby_user_root_response(state: &AppState, principal: AccessPrincipal) -> Response {
+    let items = match emby_visible_library_items(state, principal).await {
+        Ok(items) => items,
+        Err(status) => return status.into_response(),
+    };
+    Json(json!({
+        "Name": "Media Folders",
+        "SortName": "Media Folders",
+        "Id": principal.user_id.to_string(),
+        "ServerId": state.server_id,
+        "Type": "Folder",
+        "IsFolder": true,
+        "MediaType": "Video",
+        "ChildCount": items.len(),
+        "RecursiveItemCount": items.len(),
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "UserData": {
+            "PlaybackPositionTicks": 0,
+            "PlayCount": 0,
+            "IsFavorite": false,
+            "Played": false,
+        },
+    }))
+    .into_response()
+}
+
+async fn emby_visible_library_items(
+    state: &AppState,
+    principal: AccessPrincipal,
+) -> Result<Vec<Value>, StatusCode> {
+    let Some(access) = state.access.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let views = libraries
+        .list_libraries()
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut items = Vec::new();
+    for view in views {
+        let library_id = view.library.id.to_string();
+        let can_view = access
+            .can_view_library(principal, &library_id)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if !view.library.is_enabled || !can_view {
+            continue;
+        }
+        let child_count =
+            emby_library_root_count(state, principal, &library_id, view.library.kind).await?;
+        items.push(emby_library_view_json(
+            &view.library,
+            &state.server_id,
+            child_count,
+        ));
+    }
+    Ok(items)
+}
+
+async fn emby_library_root_count(
+    state: &AppState,
+    principal: AccessPrincipal,
+    library_id: &str,
+    kind: LibraryKind,
+) -> Result<i64, StatusCode> {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let item_types = match kind {
+        LibraryKind::Movie => vec!["MOVIE".to_owned()],
+        LibraryKind::Series => vec!["SERIES".to_owned()],
+        LibraryKind::Mixed => vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+    };
+    catalog
+        .list_library_items_filtered(
+            principal,
+            library_id,
+            &CatalogFilter {
+                item_types,
+                ..CatalogFilter::default()
+            },
+            0,
+            1,
+        )
+        .await
+        .map(|page| page.total)
+        .map_err(|error| match error {
+            CatalogError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
+            CatalogError::LibraryNotFound | CatalogError::AccessDenied => StatusCode::NOT_FOUND,
+        })
 }
 
 async fn emby_user_resume(
@@ -1862,7 +1963,14 @@ async fn emby_user_latest(
         return status.into_response();
     }
     let group_items = query.group_items.unwrap_or(true);
-    if group_items && query.parent_id.is_none() && query.include_item_types.is_none() {
+    let parent_is_library = query
+        .parent_id
+        .as_deref()
+        .is_some_and(|parent_id| parent_id.parse::<crate::domain::ids::LibraryId>().is_ok());
+    if group_items
+        && query.include_item_types.is_none()
+        && (query.parent_id.is_none() || parent_is_library)
+    {
         query.include_item_types = Some("Movie,Series".to_owned());
     }
     query.sort_by = Some("DateCreated".to_owned());
@@ -2297,6 +2405,18 @@ async fn emby_list_items(
     principal: AccessPrincipal,
     query: &EmbyItemsQuery,
 ) -> Response {
+    let root_id = principal.user_id.to_string();
+    if emby_query_targets_user_root_views(query, &root_id) {
+        return match emby_visible_library_items(state, principal).await {
+            Ok(items) => Json(json!({
+                "Items": items,
+                "TotalRecordCount": items.len(),
+                "StartIndex": 0,
+            }))
+            .into_response(),
+            Err(status) => status.into_response(),
+        };
+    }
     match emby_catalog_page_from_query(state, principal, query).await {
         Ok(page) => {
             let preferred_source_id = emby_compat_media_source_id(query.ids.as_deref(), &page);
@@ -2311,6 +2431,20 @@ async fn emby_list_items(
         }
         Err(status) => status.into_response(),
     }
+}
+
+fn emby_query_targets_user_root_views(query: &EmbyItemsQuery, root_id: &str) -> bool {
+    let parent_is_root = query.parent_id.as_deref() == Some(root_id);
+    let requests_folder_views = query.include_item_types.as_deref().is_some_and(|types| {
+        types.split(',').all(|item_type| {
+            matches!(
+                item_type.trim().to_ascii_lowercase().as_str(),
+                "folder" | "collectionfolder"
+            )
+        })
+    });
+    (parent_is_root && (query.include_item_types.is_none() || requests_folder_views))
+        || (query.parent_id.is_none() && requests_folder_views)
 }
 
 async fn emby_catalog_page_from_query(
@@ -2456,6 +2590,9 @@ async fn emby_item_response(
     principal: AccessPrincipal,
     item_id: &str,
 ) -> Response {
+    if item_id == principal.user_id.to_string() {
+        return emby_user_root_response(state, principal).await;
+    }
     if let Ok(library_id) = item_id.parse::<crate::domain::ids::LibraryId>()
         && let Some(libraries) = state.libraries.as_ref()
     {
@@ -2472,13 +2609,11 @@ async fn emby_item_response(
                     Ok(false) => return StatusCode::NOT_FOUND.into_response(),
                     Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
                 }
-                let Some(database) = state.database.as_ref() else {
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                };
-                let child_count = match database.count_catalog_items(Some(item_id)).await {
-                    Ok(count) => count,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
+                let child_count =
+                    match emby_library_root_count(state, principal, item_id, library.kind).await {
+                        Ok(count) => count,
+                        Err(status) => return status.into_response(),
+                    };
                 return Json(emby_library_view_json(
                     &library,
                     &state.server_id,
@@ -3485,19 +3620,28 @@ fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -
 fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count: i64) -> Value {
     json!({
         "Name": library.name,
+        "SortName": library.name,
         "Id": library.id,
         "ServerId": server_id,
         "Type": "CollectionFolder",
         "IsFolder": true,
+        "MediaType": "Video",
         "CollectionType": emby_collection_type(library.kind),
         "ChildCount": child_count,
         "PrimaryImageItemId": library.cover_image_tag.as_ref().map(|_| library.id.to_string()),
+        "PrimaryImageTag": library.cover_image_tag,
         "ImageTags": library
             .cover_image_tag
             .as_ref()
             .map(|tag| json!({"Primary": tag}))
             .unwrap_or_else(|| json!({})),
         "BackdropImageTags": [],
+        "UserData": {
+            "PlaybackPositionTicks": 0,
+            "PlayCount": 0,
+            "IsFavorite": false,
+            "Played": false,
+        },
     })
 }
 
