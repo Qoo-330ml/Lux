@@ -1963,10 +1963,10 @@ async fn emby_user_latest(
         return status.into_response();
     }
     let group_items = query.group_items.unwrap_or(true);
-    let parent_is_library = query
-        .parent_id
-        .as_deref()
-        .is_some_and(|parent_id| parent_id.parse::<crate::domain::ids::LibraryId>().is_ok());
+    let parent_is_library = match query.parent_id.as_deref() {
+        Some(parent_id) => emby_parent_is_library(&state, parent_id).await,
+        None => false,
+    };
     if group_items
         && query.include_item_types.is_none()
         && (query.parent_id.is_none() || parent_is_library)
@@ -2015,6 +2015,19 @@ async fn emby_user_latest(
         Ok(items) => Json(items).into_response(),
         Err(status) => status.into_response(),
     }
+}
+
+async fn emby_parent_is_library(state: &AppState, parent_id: &str) -> bool {
+    let Ok(library_id) = parent_id.parse::<crate::domain::ids::LibraryId>() else {
+        return false;
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return false;
+    };
+    matches!(
+        libraries.get_library(library_id).await,
+        Ok(library) if library.is_enabled
+    )
 }
 
 fn emby_latest_groups_children(query: &EmbyItemsQuery) -> bool {
