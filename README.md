@@ -10,6 +10,8 @@ Lux 是面向 NAS 的个人媒体服务端：用 Rust 提供高效、可诊断�
 
 Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、加载慢等痛点。虽然Emby的第三方客户端开发环境很好，大批量的第三方播放器涌现弥补了Emby的一些问题，但指标不治本，作为一个媒体管理者，打开emby网页对于我来说真的变成了一件很痛苦的事情。于是本项目因运而生，Lux兼容了Emby的大部分接口，可以直接使用第三方emby客户端进行连接Lux，获得很好的播放体验，同时媒体库的占用也大大降低，流畅性得到了提高。
 
+当然，还要说在前面的是，Lux现在不支持web播放，本身web播放，浏览器解码能力不行，体验只会差，可以配合比如harbor、vidhub、hills等优秀第三方emby客户端来连接Lux。
+
 ## 特性
 
 - 电影、电视剧和混合媒体库，支持一个媒体库配置多个根路径。
@@ -30,12 +32,16 @@ Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、�
 需要 Docker Engine 和 Docker Compose v2：
 
 ```bash
-git clone https://github.com/Qoo-330ml/Lux.git
-cd Lux
-
-mkdir -p config media
-docker compose pull
-docker compose up -d
+services:
+  lux:
+    image: pdzhou/lux:latest
+    container_name: lux
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./config:/config:rw
+      - ./media:/media:rw
+    restart: unless-stopped
 ```
 
 打开 <http://localhost:8097/>，按引导完成数据库选择和第一个管理员创建。
@@ -56,8 +62,34 @@ docker compose up -d
 PostgreSQL 不是 Lux 容器内的子进程。可以使用 Compose 的 `postgres` profile，也可以填写部署环境中已有的 PostgreSQL：
 
 ```bash
-export LUX_POSTGRES_PASSWORD='请替换为强密码'
-docker compose --profile postgres up -d
+services:
+  lux:
+    image: pdzhou/lux:latest
+    container_name: lux
+    user: "0:0"
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./config:/config:rw
+      - ./media:/media:rw
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lux-postgres
+    environment:
+      POSTGRES_DB: ${LUX_POSTGRES_DB:-lux}
+      POSTGRES_USER: ${LUX_POSTGRES_USER:-lux}
+      POSTGRES_PASSWORD: ${LUX_POSTGRES_PASSWORD:-}  #-后面填写密码
+    volumes:
+      # Store PostgreSQL data directly in the project directory.
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 ```
 
 在首次引导中选择 PostgreSQL 时，若使用本 Compose 提供的数据库，主机填写 `postgres`，端口填写 `5432`。数据库后端只能在创建第一个管理员之前选择；当前不支持已初始化实例在线切换，也不会自动执行 SQLite 到 PostgreSQL 的迁移。
@@ -202,8 +234,9 @@ Emby 路由、DTO 和认证兼容逻辑与 Lux 自有 API 保持边界，不直�
 | Harbor | 1.4.6（macOS arm64） | 添加、登录、进入媒体库并显示条目已验证 |
 | Lux Web | Chrome 150 smoke | 登录、筛选、详情、MP4 直放、收藏、账户、管理流程和多 viewport smoke 已验证 |
 | Infuse | 未测试 | 尚未形成可发布的兼容性结论 |
+| 网易爆米花 | 2.15.3（ios26） | 添加、登录、浏览、详情、本地直放、播放状态 |
 
-完整请求序列、版本、证据和已知差异见 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)。
+如果遇到有问题的第三方emby播放器，欢迎提issue。
 
 ## 已知限制
 
@@ -234,6 +267,7 @@ Emby 路由、DTO 和认证兼容逻辑与 Lux 自有 API 保持边界，不直�
 - 提交 PR 前运行与改动范围相关的检查，并在描述中说明改动文件、验收结果、测试结果和剩余风险。
 
 欢迎提交 issue 和 pull request；如果是客户端兼容性问题，请同时提供客户端版本、平台、脱敏后的请求路径、状态码和关键响应字段。
+
 
 ## License
 
