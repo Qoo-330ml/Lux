@@ -103,7 +103,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-button-glass, .lux-button-secondary { border-color: var(--lux-line); color: #fff; background: rgba(0,0,0,.28); backdrop-filter: blur(14px); }
 .lux-button-glass:hover, .lux-button-secondary:hover { border-color: rgba(255,255,255,.38); background: rgba(255,255,255,.1); }
 
-.lux-home-content { position: relative; z-index: 2; width: min(1400px, calc(100% - 48px)); margin: -24px auto 0; padding: 0 0 80px; }
+.lux-home-content { position: relative; z-index: 2; width: 92%; margin: -24px auto 0; padding: 0 0 80px; }
 .lux-section { margin-top: 52px; }
 .lux-section-heading, .lux-page-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
 .lux-section-heading h2 { margin: 0; font-size: 1.18rem; font-weight: 600; letter-spacing: -.025em; }
@@ -227,8 +227,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-empty-card { display: flex; flex: 1 1 100%; align-items: center; justify-content: space-between; min-height: 92px; padding: 17px 20px; border: 1px dashed var(--lux-line); border-radius: 14px; color: var(--lux-muted); background: rgba(255,255,255,.025); font-size: .88rem; }
 .lux-empty-card a { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
 
-.lux-page { width: min(1400px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 90px; }
-.lux-page-narrow { width: min(1280px, calc(100% - 48px)); }
+.lux-page { width: 92%; min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 90px; }
+.lux-page-narrow { width: 92%; }
 .lux-page-heading { display: block; margin-bottom: 38px; }
 .lux-page-heading h1 { margin: 10px 0 7px; font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.07em; }
 .lux-page-heading p { margin: 0; color: var(--lux-muted); }
@@ -252,7 +252,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-page { position: relative; min-height: 100vh; overflow: hidden; isolation: isolate; background: #08080a; }
 .lux-detail-backdrop { position: absolute; z-index: -3; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .58; filter: saturate(.78) brightness(.72) blur(1px); transform: scale(1.02); }
 .lux-detail-overlay { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg, rgba(5,5,6,.95), rgba(5,5,6,.7) 45%, rgba(5,5,6,.42)), linear-gradient(0deg, #050506 4%, transparent 58%); }
-.lux-detail-content { width: min(1280px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
+.lux-detail-content { width: 92%; min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
 .lux-hero-actions > .lux-media-actions { position: relative; top: auto; right: auto; align-self: center; }
 .lux-hero-actions > .lux-media-actions .lux-media-actions-trigger { width: 48px; height: 48px; }
 .lux-hero-actions > .lux-media-actions .lux-media-action-menu { top: 54px; right: 0; }
@@ -376,11 +376,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-episode-card-art > span { display: grid; place-items: center; height: 100%; padding: 12px; color: var(--lux-muted); font-size: .72rem; text-align: center; }
 .lux-episode-card strong { overflow: hidden; color: inherit; font-size: .78rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .lux-player-page { min-height: 100vh; padding: 100px 32px 42px; background: #050506; }
-.lux-player-topbar { display: flex; align-items: center; justify-content: space-between; width: min(1280px, 100%); margin: 0 auto 24px; color: #fff; }
+.lux-player-topbar { display: flex; align-items: center; justify-content: space-between; width: 92%; margin: 0 auto 24px; color: #fff; }
 .lux-player-topbar > a, .lux-player-topbar button { display: inline-grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--lux-line-soft); border-radius: 50%; color: #fff; background: rgba(255,255,255,.04); }
 .lux-player-topbar > span { overflow: hidden; padding: 0 20px; text-overflow: ellipsis; white-space: nowrap; }
 .lux-player-topbar > div { display: flex; gap: 9px; }
-.lux-player-frame { position: relative; width: min(1280px, 100%); margin: 0 auto; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 14px; background: #000; box-shadow: 0 25px 70px rgba(0,0,0,.36); }
+.lux-player-frame { position: relative; width: 92%; margin: 0 auto; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 14px; background: #000; box-shadow: 0 25px 70px rgba(0,0,0,.36); }
 .lux-video { display: block; width: 100%; max-height: calc(100vh - 190px); aspect-ratio: 16 / 9; background: #000; object-fit: contain; }
 .lux-player-controls { position: absolute; right: 18px; bottom: 16px; left: 18px; display: flex; align-items: center; gap: 12px; padding: 10px 13px; border: 1px solid rgba(255,255,255,.16); border-radius: 12px; color: #fff; background: rgba(15,15,18,.72); backdrop-filter: blur(15px); }
 .lux-player-controls button { display: grid; place-items: center; border: 0; color: inherit; background: transparent; }
@@ -423,7 +423,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-skeleton-row { height: 250px; margin-top: 22px; border-radius: 12px; }
 @keyframes lux-shimmer { to { background-position: -200% 0; } }
 
-.lux-admin-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); width: min(1400px, calc(100% - 48px)); min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 90px; background: var(--lux-bg); }
+.lux-admin-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); width: 92%; min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 90px; background: var(--lux-bg); }
 .lux-admin-sidebar { position: sticky; top: 32px; display: flex; flex-direction: column; height: max-content; padding: 0 16px 22px; border-right: 0; background: transparent; backdrop-filter: none; }
 .lux-admin-sidebar-heading { display: flex; align-items: center; gap: 11px; padding: 6px 10px 28px; border-bottom: 1px solid var(--lux-line-soft); }
 .lux-admin-sidebar-heading strong, .lux-admin-sidebar-heading small { display: block; }
@@ -868,7 +868,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-mobile-admin { display: flex; align-items: center; gap: 7px; padding: 10px 12px; border-top: 1px solid var(--lux-line-soft); color: var(--lux-subtle); font-size: .72rem; }
   .lux-hero { min-height: 680px; }
   .lux-hero-copy { margin-bottom: 74px; }
-  .lux-home-content, .lux-page, .lux-page-narrow { width: min(100% - 32px, 1400px); }
+  .lux-home-content, .lux-page, .lux-page-narrow { width: 92%; }
   .lux-detail-grid { grid-template-columns: minmax(200px, 250px) minmax(0, 1fr); gap: 28px; }
   .lux-detail-page-episode .lux-detail-grid { grid-template-columns: minmax(260px, 360px) minmax(0, 1fr); }
   .lux-media-card { flex-basis: 150px; }
@@ -904,10 +904,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-hero-copy p { font-size: .91rem; }
   .lux-hero-action-row { row-gap: 20px; width: 100%; }
   .lux-hero-carousel-controls { margin-top: 0; }
-  .lux-home-content { width: calc(100% - 32px); padding-bottom: 52px; }
+  .lux-home-content { width: 92%; padding-bottom: 52px; }
   .lux-section { margin-top: 38px; }
   :root { --lux-header-height: 74px; --lux-page-top: 98px; }
-  .lux-page { width: calc(100% - 32px); }
+  .lux-page { width: 92%; }
   .lux-page-heading { margin-bottom: 28px; }
   .lux-page-heading h1 { font-size: 2.1rem; }
   .lux-library-sort-toolbar { align-items: stretch; flex-direction: column; margin-top: -12px; }
@@ -919,7 +919,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-search-panel input { flex-basis: calc(100% - 40px); min-height: 32px; }
   .lux-search-panel .lux-button { flex: 1; }
   .lux-auth-card { padding: 30px 24px; }
-  .lux-detail-content { width: calc(100% - 32px); }
+  .lux-detail-content { width: 92%; }
   .lux-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-detail-poster-column { width: min(220px, 62vw); }
   .lux-detail-page-episode .lux-detail-poster-column { width: min(100%, 420px); }

@@ -10,7 +10,7 @@ test("admin console uses the account settings page rhythm", () => {
   const contentRule = stylesheet.match(/\.lux-admin-content\s*\{([^}]*)\}/)?.[1] ?? "";
   const headingRule = stylesheet.match(/\.lux-admin-page-heading\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(layoutRule, /width:\s*min\(1400px,\s*calc\(100%\s*-\s*48px\)\)/);
+  assert.match(layoutRule, /width:\s*92%/);
   assert.match(layoutRule, /padding:\s*var\(--lux-page-top\)\s+0\s+90px/);
   assert.match(sidebarRule, /background:\s*transparent/);
   assert.match(sidebarRule, /border-right:\s*0/);
