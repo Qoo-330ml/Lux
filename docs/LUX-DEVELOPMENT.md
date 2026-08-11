@@ -1791,6 +1791,7 @@ services:
 | LUX-162 | src/application/plugin_store.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-164 | src/application/metadata_paths.rs、src/application/people.rs、migrations/（后续对象关系）、tests/、docs/ |
 | LUX-165 | src/application/images.rs、src/application/library_covers.rs、src/api/mod.rs、tests/、docs/ |
+| LUX-166 | src/application/metadata_paths.rs、tests/metadata_paths.rs、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3544,6 +3545,27 @@ Web 插件商店中填写其他 HTTPS 目录地址。目录项必须包含稳定
 
 - 不迁移或删除已有媒体目录 NFO、海报、背景图。
 - 不实现图片缩放、淘汰策略、合集/类型/工作室/标签对象。
+
+#### LUX-166：辅助元数据对象目录合同
+
+范围：为后续合集、类型、工作室和标签资源建立统一的安全路径规则：
+`/config/metadata/<kind>/<bucket>/<display-name>-<provider>-<object-id>/`。本任务只提供路径工具和
+契约测试，不创建数据库表、不修改现有合集关系、不增加 API，也不执行 TMDb 自动合集或对象索引。
+
+验收：
+
+- [x] `collections`、`genres`、`studios`、`tags` 使用独立的 metadata 子目录。
+- [x] 路径包含可读展示名、provider 和受校验的 object ID。
+- [x] 展示名清洗、首字符分桶和越界输入拒绝有自动化测试。
+
+验证：参见 docs/LUX-166-PLAN.md。
+
+依赖：LUX-164、LUX-165。
+
+明确不做：
+
+- 不增加合集、类型、工作室或标签的数据库关系和 API。
+- 不实现 TMDb 自动合集、对象索引、对象图片下载或迁移。
 
 ## 26. 风险与缓解
 

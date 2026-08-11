@@ -14,7 +14,9 @@ Emby 的 `/config/metadata` 目录提供了可借鉴的按对象分组和分片�
 - Lux 管理的元数据资源统一位于 `/config/metadata`。
 - `library/<shard>/<item-id>/` 存放 Lux 管理的媒体条目图片、章节缩略图和后续资源。
 - `people/<bucket>/<display-name>-<provider>-<provider-id>/` 存放人物头像和 `person.nfo`。
-- `collections`、`genres`、`studios`、`tags` 使用同样的对象目录模式，按后续任务逐步启用。
+- `collections`、`genres`、`studios`、`tags` 使用
+  `<kind>/<bucket>/<display-name>-<provider>-<object-id>/` 的对象目录模式，按后续任务逐步启用；
+  当前只确定路径合同，不代表这些对象已经进入数据库或 API。
 - 文件系统只保存资源和可迁移快照；媒体筛选、人物关系和对象索引仍由数据库负责。
 - 媒体目录中的现有 NFO 和本地图片继续遵守 ADR-005，不因新增配置卷目录而自动迁移或降低优先级。
 - 由 Lux 在线刮削或后台任务新生成的图片优先写入 metadata/library；媒体目录仍作为本地图片输入和
@@ -27,6 +29,8 @@ Emby 的 `/config/metadata` 目录提供了可借鉴的按对象分组和分片�
   单目录堆积大量文件。
 - 人物目录名称只用于可读性，真实身份必须包含 provider 和 provider ID；展示名经过受限清洗，
   不得产生路径穿越或控制字符。
+- 辅助对象目录名称同样只用于可读性，使用展示名首字符桶分散目录；真实身份必须包含 provider
+  和 object ID，provider 与 object ID 必须是受限 ASCII 路径组件。
 - 对象主图使用 `folder.<ext>`；人物资料快照使用 `person.nfo`。文件写入采用临时文件、同步和
   原子替换。
 

@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use luxd::application::metadata_paths::{
-    library_item_directory, metadata_root, people_directory, people_index_path,
+    MetadataObjectKind, library_item_directory, metadata_object_directory, metadata_root,
+    people_directory, people_index_path,
 };
 
 #[test]
@@ -44,4 +45,64 @@ fn metadata_paths_reject_traversal_components() {
     assert!(library_item_directory(config, "../item").is_err());
     assert!(people_directory(config, "person", "tmdb", "../person").is_err());
     assert!(people_index_path(config, "person/id").is_err());
+}
+
+#[test]
+fn metadata_object_paths_keep_the_kind_and_human_readable_identity() {
+    let config = Path::new("/config");
+    let path = metadata_object_directory(
+        config,
+        MetadataObjectKind::Genre,
+        "科幻 / 冒险",
+        "TMDb",
+        "878",
+    )
+    .expect("valid metadata object");
+    assert_eq!(
+        path,
+        Path::new("/config/metadata/genres/科/科幻-_-冒险-tmdb-878")
+    );
+}
+
+#[test]
+fn metadata_object_kinds_use_independent_directories() {
+    let config = Path::new("/config");
+    let kinds = [
+        (MetadataObjectKind::Collection, "collections"),
+        (MetadataObjectKind::Genre, "genres"),
+        (MetadataObjectKind::Studio, "studios"),
+        (MetadataObjectKind::Tag, "tags"),
+    ];
+    for (kind, directory) in kinds {
+        let path = metadata_object_directory(config, kind, "Drama", "local", "drama")
+            .expect("valid metadata object");
+        assert_eq!(
+            path.components()
+                .nth(3)
+                .and_then(|value| value.as_os_str().to_str()),
+            Some(directory)
+        );
+    }
+}
+
+#[test]
+fn metadata_object_paths_reject_unsafe_identity_components() {
+    let config = Path::new("/config");
+    assert!(
+        metadata_object_directory(config, MetadataObjectKind::Tag, "tag", "local", "../tag")
+            .is_err()
+    );
+    assert!(
+        metadata_object_directory(
+            config,
+            MetadataObjectKind::Tag,
+            "tag",
+            "local/provider",
+            "tag"
+        )
+        .is_err()
+    );
+    assert!(
+        metadata_object_directory(config, MetadataObjectKind::Tag, "", "local", "tag").is_err()
+    );
 }

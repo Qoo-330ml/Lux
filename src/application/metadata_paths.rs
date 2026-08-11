@@ -12,6 +12,25 @@ pub const LIBRARY_DIR: &str = "library";
 pub const PEOPLE_DIR: &str = "people";
 pub const PEOPLE_INDEX_DIR: &str = "index";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataObjectKind {
+    Collection,
+    Genre,
+    Studio,
+    Tag,
+}
+
+impl MetadataObjectKind {
+    const fn directory(self) -> &'static str {
+        match self {
+            Self::Collection => "collections",
+            Self::Genre => "genres",
+            Self::Studio => "studios",
+            Self::Tag => "tags",
+        }
+    }
+}
+
 pub fn metadata_root(config_dir: &Path) -> PathBuf {
     config_dir.join(METADATA_DIR)
 }
@@ -64,6 +83,32 @@ pub fn people_index_directory(config_dir: &Path) -> PathBuf {
     metadata_root(config_dir)
         .join(PEOPLE_DIR)
         .join(PEOPLE_INDEX_DIR)
+}
+
+pub fn metadata_object_directory(
+    config_dir: &Path,
+    kind: MetadataObjectKind,
+    display_name: &str,
+    provider: &str,
+    object_id: &str,
+) -> Result<PathBuf, MetadataPathError> {
+    validate_component(provider, "provider")?;
+    validate_component(object_id, "object ID")?;
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        return Err(MetadataPathError::EmptyComponent("display name"));
+    }
+    let bucket = display_name
+        .chars()
+        .find(|character| character.is_alphanumeric())
+        .map(|character| character.to_string())
+        .unwrap_or_else(|| "_".to_owned());
+    let display_name = readable_component(display_name);
+    let provider = ascii_component(provider, "provider")?;
+    Ok(metadata_root(config_dir)
+        .join(kind.directory())
+        .join(bucket)
+        .join(format!("{display_name}-{provider}-{object_id}")))
 }
 
 fn stable_shard(value: &str) -> String {
