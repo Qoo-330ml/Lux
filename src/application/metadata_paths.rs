@@ -21,12 +21,21 @@ pub enum MetadataObjectKind {
 }
 
 impl MetadataObjectKind {
-    const fn directory(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Collection => "collections",
             Self::Genre => "genres",
             Self::Studio => "studios",
             Self::Tag => "tags",
+        }
+    }
+
+    pub(crate) const fn file_name(self) -> &'static str {
+        match self {
+            Self::Collection => "collection.json",
+            Self::Genre => "genre.json",
+            Self::Studio => "studio.json",
+            Self::Tag => "tag.json",
         }
     }
 }
@@ -106,7 +115,7 @@ pub fn metadata_object_directory(
     let display_name = readable_component(display_name);
     let provider = ascii_component(provider, "provider")?;
     Ok(metadata_root(config_dir)
-        .join(kind.directory())
+        .join(kind.as_str())
         .join(bucket)
         .join(format!("{display_name}-{provider}-{object_id}")))
 }

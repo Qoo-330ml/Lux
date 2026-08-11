@@ -33,6 +33,8 @@ Emby 的 `/config/metadata` 目录提供了可借鉴的按对象分组和分片�
   和 object ID，provider 与 object ID 必须是受限 ASCII 路径组件。
 - 对象主图使用 `folder.<ext>`；人物资料快照使用 `person.nfo`。文件写入采用临时文件、同步和
   原子替换。
+- 辅助对象的可重建描述使用对应的 `<kind-singular>.json`，例如合集使用 `collection.json`；
+  这些快照不能替代数据库关系，也不作为请求路径上的扫描索引。
 
 ## 后果
 

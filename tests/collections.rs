@@ -5,6 +5,7 @@ use luxd::{
     api::{AppState, app_with_state},
     application::{
         libraries::LibraryService,
+        metadata_paths::{MetadataObjectKind, metadata_object_directory},
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
@@ -114,6 +115,7 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     })?;
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
+    let config_dir = config.config_dir.clone();
     let state = AppState::ready(config, database.clone(), setup, web_auth, emby_auth)
         .with_tmdb_client(tmdb);
     let app = app_with_state(state);
@@ -145,6 +147,21 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
         .ok_or("missing collection item")?
         .to_owned();
     assert_eq!(refresh_body["memberCount"], 1);
+    let collection_directory = metadata_object_directory(
+        &config_dir,
+        MetadataObjectKind::Collection,
+        "Stub Collection",
+        "tmdb",
+        "10",
+    )?;
+    let collection_snapshot =
+        tokio::fs::read_to_string(collection_directory.join("collection.json")).await?;
+    let collection_snapshot: Value = serde_json::from_str(&collection_snapshot)?;
+    assert_eq!(collection_snapshot["kind"], "collections");
+    assert_eq!(collection_snapshot["displayName"], "Stub Collection");
+    assert_eq!(collection_snapshot["provider"], "tmdb");
+    assert_eq!(collection_snapshot["objectId"], "10");
+    assert_eq!(collection_snapshot["memberCount"], 1);
 
     let refreshed_again = client
         .post(format!(

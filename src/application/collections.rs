@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::{
     application::{
+        metadata_objects::{MetadataObjectError, MetadataObjectSnapshot, MetadataObjectStore},
         scraper::{ScraperError, ScraperGetRequest, ScraperItemType, ScraperResolver},
         tmdb::TmdbError,
         tmdb_plugin::TmdbProvider,
@@ -14,6 +15,7 @@ pub struct CollectionService {
     database: Database,
     tmdb: TmdbProvider,
     resolver: Option<ScraperResolver>,
+    metadata_objects: Option<MetadataObjectStore>,
 }
 
 impl CollectionService {
@@ -25,6 +27,7 @@ impl CollectionService {
             database,
             tmdb: tmdb.into(),
             resolver: None,
+            metadata_objects: None,
         }
     }
 
@@ -36,7 +39,13 @@ impl CollectionService {
             database,
             tmdb: tmdb.into(),
             resolver: Some(resolver),
+            metadata_objects: None,
         }
+    }
+
+    pub fn with_config_dir(mut self, config_dir: std::path::PathBuf) -> Self {
+        self.metadata_objects = Some(MetadataObjectStore::new(config_dir));
+        self
     }
 
     pub async fn refresh_for_item(
@@ -110,6 +119,19 @@ impl CollectionService {
                 member_provider_ids: &member_provider_ids,
             })
             .await?;
+        if let Some(metadata_objects) = &self.metadata_objects {
+            let mut snapshot = MetadataObjectSnapshot::new(
+                crate::application::metadata_paths::MetadataObjectKind::Collection,
+                title,
+                &provider_name,
+                &collection_id,
+            )?
+            .with_member_count(result.member_count);
+            if let Some(overview) = details.overview.clone() {
+                snapshot = snapshot.with_overview(overview);
+            }
+            metadata_objects.write_snapshot(snapshot).await?;
+        }
         Ok(CollectionRefreshReport {
             source_item_id: item_id.to_owned(),
             collection_item_id: result.collection_item_id,
@@ -148,6 +170,7 @@ pub enum CollectionError {
     Tmdb(TmdbError),
     Scraper(ScraperError),
     Storage(StorageError),
+    Metadata(MetadataObjectError),
 }
 
 impl fmt::Display for CollectionError {
@@ -159,6 +182,7 @@ impl fmt::Display for CollectionError {
             Self::Tmdb(error) => error.fmt(formatter),
             Self::Scraper(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
+            Self::Metadata(error) => error.fmt(formatter),
         }
     }
 }
@@ -174,5 +198,11 @@ impl From<TmdbError> for CollectionError {
 impl From<StorageError> for CollectionError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<MetadataObjectError> for CollectionError {
+    fn from(error: MetadataObjectError) -> Self {
+        Self::Metadata(error)
     }
 }

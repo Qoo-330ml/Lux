@@ -1792,6 +1792,7 @@ services:
 | LUX-164 | src/application/metadata_paths.rs、src/application/people.rs、migrations/（后续对象关系）、tests/、docs/ |
 | LUX-165 | src/application/images.rs、src/application/library_covers.rs、src/api/mod.rs、tests/、docs/ |
 | LUX-166 | src/application/metadata_paths.rs、tests/metadata_paths.rs、docs/ |
+| LUX-167 | src/application/metadata_objects.rs、src/application/collections.rs、src/api/mod.rs、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3566,6 +3567,28 @@ Web 插件商店中填写其他 HTTPS 目录地址。目录项必须包含稳定
 
 - 不增加合集、类型、工作室或标签的数据库关系和 API。
 - 不实现 TMDb 自动合集、对象索引、对象图片下载或迁移。
+
+#### LUX-167：元数据对象快照写入
+
+范围：为四类辅助元数据对象提供共用的配置卷快照写入边界。对象目录内使用
+`<kind-singular>.json` 保存可重建描述；已有合集刷新接入 `collection.json`，数据库继续作为关系和
+查询事实来源。genres、studios、tags 在本任务只提供共用写入能力，不伪造对象数据源。
+
+验收：
+
+- [x] 快照保存 kind、展示名、provider、object ID，并可保存简介和成员数摘要。
+- [x] 父级符号链接、越界路径、过大快照被拒绝，写入采用同步和原子替换。
+- [x] 合集刷新成功后生成或更新 `metadata/collections/.../collection.json`。
+- [x] 四类对象共用同一存储边界，不新增 genres/studios/tags 数据库关系或 API。
+
+验证：参见 docs/LUX-167-PLAN.md。
+
+依赖：LUX-166、现有合集刷新能力。
+
+明确不做：
+
+- 不改变合集数据库关系、成员 ACL 或客户端 API 合同。
+- 不实现 genres、studios、tags 的抓取、索引、筛选或详情 API。
 
 ## 26. 风险与缓解
 

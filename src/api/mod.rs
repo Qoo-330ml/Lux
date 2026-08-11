@@ -197,11 +197,14 @@ impl AppState {
         );
         let tmdb = TmdbProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
         let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
-        let collections = Some(CollectionService::with_resolver(
-            database.clone(),
-            tmdb.clone(),
-            scraper_resolver.clone(),
-        ));
+        let collections = Some(
+            CollectionService::with_resolver(
+                database.clone(),
+                tmdb.clone(),
+                scraper_resolver.clone(),
+            )
+            .with_config_dir(config.config_dir.clone()),
+        );
         let metadata_reidentify = Some(
             MetadataReidentifyService::with_resolver_and_selection(
                 database.clone(),
@@ -306,11 +309,12 @@ impl AppState {
         let tmdb = TmdbProvider::from(tmdb);
         self.tmdb = Some(tmdb.clone());
         if let Some(resolver) = self.scraper_resolver.clone() {
-            self.collections = Some(CollectionService::with_resolver(
-                database.clone(),
-                tmdb.clone(),
-                resolver.clone(),
-            ));
+            let mut collections =
+                CollectionService::with_resolver(database.clone(), tmdb.clone(), resolver.clone());
+            if let Some(config_dir) = self.config_dir.clone() {
+                collections = collections.with_config_dir(config_dir);
+            }
+            self.collections = Some(collections);
             self.metadata_reidentify = Some(
                 MetadataReidentifyService::with_resolver_and_selection(
                     database.clone(),
@@ -325,7 +329,11 @@ impl AppState {
                 database, tmdb, resolver,
             ));
         } else {
-            self.collections = Some(CollectionService::new(database.clone(), tmdb.clone()));
+            let mut collections = CollectionService::new(database.clone(), tmdb.clone());
+            if let Some(config_dir) = self.config_dir.clone() {
+                collections = collections.with_config_dir(config_dir);
+            }
+            self.collections = Some(collections);
             self.metadata_reidentify = Some(
                 MetadataReidentifyService::with_selection(
                     database.clone(),
@@ -8727,7 +8735,10 @@ async fn admin_refresh_collection(
         )
         .into_response(),
         Err(
-            CollectionError::Tmdb(_) | CollectionError::Scraper(_) | CollectionError::Storage(_),
+            CollectionError::Tmdb(_)
+            | CollectionError::Scraper(_)
+            | CollectionError::Storage(_)
+            | CollectionError::Metadata(_),
         ) => api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,

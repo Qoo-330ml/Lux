@@ -41,6 +41,7 @@
 - LUX-151 IP 归属地只扩展 Lux 管理员 Web 仪表盘的 `nowPlaying` 数据，不改变 VidHub、SenPlayer 或 Infuse 的 Emby 兼容接口；Hiofd 出站可用性和归属地准确性尚未做目标 NAS 现场验证。
 - LUX-165 图片资源布局回归：Rust 集成测试已验证新下载图片写入 `/config/metadata/library/<shard>/<item-id>/`，Lux/Emby 图片端点可读取该路径，媒体目录本地图片仍可读取，且删除仅允许两类受保护根目录；这属于服务端协议回归，不替代 VidHub、SenPlayer 或 Infuse 的真实客户端复测。
 - LUX-166 元数据对象路径回归：Rust 路径契约测试已验证 `collections`、`genres`、`studios`、`tags` 的展示名桶、provider/object ID 身份和越界拒绝；本任务不改变客户端 API 行为。
+- LUX-167 元数据对象快照回归：合集刷新协议测试已验证数据库关系更新后生成 `collection.json`，快照写入失败映射为可重试的服务错误；genres、studios、tags 尚无在线对象数据源，因此仅验证共用存储能力。
 
 ## LUX-025 本机探针进度（2026-08-02）
 
