@@ -301,6 +301,9 @@ describe("AdminPluginsPage plugin cards", () => {
         libraryIds: ["library-1"],
         concurrency: 2,
         existingInfoPolicy: "SKIP",
+        mediaInfoEnabled: true,
+        thumbnailEnabled: true,
+        thumbnailPositionPercent: 30,
         writeSidecars: true,
         schedule: "0 3 * * *",
       },
@@ -308,6 +311,9 @@ describe("AdminPluginsPage plugin cards", () => {
         { key: "libraryIds", label: "媒体库", type: "select", required: true, sensitive: false, multiple: true, optionsSource: "media-libraries", options: [{ value: "library-1", label: "电影库" }, { value: "library-2", label: "剧集库" }] },
         { key: "concurrency", label: "并发数", type: "number", required: true, sensitive: false, defaultValue: 2, minimum: 1, maximum: 64 },
         { key: "existingInfoPolicy", label: "已有媒体信息处理方式", type: "select", required: false, sensitive: false, defaultValue: "SKIP", options: [{ value: "SKIP", label: "跳过已有媒体信息" }, { value: "OVERWRITE", label: "覆盖已有媒体信息" }] },
+        { key: "mediaInfoEnabled", label: "提取媒体信息", type: "toggle", required: false, sensitive: false, defaultValue: true, description: "使用 ffprobe 提取媒体轨道信息。" },
+        { key: "thumbnailEnabled", label: "补全 STRM 缩略图", type: "toggle", required: false, sensitive: false, defaultValue: false, description: "仅为缺失或无效的 STRM 缩略图使用 ffmpeg 截图。" },
+        { key: "thumbnailPositionPercent", label: "缩略图位置", type: "number", required: false, sensitive: false, defaultValue: 30, minimum: 1, maximum: 99, description: "按视频时长百分比截图。" },
         { key: "writeSidecars", label: "写入 mediainfo.json", type: "toggle", required: false, sensitive: false },
         { key: "schedule", label: "执行计划", type: "text", required: true, sensitive: false, defaultValue: "0 3 * * *" },
       ],
@@ -324,7 +330,11 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(selects[0]?.options[0]?.textContent).toBe("电影库");
     expect(dialog?.querySelector('input[type="number"]')).toBeTruthy();
     expect(dialog?.querySelectorAll('select')).toHaveLength(2);
-    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(1);
+    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(3);
+    expect(dialog?.textContent).toContain("提取媒体信息");
+    expect(dialog?.textContent).toContain("补全 STRM 缩略图");
+    expect(dialog?.querySelector<HTMLInputElement>('[id$="-thumbnail-position-percent"]')?.value).toBe("30");
+    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-dialog\s*\{[^}]*max-height:\s*calc\(100vh - 48px\);/s);
 
     await act(async () => {
       dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
@@ -333,6 +343,9 @@ describe("AdminPluginsPage plugin cards", () => {
       libraryIds: ["library-1"],
       concurrency: 2,
       existingInfoPolicy: "SKIP",
+      mediaInfoEnabled: true,
+      thumbnailEnabled: true,
+      thumbnailPositionPercent: 30,
       writeSidecars: true,
       schedule: "0 3 * * *",
     }));

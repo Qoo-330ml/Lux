@@ -63,6 +63,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   const [libraryIds, setLibraryIds] = useState<string[]>([]);
   const [concurrency, setConcurrency] = useState(2);
   const [existingInfoPolicy, setExistingInfoPolicy] = useState("SKIP");
+  const [mediaInfoEnabled, setMediaInfoEnabled] = useState(true);
+  const [thumbnailEnabled, setThumbnailEnabled] = useState(false);
+  const [thumbnailPositionPercent, setThumbnailPositionPercent] = useState(30);
   const [writeSidecars, setWriteSidecars] = useState(true);
   const [schedule, setSchedule] = useState("0 3 * * *");
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -76,6 +79,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   const libraryIdsField = plugin.configFields.find((field) => field.key === "libraryIds");
   const concurrencyField = plugin.configFields.find((field) => field.key === "concurrency");
   const existingInfoPolicyField = plugin.configFields.find((field) => field.key === "existingInfoPolicy");
+  const mediaInfoEnabledField = plugin.configFields.find((field) => field.key === "mediaInfoEnabled");
+  const thumbnailEnabledField = plugin.configFields.find((field) => field.key === "thumbnailEnabled");
+  const thumbnailPositionPercentField = plugin.configFields.find((field) => field.key === "thumbnailPositionPercent");
   const writeSidecarsField = plugin.configFields.find((field) => field.key === "writeSidecars");
   const scheduleField = plugin.configFields.find((field) => field.key === "schedule");
   const customApiBaseUrlOption = apiBaseUrlField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
@@ -88,6 +94,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
           libraryIds,
           concurrency,
           existingInfoPolicy,
+          ...(mediaInfoEnabledField ? { mediaInfoEnabled } : {}),
+          ...(thumbnailEnabledField ? { thumbnailEnabled } : {}),
+          ...(thumbnailPositionPercentField ? { thumbnailPositionPercent } : {}),
           writeSidecars,
           ...(scheduleField ? { schedule: schedule.trim() } : {}),
         })
@@ -156,12 +165,18 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
     const configuredExistingInfoPolicy = typeof values.existingInfoPolicy === "string"
       ? values.existingInfoPolicy
       : String(existingInfoPolicyField?.defaultValue ?? "SKIP");
+    const configuredThumbnailPositionPercent = typeof values.thumbnailPositionPercent === "number"
+      ? values.thumbnailPositionPercent
+      : Number(thumbnailPositionPercentField?.defaultValue ?? 30);
     setExistingInfoPolicy(configuredExistingInfoPolicy);
+    setMediaInfoEnabled(values.mediaInfoEnabled !== false);
+    setThumbnailEnabled(values.thumbnailEnabled === true);
+    setThumbnailPositionPercent(configuredThumbnailPositionPercent);
     setWriteSidecars(values.writeSidecars !== false);
     setSchedule(typeof values.schedule === "string" ? values.schedule : String(scheduleField?.defaultValue ?? "0 3 * * *"));
     setApiKey("");
     setApiKeyDirty(false);
-  }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue]);
+  }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue]);
 
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
@@ -202,6 +217,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
                 {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<select id={"plugin-config-" + plugin.id + "-library-ids"} multiple required={libraryIdsField.required} value={libraryIds} onChange={(event) => setLibraryIds(Array.from(event.target.selectedOptions, (option) => option.value))}>{(libraryIdsField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{libraryIdsField.description}</small></label> : null}
                 {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
                 {existingInfoPolicyField ? <label htmlFor={"plugin-config-" + plugin.id + "-existing-info-policy"}>{existingInfoPolicyField.label}<select id={"plugin-config-" + plugin.id + "-existing-info-policy"} value={existingInfoPolicy} onChange={(event) => setExistingInfoPolicy(event.target.value)}>{(existingInfoPolicyField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{existingInfoPolicyField.description}</small></label> : null}
+                {mediaInfoEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={mediaInfoEnabled} onChange={(event) => setMediaInfoEnabled(event.target.checked)} /> <span><strong>{mediaInfoEnabledField.label}</strong><small>{mediaInfoEnabledField.description}</small></span></label> : null}
+                {thumbnailEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={thumbnailEnabled} onChange={(event) => setThumbnailEnabled(event.target.checked)} /> <span><strong>{thumbnailEnabledField.label}</strong><small>{thumbnailEnabledField.description}</small></span></label> : null}
+                {thumbnailPositionPercentField ? <label htmlFor={"plugin-config-" + plugin.id + "-thumbnail-position-percent"}>{thumbnailPositionPercentField.label}<input id={"plugin-config-" + plugin.id + "-thumbnail-position-percent"} type="number" required={thumbnailPositionPercentField.required} min={thumbnailPositionPercentField.minimum ?? 1} max={thumbnailPositionPercentField.maximum ?? 99} value={thumbnailPositionPercent} onChange={(event) => setThumbnailPositionPercent(Number(event.target.value))} /><small>{thumbnailPositionPercentField.description}</small></label> : null}
                 {writeSidecarsField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={writeSidecars} onChange={(event) => setWriteSidecars(event.target.checked)} /> <span><strong>{writeSidecarsField.label}</strong><small>{writeSidecarsField.description}</small></span></label> : null}
                 {scheduleField ? <label htmlFor={"plugin-config-" + plugin.id + "-schedule"}>{scheduleField.label}<input id={"plugin-config-" + plugin.id + "-schedule"} type="text" required={scheduleField.required} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="0 3 * * *" /><small>{scheduleField.description}</small></label> : null}
               </> : <>
