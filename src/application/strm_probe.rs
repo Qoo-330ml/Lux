@@ -354,7 +354,7 @@ impl StrmProbeService {
                 return SourceOutcome::failed(source.source_id, "FAILED", error.to_string());
             }
         };
-        if source.probe_status == "READY" && !include_ready {
+        if source.probe_status == "READY" && !include_ready && source.has_media_info {
             return SourceOutcome::skipped(source.source_id);
         }
         let Some(url) = source.external_url else {

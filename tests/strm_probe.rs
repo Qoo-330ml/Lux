@@ -3,6 +3,7 @@ use std::{fs, path::Path};
 use luxd::{
     application::{
         plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
+        probe::{FfprobeRunner, MediaProbeService},
         scanner::LibraryScanner,
         strm_probe::StrmProbeService,
     },
@@ -82,6 +83,21 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
+
+    let generic_probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(&fake_ffprobe, std::time::Duration::from_secs(5)),
+    );
+    let report = generic_probe.probe_movie_library(library.id).await?;
+    assert_eq!(report.ready, 0);
+    assert_eq!(report.skipped, 1);
+    sqlx::query(
+        "UPDATE media_sources
+         SET probe_status = 'READY', container = 'strm', duration_ticks = NULL,
+             bitrate = NULL, probe_error = NULL",
+    )
+    .execute(database.pool())
+    .await?;
 
     let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(MEDIA_INFO_PLUGIN_ID).await?;

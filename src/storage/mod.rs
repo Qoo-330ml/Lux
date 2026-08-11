@@ -7362,6 +7362,13 @@ impl Database {
         let rows = if let Some(after_source_id) = after_source_id {
             self.query(
                 "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM media_streams mt
+                            WHERE mt.media_source_id = ms.id
+                        ) OR ms.duration_ticks IS NOT NULL
+                            OR ms.bitrate IS NOT NULL
+                            OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
+                            THEN 1 ELSE 0 END AS has_media_info,
                         lr.canonical_path AS root_path, fe.relative_path
                  FROM media_sources ms
                  JOIN media_items mi ON mi.id = ms.item_id
@@ -7380,6 +7387,13 @@ impl Database {
         } else {
             self.query(
                 "SELECT ms.id AS source_id, ms.probe_status, ms.external_url,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM media_streams mt
+                            WHERE mt.media_source_id = ms.id
+                        ) OR ms.duration_ticks IS NOT NULL
+                            OR ms.bitrate IS NOT NULL
+                            OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
+                            THEN 1 ELSE 0 END AS has_media_info,
                         lr.canonical_path AS root_path, fe.relative_path
                  FROM media_sources ms
                  JOIN media_items mi ON mi.id = ms.item_id
@@ -7400,6 +7414,7 @@ impl Database {
                 .map(|row| StoredStrmMediaSource {
                     source_id: row.get("source_id"),
                     probe_status: row.get("probe_status"),
+                    has_media_info: row.get::<i64, _>("has_media_info") != 0,
                     external_url: row.get("external_url"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
@@ -9422,6 +9437,7 @@ pub(crate) struct StoredThumbnailSource {
 pub(crate) struct StoredStrmMediaSource {
     pub(crate) source_id: String,
     pub(crate) probe_status: String,
+    pub(crate) has_media_info: bool,
     pub(crate) external_url: Option<String>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,

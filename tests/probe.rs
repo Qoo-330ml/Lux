@@ -395,7 +395,8 @@ async fn strm_probe_without_sidecar_does_not_run_ffprobe() -> Result<(), Box<dyn
     .probe_movie_library(library.id)
     .await?;
     assert_eq!(report.attempted, 1);
-    assert_eq!(report.ready, 1);
+    assert_eq!(report.ready, 0);
+    assert_eq!(report.skipped, 1);
     assert_eq!(report.failed, 0);
 
     let source: (
@@ -415,7 +416,7 @@ async fn strm_probe_without_sidecar_does_not_run_ffprobe() -> Result<(), Box<dyn
     assert_eq!(
         source,
         (
-            "READY".to_owned(),
+            "PENDING".to_owned(),
             Some("strm".to_owned()),
             None,
             None,
@@ -436,7 +437,8 @@ async fn strm_probe_without_sidecar_does_not_run_ffprobe() -> Result<(), Box<dyn
     )
     .probe_movie_library(library.id)
     .await?;
-    assert_eq!(second.attempted, 0);
+    assert_eq!(second.attempted, 1);
+    assert_eq!(second.ready, 0);
     assert_eq!(second.skipped, 1);
     Ok(())
 }

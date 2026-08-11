@@ -860,17 +860,9 @@ impl MediaProbeService {
                         report.ready += 1;
                     }
                     Ok(None) => {
-                        self.database
-                            .save_media_probe(MediaProbeUpdate {
-                                source_id: &source.source_id,
-                                container: None,
-                                source_size: None,
-                                duration_ticks: None,
-                                bitrate: None,
-                                streams: &[],
-                            })
-                            .await?;
-                        report.ready += 1;
+                        // A STRM without a sidecar is owned by the STRM plugin;
+                        // leave it pending instead of making SKIP suppress it.
+                        report.skipped += 1;
                     }
                     Err(error) => {
                         if matches!(error, ProbeError::Timeout) {
