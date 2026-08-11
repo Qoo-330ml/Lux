@@ -66,6 +66,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-back-button { margin-right: 2px; }
 .lux-user-button { padding: 4px; }
 .lux-avatar { display: inline-grid; place-items: center; width: 44px; height: 44px; border-radius: 50%; color: #fff; background: linear-gradient(145deg, #707074, #28282d); font-weight: 650; }
+.lux-avatar img { display: block; width: 100%; height: 100%; border-radius: inherit; object-fit: cover; }
 .lux-desktop-nav { gap: 22px; margin-left: 24px; }
 .lux-nav-link { position: relative; color: rgba(255,255,255,.66); font-size: .9rem; transition: color .2s ease; }
 .lux-nav-link:hover, .lux-nav-link.is-active { color: #fff; }

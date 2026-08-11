@@ -3,9 +3,10 @@
 import { act } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountPage } from "../src/features/account/AccountPage";
+import { LuxShell } from "../src/components/layout/LuxShell";
 import { api } from "../src/lib/api/client";
 import { accountSettingsStorageKey, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings } from "../src/features/account/account-settings";
 
@@ -113,8 +114,12 @@ describe("account settings", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AccountPage user={user} />
+          <MemoryRouter initialEntries={["/account"]}>
+            <Routes>
+              <Route element={<LuxShell user={user} />}>
+                <Route path="/account" element={<AccountPage user={user} />} />
+              </Route>
+            </Routes>
           </MemoryRouter>
         </QueryClientProvider>,
       );
@@ -133,8 +138,14 @@ describe("account settings", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const saveButton = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("保存头像"));
-    expect(saveButton).toBeTruthy();
+    await vi.waitFor(() => {
+      const button = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((candidate) => candidate.textContent?.includes("保存头像"));
+      expect(button).toBeTruthy();
+      expect(button?.disabled).toBe(false);
+    });
+    const saveButton = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.includes("保存头像"));
 
     await act(async () => {
       saveButton?.click();
@@ -144,6 +155,9 @@ describe("account settings", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/auth/avatar",
       expect.objectContaining({ method: "PUT", credentials: "same-origin" }),
+    );
+    expect(container.querySelector<HTMLImageElement>(".lux-avatar img")?.getAttribute("src")).toMatch(
+      /^\/api\/v1\/auth\/avatar\?v=\d+$/,
     );
     expect(localStorage.getItem("lux.account.avatar:user-1")).toBeNull();
     expect(container.textContent).toContain("头像已保存");

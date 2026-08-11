@@ -18,6 +18,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { Library, LuxUser } from "../../lib/api/types";
 import { LuxSelect } from "../../components/LuxSelect";
+import { useAvatar } from "../../components/layout/LuxShell";
 import {
   applyAccountTheme,
   applyAccountAccent,
@@ -32,9 +33,9 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
+  const { avatarUrl, setAvatarUrl } = useAvatar();
   const [settings, setSettings] = useState<AccountSettings>(() => readAccountSettings(user.id));
   const [draggedLibraryId, setDraggedLibraryId] = useState<string | null>(null);
-  const [avatarUrl, setAvatarUrl] = useState<string | null>(() => api.avatarUrl());
   const [avatarImageFailed, setAvatarImageFailed] = useState(false);
   const [pendingAvatarUrl, setPendingAvatarUrl] = useState<string | null>(null);
   const [pendingAvatarFile, setPendingAvatarFile] = useState<File | null>(null);
