@@ -48,7 +48,7 @@ docker compose --profile postgres up -d
 因此删除前应先备份。启用 profile 后，在 Lux 引导中选择 PostgreSQL，主机填写 Compose 服务名
 `postgres`，端口填写 `5432`。也可以不启用 profile，连接外部已有的 PostgreSQL 服务。
 
-镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本会创建 `/config/plugins`，并将镜像内置的 TMDb 插件包复制到持久化配置目录；不会递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。项目自带的 TMDb 插件会在发现后自动标记为已安装、已启用。
+镜像和 Compose 都以 `root`（UID 0）运行 Lux。入口脚本只创建 `/config/plugins`，不会向其中复制插件；插件包由管理员从配置的插件商店下载、校验并显式安装。入口脚本不会递归修改 `/config` 或 `/media` 的所有权，因此 bind mount 到 NAS 的目录无需预先调整 UID/GID，也不会因媒体库大小增加启动遍历时间。
 
 首次部署只在内网访问 `http://127.0.0.1:8097/` 完成初始化。初始化完成后再开放反向代理入口；不要把未初始化的 setup 页面直接暴露到公网。
 

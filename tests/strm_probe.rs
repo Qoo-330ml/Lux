@@ -40,20 +40,8 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     )?;
     make_executable(&fake_ffmpeg)?;
 
-    let plugin_binary = std::env::var_os("CARGO_BIN_EXE_lux-plugin-strm-media-info")
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_lux_plugin_strm_media_info"))
-        .ok_or("strm-media-info plugin binary path is missing")?;
     let wrapper = binary_dir.join("plugin");
-    fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nLUX_FFPROBE_BINARY={} LUX_FFMPEG_BINARY={} exec {} \"$@\"\n",
-            shell_quote(&fake_ffprobe),
-            shell_quote(&fake_ffmpeg),
-            shell_quote(Path::new(&plugin_binary)),
-        ),
-    )?;
-    make_executable(&wrapper)?;
+    write_fake_media_probe_plugin(&wrapper, "h264")?;
     fs::write(
         plugin_dir.join("manifest.json"),
         serde_json::to_vec_pretty(&json!({
@@ -296,7 +284,7 @@ printf '%s' '{"format":{"format_name":"matroska"},"streams":[{"index":0,"codec_t
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(overwritten_codec, "vp9");
+    assert_eq!(overwritten_codec, "h264");
     Ok(())
 }
 
@@ -318,19 +306,8 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
 "#,
     )?;
     make_executable(&fake_ffprobe)?;
-    let plugin_binary = std::env::var_os("CARGO_BIN_EXE_lux-plugin-strm-media-info")
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_lux_plugin_strm_media_info"))
-        .ok_or("strm-media-info plugin binary path is missing")?;
     let wrapper = binary_dir.join("plugin");
-    fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nLUX_FFPROBE_BINARY={} exec {} \"$@\"\n",
-            shell_quote(Path::new(&fake_ffprobe)),
-            shell_quote(Path::new(&plugin_binary)),
-        ),
-    )?;
-    make_executable(&wrapper)?;
+    write_fake_media_probe_plugin(&wrapper, "h264")?;
     fs::write(
         plugin_dir.join("manifest.json"),
         serde_json::to_vec_pretty(&json!({
@@ -477,15 +454,36 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
 }
 
 #[cfg(unix)]
+fn write_fake_media_probe_plugin(
+    path: &Path,
+    codec: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let script = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  case "$method" in
+    plugin.hello) printf '{{"id":"%s","result":{{"id":"org.lux.strm-media-info","name":"strm媒体信息提取","apiVersion":1,"capabilities":["media.probe"],"supportedItemTypes":[]}}}}\n' "$id" ;;
+    plugin.health) printf '{{"id":"%s","result":{{"available":true,"configured":true}}}}\n' "$id" ;;
+    media.probe) printf '{{"id":"%s","result":{{"container":"matroska","sourceSize":1234,"durationTicks":125000000,"bitrate":500000,"streams":[{{"streamIndex":0,"streamType":"VIDEO","codec":"{}","isDefault":false,"isForced":false,"details":{{}}}},{{"streamIndex":1,"streamType":"AUDIO","codec":"aac","language":"eng","isDefault":false,"isForced":false,"details":{{}}}}],"thumbnailJpegBase64":"/9j/ZmFrZS10aHVtYv/Z"}}}}\n' "$id" ;;
+    plugin.shutdown) printf '{{"id":"%s","result":{{"accepted":true}}}}\n' "$id" ;;
+    *) printf '{{"id":"%s","error":{{"code":"PLUGIN_INVALID_REQUEST","message":"unsupported method"}}}}\n' "$id" ;;
+  esac
+done
+"#,
+        codec
+    );
+    fs::write(path, script)?;
+    make_executable(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn make_executable(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions)
-}
-
-#[cfg(unix)]
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }

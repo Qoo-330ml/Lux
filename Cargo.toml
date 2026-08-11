@@ -53,23 +53,3 @@ path = "src/lib.rs"
 [[bin]]
 name = "luxd"
 path = "src/main.rs"
-
-[[bin]]
-name = "lux-plugin-tmdb"
-path = "src/bin/lux-plugin-tmdb.rs"
-
-[[bin]]
-name = "lux-plugin-strm-media-info"
-path = "src/bin/lux-plugin-strm-media-info.rs"
-
-[[bin]]
-name = "lux-plugin-ip-hiofd"
-path = "src/bin/lux-plugin-ip-hiofd.rs"
-
-[[bin]]
-name = "lux-plugin-qoo-ip138"
-path = "src/bin/lux-plugin-qoo-ip138.rs"
-
-[[bin]]
-name = "lux-plugin-pack"
-path = "src/bin/lux-plugin-pack.rs"

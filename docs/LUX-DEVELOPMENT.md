@@ -304,14 +304,14 @@ Lux 的核心价值不是功能数量，而是：
 
 首版不提供内置备份与恢复。配置和数据库通过 Docker 持久化卷由 NAS 自己备份。
 
-### 3.15 内置插件与刮削器
+### 3.15 外置插件与刮削器
 
-- Lux 提供安全的插件注册表；插件以标准 `.zip` 插件包放入 `/config/plugins`，服务重启时扫描并加载。插件代码运行在受监督的独立进程中，不直接注入 Lux Rust 主进程。
+- Lux 提供安全的插件注册表；插件以标准 `.zip` 插件包放入 `/config/plugins`，服务重启时扫描并加载。插件代码运行在受监督的独立进程中，不直接注入 Lux Rust 主进程。Lux 发布包和 Docker 镜像不包含任何现有插件实现、打包器或插件 ZIP。
 - 插件商店使用可配置的 HTTPS 目录地址；目录返回插件元数据和包地址。默认目录源为 `https://github.com/Qoo-330ml/Lux-plugins`，Lux 将其解析为仓库 `main` 分支的 `index.json`；管理员可以在插件商店页面填写其他目录地址。
 - 管理员从插件商店安装插件时，Lux 只下载目录声明的 `.zip` 包，限制大小、文件数量、路径、manifest、协议版本、平台入口和声明文件 SHA-256，并在校验成功后原子写入 `/config/plugins`；未经目录声明的地址不得作为下载目标。
-- 首个独立插件为 `org.lux.tmdb`。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
+- 首个独立插件为 `org.lux.tmdb`，由外部插件仓库发布。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
 - SDK v1 同时支持 `media_probe` 插件类型。`org.lux.strm-media-info` 只接收 Lux 宿主按单个任务提交的已校验 STRM 探测目标，按原始字符串调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
-- 只有已安装、已启用且有可用凭据的插件才能被媒体库选择。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用服务端内置的默认 API Key；任何凭据都不返回 API 或写入日志。
+- 只有已安装、已启用且有可用凭据的插件才能被媒体库选择。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用外置 TMDb 插件自己的默认凭据；任何凭据都不返回 API 或写入日志。
 - 媒体库的 `scraperId` 为空表示不进行在线刮削、只使用本地元数据；插件安装状态与媒体库选择均持久化，服务重启后保持不变。
 - 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
 - 全局策略的服务器设置不得返回任何凭据；插件凭据仍只在插件管理页面配置。播放进度阈值继续属于服务器设置，不在媒体库策略页重复管理。
@@ -1796,6 +1796,7 @@ services:
 | LUX-168 | src/application/metadata.rs、src/application/nfo.rs、src/application/scraper.rs、src/application/tmdb.rs、src/application/tmdb_plugin.rs、src/application/candidates.rs、src/bin/lux-plugin-tmdb.rs、tests/、docs/ |
 | LUX-169 | plugins/org.lux.tmdb/manifest.json、src/application/plugins.rs、src/application/plugin_store.rs、scripts/package-tmdb-plugin.sh、Dockerfile、tests/、docs/ |
 | LUX-170 | src/application/nfo.rs、src/application/metadata.rs、src/application/people.rs、src/application/scanner.rs、src/api/mod.rs、web/src/features/detail/、tests/、docs/ |
+| LUX-171 | Cargo.toml、Dockerfile、docker-entrypoint.sh、src/application/plugins.rs、src/application/plugin_store.rs、src/bin/、plugins/、scripts/、tests/、web/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3669,6 +3670,32 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 - 不扩展剧集、季度和单集 NFO 演员字段。
 
 依赖：LUX-164、LUX-168。
+
+#### LUX-171：外置插件包与商店安装
+
+范围：将现有 TMDb、STRM 媒体探测和 IP 归属地插件完全移出 Lux 源码与部署镜像。插件实现和发布包由
+`Qoo-330ml/Lux-plugins` 维护；Lux 只保留插件协议、包发现/校验、独立进程监督、商店目录和显式安装
+接口。新部署的 Lux 不自动复制或自动启用插件，管理员从插件商店安装后才能使用。
+
+验收：
+
+- [x] 外部插件仓库先发布当前版本的 `linux-x86_64` 和 `linux-aarch64` 包；两种包分别由 AMD/x86 与 ARM runner 编译，文件名包含插件版本和架构，Release 资产与 `index.json` 中对应版本、架构、地址和 SHA-256 一致。
+- [x] Lux 源码、Cargo targets、Dockerfile 和 entrypoint 不再包含现有插件进程实现、插件打包器、插件 manifest 或内置 ZIP。
+- [x] 新建空 `/config` 启动 Lux 后，`/config/plugins` 不会出现任何自动复制的插件包，插件列表只显示商店中的可安装项。
+- [x] 管理员从商店安装插件时，Lux 下载目录声明的包，完成大小、manifest、协议、平台入口和 SHA-256 校验后原子写入 `/config/plugins`，随后可以启用并调用插件。
+- [x] 已存在于 `/config/plugins` 的插件在重启后仍可发现；安装状态、启用状态和媒体库 `scraperId` 持久化，不因移除内置包逻辑而自动变化。
+- [x] Rust 和 Web 测试覆盖“无内置包”和“显式商店安装”路径；插件进程自身的 RPC/上游行为测试归外部插件仓库维护。
+
+验证：
+
+- `cargo build --locked`
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-142、LUX-146、LUX-151、LUX-162、LUX-169。
 
 ## 26. 风险与缓解
 

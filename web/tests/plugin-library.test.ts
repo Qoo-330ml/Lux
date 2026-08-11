@@ -16,14 +16,14 @@ const pluginLibraryCss = readFileSync(resolve(process.cwd(), "src/features/admin
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const configuredPlugin: AdminPlugin = {
-  id: "tmdb",
+  id: "org.lux.tmdb",
   name: "TMDb 元数据插件",
   description: "使用 TMDb 补全电影和剧集元数据、海报与背景图。",
   category: "SCRAPER",
   version: "1.0.0",
-  runtime: "built-in",
+  runtime: "process",
   capabilities: ["metadata.search"],
-  status: "BUILT_IN_COMPATIBILITY",
+  status: "READY",
   running: true,
   lastError: null,
   installed: true,
@@ -37,9 +37,9 @@ const configuredPlugin: AdminPlugin = {
     type: "password",
     required: false,
     sensitive: true,
-    description: "可选。留空时使用 Lux 内置的 TMDb Key。",
+    description: "可选。留空时使用 TMDb 插件自己的默认凭据。",
   }],
-  configSource: "BUILT_IN",
+  configSource: "PLUGIN_DEFAULT",
 };
 
 let currentPlugin = configuredPlugin;
@@ -250,7 +250,7 @@ describe("AdminPluginsPage plugin cards", () => {
     await act(async () => {
       dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
     });
-    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("tmdb", expect.objectContaining({
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.tmdb", expect.objectContaining({
       preferredLanguage: "zh-CN",
       languageFallbackEnabled: false,
       fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
@@ -292,7 +292,7 @@ describe("AdminPluginsPage plugin cards", () => {
     await act(async () => {
       toggle?.click();
     });
-    expect(api.updateAdminPluginEnabled).toHaveBeenCalledWith("tmdb", false);
+    expect(api.updateAdminPluginEnabled).toHaveBeenCalledWith("org.lux.tmdb", false);
   });
 
   it("shows a disabled installed plugin as off and offers to enable it", async () => {

@@ -494,7 +494,7 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it("exposes the paginated plugin catalog and installs a built-in plugin with CSRF", async () => {
+  it("exposes the paginated plugin catalog and installs a store plugin with CSRF", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
       if (path === "/api/v1/admin/plugins?page=1&pageSize=50") {

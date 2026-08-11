@@ -220,7 +220,7 @@ export type AdminPlugin = {
   configurable: boolean;
   configFields: AdminPluginConfigField[];
   configValues?: Record<string, unknown>;
-  configSource: "BUILT_IN" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
+  configSource: "PLUGIN_DEFAULT" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
 };
 
 export type AdminPluginStore = {

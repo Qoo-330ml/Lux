@@ -296,7 +296,7 @@ RPC          = media.probe
 - `src/application/probe.rs`：旁车导入、结果映射和兼容旁车写入。
 - `src/application/strm_probe.rs`：STRM 任务、并发、取消、恢复和插件结果持久化。
 - `src/application/strm_probe_policy.rs`：远程 URL 协议和 SSRF 基础策略。
-- `src/bin/lux-plugin-strm-media-info.rs`：独立 `ffprobe` 插件进程。
+- `Qoo-330ml/Lux-plugins`：独立 `ffprobe` 插件进程的源码、构建 workflow 和 Release 包。
 - `src/application/plugin_protocol.rs`、`src/application/plugin_runtime.rs`：媒体插件 manifest、RPC DTO 和隔离调用。
 - `src/application/scanner.rs`：扫描完成后的后台探测衔接。
 - `src/api/mod.rs`：管理 API 和任务服务注入。

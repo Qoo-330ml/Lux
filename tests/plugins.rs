@@ -1,4 +1,4 @@
-use std::{fs, time::Duration};
+use std::{fs, path::Path, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer, SigningKey};
@@ -61,6 +61,39 @@ async fn start_server(
     Ok((format!("http://{address}"), server))
 }
 
+async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let plugin_dir = config_dir.join("plugins/org.lux.tmdb/binaries");
+    tokio::fs::create_dir_all(&plugin_dir).await?;
+    tokio::fs::write(plugin_dir.join("plugin"), b"#!/bin/sh\nexit 0\n").await?;
+    tokio::fs::write(
+        config_dir.join("plugins/org.lux.tmdb/manifest.json"),
+        serde_json::to_vec(&json!({
+            "formatVersion": 1,
+            "id": "org.lux.tmdb",
+            "name": "TMDb 元数据插件",
+            "description": "从 TMDb 提供 Emby 风格电影、剧集和图片元数据。",
+            "version": "0.1.5",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "metadata",
+            "category": "SCRAPER",
+            "supportedItemTypes": ["Movie"],
+            "capabilities": ["metadata.search"],
+            "configFields": [{
+                "key": "apiKey",
+                "label": "TMDb API Key",
+                "type": "password",
+                "required": false,
+                "sensitive": true
+            }],
+            "permissions": {"network": [], "filesystem": []},
+            "files": []
+        }))?,
+    )
+    .await?;
+    Ok(())
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)
@@ -100,12 +133,20 @@ async fn admin_session(
     Ok((format!("lux_session={session}; lux_csrf={csrf}"), csrf))
 }
 
+fn plugin_by_id<'a>(body: &'a Value, plugin_id: &str) -> &'a Value {
+    body["plugins"]
+        .as_array()
+        .and_then(|plugins| plugins.iter().find(|plugin| plugin["id"] == plugin_id))
+        .unwrap_or_else(|| panic!("plugin {plugin_id} is missing from the response"))
+}
+
 #[tokio::test]
 async fn admin_can_install_tmdb_and_select_it_for_a_library()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
     tokio::fs::create_dir_all(&config_dir).await?;
+    seed_local_tmdb_package(&config_dir).await?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir,
@@ -133,55 +174,34 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
         .await?;
     assert_eq!(catalog.status(), reqwest::StatusCode::OK);
     let catalog_body: Value = catalog.json().await?;
+    let tmdb = plugin_by_id(&catalog_body, "org.lux.tmdb");
     assert_eq!(catalog_body["total"], 4);
-    assert_eq!(catalog_body["plugins"][0]["id"], "tmdb");
-    assert_eq!(catalog_body["plugins"][0]["category"], "SCRAPER");
-    assert_eq!(catalog_body["plugins"][0]["version"], "0.1.5");
-    assert_eq!(catalog_body["plugins"][0]["installed"], false);
-    assert_eq!(catalog_body["plugins"][0]["configured"], true);
-    assert_eq!(catalog_body["plugins"][0]["configurable"], true);
-    assert_eq!(catalog_body["plugins"][0]["configSource"], "BUILT_IN");
+    assert_eq!(tmdb["category"], "SCRAPER");
+    assert_eq!(tmdb["version"], "0.1.5");
+    assert_eq!(tmdb["installed"], false);
+    assert_eq!(tmdb["configured"], true);
+    assert_eq!(tmdb["configurable"], true);
+    assert_eq!(tmdb["configSource"], "PLUGIN_DEFAULT");
+    assert_eq!(tmdb["configFields"][0]["key"], "apiKey");
+    assert_eq!(tmdb["configFields"][1]["key"], "preferredLanguage");
+    assert_eq!(tmdb["configFields"][1]["options"][0]["value"], "zh-CN");
+    assert_eq!(tmdb["configFields"][3]["multiple"], true);
+    assert_eq!(tmdb["configValues"]["preferredLanguage"], "zh-CN");
     assert_eq!(
-        catalog_body["plugins"][0]["configFields"][0]["key"],
-        "apiKey"
-    );
-    assert_eq!(
-        catalog_body["plugins"][0]["configFields"][1]["key"],
-        "preferredLanguage"
-    );
-    assert_eq!(
-        catalog_body["plugins"][0]["configFields"][1]["options"][0]["value"],
-        "zh-CN"
-    );
-    assert_eq!(
-        catalog_body["plugins"][0]["configFields"][3]["multiple"],
-        true
-    );
-    assert_eq!(
-        catalog_body["plugins"][0]["configValues"]["preferredLanguage"],
-        "zh-CN"
-    );
-    assert_eq!(
-        catalog_body["plugins"][0]["configValues"]["fallbackLanguages"],
+        tmdb["configValues"]["fallbackLanguages"],
         json!(["zh-SG", "zh-HK", "zh-TW"])
     );
+    assert_eq!(tmdb["configValues"]["alternateApiEnabled"], false);
     assert_eq!(
-        catalog_body["plugins"][0]["configValues"]["alternateApiEnabled"],
-        false
-    );
-    assert_eq!(
-        catalog_body["plugins"][0]["configValues"]["apiBaseUrl"],
+        tmdb["configValues"]["apiBaseUrl"],
         "https://api.themoviedb.org"
     );
+    assert_eq!(tmdb["configFields"][4]["key"], "alternateApiEnabled");
     assert_eq!(
-        catalog_body["plugins"][0]["configFields"][4]["key"],
-        "alternateApiEnabled"
-    );
-    assert_eq!(
-        catalog_body["plugins"][0]["configFields"][5]["options"][1]["label"],
+        tmdb["configFields"][5]["options"][1]["label"],
         "https://api.tmdb.org"
     );
-    assert!(catalog_body["plugins"][0].get("apiKey").is_none());
+    assert!(tmdb.get("apiKey").is_none());
 
     let installed = client
         .post(format!("{base_url}/api/v1/admin/plugins/tmdb/install"))
@@ -204,8 +224,9 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
         .await?;
     assert_eq!(managed.status(), reqwest::StatusCode::OK);
     let managed_body: Value = managed.json().await?;
+    let managed_tmdb = plugin_by_id(&managed_body, "org.lux.tmdb");
     assert_eq!(managed_body["total"], 1);
-    assert_eq!(managed_body["plugins"][0]["id"], "org.lux.tmdb");
+    assert_eq!(managed_tmdb["id"], "org.lux.tmdb");
 
     let created = client
         .post(format!("{base_url}/api/v1/admin/libraries"))
@@ -300,6 +321,7 @@ async fn admin_can_disable_an_installed_plugin_without_removing_it()
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
+    seed_local_tmdb_package(&config.config_dir).await?;
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::new();
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
@@ -366,13 +388,14 @@ async fn admin_can_disable_an_installed_plugin_without_removing_it()
 }
 
 #[tokio::test]
-async fn admin_can_configure_tmdb_key_and_reset_to_the_embedded_default()
+async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
+    seed_local_tmdb_package(&config.config_dir).await?;
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::new();
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
@@ -439,7 +462,7 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_embedded_default()
     assert_eq!(reset.status(), reqwest::StatusCode::OK);
     assert_eq!(
         reset.json::<Value>().await?["plugin"]["configSource"],
-        "BUILT_IN"
+        "PLUGIN_DEFAULT"
     );
     assert!(!temp_dir.path().join("config/tmdb_api_key").exists());
 
@@ -505,14 +528,14 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
         .await?
         .json::<Value>()
         .await?;
+    let tmdb = plugin_by_id(&catalog, "org.lux.tmdb");
     assert_eq!(catalog["total"], 4);
-    assert_eq!(catalog["plugins"][0]["id"], "org.lux.tmdb");
-    assert_eq!(catalog["plugins"][0]["category"], "SCRAPER");
-    assert_eq!(catalog["plugins"][0]["version"], "1.0.0");
-    assert_eq!(catalog["plugins"][0]["runtime"], "process");
-    assert_eq!(catalog["plugins"][0]["installed"], true);
-    assert_eq!(catalog["plugins"][0]["enabled"], true);
-    assert_eq!(catalog["plugins"][0]["available"], true);
+    assert_eq!(tmdb["category"], "SCRAPER");
+    assert_eq!(tmdb["version"], "1.0.0");
+    assert_eq!(tmdb["runtime"], "process");
+    assert_eq!(tmdb["installed"], false);
+    assert_eq!(tmdb["enabled"], false);
+    assert_eq!(tmdb["available"], false);
 
     let installed = client
         .post(format!(
@@ -522,7 +545,7 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
         .header("x-csrf-token", &csrf)
         .send()
         .await?;
-    assert_eq!(installed.status(), reqwest::StatusCode::OK);
+    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
     assert_eq!(
         installed.json::<Value>().await?["plugin"]["installed"],
         true

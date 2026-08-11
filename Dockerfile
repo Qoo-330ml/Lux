@@ -12,9 +12,6 @@ RUN pnpm build
 FROM rust:1.85-bookworm AS builder
 
 WORKDIR /src
-ARG LUX_TMDB_PLUGIN_VERSION=0.1.5
-ARG LUX_IP_LOCATION_PLUGIN_VERSION=0.1.0
-ARG LUX_STRM_MEDIA_INFO_PLUGIN_VERSION=0.1.0
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -26,15 +23,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 RUN mkdir -p src/bin \
     && printf 'pub fn placeholder() {}\n' > src/lib.rs \
     && printf 'fn main() {}\n' > src/main.rs \
-    && for bin in \
-         lux-plugin-tmdb \
-         lux-plugin-strm-media-info \
-         lux-plugin-ip-hiofd \
-         lux-plugin-qoo-ip138 \
-         lux-plugin-pack; do \
-         printf 'fn main() {}\n' > "src/bin/${bin}.rs"; \
-       done \
-    && cargo build --release --locked --bins
+    && cargo build --release --locked --bin luxd
 
 COPY build.rs ./build.rs
 COPY src ./src
@@ -45,48 +34,7 @@ COPY logo.svg ./logo.svg
 COPY web ./web
 COPY --from=web-builder /src/web/dist ./web/dist
 
-RUN cargo build --release --locked \
-        --bin luxd \
-        --bin lux-plugin-tmdb \
-        --bin lux-plugin-strm-media-info \
-        --bin lux-plugin-ip-hiofd \
-        --bin lux-plugin-qoo-ip138 \
-        --bin lux-plugin-pack \
-    && plugin_arch="$(uname -m)" \
-    && case "$plugin_arch" in \
-         x86_64) plugin_arch="x86_64" ;; \
-         aarch64) plugin_arch="aarch64" ;; \
-         *) echo "unsupported plugin architecture: $plugin_arch" >&2; exit 1 ;; \
-       esac \
-    && mkdir -p /src/dist \
-    && /src/target/release/lux-plugin-pack \
-         --plugin tmdb \
-         --binary /src/target/release/lux-plugin-tmdb \
-         --output /src/dist/org.lux.tmdb.zip \
-         --version "$LUX_TMDB_PLUGIN_VERSION" \
-         --platform linux \
-         --arch "$plugin_arch" \
-    && /src/target/release/lux-plugin-pack \
-         --plugin strm-media-info \
-         --binary /src/target/release/lux-plugin-strm-media-info \
-         --output /src/dist/org.lux.strm-media-info.zip \
-         --version "$LUX_STRM_MEDIA_INFO_PLUGIN_VERSION" \
-         --platform linux \
-         --arch "$plugin_arch" \
-    && /src/target/release/lux-plugin-pack \
-         --plugin ip-hiofd \
-         --binary /src/target/release/lux-plugin-ip-hiofd \
-         --output /src/dist/org.lux.ip-hiofd.zip \
-         --version "$LUX_IP_LOCATION_PLUGIN_VERSION" \
-         --platform linux \
-         --arch "$plugin_arch" \
-    && /src/target/release/lux-plugin-pack \
-         --plugin qoo-ip138 \
-         --binary /src/target/release/lux-plugin-qoo-ip138 \
-         --output /src/dist/org.lux.qoo-ip138.zip \
-         --version "$LUX_IP_LOCATION_PLUGIN_VERSION" \
-         --platform linux \
-         --arch "$plugin_arch"
+RUN cargo build --release --locked --bin luxd
 
 FROM debian:bookworm-slim
 
@@ -98,15 +46,11 @@ LABEL org.opencontainers.image.title="Lux" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg fonts-noto-cjk \
-    && mkdir -p /config /media /usr/local/share/lux/plugins /usr/share/doc/lux \
+    && mkdir -p /config /media /usr/share/doc/lux \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
 COPY --from=builder /src/assets/fonts/SmileySans-LICENSE.txt /usr/share/doc/lux/SmileySans-LICENSE.txt
-COPY --from=builder /src/dist/org.lux.tmdb.zip /usr/local/share/lux/plugins/org.lux.tmdb.zip
-COPY --from=builder /src/dist/org.lux.strm-media-info.zip /usr/local/share/lux/plugins/org.lux.strm-media-info.zip
-COPY --from=builder /src/dist/org.lux.ip-hiofd.zip /usr/local/share/lux/plugins/org.lux.ip-hiofd.zip
-COPY --from=builder /src/dist/org.lux.qoo-ip138.zip /usr/local/share/lux/plugins/org.lux.qoo-ip138.zip
 COPY --from=web-builder /src/web/dist /usr/local/share/lux/web
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

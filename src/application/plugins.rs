@@ -31,7 +31,6 @@ use crate::{
             tmdb_api_base_url_options, tmdb_language_options, write_tmdb_api_key,
             write_tmdb_settings,
         },
-        tmdb::EMBEDDED_TMDB_API_KEY,
     },
     domain::ids::LibraryId,
     storage::{Database, StorageError},
@@ -43,13 +42,10 @@ pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.strm-media-info";
 pub const MEDIA_INFO_LEGACY_PLUGIN_ID: &str = "org.lux.media-info";
 pub const IP_HIOFD_PLUGIN_ID: &str = "org.lux.ip-hiofd";
 pub const IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
-const TMDB_PLUGIN_NAME: &str = "TMDb 元数据插件";
-const TMDB_PLUGIN_DESCRIPTION: &str = "使用 TMDb 补全电影和剧集元数据、海报与背景图。";
-const TMDB_PLUGIN_VERSION: &str = "0.1.5";
-const CONFIG_SOURCE_BUILT_IN: &str = "BUILT_IN";
 const CONFIG_SOURCE_CUSTOM: &str = "CUSTOM";
 const CONFIG_SOURCE_ENVIRONMENT: &str = "ENVIRONMENT";
 const CONFIG_SOURCE_READ_ACCESS_TOKEN: &str = "READ_ACCESS_TOKEN";
+const CONFIG_SOURCE_PLUGIN_DEFAULT: &str = "PLUGIN_DEFAULT";
 const CONFIG_SOURCE_NONE: &str = "NONE";
 const CONFIG_SOURCE_PLUGIN: &str = "PLUGIN_CONFIG";
 const PLUGIN_CONFIG_DIR: &str = "plugin-config";
@@ -102,7 +98,7 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
             input_type: "password".to_owned(),
             required: false,
             sensitive: true,
-            description: Some("可选。留空时使用 Lux 内置的 TMDb Key。".to_owned()),
+            description: Some("可选。留空时使用 TMDb 插件自己的默认凭据。".to_owned()),
             multiple: false,
             options: Vec::new(),
             options_source: None,
@@ -242,7 +238,6 @@ impl PluginService {
         limit: i64,
         installed_only: bool,
     ) -> Result<PluginPage, PluginServiceError> {
-        self.ensure_builtin_plugins_installed().await?;
         let catalog = self.catalog_snapshot().await;
         let store_index = self.store_index().await;
         let mut views = Vec::with_capacity(catalog.plugins.len() + store_index.plugins.len() + 1);
@@ -262,31 +257,10 @@ impl PluginService {
             }
             if let Some(plugin) = local_plugin {
                 views.push(self.dynamic_view(plugin, installed, enabled).await?);
-            } else if is_tmdb_plugin_id(&entry.id) {
-                views.push(self.remote_tmdb_view(entry, installed, enabled).await);
             } else {
                 views.push(remote_plugin_view(entry, installed, enabled));
             }
             listed_ids.insert(entry.id.clone());
-        }
-        let legacy_tmdb_status = self
-            .database
-            .plugin_installation_status(TMDB_PLUGIN_ID)
-            .await?;
-        if !listed_ids.iter().any(|id| is_tmdb_plugin_id(id)) {
-            let installed = legacy_tmdb_status.is_some();
-            let enabled = legacy_tmdb_status == Some(true);
-            if !installed_only || installed {
-                views.push(
-                    legacy_tmdb_view(
-                        installed,
-                        enabled,
-                        self.tmdb_config_source().await,
-                        &self.config_dir,
-                    )
-                    .await,
-                );
-            }
         }
         for plugin in &catalog.plugins {
             if listed_ids.contains(&plugin.manifest.id) || is_tmdb_plugin_id(&plugin.manifest.id) {
@@ -444,7 +418,6 @@ impl PluginService {
         let catalog = self.catalog_snapshot().await;
         let scraper_id = self.canonical_plugin_id(scraper_id, &catalog);
         self.ensure_known_plugin(&scraper_id, &catalog)?;
-        self.ensure_builtin_plugins_installed().await?;
         if !self.database.is_plugin_installed(&scraper_id).await? {
             return Err(PluginServiceError::Unavailable(scraper_id));
         }
@@ -477,7 +450,6 @@ impl PluginService {
         if !is_public_address(ip) {
             return Err(PluginServiceError::Unavailable("ip_location".to_owned()));
         }
-        self.ensure_builtin_plugins_installed().await?;
         let query_ip = ip.to_string();
         let other_plugins = self.installed_other_ip_location_plugins().await?;
         let plugin_ids = if other_plugins.is_empty() {
@@ -938,7 +910,6 @@ impl PluginService {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(scraper_id, &catalog);
         self.ensure_known_plugin(&plugin_id, &catalog)?;
-        self.ensure_builtin_plugins_installed().await?;
         if plugin_id == TMDB_PLUGIN_ID {
             return Err(PluginServiceError::Unavailable(plugin_id));
         }
@@ -1027,11 +998,57 @@ impl PluginService {
             let _ = fs::remove_file(&archive).await;
             return Err(PluginServiceError::ConfigIo(error));
         }
-        let destination = plugin_dir.join(format!("{}-{}.zip", entry.id, entry.version));
-        if let Err(error) = fs::rename(&archive, &destination).await {
+        let validation_dir = self
+            .config_dir
+            .join(format!(".lux-plugin-validation-{}", Uuid::now_v7()));
+        if let Err(error) = fs::create_dir_all(&validation_dir).await {
             let _ = fs::remove_file(&archive).await;
             return Err(PluginServiceError::ConfigIo(error));
         }
+        let validation_archive = validation_dir.join("package.zip");
+        if let Err(error) = fs::rename(&archive, &validation_archive).await {
+            let _ = fs::remove_dir_all(&validation_dir).await;
+            return Err(PluginServiceError::ConfigIo(error));
+        }
+        let validation_catalog = PluginCatalog::discover(&validation_dir);
+        if validation_catalog.get(&entry.id).is_none() {
+            let _ = fs::remove_dir_all(&validation_dir).await;
+            return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
+        }
+        let destination = plugin_dir.join(format!("{}-{}.zip", entry.id, entry.version));
+        let staged_destination =
+            plugin_dir.join(format!(".lux-plugin-install-{}.zip", Uuid::now_v7()));
+        if let Err(error) = fs::rename(&validation_archive, &staged_destination).await {
+            let _ = fs::remove_dir_all(&validation_dir).await;
+            return Err(PluginServiceError::ConfigIo(error));
+        }
+        if let Err(error) = fs::rename(&staged_destination, &destination).await {
+            let _ = fs::remove_file(&staged_destination).await;
+            let _ = fs::remove_dir_all(&validation_dir).await;
+            return Err(PluginServiceError::ConfigIo(error));
+        }
+        let mut entries = fs::read_dir(&plugin_dir)
+            .await
+            .map_err(PluginServiceError::ConfigIo)?;
+        while let Some(entry_result) = entries
+            .next_entry()
+            .await
+            .map_err(PluginServiceError::ConfigIo)?
+        {
+            let path = entry_result.path();
+            if path.is_file()
+                && path.extension().is_some_and(|extension| extension == "zip")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&format!("{}-", entry.id)) && path != destination
+                    })
+            {
+                let _ = fs::remove_file(path).await;
+            }
+        }
+        let _ = fs::remove_dir_all(&validation_dir).await;
         let catalog = PluginCatalog::discover(&plugin_dir);
         if catalog.get(&entry.id).is_none() {
             let _ = fs::remove_file(&destination).await;
@@ -1047,15 +1064,6 @@ impl PluginService {
         installed: bool,
         enabled: bool,
     ) -> Result<PluginView, PluginServiceError> {
-        if plugin_id == TMDB_PLUGIN_ID {
-            return Ok(legacy_tmdb_view(
-                installed,
-                enabled,
-                self.tmdb_config_source().await,
-                &self.config_dir,
-            )
-            .await);
-        }
         let catalog = self.catalog_snapshot().await;
         let Some(plugin) = catalog.get(plugin_id) else {
             return Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()));
@@ -1063,42 +1071,9 @@ impl PluginService {
         self.dynamic_view(plugin, installed, enabled).await
     }
 
-    async fn remote_tmdb_view(
-        &self,
-        entry: &PluginStoreEntry,
-        installed: bool,
-        enabled: bool,
-    ) -> PluginView {
-        let mut view = legacy_tmdb_view(
-            installed,
-            enabled,
-            self.tmdb_config_source().await,
-            &self.config_dir,
-        )
-        .await;
-        view.name = entry.name.clone();
-        view.description = entry.description.clone();
-        view.version = Some(entry.version.clone());
-        view.runtime = (!entry.runtime.is_empty()).then(|| entry.runtime.clone());
-        view.capabilities = entry.capabilities.clone();
-        view
-    }
-
     async fn plugin_state(&self, plugin_id: &str) -> Result<(bool, bool), PluginServiceError> {
         let status = self.database.plugin_installation_status(plugin_id).await?;
         Ok((status.is_some(), status == Some(true)))
-    }
-
-    async fn ensure_builtin_plugins_installed(&self) -> Result<(), PluginServiceError> {
-        let catalog = self.catalog_snapshot().await;
-        for plugin_id in [TMDB_DYNAMIC_PLUGIN_ID, IP138_PLUGIN_ID] {
-            if catalog.get(plugin_id).is_some()
-                && !self.database.has_plugin_installation(plugin_id).await?
-            {
-                self.database.install_plugin(plugin_id).await?;
-            }
-        }
-        Ok(())
     }
 
     async fn installed_other_ip_location_plugins(&self) -> Result<Vec<String>, PluginServiceError> {
@@ -1241,10 +1216,8 @@ impl PluginService {
             || secret_file_configured(&self.config_dir, TMDB_TOKEN_FILE).await
         {
             CONFIG_SOURCE_READ_ACCESS_TOKEN
-        } else if !EMBEDDED_TMDB_API_KEY.is_empty() {
-            CONFIG_SOURCE_BUILT_IN
         } else {
-            CONFIG_SOURCE_NONE
+            CONFIG_SOURCE_PLUGIN_DEFAULT
         }
     }
 }
@@ -1711,56 +1684,6 @@ fn is_strm_resolver_plugin(plugin: &DiscoveredPlugin) -> bool {
 impl From<StorageError> for PluginServiceError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
-    }
-}
-
-async fn legacy_tmdb_view(
-    installed: bool,
-    enabled: bool,
-    config_source: &str,
-    config_dir: &std::path::Path,
-) -> PluginView {
-    PluginView {
-        id: TMDB_PLUGIN_ID.to_owned(),
-        name: TMDB_PLUGIN_NAME.to_owned(),
-        description: TMDB_PLUGIN_DESCRIPTION.to_owned(),
-        category: PLUGIN_CATEGORY_SCRAPER.to_owned(),
-        version: Some(TMDB_PLUGIN_VERSION.to_owned()),
-        runtime: Some("built-in".to_owned()),
-        capabilities: vec![
-            "metadata.search".to_owned(),
-            "metadata.get".to_owned(),
-            "metadata.images".to_owned(),
-            "metadata.credits".to_owned(),
-            "metadata.externalIds".to_owned(),
-            "metadata.trailers".to_owned(),
-        ],
-        status: if installed && enabled {
-            "BUILT_IN_COMPATIBILITY".to_owned()
-        } else if installed {
-            "DISABLED".to_owned()
-        } else {
-            "BUILT_IN_COMPATIBILITY".to_owned()
-        },
-        running: true,
-        last_error: None,
-        installed,
-        enabled,
-        configured: config_source != CONFIG_SOURCE_NONE,
-        available: enabled && config_source != CONFIG_SOURCE_NONE,
-        unavailable_reason: if !installed {
-            Some("NOT_INSTALLED".to_owned())
-        } else if !enabled {
-            Some("DISABLED".to_owned())
-        } else if config_source == CONFIG_SOURCE_NONE {
-            Some("NOT_CONFIGURED".to_owned())
-        } else {
-            None
-        },
-        configurable: true,
-        config_fields: tmdb_config_fields(),
-        config_source: config_source.to_owned(),
-        config_values: tmdb_config_values(config_dir).await,
     }
 }
 

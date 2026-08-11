@@ -49,7 +49,7 @@ const configuredScraper: AdminPlugin = {
   unavailableReason: null,
   configurable: true,
   configFields: [],
-  configSource: "BUILT_IN",
+  configSource: "PLUGIN_DEFAULT",
 };
 
 const mediaProbePlugin: AdminPlugin = {

@@ -66,7 +66,7 @@ export function AdminPluginsPage() {
   return (
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading">
-        <div><h1>插件库</h1><p>安装已内置并经过验证的元数据插件，再为媒体库选择刮削器。</p></div>
+        <div><h1>插件库</h1><p>从插件商店安装经过校验的插件，再为媒体库选择刮削器。</p></div>
         <button className="lux-button lux-button-secondary lux-admin-plugin-store-trigger" type="button" aria-label="设置插件商店来源" aria-haspopup="dialog" aria-expanded={storeDialogOpen} onClick={() => setStoreDialogOpen(true)}><Globe2 size={15} /> 插件商店来源</button>
       </header>
       {storeDialogOpen ? (
@@ -273,7 +273,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
                 {writeSidecarsField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={writeSidecars} onChange={(event) => setWriteSidecars(event.target.checked)} /> <span><strong>{writeSidecarsField.label}</strong><small>{writeSidecarsField.description}</small></span></label> : null}
                 {scheduleField ? <label htmlFor={"plugin-config-" + plugin.id + "-schedule"}>{scheduleField.label}<input id={"plugin-config-" + plugin.id + "-schedule"} type="text" required={scheduleField.required} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="0 3 * * *" /><small>{scheduleField.description}</small></label> : null}
               </> : <>
-                {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空可恢复内置 Key" autoComplete="new-password" /></label> : null}
+                {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空使用插件默认凭据" autoComplete="new-password" /></label> : null}
                 {preferredLanguageField ? <label htmlFor={"plugin-config-" + plugin.id + "-preferred-language"}>{preferredLanguageField.label}<select id={"plugin-config-" + plugin.id + "-preferred-language"} value={preferredLanguage} onChange={(event) => setPreferredLanguage(event.target.value)}>{(preferredLanguageField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label> : null}
                 {fallbackEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={languageFallbackEnabled} onChange={(event) => setLanguageFallbackEnabled(event.target.checked)} /> <span><strong>{fallbackEnabledField.label}</strong><small>{fallbackEnabledField.description}</small></span></label> : null}
                 {fallbackLanguagesField ? <label htmlFor={"plugin-config-" + plugin.id + "-fallback-languages"}>{fallbackLanguagesField.label}<select id={"plugin-config-" + plugin.id + "-fallback-languages"} multiple value={fallbackLanguages} onChange={(event) => setFallbackLanguages(Array.from(event.target.selectedOptions, (option) => option.value))}>{(fallbackLanguagesField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{fallbackLanguagesField.description}</small></label> : null}
@@ -307,7 +307,7 @@ function availabilityLabel(source: AdminPlugin["configSource"]) {
   if (source === "CUSTOM") return "使用自定义 Key";
   if (source === "ENVIRONMENT") return "使用环境变量 Key";
   if (source === "READ_ACCESS_TOKEN") return "使用 Read Access Token";
-  if (source === "BUILT_IN") return "使用内置 Key";
+  if (source === "PLUGIN_DEFAULT") return "使用插件默认凭据";
   if (source === "PLUGIN_CONFIG") return "使用插件配置";
   return "未配置凭据";
 }

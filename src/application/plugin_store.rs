@@ -23,6 +23,15 @@ pub struct PluginStoreIndex {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct PluginStorePackage {
+    pub platform: String,
+    pub arch: String,
+    #[serde(rename = "url", alias = "package")]
+    pub package_url: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct PluginStoreEntry {
     pub id: String,
     pub name: String,
@@ -34,8 +43,11 @@ pub struct PluginStoreEntry {
     pub runtime: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
-    #[serde(rename = "package")]
+    #[serde(default)]
+    pub packages: Vec<PluginStorePackage>,
+    #[serde(default, rename = "package")]
     pub package_url: String,
+    #[serde(default)]
     pub sha256: String,
 }
 
@@ -44,6 +56,7 @@ pub enum PluginStoreError {
     InvalidSource,
     InvalidCatalog,
     InvalidPackage,
+    UnsupportedPlatform,
     Http(reqwest::Error),
     Io(std::io::Error),
 }
@@ -54,6 +67,9 @@ impl fmt::Display for PluginStoreError {
             Self::InvalidSource => formatter.write_str("plugin store source is invalid"),
             Self::InvalidCatalog => formatter.write_str("plugin store catalog is invalid"),
             Self::InvalidPackage => formatter.write_str("plugin package is invalid"),
+            Self::UnsupportedPlatform => {
+                formatter.write_str("plugin package is unavailable for this platform")
+            }
             Self::Http(_) => formatter.write_str("plugin store request failed"),
             Self::Io(_) => formatter.write_str("plugin store file operation failed"),
         }
@@ -65,7 +81,10 @@ impl std::error::Error for PluginStoreError {
         match self {
             Self::Http(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::InvalidSource | Self::InvalidCatalog | Self::InvalidPackage => None,
+            Self::InvalidSource
+            | Self::InvalidCatalog
+            | Self::InvalidPackage
+            | Self::UnsupportedPlatform => None,
         }
     }
 }
@@ -153,9 +172,10 @@ impl PluginStore {
         &self,
         entry: &PluginStoreEntry,
     ) -> Result<PathBuf, PluginStoreError> {
+        let (package_url, expected) = select_package(entry)?;
         let response = self
             .client
-            .get(&entry.package_url)
+            .get(package_url)
             .send()
             .await
             .map_err(PluginStoreError::Http)?
@@ -173,7 +193,7 @@ impl PluginStore {
             PluginStoreError::InvalidPackage,
         )
         .await?;
-        let expected = entry.sha256.to_ascii_lowercase();
+        let expected = expected.to_ascii_lowercase();
         let temporary = self
             .config_dir
             .join(format!(".lux-plugin-{}.zip", Uuid::now_v7()));
@@ -236,6 +256,44 @@ async fn read_limited_body(
     Ok(bytes)
 }
 
+fn select_package(entry: &PluginStoreEntry) -> Result<(&str, &str), PluginStoreError> {
+    let (platform, arch) = current_platform_and_arch();
+    if let Some(package) = entry
+        .packages
+        .iter()
+        .find(|package| package.platform == platform && package.arch == arch)
+    {
+        return Ok((&package.package_url, &package.sha256));
+    }
+    if let Some(package) = entry
+        .packages
+        .iter()
+        .find(|package| package.platform == "*" && package.arch == "*")
+    {
+        return Ok((&package.package_url, &package.sha256));
+    }
+    if entry.packages.is_empty() && !entry.package_url.is_empty() && !entry.sha256.is_empty() {
+        return Ok((&entry.package_url, &entry.sha256));
+    }
+    Err(PluginStoreError::UnsupportedPlatform)
+}
+
+fn current_platform_and_arch() -> (&'static str, &'static str) {
+    let platform = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "windows",
+        "linux" => "linux",
+        _ => std::env::consts::OS,
+    };
+    let arch = match (platform, std::env::consts::ARCH) {
+        ("darwin", "aarch64") => "arm64",
+        (_, "aarch64") => "aarch64",
+        (_, "x86_64") => "x86_64",
+        (_, value) => value,
+    };
+    (platform, arch)
+}
+
 pub fn validate_store_source(source: &str) -> Result<&str, PluginStoreError> {
     let source = source.trim();
     if source.is_empty()
@@ -295,26 +353,66 @@ fn validate_catalog(
             || entry.version.is_empty()
             || entry.version.len() > 128
             || entry.version.contains('/')
-            || entry.sha256.len() != 64
-            || !entry
-                .sha256
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
         {
             return Err(PluginStoreError::InvalidCatalog);
         }
-        let package_url = catalog_url
-            .join(&entry.package_url)
-            .map_err(|_| PluginStoreError::InvalidCatalog)?;
-        if package_url.scheme() != "https"
-            || package_url.host_str().is_none()
-            || !package_url.username().is_empty()
-            || package_url.password().is_some()
-            || package_url.fragment().is_some()
-        {
-            return Err(PluginStoreError::InvalidCatalog);
+        if entry.packages.is_empty() {
+            if entry.package_url.is_empty()
+                || entry.sha256.len() != 64
+                || !entry
+                    .sha256
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(PluginStoreError::InvalidCatalog);
+            }
+            entry.packages.push(PluginStorePackage {
+                platform: "*".to_owned(),
+                arch: "*".to_owned(),
+                package_url: entry.package_url.clone(),
+                sha256: entry.sha256.clone(),
+            });
         }
-        entry.package_url = package_url.to_string();
+        let mut package_targets = std::collections::HashSet::new();
+        for package in &mut entry.packages {
+            if package.platform.is_empty()
+                || package.platform.len() > 32
+                || package.platform.chars().any(|character| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '*' | '-' | '_'))
+                })
+                || package.arch.is_empty()
+                || package.arch.len() > 32
+                || package.arch.chars().any(|character| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '*' | '-' | '_'))
+                })
+                || !package_targets.insert((package.platform.clone(), package.arch.clone()))
+                || package.sha256.len() != 64
+                || !package
+                    .sha256
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(PluginStoreError::InvalidCatalog);
+            }
+            let package_url = catalog_url
+                .join(&package.package_url)
+                .map_err(|_| PluginStoreError::InvalidCatalog)?;
+            if package_url.scheme() != "https"
+                || package_url.host_str().is_none()
+                || !package_url.username().is_empty()
+                || package_url.password().is_some()
+                || package_url.fragment().is_some()
+            {
+                return Err(PluginStoreError::InvalidCatalog);
+            }
+            package.package_url = package_url.to_string();
+        }
+        if entry.package_url.is_empty() {
+            entry.package_url = entry.packages[0].package_url.clone();
+            entry.sha256 = entry.packages[0].sha256.clone();
+        } else {
+            entry.package_url = entry.packages[0].package_url.clone();
+        }
     }
     Ok(())
 }
@@ -323,10 +421,10 @@ const DEFAULT_PLUGIN_INDEX_JSON: &str = r#"
 {
   "formatVersion": 1,
   "plugins": [
-    {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.5","runtime":"process","capabilities":["metadata.search","metadata.get","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"package":"packages/org.lux.tmdb-0.1.5.zip","sha256":"1919b9783e19d6f7acea4473f66df66459ff327c41a9c4995cc66114fb95ec58"},
-    {"id":"org.lux.strm-media-info","name":"strm媒体信息提取","description":"使用 ffprobe 提取媒体信息，并使用 ffmpeg 补全 STRM 缩略图。","category":"MEDIA","version":"0.2.0","runtime":"process","capabilities":["media.probe"],"package":"packages/org.lux.strm-media-info-0.2.0.zip","sha256":"1f618421760809bba83cc2a7fc12a186808d41123132a7735a3e64b651048df5"},
-    {"id":"org.lux.ip-hiofd","name":"IP归属地查询增强","description":"通过 Hiofd 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"package":"packages/org.lux.ip-hiofd-0.1.0.zip","sha256":"c9fac43a37b034bffaf5ffb55cdb8e256bbdc3e9eaf86a514540c56be46086b6"},
-    {"id":"org.lux.qoo-ip138","name":"ip138 IP归属地查询","description":"通过 ipshudi.com 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"package":"packages/org.lux.qoo-ip138-0.1.0.zip","sha256":"09f0620824989c32eeaedf77cac53595b410d100beeb050a20d021fbe4a51717"}
+    {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.5","runtime":"process","capabilities":["metadata.search","metadata.get","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.tmdb-0.1.5-linux-aarch64.zip","sha256":"00e2b91bf51a32e98debee8049c460d6da0a8f5e4c91af025f88b4045303c9e6"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.tmdb-0.1.5-linux-x86_64.zip","sha256":"0babd6b44507b54986ce8aa0dfcbc9cb918ca0aed8ff41039a3fede6bc97ef62"}]},
+    {"id":"org.lux.strm-media-info","name":"strm媒体信息提取","description":"使用 ffprobe 提取媒体信息，并使用 ffmpeg 补全 STRM 缩略图。","category":"MEDIA","version":"0.2.0","runtime":"process","capabilities":["media.probe"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.strm-media-info-0.2.0-linux-aarch64.zip","sha256":"042e19c26090818a127cad3d5a757396dd77679eb3cc1240b92b780faadd38e5"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.strm-media-info-0.2.0-linux-x86_64.zip","sha256":"ba9c051b804ee20bbf4f24eeb8a3aeccb7e5e9922f8d7a469c19e4fe41a199b2"}]},
+    {"id":"org.lux.ip-hiofd","name":"IP归属地查询增强","description":"通过 Hiofd 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.ip-hiofd-0.1.0-linux-aarch64.zip","sha256":"1cc18a886d87477debaa48c1947ff324183b158a3014a682a6b28f3129ec1f28"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.ip-hiofd-0.1.0-linux-x86_64.zip","sha256":"d07929bdfcc486fb2704d70be3da9a690858da6fb7ea053fd4571483127b5d9a"}]},
+    {"id":"org.lux.qoo-ip138","name":"ip138 IP归属地查询","description":"通过 ipshudi.com 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.qoo-ip138-0.1.0-linux-aarch64.zip","sha256":"f38791fd6a8798bfad195ce94a08fa5891ce96b24cd1eda7449ee694e7894d73"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.qoo-ip138-0.1.0-linux-x86_64.zip","sha256":"508e512fa0719df5f19233db8c3b4113672a975dd96325e03042bf0955377cbb"}]}
   ]
 }
 "#;
@@ -369,6 +467,7 @@ mod tests {
                 version: "1.0.0".to_owned(),
                 runtime: "process".to_owned(),
                 capabilities: Vec::new(),
+                packages: Vec::new(),
                 package_url: "packages/example.zip".to_owned(),
                 sha256: "a".repeat(64),
             }],
@@ -382,6 +481,7 @@ mod tests {
             index.plugins[0].package_url,
             "https://example.com/store/packages/example.zip"
         );
+        assert_eq!(index.plugins[0].packages[0].platform, "*");
     }
 
     #[test]
@@ -390,6 +490,41 @@ mod tests {
         assert_eq!(index.format_version, 1);
         assert_eq!(index.plugins.len(), 4);
         assert_eq!(index.plugins[0].id, "org.lux.tmdb");
+        assert_eq!(index.plugins[0].packages.len(), 2);
+    }
+
+    #[test]
+    fn selects_the_package_for_the_running_platform_and_architecture() {
+        let (platform, arch) = current_platform_and_arch();
+        let entry = PluginStoreEntry {
+            id: "org.lux.example".to_owned(),
+            name: "Example".to_owned(),
+            description: String::new(),
+            category: "UTILITY".to_owned(),
+            version: "1.0.0".to_owned(),
+            runtime: "process".to_owned(),
+            capabilities: Vec::new(),
+            packages: vec![
+                PluginStorePackage {
+                    platform: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    package_url: "https://example.com/x86.zip".to_owned(),
+                    sha256: "a".repeat(64),
+                },
+                PluginStorePackage {
+                    platform: platform.to_owned(),
+                    arch: arch.to_owned(),
+                    package_url: "https://example.com/current.zip".to_owned(),
+                    sha256: "b".repeat(64),
+                },
+            ],
+            package_url: String::new(),
+            sha256: String::new(),
+        };
+        assert_eq!(
+            select_package(&entry).expect("matching package").0,
+            "https://example.com/current.zip"
+        );
     }
 
     #[tokio::test]

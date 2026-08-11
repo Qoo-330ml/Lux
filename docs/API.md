@@ -68,7 +68,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 以下接口要求 `canManageServer`；写操作还要求 `X-CSRF-Token`：
 
-- `GET /api/v1/admin/plugin-store`：读取当前插件商店来源和内置默认来源。默认来源为 `https://github.com/Qoo-330ml/Lux-plugins`，GitHub 仓库地址解析为 `main/index.json`；读取需要管理员权限。
+- `GET /api/v1/admin/plugin-store`：读取当前插件商店来源和默认来源。默认来源为 `https://github.com/Qoo-330ml/Lux-plugins`，GitHub 仓库地址解析为 `main/index.json`；读取需要管理员权限。
 - `PUT /api/v1/admin/plugin-store`：管理员发送 `{ "url": "https://example.com/lux/index.json" }` 保存插件目录来源，需要 CSRF。只接受无凭据、无 fragment、无控制字符且不超过 2048 个字符的 HTTPS 地址；成功返回 `url` 和 `defaultUrl`。
 - `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回当前插件商店目录和 `/config/plugins` 本地发现的插件包及 `installed`、`enabled`、`running`、`configured`、`available`、`configurable`、`configFields`、非敏感 `configValues`、`configSource`、`version`、`runtime`、`capabilities`、`status` 和脱敏 `lastError` 状态。`configFields` 包含输入类型、是否多选、默认值、数值范围和选项来源；`media-libraries` 选项由当前媒体库动态填充。TMDb 的 `configValues` 返回非敏感设置，不返回 API Key 或 Token。目录不可用时，已发现的本地插件仍可用于已安装管理页。
 - `POST /api/v1/admin/plugins/{pluginId}/install`：安装本地发现的插件，或下载当前插件商店目录声明的 `.zip` 包并校验大小、路径、manifest、平台入口和 SHA-256 后原子写入 `/config/plugins`，默认启用。首次安装返回 201，重复请求返回 200；下载失败或未知插件返回相应错误，不改变安装状态。
@@ -80,7 +80,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `media_probe` 插件必须声明 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。`org.lux.strm-media-info` 的 `media.probe` 只处理单个由宿主校验的不透明 STRM 目标，可为媒体信息和缩略图分别设置开关；目标可以是私网地址、公网地址、域名或路径。宿主负责并发、超时、取消、恢复、落库和可选旁车写回。播放和 PlaybackInfo 不触发该 RPC。
 - 未安装、未启用、无可用凭据、运行失败或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
-插件包不从任意未登记的远程 URL 自动下载；远程安装只使用当前插件商店目录声明的包地址。插件 API、媒体库 API 和日志不返回插件配置中的敏感值；TMDb API Key 和 Read Access Token 只存在受限配置或内置实现中。
+插件包不从任意未登记的远程 URL 自动下载；远程安装只使用当前插件商店目录声明的 Release 包地址。插件 API、媒体库 API 和日志不返回插件配置中的敏感值；TMDb API Key 和 Read Access Token 只存在受限配置或外置插件运行时中。
 
 ## 元数据候选管理（LUX-053）
 

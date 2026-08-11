@@ -38,14 +38,25 @@ Lux 默认从 `https://github.com/Qoo-330ml/Lux-plugins` 读取插件目录；Gi
     "version": "1.0.0",
     "runtime": "process",
     "capabilities": ["utility.example"],
-    "package": "packages/org.lux.example-1.0.0.zip",
-    "sha256": "<64 lowercase hexadecimal characters>"
+    "packages": [{
+      "platform": "linux",
+      "arch": "x86_64",
+      "url": "https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.example-1.0.0-linux-x86_64.zip",
+      "sha256": "<64 lowercase hexadecimal characters>"
+    }, {
+      "platform": "linux",
+      "arch": "aarch64",
+      "url": "https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-1/org.lux.example-1.0.0-linux-aarch64.zip",
+      "sha256": "<64 lowercase hexadecimal characters>"
+    }]
   }]
 }
 ```
 
-`package` 可以是相对目录地址或 HTTPS 地址；Lux 只下载目录声明的 ZIP，并在安装前执行包大小、路径、
-manifest、平台入口和 SHA-256 校验。目录项的插件 ID、版本和包哈希必须唯一且符合格式限制。
+插件仓库只提交源码和 manifest；workflow 分别在 AMD/x86 与 ARM runner 编译，并把带版本和架构的 ZIP
+上传到 GitHub Release，再将 Release 地址和 SHA-256 写入 `packages`。Lux 按当前运行平台选择对应包，
+只下载目录声明的 ZIP，并在安装前执行包大小、路径、manifest、平台入口和 SHA-256 校验。目录项的插件 ID、
+版本、目标平台和包哈希必须唯一且符合格式限制。旧目录也可以继续使用单个 `package` 字段作为兼容格式。
 
 ## Manifest
 
@@ -105,7 +116,7 @@ manifest、平台入口和 SHA-256 校验。目录项的插件 ID、版本和包
 `formatVersion` 是包格式；`apiVersion` 是 RPC 契约；`version` 是插件自身版本。三者不能混用。
 
 `type` 当前允许 `metadata`、`media_probe`、`ip_location` 和 `strm_resolver`。媒体探测插件必须同时声明
-`category: "MEDIA"` 和 `capabilities: ["media.probe"]`。例如内置的
+`category: "MEDIA"` 和 `capabilities: ["media.probe"]`。例如商店中的
 `org.lux.strm-media-info` 使用以下 manifest 核心字段：
 
 ```json
@@ -154,17 +165,15 @@ manifest、平台入口和 SHA-256 校验。目录项的插件 ID、版本和包
 ```
 
 Lux 不再要求插件包使用 Lux Ed25519 签名。运行时仅兼容读取历史签名字段，签名不会作为插件发现
-或启动的阻断条件；当前打包器始终只生成普通包。插件仍必须通过 ZIP 大小、文件数量、路径、
+或启动的阻断条件；外部插件仓库的构建流程生成普通包。插件仍必须通过 ZIP 大小、文件数量、路径、
 manifest、格式版本、协议版本、平台入口和声明文件 SHA-256 校验；插件继续在独立进程中运行。
 
-构建 TMDb 包：
-
-```bash
-./scripts/package-tmdb-plugin.sh
-```
-
-脚本输出 `org.lux.tmdb-<version>.zip`，只包含 `manifest.json` 和当前平台的
-`binaries/<platform>-<arch>/lux-plugin-tmdb`。插件目录只在 Lux 重启时扫描，升级包后需要重启。
+Lux 主仓库不再包含插件实现或打包脚本。插件源码、manifest 模板和构建脚本位于
+[Lux-plugins](https://github.com/Qoo-330ml/Lux-plugins)，向其 `main` 分支提交后由 GitHub
+Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Release 资产命名为
+`<plugin-id>-<version>-linux-x86_64.zip` 或 `<plugin-id>-<version>-linux-aarch64.zip`；商店
+`index.json` 按平台列出 Release URL 和 SHA-256。Lux 选择当前平台的资产，校验后自动保存为
+`/config/plugins/<plugin-id>-<version>.zip`，插件目录只在 Lux 重启时扫描，升级包后需要重启。
 
 ## RPC 方法
 

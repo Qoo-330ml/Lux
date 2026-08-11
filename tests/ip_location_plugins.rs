@@ -89,6 +89,7 @@ async fn an_installed_other_provider_disables_ip138() -> Result<(), Box<dyn std:
     };
     let database = Database::connect(&config).await?;
     let plugins = PluginService::new(database, config_dir);
+    plugins.install("org.lux.qoo-ip138").await?;
     plugins.install("org.lux.ip-hiofd").await?;
 
     let page = plugins.list_installed(0, 20).await?;
