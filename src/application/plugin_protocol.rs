@@ -12,8 +12,10 @@ pub const PLUGIN_CATEGORY_MEDIA: &str = "MEDIA";
 pub const PLUGIN_CATEGORY_NETWORK: &str = "NETWORK";
 pub const PLUGIN_TYPE_MEDIA_PROBE: &str = "media_probe";
 pub const PLUGIN_TYPE_IP_LOCATION: &str = "ip_location";
+pub const PLUGIN_TYPE_STRM_RESOLVER: &str = "strm_resolver";
 pub const MEDIA_PROBE_CAPABILITY: &str = "media.probe";
 pub const IP_LOCATION_CAPABILITY: &str = "ip.location";
+pub const STRM_RESOLVE_CAPABILITY: &str = "strm.resolve";
 pub const CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES: &str = "media-libraries";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -101,6 +103,22 @@ impl PluginManifest {
                 {
                     return Err(PluginManifestError::Invalid(
                         "ip location plugins must declare ip.location".to_owned(),
+                    ));
+                }
+            }
+            PLUGIN_TYPE_STRM_RESOLVER => {
+                if self.category != PLUGIN_CATEGORY_MEDIA {
+                    return Err(PluginManifestError::Invalid(
+                        "STRM resolver plugins must use the MEDIA category".to_owned(),
+                    ));
+                }
+                if !self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == STRM_RESOLVE_CAPABILITY)
+                {
+                    return Err(PluginManifestError::Invalid(
+                        "STRM resolver plugins must declare strm.resolve".to_owned(),
                     ));
                 }
             }
@@ -411,6 +429,27 @@ pub struct MediaProbeRpcResult {
     pub streams: Vec<MediaProbeRpcStream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_jpeg_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StrmResolveRpcRequest {
+    pub target: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StrmResolveStatus {
+    Resolved,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StrmResolveRpcResult {
+    pub status: StrmResolveStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

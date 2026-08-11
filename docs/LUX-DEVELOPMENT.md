@@ -1771,6 +1771,7 @@ services:
 | LUX-154 | src/application/scanner.rs、src/storage/mod.rs、migrations/、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
 | LUX-156 | src/observability/、src/main.rs、src/api/mod.rs、Cargo.toml、Cargo.lock、tests/observability.rs、tests/log_export.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 | LUX-158 | src/application/strm_target.rs、src/application/、tests/strm_target.rs、docs/ |
+| LUX-160 | src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3385,6 +3386,39 @@ URL 型目标继续提供外部 HTTP 直播放行；路径、其他目标和空�
 
 - 不实现路径映射、外部解析器注册、目标转发、媒体字节代理或转码。
 - 不绑定任何具体云盘、网盘或第三方工具。
+
+#### LUX-160：通用 `.strm` 目标解析与转发
+
+范围：通过通用 `strm_resolver` 插件处理路径型和未知型 `.strm` 原始目标。插件只接收 Lux
+保存的原始目标，不访问 Lux 数据库和媒体根目录；Lux 不解释路径中的服务商、挂载名或映射规则。
+
+插件 manifest 必须声明 `type: "strm_resolver"`、`category: "MEDIA"` 和
+`strm.resolve` 能力。宿主通过 `strm.resolve` RPC 发送原始目标，插件返回 `RESOLVED` 加
+HTTP(S) URL，或 `UNSUPPORTED`。宿主按插件 ID 稳定顺序尝试已安装、启用且配置有效的解析器，
+第一个成功结果用于播放，因此可以接入多个互不相同的解析工具。
+
+宿主对插件返回地址执行独立的 HTTP(S)、长度、凭据、fragment 和控制字符校验；校验失败、
+插件失败或没有可用解析器时，不产生伪造直链。视频端点只在解析成功后临时重定向到结果地址，
+不代理媒体字节、不缓存地址、不在日志记录原始目标或完整外部 URL。
+
+验收：
+
+- [ ] 通用解析器 manifest 和 RPC 合同有协议测试，未知插件类型和缺少能力仍被拒绝。
+- [ ] 多个解析器按稳定顺序尝试；未安装、禁用或未配置的解析器不参与请求。
+- [ ] 仅路径/未知目标触发解析；HTTP(S) 目标保持既有直连合同。
+- [ ] 解析器返回的非 HTTP(S)、带凭据、带 fragment、含控制字符或超长地址均被拒绝。
+- [ ] 解析成功时 `PlaybackInfo` 提供 Lux 受保护的视频入口，入口临时重定向到已校验地址；
+      未解析时不伪造可播放 URL。
+- [ ] 通过专项 Rust 测试、格式化、Clippy，并记录 ARM 本机 `uname -m`。
+
+验证：参见 `docs/LUX-160-PLAN.md`。
+
+依赖：LUX-159、LUX-142。
+
+明确不做：
+
+- 不绑定任何具体云盘、网盘、代理或第三方工具。
+- 不把路径直接拼接为 URL，不请求路径代表的本地文件，不实现媒体字节代理或转码。
 
 ## 26. 风险与缓解
 

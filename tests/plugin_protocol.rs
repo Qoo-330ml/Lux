@@ -1,7 +1,8 @@
 use luxd::application::plugin_protocol::{
     IP_LOCATION_CAPABILITY, IpLocationRpcResult, MediaProbeRpcResult, PLUGIN_API_VERSION,
-    PLUGIN_CATEGORY_NETWORK, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_IP_LOCATION, PluginManifest,
-    PluginRequest,
+    PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_IP_LOCATION,
+    PLUGIN_TYPE_STRM_RESOLVER, PluginManifest, PluginRequest, STRM_RESOLVE_CAPABILITY,
+    StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
 };
 use serde_json::json;
 
@@ -182,6 +183,75 @@ fn rejects_an_ip_location_manifest_without_the_network_capability() {
     .expect_err("ip location plugin capability must be declared");
 
     assert!(error.to_string().contains("ip.location"));
+}
+
+#[test]
+fn accepts_a_generic_strm_resolver_manifest_and_contract() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.example-resolver",
+        "name": "Generic STRM resolver",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_STRM_RESOLVER,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "capabilities": [STRM_RESOLVE_CAPABILITY],
+        "permissions": {"network": ["resolver.example"]},
+        "files": []
+    }))
+    .expect("STRM resolver manifest should validate");
+
+    let request = StrmResolveRpcRequest {
+        target: "/opaque/or/path target.mp4".to_owned(),
+    };
+    let request_value = serde_json::to_value(request).expect("resolver request should serialize");
+    assert_eq!(
+        request_value,
+        json!({"target": "/opaque/or/path target.mp4"})
+    );
+
+    let result: StrmResolveRpcResult = serde_json::from_value(json!({
+        "status": "RESOLVED",
+        "url": "https://media.example/direct.mp4"
+    }))
+    .expect("resolved result should deserialize");
+    assert_eq!(result.status, StrmResolveStatus::Resolved);
+    assert_eq!(
+        result.url.as_deref(),
+        Some("https://media.example/direct.mp4")
+    );
+    assert_eq!(manifest.plugin_type, PLUGIN_TYPE_STRM_RESOLVER);
+}
+
+#[test]
+fn accepts_an_unsupported_strm_resolver_result_without_a_url() {
+    let result: StrmResolveRpcResult = serde_json::from_value(json!({
+        "status": "UNSUPPORTED"
+    }))
+    .expect("unsupported result should deserialize");
+
+    assert_eq!(result.status, StrmResolveStatus::Unsupported);
+    assert!(result.url.is_none());
+}
+
+#[test]
+fn rejects_a_strm_resolver_manifest_without_its_capability() {
+    let error = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.invalid-resolver",
+        "name": "Invalid STRM resolver",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_STRM_RESOLVER,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "capabilities": [],
+        "files": []
+    }))
+    .expect_err("STRM resolver capability must be declared");
+
+    assert!(error.to_string().contains("strm.resolve"));
 }
 
 #[test]
