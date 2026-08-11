@@ -303,6 +303,8 @@ Lux 的核心价值不是功能数量，而是：
 ### 3.15 内置插件与刮削器
 
 - Lux 提供安全的插件注册表；插件以标准 `.zip` 插件包放入 `/config/plugins`，服务重启时扫描并加载。插件代码运行在受监督的独立进程中，不直接注入 Lux Rust 主进程。
+- 插件商店使用可配置的 HTTPS 目录地址；目录返回插件元数据和包地址。默认目录源为 `https://github.com/Qoo-330ml/Lux-plugins`，Lux 将其解析为仓库 `main` 分支的 `index.json`；管理员可以在插件商店页面填写其他目录地址。
+- 管理员从插件商店安装插件时，Lux 只下载目录声明的 `.zip` 包，限制大小、文件数量、路径、manifest、协议版本、平台入口和声明文件 SHA-256，并在校验成功后原子写入 `/config/plugins`；未经目录声明的地址不得作为下载目标。
 - 首个独立插件为 `org.lux.tmdb`。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
 - SDK v1 同时支持 `media_probe` 插件类型。`org.lux.strm-media-info` 只接收 Lux 宿主按单个任务提交的已校验 STRM 探测目标，按原始字符串调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
 - 只有已安装、已启用且有可用凭据的插件才能被媒体库选择。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用服务端内置的默认 API Key；任何凭据都不返回 API 或写入日志。
@@ -1773,6 +1775,7 @@ services:
 | LUX-156 | src/observability/、src/main.rs、src/api/mod.rs、Cargo.toml、Cargo.lock、tests/observability.rs、tests/log_export.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 | LUX-158 | src/application/strm_target.rs、src/application/、tests/strm_target.rs、docs/ |
 | LUX-160 | src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、tests/、docs/ |
+| LUX-162 | src/application/plugin_store.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2985,7 +2988,7 @@ services:
 
 - 不在 Lux Rust 主进程中 `dlopen` 任意 native DLL。
 - 不直接运行或模拟完整 Emby 服务端以兼容原始 `MovieDb.dll`；原始 DLL 只作为行为参考。
-- 不自动从任意远程地址下载第三方插件包。
+- 不从任意未登记的远程地址下载第三方插件包；远程安装只允许使用当前插件商店目录声明的包地址。
 
 #### LUX-144：TMDb 多语言首选与回退配置
 
@@ -3430,6 +3433,45 @@ HTTP(S) URL，或 `UNSUPPORTED`。宿主按插件 ID 稳定顺序尝试已安装
 
 - 不绑定任何具体云盘、网盘、代理或第三方工具。
 - 不把路径直接拼接为 URL，不请求路径代表的本地文件，不实现媒体字节代理或转码。
+
+#### LUX-162：可配置插件商店与远程插件包
+
+范围：将插件商店目录从 Lux 进程内的静态插件发现结果扩展为可配置的远程目录。默认目录源为
+`https://github.com/Qoo-330ml/Lux-plugins`，按该仓库 `main/index.json` 读取插件元数据；管理员可以在
+Web 插件商店中填写其他 HTTPS 目录地址。目录项必须包含稳定插件 ID、manifest 元数据、相对或绝对
+`.zip` 包地址和 SHA-256，安装只允许下载当前目录声明的包。
+
+安装流程先将包下载到 `/config/plugins` 外的临时文件，限制响应大小和超时，校验 ZIP 路径、manifest、
+协议版本、当前平台入口、声明文件哈希和包内文件上限，再原子移动到 `/config/plugins` 并刷新进程内插件
+目录；失败不得写入安装状态或留下可执行临时文件。远程目录不可用时，已发现的本地插件仍可在已安装
+管理页使用，错误不得把远程地址或完整下载地址写入日志。
+
+验收：
+
+- [ ] 空配置首次读取插件商店时返回内置默认仓库地址；管理员可保存合法 HTTPS 目录地址，拒绝凭据、
+      fragment、控制字符和超长地址；刷新或重启后保持。
+- [ ] 默认 `Lux-plugins` 仓库的 `index.json` 可返回 TMDb、STRM 媒体信息和 IP 归属地插件目录项；
+      列表仍分页并保留当前已安装状态。
+- [ ] 管理员安装目录中的插件后，包通过大小、路径、manifest、平台入口和 SHA-256 校验，写入
+      `/config/plugins` 并立即可在媒体库刮削器/插件配置中使用；下载失败、哈希错误和不兼容包不改变安装状态。
+- [ ] 非管理员不能读取或修改商店来源；插件包下载不记录凭据、完整外部 URL 或包内容。
+- [ ] 新增远程目录、包校验、配置持久化和 Web 商店地址表单测试；空数据库迁移链、ARM 本机
+      `uname -m`、Rust 格式化、Clippy、Web 单测和构建均通过。
+
+验证：
+
+- `cargo test --locked --test plugins --test plugin_package --test plugin_store`
+- `pnpm --dir web test -- plugin-library.test.ts -- api-client.test.ts`
+- `pnpm --dir web build`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-140、LUX-142。
+
+明确不做：
+
+- 不实现任意 URL 的插件包安装，不放宽现有独立进程和包校验边界。
+- 不把插件仓库改造成代码执行平台；仓库只提供已打包插件和目录索引。
 
 ## 26. 风险与缓解
 
