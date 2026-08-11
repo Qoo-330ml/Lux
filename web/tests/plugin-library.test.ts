@@ -110,13 +110,27 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(card?.querySelector('[aria-label="配置 TMDb 元数据插件"]')).toBeTruthy();
   });
 
-  it("renders the configurable plugin store source", async () => {
+  it("keeps the plugin store source behind a compact entry and opens its settings dialog", async () => {
     await renderPage();
 
-    const input = container.querySelector<HTMLInputElement>("#lux-plugin-store-url");
+    expect(container.querySelector(".lux-admin-plugin-store")).toBeNull();
+    const trigger = container.querySelector<HTMLButtonElement>('[aria-label="设置插件商店来源"]');
+    expect(trigger).toBeTruthy();
+    expect(trigger?.textContent).toContain("插件商店来源");
+
+    await act(async () => trigger?.click());
+
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const input = dialog?.querySelector<HTMLInputElement>("#lux-plugin-store-url");
+    expect(dialog).toBeTruthy();
+    expect(dialog?.textContent).toContain("插件商店来源");
     expect(input?.value).toBe("https://github.com/Qoo-330ml/Lux-plugins");
-    expect(container.querySelector(".lux-admin-plugin-store")?.textContent).toContain("插件商店来源");
-    expect(container.querySelector<HTMLButtonElement>('.lux-admin-plugin-store button[type="submit"]')?.disabled).toBe(false);
+    expect(dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(false);
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('[aria-label="关闭插件商店来源设置"]')?.click();
+    });
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
   });
 
   it("lays out plugin cards two per row on desktop", async () => {

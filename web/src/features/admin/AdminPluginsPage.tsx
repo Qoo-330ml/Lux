@@ -13,9 +13,13 @@ export function AdminPluginsPage() {
   const installedPlugins = useQuery({ queryKey: queryKeys.adminInstalledPlugins, queryFn: () => api.adminInstalledPlugins() });
   const store = useQuery({ queryKey: queryKeys.adminPluginStore, queryFn: () => api.adminPluginStore() });
   const [storeUrl, setStoreUrl] = useState("");
+  const [storeDialogOpen, setStoreDialogOpen] = useState(false);
+  const storeDialogCloseRef = useRef<HTMLButtonElement>(null);
+  const closeStoreDialog = useCallback(() => setStoreDialogOpen(false), []);
   const updateStore = useMutation({
     mutationFn: () => api.updateAdminPluginStore(storeUrl.trim()),
     onSuccess: () => {
+      closeStoreDialog();
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminPluginStore });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
@@ -42,6 +46,19 @@ export function AdminPluginsPage() {
     if (store.data?.url) setStoreUrl(store.data.url);
   }, [store.data?.url]);
 
+  useEffect(() => {
+    if (!storeDialogOpen) return;
+    storeDialogCloseRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeStoreDialog();
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [closeStoreDialog, storeDialogOpen]);
+
   if (plugins.isPending || installedPlugins.isPending || store.isPending) return <AdminPluginsState label="正在读取插件库…" />;
   if (plugins.error || installedPlugins.error || store.error) return <AdminPluginsState label={plugins.error?.message || installedPlugins.error?.message || store.error?.message || "插件库加载失败"} error />;
 
@@ -50,13 +67,26 @@ export function AdminPluginsPage() {
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading">
         <div><h1>插件库</h1><p>安装已内置并经过验证的元数据插件，再为媒体库选择刮削器。</p></div>
+        <button className="lux-button lux-button-secondary lux-admin-plugin-store-trigger" type="button" aria-label="设置插件商店来源" aria-haspopup="dialog" aria-expanded={storeDialogOpen} onClick={() => setStoreDialogOpen(true)}><Globe2 size={15} /> 插件商店来源</button>
       </header>
-      <form className="lux-admin-plugin-store" onSubmit={(event) => { event.preventDefault(); updateStore.mutate(); }}>
-        <div className="lux-admin-plugin-store-heading"><Globe2 size={18} aria-hidden="true" /><div><h2>插件商店来源</h2><p>填写插件目录地址；GitHub 仓库地址会自动读取其 main/index.json。</p></div></div>
-        <label htmlFor="lux-plugin-store-url">目录地址<input id="lux-plugin-store-url" type="url" value={storeUrl} onChange={(event) => setStoreUrl(event.target.value)} placeholder={store.data?.defaultUrl} required /></label>
-        <button className="lux-button lux-button-primary" type="submit" disabled={updateStore.isPending || !storeUrl.trim()}>{updateStore.isPending ? "保存中…" : "保存来源"}</button>
-        {updateStore.error ? <span className="lux-error-copy" role="alert">{updateStore.error.message}</span> : null}
-      </form>
+      {storeDialogOpen ? (
+        <div className="lux-admin-plugin-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeStoreDialog(); }}>
+          <section className="lux-admin-plugin-dialog lux-admin-plugin-store-dialog" role="dialog" aria-modal="true" aria-labelledby="plugin-store-source-dialog-title">
+            <div className="lux-admin-plugin-dialog-heading">
+              <div><h2 id="plugin-store-source-dialog-title">插件商店来源</h2><p className="lux-admin-plugin-dialog-copy">填写插件目录地址；GitHub 仓库地址会自动读取其 main/index.json。</p></div>
+              <button ref={storeDialogCloseRef} className="lux-icon-button lux-admin-plugin-dialog-close" type="button" aria-label="关闭插件商店来源设置" onClick={closeStoreDialog}><X size={17} /></button>
+            </div>
+            <form className="lux-admin-plugin-dialog-form" onSubmit={(event) => { event.preventDefault(); updateStore.mutate(); }}>
+              <label htmlFor="lux-plugin-store-url">目录地址<input id="lux-plugin-store-url" type="url" value={storeUrl} onChange={(event) => setStoreUrl(event.target.value)} placeholder={store.data?.defaultUrl} required /></label>
+              <div className="lux-admin-plugin-dialog-actions">
+                <button className="lux-button lux-button-secondary" type="button" onClick={closeStoreDialog}>取消</button>
+                <button className="lux-button lux-button-primary" type="submit" disabled={updateStore.isPending || !storeUrl.trim()}>{updateStore.isPending ? "保存中…" : "保存来源"}</button>
+              </div>
+              {updateStore.error ? <span className="lux-error-copy" role="alert">{updateStore.error.message}</span> : null}
+            </form>
+          </section>
+        </div>
+      ) : null}
       <nav className="lux-admin-plugin-tabs" aria-label="插件库视图">
         <button className={mode === "store" ? "is-active" : ""} type="button" aria-pressed={mode === "store"} onClick={() => setMode("store")}>插件商店<span>{plugins.data.total ?? plugins.data.plugins?.length ?? 0}</span></button>
         <button className={mode === "installed" ? "is-active" : ""} type="button" aria-pressed={mode === "installed"} onClick={() => setMode("installed")}>已安装管理<span>{installedPlugins.data.total ?? installedPlugins.data.plugins?.length ?? 0}</span></button>
