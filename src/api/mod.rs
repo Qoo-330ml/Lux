@@ -2780,11 +2780,25 @@ async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
+    let strm_resolver_available = match state.plugins.as_ref() {
+        Some(plugins) => match plugins.has_available_strm_resolver().await {
+            Ok(available) => available,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+        None => false,
+    };
     Json(json!({
         "PlaySessionId": Uuid::now_v7().to_string(),
         "MediaSources": sources
             .into_iter()
-            .map(|source| emby_media_source_json(&item.id, source, true))
+            .map(|source| {
+                emby_media_source_json_with_resolver(
+                    &item.id,
+                    source,
+                    true,
+                    strm_resolver_available,
+                )
+            })
             .collect::<Vec<_>>(),
     }))
     .into_response()
@@ -3655,23 +3669,50 @@ fn emby_media_source_json(
     source: &crate::application::catalog::CatalogSource,
     include_media_streams: bool,
 ) -> Value {
+    emby_media_source_json_with_resolver(item_id, source, include_media_streams, false)
+}
+
+fn emby_media_source_json_with_resolver(
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+    include_media_streams: bool,
+    strm_resolver_available: bool,
+) -> Value {
     let is_remote = source.source_kind == "STRM_URL"
         && source
             .external_url
             .as_deref()
             .is_some_and(is_http_strm_target);
-    let direct_stream_url = if source.source_kind == "LOCAL_FILE" {
-        let suffix = source
-            .container
+    let is_resolver_target = strm_resolver_available
+        && source.source_kind == "STRM_URL"
+        && source
+            .external_url
             .as_deref()
-            .map(|container| format!(".{container}"))
-            .unwrap_or_default();
-        Some(format!("/Videos/{item_id}/{}/stream{suffix}", source.id))
+            .is_some_and(|target| !is_http_strm_target(target));
+    let stream_suffix = source
+        .container
+        .as_deref()
+        .filter(|container| {
+            !(source.source_kind == "STRM_URL" && container.eq_ignore_ascii_case("strm"))
+        })
+        .map(|container| format!(".{container}"))
+        .unwrap_or_default();
+    let direct_stream_url = if source.source_kind == "LOCAL_FILE" {
+        Some(format!(
+            "/Videos/{item_id}/{}/stream{stream_suffix}",
+            source.id
+        ))
     } else if is_remote {
         source.external_url.clone()
+    } else if is_resolver_target {
+        Some(format!(
+            "/Videos/{item_id}/{}/stream{stream_suffix}",
+            source.id
+        ))
     } else {
         None
     };
+    let is_remote_playback = is_remote || is_resolver_target;
     let mut value = json!({
         "Id": source.id,
         "Name": source.edition_name,
@@ -3684,9 +3725,9 @@ fn emby_media_source_json(
         "RunTimeTicks": source.duration_ticks,
         "Path": source.external_url,
         "IsDefault": source.is_default,
-        "Protocol": if is_remote { "Http" } else { "File" },
+        "Protocol": if is_remote_playback { "Http" } else { "File" },
         "Type": "Default",
-        "IsRemote": is_remote,
+        "IsRemote": is_remote_playback,
         "SupportsDirectPlay": direct_stream_url.is_some(),
         "SupportsDirectStream": false,
         "SupportsTranscoding": false,
@@ -6502,10 +6543,23 @@ async fn serve_media_file(
         let Some(external_url) = source.external_url else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        if !is_http_strm_target(&external_url) {
-            return StatusCode::NOT_IMPLEMENTED.into_response();
-        }
-        let Ok(location) = HeaderValue::from_str(&external_url) else {
+        let location = if is_http_strm_target(&external_url) {
+            external_url
+        } else {
+            let Some(plugins) = state.plugins.as_ref() else {
+                return StatusCode::NOT_IMPLEMENTED.into_response();
+            };
+            let resolved = match plugins.resolve_strm_target(&external_url).await {
+                Ok(Some(url)) => url,
+                Ok(None) => return StatusCode::NOT_IMPLEMENTED.into_response(),
+                Err(PluginServiceError::InvalidResponse) => {
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            resolved
+        };
+        let Ok(location) = HeaderValue::from_str(&location) else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
         return match Response::builder()
@@ -12775,7 +12829,8 @@ mod tests {
 
     use super::{
         MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby,
-        emby_media_source_json, emby_media_stream_item_id, emby_playback_info_item_id,
+        emby_media_source_json, emby_media_source_json_with_resolver, emby_media_stream_item_id,
+        emby_playback_info_item_id,
         is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
         is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
@@ -13106,6 +13161,35 @@ mod tests {
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);
         assert_eq!(body["MediaStreams"][0]["Height"], 1080);
         assert_eq!(body["MediaStreams"][0]["Profile"], "High");
+    }
+
+    #[test]
+    fn resolver_targets_use_a_protected_lux_stream_entrypoint() {
+        let source = CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "STRM_URL".to_owned(),
+            container: Some("mkv".to_owned()),
+            size: None,
+            external_url: Some("/cloud/library/movie.mp4".to_owned()),
+            edition_name: None,
+            quality_label: None,
+            bitrate: None,
+            duration_ticks: None,
+            is_default: true,
+            probe_status: "PENDING".to_owned(),
+            streams: Vec::new(),
+        };
+
+        let body = emby_media_source_json_with_resolver("item-1", &source, false, true);
+
+        assert_eq!(body["Protocol"], "Http");
+        assert_eq!(body["IsRemote"], true);
+        assert_eq!(body["SupportsDirectPlay"], true);
+        assert_eq!(
+            body["DirectStreamUrl"],
+            "/Videos/item-1/source-1/stream.mkv"
+        );
+        assert_eq!(body["Path"], "/cloud/library/movie.mp4");
     }
 
     #[test]
