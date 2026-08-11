@@ -6549,15 +6549,14 @@ async fn serve_media_file(
             let Some(plugins) = state.plugins.as_ref() else {
                 return StatusCode::NOT_IMPLEMENTED.into_response();
             };
-            let resolved = match plugins.resolve_strm_target(&external_url).await {
+            match plugins.resolve_strm_target(&external_url).await {
                 Ok(Some(url)) => url,
                 Ok(None) => return StatusCode::NOT_IMPLEMENTED.into_response(),
                 Err(PluginServiceError::InvalidResponse) => {
                     return StatusCode::BAD_GATEWAY.into_response();
                 }
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            };
-            resolved
+            }
         };
         let Ok(location) = HeaderValue::from_str(&location) else {
             return StatusCode::BAD_GATEWAY.into_response();
