@@ -513,7 +513,7 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
         .scan_movie_library(library.id)
         .await?;
 
-    let store = MovieNfoMetadataStore::new(config.config_dir.clone());
+    let store = MovieNfoMetadataStore::new(database.clone());
     let report = MetadataEnricher::new(database.clone())
         .with_movie_nfo_store(store.clone())
         .enrich_movie_library(library.id)
@@ -531,6 +531,17 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
     assert_eq!(details.genres, vec!["动作"]);
     assert_eq!(details.directors[0].name, "导演甲");
     assert_eq!(details.trailers, vec!["https://example.com/trailer"]);
+    let stored_json: Option<String> =
+        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(stored_json.is_some());
+    assert!(
+        stored_json
+            .as_deref()
+            .is_some_and(|value| value.contains("示例影业"))
+    );
+    assert!(!config.config_dir.join("metadata").join("library").exists());
     Ok(())
 }
 

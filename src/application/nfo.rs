@@ -23,7 +23,6 @@ use crate::application::metadata::{
     MetadataField, MetadataSource, MetadataState, NfoError, NfoMetadata, find_nfo_path,
     nfo_fingerprint, parse_nfo, series_directory,
 };
-use crate::application::metadata_paths::library_item_nfo_path;
 use crate::application::people::ActorCredit;
 use crate::storage::{Database, MediaMetadataUpdate, StorageError};
 
@@ -537,12 +536,12 @@ fn push_credit(values: &mut Vec<MovieNfoCredit>, provider_id: String, name: &str
 
 #[derive(Clone)]
 pub struct MovieNfoMetadataStore {
-    config_dir: PathBuf,
+    database: Database,
 }
 
 impl MovieNfoMetadataStore {
-    pub fn new(config_dir: PathBuf) -> Self {
-        Self { config_dir }
+    pub fn new(database: Database) -> Self {
+        Self { database }
     }
 
     pub async fn write_item(
@@ -550,30 +549,33 @@ impl MovieNfoMetadataStore {
         item_id: &str,
         details: &MovieNfoDetails,
     ) -> Result<(), MovieNfoMetadataStoreError> {
-        let path = library_item_nfo_path(&self.config_dir, item_id)
-            .map_err(|error| MovieNfoMetadataStoreError::InvalidPath(error.to_string()))?;
-        let bytes = serde_json::to_vec_pretty(details)
+        let json = serde_json::to_string(details)
             .map_err(|error| MovieNfoMetadataStoreError::Serialization(error.to_string()))?;
-        write_movie_nfo_snapshot_atomically(&path, &bytes).await
+        if json.len() > MAX_MOVIE_NFO_BYTES {
+            return Err(MovieNfoMetadataStoreError::TooLarge);
+        }
+        self.database
+            .update_media_item_nfo_metadata(item_id, Some(&json))
+            .await
+            .map_err(MovieNfoMetadataStoreError::Storage)
     }
 
     pub async fn read_item(
         &self,
         item_id: &str,
     ) -> Result<Option<MovieNfoDetails>, MovieNfoMetadataStoreError> {
-        let path = library_item_nfo_path(&self.config_dir, item_id)
-            .map_err(|error| MovieNfoMetadataStoreError::InvalidPath(error.to_string()))?;
-        let bytes = match fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(MovieNfoMetadataStoreError::Io { path, source });
-            }
+        let Some(json) = self
+            .database
+            .media_item_nfo_metadata_json(item_id)
+            .await
+            .map_err(MovieNfoMetadataStoreError::Storage)?
+        else {
+            return Ok(None);
         };
-        if bytes.len() > MAX_MOVIE_NFO_BYTES {
+        if json.len() > MAX_MOVIE_NFO_BYTES {
             return Err(MovieNfoMetadataStoreError::TooLarge);
         }
-        serde_json::from_slice(&bytes)
+        serde_json::from_str(&json)
             .map(Some)
             .map_err(|error| MovieNfoMetadataStoreError::Serialization(error.to_string()))
     }
@@ -581,88 +583,28 @@ impl MovieNfoMetadataStore {
     pub async fn exists(&self, item_id: &str) -> Result<bool, MovieNfoMetadataStoreError> {
         Ok(self.read_item(item_id).await?.is_some())
     }
-}
 
-async fn write_movie_nfo_snapshot_atomically(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), MovieNfoMetadataStoreError> {
-    let parent = path.parent().ok_or_else(|| {
-        MovieNfoMetadataStoreError::InvalidPath("movie NFO cache has no parent".to_owned())
-    })?;
-    fs::create_dir_all(parent)
-        .await
-        .map_err(|source| MovieNfoMetadataStoreError::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            MovieNfoMetadataStoreError::InvalidPath(
-                "movie NFO cache has an invalid file name".to_owned(),
-            )
-        })?;
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::now_v7()));
-    let result = async {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
+    pub async fn clear_item(&self, item_id: &str) -> Result<(), MovieNfoMetadataStoreError> {
+        self.database
+            .update_media_item_nfo_metadata(item_id, None)
             .await
-            .map_err(|source| MovieNfoMetadataStoreError::Io {
-                path: temporary.clone(),
-                source,
-            })?;
-        file.write_all(bytes)
-            .await
-            .map_err(|source| MovieNfoMetadataStoreError::Io {
-                path: temporary.clone(),
-                source,
-            })?;
-        file.sync_all()
-            .await
-            .map_err(|source| MovieNfoMetadataStoreError::Io {
-                path: temporary.clone(),
-                source,
-            })?;
-        drop(file);
-        fs::rename(&temporary, path)
-            .await
-            .map_err(|source| MovieNfoMetadataStoreError::Io {
-                path: path.to_owned(),
-                source,
-            })
+            .map_err(MovieNfoMetadataStoreError::Storage)
     }
-    .await;
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary).await;
-    }
-    result
 }
 
 #[derive(Debug)]
 pub enum MovieNfoMetadataStoreError {
-    InvalidPath(String),
     Serialization(String),
     TooLarge,
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    Storage(StorageError),
 }
 
 impl fmt::Display for MovieNfoMetadataStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPath(message) | Self::Serialization(message) => {
-                formatter.write_str(message)
-            }
+            Self::Serialization(message) => formatter.write_str(message),
             Self::TooLarge => formatter.write_str("movie NFO cache is too large"),
-            Self::Io { path, source } => {
-                write!(formatter, "movie NFO cache '{}': {source}", path.display())
-            }
+            Self::Storage(error) => error.fmt(formatter),
         }
     }
 }
@@ -670,9 +612,15 @@ impl fmt::Display for MovieNfoMetadataStoreError {
 impl std::error::Error for MovieNfoMetadataStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
-            Self::InvalidPath(_) | Self::Serialization(_) | Self::TooLarge => None,
+            Self::Storage(error) => Some(error),
+            Self::Serialization(_) | Self::TooLarge => None,
         }
+    }
+}
+
+impl From<StorageError> for MovieNfoMetadataStoreError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
     }
 }
 

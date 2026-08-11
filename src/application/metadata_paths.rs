@@ -11,7 +11,6 @@ pub const METADATA_DIR: &str = "metadata";
 pub const LIBRARY_DIR: &str = "library";
 pub const PEOPLE_DIR: &str = "people";
 pub const PEOPLE_INDEX_DIR: &str = "index";
-pub const MOVIE_NFO_METADATA_FILE: &str = "movie.nfo.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataObjectKind {
@@ -54,13 +53,6 @@ pub fn library_item_directory(
         .join(LIBRARY_DIR)
         .join(stable_shard(item_id))
         .join(item_id))
-}
-
-pub fn library_item_nfo_path(
-    config_dir: &Path,
-    item_id: &str,
-) -> Result<PathBuf, MetadataPathError> {
-    Ok(library_item_directory(config_dir, item_id)?.join(MOVIE_NFO_METADATA_FILE))
 }
 
 pub fn people_directory(

@@ -1797,7 +1797,7 @@ services:
 | LUX-169 | plugins/org.lux.tmdb/manifest.json、src/application/plugins.rs、src/application/plugin_store.rs、scripts/package-tmdb-plugin.sh、Dockerfile、tests/、docs/ |
 | LUX-170 | src/application/nfo.rs、src/application/metadata.rs、src/application/people.rs、src/application/scanner.rs、src/api/mod.rs、web/src/features/detail/、tests/、docs/ |
 | LUX-171 | Cargo.toml、Dockerfile、docker-entrypoint.sh、src/application/plugins.rs、src/application/plugin_store.rs、src/bin/、plugins/、scripts/、tests/、web/、docs/ |
-| LUX-172 | src/application/nfo.rs、src/application/metadata.rs、src/application/metadata_paths.rs、src/application/scanner.rs、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/types.ts、tests/、docs/ |
+| LUX-172 | migrations/、migrations-postgres/、src/application/nfo.rs、src/application/metadata.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/types.ts、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3700,9 +3700,9 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 
 #### LUX-172：本地电影 NFO 丰富字段展示
 
-范围：在索引后的后台本地元数据阶段解析电影 NFO 的丰富字段，并将结果原子写入
-`/config/metadata/library/<shard>/<item-id>/movie.nfo.json`。媒体详情接口读取该 JSON 快照并返回
-`nfo` 对象；接口同时将 NFO 中的评分、上映日期、状态、语言、运行时和 provider ID 回填到现有兼容字段，
+范围：在索引后的后台本地元数据阶段解析电影 NFO 的丰富字段，并将解析后的 JSON 原子写入
+`media_items.nfo_metadata_json`。媒体详情接口从数据库读取该 JSON 并返回 `nfo` 对象；接口同时将 NFO
+中的评分、上映日期、状态、语言、运行时和 provider ID 回填到现有兼容字段，
 使没有在线匹配的本地完整 NFO 也能直接展示。Web 详情页展示标语、类型、国家/地区、制片公司、认证、
 合集、导演、编剧、投票数、官网、预告片和外部 ID。
 
@@ -3713,7 +3713,7 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 
 验收：
 
-- [x] 索引后台读取本地电影 NFO 并生成原子 JSON 快照；详情请求不打开或解析 XML。
+- [x] 索引后台读取本地电影 NFO 并原子写入数据库 JSON；详情请求不打开或解析 XML。
 - [x] 本地完整 NFO 在没有在线匹配时，详情接口返回丰富字段并回填兼容字段。
 - [x] 详情页展示标语、标签、评分辅助信息、导演/编剧、外部 ID 和安全的 HTTP(S) 链接。
 - [x] 电影 NFO 的大小、XML 事件数、字段长度、数组数量、评分/运行时/URL 范围继续受安全限制。

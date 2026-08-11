@@ -64,7 +64,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .scan_movie_library(library.id)
         .await?;
     MetadataEnricher::new(database.clone())
-        .with_movie_nfo_store(MovieNfoMetadataStore::new(config.config_dir.clone()))
+        .with_movie_nfo_store(MovieNfoMetadataStore::new(database.clone()))
         .enrich_movie_library(library.id)
         .await?;
     let removed_version = first_dir.join("Alpha.Movie.2020.2160p.mkv");
@@ -728,7 +728,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(lux_detail_body["nfo"]["genres"][0], "动作");
     assert_eq!(lux_detail_body["nfo"]["directors"][0]["name"], "导演甲");
     assert_eq!(lux_detail_body["nfo"]["writers"][0]["name"], "编剧甲");
-    assert_eq!(lux_detail_body["nfo"]["trailers"][0], "https://example.com/trailer");
+    assert_eq!(
+        lux_detail_body["nfo"]["trailers"][0],
+        "https://example.com/trailer"
+    );
     assert_eq!(
         lux_detail_body["mediaSources"].as_array().map(Vec::len),
         Some(1)

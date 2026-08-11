@@ -8139,6 +8139,41 @@ impl Database {
         })
     }
 
+    pub(crate) async fn media_item_nfo_metadata_json(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT nfo_metadata_json
+             FROM media_items
+             WHERE id = ? AND nfo_metadata_json IS NOT NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_media_item_nfo_metadata(
+        &self,
+        item_id: &str,
+        nfo_metadata_json: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
+            .bind(nfo_metadata_json)
+            .bind(item_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn mark_media_item_metadata_checked(
         &self,
         item_id: &str,

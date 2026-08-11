@@ -759,6 +759,12 @@ impl MetadataEnricher {
         let metadata = match parse_nfo(&bytes) {
             Ok(metadata) => metadata,
             Err(_) => {
+                if let Some(movie_nfo) = &self.movie_nfo {
+                    movie_nfo
+                        .clear_item(item_id)
+                        .await
+                        .map_err(MetadataError::NfoCache)?;
+                }
                 if let Some(fingerprint) = fingerprint.as_deref() {
                     self.database
                         .mark_media_item_metadata_checked(item_id, fingerprint)
@@ -772,6 +778,12 @@ impl MetadataEnricher {
             Ok(details) => details,
             Err(error) => {
                 tracing::warn!(item_id, %error, "local movie NFO rich details could not be parsed");
+                if let Some(movie_nfo) = &self.movie_nfo {
+                    movie_nfo
+                        .clear_item(item_id)
+                        .await
+                        .map_err(MetadataError::NfoCache)?;
+                }
                 if let Some(fingerprint) = fingerprint.as_deref() {
                     self.database
                         .mark_media_item_metadata_checked(item_id, fingerprint)

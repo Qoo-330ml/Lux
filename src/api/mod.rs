@@ -227,7 +227,7 @@ impl AppState {
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
         let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
-        let movie_nfo = MovieNfoMetadataStore::new(config_dir.clone());
+        let movie_nfo = MovieNfoMetadataStore::new(database.clone());
         let probe = Some(MediaProbeService::new(
             database.clone(),
             FfprobeRunner::default(),
