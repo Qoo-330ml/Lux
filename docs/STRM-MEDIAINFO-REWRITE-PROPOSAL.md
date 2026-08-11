@@ -1,6 +1,6 @@
 # MediaInfoKeeper 改写为 Lux 插件的设计与实现说明
 
-> 状态：已选择插件路线；核心实现已落地，管理 Web 页面和计划调度仍待后续任务
+> 状态：已选择插件路线；STRM 缩略图扩展纳入 LUX-146 实施
 >
 > 日期：2026-08-05
 >
@@ -10,8 +10,8 @@
 
 可以改写，采用“外部进程插件 + Lux 宿主任务”的拆分：
 
-1. `org.lux.strm-media-info` 是遵循 Lux Plugin SDK v1 的独立 `media_probe` 进程，负责调用 `ffprobe` 并返回受限结果。
-2. Lux 核心负责媒体库选择、任务生命周期、STRM 探测目标长度校验、并发、结果落库和 `*-mediainfo.json` 写回。
+1. `org.lux.strm-media-info` 是遵循 Lux Plugin SDK v1 的独立 `media_probe` 进程，使用 FFmpeg 原生库在一次输入会话中返回受限媒体信息和可选 JPEG 缩略图。
+2. Lux 核心负责媒体库选择、任务生命周期、STRM 探测目标长度校验、并发、结果落库、`THUMB` 图片登记和 `*-mediainfo.json` 写回。
 
 MediaInfoKeeper 的核心流程不是单纯的元数据转换，而是：选择媒体库、遍历媒体项、读取 `.strm` 指向的外部地址、调度并发 `ffprobe`、保存探测结果，并在需要时写入旁车文件。这些操作都属于 Lux 核心服务负责的资源边界。当前插件 SDK 的插件不能直接访问 Lux 数据库、媒体库根目录或内部任务对象，因此不适合直接承载这一流程。
 
@@ -44,7 +44,8 @@ MediaInfoKeeper 的核心流程不是单纯的元数据转换，而是：选择�
 | 全库或最近项目扫描 | 作为持久化后台任务执行 | 不在 HTTP 请求中扫描，也不使用不可追踪的 fire-and-forget 任务 |
 | 全局/单库并发数 | 复用每库 `probeConcurrency`，增加 STRM 远程探测全局上限 | 实际并发取两者的约束交集 |
 | `.strm` 外部地址探测 | 新增显式开启的后台探测任务 | 默认关闭，且只经过非空和长度校验 |
-| `ffprobe` 媒体信息 | 解析为 Lux 的 `media_sources` 和 `media_streams` | 不把原始 `ffprobe` JSON 直接作为公共数据模型 |
+| FFmpeg 媒体信息 | 解析为 Lux 的 `media_sources` 和 `media_streams` | 不把原始探测 JSON 直接作为公共数据模型 |
+| STRM 缩略图 | 30% 位置解码一帧，写入同目录 `*-thumb.jpg` 并登记 `THUMB` | 仅由 `thumbnailEnabled` 开关控制，与媒体信息独立 |
 | `*-mediainfo.json` | 继续兼容读取；可选写回 | 写回必须使用受限、可兼容的旁车格式 |
 | 失败重试/超时 | 任务级取消、重试、恢复和错误统计 | 单个 URL 失败不能中断整个媒体库任务 |
 | 右键/计划任务 | 管理 API 触发；计划任务待 Lux 调度器完成后接入 | 不提前假设当前尚未完成的调度器能力 |
@@ -69,7 +70,7 @@ Lux API 校验权限、配置和库 ID
         │
         ├─ 已有旁车/NFO 且未要求重探测：导入并跳过网络请求
         │
-        └─ 需要探测：通过探测目标输入校验后执行 ffprobe
+        └─ 需要探测：通过探测目标输入校验后建立一次 FFmpeg 输入会话
                 │
                 ▼
         解析受限结果 → 保存 media_sources/media_streams
@@ -120,13 +121,13 @@ MediaInfoKeeper 使用全局队列和单项去重。Lux 应改为可恢复的持
 
 ### 4.4 `ffprobe` 执行
 
-复用 Lux 现有的安全 runner，但增加远程输入专用策略：
+插件使用 FFmpeg 原生库建立受控输入会话，但增加远程输入专用策略：
 
 - 使用参数数组启动进程，不经过 shell。
-- 采用固定的 `ffprobe` 参数集合，只读取 format、stream 等必要信息。
+- 只读取需要的 format/stream 信息；启用缩略图时按媒体时长的 30% 解码一个视频帧，并在同一输入会话中完成。
 - 维持超时、stdout/stderr 上限，超限视为失败。
 - 网络请求只在后台 worker 中执行。
-- 不记录完整 URL、查询字符串、认证信息或 `ffprobe` 完整命令行。
+- 不记录完整 URL、查询字符串、认证信息或完整 FFmpeg 参数。
 - 不把原始探测 JSON 直接返回 API 或写入日志。
 
 远程输入失败应归类为稳定的错误码，例如 `INVALID_URL`、`BLOCKED_ADDRESS`、`TIMEOUT`、`PROCESS_FAILED`、`INVALID_OUTPUT`，并将详细诊断限制在本地受控日志中。
@@ -238,7 +239,7 @@ RPC          = media.probe
 - 将插件结果限制为 `media_sources`、`media_streams` 可接受的字段。
 - 按管理员开关原子写入兼容旁车文件。
 
-插件不能自行选择媒体库、遍历文件、写旁车或改变 Lux 数据库；插件进程退出、超时或返回异常结果只影响对应源/任务。
+插件不能自行选择媒体库、遍历文件、写旁车或改变 Lux 数据库；插件进程退出、超时或返回异常结果只影响对应源/任务。插件返回的缩略图只允许是受大小限制的 JPEG Base64 结果。
 
 ## 9. 分阶段实现计划
 

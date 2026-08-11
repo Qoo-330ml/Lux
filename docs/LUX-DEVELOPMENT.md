@@ -3038,15 +3038,18 @@ services:
 
 范围：将 MediaInfoKeeper 的 `.strm` 远程媒体信息提取能力改写为 Lux Plugin SDK v1 的独立
 `media_probe` 插件和 Lux 宿主后台任务。插件 ID 固定为 `org.lux.strm-media-info`，能力为
-`media.probe`；插件只负责接收单个已校验的 STRM 探测目标、调用 `ffprobe` 并返回受限的
-format/stream 结果。探测目标按原始字符串传递，不解析其 URL、IP 或网段类型。媒体库选择、
-任务、并发、目标输入校验、数据库写入和兼容旁车写回均由 Lux 宿主负责。
+`media.probe`；插件接收单个已校验的 STRM 探测目标，并在需要时通过同一 FFmpeg 输入会话
+返回受限的 format/stream 结果和一帧 JPEG 缩略图。探测目标按原始字符串传递，不解析其 URL、
+IP 或网段类型。媒体库选择、任务、并发、目标输入校验、数据库写入和兼容旁车/图片写回均由
+Lux 宿主负责。
 
 旧版本的 `org.lux.media-info` 作为迁移别名处理：已有插件配置会迁移到新的插件配置路径，
 新的 API、manifest 和插件进程只使用 `org.lux.strm-media-info`。
 
-插件 manifest 声明 `libraryIds`、`concurrency`、`existingInfoPolicy`、`writeSidecars` 和
-`schedule` 配置项；`schedule` 使用标准五段式 cron（分 时 日 月 周），按 UTC 解释，默认
+插件 manifest 声明 `libraryIds`、`mediaInfoEnabled`、`thumbnailEnabled`、`concurrency`、
+`existingInfoPolicy`、`writeSidecars` 和 `schedule` 配置项；两个开关彼此独立，默认媒体信息
+提取开启、STRM 缩略图关闭。缩略图固定从媒体时长的 30% 位置提取，输出为同目录
+`*-thumb.jpg`，只针对 `.strm` 来源。`schedule` 使用标准五段式 cron（分 时 日 月 周），按 UTC 解释，默认
 `0 3 * * *`。其中 `existingInfoPolicy` 的选项为 `SKIP`（跳过已有媒体信息）和 `OVERWRITE`
 （覆盖已有媒体信息）。读取旧版本配置时，`includeReady: false` 迁移为 `SKIP`，
 `includeReady: true` 迁移为 `OVERWRITE`。
@@ -3054,8 +3057,10 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 `POST /api/v1/admin/plugins/org.lux.strm-media-info/run` 或兼容的
 `POST /api/v1/admin/strm-probe-jobs` 按已保存配置启动任务，不从请求体接收宿主覆盖参数。服务为每个选定媒体库建立持久化任务，使用全局操作信号量
 和媒体库 `probeConcurrency` 的较小值限制并发；任务支持分页列表、详情、取消、重试，并在服务
-重启后恢复 PENDING/RUNNING 状态。探测结果保存到 `media_sources`/`media_streams`，旁车写回
-使用同目录 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。
+重启后恢复 PENDING/RUNNING 状态。探测结果保存到 `media_sources`/`media_streams`，缩略图通过
+现有 `THUMB` 图片记录提供给图片接口，旁车写回使用同目录 `*-mediainfo.json` 的 MediaInfoKeeper
+兼容子集和临时文件原子替换。对于同一个源，媒体信息和缩略图最多触发一次 FFmpeg 输入会话；
+已有对应结果时只执行缺失的能力，媒体信息关闭时仍可单独生成缩略图。
 
 插件启用后，宿主自动登记一个全局 `STRM_MEDIA_INFO` 计划任务；任务读取同一份插件配置，首次
 执行在后台完成，后续按 `schedule` cron 表达式重复执行。管理员可以在“任务与日志”中直接修改该任务的
@@ -3075,10 +3080,12 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 验收：
 
 - [ ] 管理员只能选择已有媒体库，未选媒体库不创建任务、不发起插件 RPC；空选择、无效 ID、并发超范围均被拒绝。
-- [ ] 插件详情页展示并保存媒体库多选、并发数、已有媒体信息处理方式、旁车写回和五段式 cron 配置；配置文件原子保存且权限受限，插件列表回显非敏感值；任务与日志页可以修改同一份 STRM 计划。
+- [ ] 插件详情页展示并保存媒体库多选、媒体信息提取开关、STRM 缩略图开关、并发数、已有媒体信息处理方式、旁车写回和五段式 cron 配置；配置文件原子保存且权限受限，插件列表回显非敏感值；任务与日志页可以修改同一份 STRM 计划。
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
+- [ ] `thumbnailEnabled` 只处理 `.strm`，按媒体时长 30% 生成 JPEG 并登记为 `THUMB`；媒体信息和缩略图按独立开关工作，已有目标缩略图不会再次访问远程媒体。
+- [ ] 启用媒体信息和缩略图时，同一个源只建立一次 FFmpeg 输入会话；输入会话、解码帧和 RPC 图片结果均受超时、输出大小和并发限制。
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
 - [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
 - [ ] 插件包、manifest、RPC 结果、STRM 探测目标策略、超时、输出上限和无真实目标的 fake ffprobe 测试覆盖；插件异常不退出主进程。
@@ -3096,7 +3103,7 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 明确不做：
 
 - 不改变 `.strm` 播放直连语义，不做代理、转码、缓存或 AList API 访问。
-- 不在普通扫描或用户请求路径中探测远程 `.strm`，不把插件权限扩展为媒体库/数据库访问。
+- 不在普通扫描或用户请求路径中探测远程 `.strm`，不把插件权限扩展为媒体库/数据库访问；STRM 缩略图只在显式后台任务中生成。
 - 不把计划任务执行放入普通扫描、播放或用户请求路径；计划任务只复用已有 STRM 后台作业服务。
 
 ---

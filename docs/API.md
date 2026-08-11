@@ -75,7 +75,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/admin/plugins/org.lux.strm-media-info/run`：按已保存的 strm-media-info 插件配置创建 STRM 探测任务，返回 202；不接受媒体库、并发等宿主覆盖参数。
 - 插件包必须是 `.zip` 或开发用解压目录，根目录包含 `manifest.json`。Lux 启动时校验包格式、协议版本、平台架构、文件哈希和签名；校验失败的包不会运行。
 - 插件通过独立进程和 JSON-RPC 风格协议提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。
-- `media_probe` 插件必须声明 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。`org.lux.strm-media-info` 的 `media.probe` 只处理单个由宿主校验的 HTTP/HTTPS URL，返回受限 format/stream 字段；宿主负责并发、超时、取消、恢复、落库和可选旁车写回。播放和 PlaybackInfo 不触发该 RPC。
+- `media_probe` 插件必须声明 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。`org.lux.strm-media-info` 的 `media.probe` 只处理单个由宿主校验的 STRM 探测目标，按请求中的 `includeMediaInfo`/`includeThumbnail` 返回受限 format/stream 字段和可选 JPEG 缩略图；两项能力在同一次 FFmpeg 输入会话中完成。宿主负责并发、超时、取消、恢复、落库、`THUMB` 图片登记和可选旁车写回。播放和 PlaybackInfo 不触发该 RPC。
 - 未安装、未启用、无可用凭据、运行失败或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
 插件包不从任意远程 URL 自动下载。插件 API、媒体库 API 和日志不返回插件配置中的敏感值；TMDb API Key 和 Read Access Token 只存在受限配置或内置实现中。
