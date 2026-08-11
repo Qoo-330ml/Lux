@@ -1062,6 +1062,19 @@ impl ImageService {
         self.resolve_candidates(candidates).await
     }
 
+    pub(crate) async fn resolve_filmly_compat(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+    ) -> Result<Option<ResolvedImage>, ImageError> {
+        let candidates = self
+            .database
+            .list_item_image_candidates(item_id, image_type, image_index)
+            .await?;
+        self.resolve_candidates(candidates).await
+    }
+
     async fn resolve_candidates(
         &self,
         candidates: Vec<crate::storage::StoredItemImageCandidate>,

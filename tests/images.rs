@@ -9,7 +9,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::{AUTHORIZATION, COOKIE, ETAG, IF_NONE_MATCH, SET_COOKIE};
+use reqwest::header::{AUTHORIZATION, COOKIE, ETAG, IF_NONE_MATCH, SET_COOKIE, USER_AGENT};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -176,6 +176,17 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
         emby_anonymous_without_tag.status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
+
+    let emby_filmly_image = client
+        .get(format!("{base_url}/emby/Items/{item_id}/Images/Primary"))
+        .header(
+            USER_AGENT,
+            "%E7%BD%91%E6%98%93%E7%88%86%E7%B1%B3%E8%8A%B1/2.12.3-423",
+        )
+        .send()
+        .await?;
+    assert_eq!(emby_filmly_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(emby_filmly_image.bytes().await?, "poster-bytes".as_bytes());
 
     let emby_capability_image = client
         .get(format!(

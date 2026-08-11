@@ -224,10 +224,11 @@ impl AppState {
             let service = ScanJobService::new(database.clone())
                 .with_admin_events(admin_events.clone())
                 .with_resource_metrics(resources.clone());
-            match library_covers.clone() {
+            let service = match library_covers.clone() {
                 Some(covers) => service.with_library_covers(covers),
                 None => service,
-            }
+            };
+            service.with_strm_probe(strm_probe.clone())
         };
         let scheduled_tasks =
             ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone())
@@ -854,6 +855,7 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
             | ["api", "v1", "collections", _]
             | ["Users", _, "Items"]
             | ["Users", _, "Items", "Root" | "Resume" | "Latest" | "NextUp"]
+            | ["Shows", "NextUp"]
             | ["Shows", _, "Seasons" | "Episodes"]
             | ["Items"]
             | ["Items", "Root"]
@@ -1146,6 +1148,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Users/{user_id}/Items/NextUp", get(emby_user_next_up))
         .route("/Users/{user_id}/Items", get(emby_user_items))
         .route("/Users/{user_id}/Items/{item_id}", get(emby_user_item))
+        .route("/Shows/NextUp", get(emby_shows_next_up))
         .route("/Shows/{series_id}/Seasons", get(emby_show_seasons))
         .route("/Shows/{series_id}/Episodes", get(emby_show_episodes))
         .route("/Items", get(emby_items))
@@ -2201,7 +2204,32 @@ async fn emby_user_next_up(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
-    let (offset, limit) = match emby_page_params(&query) {
+    emby_next_up_response(&state, &user, &user_id, &query).await
+}
+
+async fn emby_shows_next_up(
+    headers: HeaderMap,
+    Query(query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let user_id = query.user_id.clone().unwrap_or_else(|| user.id.to_string());
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    emby_next_up_response(&state, &user, &user_id, &query).await
+}
+
+async fn emby_next_up_response(
+    state: &AppState,
+    user: &UserRecord,
+    user_id: &str,
+    query: &EmbyItemsQuery,
+) -> Response {
+    let (offset, limit) = match emby_page_params(query) {
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
@@ -2211,7 +2239,7 @@ async fn emby_user_next_up(
     match catalog
         .list_next_up(
             AccessPrincipal::new(user.id, user.is_admin),
-            &user_id,
+            user_id,
             offset,
             limit,
         )
@@ -2219,8 +2247,8 @@ async fn emby_user_next_up(
     {
         Ok(page) => {
             emby_catalog_page_for_user_with_fields(
-                &state,
-                &user_id,
+                state,
+                user_id,
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
@@ -6183,6 +6211,7 @@ async fn emby_image(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
+    let filmly_compat = is_filmly_image_request(&headers) && query.tag.is_none();
     let user = match require_emby_user_with_query(&headers, &state, &query).await {
         Ok(user) => Some(user),
         Err(StatusCode::UNAUTHORIZED) => None,
@@ -6208,6 +6237,12 @@ async fn emby_image(
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // Filmly's native image loader drops Emby auth headers and image tags. Keep this
+    // exception limited to artwork requests from that client; media streams remain gated.
+    if filmly_compat && user.is_none() {
+        return serve_filmly_compat_image(images, &headers, &method, &item_id, &image_type, 0)
+            .await;
+    }
     match principal {
         Some(principal) => {
             serve_image(
@@ -6236,6 +6271,18 @@ async fn emby_image(
     }
 }
 
+fn is_filmly_image_request(headers: &HeaderMap) -> bool {
+    header_str(headers, "user-agent").is_some_and(|value| {
+        value.split_ascii_whitespace().next().is_some_and(|client| {
+            client.starts_with("网易爆米花")
+                || client.starts_with("%E7%BD%91%E6%98%93%E7%88%86%E7%B1%B3%E8%8A%B1")
+                || client
+                    .get(.."Filmly/".len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Filmly/"))
+        })
+    })
+}
+
 async fn emby_image_at_index(
     headers: HeaderMap,
     method: Method,
@@ -6246,6 +6293,7 @@ async fn emby_image_at_index(
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let filmly_compat = is_filmly_image_request(&headers) && query.tag.is_none();
     let user = match require_emby_user_with_query(&headers, &state, &query).await {
         Ok(user) => Some(user),
         Err(StatusCode::UNAUTHORIZED) => None,
@@ -6271,6 +6319,17 @@ async fn emby_image_at_index(
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    if filmly_compat && user.is_none() {
+        return serve_filmly_compat_image(
+            images,
+            &headers,
+            &method,
+            &item_id,
+            &image_type,
+            image_index,
+        )
+        .await;
+    }
     match principal {
         Some(principal) => {
             serve_image(
@@ -6966,6 +7025,40 @@ async fn serve_tagged_image(
     {
         Ok(Some(image)) => image,
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+        Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    serve_image_file(
+        &image.path,
+        image.content_type,
+        image.content_length,
+        &image.etag,
+        headers,
+        method,
+    )
+    .await
+}
+
+async fn serve_filmly_compat_image(
+    images: &ImageService,
+    headers: &HeaderMap,
+    method: &Method,
+    item_id: &str,
+    image_type: &str,
+    image_index: i64,
+) -> Response {
+    let Some(image_type) = normalize_image_type(image_type) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let image = match images
+        .resolve_filmly_compat(item_id, image_type, image_index)
+        .await
+    {
+        Ok(Some(image)) => image,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
             return StatusCode::FORBIDDEN.into_response();
         }
