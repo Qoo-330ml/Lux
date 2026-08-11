@@ -17,7 +17,10 @@ use crate::{
             CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, IP_LOCATION_CAPABILITY, IpLocationRpcRequest,
             IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
             MediaProbeRpcStreamType, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_SCRAPER,
-            PLUGIN_TYPE_IP_LOCATION, PluginConfigField, PluginConfigOption,
+            PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, STRM_RESOLVE_CAPABILITY,
+            STRM_RESOLVE_METHOD,
+            StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus, PluginConfigField,
+            PluginConfigOption,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
@@ -469,6 +472,90 @@ impl PluginService {
         params: Value,
     ) -> Result<Value, PluginServiceError> {
         self.call(scraper_id, method, params).await
+    }
+
+    pub async fn has_available_strm_resolver(&self) -> Result<bool, PluginServiceError> {
+        Ok(!self.available_strm_resolver_ids().await?.is_empty())
+    }
+
+    pub async fn resolve_strm_target(
+        &self,
+        target: &str,
+    ) -> Result<Option<String>, PluginServiceError> {
+        let mut first_error = None;
+        for plugin_id in self.available_strm_resolver_ids().await? {
+            let request = StrmResolveRpcRequest {
+                target: target.to_owned(),
+            };
+            let params = serde_json::to_value(request).map_err(|_| PluginServiceError::InvalidResponse)?;
+            let value = match self
+                .supervisor
+                .call_isolated(&plugin_id, STRM_RESOLVE_METHOD, params)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(PluginServiceError::Runtime(error));
+                    }
+                    continue;
+                }
+            };
+            let result: StrmResolveRpcResult = match serde_json::from_value(value) {
+                Ok(result) => result,
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(PluginServiceError::InvalidResponse);
+                    }
+                    continue;
+                }
+            };
+            match result.status {
+                StrmResolveStatus::Unsupported if result.url.is_none() => {}
+                StrmResolveStatus::Resolved => {
+                    let Some(url) = result.url else {
+                        if first_error.is_none() {
+                            first_error = Some(PluginServiceError::InvalidResponse);
+                        }
+                        continue;
+                    };
+                    if validate_strm_resolver_url(&url) {
+                        return Ok(Some(url));
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(PluginServiceError::InvalidResponse);
+                    }
+                }
+                StrmResolveStatus::Unsupported => {
+                    if first_error.is_none() {
+                        first_error = Some(PluginServiceError::InvalidResponse);
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    async fn available_strm_resolver_ids(&self) -> Result<Vec<String>, PluginServiceError> {
+        let mut plugin_ids = Vec::new();
+        for plugin in &self.catalog.plugins {
+            if !is_strm_resolver_plugin(plugin)
+                || !self
+                    .database
+                    .is_plugin_installed(&plugin.manifest.id)
+                    .await?
+            {
+                continue;
+            }
+            let view = self.dynamic_view(plugin, true, true).await?;
+            if view.available {
+                plugin_ids.push(plugin.manifest.id.clone());
+            }
+        }
+        Ok(plugin_ids)
     }
 
     pub async fn update_dynamic_config(
@@ -1331,6 +1418,29 @@ fn normalize_ip_location_field(value: Option<String>) -> Option<String> {
     .then_some(value)
 }
 
+pub fn validate_strm_resolver_url(value: &str) -> bool {
+    if value.chars().count() > 8 * 1024
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let Some((_, authority_and_path)) = value.split_once("://") else {
+        return false;
+    };
+    if authority_and_path.starts_with('/') {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+}
+
 fn is_ip_location_plugin(plugin: &DiscoveredPlugin) -> bool {
     plugin.manifest.plugin_type == PLUGIN_TYPE_IP_LOCATION
         && plugin.manifest.category == PLUGIN_CATEGORY_NETWORK
@@ -1339,6 +1449,16 @@ fn is_ip_location_plugin(plugin: &DiscoveredPlugin) -> bool {
             .capabilities
             .iter()
             .any(|capability| capability == IP_LOCATION_CAPABILITY)
+}
+
+fn is_strm_resolver_plugin(plugin: &DiscoveredPlugin) -> bool {
+    plugin.manifest.plugin_type == PLUGIN_TYPE_STRM_RESOLVER
+        && plugin.manifest.category == crate::application::plugin_protocol::PLUGIN_CATEGORY_MEDIA
+        && plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == STRM_RESOLVE_CAPABILITY)
 }
 
 impl From<StorageError> for PluginServiceError {

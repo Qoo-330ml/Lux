@@ -16,6 +16,7 @@ pub const PLUGIN_TYPE_STRM_RESOLVER: &str = "strm_resolver";
 pub const MEDIA_PROBE_CAPABILITY: &str = "media.probe";
 pub const IP_LOCATION_CAPABILITY: &str = "ip.location";
 pub const STRM_RESOLVE_CAPABILITY: &str = "strm.resolve";
+pub const STRM_RESOLVE_METHOD: &str = "strm.resolve";
 pub const CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES: &str = "media-libraries";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
