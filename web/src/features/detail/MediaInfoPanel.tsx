@@ -63,7 +63,11 @@ export function MediaInfoPanel({
         <HorizontalScrollRail className="lux-media-stream-rail" ariaLabel="视频轨道">
           <div className="lux-media-stream-grid">
             {streamGroups.flatMap(({ type, streams: groupStreams }) => groupStreams.map((stream) => (
-              <MediaStreamCard key={`${type}-${stream.index}`} stream={stream} />
+              <MediaStreamCard
+                key={`${type}-${stream.index}`}
+                stream={stream}
+                sourceBitrate={source.bitrate}
+              />
             )))}
           </div>
         </HorizontalScrollRail>
@@ -72,10 +76,16 @@ export function MediaInfoPanel({
   );
 }
 
-function MediaStreamCard({ stream }: { stream: MediaStream }) {
+function MediaStreamCard({
+  stream,
+  sourceBitrate,
+}: {
+  stream: MediaStream;
+  sourceBitrate?: number | null;
+}) {
   const kind = stream.type?.toUpperCase() ?? "UNKNOWN";
   const title = stream.title || streamLabel(stream, kind);
-  const rows = streamDetailRows(stream, kind);
+  const rows = streamDetailRows(stream, kind, sourceBitrate);
   const language = stream.language ? languageLabel(stream.language) : undefined;
 
   return (
@@ -100,7 +110,11 @@ function MediaStreamCard({ stream }: { stream: MediaStream }) {
   );
 }
 
-function streamDetailRows(stream: MediaStream, kind: string): Array<[string, string]> {
+function streamDetailRows(
+  stream: MediaStream,
+  kind: string,
+  sourceBitrate?: number | null,
+): Array<[string, string]> {
   const details = stream.details ?? {};
   const rows: Array<[string, string]> = [];
   const add = (label: string, value: string | undefined) => {
@@ -113,7 +127,7 @@ function streamDetailRows(stream: MediaStream, kind: string): Array<[string, str
     add("分辨率", width && height ? `${width} × ${height}` : undefined);
     add("宽高比", textValue(details.AspectRatio));
     add("帧率", formatFrameRate(details.RealFrameRate ?? details.AverageFrameRate));
-    add("码率", formatBitrate(details.BitRate));
+    add("码率", formatBitrate(details.BitRate ?? sourceBitrate));
     add("配置", textValue(details.Profile));
     add("等级", textValue(details.Level));
     add("色深", withUnit(details.BitDepth, "bit"));
@@ -123,7 +137,7 @@ function streamDetailRows(stream: MediaStream, kind: string): Array<[string, str
     add("色彩基元", textValue(details.ColorPrimaries));
   }
   if (kind === "AUDIO") {
-    add("布局", textValue(details.ChannelLayout));
+    add("布局", channelLayout(details.ChannelLayout, details.Channels));
     add("声道", withUnit(details.Channels, "ch"));
     add("码率", formatBitrate(details.BitRate));
     add("采样率", formatSampleRate(details.SampleRate));
@@ -154,6 +168,7 @@ function codecLabel(codec: string) {
   if (normalized === "h264" || normalized === "avc") return "H264";
   if (normalized === "hevc" || normalized === "h265") return "HEVC";
   if (normalized === "subrip") return "SubRip";
+  if (normalized === "hdmv_pgs_subtitle" || normalized === "pgssub") return "PGSSUB";
   return codec.toUpperCase();
 }
 
@@ -173,8 +188,36 @@ function withUnit(value: unknown, unit: string) {
 }
 
 function formatFrameRate(value: unknown) {
-  const number = numberValue(value);
+  const number = ratioValue(value) ?? numberValue(value);
   return number === undefined ? undefined : `${number} fps`;
+}
+
+function ratioValue(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)$/);
+  if (!match) return undefined;
+  const numerator = Number(match[1]);
+  const denominator = Number(match[2]);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator === 0) return undefined;
+  return Number(stripTrailingZeros(numerator / denominator));
+}
+
+function channelLayout(layout: unknown, channels: unknown) {
+  const text = textValue(layout);
+  if (text) return text;
+  const count = numberValue(channels);
+  if (count === undefined) return undefined;
+  const knownLayouts: Record<number, string> = {
+    1: "1.0",
+    2: "2.0",
+    3: "2.1",
+    4: "4.0",
+    5: "5.0",
+    6: "5.1",
+    7: "6.1",
+    8: "7.1",
+  };
+  return knownLayouts[count] ?? `${count} ch`;
 }
 
 function formatSampleRate(value: unknown) {
