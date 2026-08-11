@@ -7152,6 +7152,7 @@ fn lux_catalog_item_json(item: &CatalogItem) -> Value {
             "poster": item.poster_image_tag,
             "fanart": item.fanart_image_tag,
             "thumb": item.thumb_image_tag,
+            "logo": item.logo_image_tag,
         },
         "mediaSources": item.media_sources.iter().map(lux_catalog_source_json).collect::<Vec<_>>(),
     })
