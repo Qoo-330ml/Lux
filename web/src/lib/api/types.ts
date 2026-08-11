@@ -41,7 +41,7 @@ export type Library = {
   latest?: MediaItem[];
 };
 
-export type ImageTags = Partial<Record<"poster" | "fanart" | "backdrop" | "thumb", string>>;
+export type ImageTags = Partial<Record<"poster" | "fanart" | "backdrop" | "thumb" | "logo", string>>;
 
 export type UserData = {
   isPlayed?: boolean;

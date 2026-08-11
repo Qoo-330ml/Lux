@@ -192,19 +192,11 @@ describe("HomePage shelves", () => {
   it("uses an available media logo in the carousel title area", async () => {
     vi.spyOn(api, "home").mockResolvedValue({
       libraries: [],
-      recommended: [{ id: "featured-1", title: "精选电影", itemType: "MOVIE" }],
+      recommended: [{ id: "featured-1", title: "精选电影", itemType: "MOVIE", imageTags: { logo: "logo-tag" } }],
       continueWatching: [],
       recentlyAdded: [],
     });
-    vi.mocked(api.itemImages).mockResolvedValue({
-      images: [{
-        id: "logo-1",
-        itemId: "featured-1",
-        imageType: "LOGO",
-        imageIndex: 0,
-        url: "/api/v1/items/featured-1/images/logo",
-      }],
-    });
+    vi.mocked(api.itemImages).mockRejectedValue(new Error("Hero should not request item images"));
 
     container = document.createElement("div");
     document.body.append(container);
@@ -228,7 +220,7 @@ describe("HomePage shelves", () => {
     });
 
     expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("src"))
-      .toBe("/api/v1/items/featured-1/images/logo");
+      .toBe("/api/v1/items/featured-1/images/logo?tag=logo-tag");
     expect(container.querySelector(".lux-hero-title")?.textContent).toBe("");
     expect(container.querySelector(".lux-hero-title")?.querySelector("img")?.getAttribute("alt"))
       .toBe("精选电影");

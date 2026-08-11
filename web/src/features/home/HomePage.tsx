@@ -60,14 +60,7 @@ function HeroCarousel({ items }: { items: MediaItem[] }) {
 
   const safeIndex = items.length ? activeIndex % items.length : 0;
   const item = items[safeIndex];
-  const itemId = item?.id ?? "";
-  const itemImages = useQuery({
-    queryKey: queryKeys.itemImages(itemId),
-    queryFn: () => api.itemImages(itemId),
-    enabled: Boolean(itemId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
-  });
-  const logo = itemImages.data?.images?.find((image) => image.imageType.toUpperCase() === "LOGO");
+  const logo = item ? imageUrl(item, "logo") : undefined;
   const image = item ? imageUrl(item, "fanart") ?? imageUrl(item) : undefined;
   const goTo = (index: number) => setActiveIndex((index + items.length) % items.length);
 
@@ -80,7 +73,7 @@ function HeroCarousel({ items }: { items: MediaItem[] }) {
       <AnimatePresence initial={false} mode="wait">
         <motion.div key={item?.id ?? "empty"} className="lux-hero-copy" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.38 }}>
           <h1 className="lux-hero-title">
-            {logo ? <img className="lux-hero-logo" src={logo.url} alt={item ? mediaTitle(item) : "Lux 精选内容"} /> : item ? mediaTitle(item) : "你的私人影院"}
+            {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} /> : item ? mediaTitle(item) : "你的私人影院"}
           </h1>
           <div className="lux-hero-meta">
             {item?.productionYear ? <span>{item.productionYear}</span> : null}

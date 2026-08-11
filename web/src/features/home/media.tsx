@@ -46,7 +46,7 @@ export function mediaTypeLabel(itemType?: string | null) {
   }
 }
 
-export function imageUrl(item: MediaItem, type: "poster" | "fanart" | "thumb" = "poster") {
+export function imageUrl(item: MediaItem, type: "poster" | "fanart" | "thumb" | "logo" = "poster") {
   const resolvedType = item.imageTags?.[type]
     ? type
     : type === "fanart" && item.imageTags?.thumb
