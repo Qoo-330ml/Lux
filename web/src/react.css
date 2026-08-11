@@ -287,11 +287,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-overview-dialog-body p { margin: 0; color: rgba(255,255,255,.78); font-size: .95rem; line-height: 1.8; white-space: pre-wrap; }
 .lux-horizontal-scroll-rail { position: relative; min-width: 0; }
 .lux-horizontal-scroll-viewport { min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; scroll-behavior: smooth; scrollbar-width: thin; }
-.lux-horizontal-scroll-arrow { position: absolute; z-index: 2; top: 50%; display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; color: #fff; background: transparent; box-shadow: none; cursor: pointer; transform: translateY(-50%); filter: drop-shadow(0 2px 5px rgba(0,0,0,.7)); }
-.lux-horizontal-scroll-arrow:hover { background: transparent; }
+.lux-horizontal-scroll-arrow { position: absolute; z-index: 2; top: 50%; display: grid; place-items: center; width: 48px; height: 48px; padding: 0; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; color: #fff; background: rgba(12,14,18,.82); box-shadow: 0 8px 24px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.14); cursor: pointer; transform: translateY(-50%); transition: background-color .18s ease, box-shadow .18s ease, transform .18s ease; backdrop-filter: blur(5px); }
+.lux-horizontal-scroll-arrow svg { width: 24px; height: 24px; }
+.lux-horizontal-scroll-arrow:hover { background: rgba(12,14,18,.94); box-shadow: 0 10px 28px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.18); transform: translateY(-50%) scale(1.04); }
+.lux-horizontal-scroll-arrow:active { transform: translateY(-50%) scale(.98); }
 .lux-horizontal-scroll-arrow:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-.lux-horizontal-scroll-arrow.is-left { left: 4px; }
-.lux-horizontal-scroll-arrow.is-right { right: 4px; }
+.lux-horizontal-scroll-arrow.is-left { left: 8px; }
+.lux-horizontal-scroll-arrow.is-right { right: 8px; }
 .lux-detail-source { display: inline-flex; align-items: center; gap: 7px; min-height: 48px; color: var(--lux-muted); font-size: .8rem; }
 .lux-detail-watched-status { display: grid; place-items: center; flex: 0 0 auto; width: 48px; height: 48px; border: 1px solid var(--lux-line); border-radius: 50%; color: var(--lux-muted); background: rgba(0,0,0,.28); }
 .lux-detail-watched-status.is-played { border-color: rgba(155,226,183,.58); color: #a4e4ba; background: rgba(96,194,132,.16); box-shadow: inset 0 0 0 1px rgba(155,226,183,.12), 0 8px 22px rgba(96,194,132,.16); }

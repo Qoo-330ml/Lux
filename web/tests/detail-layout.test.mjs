@@ -68,15 +68,20 @@ test("media stream cards keep a compact width on wide detail pages", () => {
   assert.match(streamCardRule, /flex:\s*0\s*0\s*260px/);
 });
 
-test("shared horizontal scroll arrows show only the chevron", () => {
+test("shared horizontal scroll arrows are larger controls with a visible shadow", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const arrowRule = stylesheet.match(/\.lux-horizontal-scroll-arrow\s*\{([^}]*)\}/)?.[1] ?? "";
   const hoverRule = stylesheet.match(/\.lux-horizontal-scroll-arrow:hover\s*\{([^}]*)\}/)?.[1] ?? "";
+  const arrowIconRule = stylesheet.match(/\.lux-horizontal-scroll-arrow\s+svg\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(arrowRule, /background:\s*transparent/);
-  assert.match(arrowRule, /box-shadow:\s*none/);
-  assert.doesNotMatch(arrowRule, /backdrop-filter/);
-  assert.match(hoverRule, /background:\s*transparent/);
+  assert.match(arrowRule, /width:\s*48px/);
+  assert.match(arrowRule, /height:\s*48px/);
+  assert.match(arrowRule, /background:\s*rgba\(12,14,18,\.82\)/);
+  assert.match(arrowRule, /box-shadow:\s*0 8px 24px rgba\(0,0,0,\.42\)/);
+  assert.match(arrowRule, /backdrop-filter:\s*blur\(5px\)/);
+  assert.match(arrowIconRule, /width:\s*24px/);
+  assert.match(arrowIconRule, /height:\s*24px/);
+  assert.match(hoverRule, /background:\s*rgba\(12,14,18,\.94\)/);
 });
 
 test("media cast has no separator line", () => {
