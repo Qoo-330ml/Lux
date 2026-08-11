@@ -154,8 +154,8 @@ pnpm --dir web build
 镜像名为 `docker.io/<DOCKERHUB_USERNAME>/lux`。发布版本示例：
 
 ```bash
-git tag v0.1.13
-git push origin v0.1.13
+git tag v0.1.14
+git push origin v0.1.14
 ```
 
 ## 架构概览
