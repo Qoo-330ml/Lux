@@ -2371,8 +2371,9 @@ impl Database {
             "INSERT INTO strm_probe_jobs (
                 id, operation_id, library_id, status, concurrency,
                 include_ready, write_sidecars, media_info_enabled,
-                thumbnail_enabled, thumbnail_position_percent, total_count
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)",
+                thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
+                total_count
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(job.operation_id)
@@ -2383,6 +2384,7 @@ impl Database {
         .bind(job.media_info_enabled)
         .bind(job.thumbnail_enabled)
         .bind(job.thumbnail_position_percent)
+        .bind(job.target_scan_job_id)
         .bind(job.total_count)
         .execute(&self.pool)
         .await
@@ -2435,7 +2437,8 @@ impl Database {
         self.query(
             "SELECT id, operation_id, library_id, status, concurrency,
                     include_ready, write_sidecars, media_info_enabled,
-                    thumbnail_enabled, thumbnail_position_percent, cursor, processed_count,
+                    thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
+                    cursor, processed_count,
                     total_count, cancel_requested, error
              FROM strm_probe_jobs WHERE id = ?",
         )
@@ -2459,7 +2462,8 @@ impl Database {
             self.query(
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
-                        thumbnail_enabled, thumbnail_position_percent, cursor, processed_count,
+                        thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
+                        cursor, processed_count,
                         total_count, cancel_requested, error
                  FROM strm_probe_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -2473,7 +2477,8 @@ impl Database {
             self.query(
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
-                        thumbnail_enabled, thumbnail_position_percent, cursor, processed_count,
+                        thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
+                        cursor, processed_count,
                         total_count, cancel_requested, error
                  FROM strm_probe_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -7472,6 +7477,144 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_strm_media_sources_for_incremental_scan_page(
+        &self,
+        scan_job_id: &str,
+        after_source_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
+        let rows = if let Some(after_source_id) = after_source_id {
+            self.query(
+                "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
+                        mi.thumbnail_fallback_required,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM media_streams mt
+                            WHERE mt.media_source_id = ms.id
+                        ) OR ms.duration_ticks IS NOT NULL
+                            OR ms.bitrate IS NOT NULL
+                            OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
+                        THEN 1 ELSE 0 END AS has_media_info,
+                        lr.canonical_path AS root_path, fe.relative_path,
+                        ii.local_path AS thumbnail_path
+                 FROM media_sources ms
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 LEFT JOIN item_images ii
+                   ON ii.item_id = ms.item_id AND ii.image_type = 'THUMB'
+                  AND ii.image_index = 0
+                 WHERE ms.source_kind = 'STRM_URL'
+                   AND fe.is_missing = 0 AND mi.removed_at IS NULL
+                   AND ms.id > ? AND EXISTS (
+                       SELECT 1 FROM scan_job_paths sjp
+                       WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                         AND sjp.library_root_id = fe.library_root_id
+                         AND (
+                               fe.relative_path = sjp.relative_path
+                               OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                                  = sjp.relative_path || '/'
+                             )
+                   )
+                 ORDER BY ms.id, fe.relative_path
+                 LIMIT ?",
+            )
+            .bind(after_source_id)
+            .bind(scan_job_id)
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query(
+                "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
+                        mi.thumbnail_fallback_required,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM media_streams mt
+                            WHERE mt.media_source_id = ms.id
+                        ) OR ms.duration_ticks IS NOT NULL
+                            OR ms.bitrate IS NOT NULL
+                            OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
+                        THEN 1 ELSE 0 END AS has_media_info,
+                        lr.canonical_path AS root_path, fe.relative_path,
+                        ii.local_path AS thumbnail_path
+                 FROM media_sources ms
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 LEFT JOIN item_images ii
+                   ON ii.item_id = ms.item_id AND ii.image_type = 'THUMB'
+                  AND ii.image_index = 0
+                 WHERE ms.source_kind = 'STRM_URL'
+                   AND fe.is_missing = 0 AND mi.removed_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM scan_job_paths sjp
+                       WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                         AND sjp.library_root_id = fe.library_root_id
+                         AND (
+                               fe.relative_path = sjp.relative_path
+                               OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                                  = sjp.relative_path || '/'
+                             )
+                   )
+                 ORDER BY ms.id, fe.relative_path
+                 LIMIT ?",
+            )
+            .bind(scan_job_id)
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredStrmMediaSource {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    thumbnail_fallback_required: row.get::<i64, _>("thumbnail_fallback_required")
+                        != 0,
+                    has_media_info: row.get::<i64, _>("has_media_info") != 0,
+                    external_url: row.get("external_url"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                    thumbnail_path: row.get("thumbnail_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn count_strm_media_sources_for_incremental_scan(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT COUNT(DISTINCT ms.id)
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0 AND mi.removed_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM scan_job_paths sjp
+                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                     AND sjp.library_root_id = fe.library_root_id
+                     AND (
+                           fe.relative_path = sjp.relative_path
+                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                              = sjp.relative_path || '/'
+                         )
+               )",
+        )
+        .bind(scan_job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_download_source(
         &self,
         item_id: &str,
@@ -8776,6 +8919,7 @@ pub(crate) struct StoredStrmProbeJob {
     pub(crate) media_info_enabled: bool,
     pub(crate) thumbnail_enabled: bool,
     pub(crate) thumbnail_position_percent: i64,
+    pub(crate) target_scan_job_id: Option<String>,
     pub(crate) cursor: Option<String>,
     pub(crate) processed_count: i64,
     pub(crate) total_count: i64,
@@ -8793,6 +8937,7 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) media_info_enabled: bool,
     pub(crate) thumbnail_enabled: bool,
     pub(crate) thumbnail_position_percent: i64,
+    pub(crate) target_scan_job_id: Option<&'a str>,
     pub(crate) total_count: i64,
 }
 
@@ -8860,6 +9005,7 @@ fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
         media_info_enabled: row.get::<i64, _>("media_info_enabled") != 0,
         thumbnail_enabled: row.get::<i64, _>("thumbnail_enabled") != 0,
         thumbnail_position_percent: row.get("thumbnail_position_percent"),
+        target_scan_job_id: row.get("target_scan_job_id"),
         cursor: row.get("cursor"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),

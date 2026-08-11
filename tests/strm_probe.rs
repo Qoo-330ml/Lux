@@ -4,8 +4,9 @@ use luxd::{
     application::{
         plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
         probe::{FfprobeRunner, MediaProbeService},
-        scanner::LibraryScanner,
+        scanner::{IncrementalScanChange, LibraryScanner, ScanJobService},
         strm_probe::{StrmProbeOptions, StrmProbeService},
+        watch::ChangeKind,
     },
     config::Config,
     library::LibraryKind,
@@ -296,6 +297,182 @@ printf '%s' '{"format":{"format_name":"matroska"},"streams":[{"index":0,"codec_t
     .fetch_one(database.pool())
     .await?;
     assert_eq!(overwritten_codec, "vp9");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn incremental_scan_queues_and_runs_targeted_strm_probe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let plugin_dir = config_dir.join("plugins/org.lux.strm-media-info");
+    let binary_dir = plugin_dir.join("binaries");
+    tokio::fs::create_dir_all(&binary_dir).await?;
+
+    let fake_ffprobe = temp_dir.path().join("ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        r#"#!/bin/sh
+printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"500000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}]}'
+"#,
+    )?;
+    make_executable(&fake_ffprobe)?;
+    let plugin_binary = std::env::var_os("CARGO_BIN_EXE_lux-plugin-strm-media-info")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_lux_plugin_strm_media_info"))
+        .ok_or("strm-media-info plugin binary path is missing")?;
+    let wrapper = binary_dir.join("plugin");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nLUX_FFPROBE_BINARY={} exec {} \"$@\"\n",
+            shell_quote(Path::new(&fake_ffprobe)),
+            shell_quote(Path::new(&plugin_binary)),
+        ),
+    )?;
+    make_executable(&wrapper)?;
+    fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "id": MEDIA_INFO_PLUGIN_ID,
+            "name": "strm媒体信息提取",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "media_probe",
+            "category": "MEDIA",
+            "capabilities": ["media.probe"],
+            "configFields": [
+                {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "required": true, "optionsSource": "media-libraries"},
+                {"key": "concurrency", "label": "并发数", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 64},
+                {"key": "mediaInfoEnabled", "label": "提取媒体信息", "type": "toggle", "defaultValue": true},
+                {"key": "thumbnailEnabled", "label": "补全 STRM 缩略图", "type": "toggle", "defaultValue": false},
+                {"key": "thumbnailPositionPercent", "label": "缩略图位置", "type": "number", "required": true, "defaultValue": 30, "minimum": 1, "maximum": 99},
+                {"key": "existingInfoPolicy", "label": "已有媒体信息处理方式", "type": "select", "defaultValue": "SKIP", "options": [{"value": "SKIP", "label": "跳过已有媒体信息"}, {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}]},
+                {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": false},
+                {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 3 * * *"}
+            ],
+            "permissions": {"network": ["media-source"], "filesystem": []},
+            "files": []
+        }))?,
+    )?;
+
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root).await?;
+    tokio::fs::write(
+        media_root.join("Existing.Movie.2023.strm"),
+        "https://media.example.invalid/existing.mkv",
+    )
+    .await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = luxd::application::libraries::LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    sqlx::query(
+        "UPDATE media_sources
+         SET container = 'matroska', duration_ticks = 125000000, bitrate = 500000
+         WHERE source_kind = 'STRM_URL'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let plugins = PluginService::new(database.clone(), config_dir);
+    plugins.install(MEDIA_INFO_PLUGIN_ID).await?;
+    plugins
+        .update_dynamic_config(
+            MEDIA_INFO_PLUGIN_ID,
+            serde_json::Map::from_iter([
+                ("libraryIds".to_owned(), json!([library.id.to_string()])),
+                ("concurrency".to_owned(), json!(2)),
+                ("mediaInfoEnabled".to_owned(), json!(true)),
+                ("thumbnailEnabled".to_owned(), json!(false)),
+                ("thumbnailPositionPercent".to_owned(), json!(30)),
+                ("existingInfoPolicy".to_owned(), json!("SKIP")),
+                ("writeSidecars".to_owned(), json!(false)),
+                ("schedule".to_owned(), json!("0 3 * * *")),
+            ]),
+        )
+        .await?;
+
+    let new_path = "New.Movie.2024.strm";
+    tokio::fs::write(
+        media_root.join(new_path),
+        "https://media.example.invalid/new.mkv",
+    )
+    .await?;
+    let strm_probe = StrmProbeService::new(database.clone(), plugins.clone());
+    let scan_jobs = ScanJobService::new(database.clone()).with_strm_probe(strm_probe.clone());
+    let scan_job = scan_jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root.id.to_string(),
+                relative_path: new_path.to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    scan_jobs.run_to_completion(&scan_job.id, 100, None).await?;
+
+    let mut probe_job_id = None;
+    for _ in 0..250 {
+        let job = sqlx::query_as::<_, (String, i64, Option<String>, String)>(
+            "SELECT id, total_count, target_scan_job_id, status
+             FROM strm_probe_jobs ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .fetch_optional(database.pool())
+        .await?;
+        if let Some((id, total_count, target_scan_job_id, _status)) = job {
+            assert_eq!(total_count, 1);
+            assert_eq!(target_scan_job_id.as_deref(), Some(scan_job.id.as_str()));
+            probe_job_id = Some(id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let probe_job_id = probe_job_id.ok_or("targeted STRM probe job was not created")?;
+    let mut probe_job = None;
+    for _ in 0..250 {
+        let job = strm_probe.get(&probe_job_id).await?;
+        if matches!(job.status.as_str(), "COMPLETED" | "FAILED") {
+            probe_job = Some(job);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let probe_job = probe_job.ok_or("targeted STRM probe job did not finish")?;
+    assert_eq!(probe_job.status, "COMPLETED");
+    let new_source: (String, String) = sqlx::query_as(
+        "SELECT ms.probe_status, mt.codec
+         FROM media_sources ms
+         JOIN media_streams mt ON mt.media_source_id = ms.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = ? AND mt.stream_type = 'VIDEO'",
+    )
+    .bind(new_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(new_source, ("READY".to_owned(), "h264".to_owned()));
+    let scheduled: (String, i64) = sqlx::query_as(
+        "SELECT cron_or_interval, is_enabled FROM scheduled_task_configs
+         WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = 'STRM_MEDIA_INFO'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(scheduled, ("0 3 * * *".to_owned(), 1));
     Ok(())
 }
 

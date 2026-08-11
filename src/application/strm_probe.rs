@@ -115,29 +115,96 @@ impl StrmProbeService {
         let operation_id = Uuid::now_v7().to_string();
         let mut jobs = Vec::with_capacity(libraries.len());
         for (library_id, total_count) in libraries {
-            let id = Uuid::now_v7().to_string();
-            self.database
-                .create_strm_probe_job(crate::storage::NewStrmProbeJob {
-                    id: &id,
-                    operation_id: &operation_id,
-                    library_id: &library_id,
-                    concurrency: options.concurrency,
-                    include_ready: options.include_ready,
-                    write_sidecars: options.write_sidecars,
-                    media_info_enabled: options.media_info_enabled,
-                    thumbnail_enabled: options.thumbnail_enabled,
-                    thumbnail_position_percent: options.thumbnail_position_percent,
-                    total_count,
-                })
-                .await?;
-            let job = self
-                .database
-                .find_strm_probe_job(&id)
-                .await?
-                .ok_or(StrmProbeError::JobNotFound)?;
-            jobs.push(strm_probe_job(job));
+            jobs.push(
+                self.create_job_record(&operation_id, &library_id, None, total_count, options)
+                    .await?,
+            );
         }
         Ok(jobs)
+    }
+
+    pub async fn create_configured_incremental_job(
+        &self,
+        scan_job_id: &str,
+        library_id: LibraryId,
+    ) -> Result<Option<StrmProbeJob>, StrmProbeError> {
+        let Some(settings) = self.plugins.enabled_media_info_settings().await? else {
+            return Ok(None);
+        };
+        if !settings.library_ids.contains(&library_id)
+            || (!settings.media_info_enabled && !settings.thumbnail_enabled)
+        {
+            return Ok(None);
+        }
+        let library_id_text = library_id.to_string();
+        let library = self
+            .database
+            .find_library(&library_id_text)
+            .await?
+            .ok_or(StrmProbeError::LibraryNotFound)?;
+        if !library.is_enabled {
+            return Ok(None);
+        }
+        let total_count = self
+            .database
+            .count_strm_media_sources_for_incremental_scan(scan_job_id)
+            .await?;
+        if total_count == 0 {
+            return Ok(None);
+        }
+        if self.database.has_active_strm_probe_jobs().await? {
+            return Err(StrmProbeError::AlreadyActive);
+        }
+        let operation_id = Uuid::now_v7().to_string();
+        let job = self
+            .create_job_record(
+                &operation_id,
+                &library_id_text,
+                Some(scan_job_id),
+                total_count,
+                StrmProbeOptions {
+                    concurrency: settings.concurrency,
+                    include_ready: settings.include_ready,
+                    write_sidecars: settings.write_sidecars,
+                    media_info_enabled: settings.media_info_enabled,
+                    thumbnail_enabled: settings.thumbnail_enabled,
+                    thumbnail_position_percent: settings.thumbnail_position_percent,
+                },
+            )
+            .await?;
+        Ok(Some(job))
+    }
+
+    async fn create_job_record(
+        &self,
+        operation_id: &str,
+        library_id: &str,
+        target_scan_job_id: Option<&str>,
+        total_count: i64,
+        options: StrmProbeOptions,
+    ) -> Result<StrmProbeJob, StrmProbeError> {
+        let id = Uuid::now_v7().to_string();
+        self.database
+            .create_strm_probe_job(crate::storage::NewStrmProbeJob {
+                id: &id,
+                operation_id,
+                library_id,
+                concurrency: options.concurrency,
+                include_ready: options.include_ready,
+                write_sidecars: options.write_sidecars,
+                media_info_enabled: options.media_info_enabled,
+                thumbnail_enabled: options.thumbnail_enabled,
+                thumbnail_position_percent: options.thumbnail_position_percent,
+                target_scan_job_id,
+                total_count,
+            })
+            .await?;
+        let job = self
+            .database
+            .find_strm_probe_job(&id)
+            .await?
+            .ok_or(StrmProbeError::JobNotFound)?;
+        Ok(strm_probe_job(job))
     }
 
     pub async fn create_configured_jobs(&self) -> Result<Vec<StrmProbeJob>, StrmProbeError> {
@@ -227,21 +294,39 @@ impl StrmProbeService {
             .library_id
             .parse::<LibraryId>()
             .map_err(|_| StrmProbeError::LibraryNotFound)?;
-        self.create_jobs(
-            &[library_id],
-            StrmProbeOptions {
-                concurrency: job.concurrency,
-                include_ready: job.include_ready,
-                write_sidecars: job.write_sidecars,
-                media_info_enabled: job.media_info_enabled,
-                thumbnail_enabled: job.thumbnail_enabled,
-                thumbnail_position_percent: job.thumbnail_position_percent,
-            },
-        )
-        .await?
-        .into_iter()
-        .next()
-        .ok_or(StrmProbeError::JobNotFound)
+        let options = StrmProbeOptions {
+            concurrency: job.concurrency,
+            include_ready: job.include_ready,
+            write_sidecars: job.write_sidecars,
+            media_info_enabled: job.media_info_enabled,
+            thumbnail_enabled: job.thumbnail_enabled,
+            thumbnail_position_percent: job.thumbnail_position_percent,
+        };
+        if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
+            if self.database.has_active_strm_probe_jobs().await? {
+                return Err(StrmProbeError::AlreadyActive);
+            }
+            let total_count = self
+                .database
+                .count_strm_media_sources_for_incremental_scan(scan_job_id)
+                .await?;
+            let operation_id = Uuid::now_v7().to_string();
+            let library_id_text = library_id.to_string();
+            self.create_job_record(
+                &operation_id,
+                &library_id_text,
+                Some(scan_job_id),
+                total_count,
+                options,
+            )
+            .await
+        } else {
+            self.create_jobs(&[library_id], options)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or(StrmProbeError::JobNotFound)
+        }
     }
 
     async fn run_claimed(&self, job: StoredStrmProbeJob) -> Result<(), StrmProbeError> {
@@ -275,14 +360,23 @@ impl StrmProbeService {
         let mut after_source_id = None::<String>;
 
         loop {
-            let sources = self
-                .database
-                .list_strm_media_sources_for_library_page(
-                    &job.library_id,
-                    after_source_id.as_deref(),
-                    SOURCE_PAGE_SIZE,
-                )
-                .await?;
+            let sources = if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
+                self.database
+                    .list_strm_media_sources_for_incremental_scan_page(
+                        scan_job_id,
+                        after_source_id.as_deref(),
+                        SOURCE_PAGE_SIZE,
+                    )
+                    .await?
+            } else {
+                self.database
+                    .list_strm_media_sources_for_library_page(
+                        &job.library_id,
+                        after_source_id.as_deref(),
+                        SOURCE_PAGE_SIZE,
+                    )
+                    .await?
+            };
             let Some(last_source_id) = sources.last().map(|source| source.source_id.clone()) else {
                 break;
             };

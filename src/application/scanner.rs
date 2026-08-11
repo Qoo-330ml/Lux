@@ -25,6 +25,7 @@ use crate::{
         metadata::MetadataEnricher,
         probe::MediaProbeService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
+        strm_probe::StrmProbeService,
         strm_target::{StrmTarget, StrmTargetKind, classify_strm_target},
         thumbnails::ThumbnailService,
         watch::ChangeKind,
@@ -1256,6 +1257,7 @@ pub struct ScanJobService {
     admin_events: AdminEventHub,
     scan_lock: Arc<Semaphore>,
     library_covers: Option<LibraryCoverService>,
+    strm_probe: Option<StrmProbeService>,
     resources: ResourceMetrics,
 }
 
@@ -1274,6 +1276,7 @@ impl ScanJobService {
             admin_events: AdminEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
             library_covers: None,
+            strm_probe: None,
             resources: ResourceMetrics::new(),
         }
     }
@@ -1290,6 +1293,11 @@ impl ScanJobService {
 
     pub fn with_library_covers(mut self, library_covers: LibraryCoverService) -> Self {
         self.library_covers = Some(library_covers);
+        self
+    }
+
+    pub fn with_strm_probe(mut self, strm_probe: StrmProbeService) -> Self {
+        self.strm_probe = Some(strm_probe);
         self
     }
 
@@ -2270,6 +2278,14 @@ impl ScanJobService {
                         self.schedule_online_metadata_after_incremental_scan(job_id, metadata)
                             .await;
                     }
+                    if let Some(strm_probe) = self.strm_probe.clone() {
+                        self.schedule_strm_probe_after_incremental_scan(
+                            job_id,
+                            &completed_job.library_id,
+                            strm_probe,
+                        )
+                        .await;
+                    }
                     self.run_auto_library_cover_after_scan(job_id).await?;
                     return Ok(());
                 }
@@ -2569,6 +2585,55 @@ impl ScanJobService {
             )
             .await;
         }
+    }
+
+    async fn schedule_strm_probe_after_incremental_scan(
+        &self,
+        scan_job_id: &str,
+        library_id: &str,
+        strm_probe: StrmProbeService,
+    ) {
+        let Ok(library_id) = library_id.parse::<LibraryId>() else {
+            tracing::warn!(
+                scan_job_id,
+                library_id,
+                "incremental scan completed but automatic STRM probe skipped for invalid library ID"
+            );
+            return;
+        };
+        let job = match strm_probe
+            .create_configured_incremental_job(scan_job_id, library_id)
+            .await
+        {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    scan_job_id,
+                    %error,
+                    "incremental scan completed but automatic STRM probe could not be queued"
+                );
+                return;
+            }
+        };
+        let job_id = job.id.clone();
+        let worker = strm_probe;
+        tokio::spawn(async move {
+            if let Err(error) = worker.run(&job_id).await {
+                tracing::error!(job_id = %job_id, %error, "automatic STRM probe stopped");
+            }
+        });
+        self.record_event(
+            scan_job_id,
+            "INFO",
+            "STRM_MEDIA_INFO_AUTO_QUEUED",
+            "已提交新增 STRM 媒体信息识别任务",
+            &format!(
+                r#"{{"jobId":"{}","itemCount":{}}}"#,
+                job.id, job.total_count
+            ),
+        )
+        .await;
     }
 
     async fn run_metadata_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {

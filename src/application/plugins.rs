@@ -738,6 +738,16 @@ impl PluginService {
         })
     }
 
+    pub async fn enabled_media_info_settings(
+        &self,
+    ) -> Result<Option<MediaInfoSettings>, PluginServiceError> {
+        let (installed, enabled) = self.plugin_state(MEDIA_INFO_PLUGIN_ID).await?;
+        if !installed || !enabled {
+            return Ok(None);
+        }
+        self.media_info_settings().await.map(Some)
+    }
+
     pub async fn sync_media_info_scheduled_task(&self) -> Result<(), PluginServiceError> {
         let (installed, enabled) = self.plugin_state(MEDIA_INFO_PLUGIN_ID).await?;
         if !installed {
