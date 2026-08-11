@@ -3329,8 +3329,19 @@ fn emby_catalog_item_json_with_state(
         "SERIES" | "SEASON" => item.episode_count,
         _ => None,
     };
+    let index_number = if item.item_type == "SEASON" {
+        item.season_number
+    } else {
+        item.episode_number
+    };
+    let season_id = if item.item_type == "EPISODE" {
+        item.parent_id.clone()
+    } else {
+        None
+    };
     let mut value = json!({
         "Name": item.title,
+        "SortName": item.sort_title,
         "OriginalTitle": item.original_title,
         "Id": item.id,
         "ServerId": server_id,
@@ -3341,9 +3352,13 @@ fn emby_catalog_item_json_with_state(
         "ParentId": parent_id,
         "PrimaryImageItemId": item.poster_image_tag.as_ref().map(|_| item.id.clone()),
         "SeriesId": item.series_id,
+        "SeasonId": season_id,
+        "IndexNumber": index_number,
         "ParentIndexNumber": item.season_number,
         "Index": item.episode_number,
         "ProductionYear": item.production_year,
+        "PremiereDate": item.premiere_date,
+        "ProviderIds": emby_provider_ids(&item.provider_ids),
         "CommunityRating": item.rating,
         "Overview": item.overview,
         "RunTimeTicks": runtime_ticks,
@@ -3386,6 +3401,21 @@ fn emby_catalog_item_json_with_state(
         );
     }
     value
+}
+
+fn emby_provider_ids(provider_ids: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    provider_ids
+        .iter()
+        .map(|(name, value)| {
+            let name = match name.to_ascii_lowercase().as_str() {
+                "tmdb" => "Tmdb",
+                "tvdb" => "Tvdb",
+                "imdb" => "Imdb",
+                _ => name,
+            };
+            (name.to_owned(), value.clone())
+        })
+        .collect()
 }
 
 fn emby_media_source_json(

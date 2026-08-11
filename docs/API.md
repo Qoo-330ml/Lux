@@ -143,7 +143,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET /Users/{userId}/Views`：返回电影媒体库视图。
 - `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`Recursive`、`StartIndex`、`Limit` 和 `IncludeItemTypes=Movie`，`ParentId` 可指向媒体库、剧集或季度；默认从 0 开始、每页 50 条，单页上限 100。
 - `GET /Users/{userId}/Items`、`GET /Items`：另支持 `IsPlayed`、`IsFavorite`、`Years`、`SortBy` 和 `SortOrder`，筛选后再分页。
-- `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影、剧集和季度详情 DTO；文件夹类型返回 `ChildCount`/`RecursiveItemCount`，`UserData` 包含 `PlaybackPositionTicks`、`PlayedPercentage`、`Played`、`IsFavorite` 和 `PlayCount`。
+- `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影、剧集和季度详情 DTO；目录和详情条目使用标准 `SortName`、`SeasonId`、`IndexNumber`、`ParentIndexNumber`、`PremiereDate` 和 `ProviderIds` 字段，旧客户端使用的 `Index` 别名继续保留。文件夹类型返回 `ChildCount`/`RecursiveItemCount`，`UserData` 包含 `PlaybackPositionTicks`、`PlayedPercentage`、`Played`、`IsFavorite` 和 `PlayCount`。
 - `GET /Shows/{seriesId}/Seasons`：按用户媒体库权限返回季度。
 - `GET /Shows/{seriesId}/Episodes?SeasonId={seasonId}&StartIndex=0&Limit=50`：返回剧集，可省略 `SeasonId` 获取整部剧集，支持分页。
 - `GET /Users/{userId}/Items/NextUp`：按该用户的播放状态返回未看完单集。

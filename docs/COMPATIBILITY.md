@@ -30,6 +30,7 @@
 - LUX-121 兼容补齐：Emby `Views` 返回媒体库类型、`ChildCount` 和标准 `ImageTags.Primary`；条目详情同时返回本地徽标的 `ImageTags.Logo`，并通过 `/Items/{itemId}/Images/Logo` 提供标准图片读取；媒体库封面支持 `/Items/{libraryId}/Images/Primary` 及带索引、HEAD、ETag 和 ACL。尚待 VidHub UI 重新实测确认。
 - Harbor 1.4.6 兼容修复：Emby 媒体库自身的 `/Users/{userId}/Items/{libraryId}` 详情现在返回 `CollectionFolder`，并复用媒体库启用状态和 ACL 校验；本机 Harbor 真实 UI 已验证可进入库并显示条目。
 - 2026-08-10 Emby 目录兼容修复：`Items/Latest` 默认按 `GroupItems=true` 返回电影/剧集根条目，剧集与季度 DTO 补充 `ChildCount`/`RecursiveItemCount`；`ParentId` 现在支持媒体库、剧集和季度，并覆盖剧集单集查询。`tests/series_api.rs` 已加入协议回归覆盖；网易爆米花真实设备复测仍待完成。
+- 2026-08-11 网易爆米花 2.15.3 DTO 兼容修复：已观察到客户端可登录并加载部分首页，但尚未进入播放会话。Emby 条目现补齐 `SortName`、`SeasonId`、`IndexNumber`、`PremiereDate` 和 `ProviderIds`，季/集层级的标准字段已有协议回归覆盖；完整首页、详情页和播放仍待重启服务后的真实设备复测，不据此宣称完全兼容。
 - 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - 播放会话失活保护：若第三方客户端异常退出、网络中断或未发送 `Stopped`，`PLAYING`/`PAUSED` 会话在连续 90 秒没有事件后从 Emby `GET /Sessions`、管理员控制台和 Web 播放状态中隐藏；显式 `Stopped` 仍立即清理活动会话。
 - LUX-091 下载回归已覆盖 Lux/Emby 的 GET/HEAD 单资源响应、Range/文件名响应，以及 `.strm` 远程资源流式转发；尚未完成第三方客户端的真实下载 UI 实测，因此不据此宣称 Infuse、VidHub 或 SenPlayer 下载兼容。

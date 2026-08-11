@@ -143,6 +143,17 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .to_owned();
     let headers = [("X-Emby-Token", token.as_str())];
 
+    let emby_series_detail = client
+        .get(format!("{base_url}/Users/{}/Items/{series_id}", admin.id))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(emby_series_detail.status(), reqwest::StatusCode::OK);
+    let emby_series_detail_body: Value = emby_series_detail.json().await?;
+    assert_eq!(emby_series_detail_body["SortName"], "example show");
+    assert_eq!(emby_series_detail_body["PremiereDate"], "2013-12-02");
+    assert_eq!(emby_series_detail_body["ProviderIds"]["Tmdb"], "60625");
+
     let seasons = client
         .get(format!("{base_url}/Shows/{series_id}/Seasons?Limit=10"))
         .header(headers[0].0, headers[0].1)
@@ -154,6 +165,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(seasons_body["Items"][0]["Type"], "Season");
     assert_eq!(seasons_body["Items"][0]["IsFolder"], true);
     assert_eq!(seasons_body["Items"][0]["ParentId"], series_id);
+    assert_eq!(seasons_body["Items"][0]["IndexNumber"], 1);
     assert_eq!(seasons_body["Items"][0]["ChildCount"], 3);
 
     let children = client
@@ -237,8 +249,11 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(episodes_body["TotalRecordCount"], 3);
     assert_eq!(episodes_body["Items"].as_array().map(Vec::len), Some(1));
     assert_eq!(episodes_body["Items"][0]["Index"], 2);
+    assert_eq!(episodes_body["Items"][0]["IndexNumber"], 2);
     assert_eq!(episodes_body["Items"][0]["ParentIndexNumber"], 1);
     assert_eq!(episodes_body["Items"][0]["ParentId"], season_id);
+    assert_eq!(episodes_body["Items"][0]["SeasonId"], season_id);
+    assert_eq!(episodes_body["Items"][0]["SeriesId"], series_id);
     assert_eq!(episodes_body["Items"][0]["UserData"]["Played"], true);
     assert_eq!(episodes_body["Items"][0]["UserData"]["PlayCount"], 4);
 
