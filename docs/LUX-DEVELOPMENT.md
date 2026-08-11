@@ -112,8 +112,8 @@ Lux 的核心价值不是功能数量，而是：
 
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
-- Lux 对目标做有限的词法分类：HTTP(S) URL、路径和未知/其他目标；分类不访问网络、不把路径当作本地文件路径，也不猜测目标所属的外部服务。
-- HTTP(S) 目标沿用直接播放语义；路径和其他目标交给后续路径转发或解析器任务处理，未配置处理方式时不得伪造可播放 URL。
+- Lux 对目标做有限的词法分类：HTTP(S) URL、路径和未知/其他目标；分类不访问网络、不把路径当作本地文件路径，也不猜测目标所属的外部服务。扫描结果把分类保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`。
+- HTTP(S) 目标沿用直接播放语义；路径和其他目标交给后续路径转发或解析器任务处理，未配置处理方式时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
 ### 3.3 播放
@@ -855,7 +855,8 @@ pub async fn get_item(
 - size
 - bitrate
 - duration_ticks
-- external_url
+- external_url：兼容字段；对 `.strm` 保存首个非空原始目标
+- strm_target_kind：可空，URL、PATH、OPAQUE、EMPTY；旧数据为空时按原始目标词法回退
 - is_default
 - probe_status
 
@@ -3348,6 +3349,35 @@ stdout 日志并在启动阶段报告降级原因。
 - 不新增数据库字段或 migration。
 - 不修改 Emby `MediaSource` 输出，不调用外部解析器，不请求路径，不代理媒体字节。
 - 不把任何具体第三方工具写入 Lux 核心。
+
+#### LUX-159：持久化 `.strm` 原始目标分类
+
+范围：在不破坏现有 `STRM_URL`/`external_url` URL 兼容行为的前提下，为 `.strm` 增加可空的
+`strm_target_kind` 持久化字段。扫描器在新增、重扫和文件内容变化时保存 `URL`、`PATH`、
+`OPAQUE` 或 `EMPTY` 分类；旧记录分类为空时由播放表面按原始目标执行同一纯词法回退。
+
+URL 型目标继续提供外部 HTTP 直播放行；路径、其他目标和空目标不生成 `DirectStreamUrl`，
+视频端点不重定向、不返回 `.strm` 文件字节。STRM 后台探测仍将原始目标交给受监督插件，
+不在普通扫描、播放或请求路径中访问目标。
+
+验收：
+
+- [ ] SQLite 和 PostgreSQL 空数据库迁移成功，旧数据库可增加可空 `strm_target_kind` 字段。
+- [ ] 电影、剧集和未解析 `.strm` 扫描均保存首个非空目标及其分类；重扫会更新分类和目标。
+- [ ] URL 型 `PlaybackInfo`/视频请求保持现有兼容行为；路径、其他目标和空目标不伪造直链，
+      也不会把 `.strm` 文件当作媒体返回。
+- [ ] 后台 STRM 探测继续使用原始目标，不因分类而在扫描或播放请求中发起网络访问。
+- [ ] 通过专项 Rust 测试、格式化、Clippy，并记录 ARM 本机 `uname -m`。
+
+验证：`cargo test --locked --test strm --test strm_target`、`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+依赖：LUX-158、LUX-146。
+
+明确不做：
+
+- 不实现路径映射、外部解析器注册、目标转发、媒体字节代理或转码。
+- 不绑定任何具体云盘、网盘或第三方工具。
 
 ## 26. 风险与缓解
 

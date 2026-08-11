@@ -4237,17 +4237,19 @@ impl Database {
         })
     }
 
-    pub(crate) async fn update_media_source_external_url(
+    pub(crate) async fn update_media_source_strm_target(
         &self,
         filesystem_entry_id: &str,
-        external_url: Option<&str>,
+        strm_target_kind: Option<&str>,
+        strm_target: Option<&str>,
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_sources
-             SET external_url = ?, updated_at = unixepoch()
+             SET external_url = ?, strm_target_kind = ?, updated_at = unixepoch()
              WHERE filesystem_entry_id = ?",
         )
-        .bind(external_url)
+        .bind(strm_target)
+        .bind(strm_target_kind)
         .bind(filesystem_entry_id)
         .execute(&self.pool)
         .await
@@ -4602,9 +4604,9 @@ impl Database {
             self.query(
                 "INSERT INTO media_sources (
                     id, item_id, source_kind, filesystem_entry_id,
-                    edition_name, quality_label, container, size,
-                    external_url, is_default, probe_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+                edition_name, quality_label, container, size,
+                    external_url, strm_target_kind, is_default, probe_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
             )
             .bind(&file.source_id)
             .bind(item_id)
@@ -4615,6 +4617,7 @@ impl Database {
             .bind(&file.container)
             .bind(file.size)
             .bind(file.external_url.as_deref())
+            .bind(file.strm_target_kind.as_deref())
             .bind(database_flag(is_new_item))
             .execute(&mut *transaction)
             .await
@@ -6742,8 +6745,8 @@ impl Database {
             "INSERT INTO media_sources (
                 id, item_id, source_kind, filesystem_entry_id,
                 edition_name, quality_label, container, size,
-                external_url, is_default, probe_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+                external_url, strm_target_kind, is_default, probe_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
         )
         .bind(source.id)
         .bind(source.item_id)
@@ -6754,6 +6757,7 @@ impl Database {
         .bind(source.container)
         .bind(source.size)
         .bind(source.external_url)
+        .bind(source.strm_target_kind)
         .bind(database_flag(source.is_default))
         .execute(&self.pool)
         .await
@@ -9706,6 +9710,7 @@ pub(crate) struct NewMediaSource<'a> {
     pub(crate) container: &'a str,
     pub(crate) size: i64,
     pub(crate) external_url: Option<&'a str>,
+    pub(crate) strm_target_kind: Option<&'a str>,
     pub(crate) is_default: bool,
 }
 
@@ -9721,6 +9726,7 @@ pub(crate) struct NewMovieFile {
     pub(crate) original_title: String,
     pub(crate) production_year: Option<i64>,
     pub(crate) source_kind: String,
+    pub(crate) strm_target_kind: Option<String>,
     pub(crate) edition_name: Option<String>,
     pub(crate) quality_label: Option<String>,
     pub(crate) container: String,
@@ -10035,6 +10041,7 @@ mod tests {
                 original_title: "Movie".to_owned(),
                 production_year: Some(2024),
                 source_kind: "LOCAL_FILE".to_owned(),
+                strm_target_kind: None,
                 edition_name: None,
                 quality_label: None,
                 container: "mkv".to_owned(),
@@ -10052,6 +10059,7 @@ mod tests {
                 original_title: "Movie".to_owned(),
                 production_year: Some(2024),
                 source_kind: "LOCAL_FILE".to_owned(),
+                strm_target_kind: None,
                 edition_name: Some("Director's Cut".to_owned()),
                 quality_label: None,
                 container: "mkv".to_owned(),

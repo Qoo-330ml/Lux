@@ -73,6 +73,7 @@ use crate::{
             write_danmaku_provider_url, write_network_proxy_url,
         },
         strm_probe::{StrmProbeError, StrmProbeService},
+        strm_target::{StrmTargetKind, classify_strm_target},
         thumbnails::ThumbnailService,
         tmdb::{TmdbClient, TmdbError},
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
@@ -3654,6 +3655,11 @@ fn emby_media_source_json(
     source: &crate::application::catalog::CatalogSource,
     include_media_streams: bool,
 ) -> Value {
+    let is_remote = source.source_kind == "STRM_URL"
+        && source
+            .external_url
+            .as_deref()
+            .is_some_and(is_http_strm_target);
     let direct_stream_url = if source.source_kind == "LOCAL_FILE" {
         let suffix = source
             .container
@@ -3661,10 +3667,11 @@ fn emby_media_source_json(
             .map(|container| format!(".{container}"))
             .unwrap_or_default();
         Some(format!("/Videos/{item_id}/{}/stream{suffix}", source.id))
-    } else {
+    } else if is_remote {
         source.external_url.clone()
+    } else {
+        None
     };
-    let is_remote = source.source_kind == "STRM_URL";
     let mut value = json!({
         "Id": source.id,
         "Name": source.edition_name,
@@ -3692,6 +3699,10 @@ fn emby_media_source_json(
         );
     }
     value
+}
+
+fn is_http_strm_target(value: &str) -> bool {
+    matches!(classify_strm_target(value).kind, StrmTargetKind::Url)
 }
 
 fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
@@ -6491,6 +6502,9 @@ async fn serve_media_file(
         let Some(external_url) = source.external_url else {
             return StatusCode::NOT_FOUND.into_response();
         };
+        if !is_http_strm_target(&external_url) {
+            return StatusCode::NOT_IMPLEMENTED.into_response();
+        }
         let Ok(location) = HeaderValue::from_str(&external_url) else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
@@ -6502,6 +6516,9 @@ async fn serve_media_file(
             Ok(response) => response,
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
+    }
+    if source.source_kind != "LOCAL_FILE" {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
     }
     let path = match canonical_local_media_path(&source.root_path, &source.relative_path).await {
         Ok(path) => path,

@@ -25,6 +25,7 @@ use crate::{
         metadata::MetadataEnricher,
         probe::MediaProbeService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
+        strm_target::{StrmTarget, StrmTargetKind, classify_strm_target},
         thumbnails::ThumbnailService,
         watch::ChangeKind,
     },
@@ -330,11 +331,15 @@ impl LibraryScanner {
             return Ok(ScanReport::default());
         };
         let is_strm = is_strm_file(path);
-        let external_url = if is_strm {
-            read_strm_url(path).await?
+        let strm_target = if is_strm {
+            Some(read_strm_target(path).await?)
         } else {
             None
         };
+        let external_url = strm_target
+            .as_ref()
+            .and_then(|target| target.value.as_deref());
+        let strm_target_kind = strm_target.as_ref().map(strm_target_kind_name);
         let relative_path = path
             .strip_prefix(root_path)
             .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
@@ -383,7 +388,11 @@ impl LibraryScanner {
         if episode_is_current && let Some(existing_entry) = existing_entry.as_ref() {
             if is_strm {
                 self.database
-                    .update_media_source_external_url(&existing_entry.id, external_url.as_deref())
+                    .update_media_source_strm_target(
+                        &existing_entry.id,
+                        strm_target_kind,
+                        external_url,
+                    )
                     .await?;
             }
             self.database
@@ -415,9 +424,10 @@ impl LibraryScanner {
             if fingerprint_unchanged {
                 if is_strm {
                     self.database
-                        .update_media_source_external_url(
+                        .update_media_source_strm_target(
                             &existing_entry.id,
-                            external_url.as_deref(),
+                            strm_target_kind,
+                            external_url,
                         )
                         .await?;
                 }
@@ -446,7 +456,11 @@ impl LibraryScanner {
                 .await?;
             if is_strm {
                 self.database
-                    .update_media_source_external_url(&existing_entry.id, external_url.as_deref())
+                    .update_media_source_strm_target(
+                        &existing_entry.id,
+                        strm_target_kind,
+                        external_url,
+                    )
                     .await?;
             }
             return Ok(ScanReport {
@@ -486,7 +500,8 @@ impl LibraryScanner {
                 quality_label: parsed.quality_label.as_deref(),
                 container: &container,
                 size,
-                external_url: external_url.as_deref(),
+                external_url,
+                strm_target_kind,
                 is_default: ensured.episode_created,
             })
             .await?;
@@ -507,11 +522,15 @@ impl LibraryScanner {
         generation: &str,
     ) -> Result<ScanReport, ScannerError> {
         let is_strm = is_strm_file(path);
-        let external_url = if is_strm {
-            read_strm_url(path).await?
+        let strm_target = if is_strm {
+            Some(read_strm_target(path).await?)
         } else {
             None
         };
+        let external_url = strm_target
+            .as_ref()
+            .and_then(|target| target.value.as_deref());
+        let strm_target_kind = strm_target.as_ref().map(strm_target_kind_name);
         let relative_path = path
             .strip_prefix(root_path)
             .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
@@ -543,9 +562,10 @@ impl LibraryScanner {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
                 if is_strm {
                     self.database
-                        .update_media_source_external_url(
+                        .update_media_source_strm_target(
                             &existing_entry.id,
-                            external_url.as_deref(),
+                            strm_target_kind,
+                            external_url,
                         )
                         .await?;
                 }
@@ -572,7 +592,11 @@ impl LibraryScanner {
                 .await?;
             if is_strm {
                 self.database
-                    .update_media_source_external_url(&existing_entry.id, external_url.as_deref())
+                    .update_media_source_strm_target(
+                        &existing_entry.id,
+                        strm_target_kind,
+                        external_url,
+                    )
                     .await?;
             }
             return Ok(ScanReport {
@@ -641,7 +665,8 @@ impl LibraryScanner {
                 quality_label: None,
                 container: &container,
                 size,
-                external_url: external_url.as_deref(),
+                external_url,
+                strm_target_kind,
                 is_default: true,
             })
             .await?;
@@ -922,11 +947,15 @@ impl LibraryScanner {
             return Ok(None);
         };
         let is_strm = is_strm_file(path);
-        let external_url = if is_strm {
-            read_strm_url(path).await?
+        let strm_target = if is_strm {
+            Some(read_strm_target(path).await?)
         } else {
             None
         };
+        let external_url = strm_target
+            .as_ref()
+            .and_then(|target| target.value.as_deref());
+        let strm_target_kind = strm_target.as_ref().map(strm_target_kind_name);
         let relative_path = path
             .strip_prefix(root_path)
             .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
@@ -971,10 +1000,11 @@ impl LibraryScanner {
             } else {
                 "LOCAL_FILE".to_owned()
             },
+            strm_target_kind: strm_target_kind.map(str::to_owned),
             edition_name: parsed_name.edition_name,
             quality_label: parsed_name.quality_label,
             container,
-            external_url,
+            external_url: external_url.map(str::to_owned),
         }))
     }
 
@@ -1015,11 +1045,15 @@ impl LibraryScanner {
             return Ok(ScanReport::default());
         };
         let is_strm = is_strm_file(path);
-        let external_url = if is_strm {
-            read_strm_url(path).await?
+        let strm_target = if is_strm {
+            Some(read_strm_target(path).await?)
         } else {
             None
         };
+        let external_url = strm_target
+            .as_ref()
+            .and_then(|target| target.value.as_deref());
+        let strm_target_kind = strm_target.as_ref().map(strm_target_kind_name);
         let relative_path = path
             .strip_prefix(root_path)
             .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
@@ -1057,9 +1091,10 @@ impl LibraryScanner {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
                 if is_strm {
                     self.database
-                        .update_media_source_external_url(
+                        .update_media_source_strm_target(
                             &existing_entry.id,
-                            external_url.as_deref(),
+                            strm_target_kind,
+                            external_url,
                         )
                         .await?;
                 }
@@ -1083,7 +1118,11 @@ impl LibraryScanner {
                 .await?;
             if is_strm {
                 self.database
-                    .update_media_source_external_url(&existing_entry.id, external_url.as_deref())
+                    .update_media_source_strm_target(
+                        &existing_entry.id,
+                        strm_target_kind,
+                        external_url,
+                    )
                     .await?;
             }
             report.changed_files = 1;
@@ -1129,9 +1168,10 @@ impl LibraryScanner {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
                 if is_strm {
                     self.database
-                        .update_media_source_external_url(
+                        .update_media_source_strm_target(
                             &existing_entry.id,
-                            external_url.as_deref(),
+                            strm_target_kind,
+                            external_url,
                         )
                         .await?;
                 }
@@ -1157,7 +1197,11 @@ impl LibraryScanner {
                 .await?;
             if is_strm {
                 self.database
-                    .update_media_source_external_url(&existing_entry.id, external_url.as_deref())
+                    .update_media_source_strm_target(
+                        &existing_entry.id,
+                        strm_target_kind,
+                        external_url,
+                    )
                     .await?;
             }
             report.created_items = usize::from(created_item);
@@ -1194,7 +1238,8 @@ impl LibraryScanner {
                 quality_label: parsed_name.quality_label.as_deref(),
                 container: &container,
                 size,
-                external_url: external_url.as_deref(),
+                external_url,
+                strm_target_kind,
                 is_default: created_item,
             })
             .await?;
@@ -3213,17 +3258,23 @@ fn is_strm_file(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("strm"))
 }
 
-async fn read_strm_url(path: &Path) -> Result<Option<String>, ScannerError> {
+async fn read_strm_target(path: &Path) -> Result<StrmTarget, ScannerError> {
     let contents = fs::read_to_string(path)
         .await
         .map_err(|source| ScannerError::Io {
             path: path.to_owned(),
             source,
         })?;
-    Ok(contents.lines().find_map(|line| {
-        let line = line.trim().trim_start_matches('\u{feff}').trim();
-        (!line.is_empty()).then(|| line.to_owned())
-    }))
+    Ok(classify_strm_target(&contents))
+}
+
+fn strm_target_kind_name(target: &StrmTarget) -> &'static str {
+    match target.kind {
+        StrmTargetKind::Empty => "EMPTY",
+        StrmTargetKind::Url => "URL",
+        StrmTargetKind::Path => "PATH",
+        StrmTargetKind::Opaque => "OPAQUE",
+    }
 }
 
 #[derive(Debug)]
