@@ -106,8 +106,6 @@ org.lux.tmdb-1.0.0.zip
       "minimum": 1,
       "maximum": 64
     },
-    {"key": "mediaInfoEnabled", "label": "提取媒体信息", "type": "toggle", "defaultValue": true},
-    {"key": "thumbnailEnabled", "label": "补全 STRM 缩略图", "type": "toggle", "defaultValue": false},
     {
       "key": "existingInfoPolicy",
       "label": "已有媒体信息处理方式",
@@ -230,9 +228,7 @@ IP 归属地插件必须声明 `type: "ip_location"`、`category: "NETWORK"` 和
 
 ```json
 {
-  "url": "https://media.example.invalid/video.mkv",
-  "includeMediaInfo": true,
-  "includeThumbnail": true
+  "url": "https://media.example.invalid/video.mkv"
 }
 ```
 
@@ -255,15 +251,9 @@ IP 归属地插件必须声明 `type: "ip_location"`、`category: "NETWORK"` 和
       "isForced": false,
       "details": {}
     }
-  ],
-  "thumbnailJpegBase64": "/9j/4AAQSkZJRgABAQ..."
+  ]
 }
 ```
-
-`includeMediaInfo` 默认按 `true` 处理以兼容旧调用；`includeThumbnail` 默认关闭。宿主只在
-缩略图缺失且配置允许时传入 `includeThumbnail: true`。插件必须在同一次 FFmpeg 输入会话中
-完成媒体信息读取和 30% 位置的一帧解码；`thumbnailJpegBase64` 只能是受大小限制的 JPEG，
-不得包含完整 URL、认证信息或原始 FFmpeg 输出。
 
 Lux 在发送请求前执行协议、主机和地址策略校验，并在收到结果后再次校验字段数量、大小、索引、枚举和数值范围。插件不得返回完整 URL、认证信息或原始 `ffprobe` JSON。插件错误使用稳定代码，例如
 `MEDIA_PROBE_INVALID_URL`、`MEDIA_PROBE_TIMEOUT`、`MEDIA_PROBE_PROCESS_FAILED` 和
