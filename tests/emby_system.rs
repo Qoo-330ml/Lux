@@ -30,6 +30,13 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
     setup
         .complete("Admin", "Administrator", "correct password")
         .await?;
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('server_name', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("客厅 Lux")
+    .execute(database.pool())
+    .await?;
     let app = app_with_state(AppState::ready(
         config.clone(),
         database.clone(),
@@ -79,7 +86,7 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
         .await?;
     assert_eq!(public.status(), reqwest::StatusCode::OK);
     let public_body: serde_json::Value = public.json().await?;
-    assert_eq!(public_body["ServerName"], "Lux");
+    assert_eq!(public_body["ServerName"], "客厅 Lux");
     assert_eq!(public_body["Version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(public_body["Id"].as_str(), Some(database.server_id()));
     assert!(
@@ -103,6 +110,7 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
         .await?;
     assert_eq!(info.status(), reqwest::StatusCode::OK);
     let info_body: serde_json::Value = info.json().await?;
+    assert_eq!(info_body["ServerName"], "客厅 Lux");
     assert_eq!(info_body["Id"], public_body["Id"]);
     assert!(info_body.get("ProgramDataPath").is_none());
     assert!(info_body.get("InternalMetadataPath").is_none());
@@ -112,6 +120,15 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
         .send()
         .await?;
     assert_eq!(info_with_query_token.status(), reqwest::StatusCode::OK);
+
+    assert_eq!(login_body["User"]["ServerName"], "客厅 Lux");
+    let public_users = client
+        .get(format!("http://{address}/Users/Public"))
+        .send()
+        .await?;
+    assert_eq!(public_users.status(), reqwest::StatusCode::OK);
+    let public_users_body: serde_json::Value = public_users.json().await?;
+    assert_eq!(public_users_body[0]["ServerName"], "客厅 Lux");
 
     for path in ["/System/Ping", "/emby/System/Ping"] {
         let response = client

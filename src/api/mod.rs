@@ -1307,14 +1307,25 @@ async fn emby_danmaku_raw(
     }
 }
 
+async fn current_emby_server_name(state: &AppState) -> String {
+    let Some(database) = state.database.as_ref() else {
+        return DEFAULT_SERVER_NAME.to_owned();
+    };
+    match database.server_name().await {
+        Ok(Some(name)) if !name.trim().is_empty() => name,
+        Ok(_) | Err(_) => DEFAULT_SERVER_NAME.to_owned(),
+    }
+}
+
 async fn emby_public_system_info(State(state): State<AppState>) -> Json<Value> {
     let startup_wizard_completed = match state.setup.as_ref() {
         Some(setup) => setup.status().await.unwrap_or(false),
         None => false,
     };
+    let server_name = current_emby_server_name(&state).await;
     Json(json!({
         "LocalAddress": "",
-        "ServerName": "Lux",
+        "ServerName": server_name,
         "Version": VERSION,
         "Id": state.server_id,
         "StartupWizardCompleted": startup_wizard_completed
@@ -1332,9 +1343,10 @@ async fn emby_system_info(
     if let Err(status) = require_emby_token(&headers, &query, auth, &state).await {
         return status.into_response();
     }
+    let server_name = current_emby_server_name(&state).await;
     Json(json!({
         "LocalAddress": "",
-        "ServerName": "Lux",
+        "ServerName": server_name,
         "Version": VERSION,
         "Id": state.server_id,
         "OperatingSystem": std::env::consts::OS,
@@ -1358,14 +1370,15 @@ async fn emby_ping(
 
 async fn emby_public_users(State(state): State<AppState>) -> Json<Value> {
     let server_id = state.server_id.clone();
-    let Some(auth) = state.emby_auth else {
+    let Some(auth) = state.emby_auth.as_ref() else {
         return Json(json!([]));
     };
+    let server_name = current_emby_server_name(&state).await;
     let users = auth.public_users().await.unwrap_or_default();
     Json(Value::Array(
         users
             .iter()
-            .map(|user| emby_user_json(user, &server_id))
+            .map(|user| emby_user_json(user, &server_id, &server_name))
             .collect(),
     ))
 }
@@ -1383,7 +1396,8 @@ async fn emby_user(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
-    Json(emby_user_json(&user, &state.server_id)).into_response()
+    let server_name = current_emby_server_name(&state).await;
+    Json(emby_user_json(&user, &state.server_id, &server_name)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1436,8 +1450,9 @@ async fn emby_authenticate(
                 }),
             )
             .await;
+            let server_name = current_emby_server_name(&state).await;
             Json(json!({
-                "User": emby_user_json(&result.user, &state.server_id),
+                "User": emby_user_json(&result.user, &state.server_id, &server_name),
                 "SessionInfo": emby_login_session_json(&result, &state.server_id),
                 "AccessToken": result.token,
                 "ServerId": state.server_id
@@ -3837,11 +3852,11 @@ fn emby_stream_type(stream_type: &str) -> &'static str {
     }
 }
 
-fn emby_user_json(user: &UserRecord, server_id: &str) -> Value {
+fn emby_user_json(user: &UserRecord, server_id: &str, server_name: &str) -> Value {
     json!({
         "Id": user.id.to_string(),
         "ServerId": server_id,
-        "ServerName": "Lux",
+        "ServerName": server_name,
         "Name": user.display_name,
         "HasPassword": true,
         "HasConfiguredPassword": true,
