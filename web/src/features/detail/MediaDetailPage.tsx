@@ -8,6 +8,7 @@ import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
 import { MediaInfoPanel } from "./MediaInfoPanel";
 import { MediaCast } from "./MediaCast";
+import { MediaNfoPanel } from "./MediaNfoPanel";
 import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
@@ -93,7 +94,15 @@ export function MediaDetailPage() {
     ? mediaTitle(media)
     : mediaTitle(seriesContext.data ?? media);
   const detailOriginalTitle = media.originalTitle?.trim();
-  const tmdbId = providerId(media.providerIds, "tmdb");
+  const localNfo = media.nfo;
+  const providerIds = { ...localNfo?.providerIds, ...media.providerIds };
+  const tmdbId = providerId(providerIds, "tmdb");
+  const premiereDate = media.premiereDate ?? localNfo?.premiered ?? localNfo?.releaseDate;
+  const rating = media.rating ?? localNfo?.rating;
+  const ratingSource = media.ratingSource ?? (localNfo?.rating != null ? "NFO" : undefined);
+  const runtimeTicks = media.runtimeTicks ?? runtimeTicksFromMinutes(localNfo?.runtime);
+  const status = media.status ?? localNfo?.status;
+  const originalLanguage = media.originalLanguage ?? localNfo?.originalLanguage;
   const detailSubtitle = isSeason
     ? `第 ${media.parentIndexNumber ?? ""} 季`
     : isEpisode
@@ -165,18 +174,18 @@ export function MediaDetailPage() {
               {detailSubtitle ? <p className="lux-detail-subtitle">{detailSubtitle}</p> : null}
             </div>
             <div className="lux-detail-meta">
-              {media.premiereDate
-                ? <span>首播 {media.premiereDate}</span>
+              {premiereDate
+                ? <span>首播 {premiereDate}</span>
                 : media.productionYear
                   ? <span>{media.productionYear}</span>
                   : null}
               {isSeries && media.seasonCount != null ? <span>{media.seasonCount} 季</span> : null}
               {isSeries && media.episodeCount != null ? <span>{media.episodeCount} 集</span> : null}
               {tmdbId ? <span>TMDb {tmdbId}</span> : null}
-              {media.rating != null && Number.isFinite(media.rating)
-                ? <span>{media.ratingSource ? `${media.ratingSource} 评分` : "评分"} {media.rating.toFixed(1)}</span>
+              {rating != null && Number.isFinite(rating)
+                ? <span>{ratingSource ? `${ratingSource} 评分` : "评分"} {rating.toFixed(1)}</span>
                 : null}
-              {runtimeLabel(media.runtimeTicks) ? <span>{runtimeLabel(media.runtimeTicks)}</span> : null}
+              {runtimeLabel(runtimeTicks) ? <span>{runtimeLabel(runtimeTicks)}</span> : null}
               {source?.qualityLabel ? <span>{source.qualityLabel}</span> : null}
             </div>
             <ExpandableOverview overview={media.overview || "暂无简介。"} />
@@ -206,13 +215,14 @@ export function MediaDetailPage() {
           </div>
         </div>
         <MediaCast actors={media.actors ?? []} />
+        <MediaNfoPanel details={localNfo} />
         {source ? (
           <MediaInfoPanel
             source={source}
             itemType={media.itemType}
             lastAirDate={media.lastAirDate}
-            status={media.status}
-            originalLanguage={media.originalLanguage}
+            status={status}
+            originalLanguage={originalLanguage}
           />
         ) : null}
         {isSeries ? (
@@ -233,6 +243,11 @@ export function MediaDetailPage() {
       {editor === "identify" ? <MediaIdentifier item={media} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
     </article>
   );
+}
+
+function runtimeTicksFromMinutes(minutes?: number | null) {
+  if (minutes == null || !Number.isFinite(minutes) || minutes < 0) return undefined;
+  return minutes * 60 * 10_000_000;
 }
 
 function ExpandableOverview({ overview }: { overview: string }) {

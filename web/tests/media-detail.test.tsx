@@ -139,6 +139,70 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-season-rail")).not.toBeNull();
   });
 
+  it("shows rich local NFO details on a movie page", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-1",
+      title: "本地电影",
+      itemType: "MOVIE",
+      nfo: {
+        rating: 8.1,
+        votes: 123,
+        tagline: "大漠路远",
+        premiered: "2026-02-17",
+        releaseDate: "2026-02-20",
+        runtime: 126,
+        status: "Released",
+        originalLanguage: "zh",
+        website: "https://example.com/movie",
+        setName: "镖人",
+        setId: "77",
+        certification: "PG-13",
+        countries: ["中国"],
+        genres: ["动作", "剧情"],
+        studios: ["示例影业"],
+        providerIds: { tmdb: "1462229" },
+        directors: [{ providerId: "18899", name: "导演甲" }],
+        writers: [{ providerId: "19999", name: "编剧甲" }],
+        trailers: ["https://example.com/trailer"],
+      },
+      mediaSources: [{ id: "source-1", sourceKind: "LOCAL_FILE", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/movie-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("大漠路远");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("动作");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("导演甲");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("编剧甲");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("123 票");
+    expect(container.querySelector("a[aria-label=\"官方网站\"]")?.getAttribute("href"))
+      .toBe("https://example.com/movie");
+    expect(container.querySelector("a[aria-label=\"预告片 1\"]")?.getAttribute("href"))
+      .toBe("https://example.com/trailer");
+  });
+
   it("shows landscape episode rows on a season detail", async () => {
     vi.spyOn(api, "item").mockImplementation(async (itemId) => itemId === "season-1"
       ? {

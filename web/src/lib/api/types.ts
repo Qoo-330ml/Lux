@@ -85,6 +85,33 @@ export type MediaActor = {
   imageUrl?: string | null;
 };
 
+export type MediaNfoCredit = {
+  providerId?: string | null;
+  name: string;
+};
+
+export type MediaNfoDetails = {
+  rating?: number | null;
+  votes?: number | null;
+  tagline?: string | null;
+  premiered?: string | null;
+  releaseDate?: string | null;
+  runtime?: number | null;
+  status?: string | null;
+  originalLanguage?: string | null;
+  website?: string | null;
+  setName?: string | null;
+  setId?: string | null;
+  certification?: string | null;
+  countries?: string[];
+  genres?: string[];
+  studios?: string[];
+  providerIds?: Record<string, string> | null;
+  directors?: MediaNfoCredit[];
+  writers?: MediaNfoCredit[];
+  trailers?: string[];
+};
+
 export type MediaItem = {
   id: string;
   title?: string | null;
@@ -107,6 +134,7 @@ export type MediaItem = {
   userData?: UserData;
   mediaSources?: MediaSource[];
   actors?: MediaActor[];
+  nfo?: MediaNfoDetails | null;
   parentId?: string | null;
   seriesId?: string | null;
   indexNumber?: number | null;

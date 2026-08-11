@@ -1,0 +1,89 @@
+import { CalendarDays, ExternalLink, Link2, UsersRound } from "lucide-react";
+import type { MediaNfoCredit, MediaNfoDetails } from "../../lib/api/types";
+
+export function MediaNfoPanel({ details }: { details?: MediaNfoDetails | null }) {
+  if (!details || !hasDetails(details)) return null;
+
+  const tags = [
+    ...(details.genres ?? []).map((value) => ({ label: "类型", value })),
+    ...(details.countries ?? []).map((value) => ({ label: "国家/地区", value })),
+    ...(details.studios ?? []).map((value) => ({ label: "制片公司", value })),
+    ...(details.certification ? [{ label: "分级", value: details.certification }] : []),
+    ...(details.setName ? [{ label: "合集", value: details.setName }] : []),
+  ];
+  const providerIds = Object.entries(details.providerIds ?? {});
+
+  return (
+    <section className="lux-media-nfo" aria-labelledby="media-nfo-heading">
+      <div className="lux-media-nfo-heading">
+        <h2 id="media-nfo-heading">更多信息</h2>
+        <span>来自本地 NFO</span>
+      </div>
+      {details.tagline ? <p className="lux-media-nfo-tagline">“{details.tagline}”</p> : null}
+      <div className="lux-media-nfo-grid">
+        {tags.length ? (
+          <div className="lux-media-nfo-tags" aria-label="本地元数据标签">
+            {tags.map(({ label, value }, index) => <span key={`${label}-${value}-${index}`} title={label}>{value}</span>)}
+          </div>
+        ) : null}
+        <div className="lux-media-nfo-summary">
+          <NfoRow label="投票数" value={details.votes != null ? `${details.votes} 票` : undefined} />
+          <NfoRow label="上映日期" value={details.releaseDate ?? details.premiered} icon={<CalendarDays size={14} />} />
+          <NfoRow label="运行时长" value={details.runtime != null ? `${details.runtime} 分钟` : undefined} />
+          <NfoRow label="状态" value={details.status} />
+        </div>
+        {details.directors?.length ? <CreditRow label="导演" credits={details.directors} /> : null}
+        {details.writers?.length ? <CreditRow label="编剧" credits={details.writers} /> : null}
+        {providerIds.length ? (
+          <NfoRow
+            label="外部 ID"
+            value={providerIds.map(([provider, id]) => `${provider.toUpperCase()} ${id}`).join(" · ")}
+            icon={<Link2 size={14} />}
+          />
+        ) : null}
+      </div>
+      {details.website || details.trailers?.length ? (
+        <div className="lux-media-nfo-links" aria-label="本地 NFO 链接">
+          {details.website && isHttpUrl(details.website) ? (
+            <a href={details.website} target="_blank" rel="noreferrer" aria-label="官方网站">
+              <ExternalLink size={14} /> 官方网站
+            </a>
+          ) : null}
+          {(details.trailers ?? []).filter(isHttpUrl).map((trailer, index) => (
+            <a href={trailer} target="_blank" rel="noreferrer" aria-label={`预告片 ${index + 1}`} key={trailer}>
+              <ExternalLink size={14} /> 预告片 {index + 1}
+            </a>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function CreditRow({ label, credits }: { label: string; credits: MediaNfoCredit[] }) {
+  return (
+    <div className="lux-media-nfo-credit-row">
+      <span><UsersRound size={14} /> {label}</span>
+      <strong>{credits.map((credit) => credit.name).join("、")}</strong>
+    </div>
+  );
+}
+
+function NfoRow({ label, value, icon }: { label: string; value?: string | null; icon?: React.ReactNode }) {
+  if (!value) return null;
+  return <div className="lux-media-nfo-row"><span>{icon}{label}</span><strong>{value}</strong></div>;
+}
+
+function hasDetails(details: MediaNfoDetails) {
+  return Boolean(
+    details.tagline || details.votes != null || details.premiered || details.releaseDate
+      || details.runtime != null || details.status || details.website || details.setName
+      || details.certification || details.genres?.length || details.countries?.length
+      || details.studios?.length || details.directors?.length || details.writers?.length
+      || Object.keys(details.providerIds ?? {}).length || details.trailers?.length,
+  );
+}
+
+function isHttpUrl(value: string) {
+  return value.startsWith("https://") || value.startsWith("http://");
+}
