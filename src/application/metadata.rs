@@ -11,6 +11,7 @@ use tokio::fs;
 
 use crate::{
     application::scanner::compute_file_fingerprint,
+    application::{nfo::parse_movie_nfo_actors, people::PeopleService},
     domain::ids::LibraryId,
     storage::{Database, MediaMetadataUpdate, StorageError},
 };
@@ -613,11 +614,20 @@ impl From<std::io::Error> for NfoError {
 #[derive(Clone)]
 pub struct MetadataEnricher {
     database: Database,
+    people: Option<PeopleService>,
 }
 
 impl MetadataEnricher {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            people: None,
+        }
+    }
+
+    pub fn with_people(mut self, people: PeopleService) -> Self {
+        self.people = Some(people);
+        self
     }
 
     pub async fn enrich_movie_library(
@@ -698,7 +708,22 @@ impl MetadataEnricher {
         } else {
             false
         };
-        if already_checked {
+        let actor_relation_missing = if let Some(people) = &self.people {
+            match people.item_actor_relation_exists(item_id).await {
+                Ok(exists) => !exists,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        %error,
+                        "local actor relation could not be checked; retrying NFO actor sync"
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        if already_checked && !actor_relation_missing {
             report.nfo_skipped = 1;
             return Ok(report);
         }
@@ -722,6 +747,26 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
+        if let Some(people) = &self.people {
+            match parse_movie_nfo_actors(&bytes) {
+                Ok(actors) => {
+                    if let Err(error) = people.persist_item_actors(item_id, "tmdb", &actors).await {
+                        tracing::warn!(
+                            item_id,
+                            %error,
+                            "local NFO actors could not be persisted"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        %error,
+                        "local movie NFO actors could not be parsed"
+                    );
+                }
+            }
+        }
         if let Some(fingerprint) = fingerprint.as_deref()
             && let Some(current) = self.database.find_media_item_metadata(item_id).await?
         {

@@ -5,6 +5,8 @@ use luxd::{
             ImageType, LocalImage, MetadataCandidate, MetadataEnricher, MetadataField,
             MetadataSource, MetadataState, NfoMetadata, find_local_images, parse_nfo,
         },
+        metadata_paths::people_directory,
+        people::PeopleService,
         scanner::LibraryScanner,
     },
     config::Config,
@@ -422,6 +424,61 @@ async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
         .fetch_one(database.pool())
         .await?;
     assert_eq!(image_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_movie_nfo_actors_are_available_without_online_matching_and_reuse_people_image()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Local Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Local.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        r#"<movie><title>本地电影</title><actor><name>演员甲</name><role>角色甲</role><type>Actor</type><tmdbid>9</tmdbid><order>0</order></actor><actor><name>演员乙</name><role>角色乙</role><type>Actor</type><tmdbid>10</tmdbid><order>1</order></actor></movie>"#,
+    )
+    .await?;
+
+    let people_dir = people_directory(&config.config_dir, "演员甲", "tmdb", "9")?;
+    tokio::fs::create_dir_all(&people_dir).await?;
+    tokio::fs::write(people_dir.join("folder.png"), b"person-image").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let people = PeopleService::new(config.config_dir.clone());
+    MetadataEnricher::new(database.clone())
+        .with_people(people.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let actors = people.list_item_actors(&item_id).await?;
+    assert_eq!(actors.len(), 2);
+    assert_eq!(actors[0].name, "演员甲");
+    assert_eq!(
+        actors[0].image_url.as_deref(),
+        Some("/api/v1/people/9/image")
+    );
+    assert_eq!(actors[1].name, "演员乙");
+    assert_eq!(actors[1].image_url, None);
     Ok(())
 }
 

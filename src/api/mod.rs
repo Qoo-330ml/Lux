@@ -222,6 +222,7 @@ impl AppState {
         ));
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
+        let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
         let probe = Some(MediaProbeService::new(
             database.clone(),
             FfprobeRunner::default(),
@@ -235,7 +236,9 @@ impl AppState {
                 Some(covers) => service.with_library_covers(covers),
                 None => service,
             };
-            service.with_strm_probe(strm_probe.clone())
+            service
+                .with_strm_probe(strm_probe.clone())
+                .with_people(people.clone())
         };
         let scheduled_tasks =
             ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone())
@@ -289,10 +292,7 @@ impl AppState {
             scraper_resolver: Some(scraper_resolver),
             tmdb: Some(tmdb),
             collections,
-            people: Some(PeopleService::new_with_proxy(
-                config_dir.clone(),
-                network_proxy_url.clone(),
-            )),
+            people: Some(people),
             user_avatars,
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,

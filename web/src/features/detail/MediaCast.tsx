@@ -1,4 +1,5 @@
 import type { MediaActor } from "../../lib/api/types";
+import { UserRound } from "lucide-react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 
 export function MediaCast({ actors }: { actors: MediaActor[] }) {
@@ -18,7 +19,7 @@ export function MediaCast({ actors }: { actors: MediaActor[] }) {
                 {actor.imageUrl ? (
                   <img src={actor.imageUrl} alt={`${actor.name} 头像`} loading="lazy" />
                 ) : (
-                  <span className="lux-media-cast-initial" aria-hidden="true">{actorInitial(actor.name)}</span>
+                  <UserRound className="lux-media-cast-placeholder-icon" size={34} strokeWidth={1.8} aria-hidden="true" />
                 )}
               </div>
               <strong title={actor.name}>{actor.name}</strong>
@@ -29,8 +30,4 @@ export function MediaCast({ actors }: { actors: MediaActor[] }) {
       </HorizontalScrollRail>
     </section>
   );
-}
-
-function actorInitial(name: string) {
-  return [...name.trim()][0] ?? "?";
 }

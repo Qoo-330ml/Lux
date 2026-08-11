@@ -1795,6 +1795,7 @@ services:
 | LUX-167 | src/application/metadata_objects.rs、src/application/collections.rs、src/api/mod.rs、tests/、docs/ |
 | LUX-168 | src/application/metadata.rs、src/application/nfo.rs、src/application/scraper.rs、src/application/tmdb.rs、src/application/tmdb_plugin.rs、src/application/candidates.rs、src/bin/lux-plugin-tmdb.rs、tests/、docs/ |
 | LUX-169 | plugins/org.lux.tmdb/manifest.json、src/application/plugins.rs、src/application/plugin_store.rs、scripts/package-tmdb-plugin.sh、Dockerfile、tests/、docs/ |
+| LUX-170 | src/application/nfo.rs、src/application/metadata.rs、src/application/people.rs、src/application/scanner.rs、src/api/mod.rs、web/src/features/detail/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3644,6 +3645,30 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 - 不改变插件协议、API Key 优先级、TMDb 请求限流或元数据字段。
 
 依赖：LUX-142、LUX-144、LUX-168。
+
+#### LUX-170：本地电影 NFO 演员回退
+
+范围：在后台本地元数据扫描阶段读取电影 NFO 的直接 `<actor>` 节点，将带有合法
+`tmdbid` 的演员、角色和排序写入统一人物关系快照。详情接口继续只读取人物缓存，不在
+用户请求中解析 NFO；已有统一人物目录或旧人物缓存中的头像按人物 ID 复用，没有头像的演员
+仍保留在详情列表中并由 Web 使用人物图标占位。首版只覆盖电影 `movie.nfo`/同目录 NFO，
+不扩展剧集、季度和单集人物关系。
+
+验收：
+
+- [x] Emby/Kodi 风格的 `<actor><name>/<role>/<tmdbid>/<order>` 节点能在后台解析。
+- [x] 没有在线匹配或刮削候选时，演员仍写入 `metadata/library/.../people.json` 并出现在详情页。
+- [x] 已有 `metadata/people/.../folder.*` 或兼容旧人物头像能复用；没有图片时演员信息不丢失。
+- [x] Web 详情页没有人物图时显示含人物含义的图标占位。
+- [x] NFO 大小、XML 事件数和字段长度继续受现有安全上限保护，详情请求不读取或解析 NFO。
+
+明确不做：
+
+- 不为缺少稳定 provider ID 的 NFO 演员虚构 TMDb ID，也不在线补抓人物资料。
+- 不改变演员去重/跨 provider 身份规则，不增加人物关系数据库表。
+- 不扩展剧集、季度和单集 NFO 演员字段。
+
+依赖：LUX-164、LUX-168。
 
 ## 26. 风险与缓解
 

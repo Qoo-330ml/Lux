@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    io::Cursor,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
 use quick_xml::{
     Writer,
-    escape::escape,
+    escape::{escape, unescape},
     events::{BytesEnd, BytesStart, BytesText, Event},
     reader::Reader,
 };
@@ -56,6 +57,162 @@ pub struct MovieNfoMetadata {
     pub writers: Vec<MovieNfoCredit>,
     pub actors: Vec<ActorCredit>,
     pub trailers: Vec<String>,
+}
+
+const MAX_MOVIE_NFO_BYTES: usize = 1024 * 1024;
+const MAX_MOVIE_NFO_EVENTS: usize = 20_000;
+const MAX_MOVIE_NFO_ACTORS: usize = 30;
+const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;
+
+/// Reads the direct `<actor>` nodes used by Emby/Kodi movie NFO files.
+///
+/// This intentionally only extracts the actor fields needed by the people
+/// cache. The caller can run it during background metadata enrichment without
+/// asking the detail endpoint to parse an untrusted XML document.
+pub fn parse_movie_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError> {
+    if bytes.len() > MAX_MOVIE_NFO_BYTES {
+        return Err(NfoError::TooLarge);
+    }
+
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut actors = Vec::new();
+    let mut actor_depth = None;
+    let mut current_field = None;
+    let mut current_actor = None;
+    let mut depth = 0_usize;
+    let mut event_count = 0_usize;
+
+    loop {
+        event_count += 1;
+        if event_count > MAX_MOVIE_NFO_EVENTS {
+            return Err(NfoError::TooManyEvents);
+        }
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Eof) => {
+                if depth != 0 {
+                    return Err(NfoError::Unbalanced);
+                }
+                break;
+            }
+            Ok(Event::Start(event)) => {
+                depth = depth.saturating_add(1);
+                if depth == 2 && event.name().as_ref() == b"actor" {
+                    actor_depth = Some(depth);
+                    current_actor = Some(ParsedMovieActor::default());
+                    current_field = None;
+                } else if actor_depth == Some(depth.saturating_sub(1)) {
+                    current_field = movie_actor_field(event.name().as_ref());
+                }
+            }
+            Ok(Event::Empty(_event)) => {
+                if actor_depth == Some(depth.saturating_sub(1)) {
+                    current_field = None;
+                }
+            }
+            Ok(Event::Text(event)) => {
+                if let (Some(actor), Some(field)) = (current_actor.as_mut(), current_field) {
+                    let decoded = event
+                        .decode()
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    let value = unescape(decoded.as_ref())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .trim()
+                        .to_owned();
+                    assign_movie_actor_field(actor, field, value)?;
+                }
+            }
+            Ok(Event::CData(event)) => {
+                if let (Some(actor), Some(field)) = (current_actor.as_mut(), current_field) {
+                    let value = event
+                        .decode()
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .trim()
+                        .to_owned();
+                    assign_movie_actor_field(actor, field, value)?;
+                }
+            }
+            Ok(Event::End(event)) => {
+                if actor_depth == Some(depth) && event.name().as_ref() == b"actor" {
+                    if let Some(actor) = current_actor.take()
+                        && let (Some(id), Some(name)) = (actor.tmdb_id, actor.name)
+                        && !id.trim().is_empty()
+                        && !name.trim().is_empty()
+                        && actors.len() < MAX_MOVIE_NFO_ACTORS
+                    {
+                        actors.push(ActorCredit {
+                            id,
+                            name,
+                            character: actor.role,
+                            order: actor.order,
+                            profile_url: None,
+                        });
+                    }
+                    actor_depth = None;
+                    current_field = None;
+                } else if actor_depth == Some(depth.saturating_sub(1)) {
+                    current_field = None;
+                }
+                if depth == 0 {
+                    return Err(NfoError::Unbalanced);
+                }
+                depth -= 1;
+            }
+            Ok(Event::DocType(_)) => return Err(NfoError::DocTypeNotAllowed),
+            Ok(_) => {}
+            Err(error) => return Err(NfoError::Xml(error.to_string())),
+        }
+        buffer.clear();
+    }
+
+    Ok(actors)
+}
+
+#[derive(Default)]
+struct ParsedMovieActor {
+    name: Option<String>,
+    role: Option<String>,
+    tmdb_id: Option<String>,
+    order: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+enum MovieActorField {
+    Name,
+    Role,
+    TmdbId,
+    Order,
+}
+
+fn movie_actor_field(tag: &[u8]) -> Option<MovieActorField> {
+    match tag {
+        b"name" => Some(MovieActorField::Name),
+        b"role" | b"character" => Some(MovieActorField::Role),
+        b"tmdbid" => Some(MovieActorField::TmdbId),
+        b"order" => Some(MovieActorField::Order),
+        _ => None,
+    }
+}
+
+fn assign_movie_actor_field(
+    actor: &mut ParsedMovieActor,
+    field: MovieActorField,
+    value: String,
+) -> Result<(), NfoError> {
+    if value.len() > MAX_MOVIE_ACTOR_FIELD_BYTES {
+        return Err(NfoError::FieldTooLarge);
+    }
+    if value.is_empty() {
+        return Ok(());
+    }
+    match field {
+        MovieActorField::Name => actor.name = Some(value),
+        MovieActorField::Role => actor.role = Some(value),
+        MovieActorField::TmdbId => actor.tmdb_id = Some(value),
+        MovieActorField::Order => actor.order = value.parse::<i32>().ok(),
+    }
+    Ok(())
 }
 
 pub fn rewrite_nfo(original: &[u8], patch: &NfoMetadata) -> Result<Vec<u8>, NfoWriteError> {

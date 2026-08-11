@@ -23,6 +23,7 @@ use crate::{
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
         media_matching::{MediaKind, clean_title, has_multi_part_marker, parse_media_name},
         metadata::MetadataEnricher,
+        people::PeopleService,
         probe::MediaProbeService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
         strm_probe::StrmProbeService,
@@ -1258,6 +1259,7 @@ pub struct ScanJobService {
     scan_lock: Arc<Semaphore>,
     library_covers: Option<LibraryCoverService>,
     strm_probe: Option<StrmProbeService>,
+    people: Option<PeopleService>,
     resources: ResourceMetrics,
 }
 
@@ -1277,6 +1279,7 @@ impl ScanJobService {
             scan_lock: Arc::new(Semaphore::new(1)),
             library_covers: None,
             strm_probe: None,
+            people: None,
             resources: ResourceMetrics::new(),
         }
     }
@@ -1298,6 +1301,11 @@ impl ScanJobService {
 
     pub fn with_strm_probe(mut self, strm_probe: StrmProbeService) -> Self {
         self.strm_probe = Some(strm_probe);
+        self
+    }
+
+    pub fn with_people(mut self, people: PeopleService) -> Self {
+        self.people = Some(people);
         self
     }
 
@@ -2647,7 +2655,10 @@ impl ScanJobService {
             tracing::warn!(job_id, library_id = %job.library_id, "local metadata enrichment skipped for invalid library ID");
             return Ok(());
         };
-        let enricher = MetadataEnricher::new(self.database.clone());
+        let enricher = match self.people.clone() {
+            Some(people) => MetadataEnricher::new(self.database.clone()).with_people(people),
+            None => MetadataEnricher::new(self.database.clone()),
+        };
         let result = match library.kind.as_str() {
             "MOVIE" => enricher.enrich_movie_library(library_id).await,
             "SERIES" => enricher.enrich_series_library(library_id).await,

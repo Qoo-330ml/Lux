@@ -186,6 +186,20 @@ impl PeopleService {
         Ok(stored.len())
     }
 
+    pub async fn item_actor_relation_exists(&self, item_id: &str) -> Result<bool, PeopleError> {
+        let new_path = library_item_directory(&self.config_dir, item_id)
+            .map_err(PeopleError::from)?
+            .join("people.json");
+        if read_people_file(&new_path).await?.is_some() {
+            return Ok(true);
+        }
+        let legacy_path = self
+            .legacy_people_dir()
+            .join(LEGACY_ITEMS_DIR)
+            .join(format!("{item_id}.json"));
+        Ok(read_people_file(&legacy_path).await?.is_some())
+    }
+
     pub async fn list_item_actors(&self, item_id: &str) -> Result<Vec<ActorView>, PeopleError> {
         let new_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
@@ -215,12 +229,11 @@ impl PeopleService {
             .filter(|actor| is_valid_person_id(&actor.id) && !actor.name.trim().is_empty())
         {
             let id = actor.id;
-            let image_url =
-                if actor.image_file.is_some() && self.profile_image(&id).await?.is_some() {
-                    Some(format!("/api/v1/people/{id}/image"))
-                } else {
-                    None
-                };
+            let image_url = self
+                .profile_image(&id)
+                .await?
+                .is_some()
+                .then(|| format!("/api/v1/people/{id}/image"));
             views.push(ActorView {
                 id,
                 name: actor.name,

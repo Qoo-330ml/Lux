@@ -15,6 +15,7 @@ use luxd::{
         libraries::LibraryService,
         metadata::MetadataEnricher,
         metadata_paths::{library_item_directory, people_directory},
+        people::PeopleService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
         setup::SetupService,
@@ -328,6 +329,48 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
             .and_then(|value| value.to_str().ok()),
         Some("image/png")
     );
+
+    lux_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_nfo_cast_is_exposed_by_detail_api_without_selection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    tokio::fs::write(
+        fixture.movie_dir.join("movie.nfo"),
+        r#"<movie><title>本地演员电影</title><actor><name>演员甲</name><role>角色甲</role><type>Actor</type><tmdbid>9</tmdbid><order>0</order></actor><actor><name>演员乙</name><role>角色乙</role><type>Actor</type><tmdbid>10</tmdbid><order>1</order></actor></movie>"#,
+    )
+    .await?;
+    let person_dir = people_directory(&fixture.config.config_dir, "演员甲", "tmdb", "9")?;
+    tokio::fs::create_dir_all(&person_dir).await?;
+    tokio::fs::write(person_dir.join("folder.png"), PNG_1X1).await?;
+
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    let people = PeopleService::new(fixture.config.config_dir.clone());
+    MetadataEnricher::new(fixture.database.clone())
+        .with_people(people)
+        .enrich_movie_library(library_id.parse()?)
+        .await?;
+
+    let (base_url, lux_server) = start_lux(&fixture).await?;
+    let client = reqwest::Client::new();
+    let (cookies, _) = login(&client, &base_url).await?;
+    let detail = client
+        .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let body: Value = detail.json().await?;
+    assert_eq!(body["actors"][0]["name"], "演员甲");
+    assert_eq!(body["actors"][0]["imageUrl"], "/api/v1/people/9/image");
+    assert_eq!(body["actors"][1]["name"], "演员乙");
+    assert!(body["actors"][1]["imageUrl"].is_null());
 
     lux_server.abort();
     Ok(())

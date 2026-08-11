@@ -3,8 +3,8 @@ use luxd::{
         libraries::LibraryService,
         metadata::NfoMetadata,
         nfo::{
-            MovieNfoCredit, MovieNfoMetadata, NfoWriteService, rewrite_movie_nfo, rewrite_nfo,
-            write_nfo_atomically,
+            MovieNfoCredit, MovieNfoMetadata, NfoWriteService, parse_movie_nfo_actors,
+            rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
         },
         people::ActorCredit,
         scanner::LibraryScanner,
@@ -167,6 +167,21 @@ fn movie_nfo_rewrite_keeps_existing_rich_fields_when_patch_is_partial()
     assert!(text.contains("<genre>旧类型</genre>"));
     assert!(text.contains("<name>旧演员</name>"));
     Ok(())
+}
+
+#[test]
+fn movie_nfo_parser_reads_emby_actor_nodes_without_online_metadata() {
+    let actors = parse_movie_nfo_actors(
+        r#"<movie><title>本地电影</title><actor><name>演员甲</name><role>角色甲</role><type>Actor</type><tmdbid>9</tmdbid><order>0</order></actor><actor><name>演员乙</name><role>角色乙</role><type>Actor</type><tmdbid>10</tmdbid><order>1</order></actor></movie>"#
+            .as_bytes(),
+    )
+    .expect("valid actor nodes");
+
+    assert_eq!(actors.len(), 2);
+    assert_eq!(actors[0].id, "9");
+    assert_eq!(actors[0].name, "演员甲");
+    assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
+    assert_eq!(actors[1].order, Some(1));
 }
 
 #[tokio::test]

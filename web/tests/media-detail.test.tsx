@@ -343,7 +343,7 @@ describe("MediaDetailPage series hierarchy", () => {
       .toContain("/api/v1/people/9/image");
     expect(cast?.textContent).toContain("演员甲");
     expect(cast?.textContent).toContain("角色甲");
-    expect(cast?.querySelector(".lux-media-cast-initial")?.textContent).toBe("演");
+    expect(cast?.querySelector(".lux-media-cast-placeholder-icon")).not.toBeNull();
   });
 
   it("opens the complete overview from the three-line summary", async () => {
