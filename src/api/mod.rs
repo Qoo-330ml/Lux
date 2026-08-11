@@ -2524,8 +2524,13 @@ fn emby_query_targets_user_root_views(query: &EmbyItemsQuery, root_id: &str) -> 
             )
         })
     });
+    let requests_filmly_home_views = query.parent_id.is_none()
+        && query.include_item_types.is_none()
+        && query.recursive != Some(true)
+        && query.exclude_item_types.is_some();
     (parent_is_root && (query.include_item_types.is_none() || requests_folder_views))
         || (query.parent_id.is_none() && requests_folder_views)
+        || requests_filmly_home_views
 }
 
 async fn emby_catalog_page_from_query(
@@ -3776,6 +3781,7 @@ fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count:
         "MediaType": "Video",
         "CollectionType": emby_collection_type(library.kind),
         "ChildCount": child_count,
+        "RecursiveItemCount": child_count,
         "PrimaryImageItemId": library.cover_image_tag.as_ref().map(|_| library.id.to_string()),
         "PrimaryImageTag": library.cover_image_tag,
         "ImageTags": library

@@ -240,11 +240,13 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
             .as_array()
             .is_some_and(|items| {
                 !items.is_empty()
+                    && items.iter().all(|item| item["Type"] == "CollectionFolder")
                     && items
                         .iter()
-                        .all(|item| matches!(item["Type"].as_str(), Some("Movie" | "Series")))
-                    && items.iter().all(|item| item["CanDownload"].is_boolean())
-                    && items.iter().all(|item| item["Chapters"].is_array())
+                        .all(|item| item["Id"] == library.id.to_string())
+                    && items
+                        .iter()
+                        .all(|item| item["RecursiveItemCount"] == item["ChildCount"])
             })
     );
 
