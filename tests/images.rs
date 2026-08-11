@@ -1,8 +1,8 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        libraries::LibraryService, metadata::MetadataEnricher, scanner::LibraryScanner,
-        setup::SetupService,
+        libraries::LibraryService, metadata::MetadataEnricher,
+        metadata_paths::library_item_directory, scanner::LibraryScanner, setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -61,6 +61,7 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
 
     let outside_path = temp_dir.path().join("outside.jpg");
     tokio::fs::write(&outside_path, b"outside").await?;
+    let config_dir = config.config_dir.clone();
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
@@ -251,6 +252,42 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     );
     assert_eq!(emby_logo.bytes().await?, "logo-bytes".as_bytes());
 
+    let metadata_item_dir = library_item_directory(&config_dir, &item_id)?;
+    tokio::fs::create_dir_all(&metadata_item_dir).await?;
+    let managed_poster = metadata_item_dir.join("poster.png");
+    tokio::fs::write(&managed_poster, b"managed-poster-bytes").await?;
+    sqlx::query("UPDATE item_images SET local_path = ? WHERE id = ?")
+        .bind(managed_poster.to_str().ok_or("non-utf8 path")?)
+        .bind(&image_id)
+        .execute(database.pool())
+        .await?;
+
+    let managed_lux_image = client
+        .get(format!("{base_url}/api/v1/items/{item_id}/images/poster"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(managed_lux_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        managed_lux_image.headers().get("content-type").unwrap(),
+        "image/png"
+    );
+    assert_eq!(
+        managed_lux_image.bytes().await?,
+        b"managed-poster-bytes".as_slice()
+    );
+
+    let managed_emby_image = client
+        .get(format!("{base_url}/Items/{item_id}/Images/Primary"))
+        .header("X-Emby-Token", &emby_token)
+        .send()
+        .await?;
+    assert_eq!(managed_emby_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        managed_emby_image.bytes().await?,
+        b"managed-poster-bytes".as_slice()
+    );
+
     let missing = client
         .get(format!("{base_url}/Items/{item_id}/Images/Backdrop"))
         .header("X-Emby-Token", &emby_token)
@@ -270,12 +307,7 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
 
     sqlx::query("UPDATE item_images SET local_path = ? WHERE id = ?")
-        .bind(
-            movie_dir
-                .join("poster.jpg")
-                .to_str()
-                .ok_or("non-utf8 path")?,
-        )
+        .bind(managed_poster.to_str().ok_or("non-utf8 path")?)
         .bind(&image_id)
         .execute(database.pool())
         .await?;
@@ -310,7 +342,8 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
         .send()
         .await?;
     assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
-    assert!(!movie_dir.join("poster.jpg").exists());
+    assert!(!managed_poster.exists());
+    assert!(movie_dir.join("poster.jpg").exists());
     let after_delete = client
         .get(format!("{base_url}/api/v1/items/{item_id}/images/poster"))
         .header(COOKIE, &cookies)

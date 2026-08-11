@@ -97,9 +97,24 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     let nfo = tokio::fs::read_to_string(&fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<title>本地标题</title>"));
     assert!(nfo.contains("<plot>Online Overview</plot>"));
-    assert!(fixture.movie_dir.join("poster.png").exists());
-    assert!(fixture.movie_dir.join("fanart.webp").exists());
-    assert_eq!(tokio::fs::read(&fallback_path).await?, PNG_1X1);
+    let metadata_item_dir = tokio::fs::canonicalize(library_item_directory(
+        &fixture.config.config_dir,
+        &item_id,
+    )?)
+    .await?;
+    assert_eq!(
+        tokio::fs::read(metadata_item_dir.join("poster.png")).await?,
+        PNG_1X1
+    );
+    assert_eq!(
+        tokio::fs::read(metadata_item_dir.join("fanart.webp")).await?,
+        b"RIFF\x04\x00\x00\x00WEBP"
+    );
+    assert_eq!(
+        tokio::fs::read(metadata_item_dir.join("thumb.png")).await?,
+        PNG_1X1
+    );
+    assert_eq!(tokio::fs::read(&fallback_path).await?, b"ffmpeg-fallback");
     let status: String =
         sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
             .bind(&item_id)

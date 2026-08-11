@@ -6,6 +6,7 @@ use luxd::{
     application::{
         images::{ImageDownloadConfig, ImageWriteError, ImageWriteService, write_image_atomically},
         libraries::LibraryService,
+        metadata_paths::library_item_directory,
         scanner::LibraryScanner,
     },
     config::Config,
@@ -92,6 +93,89 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
 
     server.abort();
     let _ = root;
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_managed_images_use_the_metadata_library_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, root, _movie_dir) = prepared_movie().await?;
+    let config_dir = root.join("config");
+    let app = Router::new().route(
+        "/poster",
+        get(|| async {
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(PNG_1X1.to_vec()))
+                .expect("test image response should be valid")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let service = ImageWriteService::new_with_config_dir(database.clone(), config_dir.clone())?;
+    let report = service
+        .download_item_image(&item_id, "poster", &format!("http://{address}/poster"))
+        .await?;
+    let expected = tokio::fs::canonicalize(library_item_directory(&config_dir, &item_id)?)
+        .await?
+        .join("poster.png");
+    assert_eq!(report.path, expected);
+    let canonical_metadata_root = tokio::fs::canonicalize(config_dir.join("metadata")).await?;
+    assert!(report.path.starts_with(canonical_metadata_root));
+    assert_eq!(tokio::fs::read(&report.path).await?, PNG_1X1);
+
+    let indexed: String =
+        sqlx::query_scalar("SELECT local_path FROM item_images WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(indexed, report.path.to_string_lossy());
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &format!("http://{address}/poster"))
+            .await?
+            .is_none()
+    );
+    server.abort();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_managed_image_writes_reject_metadata_parent_symlinks()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let (database, item_id, root, _movie_dir) = prepared_movie().await?;
+    let config_dir = root.join("config");
+    tokio::fs::create_dir_all(&config_dir).await?;
+    let external_metadata = root.join("external-metadata");
+    tokio::fs::create_dir_all(&external_metadata).await?;
+    symlink(&external_metadata, config_dir.join("metadata"))?;
+
+    let app = Router::new().route(
+        "/poster",
+        get(|| async {
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(PNG_1X1.to_vec()))
+                .expect("test image response should be valid")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let service = ImageWriteService::new_with_config_dir(database, config_dir)?;
+    let error = service
+        .download_item_image(&item_id, "poster", &format!("http://{address}/poster"))
+        .await
+        .expect_err("metadata symlink should be rejected");
+    assert!(matches!(error, ImageWriteError::SymlinkTarget(_)));
+    assert!(!external_metadata.join("library").exists());
+    server.abort();
     Ok(())
 }
 

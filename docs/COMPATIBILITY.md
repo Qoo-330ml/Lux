@@ -39,6 +39,7 @@
 - LUX-091 下载回归已覆盖 Lux/Emby 的 GET/HEAD 单资源响应、Range/文件名响应，以及 `.strm` 远程资源流式转发；尚未完成第三方客户端的真实下载 UI 实测，因此不据此宣称 Infuse、VidHub 或 SenPlayer 下载兼容。
 - LUX-160 通用 `.strm` 解析回归已覆盖路径目标的 `PlaybackInfo` Lux 入口、受监督解析器 RPC 和 307 转发；尚未完成目标客户端现场配置与播放实测，不据此宣称客户端兼容。
 - LUX-151 IP 归属地只扩展 Lux 管理员 Web 仪表盘的 `nowPlaying` 数据，不改变 VidHub、SenPlayer 或 Infuse 的 Emby 兼容接口；Hiofd 出站可用性和归属地准确性尚未做目标 NAS 现场验证。
+- LUX-165 图片资源布局回归：Rust 集成测试已验证新下载图片写入 `/config/metadata/library/<shard>/<item-id>/`，Lux/Emby 图片端点可读取该路径，媒体目录本地图片仍可读取，且删除仅允许两类受保护根目录；这属于服务端协议回归，不替代 VidHub、SenPlayer 或 Infuse 的真实客户端复测。
 
 ## LUX-025 本机探针进度（2026-08-02）
 

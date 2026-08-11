@@ -16,6 +16,7 @@ use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
     application::{
         metadata::series_directory,
+        metadata_paths::{library_item_directory, metadata_root},
         scraper::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperResolver,
         },
@@ -48,31 +49,58 @@ pub struct ImageWriteService {
     database: Database,
     http: Client,
     max_bytes: u64,
+    config_dir: Option<PathBuf>,
 }
 
 impl ImageWriteService {
     pub fn new(database: Database) -> Result<Self, ImageWriteError> {
-        Self::with_config(database, ImageDownloadConfig::default())
+        Self::with_proxy_config(database, ImageDownloadConfig::default(), None, None)
     }
 
     pub fn new_with_proxy(
         database: Database,
         proxy_url: Option<String>,
     ) -> Result<Self, ImageWriteError> {
-        Self::with_proxy_config(database, ImageDownloadConfig::default(), proxy_url)
+        Self::with_proxy_config(database, ImageDownloadConfig::default(), proxy_url, None)
+    }
+
+    pub fn new_with_config_dir(
+        database: Database,
+        config_dir: PathBuf,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config(
+            database,
+            ImageDownloadConfig::default(),
+            None,
+            Some(config_dir),
+        )
+    }
+
+    pub fn new_with_proxy_and_config_dir(
+        database: Database,
+        config_dir: PathBuf,
+        proxy_url: Option<String>,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config(
+            database,
+            ImageDownloadConfig::default(),
+            proxy_url,
+            Some(config_dir),
+        )
     }
 
     pub fn with_config(
         database: Database,
         config: ImageDownloadConfig,
     ) -> Result<Self, ImageWriteError> {
-        Self::with_proxy_config(database, config, None)
+        Self::with_proxy_config(database, config, None, None)
     }
 
     fn with_proxy_config(
         database: Database,
         config: ImageDownloadConfig,
         proxy_url: Option<String>,
+        config_dir: Option<PathBuf>,
     ) -> Result<Self, ImageWriteError> {
         if config.max_bytes == 0 {
             return Err(ImageWriteError::InvalidConfiguration(
@@ -88,6 +116,7 @@ impl ImageWriteService {
             database,
             http,
             max_bytes: config.max_bytes,
+            config_dir,
         })
     }
 
@@ -149,18 +178,6 @@ impl ImageWriteService {
             .find_item_image(item_id, image_id)
             .await?
             .ok_or(ImageWriteError::ItemNotFound)?;
-        let Some(root_path) = image.root_path.as_deref() else {
-            return Err(ImageWriteError::PathOutsideRoot(PathBuf::from(
-                &image.local_path,
-            )));
-        };
-        let canonical_root =
-            fs::canonicalize(root_path)
-                .await
-                .map_err(|source| ImageWriteError::Io {
-                    path: PathBuf::from(root_path),
-                    source,
-                })?;
         let path = PathBuf::from(&image.local_path);
         if let Ok(metadata) = fs::symlink_metadata(&path).await {
             if metadata.file_type().is_symlink() {
@@ -173,7 +190,23 @@ impl ImageWriteService {
                         path: path.clone(),
                         source,
                     })?;
-            if !canonical_path.starts_with(&canonical_root) || canonical_path == canonical_root {
+            let in_metadata = if let Some(config_dir) = self.config_dir.as_ref() {
+                fs::canonicalize(metadata_root(config_dir))
+                    .await
+                    .map(|root| canonical_path.starts_with(&root) && canonical_path != root)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            let in_media_root = if let Some(root_path) = image.root_path.as_deref() {
+                fs::canonicalize(root_path)
+                    .await
+                    .map(|root| canonical_path.starts_with(&root) && canonical_path != root)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if !in_metadata && !in_media_root {
                 return Err(ImageWriteError::PathOutsideRoot(canonical_path));
             }
             fs::remove_file(&canonical_path)
@@ -196,6 +229,13 @@ impl ImageWriteService {
     ) -> Result<bool, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        if let Some(config_dir) = self.config_dir.as_ref()
+            && self
+                .metadata_image_exists(config_dir, item_id, image_type)
+                .await?
+        {
+            return Ok(true);
+        }
         let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
         let Some(path) = find_any_image_path(
             &directory,
@@ -208,6 +248,35 @@ impl ImageWriteService {
             return Ok(false);
         };
         image_file_stamp(&path).await.map(|_| true)
+    }
+
+    async fn metadata_image_exists(
+        &self,
+        config_dir: &Path,
+        item_id: &str,
+        image_type: &str,
+    ) -> Result<bool, ImageWriteError> {
+        let directory = library_item_directory(config_dir, item_id)
+            .map_err(|error| ImageWriteError::InvalidConfiguration(error.to_string()))?;
+        reject_metadata_symlinks(&directory).await?;
+        let metadata = match fs::symlink_metadata(&directory).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(image_io_error(&directory, source)),
+        };
+        if !metadata.is_dir() {
+            return Err(ImageWriteError::Io {
+                path: directory,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "metadata item path is not a directory",
+                ),
+            });
+        }
+        let Some(path) = find_any_image_path(&directory, image_type, None, None).await? else {
+            return Ok(false);
+        };
+        image_file_stamp(&path).await.map(|stamp| stamp.is_some())
     }
 
     pub(crate) async fn has_local_image(
@@ -299,7 +368,19 @@ impl ImageWriteService {
         }
         validate_image_payload(format, &body)?;
 
-        let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let (root, directory, movie_stem, episode_stem) = if let Some(config_dir) =
+            self.config_dir.as_ref()
+        {
+            let root = metadata_root(config_dir);
+            let directory = self.metadata_image_directory(config_dir, item_id).await?;
+            let canonical_root = fs::canonicalize(&root)
+                .await
+                .map_err(|source| image_io_error(&root, source))?;
+            (canonical_root, directory, None, None)
+        } else {
+            let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+            (root, directory, movie_stem, episode_stem)
+        };
         let target = image_target(
             &directory,
             image_type,
@@ -338,6 +419,31 @@ impl ImageWriteService {
             file_size,
             content_tag,
         })
+    }
+
+    async fn metadata_image_directory(
+        &self,
+        config_dir: &Path,
+        item_id: &str,
+    ) -> Result<PathBuf, ImageWriteError> {
+        let root = metadata_root(config_dir);
+        let directory = library_item_directory(config_dir, item_id)
+            .map_err(|error| ImageWriteError::InvalidConfiguration(error.to_string()))?;
+        reject_metadata_symlinks(&root).await?;
+        fs::create_dir_all(&directory)
+            .await
+            .map_err(|source| image_io_error(&directory, source))?;
+        reject_metadata_symlinks(&directory).await?;
+        let canonical_root = fs::canonicalize(&root)
+            .await
+            .map_err(|source| image_io_error(&root, source))?;
+        let canonical_directory = fs::canonicalize(&directory)
+            .await
+            .map_err(|source| image_io_error(&directory, source))?;
+        if !canonical_directory.starts_with(&canonical_root) {
+            return Err(ImageWriteError::PathOutsideRoot(canonical_directory));
+        }
+        Ok(canonical_directory)
     }
 
     pub async fn download_item_image_from_tmdb_candidate(
@@ -1003,6 +1109,32 @@ async fn image_file_stamp(path: &Path) -> Result<Option<ImageFileStamp>, ImageWr
     }))
 }
 
+async fn reject_metadata_symlinks(path: &Path) -> Result<(), ImageWriteError> {
+    let mut current = Some(path.to_owned());
+    while let Some(candidate) = current {
+        match fs::symlink_metadata(&candidate).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ImageWriteError::SymlinkTarget(candidate));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ImageWriteError::Io {
+                    path: candidate,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "metadata path component is not a directory",
+                    ),
+                });
+            }
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = candidate.parent().map(Path::to_owned);
+            }
+            Err(source) => return Err(image_io_error(&candidate, source)),
+        }
+    }
+    Ok(())
+}
+
 fn content_tag(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -1021,11 +1153,16 @@ fn image_io_error(path: &Path, source: std::io::Error) -> ImageWriteError {
 pub struct ImageService {
     database: Database,
     access: MediaAccessService,
+    config_dir: PathBuf,
 }
 
 impl ImageService {
-    pub fn new(database: Database, access: MediaAccessService) -> Self {
-        Self { database, access }
+    pub fn new(database: Database, access: MediaAccessService, config_dir: PathBuf) -> Self {
+        Self {
+            database,
+            access,
+            config_dir,
+        }
     }
 
     pub async fn resolve(
@@ -1083,6 +1220,7 @@ impl ImageService {
             return Ok(None);
         }
 
+        let metadata_root = fs::canonicalize(metadata_root(&self.config_dir)).await.ok();
         let mut saw_outside_root = false;
         for candidate in candidates {
             let path = PathBuf::from(&candidate.local_path);
@@ -1092,7 +1230,12 @@ impl ImageService {
             let Ok(canonical_root) = fs::canonicalize(&candidate.root_path).await else {
                 continue;
             };
-            if !canonical_path.starts_with(&canonical_root) || canonical_path == canonical_root {
+            let in_media_root =
+                canonical_path.starts_with(&canonical_root) && canonical_path != canonical_root;
+            let in_metadata_root = metadata_root
+                .as_ref()
+                .is_some_and(|root| canonical_path.starts_with(root) && canonical_path != *root);
+            if !in_media_root && !in_metadata_root {
                 saw_outside_root = true;
                 continue;
             }
@@ -1192,7 +1335,7 @@ pub enum ImageError {
 impl fmt::Display for ImageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Forbidden => formatter.write_str("image path is outside the media root"),
+            Self::Forbidden => formatter.write_str("image path is outside the allowed image roots"),
             Self::TooLarge { path, size } => {
                 write!(
                     formatter,
@@ -1290,7 +1433,7 @@ impl fmt::Display for ImageWriteError {
             Self::PathOutsideRoot(path) => {
                 write!(
                     formatter,
-                    "image path '{}' is outside the media root",
+                    "image path '{}' is outside the allowed image roots",
                     path.display()
                 )
             }

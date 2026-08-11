@@ -37,6 +37,7 @@ const SMILEY_SANS_FONT: &[u8] = include_bytes!("../../assets/fonts/SmileySans-Ob
 pub struct LibraryCoverService {
     database: Database,
     directory: PathBuf,
+    metadata_directory: Option<PathBuf>,
     font_path: Option<PathBuf>,
     generation_lock: std::sync::Arc<Semaphore>,
 }
@@ -46,6 +47,7 @@ impl LibraryCoverService {
         Self {
             database,
             directory,
+            metadata_directory: None,
             font_path: configured_cover_font(),
             generation_lock: std::sync::Arc::new(Semaphore::new(1)),
         }
@@ -53,6 +55,11 @@ impl LibraryCoverService {
 
     pub fn with_font_path(mut self, font_path: impl Into<PathBuf>) -> Self {
         self.font_path = Some(font_path.into());
+        self
+    }
+
+    pub fn with_metadata_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.metadata_directory = Some(directory.into());
         self
     }
 
@@ -177,6 +184,10 @@ impl LibraryCoverService {
             .database
             .list_random_library_poster_paths(library_id, AUTO_LIBRARY_COVER_CANDIDATE_LIMIT)
             .await?;
+        let metadata_root = match self.metadata_directory.as_ref() {
+            Some(directory) => fs::canonicalize(directory).await.ok(),
+            None => None,
+        };
         let mut poster_bytes = Vec::with_capacity(AUTO_LIBRARY_COVER_POSTER_COUNT);
         let mut seen_items = HashSet::new();
         for candidate in candidates {
@@ -189,7 +200,11 @@ impl LibraryCoverService {
             let Ok(poster_path) = fs::canonicalize(&candidate.local_path).await else {
                 continue;
             };
-            if poster_path == root_path || !poster_path.starts_with(&root_path) {
+            let in_media_root = poster_path != root_path && poster_path.starts_with(&root_path);
+            let in_metadata_root = metadata_root
+                .as_ref()
+                .is_some_and(|root| poster_path != root.as_path() && poster_path.starts_with(root));
+            if !in_media_root && !in_metadata_root {
                 continue;
             }
             let Ok(bytes) = fs::read(&poster_path).await else {

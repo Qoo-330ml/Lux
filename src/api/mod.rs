@@ -177,12 +177,16 @@ impl AppState {
         ));
         let admin_events = AdminEventHub::new();
         let access = MediaAccessService::new(database.clone());
-        let image_writes =
-            ImageWriteService::new_with_proxy(database.clone(), network_proxy_url.clone()).ok();
-        let library_covers = Some(LibraryCoverService::new(
+        let image_writes = ImageWriteService::new_with_proxy_and_config_dir(
             database.clone(),
-            config.config_dir.join("library-covers"),
-        ));
+            config.config_dir.clone(),
+            network_proxy_url.clone(),
+        )
+        .ok();
+        let library_covers = Some(
+            LibraryCoverService::new(database.clone(), config.config_dir.join("library-covers"))
+                .with_metadata_directory(config.config_dir.join("metadata")),
+        );
         let metadata_selection = image_writes.clone().map(|images| {
             MetadataSelectionService::with_config_dir(database.clone(), images, config_dir.clone())
         });
@@ -249,7 +253,11 @@ impl AppState {
             emby_auth: Some(emby_auth),
             libraries: Some(LibraryService::new(database.clone())),
             catalog: Some(CatalogService::new(database.clone(), access.clone())),
-            images: Some(ImageService::new(database.clone(), access.clone())),
+            images: Some(ImageService::new(
+                database.clone(),
+                access.clone(),
+                config.config_dir.clone(),
+            )),
             image_writes,
             image_candidates,
             library_covers: library_covers.clone(),

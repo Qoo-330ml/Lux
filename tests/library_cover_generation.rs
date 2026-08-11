@@ -5,7 +5,9 @@ use image::{DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
 use luxd::{
     application::{
         libraries::LibraryService,
-        library_covers::{AutoLibraryCoverResult, LibraryCoverService},
+        library_covers::{
+            AUTO_LIBRARY_COVER_POSTER_COUNT, AutoLibraryCoverResult, LibraryCoverService,
+        },
         scanner::ScanJobService,
     },
     config::Config,
@@ -166,6 +168,55 @@ async fn auto_cover_waits_for_nine_posters_then_runs_only_once()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(task, (None, 0, r#"{"oneShot":true}"#.to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_cover_reads_posters_from_metadata_library() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = config(temp_dir.path());
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("中文媒体库", LibraryKind::Movie, true)
+        .await?;
+    let scan_root = temp_dir.path().join("Movies");
+    fs::create_dir_all(&scan_root)?;
+    libraries
+        .add_root(library.id, scan_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let metadata_library = config.config_dir.join("metadata/library/aa");
+    add_posters(
+        &database,
+        &library.id.to_string(),
+        &metadata_library,
+        AUTO_LIBRARY_COVER_POSTER_COUNT,
+    )
+    .await?;
+    let covers =
+        LibraryCoverService::new(database.clone(), config.config_dir.join("library-covers"))
+            .with_metadata_directory(config.config_dir.join("metadata"));
+
+    assert_eq!(
+        covers.generate_if_eligible(library.id).await?,
+        AutoLibraryCoverResult::Generated
+    );
+    let generated_path = LibraryService::new(database)
+        .list_libraries()
+        .await?
+        .into_iter()
+        .find(|view| view.library.id == library.id)
+        .and_then(|view| view.library.cover_image_path)
+        .ok_or("generated cover path")?;
+    assert!(
+        config
+            .config_dir
+            .join("library-covers")
+            .join(generated_path)
+            .is_file()
+    );
     Ok(())
 }
 
