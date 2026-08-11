@@ -3,7 +3,6 @@
 [![GitHub Stars](https://img.shields.io/github/stars/Qoo-330ml/Lux?style=flat-square)](https://github.com/Qoo-330ml/Lux/stargazers)
 [![Docker Pulls](https://img.shields.io/docker/pulls/pdzhou/lux?style=flat-square)](https://hub.docker.com/r/pdzhou/lux)
 [![Docker Image Version](https://img.shields.io/docker/v/pdzhou/lux?sort=semver&style=flat-square)](https://hub.docker.com/r/pdzhou/lux/tags)
-[![Docker Build](https://img.shields.io/github/actions/workflow/status/Qoo-330ml/Lux/dockerhub.yml?branch=main&style=flat-square&label=docker%20build)](https://github.com/Qoo-330ml/Lux/actions/workflows/dockerhub.yml)
 
 ![Lux logo](logo.svg)
 
