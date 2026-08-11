@@ -5329,7 +5329,8 @@ impl Database {
                  rating = COALESCE(?, rating),
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  provider_ids_json = ?, identification_status = 'ONLINE_CONFIRMED',
-                 metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?
+                 metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
+                 thumbnail_fallback_required = ?
              WHERE id = ? AND removed_at IS NULL",
         )
         .bind(update.title)
@@ -5347,6 +5348,7 @@ impl Database {
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
+        .bind(database_flag(update.thumbnail_fallback_required))
         .bind(update.item_id)
         .execute(&mut *transaction)
         .await
@@ -9856,6 +9858,7 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
+    pub(crate) thumbnail_fallback_required: bool,
 }
 
 pub(crate) struct LibrarySettingsUpdate<'a> {

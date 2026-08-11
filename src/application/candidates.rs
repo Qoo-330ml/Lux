@@ -1025,6 +1025,8 @@ impl MetadataSelectionService {
                 }
             }
         }
+        let has_thumbnail =
+            image_types.contains(&"THUMB") || self.images.has_local_image(item_id, "THUMB").await?;
         let actor_count = self
             .people
             .persist_item_actors(item_id, &candidate.provider, &payload.actors)
@@ -1060,6 +1062,7 @@ impl MetadataSelectionService {
                 metadata_fingerprint: &nfo_report.fingerprint,
                 provenance_json: &state.provenance_json(),
                 locked_fields_json: &state.locked_fields_json(),
+                thumbnail_fallback_required: !has_thumbnail,
             })
             .await?;
         if !selected {
@@ -1067,11 +1070,6 @@ impl MetadataSelectionService {
                 "CONCURRENTLY_SELECTED".to_owned(),
             ));
         }
-        let has_thumbnail =
-            image_types.contains(&"THUMB") || self.images.has_local_image(item_id, "THUMB").await?;
-        self.database
-            .set_thumbnail_fallback_required(item_id, !has_thumbnail)
-            .await?;
         Ok(MetadataSelectionReport {
             item_id: item_id.to_owned(),
             candidate_id: candidate_id.to_owned(),

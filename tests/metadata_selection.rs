@@ -489,6 +489,56 @@ async fn failed_selection_stays_pending_and_can_be_retried()
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn selection_failure_after_writeback_checks_does_not_confirm_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let fixture = prepare_fixture(false).await?;
+    symlink(
+        fixture.movie_dir.join("missing-thumb.jpg"),
+        fixture.movie_dir.join("thumb.jpg"),
+    )?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({ "title": "Retry Without Confirmation" }),
+    )
+    .await?;
+    let (base_url, lux_server) = start_lux(&fixture).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = login(&client, &base_url).await?;
+
+    let response = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{}/identify/candidates/{candidate_id}/select",
+            fixture.item_id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "refreshUnlocked" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let item_status: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&fixture.item_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(item_status, "LOCAL_CONFIRMED");
+    let candidate_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+            .bind(&candidate_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(candidate_status, "PENDING");
+
+    lux_server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn series_and_season_selection_writes_to_their_media_directories()
 -> Result<(), Box<dyn std::error::Error>> {
