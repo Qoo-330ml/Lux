@@ -23,6 +23,7 @@ use crate::{
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
         media_matching::{MediaKind, clean_title, has_multi_part_marker, parse_media_name},
         metadata::MetadataEnricher,
+        nfo::MovieNfoMetadataStore,
         people::PeopleService,
         probe::MediaProbeService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
@@ -1260,6 +1261,7 @@ pub struct ScanJobService {
     library_covers: Option<LibraryCoverService>,
     strm_probe: Option<StrmProbeService>,
     people: Option<PeopleService>,
+    movie_nfo: Option<MovieNfoMetadataStore>,
     resources: ResourceMetrics,
 }
 
@@ -1280,6 +1282,7 @@ impl ScanJobService {
             library_covers: None,
             strm_probe: None,
             people: None,
+            movie_nfo: None,
             resources: ResourceMetrics::new(),
         }
     }
@@ -1306,6 +1309,11 @@ impl ScanJobService {
 
     pub fn with_people(mut self, people: PeopleService) -> Self {
         self.people = Some(people);
+        self
+    }
+
+    pub fn with_movie_nfo_store(mut self, movie_nfo: MovieNfoMetadataStore) -> Self {
+        self.movie_nfo = Some(movie_nfo);
         self
     }
 
@@ -2655,9 +2663,14 @@ impl ScanJobService {
             tracing::warn!(job_id, library_id = %job.library_id, "local metadata enrichment skipped for invalid library ID");
             return Ok(());
         };
+        let enricher = MetadataEnricher::new(self.database.clone());
         let enricher = match self.people.clone() {
-            Some(people) => MetadataEnricher::new(self.database.clone()).with_people(people),
-            None => MetadataEnricher::new(self.database.clone()),
+            Some(people) => enricher.with_people(people),
+            None => enricher,
+        };
+        let enricher = match self.movie_nfo.clone() {
+            Some(movie_nfo) => enricher.with_movie_nfo_store(movie_nfo),
+            None => enricher,
         };
         let result = match library.kind.as_str() {
             "MOVIE" => enricher.enrich_movie_library(library_id).await,

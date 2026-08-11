@@ -6,6 +6,7 @@ use luxd::{
             MetadataSource, MetadataState, NfoMetadata, find_local_images, parse_nfo,
         },
         metadata_paths::people_directory,
+        nfo::MovieNfoMetadataStore,
         people::PeopleService,
         scanner::LibraryScanner,
     },
@@ -479,6 +480,57 @@ async fn local_movie_nfo_actors_are_available_without_online_matching_and_reuse_
     );
     assert_eq!(actors[1].name, "演员乙");
     assert_eq!(actors[1].image_url, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Rich Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Rich.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        r#"<movie><title>本地丰富电影</title><rating>8.1</rating><votes>123</votes><tagline>大漠路远</tagline><premiered>2026-02-17</premiered><releasedate>2026-02-20</releasedate><runtime>126</runtime><status>Released</status><language>zh</language><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>示例影业</studio><tmdbid>1462229</tmdbid><director tmdbid="18899">导演甲</director><writer tmdbid="19999">编剧甲</writer><trailer>https://example.com/trailer</trailer></movie>"#,
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let store = MovieNfoMetadataStore::new(config.config_dir.clone());
+    let report = MetadataEnricher::new(database.clone())
+        .with_movie_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(report.nfo_loaded, 1);
+
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let details = store
+        .read_item(&item_id)
+        .await?
+        .ok_or("rich NFO cache missing")?;
+    assert_eq!(details.rating, Some(8.1));
+    assert_eq!(details.genres, vec!["动作"]);
+    assert_eq!(details.directors[0].name, "导演甲");
+    assert_eq!(details.trailers, vec!["https://example.com/trailer"]);
     Ok(())
 }
 

@@ -1,8 +1,8 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        libraries::LibraryService, metadata::MetadataEnricher, scanner::LibraryScanner,
-        setup::SetupService,
+        libraries::LibraryService, metadata::MetadataEnricher, nfo::MovieNfoMetadataStore,
+        scanner::LibraryScanner, setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
@@ -51,6 +51,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     tokio::fs::write(first_dir.join("Alpha.Movie.2020.mkv"), b"alpha").await?;
     tokio::fs::write(first_dir.join("poster.jpg"), b"alpha-poster").await?;
     tokio::fs::write(first_dir.join("fanart.jpg"), b"alpha-fanart").await?;
+    tokio::fs::write(
+        first_dir.join("movie.nfo"),
+        r#"<movie><rating>8.1</rating><votes>123</votes><tagline>本地标语</tagline><premiered>2020-01-02</premiered><runtime>126</runtime><status>Released</status><language>zh</language><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>本地影业</studio><tmdbid>12345</tmdbid><director tmdbid="88">导演甲</director><writer tmdbid="99">编剧甲</writer><trailer>https://example.com/trailer</trailer></movie>"#,
+    )
+    .await?;
     tokio::fs::write(second_dir.join("Beta.Movie.2021.mp4"), b"beta").await?;
     libraries
         .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
@@ -59,6 +64,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .scan_movie_library(library.id)
         .await?;
     MetadataEnricher::new(database.clone())
+        .with_movie_nfo_store(MovieNfoMetadataStore::new(config.config_dir.clone()))
         .enrich_movie_library(library.id)
         .await?;
     let removed_version = first_dir.join("Alpha.Movie.2020.2160p.mkv");
@@ -715,6 +721,14 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let lux_detail_body: Value = lux_detail.json().await?;
     assert_eq!(lux_detail_body["id"], item_id);
     assert_eq!(lux_detail_body["productionYear"], 2020);
+    assert_eq!(lux_detail_body["rating"], 8.1);
+    assert_eq!(lux_detail_body["ratingSource"], "NFO");
+    assert_eq!(lux_detail_body["providerIds"]["tmdb"], "12345");
+    assert_eq!(lux_detail_body["nfo"]["tagline"], "本地标语");
+    assert_eq!(lux_detail_body["nfo"]["genres"][0], "动作");
+    assert_eq!(lux_detail_body["nfo"]["directors"][0]["name"], "导演甲");
+    assert_eq!(lux_detail_body["nfo"]["writers"][0]["name"], "编剧甲");
+    assert_eq!(lux_detail_body["nfo"]["trailers"][0], "https://example.com/trailer");
     assert_eq!(
         lux_detail_body["mediaSources"].as_array().map(Vec::len),
         Some(1)

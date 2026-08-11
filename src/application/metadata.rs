@@ -11,7 +11,13 @@ use tokio::fs;
 
 use crate::{
     application::scanner::compute_file_fingerprint,
-    application::{nfo::parse_movie_nfo_actors, people::PeopleService},
+    application::{
+        nfo::{
+            MovieNfoMetadataStore, MovieNfoMetadataStoreError, parse_movie_nfo_actors,
+            parse_movie_nfo_details,
+        },
+        people::PeopleService,
+    },
     domain::ids::LibraryId,
     storage::{Database, MediaMetadataUpdate, StorageError},
 };
@@ -615,6 +621,7 @@ impl From<std::io::Error> for NfoError {
 pub struct MetadataEnricher {
     database: Database,
     people: Option<PeopleService>,
+    movie_nfo: Option<MovieNfoMetadataStore>,
 }
 
 impl MetadataEnricher {
@@ -622,11 +629,17 @@ impl MetadataEnricher {
         Self {
             database,
             people: None,
+            movie_nfo: None,
         }
     }
 
     pub fn with_people(mut self, people: PeopleService) -> Self {
         self.people = Some(people);
+        self
+    }
+
+    pub fn with_movie_nfo_store(mut self, movie_nfo: MovieNfoMetadataStore) -> Self {
+        self.movie_nfo = Some(movie_nfo);
         self
     }
 
@@ -723,7 +736,15 @@ impl MetadataEnricher {
         } else {
             false
         };
-        if already_checked && !actor_relation_missing {
+        let rich_cache_missing = if let Some(movie_nfo) = &self.movie_nfo {
+            !movie_nfo
+                .exists(item_id)
+                .await
+                .map_err(MetadataError::NfoCache)?
+        } else {
+            false
+        };
+        if already_checked && !actor_relation_missing && !rich_cache_missing {
             report.nfo_skipped = 1;
             return Ok(report);
         }
@@ -747,6 +768,25 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
+        let rich_details = match parse_movie_nfo_details(&bytes) {
+            Ok(details) => details,
+            Err(error) => {
+                tracing::warn!(item_id, %error, "local movie NFO rich details could not be parsed");
+                if let Some(fingerprint) = fingerprint.as_deref() {
+                    self.database
+                        .mark_media_item_metadata_checked(item_id, fingerprint)
+                        .await?;
+                }
+                report.nfo_failed = 1;
+                return Ok(report);
+            }
+        };
+        if let Some(movie_nfo) = &self.movie_nfo {
+            movie_nfo
+                .write_item(item_id, &rich_details)
+                .await
+                .map_err(MetadataError::NfoCache)?;
+        }
         if let Some(people) = &self.people {
             match parse_movie_nfo_actors(&bytes) {
                 Ok(actors) => {
@@ -1395,6 +1435,7 @@ pub enum MetadataError {
         size: u64,
     },
     Storage(StorageError),
+    NfoCache(MovieNfoMetadataStoreError),
 }
 
 impl fmt::Display for MetadataError {
@@ -1409,6 +1450,7 @@ impl fmt::Display for MetadataError {
                 path.display()
             ),
             Self::Storage(error) => error.fmt(formatter),
+            Self::NfoCache(error) => error.fmt(formatter),
         }
     }
 }
@@ -1419,6 +1461,7 @@ impl std::error::Error for MetadataError {
             Self::Io { source, .. } => Some(source),
             Self::FileSizeOutOfRange { .. } => None,
             Self::Storage(error) => Some(error),
+            Self::NfoCache(error) => Some(error),
         }
     }
 }

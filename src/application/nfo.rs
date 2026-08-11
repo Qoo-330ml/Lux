@@ -12,7 +12,7 @@ use quick_xml::{
     events::{BytesEnd, BytesStart, BytesText, Event},
     reader::Reader,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -23,13 +23,39 @@ use crate::application::metadata::{
     MetadataField, MetadataSource, MetadataState, NfoError, NfoMetadata, find_nfo_path,
     nfo_fingerprint, parse_nfo, series_directory,
 };
+use crate::application::metadata_paths::library_item_nfo_path;
 use crate::application::people::ActorCredit;
 use crate::storage::{Database, MediaMetadataUpdate, StorageError};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MovieNfoCredit {
     pub provider_id: String,
     pub name: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieNfoDetails {
+    pub rating: Option<f64>,
+    pub votes: Option<i64>,
+    pub tagline: Option<String>,
+    pub premiered: Option<String>,
+    #[serde(rename = "releaseDate")]
+    pub release_date: Option<String>,
+    pub runtime: Option<i32>,
+    pub status: Option<String>,
+    pub original_language: Option<String>,
+    pub website: Option<String>,
+    pub set_name: Option<String>,
+    pub set_id: Option<String>,
+    pub certification: Option<String>,
+    pub countries: Vec<String>,
+    pub genres: Vec<String>,
+    pub studios: Vec<String>,
+    pub provider_ids: BTreeMap<String, String>,
+    pub directors: Vec<MovieNfoCredit>,
+    pub writers: Vec<MovieNfoCredit>,
+    pub trailers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -213,6 +239,441 @@ fn assign_movie_actor_field(
         MovieActorField::Order => actor.order = value.parse::<i32>().ok(),
     }
     Ok(())
+}
+
+const MAX_MOVIE_NFO_DETAILS_ITEMS: usize = 64;
+const MAX_MOVIE_NFO_DETAILS_TEXT_BYTES: usize = 256 * 1024;
+const MAX_MOVIE_NFO_DETAILS_URL_BYTES: usize = 2048;
+const MAX_MOVIE_NFO_DETAILS_ID_BYTES: usize = 256;
+
+/// Reads the rich, direct child fields written by the movie NFO writer.
+///
+/// This is deliberately a background-only parser. The detail endpoint reads
+/// the JSON snapshot produced from this value instead of opening an NFO file.
+pub fn parse_movie_nfo_details(bytes: &[u8]) -> Result<MovieNfoDetails, NfoError> {
+    if bytes.len() > MAX_MOVIE_NFO_BYTES {
+        return Err(NfoError::TooLarge);
+    }
+
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut details = MovieNfoDetails::default();
+    let mut active = None;
+    let mut depth = 0_usize;
+    let mut event_count = 0_usize;
+
+    loop {
+        event_count += 1;
+        if event_count > MAX_MOVIE_NFO_EVENTS {
+            return Err(NfoError::TooManyEvents);
+        }
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Eof) => {
+                if depth != 0 {
+                    return Err(NfoError::Unbalanced);
+                }
+                break;
+            }
+            Ok(Event::Start(event)) => {
+                depth = depth.saturating_add(1);
+                if depth == 2 {
+                    active = rich_value_kind(&event)?;
+                }
+            }
+            Ok(Event::Text(event)) => {
+                if let Some(active) = active.as_mut()
+                    && depth == 2
+                {
+                    append_rich_text(
+                        &mut active.text,
+                        unescape(
+                            event
+                                .decode()
+                                .map_err(|error| NfoError::Xml(error.to_string()))?
+                                .as_ref(),
+                        )
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .as_ref(),
+                    )?;
+                }
+            }
+            Ok(Event::CData(event)) => {
+                if let Some(active) = active.as_mut()
+                    && depth == 2
+                {
+                    append_rich_text(
+                        &mut active.text,
+                        event
+                            .decode()
+                            .map_err(|error| NfoError::Xml(error.to_string()))?
+                            .as_ref(),
+                    )?;
+                }
+            }
+            Ok(Event::End(_)) => {
+                if depth == 2 {
+                    if let Some(active) = active.take() {
+                        assign_rich_value(&mut details, active.kind, active.text.trim())?;
+                    }
+                }
+                if depth == 0 {
+                    return Err(NfoError::Unbalanced);
+                }
+                depth -= 1;
+            }
+            Ok(Event::Empty(_)) => {}
+            Ok(Event::DocType(_)) => return Err(NfoError::DocTypeNotAllowed),
+            Ok(_) => {}
+            Err(error) => return Err(NfoError::Xml(error.to_string())),
+        }
+        buffer.clear();
+    }
+
+    Ok(details)
+}
+
+struct ActiveRichValue {
+    kind: RichValueKind,
+    text: String,
+}
+
+enum RichValueKind {
+    Rating,
+    Votes,
+    Tagline,
+    Premiered,
+    ReleaseDate,
+    Runtime,
+    Status,
+    OriginalLanguage,
+    Website,
+    SetName,
+    SetId,
+    Certification,
+    Country,
+    Genre,
+    Studio,
+    Provider(String),
+    Director(String),
+    Writer(String),
+    Trailer,
+}
+
+fn rich_value_kind(event: &BytesStart<'_>) -> Result<Option<ActiveRichValue>, NfoError> {
+    let event_name = event.name();
+    let tag = event_name.as_ref();
+    let kind = match tag {
+        b"rating" => RichValueKind::Rating,
+        b"votes" => RichValueKind::Votes,
+        b"tagline" => RichValueKind::Tagline,
+        b"premiered" => RichValueKind::Premiered,
+        b"releasedate" => RichValueKind::ReleaseDate,
+        b"runtime" => RichValueKind::Runtime,
+        b"status" => RichValueKind::Status,
+        b"language" => RichValueKind::OriginalLanguage,
+        b"website" => RichValueKind::Website,
+        b"set" => RichValueKind::SetName,
+        b"setid" => RichValueKind::SetId,
+        b"mpaa" => RichValueKind::Certification,
+        b"country" => RichValueKind::Country,
+        b"genre" => RichValueKind::Genre,
+        b"studio" => RichValueKind::Studio,
+        b"trailer" => RichValueKind::Trailer,
+        b"director" => {
+            RichValueKind::Director(attribute_value(event, b"tmdbid")?.unwrap_or_default())
+        }
+        b"writer" | b"credits" => {
+            RichValueKind::Writer(attribute_value(event, b"tmdbid")?.unwrap_or_default())
+        }
+        b"tmdbid" => RichValueKind::Provider("tmdb".to_owned()),
+        b"imdbid" => RichValueKind::Provider("imdb".to_owned()),
+        b"tvdbid" => RichValueKind::Provider("tvdb".to_owned()),
+        b"wikidataid" => RichValueKind::Provider("wikidata".to_owned()),
+        b"uniqueid" => {
+            let Some(provider) = attribute_value(event, b"type")? else {
+                return Ok(None);
+            };
+            let provider = provider.trim().to_ascii_lowercase();
+            if !matches!(provider.as_str(), "tmdb" | "imdb" | "tvdb" | "wikidata") {
+                return Ok(None);
+            }
+            RichValueKind::Provider(provider)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(ActiveRichValue {
+        kind,
+        text: String::new(),
+    }))
+}
+
+fn attribute_value(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<String>, NfoError> {
+    for attribute in event.attributes().with_checks(false) {
+        let attribute = attribute.map_err(|error| NfoError::Xml(error.to_string()))?;
+        if attribute.key.as_ref() == name {
+            return attribute
+                .unescape_value()
+                .map(|value| Some(value.into_owned()))
+                .map_err(|error| NfoError::Xml(error.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn append_rich_text(target: &mut String, value: &str) -> Result<(), NfoError> {
+    if target.len().saturating_add(value.len()) > MAX_MOVIE_NFO_DETAILS_TEXT_BYTES {
+        return Err(NfoError::FieldTooLarge);
+    }
+    target.push_str(value);
+    Ok(())
+}
+
+fn assign_rich_value(
+    details: &mut MovieNfoDetails,
+    kind: RichValueKind,
+    raw_value: &str,
+) -> Result<(), NfoError> {
+    if raw_value.is_empty() {
+        return Ok(());
+    }
+    match kind {
+        RichValueKind::Rating => {
+            details.rating = raw_value
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && (0.0..=10.0).contains(value));
+        }
+        RichValueKind::Votes => {
+            details.votes = raw_value.parse::<i64>().ok().filter(|value| *value >= 0);
+        }
+        RichValueKind::Runtime => {
+            details.runtime = raw_value
+                .parse::<i32>()
+                .ok()
+                .filter(|value| (0..=10_000).contains(value));
+        }
+        RichValueKind::Website => details.website = http_url(raw_value),
+        RichValueKind::Trailer => {
+            if let Some(value) = http_url(raw_value) {
+                push_unique(&mut details.trailers, value);
+            }
+        }
+        RichValueKind::Premiered => details.premiered = bounded_text(raw_value),
+        RichValueKind::ReleaseDate => details.release_date = bounded_text(raw_value),
+        RichValueKind::Tagline => details.tagline = bounded_text(raw_value),
+        RichValueKind::Status => details.status = bounded_text(raw_value),
+        RichValueKind::OriginalLanguage => details.original_language = bounded_text(raw_value),
+        RichValueKind::SetName => details.set_name = bounded_text(raw_value),
+        RichValueKind::SetId => details.set_id = bounded_id(raw_value),
+        RichValueKind::Certification => details.certification = bounded_text(raw_value),
+        RichValueKind::Country => push_bounded(&mut details.countries, raw_value),
+        RichValueKind::Genre => push_bounded(&mut details.genres, raw_value),
+        RichValueKind::Studio => push_bounded(&mut details.studios, raw_value),
+        RichValueKind::Provider(provider) => {
+            if let Some(value) = bounded_id(raw_value) {
+                details.provider_ids.insert(provider, value);
+            }
+        }
+        RichValueKind::Director(provider_id) => {
+            push_credit(&mut details.directors, provider_id, raw_value);
+        }
+        RichValueKind::Writer(provider_id) => {
+            push_credit(&mut details.writers, provider_id, raw_value);
+        }
+    }
+    Ok(())
+}
+
+fn bounded_text(value: &str) -> Option<String> {
+    (value.len() <= MAX_MOVIE_NFO_DETAILS_TEXT_BYTES).then(|| value.to_owned())
+}
+
+fn bounded_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= MAX_MOVIE_NFO_DETAILS_ID_BYTES).then(|| value.to_owned())
+}
+
+fn http_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() <= MAX_MOVIE_NFO_DETAILS_URL_BYTES
+        && (value.starts_with("https://") || value.starts_with("http://")))
+    .then(|| value.to_owned())
+}
+
+fn push_bounded(values: &mut Vec<String>, value: &str) {
+    if values.len() >= MAX_MOVIE_NFO_DETAILS_ITEMS {
+        return;
+    }
+    let Some(value) = bounded_text(value) else {
+        return;
+    };
+    push_unique(values, value);
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value)
+        && values.len() < MAX_MOVIE_NFO_DETAILS_ITEMS
+    {
+        values.push(value);
+    }
+}
+
+fn push_credit(values: &mut Vec<MovieNfoCredit>, provider_id: String, name: &str) {
+    let Some(name) = bounded_text(name) else {
+        return;
+    };
+    if values.len() >= MAX_MOVIE_NFO_DETAILS_ITEMS {
+        return;
+    }
+    if values
+        .iter()
+        .any(|credit| credit.provider_id == provider_id && credit.name == name)
+    {
+        return;
+    }
+    values.push(MovieNfoCredit { provider_id, name });
+}
+
+#[derive(Clone)]
+pub struct MovieNfoMetadataStore {
+    config_dir: PathBuf,
+}
+
+impl MovieNfoMetadataStore {
+    pub fn new(config_dir: PathBuf) -> Self {
+        Self { config_dir }
+    }
+
+    pub async fn write_item(
+        &self,
+        item_id: &str,
+        details: &MovieNfoDetails,
+    ) -> Result<(), MovieNfoMetadataStoreError> {
+        let path = library_item_nfo_path(&self.config_dir, item_id)
+            .map_err(|error| MovieNfoMetadataStoreError::InvalidPath(error.to_string()))?;
+        let bytes = serde_json::to_vec_pretty(details)
+            .map_err(|error| MovieNfoMetadataStoreError::Serialization(error.to_string()))?;
+        write_movie_nfo_snapshot_atomically(&path, &bytes).await
+    }
+
+    pub async fn read_item(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<MovieNfoDetails>, MovieNfoMetadataStoreError> {
+        let path = library_item_nfo_path(&self.config_dir, item_id)
+            .map_err(|error| MovieNfoMetadataStoreError::InvalidPath(error.to_string()))?;
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(MovieNfoMetadataStoreError::Io { path, source });
+            }
+        };
+        if bytes.len() > MAX_MOVIE_NFO_BYTES {
+            return Err(MovieNfoMetadataStoreError::TooLarge);
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| MovieNfoMetadataStoreError::Serialization(error.to_string()))
+    }
+
+    pub async fn exists(&self, item_id: &str) -> Result<bool, MovieNfoMetadataStoreError> {
+        Ok(self.read_item(item_id).await?.is_some())
+    }
+}
+
+async fn write_movie_nfo_snapshot_atomically(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), MovieNfoMetadataStoreError> {
+    let parent = path.parent().ok_or_else(|| {
+        MovieNfoMetadataStoreError::InvalidPath("movie NFO cache has no parent".to_owned())
+    })?;
+    fs::create_dir_all(parent)
+        .await
+        .map_err(|source| MovieNfoMetadataStoreError::Io {
+            path: parent.to_owned(),
+            source,
+        })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            MovieNfoMetadataStoreError::InvalidPath(
+                "movie NFO cache has an invalid file name".to_owned(),
+            )
+        })?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::now_v7()));
+    let result = async {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .map_err(|source| MovieNfoMetadataStoreError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        file.write_all(bytes)
+            .await
+            .map_err(|source| MovieNfoMetadataStoreError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        file.sync_all()
+            .await
+            .map_err(|source| MovieNfoMetadataStoreError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .await
+            .map_err(|source| MovieNfoMetadataStoreError::Io {
+                path: path.to_owned(),
+                source,
+            })
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    result
+}
+
+#[derive(Debug)]
+pub enum MovieNfoMetadataStoreError {
+    InvalidPath(String),
+    Serialization(String),
+    TooLarge,
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for MovieNfoMetadataStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPath(message) | Self::Serialization(message) => {
+                formatter.write_str(message)
+            }
+            Self::TooLarge => formatter.write_str("movie NFO cache is too large"),
+            Self::Io { path, source } => {
+                write!(formatter, "movie NFO cache '{}': {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for MovieNfoMetadataStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::InvalidPath(_) | Self::Serialization(_) | Self::TooLarge => None,
+        }
+    }
 }
 
 pub fn rewrite_nfo(original: &[u8], patch: &NfoMetadata) -> Result<Vec<u8>, NfoWriteError> {

@@ -61,7 +61,10 @@ use crate::{
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
         metadata::MetadataField,
         network_diagnostics::{NetworkDiagnostics, NetworkProbeResult, test_network},
-        nfo::{MetadataWriteRequest, MetadataWriteService, NfoWriteError},
+        nfo::{
+            MetadataWriteRequest, MetadataWriteService, MovieNfoDetails, MovieNfoMetadataStore,
+            NfoWriteError,
+        },
         people::{PeopleError, PeopleService},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
@@ -140,6 +143,7 @@ pub struct AppState {
     tmdb: Option<TmdbProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
+    movie_nfo: Option<MovieNfoMetadataStore>,
     user_avatars: Option<UserAvatarService>,
     ip_location: Option<IpLocationService>,
     admin_events: AdminEventHub,
@@ -223,6 +227,7 @@ impl AppState {
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
         let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
+        let movie_nfo = MovieNfoMetadataStore::new(config_dir.clone());
         let probe = Some(MediaProbeService::new(
             database.clone(),
             FfprobeRunner::default(),
@@ -239,6 +244,7 @@ impl AppState {
             service
                 .with_strm_probe(strm_probe.clone())
                 .with_people(people.clone())
+                .with_movie_nfo_store(movie_nfo.clone())
         };
         let scheduled_tasks =
             ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone())
@@ -293,6 +299,7 @@ impl AppState {
             tmdb: Some(tmdb),
             collections,
             people: Some(people),
+            movie_nfo: Some(movie_nfo),
             user_avatars,
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
@@ -5611,9 +5618,20 @@ async fn lux_get_item(
                     },
                     None => Vec::new(),
                 };
+                let nfo = match state.movie_nfo.as_ref() {
+                    Some(movie_nfo) => match movie_nfo.read_item(&item.id).await {
+                        Ok(nfo) => nfo,
+                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    },
+                    None => None,
+                };
                 let mut body = lux_catalog_item_json_with_user_state(&item, user_state.as_ref());
                 if let Value::Object(object) = &mut body {
                     object.insert("actors".to_owned(), json!(actors));
+                    object.insert("nfo".to_owned(), json!(nfo));
+                    if let Some(nfo) = nfo.as_ref() {
+                        apply_movie_nfo_details(object, nfo);
+                    }
                 }
                 Json(body).into_response()
             }
@@ -7276,6 +7294,41 @@ fn lux_catalog_item_json_with_user_state(
         object.insert("userData".to_owned(), lux_user_data_json(user_state));
     }
     value
+}
+
+fn apply_movie_nfo_details(object: &mut serde_json::Map<String, Value>, nfo: &MovieNfoDetails) {
+    if let Some(rating) = nfo.rating {
+        object.insert("rating".to_owned(), json!(rating));
+        object.insert("ratingSource".to_owned(), json!("NFO"));
+    }
+    if let Some(premiered) = nfo.premiered.as_deref().or(nfo.release_date.as_deref()) {
+        object.insert("premiereDate".to_owned(), json!(premiered));
+    }
+    if let Some(status) = nfo.status.as_deref() {
+        object.insert("status".to_owned(), json!(status));
+    }
+    if let Some(language) = nfo.original_language.as_deref() {
+        object.insert("originalLanguage".to_owned(), json!(language));
+    }
+    if let Some(runtime) = nfo.runtime {
+        if let Some(runtime_ticks) = i64::from(runtime)
+            .checked_mul(60)
+            .and_then(|value| value.checked_mul(10_000_000))
+        {
+            object.insert("runtimeTicks".to_owned(), json!(runtime_ticks));
+        }
+    }
+    if !nfo.provider_ids.is_empty() {
+        let mut provider_ids = object
+            .get("providerIds")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (provider, id) in &nfo.provider_ids {
+            provider_ids.insert(provider.clone(), json!(id));
+        }
+        object.insert("providerIds".to_owned(), Value::Object(provider_ids));
+    }
 }
 
 fn lux_user_data_json(state: Option<&crate::storage::StoredUserItemState>) -> Value {

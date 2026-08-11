@@ -4,7 +4,7 @@ use luxd::{
         metadata::NfoMetadata,
         nfo::{
             MovieNfoCredit, MovieNfoMetadata, NfoWriteService, parse_movie_nfo_actors,
-            rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
+            parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
         },
         people::ActorCredit,
         scanner::LibraryScanner,
@@ -182,6 +182,48 @@ fn movie_nfo_parser_reads_emby_actor_nodes_without_online_metadata() {
     assert_eq!(actors[0].name, "演员甲");
     assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
     assert_eq!(actors[1].order, Some(1));
+}
+
+#[test]
+fn movie_nfo_parser_reads_rich_local_details_without_online_metadata() {
+    let details = parse_movie_nfo_details(
+        r#"<movie>
+            <rating>8.1</rating><votes>123</votes><tagline>大漠路远</tagline>
+            <premiered>2026-02-17</premiered><releasedate>2026-02-20</releasedate>
+            <runtime>126</runtime><status>Released</status><language>zh</language>
+            <website>https://example.com/movie</website><set>镖人</set><setid>77</setid>
+            <mpaa>PG-13</mpaa><country>中国</country><country>香港</country>
+            <genre>动作</genre><genre>剧情</genre><studio>示例影业</studio>
+            <tmdbid>1462229</tmdbid><imdbid>tt1234567</imdbid>
+            <uniqueid type="wikidata">Q123</uniqueid>
+            <director tmdbid="18899">导演甲</director>
+            <writer tmdbid="19999">编剧甲</writer>
+            <credits tmdbid="20000">编剧乙</credits>
+            <trailer>https://www.youtube.com/watch?v=test</trailer>
+        </movie>"#
+            .as_bytes(),
+    )
+    .expect("valid rich movie nfo");
+
+    assert_eq!(details.rating, Some(8.1));
+    assert_eq!(details.votes, Some(123));
+    assert_eq!(details.tagline.as_deref(), Some("大漠路远"));
+    assert_eq!(details.premiered.as_deref(), Some("2026-02-17"));
+    assert_eq!(details.release_date.as_deref(), Some("2026-02-20"));
+    assert_eq!(details.runtime, Some(126));
+    assert_eq!(details.original_language.as_deref(), Some("zh"));
+    assert_eq!(details.countries, vec!["中国", "香港"]);
+    assert_eq!(details.genres, vec!["动作", "剧情"]);
+    assert_eq!(details.studios, vec!["示例影业"]);
+    assert_eq!(details.provider_ids["tmdb"], "1462229");
+    assert_eq!(details.provider_ids["imdb"], "tt1234567");
+    assert_eq!(details.provider_ids["wikidata"], "Q123");
+    assert_eq!(details.directors[0].name, "导演甲");
+    assert_eq!(details.writers.len(), 2);
+    assert_eq!(
+        details.trailers,
+        vec!["https://www.youtube.com/watch?v=test"]
+    );
 }
 
 #[tokio::test]
