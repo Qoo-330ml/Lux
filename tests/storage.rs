@@ -16,7 +16,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 51);
+    assert_eq!(database.schema_version().await?, 52);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -36,8 +36,58 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 51);
+    assert_eq!(second_database.schema_version().await?, 52);
     second_database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn strm_probe_scan_job_reference_prevents_scan_job_deletion()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Migration test", LibraryKind::Movie, false)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES (?, ?, 'INCREMENTAL_SCAN', 'COMPLETED', 'migration-test')",
+    )
+    .bind("migration-scan-job")
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO strm_probe_jobs (
+            id, operation_id, library_id, status, concurrency, target_scan_job_id
+         ) VALUES (?, ?, ?, 'COMPLETED', 1, ?)",
+    )
+    .bind("migration-probe-job")
+    .bind("migration-operation")
+    .bind(library.id.to_string())
+    .bind("migration-scan-job")
+    .execute(database.pool())
+    .await?;
+
+    let deletion = sqlx::query("DELETE FROM scan_jobs WHERE id = ?")
+        .bind("migration-scan-job")
+        .execute(database.pool())
+        .await;
+    assert!(deletion.is_err());
+
+    let target_scan_job_id: Option<String> =
+        sqlx::query_scalar("SELECT target_scan_job_id FROM strm_probe_jobs WHERE id = ?")
+            .bind("migration-probe-job")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(target_scan_job_id.as_deref(), Some("migration-scan-job"));
+
+    database.close().await;
     Ok(())
 }
 
@@ -52,7 +102,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 51);
+    assert_eq!(database.schema_version().await?, 52);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
