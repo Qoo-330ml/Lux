@@ -1223,6 +1223,23 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-library-management-toolbar > div { justify-content: center; flex-wrap: wrap; }
   .lux-admin-library-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
   .lux-admin-library-overflow { opacity: 1; transform: none; }
+  .lux-library-action-menu {
+    position: fixed;
+    z-index: 50;
+    top: auto;
+    right: 16px;
+    bottom: calc(16px + env(safe-area-inset-bottom));
+    width: min(320px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px - env(safe-area-inset-bottom));
+    max-height: calc(100dvh - 32px - env(safe-area-inset-bottom));
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    -webkit-overflow-scrolling: touch;
+  }
+  .lux-library-action-menu-heading { position: sticky; z-index: 1; top: 0; background: rgba(30,30,35,.98); backdrop-filter: blur(18px); }
+  .lux-library-action-menu button { min-height: 44px; }
   .lux-library-dialog-header, .lux-library-dialog-scroll { padding-right: 16px; padding-left: 16px; }
   .lux-library-dialog-form { padding-right: 16px; padding-left: 16px; }
   .lux-library-strategy-heading { align-items: flex-start; flex-direction: column; }
