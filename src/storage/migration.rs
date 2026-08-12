@@ -508,6 +508,7 @@ async fn normalize_active_jobs(
         ("metadata_reidentify_jobs", "QUEUED"),
         ("strm_probe_jobs", "PENDING"),
         ("danmaku_match_jobs", "PENDING"),
+        ("chapter_detection_jobs", "PENDING"),
     ] {
         let query = format!(
             "UPDATE {} SET status = $1 WHERE status = 'RUNNING'",
@@ -520,7 +521,11 @@ async fn normalize_active_jobs(
             .await
             .map_err(database_error)?;
     }
-    for table in ["metadata_reidentify_job_items", "danmaku_match_job_items"] {
+    for table in [
+        "metadata_reidentify_job_items",
+        "danmaku_match_job_items",
+        "chapter_detection_job_items",
+    ] {
         let query = format!(
             "UPDATE {} SET status = 'PENDING' WHERE status = 'RUNNING'",
             quote_identifier(table)?
@@ -668,6 +673,7 @@ pub const MIGRATION_TABLES: &[MigrationTable] = &[
     table("access_tokens"),
     table("item_images"),
     table("media_streams"),
+    table("media_chapters"),
     table("user_library_access"),
     table("scan_jobs"),
     table("scheduled_task_configs"),
@@ -687,6 +693,9 @@ pub const MIGRATION_TABLES: &[MigrationTable] = &[
     table("danmaku_tracks"),
     table("danmaku_match_jobs"),
     table("danmaku_match_job_items"),
+    table("chapter_detection_jobs"),
+    table("chapter_detection_job_items"),
+    table("chapter_detection_source_states"),
     table("scan_job_paths"),
     table("reconciliation_scan_entries"),
 ];
@@ -708,5 +717,6 @@ pub fn normalized_job_tables() -> &'static [&'static str] {
         "metadata_reidentify_jobs",
         "strm_probe_jobs",
         "danmaku_match_jobs",
+        "chapter_detection_jobs",
     ]
 }

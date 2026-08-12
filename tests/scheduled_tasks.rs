@@ -1,6 +1,8 @@
 use std::fs;
 
 use luxd::application::{
+    chapter_detector::{ChapterDetectionService, DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID},
+    libraries::LibrarySettingsPatch,
     plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
     scheduled_tasks::ScheduledTaskService,
     strm_probe::StrmProbeService,
@@ -67,6 +69,7 @@ async fn enabled_strm_task_runs_once_per_matching_cron_minute()
         database.clone(),
         plugins.clone(),
         StrmProbeService::new(database.clone(), plugins),
+        None,
     );
 
     scheduler.run_once().await;
@@ -76,5 +79,92 @@ async fn enabled_strm_task_runs_once_per_matching_cron_minute()
         .fetch_one(database.pool())
         .await?;
     assert_eq!(jobs, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn enabled_chapter_task_creates_one_detection_job_per_matching_minute()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let plugin_dir = config_dir.join(format!("plugins/{DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID}"));
+    tokio::fs::create_dir_all(plugin_dir.join("binaries")).await?;
+    fs::write(plugin_dir.join("binaries/plugin"), b"placeholder")?;
+    tokio::fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "id": DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID,
+            "name": "Intro/outro detector",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "chapter_detector",
+            "category": "MEDIA",
+            "supportedItemTypes": ["Episode"],
+            "capabilities": ["chapters.detect"],
+            "configFields": [
+                {"key": "concurrency", "label": "Concurrency", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 16},
+                {"key": "introWindowSeconds", "label": "Intro window", "type": "number", "required": true, "defaultValue": 180, "minimum": 15, "maximum": 300},
+                {"key": "creditsWindowSeconds", "label": "Credits window", "type": "number", "required": true, "defaultValue": 180, "minimum": 15, "maximum": 600},
+                {"key": "matchThreshold", "label": "Threshold", "type": "number", "required": true, "defaultValue": 80, "minimum": 1, "maximum": 100},
+                {"key": "schedule", "label": "Schedule", "type": "text", "required": true, "defaultValue": "0 4 * * 0"}
+            ],
+            "permissions": {"network": [], "filesystem": []},
+            "files": []
+        }))?,
+    )
+    .await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    let library = luxd::application::libraries::LibraryService::new(database.clone())
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let second_library = luxd::application::libraries::LibraryService::new(database.clone())
+        .create_library("More Shows", LibraryKind::Series, false)
+        .await?;
+    let plugins = PluginService::new(database.clone(), config_dir);
+    plugins.install(DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID).await?;
+    let libraries = luxd::application::libraries::LibraryService::new(database.clone());
+    for selected_library in [library.id, second_library.id] {
+        libraries
+            .update_settings(
+                selected_library,
+                LibrarySettingsPatch {
+                    chapter_source_id: Some(Some(DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID.to_owned())),
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
+    plugins
+        .update_dynamic_config(
+            DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID,
+            Map::from_iter([
+                ("concurrency".to_owned(), json!(2)),
+                ("introWindowSeconds".to_owned(), json!(180)),
+                ("creditsWindowSeconds".to_owned(), json!(180)),
+                ("matchThreshold".to_owned(), json!(80)),
+                ("schedule".to_owned(), json!("* * * * *")),
+            ]),
+        )
+        .await?;
+    let scheduler = ScheduledTaskService::new(
+        database.clone(),
+        plugins.clone(),
+        StrmProbeService::new(database.clone(), plugins.clone()),
+        Some(ChapterDetectionService::new(database.clone(), plugins)),
+    );
+
+    scheduler.run_once().await;
+    scheduler.run_once().await;
+
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapter_detection_jobs")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(jobs, 2);
     Ok(())
 }

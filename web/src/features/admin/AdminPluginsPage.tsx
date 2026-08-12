@@ -112,6 +112,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   const [customApiBaseUrl, setCustomApiBaseUrl] = useState("");
   const [libraryIds, setLibraryIds] = useState<string[]>([]);
   const [concurrency, setConcurrency] = useState(2);
+  const [introWindowSeconds, setIntroWindowSeconds] = useState(180);
+  const [creditsWindowSeconds, setCreditsWindowSeconds] = useState(180);
+  const [matchThreshold, setMatchThreshold] = useState(80);
   const [existingInfoPolicy, setExistingInfoPolicy] = useState("SKIP");
   const [mediaInfoEnabled, setMediaInfoEnabled] = useState(true);
   const [thumbnailEnabled, setThumbnailEnabled] = useState(false);
@@ -120,6 +123,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   const [schedule, setSchedule] = useState("0 3 * * *");
   const closeRef = useRef<HTMLButtonElement>(null);
   const isMediaInfo = plugin.id === "org.lux.strm-media-info";
+  const isChapterSource = plugin.capabilities?.some((capability) => capability === "chapters.detect" || capability === "chapters.lookup") === true;
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
   const preferredLanguageField = plugin.configFields.find((field) => field.key === "preferredLanguage");
   const fallbackEnabledField = plugin.configFields.find((field) => field.key === "languageFallbackEnabled");
@@ -128,6 +132,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   const apiBaseUrlField = plugin.configFields.find((field) => field.key === "apiBaseUrl");
   const libraryIdsField = plugin.configFields.find((field) => field.key === "libraryIds");
   const concurrencyField = plugin.configFields.find((field) => field.key === "concurrency");
+  const introWindowField = plugin.configFields.find((field) => field.key === "introWindowSeconds");
+  const creditsWindowField = plugin.configFields.find((field) => field.key === "creditsWindowSeconds");
+  const matchThresholdField = plugin.configFields.find((field) => field.key === "matchThreshold");
   const existingInfoPolicyField = plugin.configFields.find((field) => field.key === "existingInfoPolicy");
   const mediaInfoEnabledField = plugin.configFields.find((field) => field.key === "mediaInfoEnabled");
   const thumbnailEnabledField = plugin.configFields.find((field) => field.key === "thumbnailEnabled");
@@ -150,7 +157,15 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
           writeSidecars,
           ...(scheduleField ? { schedule: schedule.trim() } : {}),
         })
-      : api.updateAdminPluginConfig(plugin.id, {
+      : isChapterSource
+        ? api.updateAdminPluginConfig(plugin.id, {
+            concurrency,
+            ...(introWindowField ? { introWindowSeconds } : {}),
+            ...(creditsWindowField ? { creditsWindowSeconds } : {}),
+            ...(matchThresholdField ? { matchThreshold } : {}),
+            ...(scheduleField ? { schedule: schedule.trim() } : {}),
+          })
+        : api.updateAdminPluginConfig(plugin.id, {
           ...(apiKeyDirty ? { apiKey } : {}),
           preferredLanguage,
           languageFallbackEnabled,
@@ -212,6 +227,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
       : [];
     setLibraryIds(configuredLibraryIds);
     setConcurrency(typeof values.concurrency === "number" ? values.concurrency : Number(concurrencyField?.defaultValue ?? 2));
+    setIntroWindowSeconds(typeof values.introWindowSeconds === "number" ? values.introWindowSeconds : Number(introWindowField?.defaultValue ?? 180));
+    setCreditsWindowSeconds(typeof values.creditsWindowSeconds === "number" ? values.creditsWindowSeconds : Number(creditsWindowField?.defaultValue ?? 180));
+    setMatchThreshold(typeof values.matchThreshold === "number" ? values.matchThreshold : Number(matchThresholdField?.defaultValue ?? 80));
     const configuredExistingInfoPolicy = typeof values.existingInfoPolicy === "string"
       ? values.existingInfoPolicy
       : String(existingInfoPolicyField?.defaultValue ?? "SKIP");
@@ -226,7 +244,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
     setSchedule(typeof values.schedule === "string" ? values.schedule : String(scheduleField?.defaultValue ?? "0 3 * * *"));
     setApiKey("");
     setApiKeyDirty(false);
-  }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue]);
+  }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue]);
 
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
@@ -266,11 +284,20 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
               {isMediaInfo ? <>
                 {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<select id={"plugin-config-" + plugin.id + "-library-ids"} multiple required={libraryIdsField.required} value={libraryIds} onChange={(event) => setLibraryIds(Array.from(event.target.selectedOptions, (option) => option.value))}>{(libraryIdsField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{libraryIdsField.description}</small></label> : null}
                 {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
+                {introWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-intro-window"}>{introWindowField.label}<input id={"plugin-config-" + plugin.id + "-intro-window"} type="number" min={introWindowField.minimum ?? 15} max={introWindowField.maximum ?? 300} value={introWindowSeconds} onChange={(event) => setIntroWindowSeconds(Number(event.target.value))} /><small>{introWindowField.description}</small></label> : null}
+                {creditsWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-credits-window"}>{creditsWindowField.label}<input id={"plugin-config-" + plugin.id + "-credits-window"} type="number" min={creditsWindowField.minimum ?? 15} max={creditsWindowField.maximum ?? 600} value={creditsWindowSeconds} onChange={(event) => setCreditsWindowSeconds(Number(event.target.value))} /><small>{creditsWindowField.description}</small></label> : null}
+                {matchThresholdField ? <label htmlFor={"plugin-config-" + plugin.id + "-match-threshold"}>{matchThresholdField.label}<input id={"plugin-config-" + plugin.id + "-match-threshold"} type="number" min={matchThresholdField.minimum ?? 1} max={matchThresholdField.maximum ?? 100} value={matchThreshold} onChange={(event) => setMatchThreshold(Number(event.target.value))} /><small>{matchThresholdField.description}</small></label> : null}
                 {existingInfoPolicyField ? <label htmlFor={"plugin-config-" + plugin.id + "-existing-info-policy"}>{existingInfoPolicyField.label}<select id={"plugin-config-" + plugin.id + "-existing-info-policy"} value={existingInfoPolicy} onChange={(event) => setExistingInfoPolicy(event.target.value)}>{(existingInfoPolicyField.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{existingInfoPolicyField.description}</small></label> : null}
                 {mediaInfoEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={mediaInfoEnabled} onChange={(event) => setMediaInfoEnabled(event.target.checked)} /> <span><strong>{mediaInfoEnabledField.label}</strong><small>{mediaInfoEnabledField.description}</small></span></label> : null}
                 {thumbnailEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={thumbnailEnabled} onChange={(event) => setThumbnailEnabled(event.target.checked)} /> <span><strong>{thumbnailEnabledField.label}</strong><small>{thumbnailEnabledField.description}</small></span></label> : null}
                 {thumbnailPositionPercentField ? <label htmlFor={"plugin-config-" + plugin.id + "-thumbnail-position-percent"}>{thumbnailPositionPercentField.label}<input id={"plugin-config-" + plugin.id + "-thumbnail-position-percent"} type="number" required={thumbnailPositionPercentField.required} min={thumbnailPositionPercentField.minimum ?? 1} max={thumbnailPositionPercentField.maximum ?? 99} value={thumbnailPositionPercent} onChange={(event) => setThumbnailPositionPercent(Number(event.target.value))} /><small>{thumbnailPositionPercentField.description}</small></label> : null}
                 {writeSidecarsField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={writeSidecars} onChange={(event) => setWriteSidecars(event.target.checked)} /> <span><strong>{writeSidecarsField.label}</strong><small>{writeSidecarsField.description}</small></span></label> : null}
+                {scheduleField ? <label htmlFor={"plugin-config-" + plugin.id + "-schedule"}>{scheduleField.label}<input id={"plugin-config-" + plugin.id + "-schedule"} type="text" required={scheduleField.required} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="0 3 * * *" /><small>{scheduleField.description}</small></label> : null}
+              </> : isChapterSource ? <>
+                {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
+                {introWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-intro-window"}>{introWindowField.label}<input id={"plugin-config-" + plugin.id + "-intro-window"} type="number" min={introWindowField.minimum ?? 15} max={introWindowField.maximum ?? 300} value={introWindowSeconds} onChange={(event) => setIntroWindowSeconds(Number(event.target.value))} /><small>{introWindowField.description}</small></label> : null}
+                {creditsWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-credits-window"}>{creditsWindowField.label}<input id={"plugin-config-" + plugin.id + "-credits-window"} type="number" min={creditsWindowField.minimum ?? 15} max={creditsWindowField.maximum ?? 600} value={creditsWindowSeconds} onChange={(event) => setCreditsWindowSeconds(Number(event.target.value))} /><small>{creditsWindowField.description}</small></label> : null}
+                {matchThresholdField ? <label htmlFor={"plugin-config-" + plugin.id + "-match-threshold"}>{matchThresholdField.label}<input id={"plugin-config-" + plugin.id + "-match-threshold"} type="number" min={matchThresholdField.minimum ?? 1} max={matchThresholdField.maximum ?? 100} value={matchThreshold} onChange={(event) => setMatchThreshold(Number(event.target.value))} /><small>{matchThresholdField.description}</small></label> : null}
                 {scheduleField ? <label htmlFor={"plugin-config-" + plugin.id + "-schedule"}>{scheduleField.label}<input id={"plugin-config-" + plugin.id + "-schedule"} type="text" required={scheduleField.required} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="0 3 * * *" /><small>{scheduleField.description}</small></label> : null}
               </> : <>
                 {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空使用插件默认凭据" autoComplete="new-password" /></label> : null}

@@ -23,6 +23,7 @@ pub struct LibraryRecord {
     pub name: String,
     pub kind: LibraryKind,
     pub scraper_id: Option<String>,
+    pub chapter_source_id: Option<String>,
     pub cover_image_path: Option<String>,
     pub cover_image_content_type: Option<String>,
     pub cover_image_size: Option<i64>,
@@ -60,6 +61,10 @@ impl LibraryKind {
             Self::Series => "SERIES",
             Self::Mixed => "MIXED",
         }
+    }
+
+    pub const fn supports_chapter_source(self) -> bool {
+        matches!(self, Self::Series | Self::Mixed)
     }
 }
 

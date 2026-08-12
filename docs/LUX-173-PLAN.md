@@ -1,57 +1,51 @@
-# LUX-173：SQLite → PostgreSQL 离线迁移与一键 Compose
+# LUX-173 实施计划：片头片尾章节标记存储
 
 ## 目标
 
-让已有 SQLite 实例在停机窗口内安全迁移到 PostgreSQL，同时保留 SQLite 作为可直接回滚的事实副本。
-迁移是管理员显式执行的运维动作，不进入 Lux HTTP 请求和正常启动路径。
+为每个 `media_source` 建立片头片尾章节标记表，作为后续 Emby 输出和检测插件的服务器 DB
+事实来源。当前任务只建立存储合同，不提前实现 LUX-174 至 LUX-176。
 
-## 不变量
+## 已确认合同
 
-- 源库始终以 SQLite `mode=ro` 打开，迁移工具不写 `/config`。
-- PostgreSQL 密码仅从 `LUX_MIGRATE_POSTGRES_PASSWORD` 环境变量读取。
-- 目标 schema 由当前 `migrations-postgres` 创建，且迁移前业务表必须为空。
-- 全部业务复制、任务状态归一和搜索重建使用同一个目标事务。
-- `_sqlx_migrations`、SQLite FTS5 影子表和可重建搜索数据不从源库复制。
-- 成功前不创建或改写 `database.json`；切换由管理员在验证后显式完成。
+- 章节归属物理媒体源，不归属逻辑条目。
+- 当前只允许 `INTRO_START`、`INTRO_END`、`CREDITS_START`；不允许普通 `CHAPTER`。
+- 当前唯一章节来源是后续 `chapter_detector` 插件；每条记录必须有插件 ID 和 0 到 1 的置信度。
+- 每个插件对同一媒体源的每种标记最多一条，起点和 `chapter_index` 必须非负。
+- Lux 不主动读取容器章节，现有 ffprobe 参数、NFO/EDL 和媒体字节保持不变。
+- 当前任务不写任何业务章节记录；LUX-175 负责校验并原子替换插件检测结果。
 
-## 实施切片
+## 增量与精确文件
 
-1. 规格与迁移清单
-   - 建立稳定的业务表依赖顺序、排除清单与状态归一规则。
-   - 单元测试先验证计划完整性、无重复表和敏感参数边界。
-2. 离线迁移命令
-   - 新增 `lux-db-migrate sqlite-to-postgres`。
-   - SQLite 使用专用只读连接，PostgreSQL 先验证空库并运行迁移。
-   - 每表分批读取，按 SQLite 动态值类型绑定到 PostgreSQL。
-   - 事务内重建 `media_search`，逐表比对计数后提交。
-3. 集成与运维
-   - SQLite fixture 覆盖文本、BLOB、NULL、浮点及任务状态。
-   - ignored PostgreSQL 集成测试覆盖真实迁移、登录、查询和搜索。
-   - Compose 增加健康依赖和资源上限；文档给出快照、切换、验证和回滚步骤。
+### 增量 1：标记合同和迁移
 
-## 迁移顺序
+- `migrations/0055_media_chapters.sql`
+- `migrations-postgres/0010_media_chapters.sql`
+- `tests/storage.rs`
+- `tests/postgres_database.rs`
 
-父表先于子表：`lux_meta`、`users`、`libraries`、`library_roots`、`filesystem_entries`、
-`media_items`、`media_sources`，随后复制会话、权限、图片、流、任务、候选、播放、合集、审计、
-插件、弹幕和扫描工作队列表。`media_search` 最后从 `media_items` 与 `item_aliases` 重建。
+先写迁移失败测试，再实现 `media_chapters` 的来源级外键、特殊枚举、范围和唯一性约束。
+
+### 增量 2：回归与版本基线
+
+- 与 schema version 强绑定的现有测试文件（仅更新预期版本）
+- `tests/probe.rs`（仅运行现有回归，不修改探测合同）
+
+验证数据库版本升级不改变本地媒体或 STRM 探测行为。
 
 ## 验证
 
-```bash
-cargo test --locked --test database_migration
-cargo test --locked --test postgres_database_migration -- --ignored
-cargo build --locked --bin lux-db-migrate
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-docker compose config
-```
+- `cargo test --locked --test probe`
+- `cargo test --locked --test storage`
+- `cargo test --locked --test postgres_database -- --ignored`
+- `cargo build --locked`
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `uname -m`
 
-真实 NAS 数据迁移需另行记录停机时间、源/目标大小、逐表计数、登录、媒体浏览、搜索和 Range 播放；
-本机 ARM64 结果不代表飞牛 x86_64 性能。
+## 明确不做
 
-2026-08-13：SQLite 计划/参数单元测试 6/6、迁移 CLI 测试 2/2、Compose 默认及
-PostgreSQL profile 配置校验通过；在飞牛 x86_64 上的临时 PostgreSQL 17 容器完成真实往返测试，
-覆盖源文件不变、逐表计数、BLOB、管理员登录、媒体查询、中文搜索别名、RUNNING 状态恢复及
-非空目标拒绝。完整
-`cargo test --all-targets` 仍被既有 LUX-169 插件目录版本断言（期望 4、实际 6）阻断；完整 Clippy
-仅命中既有 `src/application/scanner.rs` 的 `nonminimal_bool`，均未在 LUX-173 中跨任务修改。
+- 不读取或保存容器普通章节。
+- 不返回 Emby `ChapterInfo`；属于 LUX-174。
+- 不增加检测任务、插件类型或 Chromaprint；属于 LUX-175。
+- 不修改媒体容器，不读写 NFO/EDL。

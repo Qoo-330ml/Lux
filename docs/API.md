@@ -53,6 +53,13 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/strm-probe-jobs/{jobId}`：查看单个 STRM 探测任务的状态、进度、并发、旁车开关和安全错误摘要。
 - `POST /api/v1/admin/strm-probe-jobs/{jobId}/cancel`：请求取消 STRM 探测任务，返回 202；worker 不再领取新媒体源。
 - `POST /api/v1/admin/strm-probe-jobs/{jobId}/retry`：重试失败或已取消的 STRM 探测任务，返回新的任务并异步执行 202。
+- `PUT /api/v1/admin/plugins/org.lux.intro-outro-detector/config`：只保存片头片尾插件的并发、开头/结尾窗口、匹配阈值和 Cron 参数；媒体库归属由 `chapterSourceId` 保存。旧 `libraryIds` 配置仅用于兼容迁移，不再作为调度事实来源。
+- `POST /api/v1/admin/libraries`：创建媒体库时可传 `chapterSourceId`；该字段仅剧集库或混合库可设置，省略或为 `null` 表示关闭片头片尾来源。
+- `PATCH /api/v1/admin/libraries/{libraryId}`：可更新 `chapterSourceId`。该字段仅剧集库或混合库可设置；值必须来自已安装、已启用且配置完整并声明 `chapters.detect` 或 `chapters.lookup` 的插件；传 `null` 清除选择。混合库仅对剧集/分集检测，运行时输出只返回当前库所选来源的章节标记，切换来源不会删除历史标记。
+- `GET /api/v1/admin/chapter-sources?page=1&pageSize=50`：分页列出可供媒体库选择的片头片尾数据源。
+- `POST /api/v1/admin/libraries/{libraryId}/chapter-detection`：管理员立即启动该媒体库的片头片尾检测任务，可选覆盖插件 ID、并发、窗口、阈值和 `forceRefresh`；不读取或探测容器普通章节。自动任务由媒体库选中的章节来源注册：本地音频检测默认每周运行，TheIntroDB 在线来源默认每天运行。
+- `GET /api/v1/admin/chapter-detection-jobs?page=1&pageSize=50&status=FAILED`、`GET /api/v1/admin/chapter-detection-jobs/{jobId}`：分页查看或读取检测任务。
+- `POST /api/v1/admin/chapter-detection-jobs/{jobId}/cancel`、`POST /api/v1/admin/chapter-detection-jobs/{jobId}/retry`：取消或重试检测任务；写操作需要管理员 Web session 和 CSRF。
 - `POST /api/v1/admin/libraries/{libraryId}/danmaku/match`：管理员提交 `{ "concurrency": 2, "overwrite": false }`，为已索引的本地视频创建异步弹幕匹配任务；成功返回 202，默认不覆盖已有同名 XML。
 - `GET /api/v1/admin/danmaku/match-jobs?page=1&pageSize=50&status=FAILED`：分页查看弹幕匹配任务；详情、取消和重试分别使用 `/api/v1/admin/danmaku/match-jobs/{jobId}`、`/cancel` 和 `/retry`。
 - `GET/PATCH /api/v1/admin/settings`：读取或调整 `serverName`、`resumePlayedPercent`（1-100）、`resumeMinTicks`（非负）和 `mediaStrategy`。`serverName` 会去除首尾空格，长度限制为 1-80 个字符，不接受控制字符。媒体策略的图像开关为 `poster`、`logo`、`thumbnail`、`banner`、`disc`、`artwork`、`wallpaper`，另有元数据/图片语言、地区、默认刮削器、`metadataRefreshMode`（`FILL_MISSING` 或 `FULL_REFRESH`）、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。旧策略 JSON 缺少新增字段时默认按 `FILL_MISSING` 处理。网络代理设置通过 `networkProxyUrl` 写入，支持 `http`、`https`、`socks4`、`socks4a`、`socks5` 和 `socks5h`；传 `null` 清除。响应中的 `networkProxy` 只返回脱敏地址、是否配置认证、来源和重启提示，不返回认证信息。写操作需要管理员 Web session 和 CSRF，响应不包含任何插件凭据。
@@ -78,6 +85,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - 插件包必须是 `.zip` 或开发用解压目录，根目录包含 `manifest.json`。Lux 启动时校验包格式、协议版本、平台架构、文件哈希和签名；校验失败的包不会运行。
 - 插件通过独立进程和 JSON-RPC 风格协议提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。
 - `media_probe` 插件必须声明 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。`org.lux.strm-media-info` 的 `media.probe` 只处理单个由宿主校验的不透明 STRM 目标，可为媒体信息和缩略图分别设置开关；目标可以是私网地址、公网地址、域名或路径。宿主负责并发、超时、取消、恢复、落库和可选旁车写回。播放和 PlaybackInfo 不触发该 RPC。
+- `chapter_detector` 插件必须声明 `category: "MEDIA"`，并至少声明 `chapters.detect` 或 `chapters.lookup`。`org.lux.intro-outro-detector` 使用 `chapters.detect` 比较宿主提取的有界音频指纹；`org.lux.theintrodb-chapter-source` 使用 `chapters.lookup`，只把已保存的 TMDb/TVDb/IMDb ID、季号、集号和可选时长交给在线插件，由插件访问固定的 TheIntroDB API。两者都不接收媒体路径或任务对象，宿主负责并发、超时、取消、恢复、结果落库和 Emby 章节映射。
 - 未安装、未启用、无可用凭据、运行失败或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
 插件包不从任意未登记的远程 URL 自动下载；远程安装只使用当前插件商店目录声明的 Release 包地址。插件 API、媒体库 API 和日志不返回插件配置中的敏感值；TMDb API Key 和 Read Access Token 只存在受限配置或外置插件运行时中。
@@ -145,9 +153,9 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET /Items/Counts`：返回当前用户可见媒体条目的 Emby 统计字段；支持 `UserId` 指定目标用户和 `IsFavorite=true|false` 按目标用户收藏状态过滤。Lux 当前支持电影、剧集、单集和合集计数，其余 Emby 类型返回 0；`ItemCount` 为过滤后所有可见目录条目（包含季度等层级条目）的总数。
 - `GET /Users/{userId}/Views`：返回电影媒体库视图。
 - `GET /Users/{userId}/Items/Root`、`GET /Items/Root?userId={userId}`：返回用户虚拟根目录；将该根 ID 作为 `ParentId` 并请求 `IncludeItemTypes=CollectionFolder` 时返回当前用户可见的媒体库文件夹。
-- `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`Recursive`、`StartIndex`、`Limit`、`IncludeItemTypes` 和 `ExcludeItemTypes`，`ParentId` 可指向虚拟根、媒体库、剧集或季度；网易爆米花首页使用的无 `ParentId`、无 `Recursive=true`、无 `IncludeItemTypes` 但带 `ExcludeItemTypes` 请求返回当前用户可见的媒体库 `CollectionFolder`，再按媒体库 ID 请求 `Items/Latest`；递归查询按排除类型过滤；默认从 0 开始、每页 50 条，单页上限 100。
-- `GET /Users/{userId}/Items`、`GET /Items`：另支持 `IsPlayed`、`IsFavorite`、`Years`、`SortBy` 和 `SortOrder`，筛选后再分页。
-- `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影、剧集和季度详情 DTO；目录和详情条目使用标准 `SortName`、`SeasonId`、`IndexNumber`、`ParentIndexNumber`、`PremiereDate`、`ProviderIds` 和用户权限相关的 `CanDownload` 字段，旧客户端使用的 `Index` 别名继续保留；请求列表 `Fields=Chapters` 时返回章节数组（当前无本地章节数据时为空数组）。文件夹类型返回 `ChildCount`/`RecursiveItemCount`，`UserData` 包含 `PlaybackPositionTicks`、`PlayedPercentage`、`Played`、`IsFavorite` 和 `PlayCount`。
+- `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`Recursive`、`StartIndex`、`Limit`、`IncludeItemTypes` 和 `ExcludeItemTypes`，`ParentId` 可指向虚拟根、媒体库、物理媒体目录、剧集或季度；电影扫描会为物理媒体目录建立稳定的 `FOLDER` 条目，普通电影列表和统计不会把这些内部目录项当成电影。网易爆米花首页使用的无 `ParentId`、无 `Recursive=true`、无 `IncludeItemTypes` 但带 `ExcludeItemTypes` 请求返回当前用户可见的媒体库 `CollectionFolder`，再按媒体库 ID 请求 `Items/Latest`；递归查询按排除类型过滤；默认从 0 开始、每页 50 条，单页上限 100。
+- `GET /Users/{userId}/Items`、`GET /Items`：另支持 `IsPlayed`、`IsFavorite`、`Years`、`SortBy` 和 `SortOrder`，筛选后再分页；`SortBy=DateCreated,SortName` 按 `DateCreated` 主排序并以标题稳定收尾。
+- `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影、剧集和季度详情 DTO；目录和详情条目使用标准 `SortName`、`SeasonId`、`IndexNumber`、`ParentIndexNumber`、`PremiereDate`、`ProviderIds` 和用户权限相关的 `CanDownload` 字段，旧客户端使用的 `Index` 别名继续保留；带 `Fields` 的列表按请求投影可选字段，缺失值不序列化为 JSON `null`，日期字段按 Emby 列表使用的 UTC ISO 时间格式输出；请求列表 `Fields=Chapters` 时返回章节数组（当前无本地章节数据时为空数组），章节元素使用 `StartPositionTicks`、`Name`、`MarkerType` 和 `ChapterIndex`。电影列表的 `ImageTags` 支持已索引的 `Primary`、`Logo`、`Thumb`、`Banner`、`Disc`、`Art` 和 `Wallpaper`，`BackdropImageTags` 保留所有背景图标签。文件夹类型返回 `ChildCount`/`RecursiveItemCount`，`UserData` 在没有播放位置时省略 `PlayedPercentage`，其余字段包含 `PlaybackPositionTicks`、`Played`、`IsFavorite` 和 `PlayCount`。
 - `GET /Shows/{seriesId}/Seasons`：按用户媒体库权限返回季度。
 - `GET /Shows/{seriesId}/Episodes?SeasonId={seasonId}&StartIndex=0&Limit=50`：返回剧集，可省略 `SeasonId` 获取整部剧集，支持分页。
 - `GET /Users/{userId}/Items/NextUp`：按该用户的播放状态返回未看完单集。

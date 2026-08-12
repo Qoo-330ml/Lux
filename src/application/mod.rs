@@ -2,6 +2,7 @@ pub mod access;
 pub mod admin_events;
 pub mod candidates;
 pub mod catalog;
+pub mod chapter_detector;
 pub mod collections;
 pub mod danmaku;
 pub mod database_setup;

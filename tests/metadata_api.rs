@@ -205,9 +205,10 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     sqlx::query(
         "INSERT INTO metadata_candidates
          (id, item_id, provider, provider_id, candidate_json, score, status, expires_at)
@@ -378,9 +379,10 @@ async fn admin_can_read_and_edit_item_metadata_with_field_locks()
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
 
     let (base_url, server) = start_server(config, database, setup, None).await?;
     let client = reqwest::Client::new();
@@ -613,9 +615,10 @@ async fn admin_can_start_a_scan_from_an_item_action() -> Result<(), Box<dyn std:
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
 
     let (base_url, server) = start_server(config, database, setup, None).await?;
     let client = reqwest::Client::new();
@@ -660,9 +663,10 @@ async fn admin_can_edit_an_external_subtitle_stream() -> Result<(), Box<dyn std:
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
         .bind(&item_id)
         .fetch_one(database.pool())
@@ -746,9 +750,10 @@ async fn admin_can_delete_a_media_source_and_matching_sidecars()
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
         .bind(&item_id)
         .fetch_one(database.pool())
@@ -805,9 +810,10 @@ async fn admin_can_remove_a_missing_media_source_from_lux() -> Result<(), Box<dy
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
         .bind(&item_id)
         .fetch_one(database.pool())

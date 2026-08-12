@@ -13,10 +13,17 @@ pub const PLUGIN_CATEGORY_NETWORK: &str = "NETWORK";
 pub const PLUGIN_TYPE_MEDIA_PROBE: &str = "media_probe";
 pub const PLUGIN_TYPE_IP_LOCATION: &str = "ip_location";
 pub const PLUGIN_TYPE_STRM_RESOLVER: &str = "strm_resolver";
+pub const PLUGIN_TYPE_CHAPTER_DETECTOR: &str = "chapter_detector";
 pub const MEDIA_PROBE_CAPABILITY: &str = "media.probe";
 pub const IP_LOCATION_CAPABILITY: &str = "ip.location";
 pub const STRM_RESOLVE_CAPABILITY: &str = "strm.resolve";
+pub const CHAPTER_DETECT_CAPABILITY: &str = "chapters.detect";
+pub const CHAPTER_LOOKUP_CAPABILITY: &str = "chapters.lookup";
 pub const STRM_RESOLVE_METHOD: &str = "strm.resolve";
+pub const CHAPTER_DETECT_METHOD: &str = "chapters.detect";
+pub const CHAPTER_LOOKUP_METHOD: &str = "chapters.lookup";
+pub const CHAPTER_FINGERPRINT_SAMPLE_RATE: u32 = 11_025;
+pub const CHAPTER_FINGERPRINT_POINT_DURATION_TICKS: i64 = 1_238_095;
 pub const CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES: &str = "media-libraries";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -120,6 +127,22 @@ impl PluginManifest {
                 {
                     return Err(PluginManifestError::Invalid(
                         "STRM resolver plugins must declare strm.resolve".to_owned(),
+                    ));
+                }
+            }
+            PLUGIN_TYPE_CHAPTER_DETECTOR => {
+                if self.category != PLUGIN_CATEGORY_MEDIA {
+                    return Err(PluginManifestError::Invalid(
+                        "chapter detector plugins must use the MEDIA category".to_owned(),
+                    ));
+                }
+                if !self.capabilities.iter().any(|capability| {
+                    capability == CHAPTER_DETECT_CAPABILITY
+                        || capability == CHAPTER_LOOKUP_CAPABILITY
+                }) {
+                    return Err(PluginManifestError::Invalid(
+                        "chapter detector plugins must declare chapters.detect or chapters.lookup"
+                            .to_owned(),
                     ));
                 }
             }
@@ -430,6 +453,85 @@ pub struct MediaProbeRpcResult {
     pub streams: Vec<MediaProbeRpcStream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_jpeg_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChapterDetectRpcRequest {
+    pub episodes: Vec<ChapterFingerprintRpcEpisode>,
+    pub intro_window_ticks: i64,
+    pub credits_window_ticks: i64,
+    pub minimum_match_duration_ticks: i64,
+    pub match_threshold: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChapterFingerprintRpcEpisode {
+    pub key: String,
+    pub sample_rate: u32,
+    pub fingerprint_point_duration_ticks: i64,
+    pub intro_fingerprint_base64: String,
+    pub credits_fingerprint_base64: String,
+    pub intro_window_start_ticks: i64,
+    pub credits_window_start_ticks: i64,
+    pub intro_window_duration_ticks: i64,
+    pub credits_window_duration_ticks: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChapterDetectRpcResult {
+    #[serde(default)]
+    pub markers: Vec<ChapterDetectRpcMarker>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChapterLookupRpcRequest {
+    pub episodes: Vec<ChapterLookupRpcEpisode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChapterLookupRpcEpisode {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmdb_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tvdb_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imdb_id: Option<String>,
+    pub season_number: i64,
+    pub episode_number: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ticks: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChapterLookupRpcResult {
+    #[serde(default)]
+    pub markers: Vec<ChapterDetectRpcMarker>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChapterDetectRpcMarker {
+    pub key: String,
+    pub marker_type: ChapterDetectMarkerType,
+    pub start_position_ticks: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub confidence: f64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ChapterDetectMarkerType {
+    IntroStart,
+    IntroEnd,
+    CreditsStart,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

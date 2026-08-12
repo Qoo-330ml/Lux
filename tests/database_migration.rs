@@ -22,6 +22,14 @@ fn migration_plan_is_unique_and_orders_core_dependencies() {
     assert_before(&names, "library_roots", "filesystem_entries");
     assert_before(&names, "media_items", "media_sources");
     assert_before(&names, "media_sources", "media_streams");
+    assert_before(&names, "media_sources", "media_chapters");
+    assert_before(&names, "libraries", "chapter_detection_jobs");
+    assert_before(
+        &names,
+        "chapter_detection_jobs",
+        "chapter_detection_job_items",
+    );
+    assert_before(&names, "media_sources", "chapter_detection_source_states");
     assert_before(&names, "scan_jobs", "scan_job_events");
     assert_before(&names, "collections", "collection_items");
 }
@@ -78,6 +86,7 @@ fn all_persistent_job_families_have_state_normalization() {
         "metadata_reidentify_jobs",
         "strm_probe_jobs",
         "danmaku_match_jobs",
+        "chapter_detection_jobs",
     ] {
         assert!(tables.contains(&expected), "{expected}");
     }

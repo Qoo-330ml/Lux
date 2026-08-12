@@ -93,6 +93,59 @@ async fn new_libraries_enable_realtime_indexing_by_default()
 }
 
 #[tokio::test]
+async fn chapter_sources_are_only_allowed_for_series_or_mixed_libraries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let service = LibraryService::new(database.clone());
+
+    let movie_error = service
+        .create_library_with_scraper_and_chapter_source(
+            "Movies",
+            LibraryKind::Movie,
+            false,
+            None,
+            Some("org.lux.intro-outro-detector"),
+            false,
+        )
+        .await
+        .expect_err("movie libraries cannot select a chapter source");
+    assert!(matches!(
+        movie_error,
+        LibraryServiceError::InvalidChapterSourceId
+    ));
+
+    let mixed = service
+        .create_library_with_scraper_and_chapter_source(
+            "Mixed",
+            LibraryKind::Mixed,
+            false,
+            None,
+            Some("org.lux.intro-outro-detector"),
+            false,
+        )
+        .await?;
+    let updated = service
+        .update_settings(
+            mixed.id,
+            luxd::application::libraries::LibrarySettingsPatch {
+                kind: Some(LibraryKind::Movie),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(updated.library.kind, LibraryKind::Movie);
+    assert_eq!(updated.library.chapter_source_id, None);
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn library_service_persists_multiple_roots_and_reports_overlap_rules()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

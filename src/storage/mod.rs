@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use sqlx::{
-    AnyPool, Executor, Row,
+    Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
 };
@@ -795,8 +795,8 @@ impl Database {
                 id, name, kind, is_enabled, realtime_watch_enabled,
                 realtime_metadata_auto_match_enabled,
                 reconciliation_schedule, metadata_schedule,
-                scan_concurrency, probe_concurrency, scraper_id
-            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+                scan_concurrency, probe_concurrency, scraper_id, chapter_source_id
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(library.id)
         .bind(library.name)
@@ -808,6 +808,7 @@ impl Database {
         .bind(library.scan_concurrency)
         .bind(library.probe_concurrency)
         .bind(library.scraper_id)
+        .bind(library.chapter_source_id)
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -883,7 +884,7 @@ impl Database {
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     realtime_metadata_auto_match_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
-                    scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
+                    scan_concurrency, probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
                     media_strategy_json
              FROM libraries ORDER BY name, id",
@@ -908,6 +909,7 @@ impl Database {
                     probe_concurrency: row.get("probe_concurrency"),
                     last_scan_at: row.get("last_scan_at"),
                     scraper_id: row.get("scraper_id"),
+                    chapter_source_id: row.get("chapter_source_id"),
                     cover_image_path: row.get("cover_image_path"),
                     cover_image_content_type: row.get("cover_image_content_type"),
                     cover_image_size: row.get("cover_image_size"),
@@ -930,7 +932,7 @@ impl Database {
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     realtime_metadata_auto_match_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
-                    scan_concurrency, probe_concurrency, last_scan_at, scraper_id,
+                    scan_concurrency, probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
                     media_strategy_json
              FROM libraries WHERE id = ?",
@@ -955,6 +957,7 @@ impl Database {
                 probe_concurrency: row.get("probe_concurrency"),
                 last_scan_at: row.get("last_scan_at"),
                 scraper_id: row.get("scraper_id"),
+                chapter_source_id: row.get("chapter_source_id"),
                 cover_image_path: row.get("cover_image_path"),
                 cover_image_content_type: row.get("cover_image_content_type"),
                 cover_image_size: row.get("cover_image_size"),
@@ -1184,6 +1187,21 @@ impl Database {
                 source,
             })?;
         }
+        if let Some(value) = settings.chapter_source_id {
+            self.query(
+                "UPDATE libraries
+                 SET chapter_source_id = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         if let Some(value) = settings.media_strategy_json {
             self.query(
                 "UPDATE libraries
@@ -1392,6 +1410,69 @@ impl Database {
         )
         .bind(schedule)
         .bind(database_flag(is_enabled))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn disable_chapter_detection_tasks(&self) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scheduled_task_configs
+             SET is_enabled = 0, cron_or_interval = NULL, updated_at = unixepoch()
+             WHERE task_type = 'CHAPTER_DETECTION'",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn upsert_chapter_detection_task(
+        &self,
+        library_id: &str,
+        plugin_id: &str,
+        schedule: &str,
+        is_enabled: bool,
+        concurrency: i64,
+        intro_window_seconds: i64,
+        credits_window_seconds: i64,
+        match_threshold: u32,
+    ) -> Result<(), StorageError> {
+        let resource_limit_json = format!(
+            "{{\"concurrency\":{concurrency},\"introWindowSeconds\":{intro_window_seconds},\"creditsWindowSeconds\":{credits_window_seconds},\"matchThreshold\":{match_threshold}}}"
+        );
+        self.query(
+            "INSERT INTO scheduled_task_configs (
+                owner_type, owner_id, task_type, task_name, task_description,
+                source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
+             ) VALUES (
+                'LIBRARY', ?, 'CHAPTER_DETECTION', '片头片尾检测',
+                '按插件配置比较同季度分集并保存片头片尾特殊章节。',
+                'PLUGIN', ?, ?, ?, ?
+             )
+             ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                task_name = excluded.task_name,
+                task_description = excluded.task_description,
+                source_type = excluded.source_type,
+                plugin_id = excluded.plugin_id,
+                cron_or_interval = excluded.cron_or_interval,
+                is_enabled = excluded.is_enabled,
+                resource_limit_json = excluded.resource_limit_json,
+                updated_at = unixepoch()",
+        )
+        .bind(library_id)
+        .bind(plugin_id)
+        .bind(schedule)
+        .bind(database_flag(is_enabled))
+        .bind(resource_limit_json)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -4234,6 +4315,14 @@ impl Database {
         filesystem_entry_id: &str,
         size: i64,
     ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         self.query(
             "UPDATE media_sources
              SET size = ?, probe_status = 'PENDING', probe_error = NULL,
@@ -4242,13 +4331,32 @@ impl Database {
         )
         .bind(size)
         .bind(filesystem_entry_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        self.query(
+            "DELETE FROM media_chapters
+             WHERE media_source_id IN (
+                 SELECT id FROM media_sources WHERE filesystem_entry_id = ?
+             )",
+        )
+        .bind(filesystem_entry_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn update_media_source_strm_target(
@@ -4518,6 +4626,173 @@ impl Database {
         })
     }
 
+    async fn ensure_movie_parent_folder_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        relative_path: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let directory = relative_path
+            .rsplit_once('/')
+            .map(|(directory, _)| directory)
+            .or_else(|| {
+                relative_path
+                    .rsplit_once('\\')
+                    .map(|(directory, _)| directory)
+            })
+            .unwrap_or_default();
+        let mut parent_folder_id = None;
+        let mut parent_id = library_id.to_owned();
+        let mut directory_key = String::new();
+        for component in directory.split(['/', '\\']) {
+            if component.is_empty() || component == "." {
+                continue;
+            }
+            if !directory_key.is_empty() {
+                directory_key.push('/');
+            }
+            directory_key.push_str(component);
+            let identity_key = format!("folder:{library_root_id}:{directory_key}");
+            let folder_id = self
+                .query_scalar::<String>("SELECT id FROM media_items WHERE identity_key = ? LIMIT 1")
+                .bind(&identity_key)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let folder_id = if let Some(folder_id) = folder_id {
+                self.query(
+                    "UPDATE media_items
+                     SET library_id = ?, item_type = 'FOLDER', parent_id = ?,
+                         title = ?, sort_title = ?, original_title = ?,
+                         identification_status = 'LOCAL_CONFIRMED', removed_at = NULL
+                     WHERE id = ?",
+                )
+                .bind(library_id)
+                .bind(&parent_id)
+                .bind(component)
+                .bind(component.to_ascii_lowercase())
+                .bind(component)
+                .bind(&folder_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                folder_id
+            } else {
+                let folder_id = Uuid::now_v7().to_string();
+                self.query(
+                    "INSERT INTO media_items (
+                        id, library_id, item_type, parent_id, title, sort_title,
+                        original_title, identification_status, identity_key
+                    ) VALUES (?, ?, 'FOLDER', ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+                )
+                .bind(&folder_id)
+                .bind(library_id)
+                .bind(&parent_id)
+                .bind(component)
+                .bind(component.to_ascii_lowercase())
+                .bind(component)
+                .bind(&identity_key)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                folder_id
+            };
+            parent_id = folder_id.clone();
+            parent_folder_id = Some(folder_id);
+        }
+        Ok(parent_folder_id)
+    }
+
+    pub(crate) async fn repair_movie_parent_folder(
+        &self,
+        library_id: &str,
+        library_root_id: &str,
+        relative_path: &str,
+        item_id: &str,
+    ) -> Result<(), StorageError> {
+        let expected_identity_key = movie_parent_folder_identity(library_root_id, relative_path);
+        let parent_is_current = if let Some(expected_identity_key) = expected_identity_key {
+            self.query_scalar::<i64>(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM media_items movie
+                     JOIN media_items parent ON parent.id = movie.parent_id
+                     WHERE movie.id = ? AND movie.item_type = 'MOVIE'
+                       AND parent.item_type = 'FOLDER'
+                       AND parent.identity_key = ? AND parent.removed_at IS NULL
+                 )",
+            )
+            .bind(item_id)
+            .bind(expected_identity_key)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value| value != 0)
+        } else {
+            self.query_scalar::<i64>(
+                "SELECT EXISTS (
+                     SELECT 1 FROM media_items
+                     WHERE id = ? AND item_type = 'MOVIE' AND parent_id IS NULL
+                 )",
+            )
+            .bind(item_id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value| value != 0)
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if parent_is_current {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let parent_folder_id = self
+            .ensure_movie_parent_folder_in_transaction(
+                &mut transaction,
+                library_id,
+                library_root_id,
+                relative_path,
+            )
+            .await?;
+        self.query(
+            "UPDATE media_items SET parent_id = ?
+             WHERE id = ? AND item_type = 'MOVIE'",
+        )
+        .bind(parent_folder_id.as_deref())
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn insert_movie_files_batch(
         &self,
         library_id: &str,
@@ -4558,11 +4833,21 @@ impl Database {
                 source,
             })?;
 
+            let parent_folder_id = self
+                .ensure_movie_parent_folder_in_transaction(
+                    &mut transaction,
+                    library_id,
+                    library_root_id,
+                    &file.relative_path,
+                )
+                .await?;
+
             let existing_item_id = match file.production_year {
                 Some(year) => {
                     self.query_scalar::<String>(
                         "SELECT id FROM media_items
-                         WHERE library_id = ? AND sort_title = ? AND production_year = ?
+                         WHERE library_id = ? AND item_type = 'MOVIE'
+                           AND sort_title = ? AND production_year = ?
                            AND removed_at IS NULL
                          LIMIT 1",
                     )
@@ -4575,7 +4860,8 @@ impl Database {
                 None => {
                     self.query_scalar::<String>(
                         "SELECT id FROM media_items
-                         WHERE library_id = ? AND sort_title = ? AND production_year IS NULL
+                         WHERE library_id = ? AND item_type = 'MOVIE'
+                           AND sort_title = ? AND production_year IS NULL
                            AND removed_at IS NULL
                          LIMIT 1",
                     )
@@ -4590,17 +4876,30 @@ impl Database {
                 source,
             })?;
             let (item_id, is_new_item) = if let Some(item_id) = existing_item_id {
+                self.query(
+                    "UPDATE media_items SET parent_id = ?
+                     WHERE id = ? AND item_type = 'MOVIE'",
+                )
+                .bind(parent_folder_id.as_deref())
+                .bind(&item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
                 (item_id, false)
             } else {
                 let item_id = Uuid::now_v7().to_string();
                 self.query(
                     "INSERT INTO media_items (
-                        id, library_id, item_type, title, sort_title,
+                        id, library_id, item_type, parent_id, title, sort_title,
                         original_title, production_year, identification_status
-                    ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+                    ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
                 )
                 .bind(&item_id)
                 .bind(library_id)
+                .bind(parent_folder_id.as_deref())
                 .bind(&file.title)
                 .bind(&file.sort_title)
                 .bind(&file.original_title)
@@ -4661,7 +4960,8 @@ impl Database {
                 self.query(
                     "SELECT id
                      FROM media_items
-                     WHERE library_id = ? AND sort_title = ? AND production_year = ?
+                     WHERE library_id = ? AND item_type = 'MOVIE'
+                       AND sort_title = ? AND production_year = ?
                        AND removed_at IS NULL",
                 )
                 .bind(library_id)
@@ -4674,7 +4974,8 @@ impl Database {
                 self.query(
                     "SELECT id
                      FROM media_items
-                     WHERE library_id = ? AND sort_title = ? AND production_year IS NULL
+                     WHERE library_id = ? AND item_type = 'MOVIE'
+                       AND sort_title = ? AND production_year IS NULL
                        AND removed_at IS NULL",
                 )
                 .bind(library_id)
@@ -5413,12 +5714,14 @@ impl Database {
             Some(_) => format!(
                 "SELECT COUNT(*) FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.library_id = ? AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}"
+                 WHERE mi.library_id = ? AND mi.item_type <> 'FOLDER'
+                   AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}"
             ),
             None => format!(
                 "SELECT COUNT(*) FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}"
+                 WHERE mi.item_type <> 'FOLDER'
+                   AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}"
             ),
         };
         let mut statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(query));
@@ -5467,6 +5770,7 @@ impl Database {
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE mi.removed_at IS NULL
                AND mi.library_id IN ({library_placeholders})
+               AND mi.item_type <> 'FOLDER'
                {CATALOG_VISIBLE_PREDICATE}
                {favorite_filter}"
         );
@@ -5547,7 +5851,8 @@ impl Database {
             "SELECT mi.id FROM media_search
              JOIN media_items mi ON mi.id = media_search.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE media_search MATCH ? AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}{}",
+             WHERE media_search MATCH ? AND mi.removed_at IS NULL
+               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
         );
         // Complete-token searches are served by FTS alone. The LIKE branch remains
@@ -5577,7 +5882,8 @@ impl Database {
              WHERE (mi.title LIKE ? OR COALESCE(mi.original_title, '') LIKE ?
                     OR EXISTS (SELECT 1 FROM item_aliases ia
                                WHERE ia.item_id = mi.id AND ia.alias LIKE ?))
-               AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}{}",
+               AND mi.removed_at IS NULL
+               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
         );
         let like_page_query = format!(
@@ -5641,7 +5947,8 @@ impl Database {
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE (ms.title ILIKE ? ESCAPE '\\' OR ms.original_title ILIKE ? ESCAPE '\\'
                     OR ms.aliases ILIKE ? ESCAPE '\\')
-               AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}{}",
+               AND mi.removed_at IS NULL
+               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
         );
         let page_query = format!(
@@ -5714,7 +6021,8 @@ impl Database {
         let count_query = format!(
             "SELECT COUNT(*) FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+             WHERE mi.removed_at IS NULL
+               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}
                AND mi.library_id IN ({placeholders})"
         );
         let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
@@ -5733,7 +6041,8 @@ impl Database {
             "SELECT mi.id
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+             WHERE mi.removed_at IS NULL
+               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}
                AND mi.library_id IN ({placeholders})
              ORDER BY mi.added_at DESC, mi.sort_title, mi.id
              LIMIT ? OFFSET ?"
@@ -6471,7 +6780,8 @@ impl Database {
                             mi.rating, mi.rating_source, mi.runtime_ticks
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                     WHERE mi.library_id = ? AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                 WHERE mi.library_id = ? AND mi.item_type <> 'FOLDER'
+                   AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                      ORDER BY mi.sort_title, mi.id
                      LIMIT ? OFFSET ?
                  ) mi
@@ -6521,7 +6831,8 @@ impl Database {
                             mi.rating, mi.rating_source, mi.runtime_ticks
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                     WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                     WHERE mi.item_type <> 'FOLDER'
+                       AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                      ORDER BY mi.sort_title, mi.id
                      LIMIT ? OFFSET ?
                  ) mi
@@ -6710,6 +7021,65 @@ impl Database {
             }
         }
         Ok(details)
+    }
+
+    pub(crate) async fn list_media_chapters_by_source_ids(
+        &self,
+        source_ids: &[String],
+    ) -> Result<HashMap<String, Vec<StoredMediaChapter>>, StorageError> {
+        let mut chapters = HashMap::<String, Vec<StoredMediaChapter>>::new();
+        for source_ids in source_ids.chunks(500) {
+            if source_ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", source_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mc.media_source_id, mc.start_position_ticks, mc.name, mc.marker_type, mc.chapter_index
+                 FROM media_chapters mc
+                 JOIN media_sources ms ON ms.id = mc.media_source_id
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN libraries l ON l.id = mi.library_id
+                 WHERE mc.media_source_id IN ({placeholders})
+                   AND mi.item_type = 'EPISODE'
+                   AND l.chapter_source_id = mc.provider_id
+                 ORDER BY media_source_id, start_position_ticks,
+                          CASE marker_type
+                              WHEN 'INTRO_START' THEN 0
+                              WHEN 'INTRO_END' THEN 1
+                              WHEN 'CREDITS_START' THEN 2
+                              ELSE 99
+                          END,
+                          chapter_index, mc.id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for source_id in source_ids {
+                statement = statement.bind(source_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let source_id: String = row.get("media_source_id");
+                chapters
+                    .entry(source_id.clone())
+                    .or_default()
+                    .push(StoredMediaChapter {
+                        source_id,
+                        start_position_ticks: row.get("start_position_ticks"),
+                        name: row.get("name"),
+                        marker_type: row.get("marker_type"),
+                        chapter_index: row.get("chapter_index"),
+                    });
+            }
+        }
+        Ok(chapters)
     }
 
     async fn fetch_catalog_rows(
@@ -8062,6 +8432,677 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_chapter_detection_sources_page(
+        &self,
+        library_id: &str,
+        plugin_id: &str,
+        after_source_id: Option<&str>,
+        limit: i64,
+        require_fingerprint: bool,
+    ) -> Result<Vec<StoredChapterDetectionSource>, StorageError> {
+        let query_with_fingerprint =
+            "SELECT ms.id AS source_id, episode.id AS item_id, season.id AS season_id,
+                    fe.fingerprint, ms.duration_ticks,
+                    episode.provider_ids_json,
+                    series.provider_ids_json AS series_provider_ids_json,
+                    episode.season_number, episode.episode_number,
+                    states.input_fingerprint AS state_input_fingerprint,
+                    states.status AS state_status,
+                    states.last_checked_at AS state_last_checked_at,
+                    states.next_retry_at AS state_next_retry_at,
+                    states.intro_fingerprint AS state_intro_fingerprint,
+                    states.credits_fingerprint AS state_credits_fingerprint
+             FROM media_sources ms
+             JOIN media_items episode ON episode.id = ms.item_id
+             JOIN media_items season ON season.id = episode.parent_id
+             JOIN media_items series ON series.id = episode.series_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             LEFT JOIN chapter_detection_source_states states
+               ON states.source_id = ms.id AND states.plugin_id = ?
+             WHERE episode.library_id = ?
+               AND episode.item_type = 'EPISODE'
+               AND season.item_type = 'SEASON'
+               AND series.item_type = 'SERIES'
+               AND ms.source_kind = 'LOCAL_FILE'
+               AND episode.removed_at IS NULL
+               AND fe.is_missing = 0
+               AND fe.fingerprint IS NOT NULL
+               AND (ms.is_default = 1 OR NOT EXISTS (
+                   SELECT 1 FROM media_sources preferred
+                   WHERE preferred.item_id = episode.id AND preferred.is_default = 1
+               ))
+               AND (? IS NULL OR ms.id > ?)
+             ORDER BY ms.id
+             LIMIT ?";
+        let query_without_fingerprint =
+            "SELECT ms.id AS source_id, episode.id AS item_id, season.id AS season_id,
+                    fe.fingerprint, ms.duration_ticks,
+                    episode.provider_ids_json,
+                    series.provider_ids_json AS series_provider_ids_json,
+                    episode.season_number, episode.episode_number,
+                    states.input_fingerprint AS state_input_fingerprint,
+                    states.status AS state_status,
+                    states.last_checked_at AS state_last_checked_at,
+                    states.next_retry_at AS state_next_retry_at,
+                    states.intro_fingerprint AS state_intro_fingerprint,
+                    states.credits_fingerprint AS state_credits_fingerprint
+             FROM media_sources ms
+             JOIN media_items episode ON episode.id = ms.item_id
+             JOIN media_items season ON season.id = episode.parent_id
+             JOIN media_items series ON series.id = episode.series_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             LEFT JOIN chapter_detection_source_states states
+               ON states.source_id = ms.id AND states.plugin_id = ?
+             WHERE episode.library_id = ?
+               AND episode.item_type = 'EPISODE'
+               AND season.item_type = 'SEASON'
+               AND series.item_type = 'SERIES'
+               AND ms.source_kind = 'LOCAL_FILE'
+               AND episode.removed_at IS NULL
+               AND fe.is_missing = 0
+               AND (ms.is_default = 1 OR NOT EXISTS (
+                   SELECT 1 FROM media_sources preferred
+                   WHERE preferred.item_id = episode.id AND preferred.is_default = 1
+               ))
+               AND (? IS NULL OR ms.id > ?)
+             ORDER BY ms.id
+             LIMIT ?";
+        let limit = limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE);
+        let rows = if require_fingerprint {
+            self.query(query_with_fingerprint)
+                .bind(plugin_id)
+                .bind(library_id)
+                .bind(after_source_id)
+                .bind(after_source_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            self.query(query_without_fingerprint)
+                .bind(plugin_id)
+                .bind(library_id)
+                .bind(after_source_id)
+                .bind(after_source_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+        };
+        rows.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredChapterDetectionSource {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    season_id: row.get("season_id"),
+                    fingerprint: row.get("fingerprint"),
+                    duration_ticks: row.get("duration_ticks"),
+                    provider_ids_json: row.get("provider_ids_json"),
+                    series_provider_ids_json: row.get("series_provider_ids_json"),
+                    season_number: row.get("season_number"),
+                    episode_number: row.get("episode_number"),
+                    state: row.get::<Option<String>, _>("state_status").map(|status| {
+                        StoredChapterDetectionSourceState {
+                            input_fingerprint: row.get("state_input_fingerprint"),
+                            status,
+                            last_checked_at: row.get("state_last_checked_at"),
+                            next_retry_at: row.get("state_next_retry_at"),
+                            intro_fingerprint: row.get("state_intro_fingerprint"),
+                            credits_fingerprint: row.get("state_credits_fingerprint"),
+                        }
+                    }),
+                })
+                .collect()
+        })
+    }
+
+    pub(crate) async fn create_chapter_detection_job(
+        &self,
+        job: NewChapterDetectionJob<'_>,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "INSERT INTO chapter_detection_jobs (
+                id, library_id, plugin_id, status, concurrency,
+                intro_window_seconds, credits_window_seconds, match_threshold, total_count
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(job.id)
+        .bind(job.library_id)
+        .bind(job.plugin_id)
+        .bind(job.concurrency)
+        .bind(job.intro_window_seconds)
+        .bind(job.credits_window_seconds)
+        .bind(job.match_threshold)
+        .bind(job.total_count)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn insert_chapter_detection_job_items(
+        &self,
+        items: &[NewChapterDetectionJobItem<'_>],
+    ) -> Result<(), StorageError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for item in items {
+            self.query(
+                "INSERT INTO chapter_detection_job_items (
+                    job_id, source_id, item_id, season_id, source_fingerprint,
+                    input_fingerprint, is_context, status
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+            )
+            .bind(item.job_id)
+            .bind(item.source_id)
+            .bind(item.item_id)
+            .bind(item.season_id)
+            .bind(item.source_fingerprint)
+            .bind(item.input_fingerprint)
+            .bind(database_flag(item.is_context))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn upsert_chapter_detection_source_state(
+        &self,
+        source_id: &str,
+        plugin_id: &str,
+        input_fingerprint: &[u8],
+        status: &str,
+        last_checked_at: i64,
+        last_success_at: Option<i64>,
+        next_retry_at: Option<i64>,
+        error: Option<&str>,
+        intro_fingerprint: Option<&[u8]>,
+        credits_fingerprint: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO chapter_detection_source_states (
+                source_id, plugin_id, input_fingerprint, status, last_checked_at,
+                last_success_at, next_retry_at, error, intro_fingerprint,
+                credits_fingerprint, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+             ON CONFLICT(source_id, plugin_id) DO UPDATE SET
+                input_fingerprint = excluded.input_fingerprint,
+                status = excluded.status,
+                last_checked_at = excluded.last_checked_at,
+                last_success_at = excluded.last_success_at,
+                next_retry_at = excluded.next_retry_at,
+                error = excluded.error,
+                intro_fingerprint = excluded.intro_fingerprint,
+                credits_fingerprint = excluded.credits_fingerprint,
+                updated_at = unixepoch()",
+        )
+        .bind(source_id)
+        .bind(plugin_id)
+        .bind(input_fingerprint)
+        .bind(status)
+        .bind(last_checked_at)
+        .bind(last_success_at)
+        .bind(next_retry_at)
+        .bind(error)
+        .bind(intro_fingerprint)
+        .bind(credits_fingerprint)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn delete_chapter_detection_job(&self, id: &str) -> Result<(), StorageError> {
+        self.query("DELETE FROM chapter_detection_jobs WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn find_chapter_detection_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredChapterDetectionJob>, StorageError> {
+        self.query(
+            "SELECT id, library_id, plugin_id, status, concurrency,
+                    intro_window_seconds, credits_window_seconds, match_threshold,
+                    cursor, processed_count, total_count, cancel_requested, error
+             FROM chapter_detection_jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_chapter_detection_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn has_active_chapter_detection_job_for_library(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                SELECT 1 FROM chapter_detection_jobs
+                WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_chapter_detection_jobs(
+        &self,
+        status: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredChapterDetectionJob>, StorageError> {
+        let query = if status.is_some() {
+            "SELECT id, library_id, plugin_id, status, concurrency,
+                    intro_window_seconds, credits_window_seconds, match_threshold,
+                    cursor, processed_count, total_count, cancel_requested, error
+             FROM chapter_detection_jobs WHERE status = ?
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        } else {
+            "SELECT id, library_id, plugin_id, status, concurrency,
+                    intro_window_seconds, credits_window_seconds, match_threshold,
+                    cursor, processed_count, total_count, cancel_requested, error
+             FROM chapter_detection_jobs
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        };
+        let rows = if let Some(status) = status {
+            self.query(query)
+                .bind(status)
+                .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+                .bind(offset.max(0))
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            self.query(query)
+                .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+                .bind(offset.max(0))
+                .fetch_all(&self.pool)
+                .await
+        };
+        rows.map(|rows| rows.into_iter().map(stored_chapter_detection_job).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_active_chapter_detection_job_ids(
+        &self,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id FROM chapter_detection_jobs
+             WHERE status IN ('PENDING', 'RUNNING') ORDER BY created_at, id LIMIT 10000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_chapter_detection_job(&self, id: &str) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let result = self
+            .query(
+                "UPDATE chapter_detection_jobs
+                 SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
+                     updated_at = unixepoch()
+                 WHERE id = ? AND status = 'PENDING'",
+            )
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if result.rows_affected() == 1 {
+            self.query(
+                "UPDATE chapter_detection_job_items SET status = 'PENDING', updated_at = unixepoch()
+                 WHERE job_id = ? AND status = 'RUNNING'",
+            )
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn requeue_running_chapter_detection_items(
+        &self,
+        job_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE chapter_detection_job_items
+             SET status = 'PENDING', updated_at = unixepoch()
+             WHERE job_id = ? AND status = 'RUNNING'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_pending_chapter_detection_items(
+        &self,
+        job_id: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredChapterDetectionItem>, StorageError> {
+        self.query(
+            "SELECT cdi.source_id, cdi.season_id,
+                    cdi.source_fingerprint,
+                    cdi.input_fingerprint, cdi.is_context,
+                    states.intro_fingerprint, states.credits_fingerprint,
+                    ms.duration_ticks,
+                    lr.canonical_path AS root_path, fe.relative_path,
+                    item.provider_ids_json,
+                    series.provider_ids_json AS series_provider_ids_json,
+                    item.season_number, item.episode_number
+             FROM chapter_detection_job_items cdi
+             JOIN chapter_detection_jobs job ON job.id = cdi.job_id
+             JOIN media_sources ms ON ms.id = cdi.source_id
+             JOIN media_items item ON item.id = cdi.item_id
+             LEFT JOIN media_items series ON series.id = item.series_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             LEFT JOIN chapter_detection_source_states states
+               ON states.source_id = cdi.source_id AND states.plugin_id = job.plugin_id
+             WHERE cdi.job_id = ? AND cdi.status = 'PENDING'
+               AND ms.source_kind = 'LOCAL_FILE'
+             ORDER BY cdi.season_id, cdi.source_id
+             LIMIT ?",
+        )
+        .bind(job_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredChapterDetectionItem {
+                    source_id: row.get("source_id"),
+                    season_id: row.get("season_id"),
+                    source_fingerprint: row.get("source_fingerprint"),
+                    input_fingerprint: row.get("input_fingerprint"),
+                    is_context: row.get::<i64, _>("is_context") != 0,
+                    intro_fingerprint: row.get("intro_fingerprint"),
+                    credits_fingerprint: row.get("credits_fingerprint"),
+                    duration_ticks: row.get("duration_ticks"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                    provider_ids_json: row.get("provider_ids_json"),
+                    series_provider_ids_json: row.get("series_provider_ids_json"),
+                    season_number: row.get("season_number"),
+                    episode_number: row.get("episode_number"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_chapter_detection_item_status(
+        &self,
+        job_id: &str,
+        source_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE chapter_detection_job_items
+             SET status = ?, error = ?, updated_at = unixepoch()
+             WHERE job_id = ? AND source_id = ?",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(job_id)
+        .bind(source_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_chapter_detection_job_progress(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+        processed_count: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE chapter_detection_jobs
+             SET cursor = ?, processed_count = ?, updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING'",
+        )
+        .bind(cursor)
+        .bind(processed_count)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn chapter_detection_job_cancel_requested(
+        &self,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar("SELECT cancel_requested FROM chapter_detection_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|value: i64| value != 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn request_chapter_detection_job_cancel(
+        &self,
+        id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE chapter_detection_jobs SET cancel_requested = 1, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_chapter_detection_job(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE chapter_detection_jobs
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn replace_detected_media_chapters(
+        &self,
+        source_id: &str,
+        provider_id: &str,
+        source_fingerprint: &[u8],
+        markers: &[NewMediaChapterMarker],
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let current = if source_fingerprint.is_empty() {
+            None
+        } else {
+            self.query_scalar::<Vec<u8>>(
+                "SELECT fe.fingerprint
+                 FROM media_sources ms
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 WHERE ms.id = ? AND ms.source_kind = 'LOCAL_FILE' AND fe.is_missing = 0",
+            )
+            .bind(source_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        };
+        if !source_fingerprint.is_empty() && current.as_deref() != Some(source_fingerprint) {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        self.query("DELETE FROM media_chapters WHERE media_source_id = ? AND provider_id = ?")
+            .bind(source_id)
+            .bind(provider_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for marker in markers {
+            self.query(
+                "INSERT INTO media_chapters (
+                    id, media_source_id, start_position_ticks, name, marker_type,
+                    chapter_index, provider_id, confidence
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(source_id)
+            .bind(marker.start_position_ticks)
+            .bind(marker.name.clone())
+            .bind(marker.marker_type.clone())
+            .bind(marker.chapter_index)
+            .bind(provider_id)
+            .bind(marker.confidence)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn insert_hierarchy_item(
         &self,
         item: NewHierarchyItem<'_>,
@@ -8470,6 +9511,50 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_catalog_image_tags_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, Vec<StoredCatalogImageTag>>, StorageError> {
+        let mut tags = HashMap::with_capacity(item_ids.len());
+        for item_ids in item_ids.chunks(500) {
+            if item_ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT item_id, id, image_type, image_index
+                 FROM item_images
+                 WHERE item_id IN ({placeholders})
+                 ORDER BY item_id, image_type, image_index, id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in item_ids {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id: String = row.get("item_id");
+                tags.entry(item_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(StoredCatalogImageTag {
+                        id: row.get("id"),
+                        image_type: row.get("image_type"),
+                        image_index: row.get("image_index"),
+                    });
+            }
+        }
+        Ok(tags)
     }
 
     pub(crate) async fn find_item_image_source(
@@ -9003,6 +10088,7 @@ pub(crate) struct StoredLibrary {
     pub(crate) probe_concurrency: i64,
     pub(crate) last_scan_at: Option<i64>,
     pub(crate) scraper_id: Option<String>,
+    pub(crate) chapter_source_id: Option<String>,
     pub(crate) cover_image_path: Option<String>,
     pub(crate) cover_image_content_type: Option<String>,
     pub(crate) cover_image_size: Option<i64>,
@@ -9186,6 +10272,24 @@ fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
         thumbnail_enabled: row.get::<i64, _>("thumbnail_enabled") != 0,
         thumbnail_position_percent: row.get("thumbnail_position_percent"),
         target_scan_job_id: row.get("target_scan_job_id"),
+        cursor: row.get("cursor"),
+        processed_count: row.get("processed_count"),
+        total_count: row.get("total_count"),
+        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
+        error: row.get("error"),
+    }
+}
+
+fn stored_chapter_detection_job(row: sqlx::any::AnyRow) -> StoredChapterDetectionJob {
+    StoredChapterDetectionJob {
+        id: row.get("id"),
+        library_id: row.get("library_id"),
+        plugin_id: row.get("plugin_id"),
+        status: row.get("status"),
+        concurrency: row.get("concurrency"),
+        intro_window_seconds: row.get("intro_window_seconds"),
+        credits_window_seconds: row.get("credits_window_seconds"),
+        match_threshold: row.get("match_threshold"),
         cursor: row.get("cursor"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),
@@ -9435,6 +10539,15 @@ pub(crate) struct StoredCatalogDetail {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredMediaChapter {
+    pub(crate) source_id: String,
+    pub(crate) start_position_ticks: i64,
+    pub(crate) name: Option<String>,
+    pub(crate) marker_type: String,
+    pub(crate) chapter_index: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredUserItemState {
     pub(crate) position_ticks: i64,
     pub(crate) is_played: bool,
@@ -9535,6 +10648,13 @@ pub(crate) struct StoredItemImage {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredCatalogImageTag {
+    pub(crate) id: String,
+    pub(crate) image_type: String,
+    pub(crate) image_index: i64,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredLibraryPoster {
     pub(crate) item_id: String,
     pub(crate) local_path: String,
@@ -9574,6 +10694,9 @@ fn catalog_filter_where_clause<'a>(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if item_types.is_empty() {
+        where_clause.push_str(" AND mi.item_type <> 'FOLDER'");
+    }
     where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
     let mut binds = library_ids
         .iter()
@@ -9678,6 +10801,29 @@ fn catalog_filter_where_clause<'a>(
         binds.push(CatalogBind::Integer(i64::from(is_favorite)));
     }
     (where_clause, binds)
+}
+
+fn movie_parent_folder_identity(library_root_id: &str, relative_path: &str) -> Option<String> {
+    let directory = relative_path
+        .rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .or_else(|| {
+            relative_path
+                .rsplit_once('\\')
+                .map(|(directory, _)| directory)
+        })
+        .unwrap_or_default();
+    let mut directory_key = String::new();
+    for component in directory.split(['/', '\\']) {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if !directory_key.is_empty() {
+            directory_key.push('/');
+        }
+        directory_key.push_str(component);
+    }
+    (!directory_key.is_empty()).then(|| format!("folder:{library_root_id}:{directory_key}"))
 }
 
 const CATALOG_VISIBLE_PREDICATE: &str = " AND (
@@ -9946,6 +11092,94 @@ pub(crate) struct StoredSeriesMetadataSource {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredChapterDetectionSource {
+    pub(crate) source_id: String,
+    pub(crate) item_id: String,
+    pub(crate) season_id: String,
+    pub(crate) fingerprint: Option<Vec<u8>>,
+    pub(crate) duration_ticks: Option<i64>,
+    pub(crate) provider_ids_json: Option<String>,
+    pub(crate) series_provider_ids_json: Option<String>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
+    pub(crate) state: Option<StoredChapterDetectionSourceState>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredChapterDetectionSourceState {
+    pub(crate) input_fingerprint: Vec<u8>,
+    pub(crate) status: String,
+    pub(crate) last_checked_at: i64,
+    pub(crate) next_retry_at: Option<i64>,
+    pub(crate) intro_fingerprint: Option<Vec<u8>>,
+    pub(crate) credits_fingerprint: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredChapterDetectionItem {
+    pub(crate) source_id: String,
+    pub(crate) season_id: String,
+    pub(crate) source_fingerprint: Option<Vec<u8>>,
+    pub(crate) input_fingerprint: Vec<u8>,
+    pub(crate) is_context: bool,
+    pub(crate) intro_fingerprint: Option<Vec<u8>>,
+    pub(crate) credits_fingerprint: Option<Vec<u8>>,
+    pub(crate) duration_ticks: Option<i64>,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+    pub(crate) provider_ids_json: Option<String>,
+    pub(crate) series_provider_ids_json: Option<String>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredChapterDetectionJob {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) plugin_id: String,
+    pub(crate) status: String,
+    pub(crate) concurrency: i64,
+    pub(crate) intro_window_seconds: i64,
+    pub(crate) credits_window_seconds: i64,
+    pub(crate) match_threshold: f64,
+    pub(crate) cursor: Option<String>,
+    pub(crate) processed_count: i64,
+    pub(crate) total_count: i64,
+    pub(crate) cancel_requested: bool,
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) struct NewChapterDetectionJob<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) plugin_id: &'a str,
+    pub(crate) concurrency: i64,
+    pub(crate) intro_window_seconds: i64,
+    pub(crate) credits_window_seconds: i64,
+    pub(crate) match_threshold: f64,
+    pub(crate) total_count: i64,
+}
+
+pub(crate) struct NewChapterDetectionJobItem<'a> {
+    pub(crate) job_id: &'a str,
+    pub(crate) source_id: &'a str,
+    pub(crate) item_id: &'a str,
+    pub(crate) season_id: &'a str,
+    pub(crate) source_fingerprint: &'a [u8],
+    pub(crate) input_fingerprint: &'a [u8],
+    pub(crate) is_context: bool,
+}
+
+pub(crate) struct NewMediaChapterMarker {
+    pub(crate) start_position_ticks: i64,
+    pub(crate) name: Option<String>,
+    pub(crate) marker_type: String,
+    pub(crate) chapter_index: i64,
+    pub(crate) confidence: f64,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredWebSession {
     pub(crate) csrf_token_hash: Vec<u8>,
     pub(crate) user_id: String,
@@ -9996,6 +11230,7 @@ pub(crate) struct NewLibrary<'a> {
     pub(crate) scan_concurrency: i64,
     pub(crate) probe_concurrency: i64,
     pub(crate) scraper_id: Option<&'a str>,
+    pub(crate) chapter_source_id: Option<&'a str>,
 }
 
 pub(crate) struct MediaMetadataUpdate<'a> {
@@ -10050,6 +11285,7 @@ pub(crate) struct LibrarySettingsUpdate<'a> {
     pub(crate) scan_concurrency: Option<i64>,
     pub(crate) probe_concurrency: Option<i64>,
     pub(crate) scraper_id: Option<Option<&'a str>>,
+    pub(crate) chapter_source_id: Option<Option<&'a str>>,
     pub(crate) media_strategy_json: Option<Option<&'a str>>,
 }
 
@@ -10471,21 +11707,29 @@ mod tests {
             .expect("batch insert");
 
         assert_eq!(created_items, 1);
-        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
-            .fetch_one(database.pool())
-            .await
-            .expect("item count");
+        let item_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type <> 'FOLDER'")
+                .fetch_one(database.pool())
+                .await
+                .expect("item count");
         let source_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_sources")
             .fetch_one(database.pool())
             .await
             .expect("source count");
         assert_eq!(item_count, 1);
         assert_eq!(source_count, 2);
+        let folder_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type = 'FOLDER'")
+                .fetch_one(database.pool())
+                .await
+                .expect("folder count");
+        assert_eq!(folder_count, 1);
 
-        let item_id: String = sqlx::query_scalar("SELECT id FROM media_items")
-            .fetch_one(database.pool())
-            .await
-            .expect("item id");
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type <> 'FOLDER'")
+                .fetch_one(database.pool())
+                .await
+                .expect("item id");
         let rows = database
             .list_catalog_rows_by_ids(std::slice::from_ref(&item_id))
             .await
@@ -10712,5 +11956,45 @@ mod tests {
             "SELECT $1, '?' AS literal, \"?\" AS identifier, $2"
         );
         assert_eq!(adapt_sql_for_backend(DatabaseBackend::Sqlite, sql), sql);
+    }
+
+    #[tokio::test]
+    async fn chapter_detection_job_creation_is_atomic_per_library() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Series, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        fn new_job<'a>(id: &'a str, library_id: &'a str) -> NewChapterDetectionJob<'a> {
+            NewChapterDetectionJob {
+                id,
+                library_id,
+                plugin_id: "org.lux.intro-outro-detector",
+                concurrency: 1,
+                intro_window_seconds: 180,
+                credits_window_seconds: 180,
+                match_threshold: 0.8,
+                total_count: 0,
+            }
+        }
+
+        assert!(
+            database
+                .create_chapter_detection_job(new_job("chapter-job-1", &library_id))
+                .await
+                .expect("first job should be created")
+        );
+        assert!(
+            !database
+                .create_chapter_detection_job(new_job("chapter-job-2", &library_id))
+                .await
+                .expect("active duplicate should be rejected")
+        );
     }
 }

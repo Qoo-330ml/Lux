@@ -110,6 +110,7 @@ impl LibraryScanner {
                     if let Some((entry_id, quick_report)) = self
                         .scan_movie_file_if_unchanged(
                             &library_id_text,
+                            &root.id,
                             &root_path,
                             &path,
                             &existing_entries,
@@ -563,6 +564,16 @@ impl LibraryScanner {
             .await?
         {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+                if let Some(item_id) = existing_entry.item_id.as_deref() {
+                    self.database
+                        .repair_movie_parent_folder(
+                            library_id_text,
+                            &root.id,
+                            &relative_path,
+                            item_id,
+                        )
+                        .await?;
+                }
                 if is_strm {
                     self.database
                         .update_media_source_strm_target(
@@ -870,6 +881,7 @@ impl LibraryScanner {
     async fn scan_movie_file_if_unchanged(
         &self,
         library_id_text: &str,
+        library_root_id: &str,
         root_path: &Path,
         path: &Path,
         existing_entries: &HashMap<String, StoredFilesystemEntry>,
@@ -908,6 +920,16 @@ impl LibraryScanner {
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
             return Ok(None);
+        }
+        if let Some(item_id) = existing_entry.item_id.as_deref() {
+            self.database
+                .repair_movie_parent_folder(
+                    library_id_text,
+                    library_root_id,
+                    &relative_path,
+                    item_id,
+                )
+                .await?;
         }
         if has_multi_part_marker(file_name) {
             let Some(parsed_name) = parse_movie_filename(file_name) else {
@@ -1088,6 +1110,13 @@ impl LibraryScanner {
             .database
             .find_filesystem_entry(&root.id, &relative_path)
             .await?;
+        if let Some(existing_entry) = existing_entry.as_ref()
+            && let Some(item_id) = existing_entry.item_id.as_deref()
+        {
+            self.database
+                .repair_movie_parent_folder(library_id_text, &root.id, &relative_path, item_id)
+                .await?;
+        }
         if !has_multi_part_marker(file_name)
             && let Some(existing_entry) = existing_entry.as_ref()
         {
