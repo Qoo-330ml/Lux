@@ -546,6 +546,131 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
 }
 
 #[tokio::test]
+async fn unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Stable Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Stable.Movie.2026.mkv"), b"movie").await?;
+    let nfo = r#"<movie><title>稳定电影</title><rating>8.2</rating><genre>剧情</genre></movie>"#;
+    let nfo_path = movie_dir.join("movie.nfo");
+    tokio::fs::write(&nfo_path, nfo.as_bytes()).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let store = LocalNfoMetadataStore::new(database.clone());
+    let enricher = MetadataEnricher::new(database.clone()).with_nfo_store(store);
+    enricher.enrich_movie_library(library.id).await?;
+
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let before: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
+         FROM media_items WHERE id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::fs::write(&nfo_path, nfo.as_bytes()).await?;
+    let second = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(second.nfo_loaded, 1);
+
+    let after: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
+         FROM media_items WHERE id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn actor_relation_failure_does_not_discard_nfo_and_is_retried_separately()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Actor Retry Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Actor.Retry.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        r#"<movie><title>演员重试电影</title><rating>7.5</rating><actor><name>演员甲</name><role>角色甲</role><tmdbid>9</tmdbid></actor></movie>"#,
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let metadata_root = config.config_dir.join("metadata");
+    tokio::fs::create_dir_all(&metadata_root).await?;
+    let blocked_library_dir = metadata_root.join("library");
+    tokio::fs::write(&blocked_library_dir, b"temporarily blocked").await?;
+
+    let people = PeopleService::new(config.config_dir.clone());
+    let enricher = MetadataEnricher::new(database.clone())
+        .with_people(people.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+    let first = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(first.nfo_loaded, 1);
+    assert_eq!(first.nfo_failed, 0);
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let rich_json: Option<String> =
+        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(rich_json.is_some());
+    let metadata_fingerprint: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(metadata_fingerprint.is_some());
+
+    tokio::fs::remove_file(&blocked_library_dir).await?;
+    let second = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(second.nfo_loaded, 1);
+    let actors = people.list_item_actors(&item_id).await?;
+    assert_eq!(actors.len(), 1);
+    assert_eq!(actors[0].name, "演员甲");
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_enrichment_skips_conflicting_nfo_and_indexes_following_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

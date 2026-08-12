@@ -4,8 +4,9 @@ use luxd::{
         metadata::{MetadataEnricher, NfoMetadata},
         nfo::{
             LocalNfoMetadataStore, MovieNfoCredit, MovieNfoMetadata, NfoWriteService,
-            parse_local_nfo_actors, parse_local_nfo_details, parse_movie_nfo_actors,
-            parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
+            parse_local_nfo_actors, parse_local_nfo_details, parse_local_nfo_projection,
+            parse_movie_nfo_actors, parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo,
+            write_nfo_atomically,
         },
         people::ActorCredit,
         scanner::LibraryScanner,
@@ -209,6 +210,34 @@ fn local_nfo_parser_supports_series_season_episode_fields() {
     )
     .expect("valid series actor node");
     assert_eq!(actors[0].id, "9");
+}
+
+#[test]
+fn local_nfo_projection_parses_base_rich_and_actor_fields_together() {
+    let projection = parse_local_nfo_projection(
+        r#"<tvshow>
+            <title>本地剧集</title><originaltitle>Original Show</originaltitle>
+            <year>2020</year><plot>剧集简介</plot><rating>8.7</rating>
+            <genre>剧情</genre><tmdbid>60625</tmdbid>
+            <actor><name>演员甲</name><role>角色甲</role><tmdbid>9</tmdbid><order>0</order></actor>
+        </tvshow>"#
+            .as_bytes(),
+    )
+    .expect("valid local NFO projection");
+
+    assert_eq!(projection.metadata.title.as_deref(), Some("本地剧集"));
+    assert_eq!(
+        projection.metadata.original_title.as_deref(),
+        Some("Original Show")
+    );
+    assert_eq!(projection.metadata.production_year, Some(2020));
+    assert_eq!(projection.metadata.overview.as_deref(), Some("剧集简介"));
+    assert_eq!(projection.details.rating, Some(8.7));
+    assert_eq!(projection.details.genres, vec!["剧情"]);
+    assert_eq!(projection.details.provider_ids["tmdb"], "60625");
+    assert_eq!(projection.actors.len(), 1);
+    assert_eq!(projection.actors[0].id, "9");
+    assert_eq!(projection.actors[0].character.as_deref(), Some("角色甲"));
 }
 
 #[test]

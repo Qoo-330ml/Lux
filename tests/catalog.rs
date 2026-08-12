@@ -737,6 +737,48 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         Some(1)
     );
 
+    // Malformed database-derived NFO JSON must not take down item detail: degrade
+    // gracefully (nfo null) and clear the cache row for background rebuilding.
+    // The detail request must not parse the source NFO file.
+    sqlx::query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
+        .bind("{not-valid-json")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let lux_detail_malformed = client
+        .get(format!("{base_url}/api/v1/items/{item_id}"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(
+        lux_detail_malformed.status(),
+        reqwest::StatusCode::OK,
+        "malformed nfo_metadata_json must not take down item detail"
+    );
+    let lux_detail_malformed_body: Value = lux_detail_malformed.json().await?;
+    assert_eq!(lux_detail_malformed_body["id"], item_id);
+    assert_eq!(lux_detail_malformed_body["title"], "Alpha Movie");
+    assert_eq!(lux_detail_malformed_body["productionYear"], 2020);
+    assert!(
+        lux_detail_malformed_body["nfo"].is_null(),
+        "malformed cached NFO must degrade to null without failing the response"
+    );
+    assert_eq!(
+        lux_detail_malformed_body["mediaSources"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let cleared_nfo_json: Option<String> =
+        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        cleared_nfo_json.is_none(),
+        "malformed nfo_metadata_json cache row must be cleared for background rebuilding"
+    );
+
     assert_ne!(admin.id, viewer.id);
     server.abort();
     Ok(())

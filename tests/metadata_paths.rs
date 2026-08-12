@@ -2,7 +2,7 @@ use std::path::Path;
 
 use luxd::application::metadata_paths::{
     MetadataObjectKind, library_item_directory, metadata_object_directory, metadata_root,
-    people_directory, people_index_path,
+    people_directory, people_index_path, people_index_path_for_provider,
 };
 
 #[test]
@@ -37,6 +37,10 @@ fn people_paths_are_readable_but_identity_uses_provider_and_id() {
         people_index_path(config, "1391125").expect("valid person ID"),
         Path::new("/config/metadata/people/index/1391125.json")
     );
+    assert_eq!(
+        people_index_path_for_provider(config, "TMDb", "1391125").expect("valid provider ID"),
+        Path::new("/config/metadata/people/index/tmdb-1391125.json")
+    );
 }
 
 #[test]
@@ -45,6 +49,7 @@ fn metadata_paths_reject_traversal_components() {
     assert!(library_item_directory(config, "../item").is_err());
     assert!(people_directory(config, "person", "tmdb", "../person").is_err());
     assert!(people_index_path(config, "person/id").is_err());
+    assert!(people_index_path_for_provider(config, "tmdb/provider", "person").is_err());
 }
 
 #[test]

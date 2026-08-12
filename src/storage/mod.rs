@@ -8263,6 +8263,27 @@ impl Database {
         })
     }
 
+    pub(crate) async fn clear_media_item_nfo_metadata_if_json(
+        &self,
+        item_id: &str,
+        expected_json: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_items
+             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL
+             WHERE id = ? AND nfo_metadata_json = ?",
+        )
+        .bind(item_id)
+        .bind(expected_json)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn invalidate_media_item_nfo_metadata_if_source_changed(
         &self,
         item_id: &str,

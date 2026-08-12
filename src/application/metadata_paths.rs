@@ -88,6 +88,20 @@ pub fn people_index_path(config_dir: &Path, person_id: &str) -> Result<PathBuf, 
         .join(format!("{person_id}.json")))
 }
 
+pub fn people_index_path_for_provider(
+    config_dir: &Path,
+    provider: &str,
+    person_id: &str,
+) -> Result<PathBuf, MetadataPathError> {
+    validate_component(provider, "provider")?;
+    validate_component(person_id, "person ID")?;
+    let provider = ascii_component(provider, "provider")?;
+    Ok(metadata_root(config_dir)
+        .join(PEOPLE_DIR)
+        .join(PEOPLE_INDEX_DIR)
+        .join(format!("{provider}-{person_id}.json")))
+}
+
 pub fn people_index_directory(config_dir: &Path) -> PathBuf {
     metadata_root(config_dir)
         .join(PEOPLE_DIR)

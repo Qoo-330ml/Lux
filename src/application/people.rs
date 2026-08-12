@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::application::metadata_paths::{
     MetadataPathError, library_item_directory, metadata_root, people_directory,
-    people_index_directory, people_index_path,
+    people_index_directory, people_index_path, people_index_path_for_provider,
 };
 
 const LEGACY_PEOPLE_DIR: &str = "people";
@@ -20,6 +20,11 @@ const LEGACY_ITEMS_DIR: &str = "items";
 const LEGACY_PROFILES_DIR: &str = "profiles";
 const PERSON_NFO: &str = "person.nfo";
 const PERSON_IMAGE: &str = "folder";
+const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 1;
+const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
+const PENDING_PERSON_NFO: &str = "personNfo";
+const PENDING_PROFILE_IMAGE: &str = "profileImage";
+const PENDING_PERSON_INDEX: &str = "personIndex";
 const MAX_ACTORS: usize = 12;
 const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
@@ -47,9 +52,36 @@ struct StoredActor {
     name: String,
     #[serde(default = "default_provider")]
     provider: String,
+    #[serde(default)]
     character: Option<String>,
+    #[serde(default)]
     order: Option<i32>,
+    #[serde(default)]
     image_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_assets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredPeopleRelation {
+    #[serde(default = "default_relation_schema_version")]
+    schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_fingerprint: Option<String>,
+    #[serde(default)]
+    actors: Vec<StoredActor>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ActorPersistReport {
+    pub stored_count: usize,
+    pub pending_assets: Vec<String>,
+}
+
+struct PersonAssetResult {
+    image_file: Option<String>,
+    pending_assets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -106,6 +138,29 @@ impl PeopleService {
         provider: &str,
         actors: &[ActorCredit],
     ) -> Result<usize, PeopleError> {
+        self.persist_item_actors_with_source(item_id, provider, actors, None)
+            .await
+            .map(|report| report.stored_count)
+    }
+
+    pub async fn persist_nfo_item_actors(
+        &self,
+        item_id: &str,
+        provider: &str,
+        actors: &[ActorCredit],
+        source_fingerprint: &[u8],
+    ) -> Result<ActorPersistReport, PeopleError> {
+        self.persist_item_actors_with_source(item_id, provider, actors, Some(source_fingerprint))
+            .await
+    }
+
+    async fn persist_item_actors_with_source(
+        &self,
+        item_id: &str,
+        provider: &str,
+        actors: &[ActorCredit],
+        source_fingerprint: Option<&[u8]>,
+    ) -> Result<ActorPersistReport, PeopleError> {
         let relation_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
@@ -117,57 +172,20 @@ impl PeopleService {
         create_private_dir(&index_dir).await?;
 
         let mut stored = Vec::new();
+        let mut pending_assets = Vec::new();
+        let provider = provider.trim().to_ascii_lowercase();
         for actor in actors.iter().take(MAX_ACTORS) {
             if !is_valid_person_id(&actor.id) || actor.name.trim().is_empty() {
                 continue;
             }
-            let person_dir = people_directory(&self.config_dir, &actor.name, provider, &actor.id)
-                .map_err(PeopleError::from)?;
-            create_private_dir(&person_dir).await?;
-            let nfo_path = person_dir.join(PERSON_NFO);
-            write_atomically(
-                &nfo_path,
-                &person_nfo_bytes(&actor.name, provider, &actor.id),
-            )
-            .await?;
-            let image_file = match self
-                .ensure_profile_image(&actor.id, actor.profile_url.as_deref(), &person_dir)
-                .await
-            {
-                Ok(image_file) => image_file,
-                Err(error) => {
-                    tracing::warn!(
-                        person_id = %actor.id,
-                        %error,
-                        "actor profile image was not cached"
-                    );
-                    None
-                }
-            };
-            if let Some(image_file) = image_file.as_deref()
-                && !image_file.starts_with("legacy/")
-            {
-                let image_path = person_dir.join(image_file);
-                let relative = image_path
-                    .strip_prefix(metadata_root(&self.config_dir))
-                    .map_err(|_| {
-                        PeopleError::Serialization(
-                            "person image path is outside metadata".to_owned(),
-                        )
-                    })?;
-                let index = StoredPersonIndex {
-                    image_path: relative.to_string_lossy().into_owned(),
-                };
-                let bytes = serde_json::to_vec_pretty(&index)
-                    .map_err(|source| PeopleError::Serialization(source.to_string()))?;
-                let index_path =
-                    people_index_path(&self.config_dir, &actor.id).map_err(PeopleError::from)?;
-                write_atomically(&index_path, &bytes).await?;
+            let assets = self.persist_person_assets(actor, &provider).await;
+            if !assets.pending_assets.is_empty() {
+                pending_assets.push(actor.id.clone());
             }
             stored.push(StoredActor {
                 id: actor.id.clone(),
                 name: actor.name.trim().to_owned(),
-                provider: provider.to_ascii_lowercase(),
+                provider: provider.clone(),
                 character: actor
                     .character
                     .as_deref()
@@ -175,29 +193,187 @@ impl PeopleService {
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned),
                 order: actor.order,
-                image_file,
+                image_file: assets.image_file,
+                pending_assets: assets.pending_assets,
             });
         }
 
         stored.sort_by_key(|actor| actor.order.unwrap_or(i32::MAX));
-        let bytes = serde_json::to_vec_pretty(&stored)
+        let relation = StoredPeopleRelation {
+            schema_version: PEOPLE_RELATION_SCHEMA_VERSION,
+            source_fingerprint: source_fingerprint
+                .filter(|fingerprint| !fingerprint.is_empty())
+                .map(encode_fingerprint),
+            actors: stored,
+        };
+        let bytes = serde_json::to_vec_pretty(&relation)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
         write_atomically(&relation_path, &bytes).await?;
-        Ok(stored.len())
+        Ok(ActorPersistReport {
+            stored_count: relation.actors.len(),
+            pending_assets,
+        })
+    }
+
+    async fn persist_person_assets(
+        &self,
+        actor: &ActorCredit,
+        provider: &str,
+    ) -> PersonAssetResult {
+        let mut pending_assets = Vec::new();
+        let person_dir = match people_directory(&self.config_dir, &actor.name, provider, &actor.id)
+        {
+            Ok(person_dir) => {
+                if let Err(error) = create_private_dir(&person_dir).await {
+                    tracing::warn!(
+                        person_id = %actor.id,
+                        %error,
+                        "actor person directory was not prepared"
+                    );
+                    pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
+                    return PersonAssetResult {
+                        image_file: None,
+                        pending_assets,
+                    };
+                }
+                person_dir
+            }
+            Err(error) => {
+                tracing::warn!(
+                    person_id = %actor.id,
+                    %error,
+                    "actor person path was not prepared"
+                );
+                pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
+                return PersonAssetResult {
+                    image_file: None,
+                    pending_assets,
+                };
+            }
+        };
+
+        let nfo_path = person_dir.join(PERSON_NFO);
+        if let Err(error) = write_atomically(
+            &nfo_path,
+            &person_nfo_bytes(&actor.name, provider, &actor.id),
+        )
+        .await
+        {
+            tracing::warn!(person_id = %actor.id, %error, "actor person NFO was not cached");
+            pending_assets.push(PENDING_PERSON_NFO.to_owned());
+        }
+
+        let image_file = match self
+            .ensure_profile_image(
+                &actor.id,
+                provider,
+                actor.profile_url.as_deref(),
+                &person_dir,
+            )
+            .await
+        {
+            Ok(image_file) => image_file,
+            Err(error) => {
+                tracing::warn!(person_id = %actor.id, %error, "actor profile image was not cached");
+                pending_assets.push(PENDING_PROFILE_IMAGE.to_owned());
+                None
+            }
+        };
+        let image_available = image_file.is_some()
+            || matches!(
+                self.profile_image_for_provider(Some(provider), &actor.id)
+                    .await,
+                Ok(Some(_))
+            );
+        if !image_available {
+            pending_assets.push(PENDING_PROFILE_IMAGE.to_owned());
+        }
+
+        if let Some(image_file) = image_file.as_deref()
+            && !image_file.starts_with("legacy/")
+        {
+            let image_path = person_dir.join(image_file);
+            let index_result = match image_path.strip_prefix(metadata_root(&self.config_dir)) {
+                Ok(relative) => {
+                    let index = StoredPersonIndex {
+                        image_path: relative.to_string_lossy().into_owned(),
+                    };
+                    match serde_json::to_vec_pretty(&index) {
+                        Ok(bytes) => match people_index_path_for_provider(
+                            &self.config_dir,
+                            provider,
+                            &actor.id,
+                        ) {
+                            Ok(index_path) => write_atomically(&index_path, &bytes).await,
+                            Err(error) => Err(PeopleError::from(error)),
+                        },
+                        Err(error) => Err(PeopleError::Serialization(error.to_string())),
+                    }
+                }
+                Err(_) => Err(PeopleError::Serialization(
+                    "person image path is outside metadata".to_owned(),
+                )),
+            };
+            if let Err(error) = index_result {
+                tracing::warn!(
+                    person_id = %actor.id,
+                    %error,
+                    "actor person image index was not cached"
+                );
+                pending_assets.push(PENDING_PERSON_INDEX.to_owned());
+            }
+        }
+
+        PersonAssetResult {
+            image_file,
+            pending_assets,
+        }
     }
 
     pub async fn item_actor_relation_exists(&self, item_id: &str) -> Result<bool, PeopleError> {
         let new_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
-        if read_people_file(&new_path).await?.is_some() {
+        if read_relation(&new_path).await?.is_some() {
             return Ok(true);
         }
         let legacy_path = self
             .legacy_people_dir()
             .join(LEGACY_ITEMS_DIR)
             .join(format!("{item_id}.json"));
-        Ok(read_people_file(&legacy_path).await?.is_some())
+        Ok(read_relation(&legacy_path).await?.is_some())
+    }
+
+    pub async fn item_actor_relation_is_current(
+        &self,
+        item_id: &str,
+        source_fingerprint: &[u8],
+    ) -> Result<bool, PeopleError> {
+        let path = library_item_directory(&self.config_dir, item_id)
+            .map_err(PeopleError::from)?
+            .join("people.json");
+        let Some(relation) = read_relation(&path).await? else {
+            return Ok(false);
+        };
+        Ok(relation
+            .source_fingerprint
+            .as_deref()
+            .and_then(decode_fingerprint)
+            .is_some_and(|stored| stored == source_fingerprint))
+    }
+
+    pub async fn nfo_relation_snapshot_exists(&self, item_id: &str) -> Result<bool, PeopleError> {
+        let path = library_item_directory(&self.config_dir, item_id)
+            .map_err(PeopleError::from)?
+            .join("people.json");
+        let Some(relation) = read_relation(&path).await? else {
+            return Ok(false);
+        };
+        Ok(relation
+            .source_fingerprint
+            .as_deref()
+            .and_then(decode_fingerprint)
+            .is_some_and(|fingerprint| fingerprint.len() == 32))
     }
 
     pub async fn list_item_actors(&self, item_id: &str) -> Result<Vec<ActorView>, PeopleError> {
@@ -215,25 +391,32 @@ impl PeopleService {
                 None => return Ok(Vec::new()),
             },
         };
-        if bytes.len() as u64 > MAX_PEOPLE_FILE_BYTES {
-            return Err(PeopleError::Serialization(
-                "people data is too large".to_owned(),
-            ));
-        }
-        let actors = serde_json::from_slice::<Vec<StoredActor>>(&bytes)
-            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        let relation = parse_relation(&bytes)?;
         let mut views = Vec::new();
-        for actor in actors
+        for actor in relation
+            .actors
             .into_iter()
             .take(MAX_ACTORS)
             .filter(|actor| is_valid_person_id(&actor.id) && !actor.name.trim().is_empty())
         {
             let id = actor.id;
-            let image_url = self
-                .profile_image(&id)
-                .await?
-                .is_some()
-                .then(|| format!("/api/v1/people/{id}/image"));
+            let provider = actor.provider;
+            let image_url = match self.profile_image_for_provider(Some(&provider), &id).await {
+                Ok(Some(_)) => {
+                    if provider.eq_ignore_ascii_case("tmdb") {
+                        Some(format!("/api/v1/people/{id}/image"))
+                    } else if validate_component(&provider).is_ok() {
+                        Some(format!("/api/v1/people/{provider}/{id}/image"))
+                    } else {
+                        None
+                    }
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(person_id = %id, %error, "actor profile image lookup failed; using placeholder");
+                    None
+                }
+            };
             views.push(ActorView {
                 id,
                 name: actor.name,
@@ -245,30 +428,42 @@ impl PeopleService {
     }
 
     pub async fn profile_image(&self, person_id: &str) -> Result<Option<PersonImage>, PeopleError> {
+        self.profile_image_for_provider(None, person_id).await
+    }
+
+    pub async fn profile_image_for_provider(
+        &self,
+        provider: Option<&str>,
+        person_id: &str,
+    ) -> Result<Option<PersonImage>, PeopleError> {
         validate_component(person_id)?;
-        let index_path =
-            people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
-        if let Some(index_bytes) = read_people_file(&index_path).await? {
-            let index = serde_json::from_slice::<StoredPersonIndex>(&index_bytes)
-                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
-            let relative = Path::new(&index.image_path);
-            if relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-            {
-                return Err(PeopleError::Serialization(
-                    "person image index contains an unsafe path".to_owned(),
-                ));
+        if let Some(provider) = provider {
+            validate_component(provider)?;
+            let index_path = people_index_path_for_provider(&self.config_dir, provider, person_id)
+                .map_err(PeopleError::from)?;
+            if let Some(image) = self.read_indexed_person_image(&index_path).await? {
+                return Ok(Some(image));
             }
-            let metadata_dir = metadata_root(&self.config_dir);
-            let path = metadata_dir.join(relative);
-            if !path.starts_with(&metadata_dir) {
-                return Err(PeopleError::Serialization(
-                    "person image path is outside metadata".to_owned(),
-                ));
+            if provider.eq_ignore_ascii_case("tmdb") {
+                let legacy_index_path =
+                    people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
+                if let Some(image) = self.read_indexed_person_image(&legacy_index_path).await? {
+                    return Ok(Some(image));
+                }
             }
-            if let Some(image) = image_from_path(&path).await? {
+            if !provider.eq_ignore_ascii_case("tmdb") {
+                return Ok(None);
+            }
+        } else {
+            let legacy_index_path =
+                people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
+            if let Some(image) = self.read_indexed_person_image(&legacy_index_path).await? {
+                return Ok(Some(image));
+            }
+            let tmdb_index_path =
+                people_index_path_for_provider(&self.config_dir, "tmdb", person_id)
+                    .map_err(PeopleError::from)?;
+            if let Some(image) = self.read_indexed_person_image(&tmdb_index_path).await? {
                 return Ok(Some(image));
             }
         }
@@ -283,6 +478,35 @@ impl PeopleService {
         Ok(None)
     }
 
+    async fn read_indexed_person_image(
+        &self,
+        index_path: &Path,
+    ) -> Result<Option<PersonImage>, PeopleError> {
+        let Some(index_bytes) = read_people_file(index_path).await? else {
+            return Ok(None);
+        };
+        let index = serde_json::from_slice::<StoredPersonIndex>(&index_bytes)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        let relative = Path::new(&index.image_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(PeopleError::Serialization(
+                "person image index contains an unsafe path".to_owned(),
+            ));
+        }
+        let metadata_dir = metadata_root(&self.config_dir);
+        let path = metadata_dir.join(relative);
+        if !path.starts_with(&metadata_dir) {
+            return Err(PeopleError::Serialization(
+                "person image path is outside metadata".to_owned(),
+            ));
+        }
+        image_from_path(&path).await
+    }
+
     fn legacy_people_dir(&self) -> PathBuf {
         self.config_dir.join(LEGACY_PEOPLE_DIR)
     }
@@ -290,6 +514,7 @@ impl PeopleService {
     async fn ensure_profile_image(
         &self,
         person_id: &str,
+        provider: &str,
         image_url: Option<&str>,
         person_dir: &Path,
     ) -> Result<Option<String>, PeopleError> {
@@ -304,14 +529,29 @@ impl PeopleService {
         }
 
         let legacy_profiles_dir = self.legacy_people_dir().join(LEGACY_PROFILES_DIR);
-        for extension in PROFILE_EXTENSIONS {
-            let path = legacy_profiles_dir.join(format!("{person_id}.{extension}"));
-            if safe_metadata(&path)
-                .await?
-                .is_some_and(|metadata| metadata.is_file())
-            {
-                return Ok(Some(format!("legacy/{person_id}.{extension}")));
+        if provider.eq_ignore_ascii_case("tmdb") {
+            for extension in PROFILE_EXTENSIONS {
+                let path = legacy_profiles_dir.join(format!("{person_id}.{extension}"));
+                if safe_metadata(&path)
+                    .await?
+                    .is_some_and(|metadata| metadata.is_file())
+                {
+                    return Ok(Some(format!("legacy/{person_id}.{extension}")));
+                }
             }
+        }
+
+        // The provider ID is the identity key. If another title already
+        // indexed a local image for this person, reuse it instead of
+        // downloading the same profile again. The relation keeps
+        // `imageFile` empty in this case; `profile_image` resolves the
+        // canonical index independently of the title-specific directory.
+        if matches!(
+            self.profile_image_for_provider(Some(provider), person_id)
+                .await,
+            Ok(Some(_))
+        ) {
+            return Ok(None);
         }
 
         let Some(image_url) = image_url else {
@@ -379,6 +619,67 @@ impl PeopleService {
     }
 }
 
+async fn read_relation(path: &Path) -> Result<Option<StoredPeopleRelation>, PeopleError> {
+    let Some(bytes) = read_people_file(path).await? else {
+        return Ok(None);
+    };
+    parse_relation(&bytes).map(Some)
+}
+
+fn parse_relation(bytes: &[u8]) -> Result<StoredPeopleRelation, PeopleError> {
+    if bytes.len() as u64 > MAX_PEOPLE_FILE_BYTES {
+        return Err(PeopleError::Serialization(
+            "people data is too large".to_owned(),
+        ));
+    }
+    let value = serde_json::from_slice::<Value>(bytes)
+        .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+    if value.is_array() {
+        let actors = serde_json::from_value::<Vec<StoredActor>>(value)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        return Ok(StoredPeopleRelation {
+            schema_version: 0,
+            source_fingerprint: None,
+            actors,
+        });
+    }
+    let relation = serde_json::from_value::<StoredPeopleRelation>(value)
+        .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+    if relation.schema_version > PEOPLE_RELATION_SCHEMA_VERSION {
+        return Err(PeopleError::Serialization(
+            "people data schema is newer than supported".to_owned(),
+        ));
+    }
+    Ok(relation)
+}
+
+fn default_relation_schema_version() -> u32 {
+    PEOPLE_RELATION_SCHEMA_VERSION
+}
+
+fn encode_fingerprint(fingerprint: &[u8]) -> String {
+    let mut encoded = String::with_capacity(fingerprint.len().saturating_mul(2));
+    for byte in fingerprint {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn decode_fingerprint(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty() || value.len() % 2 != 0 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        decoded.push(((high << 4) | low) as u8);
+    }
+    Some(decoded)
+}
+
 async fn read_people_file(path: &Path) -> Result<Option<Vec<u8>>, PeopleError> {
     let Some(metadata) = safe_metadata(path).await? else {
         return Ok(None);
@@ -386,6 +687,11 @@ async fn read_people_file(path: &Path) -> Result<Option<Vec<u8>>, PeopleError> {
     if !metadata.is_file() {
         return Err(PeopleError::Serialization(
             "people data path is not a file".to_owned(),
+        ));
+    }
+    if metadata.len() > MAX_PEOPLE_FILE_BYTES {
+        return Err(PeopleError::Serialization(
+            "people data is too large".to_owned(),
         ));
     }
     fs::read(path)
@@ -641,7 +947,7 @@ impl From<MetadataPathError> for PeopleError {
 mod tests {
     use super::{ActorCredit, PeopleError, PeopleService};
     use crate::application::metadata_paths::{
-        library_item_directory, people_directory, people_index_path,
+        library_item_directory, people_directory, people_index_path_for_provider,
     };
 
     #[tokio::test]
@@ -690,17 +996,63 @@ mod tests {
         let relation = library_item_directory(config.path(), "item-1")?.join("people.json");
         let relation: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(relation).await?)?;
-        assert_eq!(relation[0]["provider"], "tmdb");
-        assert_eq!(relation[0]["imageFile"], "folder.png");
+        assert_eq!(relation["schemaVersion"], 1);
+        assert_eq!(relation["actors"][0]["provider"], "tmdb");
+        assert_eq!(relation["actors"][0]["imageFile"], "folder.png");
 
         let index: serde_json::Value = serde_json::from_slice(
-            &tokio::fs::read(people_index_path(config.path(), "9")?).await?,
+            &tokio::fs::read(people_index_path_for_provider(config.path(), "tmdb", "9")?).await?,
         )?;
         assert_eq!(index["imagePath"], "people/演/演员甲-tmdb-9/folder.png");
         assert_eq!(
             service.profile_image("9").await?.map(|image| image.path),
             Some(person_dir.join("folder.png"))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_scoped_people_images_do_not_collide_on_numeric_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let tmdb_dir = people_directory(config.path(), "甲演员", "tmdb", "9")?;
+        let imdb_dir = people_directory(config.path(), "乙演员", "imdb", "9")?;
+        tokio::fs::create_dir_all(&tmdb_dir).await?;
+        tokio::fs::create_dir_all(&imdb_dir).await?;
+        tokio::fs::write(tmdb_dir.join("folder.png"), b"tmdb-image").await?;
+        tokio::fs::write(imdb_dir.join("folder.png"), b"imdb-image").await?;
+
+        let service = PeopleService::new(config.path().to_owned());
+        for (item_id, provider, name) in [
+            ("item-tmdb", "tmdb", "甲演员"),
+            ("item-imdb", "imdb", "乙演员"),
+        ] {
+            service
+                .persist_item_actors(
+                    item_id,
+                    provider,
+                    &[ActorCredit {
+                        id: "9".to_owned(),
+                        name: name.to_owned(),
+                        character: None,
+                        order: Some(0),
+                        profile_url: None,
+                    }],
+                )
+                .await?;
+        }
+
+        let tmdb = service
+            .profile_image_for_provider(Some("tmdb"), "9")
+            .await?
+            .ok_or("missing tmdb image")?;
+        let imdb = service
+            .profile_image_for_provider(Some("imdb"), "9")
+            .await?
+            .ok_or("missing imdb image")?;
+        assert_eq!(tmdb.path, tmdb_dir.join("folder.png"));
+        assert_eq!(imdb.path, imdb_dir.join("folder.png"));
+        assert_ne!(tmdb.path, imdb.path);
         Ok(())
     }
 
@@ -748,6 +1100,74 @@ mod tests {
             .await
             .expect_err("symlinked metadata parent must be rejected");
         assert!(matches!(error, PeopleError::Symlink(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nfo_relation_tracks_source_revision_and_reuses_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let first = [1_u8, 2, 3];
+        let second = [4_u8, 5, 6];
+        let actors = [ActorCredit {
+            id: "9".to_owned(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+        }];
+
+        service
+            .persist_nfo_item_actors("item-1", "tmdb", &actors, &first)
+            .await?;
+        let relation_path = library_item_directory(config.path(), "item-1")?.join("people.json");
+        let relation: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(relation_path).await?)?;
+        assert_eq!(relation["actors"][0]["pendingAssets"][0], "profileImage");
+        assert!(
+            service
+                .item_actor_relation_is_current("item-1", &first)
+                .await?
+        );
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-1", &second)
+                .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nfo_relation_keeps_actor_when_person_assets_fail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let person_dir = people_directory(config.path(), "演员甲", "tmdb", "9")?;
+        tokio::fs::create_dir_all(person_dir.parent().ok_or("missing person parent")?).await?;
+        tokio::fs::write(&person_dir, b"directory replacement").await?;
+
+        let service = PeopleService::new(config.path().to_owned());
+        let report = service
+            .persist_nfo_item_actors(
+                "item-1",
+                "tmdb",
+                &[ActorCredit {
+                    id: "9".to_owned(),
+                    name: "演员甲".to_owned(),
+                    character: Some("角色甲".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                }],
+                &[1, 2, 3],
+            )
+            .await?;
+        assert_eq!(report.stored_count, 1);
+        assert!(!report.pending_assets.is_empty());
+
+        let actors = service.list_item_actors("item-1").await?;
+        assert_eq!(actors.len(), 1);
+        assert_eq!(actors[0].name, "演员甲");
+        assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
         Ok(())
     }
 }

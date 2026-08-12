@@ -35,6 +35,7 @@ pub struct LocalNfoCredit {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct LocalNfoDetails {
     pub rating: Option<f64>,
     pub votes: Option<i64>,
@@ -60,6 +61,13 @@ pub struct LocalNfoDetails {
     pub season_number: Option<i32>,
     pub episode_number: Option<i32>,
     pub trailers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LocalNfoProjection {
+    pub metadata: NfoMetadata,
+    pub details: LocalNfoDetails,
+    pub actors: Vec<ActorCredit>,
 }
 
 /// Compatibility alias for callers that used the original movie-only name.
@@ -98,13 +106,16 @@ const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
 const MAX_MOVIE_NFO_ACTORS: usize = 30;
 const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;
+const MAX_MOVIE_NFO_DETAILS_ITEMS: usize = 64;
+const MAX_MOVIE_NFO_DETAILS_TEXT_BYTES: usize = 256 * 1024;
+const MAX_MOVIE_NFO_DETAILS_URL_BYTES: usize = 2048;
+const MAX_MOVIE_NFO_DETAILS_ID_BYTES: usize = 256;
 
-/// Reads the direct `<actor>` nodes used by Emby/Kodi local NFO files.
+/// Parses all local NFO projections in one bounded XML pass.
 ///
-/// This intentionally only extracts the actor fields needed by the people
-/// cache. The caller can run it during background metadata enrichment without
-/// asking the detail endpoint to parse an untrusted XML document.
-pub fn parse_local_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError> {
+/// Background enrichment uses this entry point so base metadata, rich detail
+/// fields, and actor relations always come from the same source revision.
+pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, NfoError> {
     if bytes.len() > MAX_LOCAL_NFO_BYTES {
         return Err(NfoError::TooLarge);
     }
@@ -112,15 +123,16 @@ pub fn parse_local_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError
     let mut reader = Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
-    let mut actors = Vec::new();
+    let mut projection = LocalNfoProjection::default();
+    let mut active_direct = None;
     let mut actor_depth = None;
-    let mut current_field = None;
+    let mut active_actor = None;
     let mut current_actor = None;
     let mut depth = 0_usize;
     let mut event_count = 0_usize;
 
     loop {
-        event_count += 1;
+        event_count = event_count.saturating_add(1);
         if event_count > MAX_LOCAL_NFO_EVENTS {
             return Err(NfoError::TooManyEvents);
         }
@@ -136,64 +148,72 @@ pub fn parse_local_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError
                 if depth == 2 && event.name().as_ref() == b"actor" {
                     actor_depth = Some(depth);
                     current_actor = Some(ParsedMovieActor::default());
-                    current_field = None;
+                    active_direct = None;
                 } else if actor_depth == Some(depth.saturating_sub(1)) {
-                    current_field = movie_actor_field(event.name().as_ref());
-                }
-            }
-            Ok(Event::Empty(_event)) => {
-                if actor_depth == Some(depth.saturating_sub(1)) {
-                    current_field = None;
+                    active_actor =
+                        movie_actor_field(event.name().as_ref()).map(|field| ActiveActorValue {
+                            field,
+                            text: String::new(),
+                        });
+                } else if depth == 2 {
+                    active_direct = direct_value_kind(&event)?;
                 }
             }
             Ok(Event::Text(event)) => {
-                if let (Some(actor), Some(field)) = (current_actor.as_mut(), current_field) {
-                    let decoded = event
-                        .decode()
-                        .map_err(|error| NfoError::Xml(error.to_string()))?;
-                    let value = unescape(decoded.as_ref())
-                        .map_err(|error| NfoError::Xml(error.to_string()))?
-                        .trim()
-                        .to_owned();
-                    assign_movie_actor_field(actor, field, value)?;
-                }
+                let decoded = event
+                    .decode()
+                    .map_err(|error| NfoError::Xml(error.to_string()))?;
+                let value =
+                    unescape(decoded.as_ref()).map_err(|error| NfoError::Xml(error.to_string()))?;
+                append_projection_text(
+                    depth,
+                    actor_depth,
+                    active_direct.as_mut(),
+                    active_actor.as_mut(),
+                    value.as_ref(),
+                )?;
             }
             Ok(Event::CData(event)) => {
-                if let (Some(actor), Some(field)) = (current_actor.as_mut(), current_field) {
-                    let value = event
-                        .decode()
-                        .map_err(|error| NfoError::Xml(error.to_string()))?
-                        .trim()
-                        .to_owned();
-                    assign_movie_actor_field(actor, field, value)?;
-                }
+                let value = event
+                    .decode()
+                    .map_err(|error| NfoError::Xml(error.to_string()))?;
+                append_projection_text(
+                    depth,
+                    actor_depth,
+                    active_direct.as_mut(),
+                    active_actor.as_mut(),
+                    value.as_ref(),
+                )?;
             }
             Ok(Event::End(event)) => {
                 if actor_depth == Some(depth) && event.name().as_ref() == b"actor" {
-                    if let Some(actor) = current_actor.take()
-                        && let (Some(id), Some(name)) = (actor.tmdb_id, actor.name)
-                        && !id.trim().is_empty()
-                        && !name.trim().is_empty()
-                        && actors.len() < MAX_MOVIE_NFO_ACTORS
-                    {
-                        actors.push(ActorCredit {
-                            id,
-                            name,
-                            character: actor.role,
-                            order: actor.order,
-                            profile_url: None,
-                        });
+                    if let Some(actor) = current_actor.take() {
+                        push_parsed_actor(&mut projection.actors, actor);
                     }
                     actor_depth = None;
-                    current_field = None;
+                    active_actor = None;
                 } else if actor_depth == Some(depth.saturating_sub(1)) {
-                    current_field = None;
+                    if let (Some(actor), Some(active)) =
+                        (current_actor.as_mut(), active_actor.take())
+                    {
+                        assign_movie_actor_field(
+                            actor,
+                            active.field,
+                            active.text.trim().to_owned(),
+                        )?;
+                    }
+                } else if depth == 2
+                    && let Some(active) = active_direct.take()
+                {
+                    let raw_value = active.text.trim().to_owned();
+                    assign_direct_value(&mut projection, active, &raw_value)?;
                 }
                 if depth == 0 {
                     return Err(NfoError::Unbalanced);
                 }
                 depth -= 1;
             }
+            Ok(Event::Empty(_)) => {}
             Ok(Event::DocType(_)) => return Err(NfoError::DocTypeNotAllowed),
             Ok(_) => {}
             Err(error) => return Err(NfoError::Xml(error.to_string())),
@@ -201,7 +221,16 @@ pub fn parse_local_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError
         buffer.clear();
     }
 
-    Ok(actors)
+    Ok(projection)
+}
+
+/// Reads the direct `<actor>` nodes used by Emby/Kodi local NFO files.
+///
+/// This intentionally only extracts the actor fields needed by the people
+/// cache. The caller can run it during background metadata enrichment without
+/// asking the detail endpoint to parse an untrusted XML document.
+pub fn parse_local_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError> {
+    parse_local_nfo_projection(bytes).map(|projection| projection.actors)
 }
 
 /// Compatibility wrapper for the original movie-only parser name.
@@ -255,96 +284,12 @@ fn assign_movie_actor_field(
     Ok(())
 }
 
-const MAX_MOVIE_NFO_DETAILS_ITEMS: usize = 64;
-const MAX_MOVIE_NFO_DETAILS_TEXT_BYTES: usize = 256 * 1024;
-const MAX_MOVIE_NFO_DETAILS_URL_BYTES: usize = 2048;
-const MAX_MOVIE_NFO_DETAILS_ID_BYTES: usize = 256;
-
 /// Reads rich direct-child fields shared by movie, series, season and episode NFO files.
 ///
 /// This is deliberately a background-only parser. The detail endpoint reads
 /// the JSON snapshot produced from this value instead of opening an NFO file.
 pub fn parse_local_nfo_details(bytes: &[u8]) -> Result<LocalNfoDetails, NfoError> {
-    if bytes.len() > MAX_LOCAL_NFO_BYTES {
-        return Err(NfoError::TooLarge);
-    }
-
-    let mut reader = Reader::from_reader(Cursor::new(bytes));
-    reader.config_mut().trim_text(true);
-    let mut buffer = Vec::new();
-    let mut details = LocalNfoDetails::default();
-    let mut active = None;
-    let mut depth = 0_usize;
-    let mut event_count = 0_usize;
-
-    loop {
-        event_count += 1;
-        if event_count > MAX_LOCAL_NFO_EVENTS {
-            return Err(NfoError::TooManyEvents);
-        }
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Eof) => {
-                if depth != 0 {
-                    return Err(NfoError::Unbalanced);
-                }
-                break;
-            }
-            Ok(Event::Start(event)) => {
-                depth = depth.saturating_add(1);
-                if depth == 2 {
-                    active = rich_value_kind(&event)?;
-                }
-            }
-            Ok(Event::Text(event)) => {
-                if let Some(active) = active.as_mut()
-                    && depth == 2
-                {
-                    append_rich_text(
-                        &mut active.text,
-                        unescape(
-                            event
-                                .decode()
-                                .map_err(|error| NfoError::Xml(error.to_string()))?
-                                .as_ref(),
-                        )
-                        .map_err(|error| NfoError::Xml(error.to_string()))?
-                        .as_ref(),
-                    )?;
-                }
-            }
-            Ok(Event::CData(event)) => {
-                if let Some(active) = active.as_mut()
-                    && depth == 2
-                {
-                    append_rich_text(
-                        &mut active.text,
-                        event
-                            .decode()
-                            .map_err(|error| NfoError::Xml(error.to_string()))?
-                            .as_ref(),
-                    )?;
-                }
-            }
-            Ok(Event::End(_)) => {
-                if depth == 2 {
-                    if let Some(active) = active.take() {
-                        assign_rich_value(&mut details, active.kind, active.text.trim())?;
-                    }
-                }
-                if depth == 0 {
-                    return Err(NfoError::Unbalanced);
-                }
-                depth -= 1;
-            }
-            Ok(Event::Empty(_)) => {}
-            Ok(Event::DocType(_)) => return Err(NfoError::DocTypeNotAllowed),
-            Ok(_) => {}
-            Err(error) => return Err(NfoError::Xml(error.to_string())),
-        }
-        buffer.clear();
-    }
-
-    Ok(details)
+    parse_local_nfo_projection(bytes).map(|projection| projection.details)
 }
 
 /// Compatibility wrapper for the original movie-only parser name.
@@ -352,9 +297,124 @@ pub fn parse_movie_nfo_details(bytes: &[u8]) -> Result<LocalNfoDetails, NfoError
     parse_local_nfo_details(bytes)
 }
 
-struct ActiveRichValue {
-    kind: RichValueKind,
+struct ActiveDirectValue {
+    base: Option<BaseNfoField>,
+    rich: Option<RichValueKind>,
     text: String,
+}
+
+struct ActiveActorValue {
+    field: MovieActorField,
+    text: String,
+}
+
+#[derive(Clone, Copy)]
+enum BaseNfoField {
+    Title,
+    OriginalTitle,
+    Year,
+    Overview,
+}
+
+fn direct_value_kind(event: &BytesStart<'_>) -> Result<Option<ActiveDirectValue>, NfoError> {
+    let base = base_nfo_field(event.name().as_ref());
+    let rich = rich_value_kind(event)?;
+    if base.is_none() && rich.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ActiveDirectValue {
+        base,
+        rich,
+        text: String::new(),
+    }))
+}
+
+fn base_nfo_field(name: &[u8]) -> Option<BaseNfoField> {
+    match name {
+        b"title" => Some(BaseNfoField::Title),
+        b"originaltitle" | b"original_title" => Some(BaseNfoField::OriginalTitle),
+        b"year" => Some(BaseNfoField::Year),
+        b"plot" | b"overview" => Some(BaseNfoField::Overview),
+        _ => None,
+    }
+}
+
+fn append_projection_text(
+    depth: usize,
+    actor_depth: Option<usize>,
+    direct: Option<&mut ActiveDirectValue>,
+    actor: Option<&mut ActiveActorValue>,
+    value: &str,
+) -> Result<(), NfoError> {
+    if depth == 2 {
+        if let Some(direct) = direct {
+            append_rich_text(&mut direct.text, value)?;
+        }
+    } else if actor_depth.is_some_and(|actor_depth| depth == actor_depth.saturating_add(1))
+        && let Some(actor) = actor
+    {
+        append_rich_text(&mut actor.text, value)?;
+    }
+    Ok(())
+}
+
+fn assign_direct_value(
+    projection: &mut LocalNfoProjection,
+    active: ActiveDirectValue,
+    raw_value: &str,
+) -> Result<(), NfoError> {
+    if let Some(base) = active.base {
+        assign_base_value(&mut projection.metadata, base, raw_value)?;
+    }
+    if let Some(rich) = active.rich {
+        assign_rich_value(&mut projection.details, rich, raw_value)?;
+    }
+    Ok(())
+}
+
+fn assign_base_value(
+    metadata: &mut NfoMetadata,
+    field: BaseNfoField,
+    raw_value: &str,
+) -> Result<(), NfoError> {
+    let value = raw_value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() > MAX_MOVIE_NFO_DETAILS_TEXT_BYTES {
+        return Err(NfoError::FieldTooLarge);
+    }
+    match field {
+        BaseNfoField::Title => metadata.title = Some(value.to_owned()),
+        BaseNfoField::OriginalTitle => metadata.original_title = Some(value.to_owned()),
+        BaseNfoField::Year => {
+            metadata.production_year = value
+                .parse::<i32>()
+                .ok()
+                .filter(|year| (1800..=2200).contains(year));
+        }
+        BaseNfoField::Overview => metadata.overview = Some(value.to_owned()),
+    }
+    Ok(())
+}
+
+fn push_parsed_actor(actors: &mut Vec<ActorCredit>, actor: ParsedMovieActor) {
+    let Some(id) = actor.tmdb_id.map(|value| value.trim().to_owned()) else {
+        return;
+    };
+    let Some(name) = actor.name.map(|value| value.trim().to_owned()) else {
+        return;
+    };
+    if id.is_empty() || name.is_empty() || actors.len() >= MAX_MOVIE_NFO_ACTORS {
+        return;
+    }
+    actors.push(ActorCredit {
+        id,
+        name,
+        character: actor.role,
+        order: actor.order,
+        profile_url: None,
+    });
 }
 
 enum RichValueKind {
@@ -383,7 +443,7 @@ enum RichValueKind {
     Trailer,
 }
 
-fn rich_value_kind(event: &BytesStart<'_>) -> Result<Option<ActiveRichValue>, NfoError> {
+fn rich_value_kind(event: &BytesStart<'_>) -> Result<Option<RichValueKind>, NfoError> {
     let event_name = event.name();
     let tag = event_name.as_ref();
     let kind = match tag {
@@ -429,10 +489,7 @@ fn rich_value_kind(event: &BytesStart<'_>) -> Result<Option<ActiveRichValue>, Nf
         }
         _ => return Ok(None),
     };
-    Ok(Some(ActiveRichValue {
-        kind,
-        text: String::new(),
-    }))
+    Ok(Some(kind))
 }
 
 fn attribute_value(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<String>, NfoError> {
@@ -581,6 +638,12 @@ pub struct LocalNfoMetadataStore {
     database: Database,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalNfoMetadataState {
+    pub has_snapshot: bool,
+    pub source_fingerprint: Option<Vec<u8>>,
+}
+
 impl LocalNfoMetadataStore {
     pub fn new(database: Database) -> Self {
         Self { database }
@@ -616,11 +679,71 @@ impl LocalNfoMetadataStore {
             return Ok(None);
         };
         if json.len() > MAX_LOCAL_NFO_BYTES {
-            return Err(LocalNfoMetadataStoreError::TooLarge);
+            tracing::warn!(
+                item_id,
+                "derived local NFO cache is too large; clearing it for rebuild"
+            );
+            self.database
+                .clear_media_item_nfo_metadata_if_json(item_id, &json)
+                .await
+                .map_err(LocalNfoMetadataStoreError::Storage)?;
+            return Ok(None);
         }
-        serde_json::from_str(&json)
-            .map(Some)
-            .map_err(|error| LocalNfoMetadataStoreError::Serialization(error.to_string()))
+        match serde_json::from_str(&json) {
+            Ok(details) => Ok(Some(details)),
+            Err(error) => {
+                tracing::warn!(
+                    item_id,
+                    error = %error,
+                    "derived local NFO cache is malformed; clearing it for rebuild"
+                );
+                self.database
+                    .clear_media_item_nfo_metadata_if_json(item_id, &json)
+                    .await
+                    .map_err(LocalNfoMetadataStoreError::Storage)?;
+                Ok(None)
+            }
+        }
+    }
+
+    pub async fn state(
+        &self,
+        item_id: &str,
+    ) -> Result<LocalNfoMetadataState, LocalNfoMetadataStoreError> {
+        let (has_snapshot, source_fingerprint) = self
+            .database
+            .media_item_nfo_metadata_state(item_id)
+            .await
+            .map_err(LocalNfoMetadataStoreError::Storage)?;
+        Ok(LocalNfoMetadataState {
+            has_snapshot,
+            source_fingerprint,
+        })
+    }
+
+    pub async fn is_current(
+        &self,
+        item_id: &str,
+        source_fingerprint: &[u8],
+    ) -> Result<bool, LocalNfoMetadataStoreError> {
+        let state = self.state(item_id).await?;
+        if !state.has_snapshot || state.source_fingerprint.as_deref() != Some(source_fingerprint) {
+            return Ok(false);
+        }
+        Ok(self.read_item(item_id).await?.is_some())
+    }
+
+    pub async fn is_usable(&self, item_id: &str) -> Result<bool, LocalNfoMetadataStoreError> {
+        let state = self.state(item_id).await?;
+        if !state.has_snapshot
+            || !state
+                .source_fingerprint
+                .as_deref()
+                .is_some_and(valid_nfo_content_fingerprint)
+        {
+            return Ok(false);
+        }
+        Ok(self.read_item(item_id).await?.is_some())
     }
 
     pub async fn exists(&self, item_id: &str) -> Result<bool, LocalNfoMetadataStoreError> {
@@ -644,6 +767,10 @@ pub(crate) fn nfo_content_fingerprint(bytes: &[u8]) -> Vec<u8> {
     hasher.update(b"LUX-NFO-CONTENT-1\0");
     hasher.update(bytes);
     hasher.finalize().to_vec()
+}
+
+fn valid_nfo_content_fingerprint(value: &[u8]) -> bool {
+    value.len() == 32
 }
 
 #[derive(Debug)]

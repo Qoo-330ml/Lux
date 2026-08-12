@@ -297,8 +297,9 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let people_file =
         library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
     let people: Value = serde_json::from_slice(&tokio::fs::read(people_file).await?)?;
-    assert_eq!(people[0]["name"], "演员甲");
-    assert_eq!(people[0]["provider"], "tmdb");
+    assert_eq!(people["schemaVersion"], 1);
+    assert_eq!(people["actors"][0]["name"], "演员甲");
+    assert_eq!(people["actors"][0]["provider"], "tmdb");
     let person_dir = people_directory(&fixture.config.config_dir, "演员甲", "tmdb", "9")?;
     assert!(person_dir.join("person.nfo").exists());
 

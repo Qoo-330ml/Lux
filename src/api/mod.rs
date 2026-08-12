@@ -722,6 +722,10 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/people/{person_id}/image",
             get(lux_get_person_image),
         )
+        .route(
+            "/api/v1/people/{provider}/{person_id}/image",
+            get(lux_get_person_image_for_provider),
+        )
         .route("/api/v1/items/{item_id}/children", get(lux_get_children))
         .route(
             "/api/v1/collections/{collection_id}",
@@ -1788,11 +1792,25 @@ fn catalog_filter_from_values(
         is_played,
         is_favorite,
         sort_by: match sort_by {
-            Some(value) if value.eq_ignore_ascii_case("DateCreated") => CatalogSort::DateCreated,
-            Some(value) if value.eq_ignore_ascii_case("PremiereDate") => CatalogSort::PremiereDate,
             Some(value)
-                if value.eq_ignore_ascii_case("CommunityRating")
-                    || value.eq_ignore_ascii_case("Rating") =>
+                if value
+                    .split(',')
+                    .any(|field| field.trim().eq_ignore_ascii_case("DateCreated")) =>
+            {
+                CatalogSort::DateCreated
+            }
+            Some(value)
+                if value
+                    .split(',')
+                    .any(|field| field.trim().eq_ignore_ascii_case("PremiereDate")) =>
+            {
+                CatalogSort::PremiereDate
+            }
+            Some(value)
+                if value.split(',').any(|field| {
+                    field.trim().eq_ignore_ascii_case("CommunityRating")
+                        || field.trim().eq_ignore_ascii_case("Rating")
+                }) =>
             {
                 CatalogSort::Rating
             }
@@ -5699,14 +5717,28 @@ async fn lux_get_item(
                 let actors = match state.people.as_ref() {
                     Some(people) => match people.list_item_actors(&item.id).await {
                         Ok(actors) => actors,
-                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %item.id,
+                                %error,
+                                "derived actor relation is unavailable; returning an empty cast"
+                            );
+                            Vec::new()
+                        }
                     },
                     None => Vec::new(),
                 };
                 let nfo = match state.local_nfo.as_ref() {
                     Some(local_nfo) => match local_nfo.read_item(&item.id).await {
                         Ok(nfo) => nfo,
-                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %item.id,
+                                %error,
+                                "derived local NFO cache is unavailable; returning partial item detail"
+                            );
+                            None
+                        }
                     },
                     None => None,
                 };
@@ -7438,13 +7470,33 @@ async fn lux_get_person_image(
     Path(person_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
+    lux_get_person_image_inner(headers, None, person_id, state).await
+}
+
+async fn lux_get_person_image_for_provider(
+    headers: HeaderMap,
+    Path((provider, person_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    lux_get_person_image_inner(headers, Some(provider), person_id, state).await
+}
+
+async fn lux_get_person_image_inner(
+    headers: HeaderMap,
+    provider: Option<String>,
+    person_id: String,
+    state: AppState,
+) -> Response {
     if let Err(response) = require_web_user(&headers, &state).await {
         return response;
     }
     let Some(people) = state.people.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let image = match people.profile_image(&person_id).await {
+    let image = match people
+        .profile_image_for_provider(provider.as_deref(), &person_id)
+        .await
+    {
         Ok(Some(image)) => image,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(PeopleError::InvalidComponent(_)) => return StatusCode::NOT_FOUND.into_response(),
@@ -13232,7 +13284,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby,
+        CatalogSort, MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby,
         emby_media_source_json, emby_media_source_json_with_resolver, emby_media_stream_item_id,
         emby_playback_info_item_id, is_catalog_aggregation_path, is_emby_legacy_strm_path,
         is_emby_media_stream_segment, is_emby_playback_callback_path, is_emby_subtitle_path,
@@ -13343,6 +13395,20 @@ mod tests {
             filter.media_source_ids,
             Some(vec!["item-1".to_owned(), "source-2".to_owned()])
         );
+    }
+
+    #[test]
+    fn emby_combined_date_created_sort_uses_date_created_primary_sort() {
+        let query = super::EmbyItemsQuery {
+            sort_by: Some("DateCreated,SortName".to_owned()),
+            sort_order: Some("Descending".to_owned()),
+            ..super::EmbyItemsQuery::default()
+        };
+
+        let filter = catalog_filter_from_emby(&query);
+
+        assert_eq!(filter.sort_by, CatalogSort::DateCreated);
+        assert!(filter.descending);
     }
 
     #[test]

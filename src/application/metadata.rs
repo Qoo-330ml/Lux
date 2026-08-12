@@ -1,11 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    io::Cursor,
     path::{Path, PathBuf},
 };
 
-use quick_xml::{escape::unescape, events::Event, reader::Reader};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -14,7 +12,7 @@ use crate::{
     application::{
         nfo::{
             LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
-            parse_local_nfo_actors, parse_local_nfo_details,
+            parse_local_nfo_projection,
         },
         people::PeopleService,
     },
@@ -22,9 +20,6 @@ use crate::{
     storage::{Database, MediaMetadataUpdate, StorageError},
 };
 
-const MAX_NFO_BYTES: usize = 1024 * 1024;
-const MAX_XML_EVENTS: usize = 20_000;
-const MAX_FIELD_BYTES: usize = 256 * 1024;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -325,109 +320,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 }
 
 pub fn parse_nfo(bytes: &[u8]) -> Result<NfoMetadata, NfoError> {
-    if bytes.len() > MAX_NFO_BYTES {
-        return Err(NfoError::TooLarge);
-    }
-    let mut reader = Reader::from_reader(Cursor::new(bytes));
-    reader.config_mut().trim_text(true);
-    let mut buffer = Vec::new();
-    let mut current_field = None;
-    let mut metadata = NfoMetadata::default();
-    let mut event_count = 0;
-    let mut depth = 0_usize;
-    loop {
-        event_count += 1;
-        if event_count > MAX_XML_EVENTS {
-            return Err(NfoError::TooManyEvents);
-        }
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Eof) => {
-                if depth != 0 {
-                    return Err(NfoError::Unbalanced);
-                }
-                break;
-            }
-            Ok(Event::Start(event)) => {
-                depth = depth.saturating_add(1);
-                current_field = recognized_field(event.name().as_ref());
-            }
-            Ok(Event::End(_)) => {
-                if depth == 0 {
-                    return Err(NfoError::Unbalanced);
-                }
-                depth -= 1;
-                current_field = None;
-            }
-            Ok(Event::Text(event)) => {
-                if let Some(field) = current_field {
-                    let decoded = event
-                        .decode()
-                        .map_err(|error| NfoError::Xml(error.to_string()))?;
-                    let value = unescape(decoded.as_ref())
-                        .map_err(|error| NfoError::Xml(error.to_string()))?
-                        .trim()
-                        .to_owned();
-                    if value.len() > MAX_FIELD_BYTES {
-                        return Err(NfoError::FieldTooLarge);
-                    }
-                    assign_field(&mut metadata, field, value);
-                }
-            }
-            Ok(Event::CData(event)) => {
-                if let Some(field) = current_field {
-                    let value = event
-                        .decode()
-                        .map_err(|error| NfoError::Xml(error.to_string()))?
-                        .trim()
-                        .to_owned();
-                    if value.len() > MAX_FIELD_BYTES {
-                        return Err(NfoError::FieldTooLarge);
-                    }
-                    assign_field(&mut metadata, field, value);
-                }
-            }
-            Ok(Event::DocType(_)) => return Err(NfoError::DocTypeNotAllowed),
-            Ok(_) => {}
-            Err(error) => return Err(NfoError::Xml(error.to_string())),
-        }
-        buffer.clear();
-    }
-    Ok(metadata)
-}
-
-#[derive(Clone, Copy)]
-enum NfoField {
-    Title,
-    OriginalTitle,
-    Year,
-    Overview,
-}
-
-fn recognized_field(name: &[u8]) -> Option<NfoField> {
-    match name {
-        b"title" => Some(NfoField::Title),
-        b"originaltitle" | b"original_title" => Some(NfoField::OriginalTitle),
-        b"year" => Some(NfoField::Year),
-        b"plot" | b"overview" => Some(NfoField::Overview),
-        _ => None,
-    }
-}
-
-fn assign_field(metadata: &mut NfoMetadata, field: NfoField, value: String) {
-    if value.is_empty() {
-        return;
-    }
-    match field {
-        NfoField::Title => metadata.title = Some(value),
-        NfoField::OriginalTitle => metadata.original_title = Some(value),
-        NfoField::Year => {
-            metadata.production_year = value
-                .parse::<i32>()
-                .ok()
-                .filter(|year| (1800..=2200).contains(year));
-        }
-        NfoField::Overview => metadata.overview = Some(value),
-    }
+    parse_local_nfo_projection(bytes).map(|projection| projection.metadata)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -711,160 +604,10 @@ impl MetadataEnricher {
         item_id: &str,
         media_path: &Path,
     ) -> Result<MetadataReport, MetadataError> {
-        let mut report = MetadataReport::default();
         let Some(nfo_path) = find_nfo_path(media_path).await else {
-            return Ok(report);
+            return Ok(MetadataReport::default());
         };
-        let fingerprint = nfo_fingerprint(&nfo_path).await.ok();
-        let already_checked = if let Some(fingerprint) = fingerprint.as_deref() {
-            self.database
-                .media_item_metadata_fingerprint(item_id)
-                .await?
-                .as_deref()
-                == Some(fingerprint)
-        } else {
-            false
-        };
-        let actor_relation_missing = if let Some(people) = &self.people {
-            match people.item_actor_relation_exists(item_id).await {
-                Ok(exists) => !exists,
-                Err(error) => {
-                    tracing::warn!(
-                        item_id,
-                        %error,
-                        "local actor relation could not be checked; retrying NFO actor sync"
-                    );
-                    true
-                }
-            }
-        } else {
-            false
-        };
-        let rich_cache_missing = if let Some(local_nfo) = &self.local_nfo {
-            !local_nfo
-                .exists(item_id)
-                .await
-                .map_err(MetadataError::NfoCache)?
-        } else {
-            false
-        };
-        if already_checked && !actor_relation_missing && !rich_cache_missing {
-            report.nfo_skipped = 1;
-            return Ok(report);
-        }
-
-        let bytes = match fs::read(&nfo_path).await {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                report.nfo_failed = 1;
-                return Ok(report);
-            }
-        };
-        let metadata = match parse_nfo(&bytes) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                if let Some(local_nfo) = &self.local_nfo {
-                    local_nfo
-                        .clear_item(item_id)
-                        .await
-                        .map_err(MetadataError::NfoCache)?;
-                }
-                if let Some(fingerprint) = fingerprint.as_deref() {
-                    self.database
-                        .mark_media_item_metadata_checked(item_id, fingerprint)
-                        .await?;
-                }
-                report.nfo_failed = 1;
-                return Ok(report);
-            }
-        };
-        let rich_details = match parse_local_nfo_details(&bytes) {
-            Ok(details) => details,
-            Err(error) => {
-                tracing::warn!(item_id, %error, "local movie NFO rich details could not be parsed");
-                if let Some(local_nfo) = &self.local_nfo {
-                    local_nfo
-                        .clear_item(item_id)
-                        .await
-                        .map_err(MetadataError::NfoCache)?;
-                }
-                if let Some(fingerprint) = fingerprint.as_deref() {
-                    self.database
-                        .mark_media_item_metadata_checked(item_id, fingerprint)
-                        .await?;
-                }
-                report.nfo_failed = 1;
-                return Ok(report);
-            }
-        };
-        if let Some(local_nfo) = &self.local_nfo {
-            let source_fingerprint = nfo_content_fingerprint(&bytes);
-            local_nfo
-                .write_item(item_id, &source_fingerprint, &rich_details)
-                .await
-                .map_err(MetadataError::NfoCache)?;
-        }
-        if let Some(people) = &self.people {
-            match parse_local_nfo_actors(&bytes) {
-                Ok(actors) => {
-                    if let Err(error) = people.persist_item_actors(item_id, "tmdb", &actors).await {
-                        tracing::warn!(
-                            item_id,
-                            %error,
-                            "local NFO actors could not be persisted"
-                        );
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        item_id,
-                        %error,
-                        "local movie NFO actors could not be parsed"
-                    );
-                }
-            }
-        }
-        if let Some(fingerprint) = fingerprint.as_deref()
-            && let Some(current) = self.database.find_media_item_metadata(item_id).await?
-        {
-            let current_metadata = NfoMetadata {
-                title: Some(current.title.clone()),
-                original_title: current.original_title,
-                overview: current.overview,
-                production_year: current
-                    .production_year
-                    .and_then(|year| i32::try_from(year).ok()),
-            };
-            let mut state = MetadataState::from_persisted(
-                current_metadata,
-                current.provenance_json.as_deref(),
-                current.locked_fields_json.as_deref(),
-            );
-            state.apply_automatic(&MetadataCandidate {
-                source: MetadataSource::LocalNfo,
-                metadata,
-            });
-            let provenance_json = state.provenance_json();
-            let locked_fields_json = state.locked_fields_json();
-            self.database
-                .update_media_item_metadata(MediaMetadataUpdate {
-                    item_id,
-                    title: state
-                        .metadata
-                        .title
-                        .as_deref()
-                        .unwrap_or(current.title.as_str()),
-                    original_title: state.metadata.original_title.as_deref(),
-                    overview: state.metadata.overview.as_deref(),
-                    production_year: state.metadata.production_year.map(i64::from),
-                    metadata_fingerprint: fingerprint,
-                    provenance_json: &provenance_json,
-                    locked_fields_json: &locked_fields_json,
-                })
-                .await?;
-        }
-        report.nfo_loaded = 1;
-        Ok(report)
+        self.enrich_nfo_item(item_id, &nfo_path).await
     }
 
     async fn index_movie_images(
@@ -1069,14 +812,14 @@ impl MetadataEnricher {
         };
         let rich_cache_missing = if let Some(local_nfo) = &self.local_nfo {
             !local_nfo
-                .exists(item_id)
+                .is_usable(item_id)
                 .await
                 .map_err(MetadataError::NfoCache)?
         } else {
             false
         };
         let actor_relation_missing = if let Some(people) = &self.people {
-            match people.item_actor_relation_exists(item_id).await {
+            match people.nfo_relation_snapshot_exists(item_id).await {
                 Ok(exists) => !exists,
                 Err(error) => {
                     tracing::warn!(
@@ -1101,22 +844,9 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
-        let metadata = match parse_nfo(&bytes) {
-            Ok(metadata) => metadata,
+        let projection = match parse_local_nfo_projection(&bytes) {
+            Ok(projection) => projection,
             Err(_) => {
-                if let Some(fingerprint) = fingerprint.as_deref() {
-                    self.database
-                        .mark_media_item_metadata_checked(item_id, fingerprint)
-                        .await?;
-                }
-                report.nfo_failed = 1;
-                return Ok(report);
-            }
-        };
-        let rich_details = match parse_local_nfo_details(&bytes) {
-            Ok(details) => details,
-            Err(error) => {
-                tracing::warn!(item_id, %error, "local NFO rich details could not be parsed");
                 if let Some(local_nfo) = &self.local_nfo {
                     local_nfo
                         .clear_item(item_id)
@@ -1132,22 +862,56 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
+        let source_fingerprint = nfo_content_fingerprint(&bytes);
         if let Some(local_nfo) = &self.local_nfo {
-            let source_fingerprint = nfo_content_fingerprint(&bytes);
-            local_nfo
-                .write_item(item_id, &source_fingerprint, &rich_details)
+            let current = local_nfo
+                .is_current(item_id, &source_fingerprint)
                 .await
                 .map_err(MetadataError::NfoCache)?;
+            if !current {
+                local_nfo
+                    .write_item(item_id, &source_fingerprint, &projection.details)
+                    .await
+                    .map_err(MetadataError::NfoCache)?;
+            }
         }
         if let Some(people) = &self.people {
-            match parse_local_nfo_actors(&bytes) {
-                Ok(actors) => {
-                    if let Err(error) = people.persist_item_actors(item_id, "tmdb", &actors).await {
-                        tracing::warn!(item_id, %error, "local NFO actors could not be persisted");
-                    }
-                }
+            let relation_current = match people
+                .item_actor_relation_is_current(item_id, &source_fingerprint)
+                .await
+            {
+                Ok(current) => current,
                 Err(error) => {
-                    tracing::warn!(item_id, %error, "local NFO actors could not be parsed");
+                    tracing::warn!(
+                        item_id,
+                        %error,
+                        "local actor relation could not be checked; retrying NFO actor sync"
+                    );
+                    false
+                }
+            };
+            if !relation_current {
+                match people
+                    .persist_nfo_item_actors(
+                        item_id,
+                        "tmdb",
+                        &projection.actors,
+                        &source_fingerprint,
+                    )
+                    .await
+                {
+                    Ok(actor_report) => {
+                        if !actor_report.pending_assets.is_empty() {
+                            tracing::warn!(
+                                item_id,
+                                pending_actors = actor_report.pending_assets.len(),
+                                "local actor relation saved with pending person assets"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(item_id, %error, "local NFO actors could not be persisted; relation remains retryable");
+                    }
                 }
             }
         }
@@ -1168,7 +932,7 @@ impl MetadataEnricher {
             );
             state.apply_automatic(&MetadataCandidate {
                 source: MetadataSource::LocalNfo,
-                metadata,
+                metadata: projection.metadata,
             });
             let provenance_json = state.provenance_json();
             let locked_fields_json = state.locked_fields_json();
