@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
 
+pub mod migration;
+
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 

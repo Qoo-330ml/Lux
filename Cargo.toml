@@ -53,3 +53,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "luxd"
 path = "src/main.rs"
+
+[[bin]]
+name = "lux-db-migrate"
+path = "src/bin/lux-db-migrate.rs"
