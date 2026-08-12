@@ -44,6 +44,12 @@ test("the global header stays fixed while page content scrolls", () => {
   assert.match(rule(".lux-header"), /(?:top:\s*0|inset:\s*0\s+0\s+auto)/);
 });
 
+test("the fixed header softens scrolling content behind its gradient", () => {
+  assert.match(rule(".lux-header"), /background:\s*linear-gradient\(/);
+  assert.match(rule(".lux-header"), /backdrop-filter:\s*blur\(18px\)/);
+  assert.match(rule(".lux-header"), /-webkit-backdrop-filter:\s*blur\(18px\)/);
+});
+
 test("mobile navigation stays attached below the fixed header", () => {
   const fixedMobileNavRule = stylesheet.match(/\.lux-mobile-nav\s*\{\s*position:\s*fixed[^}]*\}/)?.[0] ?? "";
 
