@@ -57,7 +57,7 @@ test("the header blur fades below the toolbar instead of ending on a hard edge",
   const fade = rule(".lux-header::before");
 
   assert.match(fade, /inset:\s*0\s+0\s+auto/);
-  assert.match(fade, /height:\s*calc\(100%\s*\+\s*clamp\(64px,\s*6vw,\s*96px\)\)/);
+  assert.match(fade, /height:\s*calc\(100%\s*\+\s*clamp\(40px,\s*4vw,\s*64px\)\)/);
   assert.match(fade, /backdrop-filter:\s*blur\(18px\)/);
   assert.match(fade, /mask-image:\s*linear-gradient\(/);
   assert.match(fade, /pointer-events:\s*none/);
