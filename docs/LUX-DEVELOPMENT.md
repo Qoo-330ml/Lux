@@ -1799,6 +1799,7 @@ services:
 | LUX-170 | src/application/nfo.rs、src/application/metadata.rs、src/application/people.rs、src/application/scanner.rs、src/api/mod.rs、web/src/features/detail/、tests/、docs/ |
 | LUX-171 | Cargo.toml、Dockerfile、docker-entrypoint.sh、src/application/plugins.rs、src/application/plugin_store.rs、src/bin/、plugins/、scripts/、tests/、web/、docs/ |
 | LUX-172 | migrations/、migrations-postgres/、src/application/nfo.rs、src/application/metadata.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/types.ts、tests/、docs/ |
+| LUX-173 | src/storage/migration.rs、src/bin/lux-db-migrate.rs、tests/database_migration.rs、tests/postgres_database_migration.rs、compose.yaml、.env.example、README.md、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3732,6 +3733,45 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 - 不把官网、预告片或 NFO 图片 URL 当作 Lux 代理目标；只作为受限外链展示。
 
 依赖：LUX-164、LUX-168、LUX-170。
+
+#### LUX-173：SQLite → PostgreSQL 离线迁移与一键 Compose
+
+范围：为已经初始化并使用 SQLite 的 Lux 实例提供显式、离线、可校验的 PostgreSQL 迁移命令。
+迁移命令只读打开源 `/config/lux.db`，连接一个没有 Lux 业务数据的 PostgreSQL 数据库，先运行当前
+PostgreSQL migrations，再在目标单事务内按外键依赖顺序分批复制业务表。SQLite FTS5 内部表和
+`_sqlx_migrations` 不直接复制；PostgreSQL 搜索派生表由迁移命令根据已复制的媒体条目与别名重建。
+
+该命令不得在 `luxd` 服务运行时自动触发，不自动改写 `/config/database.json`，也不删除、重命名或
+修改源 SQLite 文件。管理员在停止 Lux、完成宿主机快照并验证迁移报告后，显式写入 PostgreSQL
+数据库配置并重启。目标连接密码只允许通过环境变量读取，不作为命令行参数、日志字段或报告内容。
+
+Compose 继续使用两个容器，但 PostgreSQL 与 Lux 属于同一个 Compose 项目；PostgreSQL 使用独立
+持久目录、健康检查和有限内存，Lux 在启用 PostgreSQL profile 时等待数据库健康。默认 SQLite
+快速启动保持兼容，不在 Lux 单容器内监管 PostgreSQL 子进程。
+
+验收：
+
+- [ ] 源 SQLite 以只读模式打开；迁移成功或失败均不修改源数据库及其配置文件。
+- [ ] 目标 PostgreSQL 必须没有 Lux 业务数据；非空目标拒绝执行且不覆盖现有数据。
+- [ ] 当前 SQLite/PostgreSQL schema 版本不一致时拒绝迁移，并报告脱敏的可操作错误。
+- [ ] 业务表按依赖顺序分批复制；二进制、空值、文本、整数和浮点字段保持类型和值。
+- [ ] SQLite FTS5 内部表不复制；PostgreSQL `media_search` 从媒体条目和别名重建。
+- [ ] 活动后台任务在目标库归一为可恢复的排队状态，避免迁移后遗留不可领取的 RUNNING 项。
+- [ ] 复制与派生重建位于一个 PostgreSQL 事务；任一步失败时目标业务表回滚为空。
+- [ ] 成功报告包含逐表源/目标行数和总耗时，不包含凭据、令牌、完整外部 URL 或媒体内容。
+- [ ] SQLite fixture 自动化测试覆盖计划、类型映射、目标非空拒绝和源只读；真实 PostgreSQL 集成测试
+  覆盖迁移、计数校验、登录、媒体库查询与搜索。
+- [ ] Compose 提供 PostgreSQL 健康依赖、持久目录和内存上限；默认 SQLite 部署行为不变。
+- [ ] 部署文档包含停止服务、快照、迁移、验证、显式切换与回滚到 SQLite 的完整顺序。
+
+明确不做：
+
+- 不实现运行中双写、在线切换、增量同步或 PostgreSQL → SQLite 回迁。
+- 不把 PostgreSQL 进程放进 Lux 容器，不自动生成或持久化数据库密码。
+- 不把迁移命令暴露为 HTTP API，不允许浏览器请求启动整库迁移。
+- 不替代 NAS/数据库平台的备份工具，也不自动删除失败目标或源 SQLite。
+
+依赖：LUX-155、LUX-135。
 
 ## 26. 风险与缓解
 
