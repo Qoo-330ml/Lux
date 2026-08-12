@@ -316,6 +316,23 @@ Lux 的核心价值不是功能数量，而是：
 - 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
 - 全局策略的服务器设置不得返回任何凭据；插件凭据仍只在插件管理页面配置。播放进度阈值继续属于服务器设置，不在媒体库策略页重复管理。
 
+### 3.16 章节与片头片尾
+
+- 章节绑定具体 `media_source`，同一逻辑条目的不同版本分别保存；普通章节与片头片尾标记共享同一领域模型。
+- 普通章节使用 `Chapter`；片头片尾使用 Emby 兼容的隐藏标记 `IntroStart`、`IntroEnd` 和
+  `CreditsStart`。首版不虚构 `CreditsEnd`，片尾区间延伸到媒体结束。
+- 本地媒体在后台 `ffprobe` 阶段读取容器内嵌章节并保存到数据库；播放、详情和列表请求不得打开媒体文件。
+- 章节和隐藏标记的权威运行时副本保存在数据库。Lux 不修改 MKV、MP4 或其他媒体容器，也不把检测结果默认写入
+  NFO 或 EDL；后续如增加导入导出，只作为显式兼容能力。
+- Emby 条目 DTO 与 `PlaybackInfo.MediaSources` 按公开 `ChapterInfo` 形状返回章节：
+  `StartPositionTicks`、可选 `Name`、可选 `ImageTag`、`MarkerType` 和 `ChapterIndex`。
+- 自动片头片尾检测由独立 `chapter_detector` 插件提供。Lux 宿主只在后台对已校验的本地媒体运行
+  ffmpeg/chromaprint，向插件发送有界、无路径、无 URL、无凭据的指纹序列；插件不能访问数据库、媒体根目录或任务对象。
+- 检测插件按季度批次比较至少两个可用分集，返回 `IntroStart`、`IntroEnd`、`CreditsStart` 候选。
+  Lux 校验时间范围、顺序、数量和来源后原子替换该插件先前生成的隐藏标记；低置信度结果不落库。
+- 媒体文件指纹变化时，旧的容器章节和检测标记同时失效；重新探测与重新检测在后台恢复。
+- 普通章节与检测标记均不得改变媒体字节、直放 URL、运行时或用户播放进度。
+
 ---
 
 ## 4. 明确不在首版范围
@@ -885,6 +902,23 @@ pub async fn get_item(
 - external_path
 - width、height、channels 等技术字段
 
+#### media_chapters
+
+- id
+- media_source_id
+- start_position_ticks
+- name，可空；隐藏标记默认不设置名称
+- marker_type：CHAPTER、INTRO_START、INTRO_END、CREDITS_START
+- chapter_index：同一媒体源内稳定、从 0 开始
+- origin：EMBEDDED、DETECTED、MANUAL、IMPORTED
+- provider_id，可空；DETECTED 必须记录插件 ID
+- confidence，可空，范围 0 到 1
+- created_at、updated_at
+- 唯一键 media_source_id + marker_type + start_position_ticks
+
+同一媒体源最多保存 10,000 个章节记录。读取始终按 `start_position_ticks`、标记优先级和 ID
+稳定排序；检测插件只能替换自己的 DETECTED 隐藏标记，不能覆盖 EMBEDDED、MANUAL 或 IMPORTED 章节。
+
 #### danmaku_tracks
 
 - id
@@ -1210,7 +1244,9 @@ locked local value
 
 - SupportsDirectPlay = true。
 - SupportsDirectStream/Transcoding 按首版实际实现返回 false。
-- MediaSources 包含版本、容器、码率、大小、时长、流列表和直放 URL。
+- MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
+- 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。普通章节与
+  `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记统一映射为 Emby `ChapterInfo`。
 - `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放仍由客户端直接访问外部地址。
 - 不伪造客户端能播放的编码。
 - 选择默认版本使用稳定策略，并允许客户端显式选择 source ID。
@@ -3732,6 +3768,74 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 - 不把官网、预告片或 NFO 图片 URL 当作 Lux 代理目标；只作为受限外链展示。
 
 依赖：LUX-164、LUX-168、LUX-170。
+
+#### LUX-173：媒体章节存储与容器章节探测
+
+范围：新增按 `media_source` 归属的章节模型；本地后台媒体探测读取 ffprobe `chapters`，校验后与
+媒体信息在同一短事务中保存。文件指纹变化时清除旧章节并把媒体源恢复为待探测。首个增量只处理
+普通 `CHAPTER`，不实现隐藏标记检测、API 映射、NFO/EDL 或媒体容器写回。
+
+验收：
+
+- [ ] SQLite 与 PostgreSQL 从空数据库迁移成功，章节外键随媒体源删除级联清理。
+- [ ] ffprobe 章节起点、标题和顺序被受限解析；负时间、超限数量、过长标题和重复章节不会污染数据库。
+- [ ] 探测成功原子替换 EMBEDDED 普通章节并保留其他来源；探测失败保留上一份成功章节。
+- [ ] 文件内容指纹变化时清除该媒体源全部旧章节，未变化文件不重复探测。
+
+验证：章节解析单元测试、SQLite/PostgreSQL 迁移测试、探测存储集成测试和基线 Rust 检查。
+
+依赖：LUX-033、LUX-064。
+
+#### LUX-174：Emby 章节兼容输出
+
+范围：从数据库批量加载章节进入目录领域对象；条目 DTO 的 `Chapters` 使用默认媒体源，
+`PlaybackInfo.MediaSources[].Chapters` 使用各自媒体源。映射公开的 `ChapterInfo` 字段和
+`Chapter`、`IntroStart`、`IntroEnd`、`CreditsStart` 枚举，不新增 Emby 私有扩展。
+
+验收：
+
+- [ ] 请求 `Fields=Chapters` 时条目返回默认媒体源章节，未请求时保持现有响应体积。
+- [ ] PlaybackInfo 为每个版本返回自己的章节，排序和 `ChapterIndex` 稳定。
+- [ ] 没有章节时返回空数组；权限、分页和播放能力行为不变。
+
+验证：Emby 目录与 PlaybackInfo 集成测试、三客户端兼容探针记录和基线 Rust 检查。
+
+依赖：LUX-173。
+
+#### LUX-175：片头片尾检测插件宿主
+
+范围：扩展 Plugin SDK v1，支持 `chapter_detector` 类型与 `chapters.detect` 能力。Lux 在持久化后台
+任务中按季度分页读取本地分集，使用现有 ffmpeg 的 chromaprint muxer 提取开头/结尾的有界原始指纹，
+只把指纹、采样率、窗口相对时间和请求内临时键发送给插件。插件不接收路径、URL、媒体源 ID、凭据或任务对象。
+宿主校验插件结果并把高置信度标记保存为 DETECTED 特殊章节。
+
+验收：
+
+- [ ] manifest、RPC 请求和响应均有严格大小、枚举、数量、时间范围和置信度校验。
+- [ ] 管理员可按已保存插件配置启动、取消、重试和查看持久化检测任务；重启恢复 PENDING/RUNNING。
+- [ ] 插件失败、ffmpeg 缺少 chromaprint、超时或坏响应只影响对应分集/任务，不删除已有确认标记。
+- [ ] 成功重跑只原子替换同一插件生成的 DETECTED 标记，不覆盖其他来源。
+
+验证：假 ffmpeg、假插件进程、任务恢复、ACL/CSRF、故障注入测试和完整项目检查。
+
+依赖：LUX-173、LUX-174、LUX-171。
+
+#### LUX-176：外置片头片尾检测插件
+
+范围：在独立 `Lux-plugins` 仓库实现 `org.lux.intro-outro-detector`。插件比较同季度至少两个分集的
+Chromaprint 原始指纹，在配置的开头/结尾窗口内寻找满足最小时长和匹配阈值的公共序列，返回
+`IntroStart`、`IntroEnd` 和可选 `CreditsStart`。插件不执行 ffmpeg、不读取媒体路径、不联网。
+
+验收：
+
+- [ ] 合成指纹测试覆盖共同片头、共同片尾、不同片头、短匹配、静音、偏移和超长季度批次。
+- [ ] RPC 只接受宿主定义的受限指纹合同；畸形或超限输入返回稳定脱敏错误。
+- [ ] manifest、x86_64/aarch64 构建和插件商店包生成成功；Lux 假宿主端到端测试得到特殊章节。
+- [ ] 未达到阈值时返回空标记，不猜测或写出低置信度结果。
+
+验证：外部插件仓库 `cargo test --locked --all-targets`、fmt、clippy、双架构打包，以及 Lux 契约测试。
+
+依赖：LUX-175。
 
 ## 26. 风险与缓解
 
