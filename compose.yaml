@@ -13,6 +13,31 @@ services:
       - ./media:/media:rw
     restart: unless-stopped
 
+  lux-postgres:
+    image: pdzhou/lux:latest
+    container_name: lux-postgres-app
+    profiles:
+      - postgres
+    user: "0:0"
+    mem_limit: ${LUX_MEMORY_LIMIT:-2g}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MALLOC_ARENA_MAX: ${LUX_MALLOC_ARENA_MAX:-2}
+      LUX_MIGRATE_POSTGRES_HOST: ${LUX_MIGRATE_POSTGRES_HOST:-postgres}
+      LUX_MIGRATE_POSTGRES_PORT: ${LUX_MIGRATE_POSTGRES_PORT:-5432}
+      LUX_MIGRATE_POSTGRES_DATABASE: ${LUX_MIGRATE_POSTGRES_DATABASE:-lux}
+      LUX_MIGRATE_POSTGRES_USER: ${LUX_MIGRATE_POSTGRES_USER:-lux}
+      LUX_MIGRATE_POSTGRES_PASSWORD: ${LUX_MIGRATE_POSTGRES_PASSWORD:-}
+      LUX_MIGRATE_POSTGRES_SSL_MODE: ${LUX_MIGRATE_POSTGRES_SSL_MODE:-disable}
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./config:/config:rw
+      - ./media:/media:rw
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     container_name: lux-postgres
@@ -25,9 +50,12 @@ services:
     volumes:
       # Store PostgreSQL data directly in the project directory.
       - ./postgres-data:/var/lib/postgresql/data
+    mem_limit: ${LUX_POSTGRES_MEMORY_LIMIT:-1g}
+    shm_size: ${LUX_POSTGRES_SHM_SIZE:-256m}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
     restart: unless-stopped

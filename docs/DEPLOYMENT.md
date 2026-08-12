@@ -143,7 +143,60 @@ docker build --build-arg LUX_VERSION=0.1.15 -t lux:0.1.15 .
 docker compose up -d
 ```
 
-启动时会自动执行当前已选择数据库的 migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。当前版本不提供应用内备份/恢复或跨数据库迁移工具，也不提供 SQLite 与 PostgreSQL 之间的数据迁移；正式 NAS 发布前必须由运维侧完成配置目录、媒体目录和（如使用）PostgreSQL 数据库的快照与恢复演练。
+启动时会自动执行当前已选择数据库的 migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。Lux 不提供应用内备份/恢复，正式 NAS 发布前仍必须由运维侧完成配置目录、媒体目录和 PostgreSQL 数据库的快照与恢复演练。
+
+## SQLite 离线迁移到 PostgreSQL
+
+迁移要求 Lux 完全停止，目标 PostgreSQL 为专用空数据库，并且源、目标 migrations 都与当前镜像一致。迁移命令只读打开 SQLite，在单个 PostgreSQL 事务中复制数据；成功前不会创建 `database.json`，失败不会修改 SQLite。
+
+1. 停止 Lux 并创建宿主机快照：
+
+```bash
+docker compose stop lux lux-postgres
+cp -a ./config ./config.before-postgres
+```
+
+2. 在 `.env` 设置 `LUX_POSTGRES_PASSWORD` 和同值的 `LUX_MIGRATE_POSTGRES_PASSWORD`，只启动数据库：
+
+```bash
+docker compose --profile postgres up -d postgres
+docker compose --profile postgres ps postgres
+```
+
+3. 使用当前 Lux 镜像执行离线迁移；不要把密码写在命令行：
+
+```bash
+docker compose --profile postgres run --rm --no-deps \
+  lux-postgres lux-db-migrate sqlite-to-postgres --source /config/lux.db
+```
+
+保存命令输出的逐表计数报告，并与 SQLite 管理统计核对。目标非空、schema 版本不符或任一表计数不符时，迁移会失败且目标业务写入回滚。
+
+4. 验证报告后，在 `/config/database.json` 写入 PostgreSQL 配置。文件权限应为 `0600`，密码不得提交到 Git 或作为日志附件：
+
+```json
+{
+  "backend": "POSTGRES",
+  "host": "postgres",
+  "port": 5432,
+  "database": "lux",
+  "username": "lux",
+  "password": "替换为强密码",
+  "sslMode": "disable"
+}
+```
+
+5. 启动 PostgreSQL 组合并验证：
+
+```bash
+docker compose --profile postgres up -d lux-postgres
+curl --fail http://127.0.0.1:8097/health/live
+curl --fail http://127.0.0.1:8097/health/ready
+```
+
+随后验证管理员登录、媒体库数量、搜索、图片、播放进度和一次 Range 播放。至少稳定观察一个扫描/刮削周期后再考虑清理旧资源。
+
+回滚时停止 `lux-postgres`，恢复 `config.before-postgres`（或至少恢复原 SQLite 与原数据库配置），再启动默认 `lux`。迁移工具不会修改源 SQLite，因此只要切换后没有产生必须保留的新播放进度，回滚不需要反向数据转换；PostgreSQL 切换后的新写入不会自动同步回 SQLite。
 
 升级后的验收最少包括：
 

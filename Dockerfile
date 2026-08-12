@@ -34,7 +34,7 @@ COPY logo.svg ./logo.svg
 COPY web ./web
 COPY --from=web-builder /src/web/dist ./web/dist
 
-RUN cargo build --release --locked --bin luxd
+RUN cargo build --release --locked --bins
 
 FROM debian:bookworm-slim
 
@@ -50,6 +50,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
+COPY --from=builder /src/target/release/lux-db-migrate /usr/local/bin/lux-db-migrate
 COPY --from=builder /src/assets/fonts/SmileySans-LICENSE.txt /usr/share/doc/lux/SmileySans-LICENSE.txt
 COPY --from=web-builder /src/web/dist /usr/local/share/lux/web
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

@@ -58,7 +58,13 @@ services:
 
 ### 使用 PostgreSQL（可选）
 
-PostgreSQL 不是 Lux 容器内的子进程。可以使用 Compose 的 `postgres` profile，也可以填写部署环境中已有的 PostgreSQL：
+PostgreSQL 不是 Lux 容器内的子进程。可以使用 Compose 的 `postgres` profile，也可以填写部署环境中已有的 PostgreSQL。复制 `.env.example` 为 `.env` 并设置强密码后，一键启动同一 Compose 项目：
+
+```bash
+docker compose --profile postgres up -d lux-postgres
+```
+
+`lux-postgres` 会等待 PostgreSQL 健康后启动；默认的 `lux` 服务仍使用 SQLite 快速启动，不要同时启动 `lux` 与 `lux-postgres`。
 
 ```bash
 services:
@@ -91,7 +97,7 @@ services:
     restart: unless-stopped
 ```
 
-在首次引导中选择 PostgreSQL 时，若使用本 Compose 提供的数据库，主机填写 `postgres`，端口填写 `5432`。数据库后端只能在创建第一个管理员之前选择；当前不支持已初始化实例在线切换，也不会自动执行 SQLite 到 PostgreSQL 的迁移。
+在首次引导中选择 PostgreSQL 时，若使用本 Compose 提供的数据库，主机填写 `postgres`，端口填写 `5432`。已有 SQLite 实例必须停止 Lux 后使用 `lux-db-migrate` 显式离线迁移；迁移工具不会自动切换数据库或删除 SQLite。完整步骤见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
 
 ## 第一次使用

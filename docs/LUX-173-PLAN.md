@@ -48,3 +48,10 @@ docker compose config
 
 真实 NAS 数据迁移需另行记录停机时间、源/目标大小、逐表计数、登录、媒体浏览、搜索和 Range 播放；
 本机 ARM64 结果不代表飞牛 x86_64 性能。
+
+2026-08-13：SQLite 计划/参数单元测试 6/6、迁移 CLI 测试 2/2、Compose 默认及
+PostgreSQL profile 配置校验通过；在飞牛 x86_64 上的临时 PostgreSQL 17 容器完成真实往返测试，
+覆盖源文件不变、逐表计数、BLOB、管理员登录、媒体查询、中文搜索别名、RUNNING 状态恢复及
+非空目标拒绝。完整
+`cargo test --all-targets` 仍被既有 LUX-169 插件目录版本断言（期望 4、实际 6）阻断；完整 Clippy
+仅命中既有 `src/application/scanner.rs` 的 `nonminimal_bool`，均未在 LUX-173 中跨任务修改。
