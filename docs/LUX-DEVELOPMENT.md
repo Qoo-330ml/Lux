@@ -318,20 +318,21 @@ Lux 的核心价值不是功能数量，而是：
 
 ### 3.16 章节与片头片尾
 
-- 章节绑定具体 `media_source`，同一逻辑条目的不同版本分别保存；普通章节与片头片尾标记共享同一领域模型。
-- 普通章节使用 `Chapter`；片头片尾使用 Emby 兼容的隐藏标记 `IntroStart`、`IntroEnd` 和
-  `CreditsStart`。首版不虚构 `CreditsEnd`，片尾区间延伸到媒体结束。
-- 本地媒体在后台 `ffprobe` 阶段读取容器内嵌章节并保存到数据库；播放、详情和列表请求不得打开媒体文件。
-- 章节和隐藏标记的权威运行时副本保存在数据库。Lux 不修改 MKV、MP4 或其他媒体容器，也不把检测结果默认写入
-  NFO 或 EDL；后续如增加导入导出，只作为显式兼容能力。
+- 章节标记绑定具体 `media_source`，同一逻辑条目的不同版本分别保存。
+- 当前唯一章节来源是片头片尾检测插件，只保存 Emby 兼容的隐藏标记 `IntroStart`、`IntroEnd` 和
+  `CreditsStart`。不产生普通 `Chapter`，也不虚构 `CreditsEnd`；片尾区间延伸到媒体结束。
+- Lux 不主动读取容器内嵌章节，现有本地媒体 `ffprobe` 不增加 `-show_chapters`。也不从 NFO 或 EDL
+  导入普通章节；播放、详情和列表请求不得为章节打开媒体文件。
+- 隐藏标记的权威运行时副本保存在数据库。Lux 不修改 MKV、MP4 或其他媒体容器，也不把检测结果默认写入
+  NFO 或 EDL。
 - Emby 条目 DTO 与 `PlaybackInfo.MediaSources` 按公开 `ChapterInfo` 形状返回章节：
   `StartPositionTicks`、可选 `Name`、可选 `ImageTag`、`MarkerType` 和 `ChapterIndex`。
 - 自动片头片尾检测由独立 `chapter_detector` 插件提供。Lux 宿主只在后台对已校验的本地媒体运行
   ffmpeg/chromaprint，向插件发送有界、无路径、无 URL、无凭据的指纹序列；插件不能访问数据库、媒体根目录或任务对象。
 - 检测插件按季度批次比较至少两个可用分集，返回 `IntroStart`、`IntroEnd`、`CreditsStart` 候选。
   Lux 校验时间范围、顺序、数量和来源后原子替换该插件先前生成的隐藏标记；低置信度结果不落库。
-- 媒体文件指纹变化时，旧的容器章节和检测标记同时失效；重新探测与重新检测在后台恢复。
-- 普通章节与检测标记均不得改变媒体字节、直放 URL、运行时或用户播放进度。
+- 媒体文件指纹变化时，旧检测标记失效；重新检测只在后台任务中发生。
+- 检测标记不得改变媒体字节、直放 URL、运行时或用户播放进度。
 
 ---
 
@@ -908,16 +909,15 @@ pub async fn get_item(
 - media_source_id
 - start_position_ticks
 - name，可空；隐藏标记默认不设置名称
-- marker_type：CHAPTER、INTRO_START、INTRO_END、CREDITS_START
+- marker_type：INTRO_START、INTRO_END、CREDITS_START
 - chapter_index：同一媒体源内稳定、从 0 开始
-- origin：EMBEDDED、DETECTED、MANUAL、IMPORTED
-- provider_id，可空；DETECTED 必须记录插件 ID
-- confidence，可空，范围 0 到 1
+- provider_id：检测插件 ID，非空
+- confidence：范围 0 到 1，非空
 - created_at、updated_at
-- 唯一键 media_source_id + marker_type + start_position_ticks
+- 唯一键 media_source_id + provider_id + marker_type
 
-同一媒体源最多保存 10,000 个章节记录。读取始终按 `start_position_ticks`、标记优先级和 ID
-稳定排序；检测插件只能替换自己的 DETECTED 隐藏标记，不能覆盖 EMBEDDED、MANUAL 或 IMPORTED 章节。
+同一插件对同一媒体源最多保存三个章节标记。读取始终按 `start_position_ticks`、标记优先级和 ID
+稳定排序；检测插件只能替换自己生成的隐藏标记。当前不保存容器章节、普通章节或手工章节。
 
 #### danmaku_tracks
 
@@ -3769,28 +3769,26 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 
 依赖：LUX-164、LUX-168、LUX-170。
 
-#### LUX-173：媒体章节存储与容器章节探测
+#### LUX-173：片头片尾章节标记存储
 
-范围：新增按 `media_source` 归属的章节模型；本地后台媒体探测读取 ffprobe `chapters`，校验后与
-媒体信息在同一短事务中保存。文件指纹变化时清除旧章节并把媒体源恢复为待探测。首个增量只处理
-普通 `CHAPTER`，不实现隐藏标记检测、API 映射、NFO/EDL 或媒体容器写回。
+范围：新增按 `media_source` 归属的片头片尾章节标记表，为后续检测插件与 Emby 输出建立服务器 DB
+事实来源。当前任务不产生章节记录，不读取容器章节，也不实现检测任务、API 映射、NFO/EDL 或媒体容器写回。
 
 验收：
 
 - [ ] SQLite 与 PostgreSQL 从空数据库迁移成功，章节外键随媒体源删除级联清理。
-- [ ] ffprobe 章节起点、标题和顺序被受限解析；负时间、超限数量、过长标题和重复章节不会污染数据库。
-- [ ] 探测成功原子替换 EMBEDDED 普通章节并保留其他来源；探测失败保留上一份成功章节。
-- [ ] 文件内容指纹变化时清除该媒体源全部旧章节，未变化文件不重复探测。
+- [ ] schema 只接受 `INTRO_START`、`INTRO_END`、`CREDITS_START`，并约束非负时间、置信度和每插件每类型唯一性。
+- [ ] 现有本地与 STRM 媒体探测行为不变，不请求、解析或保存 ffprobe 容器章节。
 
-验证：章节解析单元测试、SQLite/PostgreSQL 迁移测试、探测存储集成测试和基线 Rust 检查。
+验证：SQLite/PostgreSQL 迁移测试、约束与级联测试、现有探测回归测试和基线 Rust 检查。
 
 依赖：LUX-033、LUX-064。
 
 #### LUX-174：Emby 章节兼容输出
 
-范围：从数据库批量加载章节进入目录领域对象；条目 DTO 的 `Chapters` 使用默认媒体源，
+范围：从数据库批量加载片头片尾章节标记进入目录领域对象；条目 DTO 的 `Chapters` 使用默认媒体源，
 `PlaybackInfo.MediaSources[].Chapters` 使用各自媒体源。映射公开的 `ChapterInfo` 字段和
-`Chapter`、`IntroStart`、`IntroEnd`、`CreditsStart` 枚举，不新增 Emby 私有扩展。
+`IntroStart`、`IntroEnd`、`CreditsStart` 枚举，不新增普通章节或 Emby 私有扩展。
 
 验收：
 
