@@ -8348,6 +8348,18 @@ fn valid_strategy_code(value: &str, max_length: usize) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
+fn valid_optional_strategy_code(value: &str, max_length: usize) -> bool {
+    value.is_empty() || valid_strategy_code(value, max_length)
+}
+
+fn valid_plugin_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 64
+        && value
+            .split('.')
+            .all(|segment| valid_strategy_code(segment, 32))
+}
+
 fn normalize_server_name(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > 80 || value.chars().any(char::is_control) {
@@ -8358,7 +8370,7 @@ fn normalize_server_name(value: &str) -> Option<String> {
 
 fn validate_media_strategy(settings: &MediaStrategySettings) -> bool {
     valid_strategy_code(&settings.metadata_language, 32)
-        && valid_strategy_code(&settings.image_language, 32)
+        && valid_optional_strategy_code(&settings.image_language, 32)
         && valid_strategy_code(&settings.region, 16)
         && matches!(
             settings.apply_scope.as_str(),
@@ -8371,7 +8383,7 @@ fn validate_media_strategy(settings: &MediaStrategySettings) -> bool {
         && settings
             .scraper_id
             .as_deref()
-            .map(|value| valid_strategy_code(value, 64))
+            .map(valid_plugin_id)
             .unwrap_or(true)
         && (0..=20).contains(&settings.images.max_backdrop_count)
         && (0..=8192).contains(&settings.images.min_download_width)
@@ -8433,7 +8445,13 @@ async fn admin_update_settings(
         || minimum_ticks < 0
         || !validate_media_strategy(&media_strategy)
     {
-        return StatusCode::BAD_REQUEST.into_response();
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "全局媒体策略无效",
+        )
+        .into_response();
     }
     if let Some(scraper_id) = media_strategy.scraper_id.as_deref() {
         if let Err(response) = validate_scraper_selection(&headers, &state, Some(scraper_id)).await
@@ -13987,13 +14005,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CatalogSort, MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby,
-        emby_media_source_json, emby_media_source_json_with_resolver, emby_media_stream_item_id,
-        emby_playback_info_item_id, is_catalog_aggregation_path, is_emby_legacy_strm_path,
-        is_emby_media_stream_segment, is_emby_playback_callback_path, is_emby_subtitle_path,
-        is_emby_video_path, is_registered_emby_video_path, lux_catalog_source_json,
-        metadata_candidate_failure_kind, playback_client_label, playback_identifier_prefix,
-        record_activity_event, safe_trace_path, secure_cookie_for_request,
+        CatalogSort, MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
+        catalog_filter_from_emby, emby_media_source_json, emby_media_source_json_with_resolver,
+        emby_media_stream_item_id, emby_playback_info_item_id, is_catalog_aggregation_path,
+        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
+        is_emby_subtitle_path, is_emby_video_path, is_registered_emby_video_path,
+        lux_catalog_source_json, metadata_candidate_failure_kind, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -14007,6 +14026,23 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri};
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn media_strategy_accepts_frontend_plugin_ids_and_no_image_language_preference() {
+        let mut settings = MediaStrategySettings::default();
+        settings.scraper_id = Some("org.lux.tmdb".to_owned());
+        settings.image_language.clear();
+
+        assert!(validate_media_strategy(&settings));
+    }
+
+    #[test]
+    fn media_strategy_rejects_unsafe_plugin_ids() {
+        let mut settings = MediaStrategySettings::default();
+        settings.scraper_id = Some("../org.lux.tmdb".to_owned());
+
+        assert!(!validate_media_strategy(&settings));
+    }
 
     #[test]
     fn catalog_concurrency_guard_excludes_streaming_paths() {
