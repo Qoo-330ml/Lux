@@ -13,8 +13,8 @@ use crate::{
     application::scanner::compute_file_fingerprint,
     application::{
         nfo::{
-            LocalNfoMetadataStore, LocalNfoMetadataStoreError, parse_local_nfo_actors,
-            parse_local_nfo_details,
+            LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
+            parse_local_nfo_actors, parse_local_nfo_details,
         },
         people::PeopleService,
     },
@@ -798,8 +798,9 @@ impl MetadataEnricher {
             }
         };
         if let Some(local_nfo) = &self.local_nfo {
+            let source_fingerprint = nfo_content_fingerprint(&bytes);
             local_nfo
-                .write_item(item_id, &rich_details)
+                .write_item(item_id, &source_fingerprint, &rich_details)
                 .await
                 .map_err(MetadataError::NfoCache)?;
         }
@@ -1132,8 +1133,9 @@ impl MetadataEnricher {
             }
         };
         if let Some(local_nfo) = &self.local_nfo {
+            let source_fingerprint = nfo_content_fingerprint(&bytes);
             local_nfo
-                .write_item(item_id, &rich_details)
+                .write_item(item_id, &source_fingerprint, &rich_details)
                 .await
                 .map_err(MetadataError::NfoCache)?;
         }

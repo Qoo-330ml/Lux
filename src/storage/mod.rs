@@ -8157,21 +8157,73 @@ impl Database {
         })
     }
 
+    pub(crate) async fn media_item_nfo_metadata_state(
+        &self,
+        item_id: &str,
+    ) -> Result<(bool, Option<Vec<u8>>), StorageError> {
+        self.query_as(
+            "SELECT CASE WHEN nfo_metadata_json IS NULL THEN 0 ELSE 1 END,
+                    nfo_metadata_fingerprint
+             FROM media_items
+             WHERE id = ?",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row: Option<(i64, Option<Vec<u8>>)>| {
+            row.map_or((false, None), |(has_snapshot, fingerprint)| {
+                (has_snapshot != 0, fingerprint)
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn update_media_item_nfo_metadata(
         &self,
         item_id: &str,
         nfo_metadata_json: Option<&str>,
+        source_fingerprint: Option<&[u8]>,
     ) -> Result<(), StorageError> {
-        self.query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
-            .bind(nfo_metadata_json)
-            .bind(item_id)
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.query(
+            "UPDATE media_items
+             SET nfo_metadata_json = ?, nfo_metadata_fingerprint = ?
+             WHERE id = ?",
+        )
+        .bind(nfo_metadata_json)
+        .bind(source_fingerprint)
+        .bind(item_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn invalidate_media_item_nfo_metadata_if_source_changed(
+        &self,
+        item_id: &str,
+        source_fingerprint: &[u8],
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_items
+             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL
+             WHERE id = ?
+               AND (nfo_metadata_fingerprint IS NULL OR nfo_metadata_fingerprint <> ?)",
+        )
+        .bind(item_id)
+        .bind(source_fingerprint)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn mark_media_item_metadata_checked(

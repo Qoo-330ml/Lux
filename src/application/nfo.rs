@@ -13,6 +13,7 @@ use quick_xml::{
     reader::Reader,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -588,6 +589,7 @@ impl LocalNfoMetadataStore {
     pub async fn write_item(
         &self,
         item_id: &str,
+        source_fingerprint: &[u8],
         details: &LocalNfoDetails,
     ) -> Result<(), LocalNfoMetadataStoreError> {
         let json = serde_json::to_string(details)
@@ -596,7 +598,7 @@ impl LocalNfoMetadataStore {
             return Err(LocalNfoMetadataStoreError::TooLarge);
         }
         self.database
-            .update_media_item_nfo_metadata(item_id, Some(&json))
+            .update_media_item_nfo_metadata(item_id, Some(&json), Some(source_fingerprint))
             .await
             .map_err(LocalNfoMetadataStoreError::Storage)
     }
@@ -622,15 +624,26 @@ impl LocalNfoMetadataStore {
     }
 
     pub async fn exists(&self, item_id: &str) -> Result<bool, LocalNfoMetadataStoreError> {
-        Ok(self.read_item(item_id).await?.is_some())
+        self.database
+            .media_item_nfo_metadata_state(item_id)
+            .await
+            .map(|(has_snapshot, _)| has_snapshot)
+            .map_err(LocalNfoMetadataStoreError::Storage)
     }
 
     pub async fn clear_item(&self, item_id: &str) -> Result<(), LocalNfoMetadataStoreError> {
         self.database
-            .update_media_item_nfo_metadata(item_id, None)
+            .update_media_item_nfo_metadata(item_id, None, None)
             .await
             .map_err(LocalNfoMetadataStoreError::Storage)
     }
+}
+
+pub(crate) fn nfo_content_fingerprint(bytes: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"LUX-NFO-CONTENT-1\0");
+    hasher.update(bytes);
+    hasher.finalize().to_vec()
 }
 
 #[derive(Debug)]
@@ -1237,7 +1250,9 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 }
 
 pub async fn write_nfo_atomically(target: &Path, patch: &NfoMetadata) -> Result<(), NfoWriteError> {
-    write_nfo_atomically_with_hook(target, patch, None).await
+    write_nfo_atomically_with_hook(target, patch, None)
+        .await
+        .map(|_| ())
 }
 
 pub async fn write_movie_nfo_atomically(
@@ -1246,6 +1261,7 @@ pub async fn write_movie_nfo_atomically(
 ) -> Result<(), NfoWriteError> {
     write_nfo_atomically_with_rewriter(target, |original| rewrite_movie_nfo(original, patch), None)
         .await
+        .map(|_| ())
 }
 
 #[derive(Clone)]
@@ -1264,8 +1280,8 @@ impl NfoWriteService {
         patch: &NfoMetadata,
     ) -> Result<NfoWriteReport, NfoWriteError> {
         let target = self.item_nfo_target(item_id).await?;
-        write_nfo_atomically(&target, patch).await?;
-        self.finish_item_write(item_id, target).await
+        let write = write_nfo_atomically_with_hook(&target, patch, None).await?;
+        self.finish_item_write(item_id, target, write).await
     }
 
     pub async fn write_item_movie_nfo(
@@ -1274,24 +1290,38 @@ impl NfoWriteService {
         patch: &MovieNfoMetadata,
     ) -> Result<NfoWriteReport, NfoWriteError> {
         let target = self.item_nfo_target(item_id).await?;
-        write_movie_nfo_atomically(&target, patch).await?;
-        self.finish_item_write(item_id, target).await
+        let write = write_nfo_atomically_with_rewriter(
+            &target,
+            |original| rewrite_movie_nfo(original, patch),
+            None,
+        )
+        .await?;
+        self.finish_item_write(item_id, target, write).await
     }
 
     async fn finish_item_write(
         &self,
         item_id: &str,
         target: PathBuf,
+        write: NfoFileWrite,
     ) -> Result<NfoWriteReport, NfoWriteError> {
         let fingerprint = nfo_fingerprint(&target)
             .await
             .map_err(|error| io_error(&target, error))?;
+        self.database
+            .invalidate_media_item_nfo_metadata_if_source_changed(
+                item_id,
+                &write.content_fingerprint,
+            )
+            .await?;
         self.database
             .mark_media_item_metadata_checked(item_id, &fingerprint)
             .await?;
         Ok(NfoWriteReport {
             path: target,
             fingerprint,
+            content_fingerprint: write.content_fingerprint,
+            changed: write.changed,
         })
     }
 
@@ -1515,13 +1545,21 @@ fn normalize_metadata_text(
 pub struct NfoWriteReport {
     pub path: PathBuf,
     pub fingerprint: Vec<u8>,
+    pub content_fingerprint: Vec<u8>,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NfoFileWrite {
+    content_fingerprint: Vec<u8>,
+    changed: bool,
 }
 
 async fn write_nfo_atomically_with_hook(
     target: &Path,
     patch: &NfoMetadata,
     before_replace: Option<fn(&Path) -> std::io::Result<()>>,
-) -> Result<(), NfoWriteError> {
+) -> Result<NfoFileWrite, NfoWriteError> {
     write_nfo_atomically_with_rewriter(
         target,
         |original| rewrite_nfo(original, patch),
@@ -1534,7 +1572,7 @@ async fn write_nfo_atomically_with_rewriter<F>(
     target: &Path,
     rewrite: F,
     before_replace: Option<fn(&Path) -> std::io::Result<()>>,
-) -> Result<(), NfoWriteError>
+) -> Result<NfoFileWrite, NfoWriteError>
 where
     F: Fn(&[u8]) -> Result<Vec<u8>, NfoWriteError>,
 {
@@ -1553,6 +1591,13 @@ where
         Err(source) => return Err(io_error(target, source)),
     };
     let rewritten = rewrite(&original)?;
+    let write = NfoFileWrite {
+        content_fingerprint: nfo_content_fingerprint(&rewritten),
+        changed: rewritten != original,
+    };
+    if !write.changed {
+        return Ok(write);
+    }
     let temporary = parent.join(format!(".lux-{}.nfo.tmp", Uuid::now_v7()));
     let result = async {
         let mut file = OpenOptions::new()
@@ -1601,7 +1646,7 @@ where
     if result.is_err() {
         let _ = fs::remove_file(&temporary).await;
     }
-    result
+    result.map(|_| write)
 }
 
 fn new_nfo(patch: &NfoMetadata) -> Result<Vec<u8>, NfoWriteError> {

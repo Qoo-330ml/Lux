@@ -1,11 +1,11 @@
 use luxd::{
     application::{
         libraries::LibraryService,
-        metadata::NfoMetadata,
+        metadata::{MetadataEnricher, NfoMetadata},
         nfo::{
-            MovieNfoCredit, MovieNfoMetadata, NfoWriteService, parse_local_nfo_actors,
-            parse_local_nfo_details, parse_movie_nfo_actors, parse_movie_nfo_details,
-            rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
+            LocalNfoMetadataStore, MovieNfoCredit, MovieNfoMetadata, NfoWriteService,
+            parse_local_nfo_actors, parse_local_nfo_details, parse_movie_nfo_actors,
+            parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
         },
         people::ActorCredit,
         scanner::LibraryScanner,
@@ -330,6 +330,95 @@ async fn nfo_service_checks_library_root_and_refreshes_metadata_fingerprint()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(fingerprint, Some(report.fingerprint));
+    Ok(())
+}
+
+#[tokio::test]
+async fn nfo_writeback_only_invalidates_rich_snapshot_when_content_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        b"<movie><title>old</title><tagline>cached</tagline></movie>",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let initial: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
+         FROM media_items WHERE id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        initial
+            .0
+            .as_deref()
+            .is_some_and(|json| json.contains("cached"))
+    );
+    assert!(initial.1.is_some());
+
+    NfoWriteService::new(database.clone())
+        .write_item_nfo(
+            &item_id,
+            &NfoMetadata {
+                title: Some("old".to_owned()),
+                ..NfoMetadata::default()
+            },
+        )
+        .await?;
+    let unchanged: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
+         FROM media_items WHERE id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unchanged, initial);
+
+    NfoWriteService::new(database.clone())
+        .write_item_nfo(
+            &item_id,
+            &NfoMetadata {
+                title: Some("new".to_owned()),
+                ..NfoMetadata::default()
+            },
+        )
+        .await?;
+    let changed: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
+         FROM media_items WHERE id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed, (None, None));
     Ok(())
 }
 
