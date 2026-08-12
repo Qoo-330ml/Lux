@@ -11,6 +11,7 @@ use luxd::{
 };
 use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use tokio::net::TcpListener;
 
 const PNG_1X1: &[u8] = &[
@@ -51,6 +52,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     tokio::fs::write(first_dir.join("Alpha.Movie.2020.mkv"), b"alpha").await?;
     tokio::fs::write(first_dir.join("poster.jpg"), b"alpha-poster").await?;
     tokio::fs::write(first_dir.join("fanart.jpg"), b"alpha-fanart").await?;
+    tokio::fs::write(first_dir.join("logo.png"), b"alpha-logo").await?;
+    tokio::fs::write(first_dir.join("thumb.jpg"), b"alpha-thumb").await?;
+    tokio::fs::write(first_dir.join("banner.jpg"), b"alpha-banner").await?;
+    tokio::fs::write(first_dir.join("disc.jpg"), b"alpha-disc").await?;
     tokio::fs::write(
         first_dir.join("movie.nfo"),
         r#"<movie><rating>8.1</rating><votes>123</votes><tagline>本地标语</tagline><premiered>2020-01-02</premiered><runtime>126</runtime><status>Released</status><language>zh</language><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>本地影业</studio><tmdbid>12345</tmdbid><director tmdbid="88">导演甲</director><writer tmdbid="99">编剧甲</writer><trailer>https://example.com/trailer</trailer></movie>"#,
@@ -85,6 +90,26 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'beta movie'")
             .fetch_one(database.pool())
             .await?;
+    sqlx::query("UPDATE media_items SET parent_id = NULL WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let alpha_parent_id: String = sqlx::query_scalar(
+        "SELECT parent_id FROM media_items WHERE id = ? AND parent_id IS NOT NULL",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT item_type FROM media_items WHERE id = ?")
+            .bind(&alpha_parent_id)
+            .fetch_one(database.pool())
+            .await?,
+        "FOLDER"
+    );
     let alpha_source_id: String =
         sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
             .bind(&item_id)
@@ -133,6 +158,19 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     )
     .bind(&item_id)
     .fetch_one(database.pool())
+    .await?;
+    let second_fanart_path = first_dir.join("fanart-extra.jpg");
+    tokio::fs::write(&second_fanart_path, b"alpha-fanart-extra").await?;
+    sqlx::query(
+        "INSERT INTO item_images
+         (id, item_id, image_type, image_index, local_path, file_size, source)
+         VALUES (?, ?, 'FANART', 1, ?, ?, 'LOCAL')",
+    )
+    .bind("alpha-fanart-extra-tag")
+    .bind(&item_id)
+    .bind(second_fanart_path.to_string_lossy().as_ref())
+    .bind(18_i64)
+    .execute(database.pool())
     .await?;
     sqlx::query(
         "INSERT INTO user_item_state (user_id, item_id, is_favorite)
@@ -329,9 +367,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_page.status(), reqwest::StatusCode::OK);
     let emby_page_body: Value = emby_page.json().await?;
     assert_eq!(emby_page_body["TotalRecordCount"], 2);
-    assert_eq!(emby_page_body["StartIndex"], 0);
+    assert!(emby_page_body.get("StartIndex").is_none());
     assert_eq!(emby_page_body["Items"].as_array().map(Vec::len), Some(1));
     assert_eq!(emby_page_body["Items"][0]["Type"], "Movie");
+    assert_eq!(emby_page_body["Items"][0]["SupportsSync"], false);
     assert_eq!(emby_page_body["Items"][0]["Name"], "Alpha Movie");
     assert_eq!(emby_page_body["Items"][0]["PrimaryImageItemId"], item_id);
     assert_eq!(
@@ -342,14 +381,112 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         emby_page_body["Items"][0]["BackdropImageTags"][0],
         alpha_fanart_id
     );
-    assert_eq!(
-        emby_page_body["Items"][0]["ParentId"],
-        library.id.to_string()
-    );
+    assert_eq!(emby_page_body["Items"][0]["ParentId"], alpha_parent_id);
     assert_eq!(
         emby_page_body["Items"][0]["MediaSources"][0]["Container"],
         "mkv"
     );
+
+    let popcorn_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ExcludeItemTypes=Audio%2CBook%2CMusicVideo%2CMusicAlbum%2CGame%2CPhoto&StartIndex=0&Limit=50&ParentId={}&IncludeItemTypes=Movie&Recursive=true&SortOrder=Descending&SortBy=DateCreated%2CSortName&Fields=BasicSyncInfo%2CChildCount%2CRunTimeTicks%2CCommunityRating%2CPremiereDate%2CProductionYear%2CCanDownload",
+            admin.id, library.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(popcorn_items.status(), reqwest::StatusCode::OK);
+    let popcorn_body: Value = popcorn_items.json().await?;
+    assert_eq!(
+        popcorn_body
+            .as_object()
+            .ok_or("Popcorn response is not an object")?
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        ["Items", "TotalRecordCount"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    );
+    let popcorn_item = popcorn_body["Items"]
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or("missing Popcorn compatibility item")?;
+    let item_keys = popcorn_item
+        .as_object()
+        .ok_or("Popcorn item is not an object")?
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_keys = [
+        "Name",
+        "ServerId",
+        "Id",
+        "CanDownload",
+        "SupportsSync",
+        "PremiereDate",
+        "CommunityRating",
+        "RunTimeTicks",
+        "ProductionYear",
+        "IsFolder",
+        "ParentId",
+        "Type",
+        "UserData",
+        "ImageTags",
+        "BackdropImageTags",
+        "MediaType",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    assert_eq!(item_keys, expected_keys);
+    assert!(
+        popcorn_item
+            .as_object()
+            .ok_or("Popcorn item is not an object")?
+            .values()
+            .all(|value| !value.is_null())
+    );
+    assert_eq!(popcorn_item["SupportsSync"], false);
+    assert_eq!(popcorn_item["CanDownload"], false);
+    assert_eq!(
+        popcorn_item["ImageTags"]["Logo"],
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'LOGO'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?
+    );
+    assert!(popcorn_item["ImageTags"]["Banner"].is_string());
+    assert!(popcorn_item["ImageTags"]["Disc"].is_string());
+    assert!(popcorn_item["ImageTags"]["Thumb"].is_string());
+    assert_eq!(
+        popcorn_item["BackdropImageTags"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(popcorn_item["PremiereDate"], "2021-01-01T00:00:00.0000000Z");
+    assert_eq!(popcorn_item["ParentId"], alpha_parent_id);
+    assert!(
+        !popcorn_item["UserData"]
+            .as_object()
+            .unwrap()
+            .contains_key("PlayedPercentage")
+    );
+
+    let folder_children = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={alpha_parent_id}&IncludeItemTypes=Movie&Limit=50",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(folder_children.status(), reqwest::StatusCode::OK);
+    let folder_children_body: Value = folder_children.json().await?;
+    assert_eq!(folder_children_body["TotalRecordCount"], 1);
+    assert_eq!(folder_children_body["Items"][0]["Id"], item_id);
 
     let filtered_by_item_id = client
         .get(format!(
@@ -464,7 +601,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .ok_or("Emby latest items should be returned as a bare array")?;
     assert_eq!(emby_latest_items.len(), 2);
     assert_eq!(emby_latest_items[0]["Name"], "Alpha Movie");
-    assert_eq!(emby_latest_items[0]["ParentId"], library.id.to_string());
+    assert_eq!(emby_latest_items[0]["ParentId"], alpha_parent_id);
     assert_eq!(emby_latest_items[0]["PrimaryImageItemId"], item_id);
     assert_eq!(
         emby_latest_items[0]["ImageTags"]["Primary"],

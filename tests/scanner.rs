@@ -93,6 +93,33 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
     assert_eq!(second.created_items, 0);
     assert_eq!(second.created_sources, 0);
     assert_eq!(second.skipped_files, 1);
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_chapters (
+             id, media_source_id, start_position_ticks, marker_type,
+             chapter_index, provider_id, confidence
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("detected-marker")
+    .bind(&source_id)
+    .bind(10_000_000_i64)
+    .bind("INTRO_START")
+    .bind(0_i64)
+    .bind("org.lux.intro-outro-detector")
+    .bind(0.9_f64)
+    .execute(database.pool())
+    .await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"changed-content").await?;
+    let changed = scanner.scan_movie_library(library.id).await?;
+    assert_eq!(changed.changed_files, 1);
+    let remaining_markers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_chapters WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_markers, 0);
     let available_after_scan: i64 = sqlx::query_scalar(
         "SELECT has_available_source FROM media_items WHERE id = (
              SELECT item_id FROM media_sources LIMIT 1
@@ -132,20 +159,27 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
     .await?;
     assert_eq!(available_after_restore, 1);
 
-    let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
-        .fetch_one(database.pool())
-        .await?;
+    let item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type <> 'FOLDER'")
+            .fetch_one(database.pool())
+            .await?;
     let source_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_sources")
         .fetch_one(database.pool())
         .await?;
     assert_eq!(item_count, 1);
     assert_eq!(source_count, 1);
+    let folder_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type = 'FOLDER'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(folder_count, 1);
     database.close().await;
 
     let reopened = Database::connect(&config).await?;
-    let persisted_item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
-        .fetch_one(reopened.pool())
-        .await?;
+    let persisted_item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type <> 'FOLDER'")
+            .fetch_one(reopened.pool())
+            .await?;
     assert_eq!(persisted_item_count, 1);
     Ok(())
 }
@@ -369,7 +403,7 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 54);
+    assert_eq!(database.schema_version().await?, 58);
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master
          WHERE type = 'table' AND name IN ('filesystem_entries', 'media_items', 'media_sources', 'media_streams')

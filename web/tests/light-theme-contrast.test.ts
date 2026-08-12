@@ -25,7 +25,8 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-hero-overlay")).not.toContain("rgba(0,0,0");
     expect(lightThemeRule(".lux-hero h1")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-hero-copy p")).toContain("color: var(--lux-muted)");
-    expect(lightThemeRule(".lux-app.is-home-route .lux-header")).toContain("rgba(244,243,241");
+    expect(lightThemeRule(".lux-app.is-home-route .lux-header::before")).toContain("rgba(244,243,241");
+    expect(lightThemeRule(".lux-header::before")).toContain("rgba(244,243,241");
   });
 
   it("uses light surfaces and dark text throughout the admin dashboard", () => {

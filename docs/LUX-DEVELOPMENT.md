@@ -104,6 +104,8 @@ Lux 的核心价值不是功能数量，而是：
 - 自动封面生成前后，只要管理员上传了自定义封面，就始终以自定义封面为准，自动生成不得覆盖或替换它。
 - 每个媒体库默认实时监听文件系统；新增、修改、重命名和删除事件只触发受影响路径的局部增量扫描。实时监听不是可关闭的媒体库开关；旧版 `realtime_watch_enabled` 字段仅作兼容保留并始终按开启处理。媒体库另有独立的 `realtime_metadata_auto_match_enabled` 开关，默认关闭；开启后，局部增量扫描完成并确认有可用媒体条目时，按 `FILL_MISSING` 提交受影响条目的在线元数据补全任务。全量校验和元数据任务可独立配置计划；局部增量扫描由实时事件触发，不作为管理员可配置的计划任务。
 - 每个媒体库可选择一个已安装的元数据刮削器；未选择时仍读取本地 NFO 和图片，但不发起在线刮削请求。
+- 剧集库和混合库可各自选择一个已安装、已启用且可用的片头片尾数据源；未选择表示不为该库生成或输出片头片尾标记。
+  片头片尾数据源必须声明 chapters.detect 或 chapters.lookup；电影库不能选择该来源。混合库只对其中的剧集/分集参与检测。
 - 管理员可在“全局策略”中设置媒体库的默认元数据、图像和字幕策略；媒体库可以继承全局默认值，也可以单独覆盖。
 - 全局图像策略包括海报、艺术图、横幅图、徽标、缩略图、光盘封面、壁纸开关、每项最大背景图数量和最小下载宽度；媒体库可覆盖这些开关。
 - 全局策略支持保守的存储预估，并明确应用范围：仅新内容、刷新选中内容或后台刷新全部内容；全局刮削可选择仅补全或完整刮削，批量刷新必须进入任务队列。
@@ -311,10 +313,34 @@ Lux 的核心价值不是功能数量，而是：
 - 管理员从插件商店安装插件时，Lux 只下载目录声明的 `.zip` 包，限制大小、文件数量、路径、manifest、协议版本、平台入口和声明文件 SHA-256，并在校验成功后原子写入 `/config/plugins`；未经目录声明的地址不得作为下载目标。
 - 首个独立插件为 `org.lux.tmdb`，由外部插件仓库发布。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
 - SDK v1 同时支持 `media_probe` 插件类型。`org.lux.strm-media-info` 只接收 Lux 宿主按单个任务提交的已校验 STRM 探测目标，按原始字符串调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
-- 只有已安装、已启用且有可用凭据的插件才能被媒体库选择。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用外置 TMDb 插件自己的默认凭据；任何凭据都不返回 API 或写入日志。
+- 只有已安装、已启用且可用的插件才能被媒体库选择或调度。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用外置 TMDb 插件自己的默认凭据；任何凭据都不返回 API 或写入日志。
 - 媒体库的 `scraperId` 为空表示不进行在线刮削、只使用本地元数据；插件安装状态与媒体库选择均持久化，服务重启后保持不变。
+- 片头片尾插件的 `libraryIds` 不再是媒体库归属配置；旧配置只用于一次性迁移到对应媒体库的
+  `chapterSourceId`，迁移后调度只读取媒体库字段。
 - 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
 - 全局策略的服务器设置不得返回任何凭据；插件凭据仍只在插件管理页面配置。播放进度阈值继续属于服务器设置，不在媒体库策略页重复管理。
+
+### 3.16 章节与片头片尾
+
+- 章节标记绑定具体 `media_source`，同一逻辑条目的不同版本分别保存。
+- 当前唯一章节来源是片头片尾检测插件，只保存 Emby 兼容的隐藏标记 `IntroStart`、`IntroEnd` 和
+  `CreditsStart`。不产生普通 `Chapter`，也不虚构 `CreditsEnd`；片尾区间延伸到媒体结束。
+- Lux 不主动读取容器内嵌章节，现有本地媒体 `ffprobe` 不增加 `-show_chapters`。也不从 NFO 或 EDL
+  导入普通章节；播放、详情和列表请求不得为章节打开媒体文件。
+- 隐藏标记的权威运行时副本保存在数据库。Lux 不修改 MKV、MP4 或其他媒体容器，也不把检测结果默认写入
+  NFO 或 EDL。
+- Emby 条目 DTO 与 `PlaybackInfo.MediaSources` 按公开 `ChapterInfo` 形状返回章节：
+  `StartPositionTicks`、可选 `Name`、可选 `ImageTag`、`MarkerType` 和 `ChapterIndex`。
+- 自动片头片尾章节由独立 `chapter_detector` 插件提供。本地音频检测插件在后台对已校验的本地媒体运行
+  ffmpeg/chromaprint；在线章节源插件只接收已保存的 provider ID、季号、集号和时长，从固定远程服务
+  获取已标注结果。两种插件都不能接收媒体路径、数据库或任务对象。
+- 检测插件按季度批次比较至少两个可用分集，返回 `IntroStart`、`IntroEnd`、`CreditsStart` 候选。
+  Lux 校验时间范围、顺序、数量和来源后原子替换 `provider_id` 等于该插件 ID 的隐藏标记；低置信度结果不落库。
+- 媒体文件指纹变化时，旧检测标记失效；重新检测只在后台任务中发生。
+- 检测标记不得改变媒体字节、直放 URL、运行时或用户播放进度。
+- 章节来源状态按 `(media_source, plugin_id)` 持久化。新入库分集只有在本季达到门槛后才进入任务：本地 ffmpeg/chromaprint 来源至少 3 集，在线来源至少 1 集；本地新增单集可复用同季已保存的音频指纹上下文，不重复运行 ffmpeg。成功结果 30 天内不刷新；无结果 7 天后重试；失败 1 天后重试；媒体输入指纹或检测参数变化、管理员显式 `forceRefresh` 或任务重试会立即重新处理。
+- 媒体库切换或清除 `chapterSourceId` 不删除历史来源标记；运行时输出只返回当前选择来源的标记，
+  重新选择旧来源即可恢复其历史结果。混合库只对其中的 EPISODE 媒体条目输出片头片尾标记，电影条目不输出。
 
 ---
 
@@ -413,7 +439,7 @@ Lux 的核心价值不是功能数量，而是：
 - tracing / tracing-subscriber：结构化日志。
 - argon2：密码哈希，使用 Argon2id。
 - uuid：内部 ID，优先 UUIDv7；Emby DTO 只暴露字符串。
-- ffprobe：本地媒体由核心服务用于技术信息、时长、内嵌轨道和章节探测；`.strm` 远程媒体只能由管理员显式创建的后台任务通过受监督的 `media_probe` 插件探测，不得进入用户请求路径。
+- ffprobe：本地媒体由核心服务用于技术信息、时长和内嵌轨道；片头片尾指纹由独立章节检测后台任务提取，核心服务不读取容器内嵌章节。`.strm` 远程媒体只能由管理员显式创建的后台任务通过受监督的 `media_probe` 插件探测，不得进入用户请求路径。
 
 依赖版本不在本文档写死。项目初始化时选择当前稳定版本并提交 Cargo.lock；升级必须单独执行、单独验证。
 
@@ -885,6 +911,22 @@ pub async fn get_item(
 - external_path
 - width、height、channels 等技术字段
 
+#### media_chapters
+
+- id
+- media_source_id
+- start_position_ticks
+- name，可空；隐藏标记默认不设置名称
+- marker_type：INTRO_START、INTRO_END、CREDITS_START
+- chapter_index：同一媒体源内稳定、从 0 开始
+- provider_id：检测插件 ID，非空
+- confidence：范围 0 到 1，非空
+- created_at、updated_at
+- 唯一键 media_source_id + provider_id + marker_type
+
+同一插件对同一媒体源最多保存三个章节标记。读取始终按 `start_position_ticks`、标记优先级和 ID
+稳定排序；检测插件只能替换自己生成的隐藏标记。当前不保存容器章节、普通章节或手工章节。
+
 #### danmaku_tracks
 
 - id
@@ -1210,7 +1252,9 @@ locked local value
 
 - SupportsDirectPlay = true。
 - SupportsDirectStream/Transcoding 按首版实际实现返回 false。
-- MediaSources 包含版本、容器、码率、大小、时长、流列表和直放 URL。
+- MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
+- 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
+  `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。
 - `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放仍由客户端直接访问外部地址。
 - 不伪造客户端能播放的编码。
 - 选择默认版本使用稳定策略，并允许客户端显式选择 source ID。
@@ -1799,6 +1843,7 @@ services:
 | LUX-170 | src/application/nfo.rs、src/application/metadata.rs、src/application/people.rs、src/application/scanner.rs、src/api/mod.rs、web/src/features/detail/、tests/、docs/ |
 | LUX-171 | Cargo.toml、Dockerfile、docker-entrypoint.sh、src/application/plugins.rs、src/application/plugin_store.rs、src/bin/、plugins/、scripts/、tests/、web/、docs/ |
 | LUX-172 | migrations/、migrations-postgres/、src/application/nfo.rs、src/application/metadata.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/types.ts、tests/、docs/ |
+| LUX-177 至 181 | migrations/、migrations-postgres/、src/library.rs、src/storage/、src/application/libraries.rs、src/application/plugins.rs、src/application/chapter_detector.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3732,6 +3777,89 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 - 不把官网、预告片或 NFO 图片 URL 当作 Lux 代理目标；只作为受限外链展示。
 
 依赖：LUX-164、LUX-168、LUX-170。
+
+#### LUX-173：片头片尾章节标记存储
+
+范围：新增按 `media_source` 归属的片头片尾章节标记表，为后续检测插件与 Emby 输出建立服务器 DB
+事实来源。当前任务不产生章节记录，不读取容器章节，也不实现检测任务、API 映射、NFO/EDL 或媒体容器写回。
+
+验收：
+
+- [x] SQLite 与 PostgreSQL 从空数据库迁移成功，章节外键随媒体源删除级联清理。
+- [x] schema 只接受 `INTRO_START`、`INTRO_END`、`CREDITS_START`，并约束非负时间、置信度和每插件每类型唯一性。
+- [x] 现有本地与 STRM 媒体探测行为不变，不请求、解析或保存 ffprobe 容器章节。
+
+验证：SQLite/PostgreSQL 迁移测试、约束与级联测试、现有探测回归测试和基线 Rust 检查。
+
+依赖：LUX-033、LUX-064。
+
+#### LUX-174：Emby 章节兼容输出
+
+范围：从数据库批量加载片头片尾章节标记进入目录领域对象；条目 DTO 的 `Chapters` 使用默认媒体源，
+`PlaybackInfo.MediaSources[].Chapters` 使用各自媒体源。映射公开的 `ChapterInfo` 字段和
+`IntroStart`、`IntroEnd`、`CreditsStart` 枚举，不新增普通章节或 Emby 私有扩展。
+
+验收：
+
+- [x] 请求 `Fields=Chapters` 时条目返回默认媒体源章节，未请求时保持现有响应体积。
+- [x] PlaybackInfo 为每个版本返回自己的章节，排序和 `ChapterIndex` 稳定。
+- [x] 没有章节时返回空数组；权限、分页和播放能力行为不变。
+
+验证：Emby 目录与 PlaybackInfo 集成测试、三客户端兼容探针记录和基线 Rust 检查。
+
+依赖：LUX-173。
+
+#### LUX-175：片头片尾检测插件宿主
+
+范围：扩展 Plugin SDK v1，支持 `chapter_detector` 类型与 `chapters.detect` 能力。Lux 在持久化后台
+任务中按季度分页读取本地分集，使用现有 ffmpeg 的 chromaprint muxer 提取开头/结尾的有界原始指纹，
+只把指纹、采样率、窗口相对时间和请求内临时键发送给插件。插件不接收路径、URL、媒体源 ID、凭据或任务对象。
+宿主校验插件结果并把高置信度标记保存为插件来源特殊章节（`provider_id` 为插件 ID）。单季度超过
+RPC 上限时批次保留一个分集的上下文重叠，但只对未处理分集落库，避免跨批次漏掉共同片头片尾。
+
+验收：
+
+- [x] manifest、RPC 请求和响应均有严格大小、枚举、数量、时间范围和置信度校验。
+- [x] 管理员可按已保存插件配置启动、取消、重试和查看持久化检测任务；重启恢复 PENDING/RUNNING。
+- [x] 插件失败、ffmpeg 缺少 chromaprint、超时或坏响应只影响对应分集/任务，不删除已有确认标记。
+- [x] 成功重跑只原子替换同一插件生成的标记，不覆盖其他来源。
+
+验证：假 ffmpeg、假插件进程、任务恢复、ACL/CSRF、故障注入测试和完整项目检查。
+
+依赖：LUX-173、LUX-174、LUX-171。
+
+#### LUX-176：外置片头片尾检测插件
+
+范围：在独立 `Lux-plugins` 仓库实现 `org.lux.intro-outro-detector`。插件比较同季度至少两个分集的
+Chromaprint 原始指纹，在配置的开头/结尾窗口内寻找满足最小时长和匹配阈值的公共序列，返回
+`IntroStart`、`IntroEnd` 和可选 `CreditsStart`。插件不执行 ffmpeg、不读取媒体路径、不联网。
+
+验收：
+
+- [x] 合成指纹测试覆盖共同片头、共同片尾、不同片头、短匹配、静音、偏移和超长季度批次。
+- [x] RPC 只接受宿主定义的受限指纹合同；畸形或超限输入返回稳定脱敏错误。
+- [x] manifest、x86_64/aarch64 构建工作流和插件商店包生成脚本已接入；Lux 假宿主端到端测试得到特殊章节。
+- [x] 未达到阈值时返回空标记，不猜测或写出低置信度结果。
+
+验证：外部插件仓库 `cargo test --locked --all-targets`、fmt、clippy、双架构打包，以及 Lux 契约测试。
+
+依赖：LUX-175。
+
+#### LUX-177：TheIntroDB 在线章节源插件
+
+范围：在独立 `Lux-plugins` 仓库实现 `org.lux.theintrodb-chapter-source`。插件通过新增的
+`chapters.lookup` 合同，按 Lux 已保存的 TMDb/TVDb/IMDb ID、季号、集号和可选时长请求
+TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接收媒体路径、`.strm` URL、音频指纹或
+任务对象，不运行 ffmpeg/ffprobe；无数据响应不会清除已有章节。
+
+验收：
+
+- [x] TheIntroDB API 查询优先级、速率限制、有限重试、配置 API Key 和响应大小均受边界约束。
+- [x] 片头/片尾时间转换、无结束片头、无开始片尾和无 provider ID 的情况有纯逻辑测试。
+- [x] Lux 宿主可以在同一章节任务接口选择 `chapters.lookup` 插件，在线分支不调用 ffmpeg，且只把插件来源标记写入章节表。
+- [x] 插件 manifest、独立仓库商店目录、aarch64/x86_64 发布工作流和使用说明已接入。
+
+依赖：LUX-175、LUX-176。
 
 ## 26. 风险与缓解
 

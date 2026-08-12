@@ -4,6 +4,9 @@ use time::OffsetDateTime;
 
 pub const DEFAULT_STRM_MEDIA_INFO_SCHEDULE: &str = "0 3 * * *";
 pub const STRM_MEDIA_INFO_TASK_TYPE: &str = "STRM_MEDIA_INFO";
+pub const DEFAULT_CHAPTER_DETECTION_SCHEDULE: &str = "0 4 * * 0";
+pub const DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE: &str = "0 5 * * *";
+pub const CHAPTER_DETECTION_TASK_TYPE: &str = "CHAPTER_DETECTION";
 const MAX_SCHEDULE_LENGTH: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

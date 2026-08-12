@@ -227,6 +227,29 @@ async fn probe_runner_classifies_timeout() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_runner_does_not_request_container_chapters() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let script = executable_script(
+        temp_dir.path(),
+        r#"#!/bin/sh
+for argument in "$@"; do
+  if [ "$argument" = "-show_chapters" ]; then
+    exit 91
+  fi
+done
+printf '%s' '{"format":{"format_name":"matroska"},"streams":[]}'
+"#,
+    )?;
+    let result = FfprobeRunner::new(script, Duration::from_secs(5))
+        .probe_path(Path::new("/tmp/fixture.mkv"))
+        .await?;
+    assert_eq!(result.container.as_deref(), Some("matroska"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn probe_service_persists_success_skips_ready_and_reprobes_changed_file()
 -> Result<(), Box<dyn std::error::Error>> {

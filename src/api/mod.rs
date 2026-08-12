@@ -50,6 +50,10 @@ use crate::{
             CatalogError, CatalogFilter, CatalogItem, CatalogPage, CatalogService, CatalogSort,
             CatalogSource, normalize_search_like_query, normalize_search_query,
         },
+        chapter_detector::{
+            ChapterDetectionError, ChapterDetectionOptions, ChapterDetectionService,
+            DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID,
+        },
         collections::{CollectionError, CollectionService},
         directory_browser::{DirectoryBrowserError, list_directories},
         images::{
@@ -136,6 +140,7 @@ pub struct AppState {
     thumbnails: Option<ThumbnailService>,
     scan_jobs: Option<ScanJobService>,
     strm_probe: Option<StrmProbeService>,
+    chapter_detection: Option<ChapterDetectionService>,
     scheduled_tasks: Option<ScheduledTaskService>,
     danmaku: Option<DanmakuService>,
     plugins: Option<PluginService>,
@@ -226,6 +231,7 @@ impl AppState {
         ));
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
+        let chapter_detection = ChapterDetectionService::new(database.clone(), plugins.clone());
         let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
         let probe = Some(MediaProbeService::new(
@@ -246,14 +252,18 @@ impl AppState {
                 .with_people(people.clone())
                 .with_nfo_store(local_nfo.clone())
         };
-        let scheduled_tasks =
-            ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone())
-                .with_library_services(
-                    scan_jobs.clone(),
-                    metadata_reidentify.clone(),
-                    probe.clone(),
-                    thumbnails.clone(),
-                );
+        let scheduled_tasks = ScheduledTaskService::new(
+            database.clone(),
+            plugins.clone(),
+            strm_probe.clone(),
+            Some(chapter_detection.clone()),
+        )
+        .with_library_services(
+            scan_jobs.clone(),
+            metadata_reidentify.clone(),
+            probe.clone(),
+            thumbnails.clone(),
+        );
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -285,6 +295,7 @@ impl AppState {
             thumbnails,
             scan_jobs: Some(scan_jobs),
             strm_probe: Some(strm_probe),
+            chapter_detection: Some(chapter_detection),
             scheduled_tasks: Some(scheduled_tasks),
             danmaku: Some(
                 DanmakuService::new(
@@ -434,11 +445,34 @@ impl AppState {
         }
     }
 
+    pub async fn resume_chapter_detection_jobs(&self) {
+        let Some(service) = self.chapter_detection.clone() else {
+            return;
+        };
+        let Ok(job_ids) = service.active_job_ids().await else {
+            tracing::error!("failed to discover active chapter detection jobs during startup");
+            return;
+        };
+        for job_id in job_ids {
+            let worker = service.clone();
+            tokio::spawn(async move {
+                if let Err(error) = worker.run(&job_id).await {
+                    tracing::error!(job_id = %job_id, %error, "resumed chapter detection job stopped");
+                }
+            });
+        }
+    }
+
     pub async fn start_scheduled_tasks(&self) {
         if let Some(plugins) = self.plugins.as_ref()
             && let Err(error) = plugins.sync_media_info_scheduled_task().await
         {
             tracing::error!(%error, "failed to synchronize STRM scheduled task");
+        }
+        if let Some(plugins) = self.plugins.as_ref()
+            && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
+        {
+            tracing::error!(%error, "failed to synchronize chapter detection scheduled tasks");
         }
         if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
             scheduled_tasks.spawn();
@@ -527,6 +561,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_run_auto_library_cover),
         )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
+        .route(
+            "/api/v1/admin/chapter-sources",
+            get(admin_list_chapter_sources),
+        )
         .route(
             "/api/v1/admin/plugins/installed",
             get(admin_list_installed_plugins),
@@ -661,6 +699,26 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}/retry",
             post(admin_retry_strm_probe),
+        )
+        .route(
+            "/api/v1/admin/libraries/{library_id}/chapter-detection",
+            post(admin_start_chapter_detection),
+        )
+        .route(
+            "/api/v1/admin/chapter-detection-jobs",
+            get(admin_list_chapter_detection_jobs),
+        )
+        .route(
+            "/api/v1/admin/chapter-detection-jobs/{job_id}",
+            get(admin_get_chapter_detection_job),
+        )
+        .route(
+            "/api/v1/admin/chapter-detection-jobs/{job_id}/cancel",
+            post(admin_cancel_chapter_detection),
+        )
+        .route(
+            "/api/v1/admin/chapter-detection-jobs/{job_id}/retry",
+            post(admin_retry_chapter_detection),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/danmaku/match",
@@ -1745,6 +1803,7 @@ fn normalize_emby_item_type(value: &str) -> Option<String> {
         "season" => Some("SEASON".to_owned()),
         "episode" => Some("EPISODE".to_owned()),
         "boxset" | "box_set" => Some("BOX_SET".to_owned()),
+        "folder" => Some("FOLDER".to_owned()),
         _ => None,
     }
 }
@@ -2460,6 +2519,7 @@ async fn emby_catalog_page_for_user_with_fields(
         fields,
         can_download,
         None,
+        true,
     )
     .await
 }
@@ -2471,6 +2531,7 @@ async fn emby_catalog_page_for_user_with_preferred_source(
     fields: Option<&str>,
     can_download: bool,
     preferred_source_id: Option<&str>,
+    include_start_index: bool,
 ) -> Response {
     match emby_catalog_items_for_user_with_preferred_source(
         state,
@@ -2482,12 +2543,16 @@ async fn emby_catalog_page_for_user_with_preferred_source(
     )
     .await
     {
-        Ok(items) => Json(json!({
-            "Items": items,
-            "TotalRecordCount": page.total,
-            "StartIndex": page.offset,
-        }))
-        .into_response(),
+        Ok(items) => {
+            let mut body = json!({
+                "Items": items,
+                "TotalRecordCount": page.total,
+            });
+            if include_start_index && let Value::Object(object) = &mut body {
+                object.insert("StartIndex".to_owned(), json!(page.offset));
+            }
+            Json(body).into_response()
+        }
         Err(status) => status.into_response(),
     }
 }
@@ -2530,8 +2595,24 @@ async fn emby_catalog_items_for_user_with_preferred_source(
         Ok(states) => states,
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let mut items = Vec::with_capacity(page.items.len());
-    for item in &page.items {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut catalog_items = page.items.clone();
+    if catalog
+        .populate_image_tags(&mut catalog_items)
+        .await
+        .is_err()
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if emby_fields_include(fields, "Chapters")
+        && catalog.populate_chapters(&mut catalog_items).await.is_err()
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut items = Vec::with_capacity(catalog_items.len());
+    for item in &catalog_items {
         let mut value = emby_catalog_item_json_with_state(
             item,
             &state.server_id,
@@ -2690,6 +2771,7 @@ async fn emby_list_items(
                 query.fields.as_deref(),
                 can_download,
                 preferred_source_id,
+                false,
             )
             .await
         }
@@ -2906,10 +2988,17 @@ async fn emby_item_response(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match catalog.find_item(principal, item_id).await {
-        Ok(Some(item)) => {
+        Ok(Some(mut item)) => {
             let Some(database) = state.database.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
+            if catalog
+                .populate_image_tags(std::slice::from_mut(&mut item))
+                .await
+                .is_err()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             let user_id = principal.user_id.to_string();
             let user_state = match database.find_user_item_state(&user_id, item_id).await {
                 Ok(state) => state,
@@ -3731,8 +3820,8 @@ fn emby_catalog_item_json_with_state(
         .runtime_ticks
         .or_else(|| default_source.and_then(|source| source.duration_ticks));
     let played_percentage = user_state.and_then(|state| {
-        if state.is_played {
-            return Some(100.0);
+        if state.position_ticks <= 0 {
+            return None;
         }
         let runtime_ticks = runtime_ticks.filter(|value| *value > 0)?;
         Some((state.position_ticks.max(0) as f64 * 100.0 / runtime_ticks as f64).clamp(0.0, 100.0))
@@ -3746,6 +3835,18 @@ fn emby_catalog_item_json_with_state(
     }
     if let Some(tag) = item.thumb_image_tag.as_ref() {
         image_tags.insert("Thumb".to_owned(), json!(tag));
+    }
+    if let Some(tag) = item.banner_image_tag.as_ref() {
+        image_tags.insert("Banner".to_owned(), json!(tag));
+    }
+    if let Some(tag) = item.disc_image_tag.as_ref() {
+        image_tags.insert("Disc".to_owned(), json!(tag));
+    }
+    if let Some(tag) = item.art_image_tag.as_ref() {
+        image_tags.insert("Art".to_owned(), json!(tag));
+    }
+    if let Some(tag) = item.wallpaper_image_tag.as_ref() {
+        image_tags.insert("Wallpaper".to_owned(), json!(tag));
     }
     let parent_id = item.parent_id.as_deref().unwrap_or(&item.library_id);
     let child_count = match item.item_type.as_str() {
@@ -3767,49 +3868,164 @@ fn emby_catalog_item_json_with_state(
     } else {
         None
     };
-    let mut value = json!({
-        "Name": item.title,
-        "SortName": item.sort_title,
-        "OriginalTitle": item.original_title,
-        "Id": item.id,
-        "ServerId": server_id,
-        "Type": emby_item_type(&item.item_type),
-        "MediaType": "Video",
-        "IsFolder": matches!(item.item_type.as_str(), "SERIES" | "SEASON" | "BOX_SET"),
-        "CollectionType": (item.item_type == "BOX_SET").then_some("movies"),
-        "ParentId": parent_id,
-        "PrimaryImageItemId": item.poster_image_tag.as_ref().map(|_| item.id.clone()),
-        "SeriesId": item.series_id,
-        "SeasonId": season_id,
-        "IndexNumber": index_number,
-        "ParentIndexNumber": item.season_number,
-        "Index": item.episode_number,
-        "ProductionYear": item.production_year,
-        "PremiereDate": item.premiere_date,
-        "ProviderIds": emby_provider_ids(&item.provider_ids),
-        "CommunityRating": item.rating,
-        "Overview": item.overview,
-        "RunTimeTicks": runtime_ticks,
-        "Container": default_source.and_then(|source| source.container.clone()),
-        "Size": default_source.and_then(|source| source.size),
-        "Bitrate": default_source.and_then(|source| source.bitrate),
-        "CanDownload": can_download,
-        "ImageTags": image_tags,
-        "BackdropImageTags": item
-            .fanart_image_tag
-            .as_ref()
-            .map(|tag| json!([tag]))
-            .unwrap_or_else(|| json!([])),
-        "ChildCount": child_count,
-        "RecursiveItemCount": recursive_item_count,
-        "UserData": {
-            "PlaybackPositionTicks": user_state.map(|state| state.position_ticks).unwrap_or_default(),
-            "PlayedPercentage": played_percentage,
-            "PlayCount": user_state.map(|state| state.play_count).unwrap_or_default(),
-            "IsFavorite": user_state.map(|state| state.is_favorite).unwrap_or(false),
-            "Played": user_state.map(|state| state.is_played).unwrap_or(false),
-        },
-    });
+    let mut user_data = serde_json::Map::from_iter([
+        (
+            "PlaybackPositionTicks".to_owned(),
+            json!(
+                user_state
+                    .map(|state| state.position_ticks)
+                    .unwrap_or_default()
+            ),
+        ),
+        (
+            "PlayCount".to_owned(),
+            json!(user_state.map(|state| state.play_count).unwrap_or_default()),
+        ),
+        (
+            "IsFavorite".to_owned(),
+            json!(user_state.map(|state| state.is_favorite).unwrap_or(false)),
+        ),
+        (
+            "Played".to_owned(),
+            json!(user_state.map(|state| state.is_played).unwrap_or(false)),
+        ),
+    ]);
+    if let Some(played_percentage) = played_percentage {
+        user_data.insert("PlayedPercentage".to_owned(), json!(played_percentage));
+    }
+
+    let mut object = serde_json::Map::from_iter([
+        ("Name".to_owned(), json!(item.title)),
+        ("Id".to_owned(), json!(item.id)),
+        ("ServerId".to_owned(), json!(server_id)),
+        ("Type".to_owned(), json!(emby_item_type(&item.item_type))),
+        ("MediaType".to_owned(), json!("Video")),
+        (
+            "IsFolder".to_owned(),
+            json!(matches!(
+                item.item_type.as_str(),
+                "SERIES" | "SEASON" | "BOX_SET" | "FOLDER"
+            )),
+        ),
+        ("ParentId".to_owned(), json!(parent_id)),
+        ("ImageTags".to_owned(), Value::Object(image_tags)),
+        (
+            "BackdropImageTags".to_owned(),
+            if item.fanart_image_tags.is_empty() {
+                item.fanart_image_tag
+                    .as_ref()
+                    .map(|tag| json!([tag]))
+                    .unwrap_or_else(|| json!([]))
+            } else {
+                json!(item.fanart_image_tags)
+            },
+        ),
+        ("UserData".to_owned(), Value::Object(user_data)),
+    ]);
+
+    if fields.is_none() {
+        object.extend([
+            ("SortName".to_owned(), json!(item.sort_title)),
+            ("OriginalTitle".to_owned(), json!(item.original_title)),
+            ("SupportsSync".to_owned(), json!(false)),
+            (
+                "CollectionType".to_owned(),
+                json!((item.item_type == "BOX_SET").then_some("movies")),
+            ),
+            (
+                "PrimaryImageItemId".to_owned(),
+                json!(item.poster_image_tag.as_ref().map(|_| item.id.clone())),
+            ),
+            ("SeriesId".to_owned(), json!(item.series_id)),
+            ("SeasonId".to_owned(), json!(season_id)),
+            ("IndexNumber".to_owned(), json!(index_number)),
+            ("ParentIndexNumber".to_owned(), json!(item.season_number)),
+            ("Index".to_owned(), json!(item.episode_number)),
+            ("ProductionYear".to_owned(), json!(item.production_year)),
+            ("PremiereDate".to_owned(), json!(item.premiere_date)),
+            (
+                "ProviderIds".to_owned(),
+                json!(emby_provider_ids(&item.provider_ids)),
+            ),
+            ("CommunityRating".to_owned(), json!(item.rating)),
+            ("Overview".to_owned(), json!(item.overview)),
+            ("RunTimeTicks".to_owned(), json!(runtime_ticks)),
+            (
+                "Container".to_owned(),
+                json!(default_source.and_then(|source| source.container.clone())),
+            ),
+            (
+                "Size".to_owned(),
+                json!(default_source.and_then(|source| source.size)),
+            ),
+            (
+                "Bitrate".to_owned(),
+                json!(default_source.and_then(|source| source.bitrate)),
+            ),
+            ("CanDownload".to_owned(), json!(can_download)),
+            ("ChildCount".to_owned(), json!(child_count)),
+            ("RecursiveItemCount".to_owned(), json!(recursive_item_count)),
+        ]);
+    } else {
+        if emby_fields_include(fields, "BasicSyncInfo") {
+            object.insert("SupportsSync".to_owned(), json!(false));
+        }
+        if emby_fields_include(fields, "CanDownload") {
+            object.insert("CanDownload".to_owned(), json!(can_download));
+        }
+        if emby_fields_include(fields, "ProductionYear") {
+            emby_insert_optional(
+                &mut object,
+                "ProductionYear",
+                item.production_year.map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "PremiereDate") {
+            emby_insert_optional(
+                &mut object,
+                "PremiereDate",
+                emby_datetime(item.premiere_date.as_deref()),
+            );
+        }
+        if emby_fields_include(fields, "CommunityRating") {
+            emby_insert_optional(
+                &mut object,
+                "CommunityRating",
+                item.rating.map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "RunTimeTicks") {
+            emby_insert_optional(
+                &mut object,
+                "RunTimeTicks",
+                runtime_ticks.map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "ChildCount") {
+            emby_insert_optional(
+                &mut object,
+                "ChildCount",
+                child_count.map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "RecursiveItemCount") {
+            emby_insert_optional(
+                &mut object,
+                "RecursiveItemCount",
+                recursive_item_count.map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "Container") {
+            emby_insert_optional(
+                &mut object,
+                "Container",
+                default_source
+                    .and_then(|source| source.container.clone())
+                    .map(|value| json!(value)),
+            );
+        }
+    }
+    let mut value = Value::Object(object);
     if emby_fields_include(fields, "MediaSources")
         && let Value::Object(object) = &mut value
     {
@@ -3819,10 +4035,12 @@ fn emby_catalog_item_json_with_state(
                 item.media_sources
                     .iter()
                     .map(|source| {
-                        emby_media_source_json(
+                        emby_media_source_json_with_resolver_and_chapters(
                             &item.id,
                             source,
                             emby_fields_include(fields, "MediaStreams"),
+                            false,
+                            emby_fields_include(fields, "Chapters"),
                         )
                     })
                     .collect(),
@@ -3832,9 +4050,39 @@ fn emby_catalog_item_json_with_state(
     if emby_fields_include(fields, "Chapters")
         && let Value::Object(object) = &mut value
     {
-        object.insert("Chapters".to_owned(), Value::Array(Vec::new()));
+        object.insert(
+            "Chapters".to_owned(),
+            Value::Array(
+                default_source
+                    .map(|source| source.chapters.iter().map(emby_chapter_json).collect())
+                    .unwrap_or_default(),
+            ),
+        );
     }
     value
+}
+
+fn emby_insert_optional(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<Value>,
+) {
+    if let Some(value) = value {
+        object.insert(key.to_owned(), value);
+    }
+}
+
+fn emby_datetime(value: Option<&str>) -> Option<Value> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let value = if value.contains('T') {
+        value.to_owned()
+    } else {
+        format!("{value}T00:00:00.0000000Z")
+    };
+    Some(json!(value))
 }
 
 fn emby_provider_ids(provider_ids: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -3852,12 +4100,19 @@ fn emby_provider_ids(provider_ids: &BTreeMap<String, String>) -> BTreeMap<String
         .collect()
 }
 
+#[cfg(test)]
 fn emby_media_source_json(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     include_media_streams: bool,
 ) -> Value {
-    emby_media_source_json_with_resolver(item_id, source, include_media_streams, false)
+    emby_media_source_json_with_resolver_and_chapters(
+        item_id,
+        source,
+        include_media_streams,
+        false,
+        false,
+    )
 }
 
 fn emby_media_source_json_with_resolver(
@@ -3865,6 +4120,22 @@ fn emby_media_source_json_with_resolver(
     source: &crate::application::catalog::CatalogSource,
     include_media_streams: bool,
     strm_resolver_available: bool,
+) -> Value {
+    emby_media_source_json_with_resolver_and_chapters(
+        item_id,
+        source,
+        include_media_streams,
+        strm_resolver_available,
+        true,
+    )
+}
+
+fn emby_media_source_json_with_resolver_and_chapters(
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+    include_media_streams: bool,
+    strm_resolver_available: bool,
+    include_chapters: bool,
 ) -> Value {
     let is_remote = source.source_kind == "STRM_URL"
         && source
@@ -3921,11 +4192,36 @@ fn emby_media_source_json_with_resolver(
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
     });
+    if include_chapters && let Value::Object(object) = &mut value {
+        object.insert(
+            "Chapters".to_owned(),
+            Value::Array(source.chapters.iter().map(emby_chapter_json).collect()),
+        );
+    }
     if include_media_streams && let Value::Object(object) = &mut value {
         object.insert(
             "MediaStreams".to_owned(),
             Value::Array(source.streams.iter().map(emby_media_stream_json).collect()),
         );
+    }
+    value
+}
+
+fn emby_chapter_json(chapter: &crate::application::catalog::CatalogChapter) -> Value {
+    let mut value = json!({
+        "StartPositionTicks": chapter.start_position_ticks,
+        "MarkerType": match chapter.marker_type.as_str() {
+            "INTRO_START" => "IntroStart",
+            "INTRO_END" => "IntroEnd",
+            "CREDITS_START" => "CreditsStart",
+            _ => "Chapter",
+        },
+        "ChapterIndex": chapter.chapter_index,
+    });
+    if let Some(name) = chapter.name.as_deref().filter(|name| !name.is_empty())
+        && let Value::Object(object) = &mut value
+    {
+        object.insert("Name".to_owned(), json!(name));
     }
     value
 }
@@ -7551,6 +7847,7 @@ struct CreateLibraryRequest {
     #[serde(default)]
     realtime_metadata_auto_match_enabled: bool,
     scraper_id: Option<String>,
+    chapter_source_id: Option<String>,
 }
 
 fn default_realtime_watch_enabled() -> bool {
@@ -7580,6 +7877,8 @@ struct UpdateLibraryRequest {
     metadata_schedule: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     scraper_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    chapter_source_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     media_strategy: Option<Option<MediaStrategySettings>>,
     scan_concurrency: Option<i64>,
@@ -9145,6 +9444,285 @@ async fn admin_retry_strm_probe(
     )
     .await;
     (StatusCode::ACCEPTED, Json(json!({ "job": job }))).into_response()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ChapterDetectionRequest {
+    #[serde(default)]
+    plugin_id: Option<String>,
+    #[serde(default)]
+    concurrency: Option<i64>,
+    #[serde(default)]
+    intro_window_seconds: Option<i64>,
+    #[serde(default)]
+    credits_window_seconds: Option<i64>,
+    #[serde(default)]
+    match_threshold: Option<u32>,
+    #[serde(default)]
+    force_refresh: bool,
+}
+
+async fn admin_start_chapter_detection(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ChapterDetectionRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return chapter_detection_error(&headers, ChapterDetectionError::LibraryNotFound);
+    };
+    let Some(service) = state.chapter_detection.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let defaults = ChapterDetectionOptions::default();
+    let plugin_id = request
+        .plugin_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID);
+    let configured_options = if let Some(plugins) = state.plugins.as_ref() {
+        match plugins.chapter_detector_settings(plugin_id).await {
+            Ok(settings) => Some(ChapterDetectionOptions {
+                concurrency: settings.concurrency,
+                intro_window_seconds: settings.intro_window_seconds,
+                credits_window_seconds: settings.credits_window_seconds,
+                match_threshold: settings.match_threshold,
+                force_refresh: false,
+            }),
+            Err(
+                PluginServiceError::InvalidConfig
+                | PluginServiceError::UnknownPlugin(_)
+                | PluginServiceError::Unavailable(_),
+            ) => None,
+            Err(error) => {
+                return chapter_detection_error(&headers, ChapterDetectionError::Plugin(error));
+            }
+        }
+    } else {
+        None
+    };
+    let configured_options = configured_options.unwrap_or(defaults);
+    let options = ChapterDetectionOptions {
+        concurrency: request
+            .concurrency
+            .unwrap_or(configured_options.concurrency),
+        intro_window_seconds: request
+            .intro_window_seconds
+            .unwrap_or(configured_options.intro_window_seconds),
+        credits_window_seconds: request
+            .credits_window_seconds
+            .unwrap_or(configured_options.credits_window_seconds),
+        match_threshold: request
+            .match_threshold
+            .unwrap_or(configured_options.match_threshold),
+        force_refresh: request.force_refresh,
+    };
+    let job = match service
+        .create_library_job(library_id, plugin_id, options)
+        .await
+    {
+        Ok(job) => job,
+        Err(error) => return chapter_detection_error(&headers, error),
+    };
+    let worker = service.clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = worker.run(&job_id).await {
+            tracing::error!(job_id = %job_id, %error, "chapter detection job stopped");
+        }
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "CHAPTER_DETECTION_STARTED",
+        Some("chapter_detection_job"),
+        Some(&job.id),
+        &format!(
+            r#"{{"libraryId":"{}","pluginId":"{}"}}"#,
+            job.library_id, job.plugin_id
+        ),
+    )
+    .await;
+    (StatusCode::ACCEPTED, Json(json!({ "job": job }))).into_response()
+}
+
+async fn admin_list_chapter_detection_jobs(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let status = query.status.as_deref().map(str::to_ascii_uppercase);
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED"
+        )
+    }) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务状态无效",
+        )
+        .into_response();
+    }
+    let Some(service) = state.chapter_detection.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.list(status.as_deref(), offset, limit).await {
+        Ok(jobs) => Json(json!({
+            "jobs": jobs,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => chapter_detection_error(&headers, error),
+    }
+}
+
+async fn admin_get_chapter_detection_job(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(service) = state.chapter_detection.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.get(&job_id).await {
+        Ok(job) => Json(json!({ "job": job })).into_response(),
+        Err(error) => chapter_detection_error(&headers, error),
+    }
+}
+
+async fn admin_cancel_chapter_detection(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.chapter_detection.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.cancel(&job_id).await {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "CHAPTER_DETECTION_CANCEL_REQUESTED",
+                Some("chapter_detection_job"),
+                Some(&job_id),
+                "{}",
+            )
+            .await;
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(error) => chapter_detection_error(&headers, error),
+    }
+}
+
+async fn admin_retry_chapter_detection(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.chapter_detection.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let job = match service.retry(&job_id).await {
+        Ok(job) => job,
+        Err(error) => return chapter_detection_error(&headers, error),
+    };
+    let worker = service.clone();
+    let new_job_id = job.id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = worker.run(&new_job_id).await {
+            tracing::error!(job_id = %new_job_id, %error, "retried chapter detection job stopped");
+        }
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "CHAPTER_DETECTION_RETRIED",
+        Some("chapter_detection_job"),
+        Some(&job_id),
+        &format!(r#"{{"newJobId":"{}"}}"#, job.id),
+    )
+    .await;
+    (StatusCode::ACCEPTED, Json(json!({ "job": job }))).into_response()
+}
+
+fn chapter_detection_error(headers: &HeaderMap, error: ChapterDetectionError) -> Response {
+    let (status, code, message) = match error {
+        ChapterDetectionError::InvalidOptions
+        | ChapterDetectionError::InvalidPluginResult
+        | ChapterDetectionError::SourceChanged
+        | ChapterDetectionError::LibraryNotSupported => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "章节检测参数或插件结果无效",
+        ),
+        ChapterDetectionError::AlreadyActive => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "已有章节检测任务运行中",
+        ),
+        ChapterDetectionError::LibraryNotFound | ChapterDetectionError::JobNotFound => (
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "章节检测目标不存在",
+        ),
+        ChapterDetectionError::NotRetryable => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "章节检测任务不可重试",
+        ),
+        ChapterDetectionError::NotCancellable => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "章节检测任务不可取消",
+        ),
+        ChapterDetectionError::PluginUnavailable(_) => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "章节检测插件不可用",
+        ),
+        ChapterDetectionError::WorkerFailed
+        | ChapterDetectionError::Plugin(_)
+        | ChapterDetectionError::Storage(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "章节检测服务暂时不可用",
+        ),
+    };
+    api_error(headers, status, code, message).into_response()
 }
 
 #[derive(Deserialize)]
@@ -11982,6 +12560,48 @@ async fn admin_list_plugins(
     admin_list_plugins_with_scope(headers, query, state, false).await
 }
 
+async fn admin_list_chapter_sources(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match plugins.list_chapter_sources(offset, limit).await {
+        Ok(page) => Json(json!({
+            "sources": page.sources.iter().map(|source| json!({
+                "id": source.id,
+                "name": source.name,
+                "description": source.description,
+                "version": source.version,
+                "capabilities": source.capabilities,
+                "lookup": source.lookup,
+            })).collect::<Vec<_>>(),
+            "total": page.total,
+            "page": page.offset / page.limit + 1,
+            "pageSize": page.limit,
+        }))
+        .into_response(),
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
 async fn admin_plugin_store(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -12295,6 +12915,43 @@ async fn validate_scraper_selection(
         .map_err(|error| plugin_error(headers, error).into_response())
 }
 
+async fn validate_chapter_source_selection(
+    headers: &HeaderMap,
+    state: &AppState,
+    kind: LibraryKind,
+    chapter_source_id: Option<&str>,
+) -> Result<(), Response> {
+    let Some(chapter_source_id) = chapter_source_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if !kind.supports_chapter_source() {
+        return Err(api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "片头片尾数据源只能用于剧集或混合媒体库",
+        )
+        .into_response());
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    match plugins
+        .has_available_chapter_source(chapter_source_id)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(plugin_error(
+            headers,
+            PluginServiceError::Unavailable(chapter_source_id.to_owned()),
+        )),
+        Err(error) => Err(plugin_error(headers, error)),
+    }
+}
+
 async fn admin_create_library(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -12329,17 +12986,33 @@ async fn admin_create_library(
             .into_response();
         }
     };
+    if let Err(response) = validate_chapter_source_selection(
+        &headers,
+        &state,
+        kind,
+        request.chapter_source_id.as_deref(),
+    )
+    .await
+    {
+        return response;
+    }
     match libraries
-        .create_library_with_scraper(
+        .create_library_with_scraper_and_chapter_source(
             &request.name,
             kind,
             request.realtime_watch_enabled,
             request.scraper_id.as_deref(),
+            request.chapter_source_id.as_deref(),
             request.realtime_metadata_auto_match_enabled,
         )
         .await
     {
         Ok(library) => {
+            if let Some(plugins) = state.plugins.as_ref()
+                && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
+            {
+                return plugin_error(&headers, error);
+            }
             let library_id = library.id.to_string();
             record_audit_event(
                 &state,
@@ -12405,6 +13078,28 @@ async fn admin_update_library(
         },
         None => None,
     };
+    let current_library = match libraries.get_library(library_id).await {
+        Ok(library) => library,
+        Err(error) => return library_error(&headers, error),
+    };
+    if let Err(response) = validate_chapter_source_selection(
+        &headers,
+        &state,
+        kind.unwrap_or(current_library.kind),
+        request
+            .chapter_source_id
+            .as_ref()
+            .and_then(|value| value.as_deref()),
+    )
+    .await
+    {
+        return response;
+    }
+    let effective_kind = kind.unwrap_or(current_library.kind);
+    let chapter_source_id = request.chapter_source_id.clone().or_else(|| {
+        (!effective_kind.supports_chapter_source() && current_library.chapter_source_id.is_some())
+            .then_some(None)
+    });
     let media_strategy_json = match request.media_strategy.as_ref() {
         None => None,
         Some(None) => Some(None),
@@ -12440,6 +13135,7 @@ async fn admin_update_library(
         reconciliation_schedule: request.reconciliation_schedule,
         metadata_schedule: request.metadata_schedule,
         scraper_id: request.scraper_id.clone(),
+        chapter_source_id,
         media_strategy_json,
         scan_concurrency: request.scan_concurrency,
         probe_concurrency: request.probe_concurrency,
@@ -12456,6 +13152,11 @@ async fn admin_update_library(
     }
     match libraries.update_settings(library_id, settings).await {
         Ok(view) => {
+            if let Some(plugins) = state.plugins.as_ref()
+                && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
+            {
+                return plugin_error(&headers, error);
+            }
             let target_id = library_id.to_string();
             record_audit_event(
                 &state,
@@ -12816,7 +13517,8 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
         | LibraryServiceError::InvalidLibraryId(_)
         | LibraryServiceError::InvalidRootId(_)
         | LibraryServiceError::InvalidKind(_)
-        | LibraryServiceError::InvalidScraperId => (
+        | LibraryServiceError::InvalidScraperId
+        | LibraryServiceError::InvalidChapterSourceId => (
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "媒体库请求无效",
@@ -13135,6 +13837,7 @@ fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
         "name": library.name,
         "kind": library.kind.as_str(),
         "scraperId": library.scraper_id,
+        "chapterSourceId": library.chapter_source_id,
         "coverImageUrl": library_cover_url(library),
         "isEnabled": library.is_enabled,
         "realtimeWatchEnabled": library.realtime_watch_enabled,
@@ -13294,7 +13997,7 @@ mod tests {
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
-    use crate::application::catalog::{CatalogSource, CatalogStream};
+    use crate::application::catalog::{CatalogChapter, CatalogSource, CatalogStream};
     use crate::application::scraper::ScraperError;
     use crate::application::setup::SetupService;
     use crate::application::tmdb::TmdbError;
@@ -13622,14 +14325,45 @@ mod tests {
                     ("Profile".to_owned(), serde_json::json!("High")),
                 ]),
             }],
+            chapters: Vec::new(),
         };
 
         let body = emby_media_source_json("item-1", &source, true);
         assert_eq!(body["Path"], "https://example.invalid/media.mkv");
         assert_eq!(body["Size"], 1_234_567);
+        assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);
         assert_eq!(body["MediaStreams"][0]["Height"], 1080);
         assert_eq!(body["MediaStreams"][0]["Profile"], "High");
+    }
+
+    #[test]
+    fn emby_media_source_chapters_are_only_included_when_requested() {
+        let source = CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "LOCAL_FILE".to_owned(),
+            container: Some("mkv".to_owned()),
+            size: None,
+            external_url: None,
+            edition_name: None,
+            quality_label: None,
+            bitrate: None,
+            duration_ticks: Some(100_000_000),
+            is_default: true,
+            probe_status: "READY".to_owned(),
+            streams: Vec::new(),
+            chapters: vec![CatalogChapter {
+                start_position_ticks: 10_000_000,
+                name: None,
+                marker_type: "INTRO_START".to_owned(),
+                chapter_index: 0,
+            }],
+        };
+
+        let without_chapters = emby_media_source_json("item-1", &source, false);
+        assert!(without_chapters.get("Chapters").is_none());
+        let with_chapters = emby_media_source_json_with_resolver("item-1", &source, false, false);
+        assert_eq!(with_chapters["Chapters"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -13647,6 +14381,7 @@ mod tests {
             is_default: true,
             probe_status: "PENDING".to_owned(),
             streams: Vec::new(),
+            chapters: Vec::new(),
         };
 
         let body = emby_media_source_json_with_resolver("item-1", &source, false, true);
@@ -13686,6 +14421,7 @@ mod tests {
                 is_forced: false,
                 details: BTreeMap::from([("Width".to_owned(), serde_json::json!(1920))]),
             }],
+            chapters: Vec::new(),
         };
 
         let body = lux_catalog_source_json(&source);

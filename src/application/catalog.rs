@@ -10,7 +10,7 @@ use crate::{
     },
     storage::{
         CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database, ResumeItemsQuery,
-        StorageError, StoredCatalogDetail, StoredCatalogRow,
+        StorageError, StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter,
     },
 };
 
@@ -148,6 +148,7 @@ impl CatalogService {
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
         let mut items = assemble_items(rows);
+        self.populate_item_details(&mut items).await?;
         self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
             items,
@@ -188,6 +189,7 @@ impl CatalogService {
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
         let mut items = assemble_items(rows);
+        self.populate_item_details(&mut items).await?;
         self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
             items,
@@ -492,6 +494,17 @@ impl CatalogService {
         Ok(())
     }
 
+    async fn populate_item_details(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {
+        let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
+        for item in items {
+            if let Some(detail) = details.get(&item.id) {
+                apply_catalog_detail(item, detail);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn find_item(
         &self,
         principal: AccessPrincipal,
@@ -507,7 +520,63 @@ impl CatalogService {
         if let Some(detail) = self.database.find_catalog_detail(item_id).await? {
             apply_catalog_detail(&mut item, &detail);
         }
+        self.populate_chapters(std::slice::from_mut(&mut item))
+            .await?;
         Ok(Some(item))
+    }
+
+    pub async fn populate_chapters(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {
+        let source_ids = items
+            .iter()
+            .flat_map(|item| item.media_sources.iter().map(|source| source.id.clone()))
+            .collect::<Vec<_>>();
+        let chapters = self
+            .database
+            .list_media_chapters_by_source_ids(&source_ids)
+            .await?;
+        for item in items {
+            for source in &mut item.media_sources {
+                source.chapters = chapters
+                    .get(&source.id)
+                    .map(|source_chapters| {
+                        source_chapters.iter().map(CatalogChapter::from).collect()
+                    })
+                    .unwrap_or_default();
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn populate_image_tags(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {
+        let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let tags = self
+            .database
+            .list_catalog_image_tags_by_ids(&item_ids)
+            .await?;
+        for item in items {
+            item.fanart_image_tags.clear();
+            let Some(item_tags) = tags.get(&item.id) else {
+                continue;
+            };
+            for tag in item_tags {
+                if tag.image_type != "FANART" && tag.image_index != 0 {
+                    continue;
+                }
+                match tag.image_type.as_str() {
+                    "POSTER" => item.poster_image_tag = Some(tag.id.clone()),
+                    "FANART" => item.fanart_image_tags.push(tag.id.clone()),
+                    "THUMB" => item.thumb_image_tag = Some(tag.id.clone()),
+                    "LOGO" => item.logo_image_tag = Some(tag.id.clone()),
+                    "BANNER" => item.banner_image_tag = Some(tag.id.clone()),
+                    "DISC" => item.disc_image_tag = Some(tag.id.clone()),
+                    "ART" => item.art_image_tag = Some(tag.id.clone()),
+                    "WALLPAPER" => item.wallpaper_image_tag = Some(tag.id.clone()),
+                    _ => {}
+                }
+            }
+            item.fanart_image_tag = item.fanart_image_tags.first().cloned();
+        }
+        Ok(())
     }
 
     pub async fn search_items(
@@ -615,8 +684,13 @@ pub struct CatalogItem {
     pub runtime_ticks: Option<i64>,
     pub poster_image_tag: Option<String>,
     pub fanart_image_tag: Option<String>,
+    pub fanart_image_tags: Vec<String>,
     pub thumb_image_tag: Option<String>,
     pub logo_image_tag: Option<String>,
+    pub banner_image_tag: Option<String>,
+    pub disc_image_tag: Option<String>,
+    pub art_image_tag: Option<String>,
+    pub wallpaper_image_tag: Option<String>,
     pub media_sources: Vec<CatalogSource>,
 }
 
@@ -634,6 +708,26 @@ pub struct CatalogSource {
     pub is_default: bool,
     pub probe_status: String,
     pub streams: Vec<CatalogStream>,
+    pub chapters: Vec<CatalogChapter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogChapter {
+    pub start_position_ticks: i64,
+    pub name: Option<String>,
+    pub marker_type: String,
+    pub chapter_index: i64,
+}
+
+impl From<&StoredMediaChapter> for CatalogChapter {
+    fn from(chapter: &StoredMediaChapter) -> Self {
+        Self {
+            start_position_ticks: chapter.start_position_ticks,
+            name: chapter.name.clone(),
+            marker_type: chapter.marker_type.clone(),
+            chapter_index: chapter.chapter_index,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -683,8 +777,13 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     runtime_ticks: row.runtime_ticks,
                     poster_image_tag: row.poster_image_tag.clone(),
                     fanart_image_tag: row.fanart_image_tag.clone(),
+                    fanart_image_tags: row.fanart_image_tag.clone().into_iter().collect(),
                     thumb_image_tag: row.thumb_image_tag.clone(),
                     logo_image_tag: row.logo_image_tag.clone(),
+                    banner_image_tag: None,
+                    disc_image_tag: None,
+                    art_image_tag: None,
+                    wallpaper_image_tag: None,
                     media_sources: Vec::new(),
                 });
                 items.len() - 1
@@ -714,6 +813,7 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     is_default: row.is_default.unwrap_or(false),
                     probe_status: row.probe_status.unwrap_or_else(|| "PENDING".to_owned()),
                     streams: Vec::new(),
+                    chapters: Vec::new(),
                 });
                 item.media_sources.len() - 1
             }
@@ -865,8 +965,13 @@ mod tests {
             runtime_ticks: None,
             poster_image_tag: None,
             fanart_image_tag: None,
+            fanart_image_tags: Vec::new(),
             thumb_image_tag: None,
             logo_image_tag: None,
+            banner_image_tag: None,
+            disc_image_tag: None,
+            art_image_tag: None,
+            wallpaper_image_tag: None,
             media_sources: Vec::new(),
         }
     }

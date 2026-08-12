@@ -75,9 +75,10 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     sqlx::query("UPDATE media_items SET provider_ids_json = '{\"tmdb\":\"999\"}' WHERE id = ?")
         .bind(&item_id)
         .execute(database.pool())

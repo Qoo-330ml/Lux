@@ -46,11 +46,35 @@ impl LibraryService {
         scraper_id: Option<&str>,
         realtime_metadata_auto_match_enabled: bool,
     ) -> Result<LibraryRecord, LibraryServiceError> {
+        self.create_library_with_scraper_and_chapter_source(
+            name,
+            kind,
+            _realtime_watch_enabled,
+            scraper_id,
+            None,
+            realtime_metadata_auto_match_enabled,
+        )
+        .await
+    }
+
+    pub async fn create_library_with_scraper_and_chapter_source(
+        &self,
+        name: &str,
+        kind: LibraryKind,
+        _realtime_watch_enabled: bool,
+        scraper_id: Option<&str>,
+        chapter_source_id: Option<&str>,
+        realtime_metadata_auto_match_enabled: bool,
+    ) -> Result<LibraryRecord, LibraryServiceError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 128 {
             return Err(LibraryServiceError::InvalidName);
         }
         let scraper_id = normalize_scraper_id(scraper_id)?;
+        let chapter_source_id = normalize_chapter_source_id(chapter_source_id)?;
+        if chapter_source_id.is_some() && !kind.supports_chapter_source() {
+            return Err(LibraryServiceError::InvalidChapterSourceId);
+        }
         let id = LibraryId::new();
         self.database
             .insert_library(NewLibrary {
@@ -64,6 +88,7 @@ impl LibraryService {
                 metadata_schedule: None,
                 scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
                 probe_concurrency: DEFAULT_PROBE_CONCURRENCY,
+                chapter_source_id: chapter_source_id.as_deref(),
             })
             .await?;
         let stored = self
@@ -118,8 +143,30 @@ impl LibraryService {
             .as_deref()
             .map(normalize_library_name)
             .transpose()?;
-        let kind = settings.kind.map(LibraryKind::as_str);
+        let requested_kind = settings.kind;
+        let kind = requested_kind.map(LibraryKind::as_str);
         let scraper_id = normalize_scraper_patch(settings.scraper_id)?;
+        let mut chapter_source_id = normalize_chapter_source_patch(settings.chapter_source_id)?;
+        let current = self
+            .database
+            .find_library(&library_id.to_string())
+            .await?
+            .ok_or(LibraryServiceError::LibraryNotFound)?;
+        let current_kind = current
+            .kind
+            .parse::<LibraryKind>()
+            .map_err(|error| LibraryServiceError::InvalidKind(error.to_string()))?;
+        let effective_kind = requested_kind.unwrap_or(current_kind);
+        if chapter_source_id
+            .as_ref()
+            .is_some_and(|value| value.is_some())
+            && !effective_kind.supports_chapter_source()
+        {
+            return Err(LibraryServiceError::InvalidChapterSourceId);
+        }
+        if !effective_kind.supports_chapter_source() {
+            chapter_source_id = Some(None);
+        }
 
         let updated = self
             .database
@@ -137,6 +184,7 @@ impl LibraryService {
                         .map(|value| value.as_deref()),
                     metadata_schedule: metadata_schedule.as_ref().map(|value| value.as_deref()),
                     scraper_id: scraper_id.as_ref().map(|value| value.as_deref()),
+                    chapter_source_id: chapter_source_id.as_ref().map(|value| value.as_deref()),
                     media_strategy_json: settings
                         .media_strategy_json
                         .as_ref()
@@ -285,6 +333,7 @@ pub struct LibrarySettingsPatch {
     pub reconciliation_schedule: Option<Option<String>>,
     pub metadata_schedule: Option<Option<String>>,
     pub scraper_id: Option<Option<String>>,
+    pub chapter_source_id: Option<Option<String>>,
     pub media_strategy_json: Option<Option<String>>,
     pub scan_concurrency: Option<i64>,
     pub probe_concurrency: Option<i64>,
@@ -314,6 +363,7 @@ pub enum LibraryServiceError {
     InvalidRootId(String),
     InvalidKind(String),
     InvalidScraperId,
+    InvalidChapterSourceId,
     LibraryNotFound,
     LibraryBusy,
     RootNotFound,
@@ -341,6 +391,9 @@ impl fmt::Display for LibraryServiceError {
             Self::InvalidRootId(error) => write!(formatter, "invalid library root ID: {error}"),
             Self::InvalidKind(error) => write!(formatter, "invalid library kind: {error}"),
             Self::InvalidScraperId => formatter.write_str("invalid library scraper ID"),
+            Self::InvalidChapterSourceId => {
+                formatter.write_str("invalid library chapter source ID")
+            }
             Self::LibraryNotFound => formatter.write_str("library not found"),
             Self::LibraryBusy => formatter.write_str("library has an active scan"),
             Self::RootNotFound => formatter.write_str("library root not found"),
@@ -369,6 +422,7 @@ impl std::error::Error for LibraryServiceError {
             | Self::InvalidRootId(_)
             | Self::InvalidKind(_)
             | Self::InvalidScraperId
+            | Self::InvalidChapterSourceId
             | Self::LibraryNotFound
             | Self::LibraryBusy
             | Self::RootNotFound
@@ -424,6 +478,36 @@ fn normalize_scraper_patch(
     }
 }
 
+fn normalize_chapter_source_id(value: Option<&str>) -> Result<Option<String>, LibraryServiceError> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.chars().count() > 128
+                || !value.chars().all(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || "-_.".contains(character)
+                })
+            {
+                Err(LibraryServiceError::InvalidChapterSourceId)
+            } else {
+                Ok(value.to_owned())
+            }
+        })
+        .transpose()
+}
+
+fn normalize_chapter_source_patch(
+    value: Option<Option<String>>,
+) -> Result<Option<Option<String>>, LibraryServiceError> {
+    match value {
+        None => Ok(None),
+        Some(None) => Ok(Some(None)),
+        Some(Some(value)) => normalize_chapter_source_id(Some(&value)).map(Some),
+    }
+}
+
 fn normalize_schedule(
     value: Option<Option<String>>,
 ) -> Result<Option<Option<String>>, LibraryServiceError> {
@@ -474,6 +558,7 @@ fn stored_library(stored: StoredLibrary) -> Result<LibraryRecord, LibraryService
         name: stored.name,
         kind,
         scraper_id: stored.scraper_id,
+        chapter_source_id: stored.chapter_source_id,
         cover_image_path: stored.cover_image_path,
         cover_image_content_type: stored.cover_image_content_type,
         cover_image_size: stored.cover_image_size,

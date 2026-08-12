@@ -15,17 +15,25 @@ use crate::network::is_public_address;
 use crate::{
     application::{
         plugin_protocol::{
-            CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, IP_LOCATION_CAPABILITY, IpLocationRpcRequest,
-            IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
-            MediaProbeRpcStreamType, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_SCRAPER,
-            PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, PluginConfigField,
-            PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
-            StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+            CHAPTER_DETECT_CAPABILITY, CHAPTER_DETECT_METHOD,
+            CHAPTER_FINGERPRINT_POINT_DURATION_TICKS, CHAPTER_FINGERPRINT_SAMPLE_RATE,
+            CHAPTER_LOOKUP_CAPABILITY, CHAPTER_LOOKUP_METHOD,
+            CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, ChapterDetectRpcRequest, ChapterDetectRpcResult,
+            ChapterLookupRpcRequest, ChapterLookupRpcResult, IP_LOCATION_CAPABILITY,
+            IpLocationRpcRequest, IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
+            MediaProbeRpcStreamType, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
+            PLUGIN_CATEGORY_SCRAPER, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_IP_LOCATION,
+            PLUGIN_TYPE_STRM_RESOLVER, PluginConfigField, PluginConfigOption,
+            STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD, StrmResolveRpcRequest,
+            StrmResolveRpcResult, StrmResolveStatus,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex},
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
-        schedule::{DEFAULT_STRM_MEDIA_INFO_SCHEDULE, validate_cron},
+        schedule::{
+            DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE,
+            DEFAULT_STRM_MEDIA_INFO_SCHEDULE, validate_cron,
+        },
         settings::{
             TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, TmdbSettings, read_tmdb_settings,
             tmdb_api_base_url_options, tmdb_language_options, write_tmdb_api_key,
@@ -39,6 +47,8 @@ use crate::{
 pub const TMDB_PLUGIN_ID: &str = "tmdb";
 pub const TMDB_DYNAMIC_PLUGIN_ID: &str = "org.lux.tmdb";
 pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.strm-media-info";
+pub const CHAPTER_DETECTOR_PLUGIN_ID: &str = "org.lux.intro-outro-detector";
+const THEINTRODB_CHAPTER_SOURCE_ID: &str = "org.lux.theintrodb-chapter-source";
 pub const MEDIA_INFO_LEGACY_PLUGIN_ID: &str = "org.lux.media-info";
 pub const IP_HIOFD_PLUGIN_ID: &str = "org.lux.ip-hiofd";
 pub const IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
@@ -75,6 +85,15 @@ pub struct MediaInfoSettings {
     pub media_info_enabled: bool,
     pub thumbnail_enabled: bool,
     pub thumbnail_position_percent: i64,
+    pub schedule: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChapterDetectorSettings {
+    pub concurrency: i64,
+    pub intro_window_seconds: i64,
+    pub credits_window_seconds: i64,
+    pub match_threshold: u32,
     pub schedule: String,
 }
 
@@ -315,8 +334,14 @@ impl PluginService {
             self.install_remote_package(&entry).await?;
         }
         self.database.install_plugin(&plugin_id).await?;
+        let current_catalog = self.catalog_snapshot().await;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
+        } else if current_catalog
+            .get(&plugin_id)
+            .is_some_and(is_chapter_detector_plugin)
+        {
+            self.sync_chapter_detection_scheduled_tasks().await?;
         }
         let plugin = self.view_for_id(&plugin_id, true, true).await?;
         Ok(PluginInstall {
@@ -344,6 +369,11 @@ impl PluginService {
         }
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
+        } else if catalog
+            .get(&plugin_id)
+            .is_some_and(is_chapter_detector_plugin)
+        {
+            self.sync_chapter_detection_scheduled_tasks().await?;
         }
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
@@ -512,6 +542,81 @@ impl PluginService {
         Ok(!self.available_strm_resolver_ids().await?.is_empty())
     }
 
+    pub async fn has_available_chapter_detector(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let Some(plugin) = catalog.get(plugin_id) else {
+            return Ok(false);
+        };
+        if !is_chapter_detector_plugin(plugin) {
+            return Ok(false);
+        }
+        let (installed, enabled) = self.plugin_state(plugin_id).await?;
+        if !installed || !enabled {
+            return Ok(false);
+        }
+        Ok(self
+            .dynamic_view(plugin, installed, enabled)
+            .await?
+            .available)
+    }
+
+    pub async fn list_chapter_sources(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<ChapterSourcePage, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let mut sources = Vec::new();
+        for plugin in &catalog.plugins {
+            if !is_chapter_detector_plugin(plugin) {
+                continue;
+            }
+            let (installed, enabled) = self.plugin_state(&plugin.manifest.id).await?;
+            if !installed || !enabled {
+                continue;
+            }
+            let view = self.dynamic_view(plugin, installed, enabled).await?;
+            if view.available {
+                sources.push(ChapterSourceView {
+                    id: view.id,
+                    name: view.name,
+                    description: view.description,
+                    version: view.version,
+                    capabilities: view.capabilities,
+                    lookup: is_chapter_lookup_plugin(plugin),
+                });
+            }
+        }
+        sources.sort_by(|left, right| left.id.cmp(&right.id));
+        let total = i64::try_from(sources.len()).unwrap_or(i64::MAX);
+        let start = offset.max(0).min(total) as usize;
+        let end = (offset.max(0).saturating_add(limit.max(0))).min(total) as usize;
+        Ok(ChapterSourcePage {
+            sources: sources[start..end].to_vec(),
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn has_available_chapter_source(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, PluginServiceError> {
+        self.has_available_chapter_detector(plugin_id).await
+    }
+
+    pub async fn is_chapter_lookup_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        Ok(catalog.get(plugin_id).is_some_and(is_chapter_lookup_plugin))
+    }
+
     pub async fn resolve_strm_target(
         &self,
         target: &str,
@@ -610,14 +715,21 @@ impl PluginService {
             .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
         let values = merge_default_config_values(&fields, values);
-        let values = normalize_plugin_config(&plugin_id, values);
+        let mut values = normalize_plugin_config(&plugin_id, values);
+        if is_chapter_detector_plugin(plugin) {
+            values.remove("libraryIds");
+        }
         let values = validate_config_values(&fields, &values)?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             media_info_schedule(&values)?;
+        } else if is_chapter_detector_plugin(plugin) {
+            chapter_detector_settings_from_values(&plugin_id, &fields, &values)?;
         }
         self.write_plugin_config(&plugin_id, &values).await?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
+        } else if is_chapter_detector_plugin(plugin) {
+            self.sync_chapter_detection_scheduled_tasks().await?;
         }
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
@@ -720,6 +832,137 @@ impl PluginService {
         self.media_info_settings().await.map(Some)
     }
 
+    pub async fn chapter_detector_settings(
+        &self,
+        plugin_id: &str,
+    ) -> Result<ChapterDetectorSettings, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.to_owned()))?;
+        if !is_chapter_detector_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id.to_owned()));
+        }
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let mut stored_values = self.read_plugin_config(plugin_id).await?;
+        stored_values.remove("libraryIds");
+        let values =
+            merge_default_config_values(&fields, normalize_plugin_config(plugin_id, stored_values));
+        chapter_detector_settings_from_values(plugin_id, &fields, &values)
+    }
+
+    pub async fn enabled_chapter_detector_settings(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<ChapterDetectorSettings>, PluginServiceError> {
+        let (installed, enabled) = self.plugin_state(plugin_id).await?;
+        if !installed || !enabled {
+            return Ok(None);
+        }
+        self.chapter_detector_settings(plugin_id).await.map(Some)
+    }
+
+    pub async fn sync_chapter_detection_scheduled_tasks(&self) -> Result<(), PluginServiceError> {
+        self.migrate_legacy_chapter_source_selections().await?;
+        self.database.disable_chapter_detection_tasks().await?;
+        let catalog = self.catalog_snapshot().await;
+        let mut selected = std::collections::HashMap::<String, String>::new();
+        for plugin in &catalog.plugins {
+            if !is_chapter_detector_plugin(plugin) {
+                continue;
+            }
+            let (installed, enabled) = self.plugin_state(&plugin.manifest.id).await?;
+            if !installed || !enabled {
+                continue;
+            }
+            match self.chapter_detector_settings(&plugin.manifest.id).await {
+                Ok(_) => {}
+                Err(PluginServiceError::InvalidConfig) => continue,
+                Err(error) => return Err(error),
+            };
+            let libraries = self.database.list_libraries().await?;
+            for library in libraries {
+                if !library.is_enabled
+                    || library.kind == "MOVIE"
+                    || library.chapter_source_id.as_deref() != Some(plugin.manifest.id.as_str())
+                {
+                    continue;
+                }
+                selected.insert(library.id, plugin.manifest.id.clone());
+            }
+        }
+        for (library_id, plugin_id) in selected {
+            let settings = self.chapter_detector_settings(&plugin_id).await?;
+            self.database
+                .upsert_chapter_detection_task(
+                    &library_id,
+                    &plugin_id,
+                    &settings.schedule,
+                    true,
+                    settings.concurrency,
+                    settings.intro_window_seconds,
+                    settings.credits_window_seconds,
+                    settings.match_threshold,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn migrate_legacy_chapter_source_selections(&self) -> Result<(), PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let mut plugins = catalog
+            .plugins
+            .iter()
+            .filter(|plugin| is_chapter_detector_plugin(plugin))
+            .collect::<Vec<_>>();
+        plugins.sort_by(|left, right| {
+            let left_priority = left.manifest.id != CHAPTER_DETECTOR_PLUGIN_ID;
+            let right_priority = right.manifest.id != CHAPTER_DETECTOR_PLUGIN_ID;
+            left_priority
+                .cmp(&right_priority)
+                .then_with(|| left.manifest.id.cmp(&right.manifest.id))
+        });
+        for plugin in plugins {
+            let (installed, enabled) = self.plugin_state(&plugin.manifest.id).await?;
+            if !installed || !enabled {
+                continue;
+            }
+            let values = self.read_plugin_config(&plugin.manifest.id).await?;
+            let Some(library_ids) = values.get("libraryIds").and_then(Value::as_array) else {
+                continue;
+            };
+            for library_id in library_ids.iter().filter_map(Value::as_str) {
+                let Some(library) = self.database.find_library(library_id).await? else {
+                    continue;
+                };
+                if library.kind == "MOVIE" || library.chapter_source_id.is_some() {
+                    continue;
+                }
+                self.database
+                    .update_library_settings(
+                        library_id,
+                        crate::storage::LibrarySettingsUpdate {
+                            name: None,
+                            kind: None,
+                            is_enabled: None,
+                            realtime_watch_enabled: None,
+                            realtime_metadata_auto_match_enabled: None,
+                            reconciliation_schedule: None,
+                            metadata_schedule: None,
+                            scan_concurrency: None,
+                            probe_concurrency: None,
+                            scraper_id: None,
+                            chapter_source_id: Some(Some(&plugin.manifest.id)),
+                            media_strategy_json: None,
+                        },
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn sync_media_info_scheduled_task(&self) -> Result<(), PluginServiceError> {
         let (installed, enabled) = self.plugin_state(MEDIA_INFO_PLUGIN_ID).await?;
         if !installed {
@@ -752,6 +995,9 @@ impl PluginService {
         plugin: &DiscoveredPlugin,
     ) -> Result<Vec<PluginConfigField>, PluginServiceError> {
         let mut fields = plugin.manifest.config_fields.clone();
+        if is_chapter_detector_plugin(plugin) {
+            fields.retain(|field| field.key != "libraryIds");
+        }
         if fields.iter().any(|field| {
             field.options_source.as_deref() == Some(CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES)
         }) {
@@ -760,7 +1006,10 @@ impl PluginService {
                 .list_libraries()
                 .await?
                 .into_iter()
-                .filter(|library| library.is_enabled)
+                .filter(|library| {
+                    library.is_enabled
+                        && (!is_chapter_detector_plugin(plugin) || library.kind != "MOVIE")
+                })
                 .map(|library| PluginConfigOption {
                     value: library.id,
                     label: library.name,
@@ -901,6 +1150,80 @@ impl PluginService {
         let response: MediaProbeRpcResult =
             serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
         media_probe_output(response).ok_or(PluginServiceError::InvalidResponse)
+    }
+
+    pub async fn detect_chapters(
+        &self,
+        plugin_id: &str,
+        request: ChapterDetectRpcRequest,
+    ) -> Result<ChapterDetectRpcResult, PluginServiceError> {
+        validate_chapter_detect_request(&request)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.to_owned()))?;
+        if !is_chapter_detector_plugin(plugin)
+            || !plugin
+                .manifest
+                .capabilities
+                .iter()
+                .any(|capability| capability == CHAPTER_DETECT_CAPABILITY)
+        {
+            return Err(PluginServiceError::Unavailable(plugin_id.to_owned()));
+        }
+        let (installed, enabled) = self.plugin_state(plugin_id).await?;
+        if !self
+            .dynamic_view(plugin, installed, enabled)
+            .await?
+            .available
+        {
+            return Err(PluginServiceError::Unavailable(plugin_id.to_owned()));
+        }
+        let params =
+            serde_json::to_value(&request).map_err(|_| PluginServiceError::InvalidResponse)?;
+        let value = self
+            .supervisor
+            .call_isolated(plugin_id, CHAPTER_DETECT_METHOD, params)
+            .await
+            .map_err(PluginServiceError::Runtime)?;
+        let result: ChapterDetectRpcResult =
+            serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
+        validate_chapter_detect_result(&request, &result)?;
+        Ok(result)
+    }
+
+    pub async fn lookup_chapters(
+        &self,
+        plugin_id: &str,
+        request: ChapterLookupRpcRequest,
+    ) -> Result<ChapterLookupRpcResult, PluginServiceError> {
+        validate_chapter_lookup_request(&request)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.to_owned()))?;
+        if !is_chapter_lookup_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id.to_owned()));
+        }
+        let (installed, enabled) = self.plugin_state(plugin_id).await?;
+        if !self
+            .dynamic_view(plugin, installed, enabled)
+            .await?
+            .available
+        {
+            return Err(PluginServiceError::Unavailable(plugin_id.to_owned()));
+        }
+        let params =
+            serde_json::to_value(&request).map_err(|_| PluginServiceError::InvalidResponse)?;
+        let value = self
+            .supervisor
+            .call_isolated(plugin_id, CHAPTER_LOOKUP_METHOD, params)
+            .await
+            .map_err(PluginServiceError::Runtime)?;
+        let result: ChapterLookupRpcResult =
+            serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
+        validate_chapter_lookup_result(&request, &result)?;
+        Ok(result)
     }
 
     pub async fn scraper_client(
@@ -1120,7 +1443,10 @@ impl PluginService {
             CONFIG_SOURCE_PLUGIN.to_owned()
         };
         let config_fields = self.config_fields_for_plugin(plugin).await?;
-        let stored_values = self.read_plugin_config(&plugin.manifest.id).await?;
+        let mut stored_values = self.read_plugin_config(&plugin.manifest.id).await?;
+        if is_chapter_detector_plugin(plugin) {
+            stored_values.remove("libraryIds");
+        }
         let config_values = merge_default_config_values(&config_fields, stored_values);
         let public_config_values = public_config_values(&config_fields, &config_values);
         let configured = if is_tmdb_plugin_id(&plugin.manifest.id) {
@@ -1223,6 +1549,14 @@ impl PluginService {
 }
 
 fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> Map<String, Value> {
+    if plugin_id == THEINTRODB_CHAPTER_SOURCE_ID
+        && values.get("schedule").and_then(Value::as_str) == Some("0 5 * * 0")
+    {
+        values.insert(
+            "schedule".to_owned(),
+            Value::String(DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE.to_owned()),
+        );
+    }
     if plugin_id != MEDIA_INFO_PLUGIN_ID {
         return values;
     }
@@ -1251,6 +1585,49 @@ fn media_info_schedule(values: &Map<String, Value>) -> Result<String, PluginServ
         .trim();
     validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
     Ok(schedule.to_owned())
+}
+
+fn chapter_detector_settings_from_values(
+    plugin_id: &str,
+    fields: &[PluginConfigField],
+    values: &Map<String, Value>,
+) -> Result<ChapterDetectorSettings, PluginServiceError> {
+    let values = validate_config_values(fields, values)?;
+    let default_schedule = if plugin_id == THEINTRODB_CHAPTER_SOURCE_ID {
+        DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE
+    } else {
+        DEFAULT_CHAPTER_DETECTION_SCHEDULE
+    };
+    let schedule = values
+        .get("schedule")
+        .and_then(Value::as_str)
+        .unwrap_or(default_schedule)
+        .trim();
+    validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+    let concurrency = values
+        .get("concurrency")
+        .and_then(Value::as_i64)
+        .ok_or(PluginServiceError::InvalidConfig)?;
+    let intro_window_seconds = values
+        .get("introWindowSeconds")
+        .and_then(Value::as_i64)
+        .ok_or(PluginServiceError::InvalidConfig)?;
+    let credits_window_seconds = values
+        .get("creditsWindowSeconds")
+        .and_then(Value::as_i64)
+        .ok_or(PluginServiceError::InvalidConfig)?;
+    let match_threshold = values
+        .get("matchThreshold")
+        .and_then(Value::as_i64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(PluginServiceError::InvalidConfig)?;
+    Ok(ChapterDetectorSettings {
+        concurrency,
+        intro_window_seconds,
+        credits_window_seconds,
+        match_threshold,
+        schedule: schedule.to_owned(),
+    })
 }
 
 fn optional_bool_config(
@@ -1452,6 +1829,24 @@ pub struct PluginPage {
     pub total: i64,
     pub offset: i64,
     pub limit: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChapterSourcePage {
+    pub sources: Vec<ChapterSourceView>,
+    pub total: i64,
+    pub offset: i64,
+    pub limit: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChapterSourceView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub version: Option<String>,
+    pub capabilities: Vec<String>,
+    pub lookup: bool,
 }
 
 #[derive(Debug)]
@@ -1679,6 +2074,195 @@ fn is_strm_resolver_plugin(plugin: &DiscoveredPlugin) -> bool {
             .capabilities
             .iter()
             .any(|capability| capability == STRM_RESOLVE_CAPABILITY)
+}
+
+fn is_chapter_detector_plugin(plugin: &DiscoveredPlugin) -> bool {
+    plugin.manifest.plugin_type == PLUGIN_TYPE_CHAPTER_DETECTOR
+        && plugin.manifest.category == PLUGIN_CATEGORY_MEDIA
+        && plugin.manifest.capabilities.iter().any(|capability| {
+            capability == CHAPTER_DETECT_CAPABILITY || capability == CHAPTER_LOOKUP_CAPABILITY
+        })
+}
+
+fn is_chapter_lookup_plugin(plugin: &DiscoveredPlugin) -> bool {
+    is_chapter_detector_plugin(plugin)
+        && plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == CHAPTER_LOOKUP_CAPABILITY)
+}
+
+fn validate_chapter_detect_request(
+    request: &ChapterDetectRpcRequest,
+) -> Result<(), PluginServiceError> {
+    if !(2..=64).contains(&request.episodes.len())
+        || !(150_000_000..=3_000_000_000).contains(&request.intro_window_ticks)
+        || !(150_000_000..=6_000_000_000).contains(&request.credits_window_ticks)
+        || !(10_000_000..=1_200_000_000).contains(&request.minimum_match_duration_ticks)
+        || !request.match_threshold.is_finite()
+        || !(0.0..=1.0).contains(&request.match_threshold)
+    {
+        return Err(PluginServiceError::InvalidResponse);
+    }
+    let mut keys = HashSet::new();
+    for episode in &request.episodes {
+        let intro_bytes = BASE64.decode(&episode.intro_fingerprint_base64).ok();
+        let credits_bytes = BASE64.decode(&episode.credits_fingerprint_base64).ok();
+        if episode.key.is_empty()
+            || episode.key.len() > 128
+            || !keys.insert(episode.key.clone())
+            || episode.sample_rate != CHAPTER_FINGERPRINT_SAMPLE_RATE
+            || episode.fingerprint_point_duration_ticks != CHAPTER_FINGERPRINT_POINT_DURATION_TICKS
+            || episode.intro_window_start_ticks < 0
+            || episode.credits_window_start_ticks < 0
+            || !(1..=request.intro_window_ticks).contains(&episode.intro_window_duration_ticks)
+            || !(1..=request.credits_window_ticks).contains(&episode.credits_window_duration_ticks)
+            || episode.intro_fingerprint_base64.len() > 512 * 1024
+            || episode.credits_fingerprint_base64.len() > 512 * 1024
+            || intro_bytes.as_ref().is_none_or(|bytes| {
+                bytes.is_empty()
+                    || bytes.len() > 384 * 1024
+                    || bytes.len() % std::mem::size_of::<u32>() != 0
+            })
+            || credits_bytes.as_ref().is_none_or(|bytes| {
+                bytes.is_empty()
+                    || bytes.len() > 384 * 1024
+                    || bytes.len() % std::mem::size_of::<u32>() != 0
+            })
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+    }
+    Ok(())
+}
+
+fn validate_chapter_lookup_request(
+    request: &ChapterLookupRpcRequest,
+) -> Result<(), PluginServiceError> {
+    if !(1..=64).contains(&request.episodes.len()) {
+        return Err(PluginServiceError::InvalidResponse);
+    }
+    let mut keys = HashSet::new();
+    for episode in &request.episodes {
+        let valid_imdb = episode.imdb_id.as_deref().is_none_or(|value| {
+            !value.is_empty()
+                && value.len() <= 32
+                && value.starts_with("tt")
+                && value[2..]
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+        });
+        if episode.key.is_empty()
+            || episode.key.len() > 128
+            || !keys.insert(episode.key.clone())
+            || episode
+                .tmdb_id
+                .is_some_and(|value| !(1..=2_000_000_000).contains(&value))
+            || episode
+                .tvdb_id
+                .is_some_and(|value| !(1..=2_000_000_000).contains(&value))
+            || !valid_imdb
+            || !(0..=1000).contains(&episode.season_number)
+            || !(0..=10000).contains(&episode.episode_number)
+            || episode
+                .duration_ticks
+                .is_some_and(|value| !(1..=3_600_000_000_000).contains(&value))
+            || (episode.tmdb_id.is_none() && episode.tvdb_id.is_none() && episode.imdb_id.is_none())
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+    }
+    Ok(())
+}
+
+fn validate_chapter_lookup_result(
+    request: &ChapterLookupRpcRequest,
+    result: &ChapterLookupRpcResult,
+) -> Result<(), PluginServiceError> {
+    if result.markers.len() > request.episodes.len().saturating_mul(3) {
+        return Err(PluginServiceError::InvalidResponse);
+    }
+    let episodes = request
+        .episodes
+        .iter()
+        .map(|episode| (episode.key.as_str(), episode))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut marker_keys = HashSet::new();
+    for marker in &result.markers {
+        let Some(episode) = episodes.get(marker.key.as_str()) else {
+            return Err(PluginServiceError::InvalidResponse);
+        };
+        if marker.start_position_ticks < 0
+            || !marker.confidence.is_finite()
+            || !(0.0..=1.0).contains(&marker.confidence)
+            || marker
+                .name
+                .as_ref()
+                .is_some_and(|name| name.chars().count() > 256)
+            || !marker_keys.insert((marker.key.as_str(), marker.marker_type))
+            || episode
+                .duration_ticks
+                .is_some_and(|duration| marker.start_position_ticks > duration)
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+    }
+    Ok(())
+}
+
+fn validate_chapter_detect_result(
+    request: &ChapterDetectRpcRequest,
+    result: &ChapterDetectRpcResult,
+) -> Result<(), PluginServiceError> {
+    if result.markers.len() > request.episodes.len().saturating_mul(3) {
+        return Err(PluginServiceError::InvalidResponse);
+    }
+    let episodes = request
+        .episodes
+        .iter()
+        .map(|episode| (episode.key.as_str(), episode))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut marker_keys = HashSet::new();
+    for marker in &result.markers {
+        let Some(episode) = episodes.get(marker.key.as_str()) else {
+            return Err(PluginServiceError::InvalidResponse);
+        };
+        if marker.start_position_ticks < 0
+            || !marker.confidence.is_finite()
+            || !(0.0..=1.0).contains(&marker.confidence)
+            || marker
+                .name
+                .as_ref()
+                .is_some_and(|name| name.chars().count() > 256)
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        if !marker_keys.insert((marker.key.as_str(), marker.marker_type)) {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        let valid_range = match marker.marker_type {
+            crate::application::plugin_protocol::ChapterDetectMarkerType::IntroStart
+            | crate::application::plugin_protocol::ChapterDetectMarkerType::IntroEnd => {
+                marker.start_position_ticks >= episode.intro_window_start_ticks
+                    && marker.start_position_ticks
+                        <= episode
+                            .intro_window_start_ticks
+                            .saturating_add(episode.intro_window_duration_ticks)
+            }
+            crate::application::plugin_protocol::ChapterDetectMarkerType::CreditsStart => {
+                marker.start_position_ticks >= episode.credits_window_start_ticks
+                    && marker.start_position_ticks
+                        <= episode
+                            .credits_window_start_ticks
+                            .saturating_add(episode.credits_window_duration_ticks)
+            }
+        };
+        if !valid_range {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+    }
+    Ok(())
 }
 
 impl From<StorageError> for PluginServiceError {

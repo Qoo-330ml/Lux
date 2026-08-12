@@ -45,9 +45,22 @@ test("the global header stays fixed while page content scrolls", () => {
 });
 
 test("the fixed header softens scrolling content behind its gradient", () => {
-  assert.match(rule(".lux-header"), /background:\s*linear-gradient\(/);
-  assert.match(rule(".lux-header"), /backdrop-filter:\s*blur\(18px\)/);
-  assert.match(rule(".lux-header"), /-webkit-backdrop-filter:\s*blur\(18px\)/);
+  const veil = rule(".lux-header::before");
+
+  assert.match(rule(".lux-header"), /background:\s*transparent/);
+  assert.match(veil, /background:\s*linear-gradient\(/);
+  assert.match(veil, /backdrop-filter:\s*blur\(18px\)/);
+  assert.match(veil, /-webkit-backdrop-filter:\s*blur\(18px\)/);
+});
+
+test("the header blur fades below the toolbar instead of ending on a hard edge", () => {
+  const fade = rule(".lux-header::before");
+
+  assert.match(fade, /inset:\s*0\s+0\s+auto/);
+  assert.match(fade, /height:\s*calc\(100%\s*\+\s*clamp\(40px,\s*4vw,\s*64px\)\)/);
+  assert.match(fade, /backdrop-filter:\s*blur\(18px\)/);
+  assert.match(fade, /mask-image:\s*linear-gradient\(/);
+  assert.match(fade, /pointer-events:\s*none/);
 });
 
 test("mobile navigation stays attached below the fixed header", () => {

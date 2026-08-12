@@ -80,6 +80,7 @@ describe("AdminLibrariesPage library cards", () => {
   beforeEach(() => {
     vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [library] });
     vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [configuredScraper] });
+    vi.spyOn(api, "adminChapterSources").mockResolvedValue({ sources: [] });
     vi.spyOn(api, "adminSettings").mockResolvedValue({
       resumePlayedPercent: 90,
       resumeMinTicks: 1_200_000_000,
@@ -327,6 +328,59 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("增量扫描");
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("全量校验");
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("元数据任务");
+  });
+
+  it("allows a mixed library to choose an intro and outro source", async () => {
+    vi.mocked(api.adminChapterSources).mockResolvedValue({
+      sources: [{
+        id: "org.lux.intro-outro-detector",
+        name: "片头片尾检测",
+        description: "检测片头片尾",
+        version: "1.0.0",
+        capabilities: ["chapters.detect"],
+        lookup: false,
+      }],
+    });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+
+    const sourceSelect = container.querySelector<HTMLButtonElement>("[aria-label='片头片尾数据源']");
+    expect(sourceSelect?.disabled).toBe(false);
+    expect(container.textContent).toContain("选择后，该媒体库的检测任务和章节输出只使用此来源。");
+  });
+
+  it("keeps an unavailable configured source clearable", async () => {
+    vi.mocked(api.adminLibraries).mockResolvedValue({
+      libraries: [{ ...library, chapterSourceId: "org.lux.missing-chapter-source" }],
+    });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+
+    expect(container.querySelector<HTMLButtonElement>("[aria-label='片头片尾数据源']")?.textContent)
+      .toContain("已配置来源（暂不可用）");
+    const clearButton = container.querySelector<HTMLButtonElement>("[aria-label='清除片头片尾数据源配置']");
+    expect(clearButton).toBeTruthy();
+    const updateLibrary = vi.spyOn(api, "updateAdminLibrary").mockResolvedValue({ library });
+    await act(async () => {
+      clearButton?.click();
+      await vi.waitFor(() => expect(updateLibrary).toHaveBeenCalledWith("library-1", { chapterSourceId: null }));
+    });
   });
 
   it("updates the realtime metadata auto-match switch", async () => {

@@ -468,9 +468,10 @@ async fn local_movie_nfo_actors_are_available_without_online_matching_and_reuse_
         .enrich_movie_library(library.id)
         .await?;
 
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let actors = people.list_item_actors(&item_id).await?;
     assert_eq!(actors.len(), 2);
     assert_eq!(actors[0].name, "演员甲");
@@ -520,9 +521,10 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
         .await?;
     assert_eq!(report.nfo_loaded, 1);
 
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let details = store
         .read_item(&item_id)
         .await?
@@ -531,10 +533,11 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
     assert_eq!(details.genres, vec!["动作"]);
     assert_eq!(details.directors[0].name, "导演甲");
     assert_eq!(details.trailers, vec!["https://example.com/trailer"]);
-    let stored_json: Option<String> =
-        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items LIMIT 1")
-            .fetch_one(database.pool())
-            .await?;
+    let stored_json: Option<String> = sqlx::query_scalar(
+        "SELECT nfo_metadata_json FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
     assert!(stored_json.is_some());
     assert!(
         stored_json
@@ -576,9 +579,10 @@ async fn unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_chang
     let enricher = MetadataEnricher::new(database.clone()).with_nfo_store(store);
     enricher.enrich_movie_library(library.id).await?;
 
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let before: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
         "SELECT nfo_metadata_json, nfo_metadata_fingerprint
          FROM media_items WHERE id = ?",
@@ -645,9 +649,10 @@ async fn actor_relation_failure_does_not_discard_nfo_and_is_retried_separately()
     let first = enricher.enrich_movie_library(library.id).await?;
     assert_eq!(first.nfo_loaded, 1);
     assert_eq!(first.nfo_failed, 0);
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let rich_json: Option<String> =
         sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
             .bind(&item_id)
