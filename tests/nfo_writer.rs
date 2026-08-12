@@ -3,8 +3,9 @@ use luxd::{
         libraries::LibraryService,
         metadata::NfoMetadata,
         nfo::{
-            MovieNfoCredit, MovieNfoMetadata, NfoWriteService, parse_movie_nfo_actors,
-            parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
+            MovieNfoCredit, MovieNfoMetadata, NfoWriteService, parse_local_nfo_actors,
+            parse_local_nfo_details, parse_movie_nfo_actors, parse_movie_nfo_details,
+            rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
         },
         people::ActorCredit,
         scanner::LibraryScanner,
@@ -182,6 +183,32 @@ fn movie_nfo_parser_reads_emby_actor_nodes_without_online_metadata() {
     assert_eq!(actors[0].name, "演员甲");
     assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
     assert_eq!(actors[1].order, Some(1));
+}
+
+#[test]
+fn local_nfo_parser_supports_series_season_episode_fields() {
+    let details = parse_local_nfo_details(
+        r#"<episodedetails>
+            <aired>2020-01-05</aired><lastaired>2020-04-01</lastaired>
+            <runtime>45</runtime><seasonnumber>1</seasonnumber><episodenumber>2</episodenumber>
+            <writer tmdbid="99">编剧甲</writer>
+        </episodedetails>"#
+            .as_bytes(),
+    )
+    .expect("valid episode nfo");
+    assert_eq!(details.aired.as_deref(), Some("2020-01-05"));
+    assert_eq!(details.last_air_date.as_deref(), Some("2020-04-01"));
+    assert_eq!(details.runtime, Some(45));
+    assert_eq!(details.season_number, Some(1));
+    assert_eq!(details.episode_number, Some(2));
+    assert_eq!(details.writers[0].name, "编剧甲");
+
+    let actors = parse_local_nfo_actors(
+        r#"<tvshow><actor><name>演员甲</name><role>角色甲</role><tmdbid>9</tmdbid></actor></tvshow>"#
+            .as_bytes(),
+    )
+    .expect("valid series actor node");
+    assert_eq!(actors[0].id, "9");
 }
 
 #[test]

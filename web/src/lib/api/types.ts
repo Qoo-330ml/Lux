@@ -96,6 +96,8 @@ export type MediaNfoDetails = {
   tagline?: string | null;
   premiered?: string | null;
   releaseDate?: string | null;
+  aired?: string | null;
+  lastAirDate?: string | null;
   runtime?: number | null;
   status?: string | null;
   originalLanguage?: string | null;
@@ -109,6 +111,8 @@ export type MediaNfoDetails = {
   providerIds?: Record<string, string> | null;
   directors?: MediaNfoCredit[];
   writers?: MediaNfoCredit[];
+  seasonNumber?: number | null;
+  episodeNumber?: number | null;
   trailers?: string[];
 };
 

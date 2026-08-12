@@ -2,7 +2,8 @@ use luxd::{
     application::{
         libraries::LibraryService,
         metadata::{MetadataEnricher, NfoMetadata},
-        nfo::NfoWriteService,
+        nfo::{LocalNfoMetadataStore, NfoWriteService},
+        people::PeopleService,
         scanner::LibraryScanner,
     },
     config::Config,
@@ -24,21 +25,21 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
     tokio::fs::create_dir_all(&season_dir).await?;
     tokio::fs::write(
         series_dir.join("tvshow.nfo"),
-        "<tvshow><title>本地剧集</title><plot>剧集简介</plot><custom>keep</custom></tvshow>",
+        "<tvshow><title>本地剧集</title><plot>剧集简介</plot><rating>8.7</rating><votes>456</votes><tagline>剧集标语</tagline><premiered>2020-01-01</premiered><status>Ended</status><language>zh</language><genre>剧情</genre><studio>示例剧厂</studio><tmdbid>60625</tmdbid><director tmdbid=\"88\">导演甲</director><actor><name>演员甲</name><role>角色甲</role><tmdbid>9</tmdbid><order>0</order></actor><custom>keep</custom></tvshow>",
     )
     .await?;
     tokio::fs::write(series_dir.join("poster.jpg"), b"series-poster").await?;
     tokio::fs::write(series_dir.join("fanart.png"), b"series-fanart").await?;
     tokio::fs::write(
         season_dir.join("season.nfo"),
-        "<season><title>本地第一季</title><plot>季简介</plot></season>",
+        "<season><title>本地第一季</title><plot>季简介</plot><aired>2020-01-05</aired><seasonnumber>1</seasonnumber><genre>剧情</genre></season>",
     )
     .await?;
     tokio::fs::write(season_dir.join("poster.jpg"), b"season-poster").await?;
     tokio::fs::write(season_dir.join("fanart.jpg"), b"season-fanart").await?;
     tokio::fs::write(
         season_dir.join("Example.Show.S01E01.nfo"),
-        "<episodedetails><title>本地第一集</title><plot>集简介</plot></episodedetails>",
+        "<episodedetails><title>本地第一集</title><plot>集简介</plot><aired>2020-01-05</aired><runtime>45</runtime><episodenumber>1</episodenumber><writer tmdbid=\"99\">编剧甲</writer></episodedetails>",
     )
     .await?;
     tokio::fs::write(season_dir.join("Example.Show.S01E01.mkv"), b"episode").await?;
@@ -55,6 +56,8 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
     scanner.scan_series_library(library.id).await?;
 
     let report = MetadataEnricher::new(database.clone())
+        .with_people(PeopleService::new(config.config_dir.clone()))
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
         .enrich_series_library(library.id)
         .await?;
     assert_eq!(report.nfo_loaded, 3);
@@ -76,6 +79,34 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
     assert_eq!(series_title, "本地剧集");
     assert_eq!(season_title, "本地第一季");
     assert_eq!(episode_title, "本地第一集");
+    let rich_nfo: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT item_type, nfo_metadata_json
+         FROM media_items
+         WHERE item_type IN ('SERIES', 'SEASON', 'EPISODE')
+         ORDER BY item_type",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(rich_nfo.len(), 3);
+    assert!(rich_nfo.iter().all(|(_, value)| value.is_some()));
+    assert!(
+        rich_nfo
+            .iter()
+            .filter_map(|(_, value)| value.as_deref())
+            .any(|value| value.contains("2020-01-05"))
+    );
+    assert!(
+        rich_nfo
+            .iter()
+            .filter_map(|(_, value)| value.as_deref())
+            .any(|value| value.contains("剧集标语"))
+    );
+    assert!(
+        rich_nfo
+            .iter()
+            .filter_map(|(_, value)| value.as_deref())
+            .any(|value| value.contains("编剧甲"))
+    );
     let image_rows: Vec<(String, String)> =
         sqlx::query_as("SELECT image_type, source FROM item_images ORDER BY item_id, image_type")
             .fetch_all(database.pool())
@@ -94,6 +125,10 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
         sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SERIES'")
             .fetch_one(database.pool())
             .await?;
+    let actors = PeopleService::new(config.config_dir.clone())
+        .list_item_actors(&series_id)
+        .await?;
+    assert_eq!(actors[0].name, "演员甲");
     let season_id: String =
         sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SEASON'")
             .fetch_one(database.pool())

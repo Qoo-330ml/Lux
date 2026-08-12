@@ -1,7 +1,7 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        libraries::LibraryService, metadata::MetadataEnricher, nfo::MovieNfoMetadataStore,
+        libraries::LibraryService, metadata::MetadataEnricher, nfo::LocalNfoMetadataStore,
         scanner::LibraryScanner, setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
@@ -64,7 +64,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .scan_movie_library(library.id)
         .await?;
     MetadataEnricher::new(database.clone())
-        .with_movie_nfo_store(MovieNfoMetadataStore::new(database.clone()))
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
         .enrich_movie_library(library.id)
         .await?;
     let removed_version = first_dir.join("Alpha.Movie.2020.2160p.mkv");

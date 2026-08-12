@@ -6,7 +6,7 @@ use luxd::{
             MetadataSource, MetadataState, NfoMetadata, find_local_images, parse_nfo,
         },
         metadata_paths::people_directory,
-        nfo::MovieNfoMetadataStore,
+        nfo::LocalNfoMetadataStore,
         people::PeopleService,
         scanner::LibraryScanner,
     },
@@ -513,9 +513,9 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
         .scan_movie_library(library.id)
         .await?;
 
-    let store = MovieNfoMetadataStore::new(database.clone());
+    let store = LocalNfoMetadataStore::new(database.clone());
     let report = MetadataEnricher::new(database.clone())
-        .with_movie_nfo_store(store.clone())
+        .with_nfo_store(store.clone())
         .enrich_movie_library(library.id)
         .await?;
     assert_eq!(report.nfo_loaded, 1);

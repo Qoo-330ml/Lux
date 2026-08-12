@@ -23,7 +23,7 @@ use crate::{
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
         media_matching::{MediaKind, clean_title, has_multi_part_marker, parse_media_name},
         metadata::MetadataEnricher,
-        nfo::MovieNfoMetadataStore,
+        nfo::LocalNfoMetadataStore,
         people::PeopleService,
         probe::MediaProbeService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
@@ -1261,7 +1261,7 @@ pub struct ScanJobService {
     library_covers: Option<LibraryCoverService>,
     strm_probe: Option<StrmProbeService>,
     people: Option<PeopleService>,
-    movie_nfo: Option<MovieNfoMetadataStore>,
+    local_nfo: Option<LocalNfoMetadataStore>,
     resources: ResourceMetrics,
 }
 
@@ -1282,7 +1282,7 @@ impl ScanJobService {
             library_covers: None,
             strm_probe: None,
             people: None,
-            movie_nfo: None,
+            local_nfo: None,
             resources: ResourceMetrics::new(),
         }
     }
@@ -1312,9 +1312,13 @@ impl ScanJobService {
         self
     }
 
-    pub fn with_movie_nfo_store(mut self, movie_nfo: MovieNfoMetadataStore) -> Self {
-        self.movie_nfo = Some(movie_nfo);
+    pub fn with_nfo_store(mut self, local_nfo: LocalNfoMetadataStore) -> Self {
+        self.local_nfo = Some(local_nfo);
         self
+    }
+
+    pub fn with_movie_nfo_store(self, local_nfo: LocalNfoMetadataStore) -> Self {
+        self.with_nfo_store(local_nfo)
     }
 
     pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
@@ -2668,8 +2672,8 @@ impl ScanJobService {
             Some(people) => enricher.with_people(people),
             None => enricher,
         };
-        let enricher = match self.movie_nfo.clone() {
-            Some(movie_nfo) => enricher.with_movie_nfo_store(movie_nfo),
+        let enricher = match self.local_nfo.clone() {
+            Some(local_nfo) => enricher.with_nfo_store(local_nfo),
             None => enricher,
         };
         let result = match library.kind.as_str() {

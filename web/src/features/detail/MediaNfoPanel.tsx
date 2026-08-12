@@ -28,8 +28,10 @@ export function MediaNfoPanel({ details }: { details?: MediaNfoDetails | null })
         ) : null}
         <div className="lux-media-nfo-summary">
           <NfoRow label="投票数" value={details.votes != null ? `${details.votes} 票` : undefined} />
-          <NfoRow label="上映日期" value={details.releaseDate ?? details.premiered} icon={<CalendarDays size={14} />} />
+          <NfoRow label="播出日期" value={details.aired ?? details.releaseDate ?? details.premiered} icon={<CalendarDays size={14} />} />
+          <NfoRow label="最后播出" value={details.lastAirDate} icon={<CalendarDays size={14} />} />
           <NfoRow label="运行时长" value={details.runtime != null ? `${details.runtime} 分钟` : undefined} />
+          <NfoRow label="季 / 集" value={formatSeasonEpisode(details.seasonNumber, details.episodeNumber)} />
           <NfoRow label="状态" value={details.status} />
         </div>
         {details.directors?.length ? <CreditRow label="导演" credits={details.directors} /> : null}
@@ -76,12 +78,20 @@ function NfoRow({ label, value, icon }: { label: string; value?: string | null; 
 
 function hasDetails(details: MediaNfoDetails) {
   return Boolean(
-    details.tagline || details.votes != null || details.premiered || details.releaseDate
-      || details.runtime != null || details.status || details.website || details.setName
+    details.tagline || details.votes != null || details.premiered || details.releaseDate || details.aired
+      || details.lastAirDate || details.runtime != null || details.seasonNumber != null || details.episodeNumber != null
+      || details.status || details.website || details.setName
       || details.certification || details.genres?.length || details.countries?.length
       || details.studios?.length || details.directors?.length || details.writers?.length
       || Object.keys(details.providerIds ?? {}).length || details.trailers?.length,
   );
+}
+
+function formatSeasonEpisode(season?: number | null, episode?: number | null) {
+  if (season == null && episode == null) return undefined;
+  if (season == null) return `第 ${episode} 集`;
+  if (episode == null) return `第 ${season} 季`;
+  return `第 ${season} 季 · 第 ${episode} 集`;
 }
 
 function isHttpUrl(value: string) {

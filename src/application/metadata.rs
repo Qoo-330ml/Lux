@@ -13,8 +13,8 @@ use crate::{
     application::scanner::compute_file_fingerprint,
     application::{
         nfo::{
-            MovieNfoMetadataStore, MovieNfoMetadataStoreError, parse_movie_nfo_actors,
-            parse_movie_nfo_details,
+            LocalNfoMetadataStore, LocalNfoMetadataStoreError, parse_local_nfo_actors,
+            parse_local_nfo_details,
         },
         people::PeopleService,
     },
@@ -621,7 +621,7 @@ impl From<std::io::Error> for NfoError {
 pub struct MetadataEnricher {
     database: Database,
     people: Option<PeopleService>,
-    movie_nfo: Option<MovieNfoMetadataStore>,
+    local_nfo: Option<LocalNfoMetadataStore>,
 }
 
 impl MetadataEnricher {
@@ -629,7 +629,7 @@ impl MetadataEnricher {
         Self {
             database,
             people: None,
-            movie_nfo: None,
+            local_nfo: None,
         }
     }
 
@@ -638,9 +638,13 @@ impl MetadataEnricher {
         self
     }
 
-    pub fn with_movie_nfo_store(mut self, movie_nfo: MovieNfoMetadataStore) -> Self {
-        self.movie_nfo = Some(movie_nfo);
+    pub fn with_nfo_store(mut self, local_nfo: LocalNfoMetadataStore) -> Self {
+        self.local_nfo = Some(local_nfo);
         self
+    }
+
+    pub fn with_movie_nfo_store(self, local_nfo: LocalNfoMetadataStore) -> Self {
+        self.with_nfo_store(local_nfo)
     }
 
     pub async fn enrich_movie_library(
@@ -736,8 +740,8 @@ impl MetadataEnricher {
         } else {
             false
         };
-        let rich_cache_missing = if let Some(movie_nfo) = &self.movie_nfo {
-            !movie_nfo
+        let rich_cache_missing = if let Some(local_nfo) = &self.local_nfo {
+            !local_nfo
                 .exists(item_id)
                 .await
                 .map_err(MetadataError::NfoCache)?
@@ -759,8 +763,8 @@ impl MetadataEnricher {
         let metadata = match parse_nfo(&bytes) {
             Ok(metadata) => metadata,
             Err(_) => {
-                if let Some(movie_nfo) = &self.movie_nfo {
-                    movie_nfo
+                if let Some(local_nfo) = &self.local_nfo {
+                    local_nfo
                         .clear_item(item_id)
                         .await
                         .map_err(MetadataError::NfoCache)?;
@@ -774,12 +778,12 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
-        let rich_details = match parse_movie_nfo_details(&bytes) {
+        let rich_details = match parse_local_nfo_details(&bytes) {
             Ok(details) => details,
             Err(error) => {
                 tracing::warn!(item_id, %error, "local movie NFO rich details could not be parsed");
-                if let Some(movie_nfo) = &self.movie_nfo {
-                    movie_nfo
+                if let Some(local_nfo) = &self.local_nfo {
+                    local_nfo
                         .clear_item(item_id)
                         .await
                         .map_err(MetadataError::NfoCache)?;
@@ -793,14 +797,14 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
-        if let Some(movie_nfo) = &self.movie_nfo {
-            movie_nfo
+        if let Some(local_nfo) = &self.local_nfo {
+            local_nfo
                 .write_item(item_id, &rich_details)
                 .await
                 .map_err(MetadataError::NfoCache)?;
         }
         if let Some(people) = &self.people {
-            match parse_movie_nfo_actors(&bytes) {
+            match parse_local_nfo_actors(&bytes) {
                 Ok(actors) => {
                     if let Err(error) = people.persist_item_actors(item_id, "tmdb", &actors).await {
                         tracing::warn!(
@@ -1053,14 +1057,39 @@ impl MetadataEnricher {
     ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         let fingerprint = nfo_fingerprint(nfo_path).await.ok();
-        if let Some(fingerprint) = fingerprint.as_deref()
-            && self
-                .database
+        let already_checked = if let Some(fingerprint) = fingerprint.as_deref() {
+            self.database
                 .media_item_metadata_fingerprint(item_id)
                 .await?
                 .as_deref()
                 == Some(fingerprint)
-        {
+        } else {
+            false
+        };
+        let rich_cache_missing = if let Some(local_nfo) = &self.local_nfo {
+            !local_nfo
+                .exists(item_id)
+                .await
+                .map_err(MetadataError::NfoCache)?
+        } else {
+            false
+        };
+        let actor_relation_missing = if let Some(people) = &self.people {
+            match people.item_actor_relation_exists(item_id).await {
+                Ok(exists) => !exists,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        %error,
+                        "local actor relation could not be checked; retrying NFO actor sync"
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        if already_checked && !rich_cache_missing && !actor_relation_missing {
             report.nfo_skipped = 1;
             return Ok(report);
         }
@@ -1083,6 +1112,43 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
+        let rich_details = match parse_local_nfo_details(&bytes) {
+            Ok(details) => details,
+            Err(error) => {
+                tracing::warn!(item_id, %error, "local NFO rich details could not be parsed");
+                if let Some(local_nfo) = &self.local_nfo {
+                    local_nfo
+                        .clear_item(item_id)
+                        .await
+                        .map_err(MetadataError::NfoCache)?;
+                }
+                if let Some(fingerprint) = fingerprint.as_deref() {
+                    self.database
+                        .mark_media_item_metadata_checked(item_id, fingerprint)
+                        .await?;
+                }
+                report.nfo_failed = 1;
+                return Ok(report);
+            }
+        };
+        if let Some(local_nfo) = &self.local_nfo {
+            local_nfo
+                .write_item(item_id, &rich_details)
+                .await
+                .map_err(MetadataError::NfoCache)?;
+        }
+        if let Some(people) = &self.people {
+            match parse_local_nfo_actors(&bytes) {
+                Ok(actors) => {
+                    if let Err(error) = people.persist_item_actors(item_id, "tmdb", &actors).await {
+                        tracing::warn!(item_id, %error, "local NFO actors could not be persisted");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(item_id, %error, "local NFO actors could not be parsed");
+                }
+            }
+        }
         if let Some(fingerprint) = fingerprint.as_deref()
             && let Some(current) = self.database.find_media_item_metadata(item_id).await?
         {
@@ -1447,7 +1513,7 @@ pub enum MetadataError {
         size: u64,
     },
     Storage(StorageError),
-    NfoCache(MovieNfoMetadataStoreError),
+    NfoCache(LocalNfoMetadataStoreError),
 }
 
 impl fmt::Display for MetadataError {

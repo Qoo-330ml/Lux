@@ -3653,8 +3653,8 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 范围：在后台本地元数据扫描阶段读取电影 NFO 的直接 `<actor>` 节点，将带有合法
 `tmdbid` 的演员、角色和排序写入统一人物关系快照。详情接口继续只读取人物缓存，不在
 用户请求中解析 NFO；已有统一人物目录或旧人物缓存中的头像按人物 ID 复用，没有头像的演员
-仍保留在详情列表中并由 Web 使用人物图标占位。首版只覆盖电影 `movie.nfo`/同目录 NFO，
-不扩展剧集、季度和单集人物关系。
+仍保留在详情列表中并由 Web 使用人物图标占位。LUX-172 将同一套人物解析和关系复用扩展到
+剧集、季度和单集 NFO。
 
 验收：
 
@@ -3668,7 +3668,7 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 
 - 不为缺少稳定 provider ID 的 NFO 演员虚构 TMDb ID，也不在线补抓人物资料。
 - 不改变演员去重/跨 provider 身份规则，不增加人物关系数据库表。
-- 不扩展剧集、季度和单集 NFO 演员字段。
+- LUX-170 本身不改变人物去重和 provider 规则；剧集层级的接入由 LUX-172 统一完成。
 
 依赖：LUX-164、LUX-168。
 
@@ -3698,31 +3698,31 @@ Lux 内部现有评分、上映日期、原始语言和 provider ID 字段继续
 
 依赖：LUX-142、LUX-146、LUX-151、LUX-162、LUX-169。
 
-#### LUX-172：本地电影 NFO 丰富字段展示
+#### LUX-172：本地 NFO 丰富字段展示
 
-范围：在索引后的后台本地元数据阶段解析电影 NFO 的丰富字段，并将解析后的 JSON 原子写入
+范围：在索引后的后台本地元数据阶段解析电影、剧集、季度和分集 NFO 的丰富字段，并将解析后的 JSON 原子写入
 `media_items.nfo_metadata_json`。媒体详情接口从数据库读取该 JSON 并返回 `nfo` 对象；接口同时将 NFO
-中的评分、上映日期、状态、语言、运行时和 provider ID 回填到现有兼容字段，
+中的评分、播出日期、最后播出日期、状态、语言、运行时和 provider ID 回填到现有兼容字段，
 使没有在线匹配的本地完整 NFO 也能直接展示。Web 详情页展示标语、类型、国家/地区、制片公司、认证、
-合集、导演、编剧、投票数、官网、预告片和外部 ID。
+合集、导演、编剧、投票数、官网、预告片、外部 ID，以及剧集层级的季/集和播出日期。
 
-首版读取字段：`rating`、`votes`、`tagline`、`premiered`、`releasedate`、`runtime`、`status`、
-`language`、`website`、`set`/`setid`、`mpaa`、重复的 `country`、`genre`、`studio`、
-`tmdbid`/`imdbid`/`tvdbid`/`wikidataid`/`uniqueid`、`director`、`writer`/`credits` 和 `trailer`。
+首版读取字段：`rating`、`votes`、`tagline`、`premiered`、`releasedate`、`aired`、`lastaired`、`runtime`、
+`status`、`language`、`website`、`set`/`setid`、`mpaa`、重复的 `country`、`genre`、`studio`、
+`tmdbid`/`imdbid`/`tvdbid`/`wikidataid`/`uniqueid`、`director`、`writer`/`credits`、`trailer`、
+`season`/`seasonnumber` 和 `episode`/`episodenumber`。
 不把 NFO 的网络图片引用当作本地图片；本地图片继续由图片索引和人物缓存负责复用，缺失时由前端使用占位。
 
 验收：
 
-- [x] 索引后台读取本地电影 NFO 并原子写入数据库 JSON；详情请求不打开或解析 XML。
+- [x] 索引后台读取本地电影、剧集、季度和分集 NFO 并原子写入数据库 JSON；详情请求不打开或解析 XML。
 - [x] 本地完整 NFO 在没有在线匹配时，详情接口返回丰富字段并回填兼容字段。
 - [x] 详情页展示标语、标签、评分辅助信息、导演/编剧、外部 ID 和安全的 HTTP(S) 链接。
-- [x] 电影 NFO 的大小、XML 事件数、字段长度、数组数量、评分/运行时/URL 范围继续受安全限制。
+- [x] 所有本地 NFO 的大小、XML 事件数、字段长度、数组数量、评分/运行时/URL 范围继续受安全限制。
 - [x] 不新增 genres、studios、导演或编剧数据库关系、筛选 API 或深度浏览 API。
 
 明确不做：
 
-- 不在用户请求路径读取、解析电影 NFO，也不因详情展示主动联网。
-- 不扩展剧集、季度和单集的丰富 NFO 字段。
+- 不在用户请求路径读取、解析本地 NFO，也不因详情展示主动联网。
 - 不把官网、预告片或 NFO 图片 URL 当作 Lux 代理目标；只作为受限外链展示。
 
 依赖：LUX-164、LUX-168、LUX-170。

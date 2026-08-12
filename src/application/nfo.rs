@@ -27,14 +27,14 @@ use crate::application::people::ActorCredit;
 use crate::storage::{Database, MediaMetadataUpdate, StorageError};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct MovieNfoCredit {
+pub struct LocalNfoCredit {
     pub provider_id: String,
     pub name: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MovieNfoDetails {
+pub struct LocalNfoDetails {
     pub rating: Option<f64>,
     pub votes: Option<i64>,
     pub tagline: Option<String>,
@@ -44,6 +44,8 @@ pub struct MovieNfoDetails {
     pub runtime: Option<i32>,
     pub status: Option<String>,
     pub original_language: Option<String>,
+    pub aired: Option<String>,
+    pub last_air_date: Option<String>,
     pub website: Option<String>,
     pub set_name: Option<String>,
     pub set_id: Option<String>,
@@ -52,10 +54,17 @@ pub struct MovieNfoDetails {
     pub genres: Vec<String>,
     pub studios: Vec<String>,
     pub provider_ids: BTreeMap<String, String>,
-    pub directors: Vec<MovieNfoCredit>,
-    pub writers: Vec<MovieNfoCredit>,
+    pub directors: Vec<LocalNfoCredit>,
+    pub writers: Vec<LocalNfoCredit>,
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
     pub trailers: Vec<String>,
 }
+
+/// Compatibility alias for callers that used the original movie-only name.
+pub type MovieNfoCredit = LocalNfoCredit;
+/// Compatibility alias for callers that used the original movie-only name.
+pub type MovieNfoDetails = LocalNfoDetails;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MovieNfoMetadata {
@@ -84,18 +93,18 @@ pub struct MovieNfoMetadata {
     pub trailers: Vec<String>,
 }
 
-const MAX_MOVIE_NFO_BYTES: usize = 1024 * 1024;
-const MAX_MOVIE_NFO_EVENTS: usize = 20_000;
+const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
+const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
 const MAX_MOVIE_NFO_ACTORS: usize = 30;
 const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;
 
-/// Reads the direct `<actor>` nodes used by Emby/Kodi movie NFO files.
+/// Reads the direct `<actor>` nodes used by Emby/Kodi local NFO files.
 ///
 /// This intentionally only extracts the actor fields needed by the people
 /// cache. The caller can run it during background metadata enrichment without
 /// asking the detail endpoint to parse an untrusted XML document.
-pub fn parse_movie_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError> {
-    if bytes.len() > MAX_MOVIE_NFO_BYTES {
+pub fn parse_local_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError> {
+    if bytes.len() > MAX_LOCAL_NFO_BYTES {
         return Err(NfoError::TooLarge);
     }
 
@@ -111,7 +120,7 @@ pub fn parse_movie_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError
 
     loop {
         event_count += 1;
-        if event_count > MAX_MOVIE_NFO_EVENTS {
+        if event_count > MAX_LOCAL_NFO_EVENTS {
             return Err(NfoError::TooManyEvents);
         }
         match reader.read_event_into(&mut buffer) {
@@ -194,6 +203,11 @@ pub fn parse_movie_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError
     Ok(actors)
 }
 
+/// Compatibility wrapper for the original movie-only parser name.
+pub fn parse_movie_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError> {
+    parse_local_nfo_actors(bytes)
+}
+
 #[derive(Default)]
 struct ParsedMovieActor {
     name: Option<String>,
@@ -245,26 +259,26 @@ const MAX_MOVIE_NFO_DETAILS_TEXT_BYTES: usize = 256 * 1024;
 const MAX_MOVIE_NFO_DETAILS_URL_BYTES: usize = 2048;
 const MAX_MOVIE_NFO_DETAILS_ID_BYTES: usize = 256;
 
-/// Reads the rich, direct child fields written by the movie NFO writer.
+/// Reads rich direct-child fields shared by movie, series, season and episode NFO files.
 ///
 /// This is deliberately a background-only parser. The detail endpoint reads
 /// the JSON snapshot produced from this value instead of opening an NFO file.
-pub fn parse_movie_nfo_details(bytes: &[u8]) -> Result<MovieNfoDetails, NfoError> {
-    if bytes.len() > MAX_MOVIE_NFO_BYTES {
+pub fn parse_local_nfo_details(bytes: &[u8]) -> Result<LocalNfoDetails, NfoError> {
+    if bytes.len() > MAX_LOCAL_NFO_BYTES {
         return Err(NfoError::TooLarge);
     }
 
     let mut reader = Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
-    let mut details = MovieNfoDetails::default();
+    let mut details = LocalNfoDetails::default();
     let mut active = None;
     let mut depth = 0_usize;
     let mut event_count = 0_usize;
 
     loop {
         event_count += 1;
-        if event_count > MAX_MOVIE_NFO_EVENTS {
+        if event_count > MAX_LOCAL_NFO_EVENTS {
             return Err(NfoError::TooManyEvents);
         }
         match reader.read_event_into(&mut buffer) {
@@ -332,6 +346,11 @@ pub fn parse_movie_nfo_details(bytes: &[u8]) -> Result<MovieNfoDetails, NfoError
     Ok(details)
 }
 
+/// Compatibility wrapper for the original movie-only parser name.
+pub fn parse_movie_nfo_details(bytes: &[u8]) -> Result<LocalNfoDetails, NfoError> {
+    parse_local_nfo_details(bytes)
+}
+
 struct ActiveRichValue {
     kind: RichValueKind,
     text: String,
@@ -343,6 +362,8 @@ enum RichValueKind {
     Tagline,
     Premiered,
     ReleaseDate,
+    Aired,
+    LastAirDate,
     Runtime,
     Status,
     OriginalLanguage,
@@ -356,6 +377,8 @@ enum RichValueKind {
     Provider(String),
     Director(String),
     Writer(String),
+    SeasonNumber,
+    EpisodeNumber,
     Trailer,
 }
 
@@ -368,6 +391,8 @@ fn rich_value_kind(event: &BytesStart<'_>) -> Result<Option<ActiveRichValue>, Nf
         b"tagline" => RichValueKind::Tagline,
         b"premiered" => RichValueKind::Premiered,
         b"releasedate" => RichValueKind::ReleaseDate,
+        b"aired" | b"airdate" => RichValueKind::Aired,
+        b"lastaired" | b"lastairdate" | b"ended" | b"enddate" => RichValueKind::LastAirDate,
         b"runtime" => RichValueKind::Runtime,
         b"status" => RichValueKind::Status,
         b"language" => RichValueKind::OriginalLanguage,
@@ -385,6 +410,8 @@ fn rich_value_kind(event: &BytesStart<'_>) -> Result<Option<ActiveRichValue>, Nf
         b"writer" | b"credits" => {
             RichValueKind::Writer(attribute_value(event, b"tmdbid")?.unwrap_or_default())
         }
+        b"season" | b"seasonnumber" => RichValueKind::SeasonNumber,
+        b"episode" | b"episodenumber" => RichValueKind::EpisodeNumber,
         b"tmdbid" => RichValueKind::Provider("tmdb".to_owned()),
         b"imdbid" => RichValueKind::Provider("imdb".to_owned()),
         b"tvdbid" => RichValueKind::Provider("tvdb".to_owned()),
@@ -429,7 +456,7 @@ fn append_rich_text(target: &mut String, value: &str) -> Result<(), NfoError> {
 }
 
 fn assign_rich_value(
-    details: &mut MovieNfoDetails,
+    details: &mut LocalNfoDetails,
     kind: RichValueKind,
     raw_value: &str,
 ) -> Result<(), NfoError> {
@@ -460,6 +487,8 @@ fn assign_rich_value(
         }
         RichValueKind::Premiered => details.premiered = bounded_text(raw_value),
         RichValueKind::ReleaseDate => details.release_date = bounded_text(raw_value),
+        RichValueKind::Aired => details.aired = bounded_text(raw_value),
+        RichValueKind::LastAirDate => details.last_air_date = bounded_text(raw_value),
         RichValueKind::Tagline => details.tagline = bounded_text(raw_value),
         RichValueKind::Status => details.status = bounded_text(raw_value),
         RichValueKind::OriginalLanguage => details.original_language = bounded_text(raw_value),
@@ -479,6 +508,18 @@ fn assign_rich_value(
         }
         RichValueKind::Writer(provider_id) => {
             push_credit(&mut details.writers, provider_id, raw_value);
+        }
+        RichValueKind::SeasonNumber => {
+            details.season_number = raw_value
+                .parse::<i32>()
+                .ok()
+                .filter(|value| (0..=10_000).contains(value));
+        }
+        RichValueKind::EpisodeNumber => {
+            details.episode_number = raw_value
+                .parse::<i32>()
+                .ok()
+                .filter(|value| (0..=100_000).contains(value));
         }
     }
     Ok(())
@@ -518,7 +559,7 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
-fn push_credit(values: &mut Vec<MovieNfoCredit>, provider_id: String, name: &str) {
+fn push_credit(values: &mut Vec<LocalNfoCredit>, provider_id: String, name: &str) {
     let Some(name) = bounded_text(name) else {
         return;
     };
@@ -531,15 +572,15 @@ fn push_credit(values: &mut Vec<MovieNfoCredit>, provider_id: String, name: &str
     {
         return;
     }
-    values.push(MovieNfoCredit { provider_id, name });
+    values.push(LocalNfoCredit { provider_id, name });
 }
 
 #[derive(Clone)]
-pub struct MovieNfoMetadataStore {
+pub struct LocalNfoMetadataStore {
     database: Database,
 }
 
-impl MovieNfoMetadataStore {
+impl LocalNfoMetadataStore {
     pub fn new(database: Database) -> Self {
         Self { database }
     }
@@ -547,69 +588,69 @@ impl MovieNfoMetadataStore {
     pub async fn write_item(
         &self,
         item_id: &str,
-        details: &MovieNfoDetails,
-    ) -> Result<(), MovieNfoMetadataStoreError> {
+        details: &LocalNfoDetails,
+    ) -> Result<(), LocalNfoMetadataStoreError> {
         let json = serde_json::to_string(details)
-            .map_err(|error| MovieNfoMetadataStoreError::Serialization(error.to_string()))?;
-        if json.len() > MAX_MOVIE_NFO_BYTES {
-            return Err(MovieNfoMetadataStoreError::TooLarge);
+            .map_err(|error| LocalNfoMetadataStoreError::Serialization(error.to_string()))?;
+        if json.len() > MAX_LOCAL_NFO_BYTES {
+            return Err(LocalNfoMetadataStoreError::TooLarge);
         }
         self.database
             .update_media_item_nfo_metadata(item_id, Some(&json))
             .await
-            .map_err(MovieNfoMetadataStoreError::Storage)
+            .map_err(LocalNfoMetadataStoreError::Storage)
     }
 
     pub async fn read_item(
         &self,
         item_id: &str,
-    ) -> Result<Option<MovieNfoDetails>, MovieNfoMetadataStoreError> {
+    ) -> Result<Option<LocalNfoDetails>, LocalNfoMetadataStoreError> {
         let Some(json) = self
             .database
             .media_item_nfo_metadata_json(item_id)
             .await
-            .map_err(MovieNfoMetadataStoreError::Storage)?
+            .map_err(LocalNfoMetadataStoreError::Storage)?
         else {
             return Ok(None);
         };
-        if json.len() > MAX_MOVIE_NFO_BYTES {
-            return Err(MovieNfoMetadataStoreError::TooLarge);
+        if json.len() > MAX_LOCAL_NFO_BYTES {
+            return Err(LocalNfoMetadataStoreError::TooLarge);
         }
         serde_json::from_str(&json)
             .map(Some)
-            .map_err(|error| MovieNfoMetadataStoreError::Serialization(error.to_string()))
+            .map_err(|error| LocalNfoMetadataStoreError::Serialization(error.to_string()))
     }
 
-    pub async fn exists(&self, item_id: &str) -> Result<bool, MovieNfoMetadataStoreError> {
+    pub async fn exists(&self, item_id: &str) -> Result<bool, LocalNfoMetadataStoreError> {
         Ok(self.read_item(item_id).await?.is_some())
     }
 
-    pub async fn clear_item(&self, item_id: &str) -> Result<(), MovieNfoMetadataStoreError> {
+    pub async fn clear_item(&self, item_id: &str) -> Result<(), LocalNfoMetadataStoreError> {
         self.database
             .update_media_item_nfo_metadata(item_id, None)
             .await
-            .map_err(MovieNfoMetadataStoreError::Storage)
+            .map_err(LocalNfoMetadataStoreError::Storage)
     }
 }
 
 #[derive(Debug)]
-pub enum MovieNfoMetadataStoreError {
+pub enum LocalNfoMetadataStoreError {
     Serialization(String),
     TooLarge,
     Storage(StorageError),
 }
 
-impl fmt::Display for MovieNfoMetadataStoreError {
+impl fmt::Display for LocalNfoMetadataStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Serialization(message) => formatter.write_str(message),
-            Self::TooLarge => formatter.write_str("movie NFO cache is too large"),
+            Self::TooLarge => formatter.write_str("local NFO cache is too large"),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
 }
 
-impl std::error::Error for MovieNfoMetadataStoreError {
+impl std::error::Error for LocalNfoMetadataStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
@@ -618,11 +659,16 @@ impl std::error::Error for MovieNfoMetadataStoreError {
     }
 }
 
-impl From<StorageError> for MovieNfoMetadataStoreError {
+impl From<StorageError> for LocalNfoMetadataStoreError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
 }
+
+/// Compatibility alias for the original movie-only store name.
+pub type MovieNfoMetadataStore = LocalNfoMetadataStore;
+/// Compatibility alias for the original movie-only store error name.
+pub type MovieNfoMetadataStoreError = LocalNfoMetadataStoreError;
 
 pub fn rewrite_nfo(original: &[u8], patch: &NfoMetadata) -> Result<Vec<u8>, NfoWriteError> {
     if original.is_empty() {

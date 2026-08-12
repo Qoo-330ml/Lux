@@ -62,7 +62,7 @@ use crate::{
         metadata::MetadataField,
         network_diagnostics::{NetworkDiagnostics, NetworkProbeResult, test_network},
         nfo::{
-            MetadataWriteRequest, MetadataWriteService, MovieNfoDetails, MovieNfoMetadataStore,
+            LocalNfoDetails, LocalNfoMetadataStore, MetadataWriteRequest, MetadataWriteService,
             NfoWriteError,
         },
         people::{PeopleError, PeopleService},
@@ -143,7 +143,7 @@ pub struct AppState {
     tmdb: Option<TmdbProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
-    movie_nfo: Option<MovieNfoMetadataStore>,
+    local_nfo: Option<LocalNfoMetadataStore>,
     user_avatars: Option<UserAvatarService>,
     ip_location: Option<IpLocationService>,
     admin_events: AdminEventHub,
@@ -227,7 +227,7 @@ impl AppState {
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
         let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
-        let movie_nfo = MovieNfoMetadataStore::new(database.clone());
+        let local_nfo = LocalNfoMetadataStore::new(database.clone());
         let probe = Some(MediaProbeService::new(
             database.clone(),
             FfprobeRunner::default(),
@@ -244,7 +244,7 @@ impl AppState {
             service
                 .with_strm_probe(strm_probe.clone())
                 .with_people(people.clone())
-                .with_movie_nfo_store(movie_nfo.clone())
+                .with_nfo_store(local_nfo.clone())
         };
         let scheduled_tasks =
             ScheduledTaskService::new(database.clone(), plugins.clone(), strm_probe.clone())
@@ -299,7 +299,7 @@ impl AppState {
             tmdb: Some(tmdb),
             collections,
             people: Some(people),
-            movie_nfo: Some(movie_nfo),
+            local_nfo: Some(local_nfo),
             user_avatars,
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
@@ -5618,8 +5618,8 @@ async fn lux_get_item(
                     },
                     None => Vec::new(),
                 };
-                let nfo = match state.movie_nfo.as_ref() {
-                    Some(movie_nfo) => match movie_nfo.read_item(&item.id).await {
+                let nfo = match state.local_nfo.as_ref() {
+                    Some(local_nfo) => match local_nfo.read_item(&item.id).await {
                         Ok(nfo) => nfo,
                         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
                     },
@@ -5630,7 +5630,7 @@ async fn lux_get_item(
                     object.insert("actors".to_owned(), json!(actors));
                     object.insert("nfo".to_owned(), json!(nfo));
                     if let Some(nfo) = nfo.as_ref() {
-                        apply_movie_nfo_details(object, nfo);
+                        apply_local_nfo_details(object, nfo);
                     }
                 }
                 Json(body).into_response()
@@ -7296,12 +7296,17 @@ fn lux_catalog_item_json_with_user_state(
     value
 }
 
-fn apply_movie_nfo_details(object: &mut serde_json::Map<String, Value>, nfo: &MovieNfoDetails) {
+fn apply_local_nfo_details(object: &mut serde_json::Map<String, Value>, nfo: &LocalNfoDetails) {
     if let Some(rating) = nfo.rating {
         object.insert("rating".to_owned(), json!(rating));
         object.insert("ratingSource".to_owned(), json!("NFO"));
     }
-    if let Some(premiered) = nfo.premiered.as_deref().or(nfo.release_date.as_deref()) {
+    if let Some(premiered) = nfo
+        .premiered
+        .as_deref()
+        .or(nfo.release_date.as_deref())
+        .or(nfo.aired.as_deref())
+    {
         object.insert("premiereDate".to_owned(), json!(premiered));
     }
     if let Some(status) = nfo.status.as_deref() {
@@ -7309,6 +7314,9 @@ fn apply_movie_nfo_details(object: &mut serde_json::Map<String, Value>, nfo: &Mo
     }
     if let Some(language) = nfo.original_language.as_deref() {
         object.insert("originalLanguage".to_owned(), json!(language));
+    }
+    if let Some(last_air_date) = nfo.last_air_date.as_deref() {
+        object.insert("lastAirDate".to_owned(), json!(last_air_date));
     }
     if let Some(runtime) = nfo.runtime {
         if let Some(runtime_ticks) = i64::from(runtime)
