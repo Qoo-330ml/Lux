@@ -42,9 +42,38 @@ pub struct CatalogService {
     access: MediaAccessService,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CatalogItemCounts {
+    pub movie_count: i64,
+    pub series_count: i64,
+    pub episode_count: i64,
+    pub box_set_count: i64,
+    pub item_count: i64,
+}
+
 impl CatalogService {
     pub fn new(database: Database, access: MediaAccessService) -> Self {
         Self { database, access }
+    }
+
+    pub async fn count_item_types(
+        &self,
+        principal: AccessPrincipal,
+        user_id: &str,
+        is_favorite: Option<bool>,
+    ) -> Result<CatalogItemCounts, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let counts = self
+            .database
+            .count_catalog_item_types(&library_ids, user_id, is_favorite)
+            .await?;
+        Ok(CatalogItemCounts {
+            movie_count: counts.movie_count,
+            series_count: counts.series_count,
+            episode_count: counts.episode_count,
+            box_set_count: counts.box_set_count,
+            item_count: counts.item_count,
+        })
     }
 
     pub async fn list_library_items(

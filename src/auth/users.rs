@@ -77,6 +77,14 @@ impl UserStore {
             .collect()
     }
 
+    pub async fn find_by_id(&self, user_id: &str) -> Result<Option<UserRecord>, UserStoreError> {
+        self.database
+            .find_user_by_id(user_id)
+            .await?
+            .map(user_record)
+            .transpose()
+    }
+
     pub async fn update_user(
         &self,
         user_id: &str,

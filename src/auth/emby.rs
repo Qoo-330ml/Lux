@@ -30,6 +30,10 @@ impl EmbyAuthService {
         stored_users.into_iter().map(user_record).collect()
     }
 
+    pub async fn user_by_id(&self, user_id: &str) -> Result<Option<UserRecord>, EmbyAuthError> {
+        Ok(self.users.find_by_id(user_id).await?)
+    }
+
     pub async fn authenticate(
         &self,
         username: &str,

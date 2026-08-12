@@ -881,6 +881,7 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
             | ["Shows", "NextUp"]
             | ["Shows", _, "Seasons" | "Episodes"]
             | ["Items"]
+            | ["Items", "Counts"]
             | ["Items", "Root"]
             | ["Search", "Hints"]
             | ["Items", _, "Children"]
@@ -1175,6 +1176,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Shows/{series_id}/Seasons", get(emby_show_seasons))
         .route("/Shows/{series_id}/Episodes", get(emby_show_episodes))
         .route("/Items", get(emby_items))
+        .route("/Items/Counts", get(emby_items_counts))
         .route("/Items/Root", get(emby_items_root))
         .route("/Search/Hints", get(emby_search_hints))
         .route("/Items/{item_id}", get(emby_item))
@@ -1711,6 +1713,16 @@ struct EmbyItemsQuery {
     group_items: Option<bool>,
     #[serde(rename = "Recursive", default)]
     recursive: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct EmbyItemCountsQuery {
+    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey", default)]
+    api_key: Option<String>,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    user_id: Option<String>,
+    #[serde(rename = "IsFavorite", alias = "isFavorite", default)]
+    is_favorite: Option<bool>,
 }
 
 fn emby_fields_include(fields: Option<&str>, field: &str) -> bool {
@@ -2556,6 +2568,79 @@ async fn emby_items(
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     emby_list_items(&headers, &state, principal, user.can_download, &query).await
+}
+
+async fn emby_items_counts(
+    headers: HeaderMap,
+    Query(query): Query<EmbyItemCountsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
+    let (principal, target_user_id) = match query.user_id.as_deref() {
+        Some(requested_id) => {
+            if let Err(status) = ensure_emby_user_scope(&user, requested_id) {
+                return status.into_response();
+            }
+            let target_user = match auth.user_by_id(requested_id).await {
+                Ok(Some(target_user)) => target_user,
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            if target_user.is_disabled {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let target_user_id = match requested_id.parse::<crate::domain::ids::UserId>() {
+                Ok(target_user_id) => target_user_id,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            (
+                AccessPrincipal::new(target_user_id, target_user.is_admin),
+                target_user.id.to_string(),
+            )
+        }
+        None => (
+            AccessPrincipal::new(user.id, user.is_admin),
+            user.id.to_string(),
+        ),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let counts = match catalog
+        .count_item_types(principal, &target_user_id, query.is_favorite)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    };
+
+    Json(json!({
+        "MovieCount": counts.movie_count,
+        "SeriesCount": counts.series_count,
+        "EpisodeCount": counts.episode_count,
+        "GameCount": 0,
+        "ArtistCount": 0,
+        "ProgramCount": 0,
+        "GameSystemCount": 0,
+        "TrailerCount": 0,
+        "SongCount": 0,
+        "AlbumCount": 0,
+        "MusicVideoCount": 0,
+        "BoxSetCount": counts.box_set_count,
+        "BookCount": 0,
+        "ItemCount": counts.item_count,
+    }))
+    .into_response()
 }
 
 async fn emby_list_items(

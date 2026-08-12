@@ -5432,6 +5432,65 @@ impl Database {
             })
     }
 
+    pub(crate) async fn count_catalog_item_types(
+        &self,
+        library_ids: &[String],
+        user_id: &str,
+        is_favorite: Option<bool>,
+    ) -> Result<StoredCatalogItemCounts, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(StoredCatalogItemCounts::default());
+        }
+
+        let library_placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let favorite_filter = is_favorite.map_or(String::new(), |_| {
+            " AND COALESCE(
+                (SELECT state_filter.is_favorite
+                 FROM user_item_state state_filter
+                 WHERE state_filter.user_id = ? AND state_filter.item_id = mi.id),
+                0
+            ) = ?"
+                .to_owned()
+        });
+        let query = format!(
+            "SELECT
+                COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
+                COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
+                COUNT(CASE WHEN mi.item_type = 'EPISODE' THEN 1 END) AS episode_count,
+                COUNT(CASE WHEN mi.item_type = 'BOX_SET' THEN 1 END) AS box_set_count,
+                COUNT(*) AS item_count
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.removed_at IS NULL
+               AND mi.library_id IN ({library_placeholders})
+               {CATALOG_VISIBLE_PREDICATE}
+               {favorite_filter}"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        if let Some(is_favorite) = is_favorite {
+            statement = statement.bind(user_id).bind(database_flag(is_favorite));
+        }
+        statement
+            .fetch_one(&self.pool)
+            .await
+            .map(|row| StoredCatalogItemCounts {
+                movie_count: row.get("movie_count"),
+                series_count: row.get("series_count"),
+                episode_count: row.get("episode_count"),
+                box_set_count: row.get("box_set_count"),
+                item_count: row.get("item_count"),
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn dashboard_stats(&self) -> Result<DashboardStats, StorageError> {
         self.query(
             "SELECT
@@ -8817,6 +8876,15 @@ pub(crate) struct DashboardStats {
     pub(crate) movie_count: i64,
     pub(crate) series_count: i64,
     pub(crate) user_count: i64,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct StoredCatalogItemCounts {
+    pub(crate) movie_count: i64,
+    pub(crate) series_count: i64,
+    pub(crate) episode_count: i64,
+    pub(crate) box_set_count: i64,
+    pub(crate) item_count: i64,
 }
 
 #[derive(Debug)]
