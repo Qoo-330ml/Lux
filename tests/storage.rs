@@ -19,7 +19,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 55);
+    assert_eq!(database.schema_version().await?, 58);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -39,7 +39,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 55);
+    assert_eq!(second_database.schema_version().await?, 58);
     second_database.close().await;
     Ok(())
 }
@@ -54,13 +54,20 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 55);
+    assert_eq!(database.schema_version().await?, 58);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_count, 1);
+    let job_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name IN ('chapter_detection_jobs', 'chapter_detection_job_items')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(job_table_count, 2);
 
     let create_sql: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
@@ -229,7 +236,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 55);
+    assert_eq!(database.schema_version().await?, 58);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
@@ -270,6 +277,50 @@ async fn library_registers_reconciliation_and_metadata_tasks_only()
         ]
     );
 
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_persists_chapter_source_selection() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library_with_scraper_and_chapter_source(
+            "Shows",
+            LibraryKind::Series,
+            false,
+            None,
+            None,
+            false,
+        )
+        .await?;
+    assert_eq!(library.chapter_source_id, None);
+
+    let updated = libraries
+        .update_settings(
+            library.id,
+            luxd::application::libraries::LibrarySettingsPatch {
+                chapter_source_id: Some(Some("org.lux.intro-outro-detector".to_owned())),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(
+        updated.library.chapter_source_id.as_deref(),
+        Some("org.lux.intro-outro-detector")
+    );
+
+    let reopened = libraries.get_library(library.id).await?;
+    assert_eq!(
+        reopened.chapter_source_id.as_deref(),
+        Some("org.lux.intro-outro-detector")
+    );
     database.close().await;
     Ok(())
 }

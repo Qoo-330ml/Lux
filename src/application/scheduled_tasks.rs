@@ -10,6 +10,10 @@ use tokio::{sync::Mutex, time::interval};
 
 use crate::{
     application::{
+        chapter_detector::{
+            ChapterDetectionError, ChapterDetectionJob, ChapterDetectionOptions,
+            ChapterDetectionService,
+        },
         plugins::PluginService,
         probe::MediaProbeService,
         reidentify::{
@@ -17,7 +21,9 @@ use crate::{
             MetadataReidentifyService,
         },
         scanner::{ScanJob, ScanJobError, ScanJobService},
-        schedule::{CronSchedule, STRM_MEDIA_INFO_TASK_TYPE, parse_cron},
+        schedule::{
+            CHAPTER_DETECTION_TASK_TYPE, CronSchedule, STRM_MEDIA_INFO_TASK_TYPE, parse_cron,
+        },
         strm_probe::{StrmProbeError, StrmProbeJob, StrmProbeService},
         thumbnails::ThumbnailService,
     },
@@ -34,7 +40,9 @@ const SCHEDULER_PAGE_SIZE: i64 = 100;
 #[derive(Clone)]
 pub struct ScheduledTaskService {
     database: Database,
+    plugins: PluginService,
     strm_probe: StrmProbeService,
+    chapter_detection: Option<ChapterDetectionService>,
     scan_jobs: Option<ScanJobService>,
     metadata_reidentify: Option<MetadataReidentifyService>,
     probe: Option<MediaProbeService>,
@@ -59,6 +67,9 @@ pub enum ScheduledTaskRun {
         operation_id: String,
         jobs: Vec<StrmProbeJob>,
     },
+    ChapterDetection {
+        job: ChapterDetectionJob,
+    },
 }
 
 impl ScheduledTaskRun {
@@ -67,6 +78,7 @@ impl ScheduledTaskRun {
             Self::Reconciliation { .. } => RECONCILIATION_TASK_TYPE,
             Self::Metadata { .. } => METADATA_TASK_TYPE,
             Self::StrmMediaInfo { .. } => STRM_MEDIA_INFO_TASK_TYPE,
+            Self::ChapterDetection { .. } => CHAPTER_DETECTION_TASK_TYPE,
         }
     }
 }
@@ -81,6 +93,7 @@ pub enum ScheduledTaskError {
     Scan(ScanJobError),
     Metadata(MetadataReidentifyError),
     Strm(StrmProbeError),
+    Chapter(ChapterDetectionError),
     Storage(StorageError),
 }
 
@@ -97,6 +110,7 @@ impl fmt::Display for ScheduledTaskError {
             Self::Scan(error) => error.fmt(formatter),
             Self::Metadata(error) => error.fmt(formatter),
             Self::Strm(error) => error.fmt(formatter),
+            Self::Chapter(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -111,10 +125,17 @@ impl From<StorageError> for ScheduledTaskError {
 }
 
 impl ScheduledTaskService {
-    pub fn new(database: Database, _plugins: PluginService, strm_probe: StrmProbeService) -> Self {
+    pub fn new(
+        database: Database,
+        plugins: PluginService,
+        strm_probe: StrmProbeService,
+        chapter_detection: Option<ChapterDetectionService>,
+    ) -> Self {
         Self {
             database,
+            plugins,
             strm_probe,
+            chapter_detection,
             scan_jobs: None,
             metadata_reidentify: None,
             probe: None,
@@ -244,7 +265,7 @@ impl ScheduledTaskService {
         if owner_type == "LIBRARY"
             && !matches!(
                 task_type.as_str(),
-                RECONCILIATION_TASK_TYPE | METADATA_TASK_TYPE
+                RECONCILIATION_TASK_TYPE | METADATA_TASK_TYPE | CHAPTER_DETECTION_TASK_TYPE
             )
         {
             return Err(ScheduledTaskError::UnsupportedTask);
@@ -262,6 +283,10 @@ impl ScheduledTaskService {
             ("LIBRARY", RECONCILIATION_TASK_TYPE) => self.run_reconciliation(owner_id).await,
             ("LIBRARY", METADATA_TASK_TYPE) => self.run_metadata(owner_id).await,
             ("GLOBAL", STRM_MEDIA_INFO_TASK_TYPE) => self.run_strm_media_info().await,
+            ("LIBRARY", CHAPTER_DETECTION_TASK_TYPE) => {
+                self.run_chapter_detection(owner_id, task.plugin_id.as_deref())
+                    .await
+            }
             _ => Err(ScheduledTaskError::UnsupportedTask),
         }
     }
@@ -337,13 +362,67 @@ impl ScheduledTaskService {
             .unwrap_or_default();
         Ok(ScheduledTaskRun::StrmMediaInfo { operation_id, jobs })
     }
+
+    async fn run_chapter_detection(
+        &self,
+        library_id: &str,
+        plugin_id: Option<&str>,
+    ) -> Result<ScheduledTaskRun, ScheduledTaskError> {
+        let service = self
+            .chapter_detection
+            .as_ref()
+            .ok_or(ScheduledTaskError::ServiceUnavailable)?;
+        let plugin_id = plugin_id.ok_or(ScheduledTaskError::ServiceUnavailable)?;
+        let settings = self
+            .plugins
+            .enabled_chapter_detector_settings(plugin_id)
+            .await
+            .map_err(|error| ScheduledTaskError::Chapter(ChapterDetectionError::from(error)))?
+            .ok_or(ScheduledTaskError::Disabled)?;
+        let library_id = library_id
+            .parse::<LibraryId>()
+            .map_err(|_| ScheduledTaskError::InvalidOwner)?;
+        let library = self
+            .database
+            .find_library(&library_id.to_string())
+            .await?
+            .ok_or(ScheduledTaskError::InvalidOwner)?;
+        if library.chapter_source_id.as_deref() != Some(plugin_id) {
+            return Err(ScheduledTaskError::Disabled);
+        }
+        let job = service
+            .create_library_job(
+                library_id,
+                plugin_id,
+                ChapterDetectionOptions {
+                    concurrency: settings.concurrency,
+                    intro_window_seconds: settings.intro_window_seconds,
+                    credits_window_seconds: settings.credits_window_seconds,
+                    match_threshold: settings.match_threshold,
+                    force_refresh: false,
+                },
+            )
+            .await
+            .map_err(ScheduledTaskError::Chapter)?;
+        let worker = service.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = worker.run(&job_id).await {
+                tracing::error!(job_id = %job_id, %error, "scheduled chapter detection task stopped");
+            }
+        });
+        Ok(ScheduledTaskRun::ChapterDetection { job })
+    }
 }
 
 fn scheduler_schedule(task: &StoredScheduledTaskConfig) -> Option<CronSchedule> {
     if !task.is_enabled
         || !matches!(
             task.task_type.as_str(),
-            RECONCILIATION_TASK_TYPE | METADATA_TASK_TYPE | STRM_MEDIA_INFO_TASK_TYPE
+            RECONCILIATION_TASK_TYPE
+                | METADATA_TASK_TYPE
+                | STRM_MEDIA_INFO_TASK_TYPE
+                | CHAPTER_DETECTION_TASK_TYPE
         )
     {
         return None;

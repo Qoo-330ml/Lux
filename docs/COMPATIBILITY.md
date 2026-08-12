@@ -34,6 +34,7 @@
 - 2026-08-10 Emby 目录兼容修复：`Items/Latest` 默认按 `GroupItems=true` 返回电影/剧集根条目，剧集与季度 DTO 补充 `ChildCount`/`RecursiveItemCount`；`ParentId` 现在支持媒体库、剧集和季度，并覆盖剧集单集查询。`tests/series_api.rs` 已加入协议回归覆盖；网易爆米花真实设备复测仍待完成。
 - 2026-08-11 网易爆米花 2.15.3 DTO 兼容修复：已观察到客户端可登录并加载部分首页，但尚未进入播放会话。Emby 条目现补齐 `SortName`、`SeasonId`、`IndexNumber`、`PremiereDate` 和 `ProviderIds`，季/集层级的标准字段已有协议回归覆盖；完整首页、详情页和播放仍待重启服务后的真实设备复测，不据此宣称完全兼容。
 - 2026-08-11 网易爆米花首页链路修复：补齐 Emby 用户虚拟根目录 `/Users/{userId}/Items/Root`、`/Items/Root?userId=...` 和 `CollectionFolder` 子项，修正媒体库范围 `Items/Latest` 将季/集误当成最新根条目的问题；协议回归已覆盖，真实设备首页复测仍待完成。
+- 2026-08-12 网易爆米花媒体库列表 DTO 对齐：针对其实际请求的 `SortBy=DateCreated,SortName`、`Fields=BasicSyncInfo,ChildCount,RunTimeTicks,CommunityRating,PremiereDate,ProductionYear,CanDownload`，列表响应现在省略未请求字段和空值，返回 `SupportsSync`、UTC ISO `PremiereDate`、无播放位置时不返回 `PlayedPercentage`，并批量返回 `Logo`、`Thumb`、`Banner`、`Disc` 与全部背景图标签；电影 `ParentId` 由扫描建立的物理目录条目提供。脱敏协议回归已覆盖，网易爆米花真实设备刷新复测仍待完成，不据此宣称完全兼容。
 - 2026-08-11 Filmly 2.12.3 首页请求修复：`/Users/{userId}/Items` 现在支持 `ExcludeItemTypes`，未指定递归和类型时按 Emby 根层级返回电影/剧集，列表 DTO 补充用户 `CanDownload` 和请求的 `Chapters` 字段；已用真实请求参数加入剧集层级协议回归，真实设备刷新复测仍待完成。
 - 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - 播放会话失活保护：若第三方客户端异常退出、网络中断或未发送 `Stopped`，`PLAYING`/`PAUSED` 会话在连续 90 秒没有事件后从 Emby `GET /Sessions`、管理员控制台和 Web 播放状态中隐藏；显式 `Stopped` 仍立即清理活动会话。

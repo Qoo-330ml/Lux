@@ -1,28 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="223" height="250" viewBox="169.5 166.5 223 250">
-  <defs>
-    <filter id="logo-outline" filterUnits="userSpaceOnUse" primitiveUnits="userSpaceOnUse" x="168" y="165" width="226" height="253" color-interpolation-filters="sRGB">
-      <feMorphology in="SourceAlpha" operator="dilate" radius="10" result="outer" />
-      <feMorphology in="SourceAlpha" operator="dilate" radius="8" result="inner" />
-      <feFlood flood-color="#ffffff" result="halo-color" />
-      <feComposite in="halo-color" in2="inner" operator="in" result="halo" />
-      <feComposite in="outer" in2="inner" operator="out" result="ring" />
-      <feFlood flood-color="#000000" result="ring-color" />
-      <feComposite in="ring-color" in2="ring" operator="in" result="outline" />
-      <feMerge>
-        <feMergeNode in="outline" />
-        <feMergeNode in="halo" />
-        <feMergeNode in="SourceGraphic" />
-      </feMerge>
-    </filter>
-  </defs>
-  <g filter="url(#logo-outline)">
-  <!-- 背景色块 -->
-  <polygon points="216,177.233 300,177.233 274,367.233 190,367.233" fill="#222222" />
-  <polygon points="278.705,218.817 364.705,218.817 334.705,405.817 252.705,405.817" fill="#B8B8B8" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="100%" height="100%">
+  <!-- Background -->
+  <rect width="1024" height="1024" fill="#ffffff" />
 
-  <!-- 字母（Arial 斜体加粗） -->
-  <text x="211" y="315" font-family="Arial, sans-serif" font-size="115" font-weight="bold" font-style="italic" fill="#B8B8B8" text-anchor="middle" dominant-baseline="middle">L</text>
-  <text x="272" y="320" font-family="Arial, sans-serif" font-size="85" font-weight="bold" font-style="italic" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">u</text>
-  <text x="336" y="315" font-family="Arial, sans-serif" font-size="100" font-weight="bold" font-style="italic" fill="#222222" text-anchor="middle" dominant-baseline="middle">X</text>
+  <!-- LUX Emblem Pattern (Monochrome Geometric Mark) -->
+  <g fill="#0a0b0d">
+    <!-- Emblem Main Body with Compound Cutout Hole -->
+    <path fill-rule="evenodd" d="
+      M 321 194
+      L 508 330
+      L 695 194
+      Q 713 194 713 214
+      L 713 281
+      L 500 480
+      L 695 572
+      Q 712 572 712 592
+      L 712 648
+      L 459 486
+      L 321 647
+      Z
+      M 391 260
+      L 508 415
+      L 391 530
+      Z
+    " />
   </g>
 </svg>

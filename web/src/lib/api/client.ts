@@ -17,6 +17,7 @@ import type {
   AdminMetadataReidentifyStart,
   AdminPlugin,
   AdminPluginStore,
+  ChapterSource,
   ApiErrorBody,
   DatabaseSetupInput,
   HomeResponse,
@@ -360,6 +361,12 @@ export class LuxApiClient {
     return this.request<{ libraries?: AdminLibrary[] }>("/api/v1/admin/libraries");
   }
 
+  adminChapterSources() {
+    return this.request<{ sources?: ChapterSource[]; total?: number; page?: number; pageSize?: number }>(
+      "/api/v1/admin/chapter-sources?page=1&pageSize=100",
+    );
+  }
+
   adminPlugins() {
     return this.request<{ plugins?: AdminPlugin[]; total?: number; page?: number; pageSize?: number }>(
       "/api/v1/admin/plugins?page=1&pageSize=50",
@@ -419,6 +426,7 @@ export class LuxApiClient {
     name: string;
     kind: string;
     scraperId?: string | null;
+    chapterSourceId?: string | null;
     realtimeMetadataAutoMatchEnabled?: boolean;
   }) {
     return this.request<{ library: AdminLibrary }>("/api/v1/admin/libraries", {

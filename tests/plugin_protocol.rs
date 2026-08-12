@@ -1,6 +1,9 @@
 use luxd::application::plugin_protocol::{
-    IP_LOCATION_CAPABILITY, IpLocationRpcResult, MediaProbeRpcResult, PLUGIN_API_VERSION,
-    PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_IP_LOCATION,
+    CHAPTER_DETECT_CAPABILITY, CHAPTER_LOOKUP_CAPABILITY, ChapterDetectMarkerType,
+    ChapterDetectRpcRequest, ChapterDetectRpcResult, ChapterFingerprintRpcEpisode,
+    ChapterLookupRpcEpisode, ChapterLookupRpcRequest, IP_LOCATION_CAPABILITY, IpLocationRpcResult,
+    MediaProbeRpcResult, PLUGIN_API_VERSION, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
+    PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_IP_LOCATION,
     PLUGIN_TYPE_STRM_RESOLVER, PluginManifest, PluginRequest, STRM_RESOLVE_CAPABILITY,
     StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
 };
@@ -115,6 +118,113 @@ fn accepts_a_media_probe_plugin_manifest() {
     );
     assert_eq!(manifest.config_fields[1].input_type, "number");
     assert_eq!(manifest.config_fields[1].default_value, Some(json!(2)));
+}
+
+#[test]
+fn accepts_a_chapter_detector_manifest_and_bounded_rpc_contract() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.intro-outro-detector",
+        "name": "Intro and outro detector",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "capabilities": [CHAPTER_DETECT_CAPABILITY],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect("chapter detector manifest should validate");
+    let request = ChapterDetectRpcRequest {
+        episodes: vec![
+            ChapterFingerprintRpcEpisode {
+                key: "episode-a".to_owned(),
+                sample_rate: 11_025,
+                fingerprint_point_duration_ticks: 1_238_095,
+                intro_fingerprint_base64: "AQID".to_owned(),
+                credits_fingerprint_base64: "BAUG".to_owned(),
+                intro_window_start_ticks: 0,
+                credits_window_start_ticks: 900_000_000,
+                intro_window_duration_ticks: 1_800_000_000,
+                credits_window_duration_ticks: 1_800_000_000,
+            },
+            ChapterFingerprintRpcEpisode {
+                key: "episode-b".to_owned(),
+                sample_rate: 11_025,
+                fingerprint_point_duration_ticks: 1_238_095,
+                intro_fingerprint_base64: "AQID".to_owned(),
+                credits_fingerprint_base64: "BAUG".to_owned(),
+                intro_window_start_ticks: 0,
+                credits_window_start_ticks: 900_000_000,
+                intro_window_duration_ticks: 1_800_000_000,
+                credits_window_duration_ticks: 1_800_000_000,
+            },
+        ],
+        intro_window_ticks: 1_800_000_000,
+        credits_window_ticks: 1_800_000_000,
+        minimum_match_duration_ticks: 100_000_000,
+        match_threshold: 0.8,
+    };
+    let value = serde_json::to_value(&request).expect("request should serialize");
+    assert!(value.get("mediaSourceId").is_none());
+    assert!(value.get("path").is_none());
+    let mut request_with_path = value.clone();
+    request_with_path["path"] = json!("/media/episode.mkv");
+    assert!(serde_json::from_value::<ChapterDetectRpcRequest>(request_with_path).is_err());
+    let result: ChapterDetectRpcResult = serde_json::from_value(json!({
+        "markers": [{
+            "key": "episode-a",
+            "markerType": "INTRO_START",
+            "startPositionTicks": 10000000,
+            "confidence": 0.93
+        }]
+    }))
+    .expect("result should deserialize");
+    assert_eq!(
+        result.markers[0].marker_type,
+        ChapterDetectMarkerType::IntroStart
+    );
+    assert_eq!(manifest.plugin_type, PLUGIN_TYPE_CHAPTER_DETECTOR);
+}
+
+#[test]
+fn accepts_a_metadata_lookup_chapter_contract_without_media_paths() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.theintrodb-chapter-source",
+        "name": "TheIntroDB chapter source",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "capabilities": [CHAPTER_LOOKUP_CAPABILITY],
+        "permissions": {"network": ["api.theintrodb.org"], "filesystem": []},
+        "files": []
+    }))
+    .expect("metadata lookup manifest should validate");
+    let request = ChapterLookupRpcRequest {
+        episodes: vec![ChapterLookupRpcEpisode {
+            key: "episode-a".to_owned(),
+            tmdb_id: Some(123),
+            tvdb_id: Some(456),
+            imdb_id: Some("tt1234567".to_owned()),
+            season_number: 1,
+            episode_number: 2,
+            duration_ticks: Some(1_800_000_000),
+        }],
+    };
+    let value = serde_json::to_value(request).expect("request should serialize");
+    assert!(value.get("path").is_none());
+    assert!(value.get("url").is_none());
+    assert!(value.get("mediaSourceId").is_none());
+    assert_eq!(value["episodes"][0]["tmdbId"], 123);
+    assert_eq!(value["episodes"][0]["seasonNumber"], 1);
+    let mut request_with_path = value;
+    request_with_path["episodes"][0]["path"] = json!("/media/episode.mkv");
+    assert!(serde_json::from_value::<ChapterLookupRpcRequest>(request_with_path).is_err());
+    assert_eq!(manifest.capabilities, vec![CHAPTER_LOOKUP_CAPABILITY]);
 }
 
 #[test]

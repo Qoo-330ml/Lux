@@ -219,6 +219,7 @@ export type AdminRoot = {
 
 export type AdminLibrary = Library & {
   scraperId?: string | null;
+  chapterSourceId?: string | null;
   isEnabled: boolean;
   realtimeWatchEnabled: boolean;
   realtimeMetadataAutoMatchEnabled: boolean;
@@ -253,6 +254,15 @@ export type AdminPlugin = {
   configFields: AdminPluginConfigField[];
   configValues?: Record<string, unknown>;
   configSource: "PLUGIN_DEFAULT" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
+};
+
+export type ChapterSource = {
+  id: string;
+  name: string;
+  description: string;
+  version?: string | null;
+  capabilities: string[];
+  lookup: boolean;
 };
 
 export type AdminPluginStore = {

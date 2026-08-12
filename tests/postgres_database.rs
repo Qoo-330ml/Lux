@@ -60,6 +60,15 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(chapter_table_count, 1);
+    let chapter_job_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name IN ('chapter_detection_jobs', 'chapter_detection_job_items')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(chapter_job_table_count, 2);
 
     let setup = SetupService::new(database.clone())?;
     setup

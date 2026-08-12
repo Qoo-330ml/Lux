@@ -410,9 +410,10 @@ async fn prepared_movie() -> Result<(Database, String, PathBuf, PathBuf), Box<dy
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     Ok((database, item_id, root, movie_dir))
 }
 
