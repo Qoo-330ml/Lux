@@ -204,7 +204,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
 
     let media_strategy = json!({
         "metadataLanguage": "en-US",
-        "imageLanguage": "en",
+        "imageLanguage": "",
         "region": "US",
         "scraperId": null,
         "applyScope": "ALL_CONTENT",
@@ -258,6 +258,56 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(
         persisted_settings_body["mediaStrategy"]["subtitles"]["hearingImpaired"],
         true
+    );
+    assert_eq!(
+        persisted_settings_body["mediaStrategy"]["imageLanguage"],
+        ""
+    );
+
+    let invalid_media_strategy = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({
+            "mediaStrategy": {
+                "metadataLanguage": "en-US",
+                "imageLanguage": "en",
+                "region": "US",
+                "scraperId": "../org.lux.tmdb",
+                "applyScope": "ALL_CONTENT",
+                "images": {
+                    "poster": true,
+                    "artwork": false,
+                    "banner": true,
+                    "logo": false,
+                    "thumbnail": false,
+                    "disc": false,
+                    "wallpaper": true,
+                    "maxBackdropCount": 2,
+                    "minDownloadWidth": 1920
+                },
+                "subtitles": {
+                    "autoDownload": true,
+                    "languages": ["en"],
+                    "forcedOnly": false,
+                    "hearingImpaired": true
+                }
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        invalid_media_strategy.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let invalid_media_strategy_body = invalid_media_strategy.json::<Value>().await?;
+    assert_eq!(
+        invalid_media_strategy_body["error"]["code"],
+        "INVALID_REQUEST"
+    );
+    assert_eq!(
+        invalid_media_strategy_body["error"]["message"],
+        "全局媒体策略无效"
     );
     let relaxed_resume = client
         .get(format!("{base_url}/Users/{admin_id}/Items/Resume"))
