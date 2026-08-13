@@ -1,8 +1,12 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        libraries::LibraryService, metadata::MetadataEnricher, nfo::LocalNfoMetadataStore,
-        scanner::LibraryScanner, setup::SetupService,
+        libraries::LibraryService,
+        metadata::MetadataEnricher,
+        nfo::LocalNfoMetadataStore,
+        people::{ActorCredit, PeopleService},
+        scanner::LibraryScanner,
+        setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
@@ -115,6 +119,25 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .bind(&item_id)
             .fetch_one(database.pool())
             .await?;
+    let people = PeopleService::new(config.config_dir.clone());
+    let person_image = config
+        .config_dir
+        .join("metadata/people/演/演员甲-tmdb-9/folder.png");
+    tokio::fs::create_dir_all(person_image.parent().ok_or("missing person image parent")?).await?;
+    tokio::fs::write(&person_image, PNG_1X1).await?;
+    people
+        .persist_item_actors(
+            &item_id,
+            "tmdb",
+            &[ActorCredit {
+                id: "9".to_owned(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+            }],
+        )
+        .await?;
     sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
         .bind(300_i64)
         .bind(&item_id)
@@ -619,6 +642,41 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(detail_body["ProductionYear"], 2020);
     assert_eq!(detail_body["PrimaryImageItemId"], item_id);
     assert_eq!(detail_body["ImageTags"]["Primary"], alpha_poster_id);
+
+    let user_scoped_detail = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items/{item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateModified%2CCanDownload",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(user_scoped_detail.status(), reqwest::StatusCode::OK);
+    let user_scoped_detail_body: Value = user_scoped_detail.json().await?;
+    assert_eq!(user_scoped_detail_body["Id"], item_id);
+    assert_eq!(user_scoped_detail_body["Name"], "Alpha Movie");
+    assert!(user_scoped_detail_body["MediaSources"].is_array());
+    assert_eq!(user_scoped_detail_body["People"][0]["Id"], "9");
+    assert_eq!(user_scoped_detail_body["People"][0]["Role"], "角色甲");
+    assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Actor");
+    assert!(user_scoped_detail_body["People"][0]["PrimaryImageTag"].is_string());
+
+    let person_image_response = client
+        .get(format!("{base_url}/emby/Persons/9/Images/Primary"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(person_image_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(person_image_response.headers()["content-type"], "image/png");
+    assert_eq!(person_image_response.bytes().await?.as_ref(), PNG_1X1);
+
+    let person_name_image_response = client
+        .get(format!("{base_url}/emby/Persons/演员甲/Images/Primary"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(person_name_image_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(person_name_image_response.bytes().await?.as_ref(), PNG_1X1);
 
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))

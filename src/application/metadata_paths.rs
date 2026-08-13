@@ -161,7 +161,7 @@ fn ascii_component(value: &str, label: &'static str) -> Result<String, MetadataP
     }
 }
 
-fn readable_component(value: &str) -> String {
+pub(crate) fn readable_component(value: &str) -> String {
     let mut result = String::new();
     for character in value.chars() {
         let character = if character.is_alphanumeric()

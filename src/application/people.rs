@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::application::metadata_paths::{
     MetadataPathError, library_item_directory, metadata_root, people_directory,
-    people_index_directory, people_index_path, people_index_path_for_provider,
+    people_index_directory, people_index_path, people_index_path_for_provider, readable_component,
 };
 
 const LEGACY_PEOPLE_DIR: &str = "people";
@@ -429,6 +429,97 @@ impl PeopleService {
 
     pub async fn profile_image(&self, person_id: &str) -> Result<Option<PersonImage>, PeopleError> {
         self.profile_image_for_provider(None, person_id).await
+    }
+
+    pub async fn profile_image_for_emby_name_or_id(
+        &self,
+        name_or_id: &str,
+    ) -> Result<Option<PersonImage>, PeopleError> {
+        if validate_component(name_or_id).is_ok()
+            && let Some(image) = self.profile_image(name_or_id).await?
+        {
+            return Ok(Some(image));
+        }
+        self.profile_image_for_name(name_or_id).await
+    }
+
+    async fn profile_image_for_name(&self, name: &str) -> Result<Option<PersonImage>, PeopleError> {
+        let name = name.trim();
+        if name.is_empty()
+            || name.len() > 128
+            || name.contains('/')
+            || name.contains('\\')
+            || matches!(name, "." | "..")
+        {
+            return Err(PeopleError::InvalidComponent(name.to_owned()));
+        }
+        let people_root = metadata_root(&self.config_dir).join(LEGACY_PEOPLE_DIR);
+        let mut buckets = match fs::read_dir(&people_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: people_root,
+                    source,
+                });
+            }
+        };
+        let prefix = format!("{}-", readable_component(name));
+        while let Some(bucket) = buckets
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: people_root.clone(),
+                source,
+            })?
+        {
+            let bucket_path = bucket.path();
+            if safe_metadata(&bucket_path)
+                .await?
+                .is_none_or(|metadata| !metadata.is_dir())
+            {
+                continue;
+            }
+            let mut persons =
+                fs::read_dir(&bucket_path)
+                    .await
+                    .map_err(|source| PeopleError::Io {
+                        path: bucket_path.clone(),
+                        source,
+                    })?;
+            while let Some(person) =
+                persons
+                    .next_entry()
+                    .await
+                    .map_err(|source| PeopleError::Io {
+                        path: bucket_path.clone(),
+                        source,
+                    })?
+            {
+                let person_path = person.path();
+                if safe_metadata(&person_path)
+                    .await?
+                    .is_none_or(|metadata| !metadata.is_dir())
+                {
+                    continue;
+                }
+                let Some(person_name) = person.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if !person_name.starts_with(&prefix) {
+                    continue;
+                }
+                for extension in PROFILE_EXTENSIONS {
+                    if let Some(image) =
+                        image_from_path(&person_path.join(format!("{PERSON_IMAGE}.{extension}")))
+                            .await?
+                    {
+                        return Ok(Some(image));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub async fn profile_image_for_provider(

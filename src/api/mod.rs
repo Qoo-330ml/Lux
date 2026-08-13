@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tower_http::{
     ServiceBuilderExt,
@@ -1234,6 +1235,14 @@ fn emby_routes() -> Router<AppState> {
         .route("/Users/{user_id}/Items/NextUp", get(emby_user_next_up))
         .route("/Users/{user_id}/Items", get(emby_user_items))
         .route("/Users/{user_id}/Items/{item_id}", get(emby_user_item))
+        .route(
+            "/Persons/{person_id}/Images/{image_type}",
+            get(emby_person_image).head(emby_person_image),
+        )
+        .route(
+            "/Persons/{person_id}/Images/{image_type}/{image_index}",
+            get(emby_person_image_at_index).head(emby_person_image_at_index),
+        )
         .route("/Shows/NextUp", get(emby_shows_next_up))
         .route("/Shows/{series_id}/Seasons", get(emby_show_seasons))
         .route("/Shows/{series_id}/Episodes", get(emby_show_episodes))
@@ -3004,14 +3013,34 @@ async fn emby_item_response(
                 Ok(state) => state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            Json(emby_catalog_item_json_with_state(
+            let mut item_json = emby_catalog_item_json_with_state(
                 &item,
                 &state.server_id,
                 user_state.as_ref(),
                 can_download,
                 None,
-            ))
-            .into_response()
+            );
+            let actors = match state.people.as_ref() {
+                Some(people) => match people.list_item_actors(&item.id).await {
+                    Ok(actors) => actors,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %item.id,
+                            %error,
+                            "derived actor relation is unavailable; returning an empty cast"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+            if let Value::Object(object) = &mut item_json {
+                object.insert(
+                    "People".to_owned(),
+                    Value::Array(actors.into_iter().map(emby_person_json).collect()),
+                );
+            }
+            Json(item_json).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -3019,6 +3048,85 @@ async fn emby_item_response(
             unreachable!("inaccessible item is returned as not found")
         }
     }
+}
+
+async fn emby_person_image(
+    headers: HeaderMap,
+    method: Method,
+    Path((person_id, image_type)): Path<(String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    emby_person_image_response(&headers, &method, &person_id, &image_type, &query, &state).await
+}
+
+async fn emby_person_image_at_index(
+    headers: HeaderMap,
+    method: Method,
+    Path((person_id, image_type, image_index)): Path<(String, String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if image_index.parse::<i64>().ok() != Some(0) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    emby_person_image_response(&headers, &method, &person_id, &image_type, &query, &state).await
+}
+
+async fn emby_person_image_response(
+    headers: &HeaderMap,
+    method: &Method,
+    person_id: &str,
+    image_type: &str,
+    query: &EmbyTokenQuery,
+    state: &AppState,
+) -> Response {
+    if normalize_image_type(image_type) != Some("POSTER") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Err(status) = require_emby_user(headers, state, query.api_key.as_deref()).await {
+        return status.into_response();
+    }
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let image = match people.profile_image_for_emby_name_or_id(person_id).await {
+        Ok(Some(image)) => image,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(PeopleError::InvalidComponent(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let etag = format!("\"{}\"", emby_person_image_tag(person_id));
+    serve_image_file(
+        &image.path,
+        image.content_type,
+        image.content_length,
+        &etag,
+        headers,
+        method,
+    )
+    .await
+}
+
+fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
+    let image_tag = actor
+        .image_url
+        .as_ref()
+        .map(|_| emby_person_image_tag(&actor.id));
+    json!({
+        "Name": actor.name,
+        "Id": actor.id,
+        "Role": actor.character,
+        "Type": "Actor",
+        "PrimaryImageTag": image_tag,
+    })
+}
+
+fn emby_person_image_tag(person_id: &str) -> String {
+    Sha256::digest(person_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn emby_playback_info(
