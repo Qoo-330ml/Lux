@@ -9370,18 +9370,22 @@ impl Database {
         image_type: &str,
         local_path: &std::path::Path,
         file_size: i64,
+        width: Option<i32>,
+        height: Option<i32>,
     ) -> Result<bool, StorageError> {
         let id = Uuid::now_v7().to_string();
         self.query(
             "INSERT INTO item_images (
-                id, item_id, image_type, image_index, local_path, file_size, source
-            ) VALUES (?, ?, ?, 0, ?, ?, 'LOCAL')
+                id, item_id, image_type, image_index, local_path, width, height, file_size, source
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, 'LOCAL')
             ON CONFLICT(item_id, image_type, image_index) DO NOTHING",
         )
         .bind(id)
         .bind(item_id)
         .bind(image_type)
         .bind(local_path.to_string_lossy().as_ref())
+        .bind(width)
+        .bind(height)
         .bind(file_size)
         .execute(&self.pool)
         .await
@@ -9418,18 +9422,19 @@ impl Database {
         item_id: &str,
         image_type: &str,
         local_path: &std::path::Path,
-        file_size: i64,
-        content_tag: &str,
-        source: &str,
+        metadata: ItemImageMetadata<'_>,
     ) -> Result<String, StorageError> {
         let id = Uuid::now_v7().to_string();
         self.query(
             "INSERT INTO item_images (
-                id, item_id, image_type, image_index, local_path, file_size, content_tag, source
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+                id, item_id, image_type, image_index, local_path, width, height,
+                file_size, content_tag, source
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
                 id = excluded.id,
                 local_path = excluded.local_path,
+                width = excluded.width,
+                height = excluded.height,
                 file_size = excluded.file_size,
                 content_tag = excluded.content_tag,
                 source = excluded.source,
@@ -9439,9 +9444,11 @@ impl Database {
         .bind(item_id)
         .bind(image_type)
         .bind(local_path.to_string_lossy().as_ref())
-        .bind(file_size)
-        .bind(content_tag)
-        .bind(source)
+        .bind(metadata.width)
+        .bind(metadata.height)
+        .bind(metadata.file_size)
+        .bind(metadata.content_tag)
+        .bind(metadata.source)
         .execute(&self.pool)
         .await
         .map(|_| id)
@@ -9505,6 +9512,53 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_item_image).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_primary_image_dimensions(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(i32, i32)>, StorageError> {
+        self.query(
+            "SELECT width, height
+             FROM item_images
+             WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0
+               AND width IS NOT NULL AND height IS NOT NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(|row| (row.get("width"), row.get("height"))))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_item_image_dimensions(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+        width: i32,
+        height: i32,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE item_images
+             SET width = ?, height = ?, updated_at = unixepoch()
+             WHERE item_id = ? AND image_type = ? AND image_index = ?",
+        )
+        .bind(width)
+        .bind(height)
+        .bind(item_id)
+        .bind(image_type)
+        .bind(image_index)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -10630,6 +10684,14 @@ pub(crate) struct StoredItemImageCandidate {
     pub(crate) id: String,
     pub(crate) local_path: String,
     pub(crate) root_path: String,
+}
+
+pub(crate) struct ItemImageMetadata<'a> {
+    pub(crate) file_size: i64,
+    pub(crate) width: Option<i32>,
+    pub(crate) height: Option<i32>,
+    pub(crate) content_tag: &'a str,
+    pub(crate) source: &'a str,
 }
 
 #[derive(Debug)]

@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{
-        images::write_image_atomically,
+        images::{read_image_dimensions_from_bytes, write_image_atomically},
         plugin_runtime::PluginRuntimeError,
         plugins::{
             MAX_STRM_THUMBNAIL_POSITION_PERCENT, MIN_STRM_THUMBNAIL_POSITION_PERCENT,
@@ -28,8 +28,8 @@ use crate::{
     domain::ids::LibraryId,
     observability::resources::ResourceMetrics,
     storage::{
-        Database, MediaProbeUpdate, MediaStreamUpdate, StorageError, StoredStrmMediaSource,
-        StoredStrmProbeJob,
+        Database, ItemImageMetadata, MediaProbeUpdate, MediaStreamUpdate, StorageError,
+        StoredStrmMediaSource, StoredStrmProbeJob,
     },
 };
 
@@ -683,15 +683,20 @@ impl StrmProbeService {
             let file_size =
                 i64::try_from(thumbnail.len()).map_err(|_| StrmProbeError::WorkerFailed)?;
             let content_tag = hex_sha256(thumbnail);
+            let dimensions = read_image_dimensions_from_bytes(thumbnail).await;
             if self
                 .database
                 .upsert_item_image(
                     &outcome.item_id,
                     "THUMB",
                     &target,
-                    file_size,
-                    &content_tag,
-                    "STRM_FFMPEG",
+                    ItemImageMetadata {
+                        file_size,
+                        width: dimensions.map(|(width, _)| width),
+                        height: dimensions.map(|(_, height)| height),
+                        content_tag: &content_tag,
+                        source: "STRM_FFMPEG",
+                    },
                 )
                 .await
                 .is_err()

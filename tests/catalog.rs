@@ -119,6 +119,23 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .bind(&item_id)
             .fetch_one(database.pool())
             .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (
+            id, media_source_id, stream_index, stream_type, codec, title,
+            details_json, is_default
+         ) VALUES (?, ?, 0, 'VIDEO', 'h264', '1080p H264', ?, 1),
+                  (?, ?, 1, 'AUDIO', 'aac', 'AAC Stereo', ?, 1)",
+    )
+    .bind("alpha-video-stream")
+    .bind(&alpha_source_id)
+    .bind(
+        r#"{"Width":"1920","Height":"1080","BitDepth":"8","BitRate":"8145838","AverageFrameRate":"24/1","RealFrameRate":"24000/1001","IsInterlaced":"false","Profile":"High"}"#,
+    )
+    .bind("alpha-audio-stream")
+    .bind(&alpha_source_id)
+    .bind(r#"{"Channels":"2","SampleRate":"48000"}"#)
+    .execute(database.pool())
+    .await?;
     let people = PeopleService::new(config.config_dir.clone());
     let person_image = config
         .config_dir
@@ -175,6 +192,13 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     )
     .bind(&item_id)
     .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE item_images SET width = 1000, height = 1500
+         WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
     .await?;
     let alpha_fanart_id: String = sqlx::query_scalar(
         "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
@@ -642,6 +666,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(detail_body["ProductionYear"], 2020);
     assert_eq!(detail_body["PrimaryImageItemId"], item_id);
     assert_eq!(detail_body["ImageTags"]["Primary"], alpha_poster_id);
+    assert_eq!(
+        detail_body["PrimaryImageAspectRatio"].as_f64(),
+        Some(2.0 / 3.0)
+    );
 
     let user_scoped_detail = client
         .get(format!(
@@ -656,6 +684,47 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(user_scoped_detail_body["Id"], item_id);
     assert_eq!(user_scoped_detail_body["Name"], "Alpha Movie");
     assert!(user_scoped_detail_body["MediaSources"].is_array());
+    assert_eq!(
+        user_scoped_detail_body["PrimaryImageAspectRatio"].as_f64(),
+        Some(2.0 / 3.0)
+    );
+    assert!(user_scoped_detail_body["MediaStreams"].is_array());
+    assert_eq!(user_scoped_detail_body["MediaStreams"][0]["Width"], 1920);
+    assert_eq!(user_scoped_detail_body["MediaStreams"][0]["BitDepth"], 8);
+    assert_eq!(
+        user_scoped_detail_body["MediaStreams"][0]["AverageFrameRate"],
+        24
+    );
+    assert!(
+        (user_scoped_detail_body["MediaStreams"][0]["RealFrameRate"]
+            .as_f64()
+            .ok_or("missing numeric real frame rate")?
+            - (24_000.0 / 1_001.0))
+            .abs()
+            < 0.000_001
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaStreams"][0]["IsInterlaced"],
+        false
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaStreams"][1]["SampleRate"],
+        48_000
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaSources"][0]["MediaStreams"][0]["Width"],
+        1920
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaSources"][0]["ItemId"],
+        item_id
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaSources"][0]["DefaultAudioStreamIndex"],
+        1
+    );
+    assert!(user_scoped_detail_body.get("CollectionType").is_none());
+    assert!(user_scoped_detail_body.get("SeasonId").is_none());
     assert_eq!(user_scoped_detail_body["People"][0]["Id"], "9");
     assert_eq!(user_scoped_detail_body["People"][0]["Role"], "角色甲");
     assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Actor");

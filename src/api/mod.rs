@@ -59,7 +59,7 @@ use crate::{
         directory_browser::{DirectoryBrowserError, list_directories},
         images::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
-            ImageWriteService, normalize_image_type,
+            ImageWriteService, normalize_image_type, read_image_dimensions,
         },
         ip_location::{IpLocation, IpLocationService},
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
@@ -1335,7 +1335,15 @@ fn emby_routes() -> Router<AppState> {
 
 #[derive(Deserialize, Default)]
 struct DanmakuQuery {
-    #[serde(rename = "api_key")]
+    #[serde(
+        rename = "api_key",
+        alias = "apiKey",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token",
+        alias = "X-MediaBrowser-Token",
+        alias = "x-media-browser-token"
+    )]
     api_key: Option<String>,
     option: Option<String>,
 }
@@ -1572,10 +1580,20 @@ async fn emby_authenticate(
 
 #[derive(Deserialize, Default)]
 struct EmbyTokenQuery {
-    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey")]
+    #[serde(
+        rename = "api_key",
+        alias = "apiKey",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token",
+        alias = "X-MediaBrowser-Token",
+        alias = "x-media-browser-token"
+    )]
     api_key: Option<String>,
     #[serde(rename = "tag", alias = "Tag")]
     tag: Option<String>,
+    #[serde(rename = "Fields", default)]
+    fields: Option<String>,
 }
 
 async fn require_emby_token(
@@ -1703,6 +1721,7 @@ async fn require_emby_user(
     let query = EmbyTokenQuery {
         api_key: api_key.map(str::to_owned),
         tag: None,
+        fields: None,
     };
     require_emby_user_with_query(headers, state, &query).await
 }
@@ -1750,7 +1769,16 @@ async fn emby_logout(
 
 #[derive(Deserialize, Default)]
 struct EmbyItemsQuery {
-    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey", default)]
+    #[serde(
+        rename = "api_key",
+        alias = "apiKey",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token",
+        alias = "X-MediaBrowser-Token",
+        alias = "x-media-browser-token",
+        default
+    )]
     api_key: Option<String>,
     #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
     user_id: Option<String>,
@@ -1788,7 +1816,16 @@ struct EmbyItemsQuery {
 
 #[derive(Deserialize, Default)]
 struct EmbyItemCountsQuery {
-    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey", default)]
+    #[serde(
+        rename = "api_key",
+        alias = "apiKey",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token",
+        alias = "X-MediaBrowser-Token",
+        alias = "x-media-browser-token",
+        default
+    )]
     api_key: Option<String>,
     #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
     user_id: Option<String>,
@@ -2932,7 +2969,14 @@ async fn emby_item(
         Err(status) => return status.into_response(),
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_item_response(&state, principal, &item_id, user.can_download).await
+    emby_item_response(
+        &state,
+        principal,
+        &item_id,
+        user.can_download,
+        query.fields.as_deref(),
+    )
+    .await
 }
 
 async fn emby_user_item(
@@ -2949,7 +2993,14 @@ async fn emby_user_item(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_item_response(&state, principal, &item_id, user.can_download).await
+    emby_item_response(
+        &state,
+        principal,
+        &item_id,
+        user.can_download,
+        query.fields.as_deref(),
+    )
+    .await
 }
 
 async fn emby_item_response(
@@ -2957,6 +3008,7 @@ async fn emby_item_response(
     principal: AccessPrincipal,
     item_id: &str,
     can_download: bool,
+    fields: Option<&str>,
 ) -> Response {
     if item_id == principal.user_id.to_string() {
         return emby_user_root_response(state, principal).await;
@@ -3013,12 +3065,15 @@ async fn emby_item_response(
                 Ok(state) => state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            let mut item_json = emby_catalog_item_json_with_state(
+            let aspect_ratio = emby_primary_image_aspect_ratio(state, principal, &item.id).await;
+            let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,
                 user_state.as_ref(),
                 can_download,
-                None,
+                fields,
+                aspect_ratio,
+                true,
             );
             let actors = match state.people.as_ref() {
                 Some(people) => match people.list_item_actors(&item.id).await {
@@ -3919,6 +3974,26 @@ fn emby_catalog_item_json_with_state(
     can_download: bool,
     fields: Option<&str>,
 ) -> Value {
+    emby_catalog_item_json_with_state_and_aspect_ratio(
+        item,
+        server_id,
+        user_state,
+        can_download,
+        fields,
+        None,
+        false,
+    )
+}
+
+fn emby_catalog_item_json_with_state_and_aspect_ratio(
+    item: &CatalogItem,
+    server_id: &str,
+    user_state: Option<&crate::storage::StoredUserItemState>,
+    can_download: bool,
+    fields: Option<&str>,
+    primary_image_aspect_ratio: Option<f64>,
+    include_top_level_media_streams: bool,
+) -> Value {
     let default_source = item
         .media_sources
         .iter()
@@ -4074,6 +4149,9 @@ fn emby_catalog_item_json_with_state(
             ("ChildCount".to_owned(), json!(child_count)),
             ("RecursiveItemCount".to_owned(), json!(recursive_item_count)),
         ]);
+        if let Some(aspect_ratio) = primary_image_aspect_ratio {
+            object.insert("PrimaryImageAspectRatio".to_owned(), json!(aspect_ratio));
+        }
     } else {
         if emby_fields_include(fields, "BasicSyncInfo") {
             object.insert("SupportsSync".to_owned(), json!(false));
@@ -4132,8 +4210,18 @@ fn emby_catalog_item_json_with_state(
                     .map(|value| json!(value)),
             );
         }
+        if emby_fields_include(fields, "PrimaryImageAspectRatio") {
+            emby_insert_optional(
+                &mut object,
+                "PrimaryImageAspectRatio",
+                primary_image_aspect_ratio.map(|value| json!(value)),
+            );
+        }
     }
     let mut value = Value::Object(object);
+    let include_media_streams = fields.is_none()
+        || emby_fields_include(fields, "MediaStreams")
+        || (include_top_level_media_streams && emby_fields_include(fields, "MediaSources"));
     if emby_fields_include(fields, "MediaSources")
         && let Value::Object(object) = &mut value
     {
@@ -4146,12 +4234,22 @@ fn emby_catalog_item_json_with_state(
                         emby_media_source_json_with_resolver_and_chapters(
                             &item.id,
                             source,
-                            emby_fields_include(fields, "MediaStreams"),
+                            include_media_streams,
                             false,
                             emby_fields_include(fields, "Chapters"),
                         )
                     })
                     .collect(),
+            ),
+        );
+    }
+    if include_top_level_media_streams && let Value::Object(object) = &mut value {
+        object.insert(
+            "MediaStreams".to_owned(),
+            Value::Array(
+                default_source
+                    .map(|source| source.streams.iter().map(emby_media_stream_json).collect())
+                    .unwrap_or_default(),
             ),
         );
     }
@@ -4178,6 +4276,42 @@ fn emby_insert_optional(
     if let Some(value) = value {
         object.insert(key.to_owned(), value);
     }
+}
+
+async fn emby_primary_image_aspect_ratio(
+    state: &AppState,
+    principal: AccessPrincipal,
+    item_id: &str,
+) -> Option<f64> {
+    if let Some((width, height)) = state
+        .database
+        .as_ref()?
+        .find_primary_image_dimensions(item_id)
+        .await
+        .ok()?
+    {
+        if width > 0 && height > 0 {
+            return Some(f64::from(width) / f64::from(height));
+        }
+    }
+
+    let images = state.images.as_ref()?;
+    let image = images
+        .resolve(principal, item_id, "POSTER", 0)
+        .await
+        .ok()??;
+    let dimensions = read_image_dimensions(&image.path).await?;
+    let width = dimensions.0;
+    let height = dimensions.1;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    if let Some(database) = state.database.as_ref() {
+        let _ = database
+            .set_item_image_dimensions(item_id, "POSTER", 0, width, height)
+            .await;
+    }
+    Some(f64::from(width) / f64::from(height))
 }
 
 fn emby_datetime(value: Option<&str>) -> Option<Value> {
@@ -4282,6 +4416,7 @@ fn emby_media_source_json_with_resolver_and_chapters(
     let is_remote_playback = is_remote || is_resolver_target;
     let mut value = json!({
         "Id": source.id,
+        "ItemId": item_id,
         "Name": source.edition_name,
         "Edition": source.edition_name,
         "Quality": source.quality_label,
@@ -4299,6 +4434,26 @@ fn emby_media_source_json_with_resolver_and_chapters(
         "SupportsDirectStream": false,
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
+        "DefaultAudioStreamIndex": source
+            .streams
+            .iter()
+            .find(|stream| stream.stream_type == "AUDIO" && stream.is_default)
+            .or_else(|| {
+                source
+                    .streams
+                    .iter()
+                    .find(|stream| stream.stream_type == "AUDIO")
+            })
+            .map(|stream| stream.index),
+        "Formats": [],
+        "HasMixedProtocols": false,
+        "IsInfiniteStream": false,
+        "ReadAtNativeFramerate": false,
+        "RequiredHttpHeaders": {},
+        "RequiresClosing": false,
+        "RequiresOpening": false,
+        "RequiresLooping": false,
+        "AddApiKeyToDirectStreamUrl": false,
     });
     if include_chapters && let Value::Object(object) = &mut value {
         object.insert(
@@ -4351,10 +4506,97 @@ fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -
     });
     if let Value::Object(object) = &mut value {
         for (key, detail) in &stream.details {
-            object.entry(key.clone()).or_insert_with(|| detail.clone());
+            let Some(detail) = normalize_emby_media_stream_detail(key, detail) else {
+                continue;
+            };
+            object.entry(key.clone()).or_insert(detail);
         }
     }
     value
+}
+
+fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Option<Value> {
+    const INTEGER_FIELDS: [&str; 9] = [
+        "BitRate",
+        "BitDepth",
+        "RefFrames",
+        "Height",
+        "Width",
+        "Level",
+        "Channels",
+        "SampleRate",
+        "AttachmentSize",
+    ];
+    const FLOAT_FIELDS: [&str; 2] = ["AverageFrameRate", "RealFrameRate"];
+    const BOOLEAN_FIELDS: [&str; 3] = ["IsInterlaced", "IsHearingImpaired", "IsTextSubtitleStream"];
+
+    if INTEGER_FIELDS
+        .iter()
+        .any(|field| key.eq_ignore_ascii_case(field))
+    {
+        return emby_integer_value(value);
+    }
+    if FLOAT_FIELDS
+        .iter()
+        .any(|field| key.eq_ignore_ascii_case(field))
+    {
+        return emby_frame_rate_value(value);
+    }
+    if BOOLEAN_FIELDS
+        .iter()
+        .any(|field| key.eq_ignore_ascii_case(field))
+    {
+        return emby_boolean_value(value);
+    }
+    (!value.is_null()).then(|| value.clone())
+}
+
+fn emby_integer_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Number(value) if value.as_i64().is_some() => Some(Value::Number(value.clone())),
+        Value::String(value) => value.trim().parse::<i64>().ok().map(Value::from),
+        _ => None,
+    }
+}
+
+fn emby_frame_rate_value(value: &Value) -> Option<Value> {
+    let number = match value {
+        Value::Number(value) => value.as_f64()?,
+        Value::String(value) => {
+            let value = value.trim();
+            if let Some((numerator, denominator)) = value.split_once('/') {
+                let numerator = numerator.trim().parse::<f64>().ok()?;
+                let denominator = denominator.trim().parse::<f64>().ok()?;
+                if denominator == 0.0 {
+                    return None;
+                }
+                numerator / denominator
+            } else {
+                value.parse::<f64>().ok()?
+            }
+        }
+        _ => return None,
+    };
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    if number.fract() == 0.0 && number <= i64::MAX as f64 {
+        return Some(Value::from(number as i64));
+    }
+    serde_json::Number::from_f64(number).map(Value::Number)
+}
+
+fn emby_boolean_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Bool(value) => Some(Value::Bool(*value)),
+        Value::Number(value) => value.as_i64().map(|value| Value::Bool(value != 0)),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(Value::Bool(true)),
+            "false" | "0" | "no" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count: i64) -> Value {
@@ -5741,7 +5983,15 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
 
 #[derive(Deserialize, Default)]
 struct EmbySearchQuery {
-    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey")]
+    #[serde(
+        rename = "api_key",
+        alias = "apiKey",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token",
+        alias = "X-MediaBrowser-Token",
+        alias = "x-media-browser-token"
+    )]
     api_key: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
@@ -7026,7 +7276,15 @@ async fn emby_subtitle_without_source(
 
 #[derive(Deserialize, Default)]
 struct EmbyStreamQuery {
-    #[serde(rename = "api_key", alias = "apiKey", alias = "ApiKey")]
+    #[serde(
+        rename = "api_key",
+        alias = "apiKey",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token",
+        alias = "X-MediaBrowser-Token",
+        alias = "x-media-browser-token"
+    )]
     api_key: Option<String>,
     #[serde(alias = "mediaSourceId", alias = "MediaSourceId")]
     media_source_id: Option<String>,
@@ -14176,11 +14434,11 @@ mod tests {
     use super::{
         CatalogSort, MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
         catalog_filter_from_emby, emby_media_source_json, emby_media_source_json_with_resolver,
-        emby_media_stream_item_id, emby_playback_info_item_id, is_catalog_aggregation_path,
-        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
-        is_emby_subtitle_path, is_emby_video_path, is_registered_emby_video_path,
-        lux_catalog_source_json, metadata_candidate_failure_kind, playback_client_label,
-        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
+        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
+        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
+        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
+        playback_client_label, playback_identifier_prefix, record_activity_event, safe_trace_path,
         secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
@@ -14544,6 +14802,44 @@ mod tests {
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);
         assert_eq!(body["MediaStreams"][0]["Height"], 1080);
         assert_eq!(body["MediaStreams"][0]["Profile"], "High");
+    }
+
+    #[test]
+    fn emby_media_streams_use_numeric_and_boolean_json_types() {
+        let stream = CatalogStream {
+            index: 0,
+            stream_type: "VIDEO".to_owned(),
+            codec: Some("h264".to_owned()),
+            language: None,
+            title: Some("1080p H264".to_owned()),
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details: BTreeMap::from([
+                ("Width".to_owned(), serde_json::json!("1920")),
+                ("BitDepth".to_owned(), serde_json::json!("8")),
+                ("AverageFrameRate".to_owned(), serde_json::json!("24/1")),
+                ("RealFrameRate".to_owned(), serde_json::json!("24000/1001")),
+                ("IsInterlaced".to_owned(), serde_json::json!("false")),
+                ("Profile".to_owned(), serde_json::json!("High")),
+            ]),
+        };
+
+        let body = emby_media_stream_json(&stream);
+
+        assert_eq!(body["Width"], 1920);
+        assert_eq!(body["BitDepth"], 8);
+        assert_eq!(body["AverageFrameRate"], 24);
+        assert!(
+            (body["RealFrameRate"]
+                .as_f64()
+                .expect("frame rate should be numeric")
+                - (24_000.0 / 1_001.0))
+                .abs()
+                < 0.000_001
+        );
+        assert_eq!(body["IsInterlaced"], false);
+        assert_eq!(body["Profile"], "High");
     }
 
     #[test]

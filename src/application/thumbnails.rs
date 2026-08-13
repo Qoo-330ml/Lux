@@ -11,9 +11,9 @@ use tokio::{fs, process::Command, time::timeout};
 use uuid::Uuid;
 
 use crate::{
-    application::images::write_image_atomically,
+    application::images::{read_image_dimensions_from_bytes, write_image_atomically},
     domain::ids::LibraryId,
-    storage::{Database, StorageError, StoredThumbnailSource},
+    storage::{Database, ItemImageMetadata, StorageError, StoredThumbnailSource},
 };
 
 const DEFAULT_FRAME: &str = "00:03:01";
@@ -190,8 +190,20 @@ impl ThumbnailService {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
+        let dimensions = read_image_dimensions_from_bytes(&bytes).await;
         self.database
-            .upsert_item_image(item_id, "THUMB", path, file_size, &content_tag, "FFMPEG")
+            .upsert_item_image(
+                item_id,
+                "THUMB",
+                path,
+                ItemImageMetadata {
+                    file_size,
+                    width: dimensions.map(|(width, _)| width),
+                    height: dimensions.map(|(_, height)| height),
+                    content_tag: &content_tag,
+                    source: "FFMPEG",
+                },
+            )
             .await
             .map(|_| ())
             .map_err(ThumbnailFileError::Storage)

@@ -10,6 +10,7 @@ use tokio::fs;
 use crate::{
     application::scanner::compute_file_fingerprint,
     application::{
+        images::read_image_dimensions,
         nfo::{
             LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
             parse_local_nfo_projection,
@@ -652,9 +653,17 @@ impl MetadataEnricher {
                     continue;
                 }
             };
+            let dimensions = read_image_dimensions(&image.path).await;
             match self
                 .database
-                .insert_item_image(item_id, image.image_type.as_str(), &image.path, file_size)
+                .insert_item_image(
+                    item_id,
+                    image.image_type.as_str(),
+                    &image.path,
+                    file_size,
+                    dimensions.map(|(width, _)| width),
+                    dimensions.map(|(_, height)| height),
+                )
                 .await
             {
                 Ok(true) => inserted_count += 1,
@@ -975,9 +984,17 @@ impl MetadataEnricher {
                     path: image.path.clone(),
                     size: file_size,
                 })?;
+            let dimensions = read_image_dimensions(&image.path).await;
             if self
                 .database
-                .insert_item_image(item_id, image.image_type.as_str(), &image.path, file_size)
+                .insert_item_image(
+                    item_id,
+                    image.image_type.as_str(),
+                    &image.path,
+                    file_size,
+                    dimensions.map(|(width, _)| width),
+                    dimensions.map(|(_, height)| height),
+                )
                 .await?
             {
                 inserted_count += 1;

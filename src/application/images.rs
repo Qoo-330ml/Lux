@@ -24,10 +24,39 @@ use crate::{
         tmdb_plugin::TmdbProvider,
     },
     network::client_builder_from_env_or,
-    storage::{Database, StorageError},
+    storage::{Database, ItemImageMetadata, StorageError},
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+
+pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        image::image_dimensions(path)
+            .ok()
+            .and_then(|(width, height)| {
+                Some((i32::try_from(width).ok()?, i32::try_from(height).ok()?))
+            })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+pub(crate) async fn read_image_dimensions_from_bytes(bytes: &[u8]) -> Option<(i32, i32)> {
+    let bytes = bytes.to_owned();
+    tokio::task::spawn_blocking(move || {
+        image::load_from_memory(&bytes).ok().and_then(|image| {
+            Some((
+                i32::try_from(image.width()).ok()?,
+                i32::try_from(image.height()).ok()?,
+            ))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
 #[derive(Clone, Debug)]
 pub struct ImageDownloadConfig {
@@ -400,15 +429,20 @@ impl ImageWriteService {
             max: i64::MAX as u64,
         })?;
         let content_tag = content_tag(&body);
+        let dimensions = read_image_dimensions(&target).await;
         let id = self
             .database
             .upsert_item_image(
                 item_id,
                 image_type,
                 &target,
-                file_size,
-                &content_tag,
-                source,
+                ItemImageMetadata {
+                    file_size,
+                    width: dimensions.map(|(width, _)| width),
+                    height: dimensions.map(|(_, height)| height),
+                    content_tag: &content_tag,
+                    source,
+                },
             )
             .await?;
         Ok(ImageWriteReport {

@@ -108,6 +108,16 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(resume_body["TotalRecordCount"], 1);
     assert_eq!(resume_body["Items"][0]["Id"], eligible_id);
 
+    let filmly_resume = client
+        .get(format!("{base_url}/emby/Users/{admin_id}/Items/Resume"))
+        .query(&[("X-Emby-Token", token.as_str()), ("Limit", "10")])
+        .send()
+        .await?;
+    assert_eq!(filmly_resume.status(), reqwest::StatusCode::OK);
+    let filmly_resume_body = filmly_resume.json::<Value>().await?;
+    assert_eq!(filmly_resume_body["TotalRecordCount"], 1);
+    assert_eq!(filmly_resume_body["Items"][0]["Id"], eligible_id);
+
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))

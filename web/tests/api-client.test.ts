@@ -450,7 +450,7 @@ describe("LuxApiClient", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
       if (path === "/api/v1/admin/dashboard") {
-        return new Response(JSON.stringify({ server: { name: "Lux", version: "0.1.16" }, health: {}, nowPlaying: [], activity: [] }), { status: 200 });
+        return new Response(JSON.stringify({ server: { name: "Lux", version: "0.1.17" }, health: {}, nowPlaying: [], activity: [] }), { status: 200 });
       }
       expect(path).toBe("/api/v1/admin/settings");
       expect(init?.method).toBe("PATCH");
@@ -465,7 +465,7 @@ describe("LuxApiClient", () => {
 
     const client = new LuxApiClient();
     await expect(client.adminDashboard()).resolves.toMatchObject({
-      server: { name: "Lux", version: "0.1.16" },
+      server: { name: "Lux", version: "0.1.17" },
       nowPlaying: [],
       activity: [],
     });
