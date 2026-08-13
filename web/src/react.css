@@ -180,7 +180,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-action svg { flex: 0 0 auto; color: rgba(255,255,255,.78); }
 
 .lux-media-editor-backdrop { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; padding: 24px; overflow-y: auto; background: rgba(0,0,0,.72); backdrop-filter: blur(8px); }
-.lux-media-editor { width: min(760px, 100%); max-height: min(820px, calc(100vh - 48px)); overflow: hidden; border: 1px solid var(--lux-line); border-radius: 16px; color: var(--lux-text); background: rgba(20,20,24,.98); box-shadow: 0 28px 80px rgba(0,0,0,.58); }
+.lux-media-editor { min-width: 0; width: min(760px, 100%); max-height: min(820px, calc(100vh - 48px)); max-height: min(820px, calc(100dvh - 48px)); overflow: hidden; border: 1px solid var(--lux-line); border-radius: 16px; color: var(--lux-text); background: rgba(20,20,24,.98); box-shadow: 0 28px 80px rgba(0,0,0,.58); }
 .lux-media-editor-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: var(--lux-dialog-header-padding); border-bottom: 1px solid var(--lux-line-soft); }
 .lux-media-editor-header h2 { margin: 8px 0 5px; color: #fff; font-size: 1.24rem; letter-spacing: -.035em; }
 .lux-media-editor-header p { margin: 0; overflow: hidden; color: var(--lux-muted); font-size: .78rem; text-overflow: ellipsis; white-space: nowrap; }
@@ -911,6 +911,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 @media (max-width: 560px) {
   .lux-header { padding: 14px 15px; }
+.lux-media-editor-backdrop { place-items: center; padding: 12px; }
+.lux-media-editor { width: calc(100vw - 24px); width: calc(100dvw - 24px); max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px); }
+.lux-media-editor-header { min-width: 0; gap: 12px; padding: 16px; }
+.lux-media-editor-header > div { min-width: 0; }
+.lux-media-editor-header h2 { margin-top: 4px; }
+.lux-media-editor-header p { white-space: normal; text-overflow: clip; overflow-wrap: anywhere; text-wrap: pretty; }
+.lux-media-editor-close { width: 44px; height: 44px; }
 .lux-back-button { display: none; }
   .lux-grid-button { display: none; }
   .lux-icon-button, .lux-user-button { min-width: 46px; height: 46px; }
@@ -1218,6 +1225,23 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-library-management-toolbar > div { justify-content: center; flex-wrap: wrap; }
   .lux-admin-library-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
   .lux-admin-library-overflow { opacity: 1; transform: none; }
+  .lux-library-action-menu {
+    position: fixed;
+    z-index: 50;
+    top: auto;
+    right: 16px;
+    bottom: calc(16px + env(safe-area-inset-bottom));
+    width: min(320px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px - env(safe-area-inset-bottom));
+    max-height: calc(100dvh - 32px - env(safe-area-inset-bottom));
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    -webkit-overflow-scrolling: touch;
+  }
+  .lux-library-action-menu-heading { position: sticky; z-index: 1; top: 0; background: rgba(30,30,35,.98); backdrop-filter: blur(18px); }
+  .lux-library-action-menu button { min-height: 44px; }
   .lux-library-dialog-header, .lux-library-dialog-scroll { padding-right: 16px; padding-left: 16px; }
   .lux-library-dialog-form { padding-right: 16px; padding-left: 16px; }
   .lux-library-strategy-heading { align-items: flex-start; flex-direction: column; }
