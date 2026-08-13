@@ -91,15 +91,6 @@ impl UserStore {
         update: UserUpdate<'_>,
     ) -> Result<Option<UserRecord>, UserStoreError> {
         let username_normalized = update.username.map(normalize_username).transpose()?;
-        if let Some(username) = username_normalized.as_deref()
-            && self
-                .database
-                .find_user_by_username(username)
-                .await?
-                .is_some_and(|user| user.id != user_id)
-        {
-            return Err(UserStoreError::UsernameAlreadyExists);
-        }
         let password_hash = update
             .password
             .filter(|password| !password.is_empty())
@@ -124,6 +115,9 @@ impl UserStore {
         {
             Ok(updated) => updated,
             Err(StorageError::LastManager) => return Err(UserStoreError::LastManager),
+            Err(StorageError::UsernameAlreadyExists) => {
+                return Err(UserStoreError::UsernameAlreadyExists);
+            }
             Err(error) => return Err(UserStoreError::Storage(error)),
         };
         updated.map(user_record).transpose()

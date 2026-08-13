@@ -414,6 +414,24 @@ impl Database {
         let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
         let next_disabled = update.is_disabled.unwrap_or(current_disabled);
         let next_can_manage = update.can_manage_server.unwrap_or(current_can_manage);
+        if let Some(username) = update.username_normalized {
+            let username_exists: i64 = self
+                .query_scalar(
+                    "SELECT COUNT(*) FROM users
+                     WHERE username_normalized = ? AND id != ?",
+                )
+                .bind(username)
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if username_exists > 0 {
+                return Err(StorageError::UsernameAlreadyExists);
+            }
+        }
         let is_disabled = update.is_disabled.map(database_flag);
         let is_admin = update.is_admin.map(database_flag);
         let can_manage_server = update.can_manage_server.map(database_flag);
@@ -11442,6 +11460,7 @@ pub enum StorageError {
         path: PathBuf,
         source: MigrateError,
     },
+    UsernameAlreadyExists,
     LastManager,
 }
 
@@ -11462,6 +11481,7 @@ impl std::fmt::Display for StorageError {
                     path.display()
                 )
             }
+            Self::UsernameAlreadyExists => formatter.write_str("username already exists"),
             Self::LastManager => {
                 formatter.write_str("at least one active server manager is required")
             }
@@ -11514,7 +11534,7 @@ impl std::error::Error for StorageError {
             Self::Io { source, .. } => Some(source),
             Self::Sqlx { source, .. } => Some(source),
             Self::Migration { source, .. } => Some(source),
-            Self::LastManager => None,
+            Self::UsernameAlreadyExists | Self::LastManager => None,
         }
     }
 }

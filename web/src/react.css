@@ -723,6 +723,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-user-badge.is-warn { border-color: rgba(226,163,75,.25); color: #f3c788; background: rgba(226,163,75,.09); }
 .lux-admin-user-actions { display: flex; align-items: center; gap: 7px; }
 .lux-admin-user-detail { grid-column: 1 / -1; display: grid; gap: 17px; padding: 17px 0 2px; border-top: 1px solid var(--lux-line-soft); }
+.lux-admin-user-identity { display: grid; gap: 10px; }
+.lux-admin-user-identity-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)) auto; align-items: end; gap: 10px; }
+.lux-admin-user-identity-fields label { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
+.lux-admin-user-identity-fields input { min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
 .lux-admin-permission-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .lux-admin-permission-toggle { display: flex; align-items: center; gap: 8px; min-height: 39px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); font-size: .75rem; cursor: pointer; }
 .lux-admin-permission-toggle input { position: absolute; opacity: 0; pointer-events: none; }
@@ -998,6 +1002,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-user-actions { justify-content: flex-end; }
   .lux-admin-permission-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lux-admin-password-row { align-items: stretch; flex-direction: column; }
+  .lux-admin-user-identity-fields { grid-template-columns: 1fr; }
   .lux-admin-metadata-heading { flex-direction: column; }
   .lux-admin-metadata-actions { display: grid; grid-template-columns: 1fr 1fr; }
   .lux-admin-metadata-actions .lux-button:last-child { grid-column: 1 / -1; }
@@ -1588,6 +1593,7 @@ html[data-lux-theme="light"] .lux-admin-form select,
 html[data-lux-theme="light"] .lux-admin-schedule-field input,
 html[data-lux-theme="light"] .lux-admin-root-form input,
 html[data-lux-theme="light"] .lux-admin-password-row input,
+html[data-lux-theme="light"] .lux-admin-user-identity-fields input,
 html[data-lux-theme="light"] .lux-admin-filter-select,
 html[data-lux-theme="light"] .lux-admin-input-with-suffix,
 html[data-lux-theme="light"] .lux-admin-settings-form > label > input[type="url"] { color: var(--lux-text); background: rgba(28,28,34,.035); }
