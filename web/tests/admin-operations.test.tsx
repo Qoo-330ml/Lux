@@ -79,6 +79,58 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).not.toContain("METADATA_REIDENTIFY_STARTED");
   });
 
+  it("shows a readable failure summary and loads per-item metadata failure details on demand", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({
+      jobs: [{
+        id: "metadata-job-failed",
+        status: "FAILED",
+        mode: "FILL_MISSING",
+        processedCount: 2,
+        totalCount: 2,
+        error: "METADATA_BATCH_PARTIAL_FAILURE",
+        createdAt: 1_700_000_000,
+        libraryId: "library-1",
+      }],
+    });
+    const getJob = vi.spyOn(api, "adminMetadataReidentifyJob").mockResolvedValue({
+      job: {
+        id: "metadata-job-failed",
+        status: "FAILED",
+        mode: "FILL_MISSING",
+        processedCount: 2,
+        totalCount: 2,
+        error: "METADATA_BATCH_PARTIAL_FAILURE",
+        createdAt: 1_700_000_000,
+        libraryId: "library-1",
+        items: [
+          { jobId: "metadata-job-failed", itemId: "movie-1", status: "FAILED", candidateCount: 1, error: "METADATA_IMAGE_WRITE_FAILED", updatedAt: 1_700_000_001 },
+          { jobId: "metadata-job-failed", itemId: "movie-2", status: "FAILED", candidateCount: 0, error: "TMDB_UNAVAILABLE", updatedAt: 1_700_000_002 },
+        ],
+      },
+    });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+
+    expect(container.textContent).toContain("任务处理失败（METADATA_BATCH_PARTIAL_FAILURE）");
+    expect(container.querySelector(".lux-admin-job-error")?.textContent).toContain("失败原因");
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="查看元数据仅补全失败详情"]')?.click();
+      await vi.waitFor(() => expect(getJob).toHaveBeenCalledWith("metadata-job-failed"));
+    });
+    expect(container.textContent).toContain("失败条目 2 个");
+    expect(container.textContent).toContain("图片下载或写回失败");
+    expect(container.textContent).toContain("TMDb 服务暂时不可用");
+    expect(container.textContent).toContain("movie-1");
+  });
+
   it("exports a selected UTC log date range from the system log tab", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
