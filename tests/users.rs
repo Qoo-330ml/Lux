@@ -165,6 +165,7 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .header(COOKIE, &cookie)
         .header("x-csrf-token", &csrf)
         .json(&json!({
+            "username": "Managed Renamed",
             "displayName": "Managed Updated",
             "password": "new managed password",
             "isAdmin": true,
@@ -176,6 +177,7 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .await?;
     assert_eq!(updated.status(), reqwest::StatusCode::OK);
     let updated_user = updated.json::<Value>().await?["user"].clone();
+    assert_eq!(updated_user["usernameNormalized"], "managed renamed");
     assert_eq!(updated_user["displayName"], "Managed Updated");
     assert_eq!(updated_user["canDownload"], true);
     assert_eq!(updated_user["canRemoteAccess"], true);
@@ -183,12 +185,34 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
     let managed_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({
-            "username": "managed",
+            "username": "managed renamed",
             "password": "new managed password"
         }))
         .send()
         .await?;
     assert_eq!(managed_login.status(), reqwest::StatusCode::OK);
+
+    let old_username_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "managed",
+            "password": "new managed password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        old_username_login.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let duplicate_username = client
+        .patch(format!("{base_url}/api/v1/admin/users/{created_id}"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "username": "regular" }))
+        .send()
+        .await?;
+    assert_eq!(duplicate_username.status(), reqwest::StatusCode::CONFLICT);
     let manager_cookie = cookie_pair(managed_login.headers());
     let manager_csrf = cookie_value(managed_login.headers(), "lux_csrf");
 

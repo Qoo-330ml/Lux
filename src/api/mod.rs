@@ -11432,6 +11432,7 @@ async fn admin_create_user(
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct UpdateUserRequest {
+    username: Option<String>,
     display_name: Option<String>,
     password: Option<String>,
     is_disabled: Option<bool>,
@@ -11461,6 +11462,7 @@ async fn admin_update_user(
         .update_user(
             &user_id,
             UserUpdate {
+                username: request.username.as_deref(),
                 display_name: request.display_name.as_deref(),
                 password: request.password.as_deref(),
                 is_disabled: request.is_disabled,
@@ -11557,6 +11559,13 @@ fn user_store_error(headers: &HeaderMap, error: UserStoreError) -> Response {
             StatusCode::CONFLICT,
             lux::ApiErrorCode::PermissionDenied,
             "至少需要一个启用的服务器管理账户",
+        )
+        .into_response(),
+        UserStoreError::UsernameAlreadyExists => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户名已被使用",
         )
         .into_response(),
         UserStoreError::InvalidUserId(_) => api_error(

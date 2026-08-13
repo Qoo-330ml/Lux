@@ -90,6 +90,16 @@ impl UserStore {
         user_id: &str,
         update: UserUpdate<'_>,
     ) -> Result<Option<UserRecord>, UserStoreError> {
+        let username_normalized = update.username.map(normalize_username).transpose()?;
+        if let Some(username) = username_normalized.as_deref()
+            && self
+                .database
+                .find_user_by_username(username)
+                .await?
+                .is_some_and(|user| user.id != user_id)
+        {
+            return Err(UserStoreError::UsernameAlreadyExists);
+        }
         let password_hash = update
             .password
             .filter(|password| !password.is_empty())
@@ -100,6 +110,7 @@ impl UserStore {
             .update_user(
                 user_id,
                 UpdateUser {
+                    username_normalized: username_normalized.as_deref(),
                     display_name: update.display_name,
                     password_hash: password_hash.as_deref(),
                     is_disabled: update.is_disabled,
@@ -210,6 +221,7 @@ fn normalized_display_name(display_name: &str, username_normalized: &str) -> Str
 #[derive(Debug)]
 pub enum UserStoreError {
     InvalidUsername,
+    UsernameAlreadyExists,
     InvalidUserId(String),
     SetupAlreadyCompleted,
     Password(PasswordError),
@@ -233,6 +245,7 @@ impl std::fmt::Display for UserStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidUsername => formatter.write_str("username must be 1-128 characters"),
+            Self::UsernameAlreadyExists => formatter.write_str("username already exists"),
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::SetupAlreadyCompleted => {
                 formatter.write_str("initial setup has already completed")
@@ -252,6 +265,7 @@ impl std::error::Error for UserStoreError {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::InvalidUsername
+            | Self::UsernameAlreadyExists
             | Self::InvalidUserId(_)
             | Self::SetupAlreadyCompleted
             | Self::LastManager => None,
@@ -261,6 +275,7 @@ impl std::error::Error for UserStoreError {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UserUpdate<'a> {
+    pub username: Option<&'a str>,
     pub display_name: Option<&'a str>,
     pub password: Option<&'a str>,
     pub is_disabled: Option<bool>,

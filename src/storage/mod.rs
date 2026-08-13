@@ -438,7 +438,8 @@ impl Database {
         }
         self.query(
             "UPDATE users
-             SET display_name = COALESCE(?, display_name),
+             SET username_normalized = COALESCE(?, username_normalized),
+                 display_name = COALESCE(?, display_name),
                  password_hash = COALESCE(?, password_hash),
                  is_disabled = COALESCE(?, is_disabled),
                  is_admin = COALESCE(?, is_admin),
@@ -448,6 +449,7 @@ impl Database {
                  updated_at = unixepoch()
              WHERE id = ?",
         )
+        .bind(update.username_normalized)
         .bind(update.display_name)
         .bind(update.password_hash)
         .bind(is_disabled)
@@ -458,9 +460,19 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
+        .map_err(|source| {
+            if update.username_normalized.is_some()
+                && source
+                    .as_database_error()
+                    .is_some_and(|error| error.is_unique_violation())
+            {
+                StorageError::UsernameAlreadyExists
+            } else {
+                StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                }
+            }
         })?;
         transaction
             .commit()
@@ -10029,6 +10041,7 @@ fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
 }
 
 pub(crate) struct UpdateUser<'a> {
+    pub(crate) username_normalized: Option<&'a str>,
     pub(crate) display_name: Option<&'a str>,
     pub(crate) password_hash: Option<&'a str>,
     pub(crate) is_disabled: Option<bool>,
