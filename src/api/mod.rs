@@ -6789,6 +6789,19 @@ async fn emby_image(
     {
         return response;
     }
+    if let Some(response) = serve_emby_person_item_image(
+        &state,
+        &headers,
+        &method,
+        &item_id,
+        &image_type,
+        0,
+        query.tag.as_deref(),
+    )
+    .await
+    {
+        return response;
+    }
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -6871,6 +6884,19 @@ async fn emby_image_at_index(
     {
         return response;
     }
+    if let Some(response) = serve_emby_person_item_image(
+        &state,
+        &headers,
+        &method,
+        &item_id,
+        &image_type,
+        image_index,
+        query.tag.as_deref(),
+    )
+    .await
+    {
+        return response;
+    }
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -6911,6 +6937,41 @@ async fn emby_image_at_index(
             .await
         }
     }
+}
+
+async fn serve_emby_person_item_image(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &Method,
+    item_id: &str,
+    image_type: &str,
+    image_index: i64,
+    tag: Option<&str>,
+) -> Option<Response> {
+    if image_index != 0 || normalize_image_type(image_type) != Some("POSTER") {
+        return None;
+    }
+    let expected_tag = emby_person_image_tag(item_id);
+    if tag.filter(|tag| !tag.is_empty()) != Some(expected_tag.as_str()) {
+        return None;
+    }
+    let people = state.people.as_ref()?;
+    let image = match people.profile_image_for_emby_name_or_id(item_id).await {
+        Ok(Some(image)) => image,
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => return None,
+        Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    };
+    Some(
+        serve_image_file(
+            &image.path,
+            image.content_type,
+            image.content_length,
+            &format!("\"{expected_tag}\""),
+            headers,
+            method,
+        )
+        .await,
+    )
 }
 
 async fn emby_subtitle_with_source(

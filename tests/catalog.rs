@@ -659,7 +659,9 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(user_scoped_detail_body["People"][0]["Id"], "9");
     assert_eq!(user_scoped_detail_body["People"][0]["Role"], "角色甲");
     assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Actor");
-    assert!(user_scoped_detail_body["People"][0]["PrimaryImageTag"].is_string());
+    let person_image_tag = user_scoped_detail_body["People"][0]["PrimaryImageTag"]
+        .as_str()
+        .ok_or("missing person image tag")?;
 
     let person_image_response = client
         .get(format!("{base_url}/emby/Persons/9/Images/Primary"))
@@ -677,6 +679,24 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .await?;
     assert_eq!(person_name_image_response.status(), reqwest::StatusCode::OK);
     assert_eq!(person_name_image_response.bytes().await?.as_ref(), PNG_1X1);
+
+    let person_item_image_url = format!(
+        "{base_url}/emby/Items/9/Images/Primary?tag={person_image_tag}&maxWidth=183&maxHeight=273"
+    );
+    let person_item_image_response = client.get(&person_item_image_url).send().await?;
+    assert_eq!(person_item_image_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        person_item_image_response.headers()["content-type"],
+        "image/png"
+    );
+    assert_eq!(person_item_image_response.bytes().await?.as_ref(), PNG_1X1);
+
+    let person_item_image_head = client.head(person_item_image_url).send().await?;
+    assert_eq!(person_item_image_head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        person_item_image_head.headers()["content-type"],
+        "image/png"
+    );
 
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
