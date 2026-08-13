@@ -141,6 +141,26 @@ describe("LuxShell user control", () => {
     expect(container.querySelector(".lux-grid-button")).toBeNull();
   });
 
+  it("keeps mobile navigation items visually consistent with icons and touch-sized rows", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LuxShell user={{ id: "user-1", usernameNormalized: "test", displayName: "test", canManageServer: true }} />
+        </MemoryRouter>,
+      );
+    });
+    act(() => container.querySelector<HTMLButtonElement>(".lux-menu-button")?.click());
+
+    const links = Array.from(container.querySelectorAll<HTMLAnchorElement>(".lux-mobile-nav-link"));
+    expect(links).toHaveLength(4);
+    expect(links.every((link) => link.querySelector("svg") && link.className.includes("lux-mobile-nav-link"))).toBe(true);
+    expect(links.every((link) => link.textContent?.trim())).toBe(true);
+  });
+
   it("hides the back button on the home page", () => {
     container = document.createElement("div");
     document.body.append(container);

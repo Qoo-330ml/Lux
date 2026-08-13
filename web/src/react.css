@@ -879,9 +879,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-header { padding: 18px 20px; }
   .lux-desktop-nav { display: none; }
   .lux-menu-button { display: inline-grid; }
-  .lux-mobile-nav { position: fixed; z-index: 25; top: var(--lux-header-height); right: 20px; display: grid; min-width: 180px; gap: 4px; padding: 10px; border: 1px solid var(--lux-line); border-radius: 13px; background: rgba(19,19,23,.92); box-shadow: 0 18px 44px rgba(0,0,0,.4); backdrop-filter: blur(18px); }
-  .lux-mobile-nav .lux-nav-link { padding: 10px 12px; }
-  .lux-mobile-nav .lux-nav-link.is-active::after { display: none; }
+  .lux-mobile-nav { position: fixed; z-index: 25; top: var(--lux-header-height); right: 16px; display: grid; min-width: 214px; gap: 4px; padding: 8px; border: 1px solid var(--lux-line); border-radius: 16px; background: rgba(19,19,23,.94); box-shadow: 0 18px 44px rgba(0,0,0,.4); backdrop-filter: blur(18px); }
+  .lux-mobile-nav .lux-mobile-nav-link { display: flex; align-items: center; gap: 11px; min-height: 44px; padding: 0 13px; border: 1px solid transparent; border-radius: 10px; color: var(--lux-muted); font-size: .84rem; font-weight: 550; transition: color .18s ease, background .18s ease, border-color .18s ease; }
+  .lux-mobile-nav .lux-mobile-nav-link svg { flex: 0 0 auto; color: var(--lux-subtle); stroke-width: 1.8; }
+  .lux-mobile-nav .lux-mobile-nav-link:hover { color: #fff; background: rgba(255,255,255,.07); }
+  .lux-mobile-nav .lux-mobile-nav-link:hover svg { color: currentColor; }
+  .lux-mobile-nav .lux-mobile-nav-link.is-active { border-color: rgba(255,255,255,.12); color: #fff; background: rgba(255,255,255,.1); }
+  .lux-mobile-nav .lux-mobile-nav-link.is-active svg { color: #fff; }
   .lux-mobile-admin { display: flex; align-items: center; gap: 7px; padding: 10px 12px; border-top: 1px solid var(--lux-line-soft); color: var(--lux-subtle); font-size: .72rem; }
   .lux-hero { min-height: 680px; }
   .lux-hero-copy { margin-bottom: 74px; }
@@ -1430,9 +1434,13 @@ html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link.is-active { co
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-icon-button,
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-user-button { border-color: var(--lux-line); background: rgba(255,255,255,.66); }
 html[data-lux-theme="light"] .lux-mobile-nav { border-color: var(--lux-line); background: rgba(255,255,255,.96); box-shadow: 0 18px 44px rgba(30,30,38,.16); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link { color: var(--lux-muted); }
 html[data-lux-theme="light"] .lux-mobile-nav .lux-nav-link { color: var(--lux-muted); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link:hover { color: var(--lux-text); background: rgba(28,28,34,.06); }
 html[data-lux-theme="light"] .lux-mobile-nav .lux-nav-link:hover { color: var(--lux-text); background: rgba(28,28,34,.06); }
-html[data-lux-theme="light"] .lux-mobile-nav .lux-nav-link.is-active { color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link.is-active { border-color: var(--lux-line-soft); color: var(--lux-text); background: rgba(28,28,34,.08); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link svg { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link.is-active svg { color: var(--lux-text); }
 
 /* Detail pages use the same pale reading layer as the light home hero. */
 html[data-lux-theme="light"] .lux-detail-page { color: var(--lux-text); background: var(--lux-bg); }
