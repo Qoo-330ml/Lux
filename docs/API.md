@@ -139,7 +139,7 @@ Lux 电影查询要求有效 Web session：
 - `GET /api/v1/items/{itemId}`：返回媒体详情、媒体源和已探测轨道；若已完成在线刮削，还返回 `rating`（0-10）、`ratingSource`、`premiereDate`、`lastAirDate`、`status`、`originalLanguage`、`providerIds`、`seasonCount` 和 `episodeCount`。剧集统计字段使用当前可见且未移除的季度/单集计算。
 - `GET /api/v1/items/{itemId}/children?itemType=SEASON|EPISODE&seasonId=...`：Web 同源读取剧集季度/单集或合集成员，结果执行当前用户 ACL。媒体条目响应同时返回 `parentId`、`seriesId`、`parentIndexNumber`（季号）和 `indexNumber`（集号），用于保持剧集层级导航。
 - `GET /api/v1/collections/{collectionId}`：返回可访问 BOX_SET 及按媒体库 ACL 过滤后的成员。
-- `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；删除为禁用语义，最后一个服务器管理账户受保护。
+- `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；`PATCH` 可通过 `username` 修改登录用户名、通过 `displayName` 修改界面昵称，字段均可独立省略。用户名会去除首尾空白并转为小写，重复用户名返回 409；修改成功后旧用户名立即失效，新用户名沿用原密码。删除为禁用语义，最后一个服务器管理账户受保护。
 - `GET /api/v1/admin/users/{userId}/libraries`：读取该用户当前可访问的媒体库 ID，用于管理控制台展示 ACL；不返回服务器路径。
 - `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计事件。
 - `GET /api/v1/admin/jobs/{jobId}`：管理员读取单个扫描任务详情，包括状态、进度、游标和错误。
