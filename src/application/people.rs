@@ -319,7 +319,11 @@ impl PeopleService {
         if let Some(image_file) = image_file.as_deref()
             && !image_file.starts_with("legacy/")
         {
-            let image_path = person_dir.join(image_file);
+            let image_path = if image_file.starts_with("people/") {
+                metadata_root(&self.config_dir).join(image_file)
+            } else {
+                person_dir.join(image_file)
+            };
             let index_result = match image_path.strip_prefix(metadata_root(&self.config_dir)) {
                 Ok(relative) => {
                     let index = StoredPersonIndex {
@@ -671,11 +675,13 @@ impl PeopleService {
         // downloading the same profile again. The relation keeps
         // `imageFile` empty in this case; `profile_image` resolves the
         // canonical index independently of the title-specific directory.
-        if matches!(
-            self.profile_image_for_provider(Some(provider), person_id)
-                .await,
-            Ok(Some(_))
-        ) {
+        if let Ok(Some(image)) = self
+            .profile_image_for_provider(Some(provider), person_id)
+            .await
+        {
+            if let Ok(relative) = image.path.strip_prefix(metadata_root(&self.config_dir)) {
+                return Ok(Some(relative.to_string_lossy().into_owned()));
+            }
             return Ok(None);
         }
 
@@ -738,9 +744,36 @@ impl PeopleService {
                 "profile image payload is invalid".to_owned(),
             ));
         }
-        let path = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
-        write_atomically(&path, &bytes).await?;
-        Ok(Some(format!("{PERSON_IMAGE}.{extension}")))
+        Ok(Some(
+            self.store_shared_profile_asset(&bytes, extension).await?,
+        ))
+    }
+
+    async fn store_shared_profile_asset(
+        &self,
+        bytes: &[u8],
+        extension: &str,
+    ) -> Result<String, PeopleError> {
+        if !PROFILE_EXTENSIONS.contains(&extension) {
+            return Err(PeopleError::InvalidImage(
+                "unsupported profile image extension".to_owned(),
+            ));
+        }
+        let digest = Sha256::digest(bytes);
+        let mut encoded = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        let relative = format!("people/assets/{encoded}.{extension}");
+        let path = metadata_root(&self.config_dir).join(&relative);
+        let parent = path.parent().ok_or_else(|| {
+            PeopleError::Serialization("profile asset path has no parent".to_owned())
+        })?;
+        create_private_dir(parent).await?;
+        if safe_metadata(&path).await?.is_none() {
+            write_atomically(&path, bytes).await?;
+        }
+        Ok(relative)
     }
 }
 
@@ -1291,6 +1324,24 @@ mod tests {
         assert_eq!(actors.len(), 1);
         assert_eq!(actors[0].name, "本地演员");
         assert!(actors[0].image_url.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn profile_assets_are_content_addressed_and_reused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let first = service
+            .store_shared_profile_asset(b"same-image", "png")
+            .await?;
+        let second = service
+            .store_shared_profile_asset(b"same-image", "png")
+            .await?;
+
+        assert_eq!(first, second);
+        let shared_path = config.path().join("metadata").join(&first);
+        assert_eq!(tokio::fs::read(shared_path).await?, b"same-image");
         Ok(())
     }
 
