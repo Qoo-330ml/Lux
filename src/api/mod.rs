@@ -580,6 +580,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_install_plugin),
         )
         .route(
+            "/api/v1/admin/plugins/{plugin_id}",
+            delete(admin_uninstall_plugin),
+        )
+        .route(
             "/api/v1/admin/plugins/{plugin_id}/enabled",
             patch(admin_update_plugin_enabled),
         )
@@ -13413,6 +13417,7 @@ async fn admin_select_candidate(
 }
 
 fn metadata_selection_error(headers: &HeaderMap, error: MetadataSelectionError) -> Response {
+    eprintln!("metadata selection error: {error}");
     match error {
         MetadataSelectionError::ItemNotFound | MetadataSelectionError::CandidateNotFound => {
             api_error(
@@ -14065,6 +14070,40 @@ async fn admin_install_plugin(
                 Json(json!({ "plugin": plugin_json(&result.plugin) })),
             )
                 .into_response()
+        }
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
+async fn admin_uninstall_plugin(
+    headers: HeaderMap,
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match plugins.uninstall(&plugin_id).await {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PLUGIN_UNINSTALLED",
+                Some("plugin"),
+                Some(&plugin_id),
+                "{}",
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => plugin_error(&headers, error),
     }

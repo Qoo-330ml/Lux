@@ -147,6 +147,14 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     let config_dir = temp_dir.path().join("config");
     tokio::fs::create_dir_all(&config_dir).await?;
     seed_local_tmdb_package(&config_dir).await?;
+    tokio::fs::create_dir_all(config_dir.join("plugin-config")).await?;
+    tokio::fs::write(
+        config_dir.join("plugin-config/org.lux.tmdb.json"),
+        br#"{"preferredLanguage":"zh-CN"}"#,
+    )
+    .await?;
+    tokio::fs::write(config_dir.join("tmdb_api_key"), "test-key").await?;
+    tokio::fs::write(config_dir.join("tmdb_settings.json"), "{}").await?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir,
@@ -382,6 +390,56 @@ async fn admin_can_disable_an_installed_plugin_without_removing_it()
         .await?;
     assert_eq!(enabled.status(), reqwest::StatusCode::OK);
     assert_eq!(enabled.json::<Value>().await?["plugin"]["enabled"], true);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_uninstall_an_installed_plugin_and_remove_its_package()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    tokio::fs::create_dir_all(&config_dir).await?;
+    seed_local_tmdb_package(&config_dir).await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let (base_url, server) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = admin_session(&client, &base_url).await?;
+
+    let installed = client
+        .post(format!("{base_url}/api/v1/admin/plugins/tmdb/install"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+
+    let uninstalled = client
+        .delete(format!("{base_url}/api/v1/admin/plugins/tmdb"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(uninstalled.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(!config_dir.join("plugins/org.lux.tmdb").exists());
+    assert!(!config_dir.join("plugin-config/org.lux.tmdb.json").exists());
+    assert!(!config_dir.join("tmdb_api_key").exists());
+    assert!(!config_dir.join("tmdb_settings.json").exists());
+
+    let managed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/plugins/installed?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(managed.status(), reqwest::StatusCode::OK);
+    let managed_body: Value = managed.json().await?;
+    assert_eq!(managed_body["total"], 0);
 
     server.abort();
     Ok(())

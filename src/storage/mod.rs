@@ -1417,6 +1417,22 @@ impl Database {
         })
     }
 
+    pub(crate) async fn disable_strm_media_info_task(&self) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scheduled_task_configs
+             SET is_enabled = 0, cron_or_interval = NULL, updated_at = unixepoch()
+             WHERE owner_type = 'GLOBAL' AND owner_id = 'global'
+               AND task_type = 'STRM_MEDIA_INFO'",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn disable_chapter_detection_tasks(&self) -> Result<(), StorageError> {
         self.query(
             "UPDATE scheduled_task_configs
@@ -1826,6 +1842,35 @@ impl Database {
         transaction
             .commit()
             .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE libraries
+             SET scraper_id = CASE WHEN scraper_id = ? THEN NULL ELSE scraper_id END,
+                 chapter_source_id = CASE WHEN chapter_source_id = ? THEN NULL ELSE chapter_source_id END,
+                 updated_at = unixepoch()
+             WHERE scraper_id = ? OR chapter_source_id = ?",
+        )
+        .bind(plugin_id)
+        .bind(plugin_id)
+        .bind(plugin_id)
+        .bind(plugin_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query("DELETE FROM installed_plugins WHERE plugin_id = ?")
+            .bind(plugin_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
