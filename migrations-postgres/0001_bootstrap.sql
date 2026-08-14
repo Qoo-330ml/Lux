@@ -117,7 +117,6 @@ CREATE TABLE media_items (
     added_at BIGINT NOT NULL DEFAULT (unixepoch()),
     removed_at BIGINT, metadata_fingerprint BYTEA, identity_key TEXT, rating DOUBLE PRECISION, rating_source TEXT, last_air_date TEXT, status TEXT, original_language TEXT, has_available_source BIGINT NOT NULL DEFAULT 0
 CHECK (has_available_source IN (0, 1)),
-    UNIQUE (library_id, sort_title, production_year)
 );
 CREATE TABLE media_sources (
     id TEXT PRIMARY KEY NOT NULL,

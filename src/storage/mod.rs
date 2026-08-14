@@ -1,7 +1,11 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use sqlx::{
-    Any, AnyPool, Executor, Row,
+    Acquire, Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
 };
@@ -119,6 +123,9 @@ impl Database {
         if let Err(source) = migrator.run(&pool).await {
             pool.close().await;
             return Err(StorageError::Migration { path, source });
+        }
+        if backend == DatabaseBackend::Sqlite {
+            remove_sqlite_title_year_unique(&pool, &path).await?;
         }
         let server_id =
             ensure_server_id(&pool, backend)
@@ -10643,6 +10650,154 @@ impl Database {
             sql,
         )))
     }
+}
+
+async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<(), StorageError> {
+    let mut connection = pool.acquire().await.map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let has_legacy_unique = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM sqlite_master
+             WHERE type = 'table'
+               AND name = 'media_items'
+               AND sql LIKE '%UNIQUE (library_id, sort_title, production_year)%'
+         )",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if has_legacy_unique == 0 {
+        return Ok(());
+    }
+
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let migration_result = async {
+        let mut transaction = connection
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let statements = [
+            "ALTER TABLE media_items RENAME TO media_items_legacy",
+            "CREATE TABLE media_items (
+                id TEXT PRIMARY KEY NOT NULL,
+                library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+                item_type TEXT NOT NULL CHECK (item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'BOX_SET', 'FOLDER', 'UNRESOLVED')),
+                parent_id TEXT,
+                series_id TEXT,
+                season_number INTEGER,
+                episode_number INTEGER,
+                absolute_number INTEGER,
+                title TEXT NOT NULL,
+                sort_title TEXT NOT NULL,
+                original_title TEXT,
+                overview TEXT,
+                production_year INTEGER,
+                premiere_date TEXT,
+                runtime_ticks INTEGER,
+                provider_ids_json TEXT,
+                metadata_provenance_json TEXT,
+                locked_fields_json TEXT,
+                identification_status TEXT NOT NULL CHECK (identification_status IN ('LOCAL_CONFIRMED', 'ONLINE_CONFIRMED', 'PENDING', 'FAILED')),
+                added_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                removed_at INTEGER,
+                metadata_fingerprint BLOB,
+                identity_key TEXT,
+                rating REAL,
+                rating_source TEXT,
+                last_air_date TEXT,
+                status TEXT,
+                original_language TEXT,
+                has_available_source INTEGER NOT NULL DEFAULT 0 CHECK (has_available_source IN (0, 1)),
+                thumbnail_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (thumbnail_fallback_required IN (0, 1)),
+                nfo_metadata_json TEXT,
+                nfo_metadata_fingerprint BLOB
+            )",
+            "INSERT INTO media_items (
+                id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+                absolute_number, title, sort_title, original_title, overview, production_year,
+                premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
+                locked_fields_json, identification_status, added_at, removed_at,
+                metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
+                original_language, has_available_source, thumbnail_fallback_required,
+                nfo_metadata_json, nfo_metadata_fingerprint
+             )
+             SELECT
+                id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+                absolute_number, title, sort_title, original_title, overview, production_year,
+                premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
+                locked_fields_json, identification_status, added_at, removed_at,
+                metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
+                original_language, has_available_source, thumbnail_fallback_required,
+                nfo_metadata_json, nfo_metadata_fingerprint
+             FROM media_items_legacy",
+            "DROP TABLE media_items_legacy",
+            "CREATE INDEX idx_media_items_library_sort ON media_items(library_id, sort_title, id)",
+            "CREATE UNIQUE INDEX idx_media_items_identity_key
+             ON media_items(identity_key)
+             WHERE identity_key IS NOT NULL",
+            "CREATE INDEX idx_media_items_parent_removed
+             ON media_items(parent_id, removed_at)",
+            "CREATE INDEX idx_media_items_series_removed
+             ON media_items(series_id, removed_at)",
+            "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
+                INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
+                VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
+                        COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.id), ''));
+            END",
+            "CREATE TRIGGER media_items_search_au AFTER UPDATE OF title, sort_title, original_title ON media_items BEGIN
+                DELETE FROM media_search WHERE item_id = OLD.id;
+                INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
+                VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
+                        COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.id), ''));
+            END",
+            "CREATE TRIGGER media_items_search_ad AFTER DELETE ON media_items BEGIN
+                DELETE FROM media_search WHERE item_id = OLD.id;
+            END",
+        ];
+        for statement in statements {
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok::<(), StorageError>(())
+    }
+    .await;
+
+    let foreign_keys_result = sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *connection)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.to_path_buf(),
+            source,
+        });
+    migration_result.and(foreign_keys_result.map(|_| ()))
 }
 
 async fn validate_postgres_schema(pool: &AnyPool) -> Result<(), StorageError> {

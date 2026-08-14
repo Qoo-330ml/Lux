@@ -284,6 +284,50 @@ async fn series_scan_groups_episode_versions_into_one_item_and_labels_sources()
 }
 
 #[tokio::test]
+async fn series_scan_allows_same_title_and_year_in_different_directories()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    create_file(
+        &root.join("中国动漫/2010/果宝特攻 (2010) {tmdb-118968}/Season 1/果宝特攻-S01E18-720p.mkv"),
+    )
+    .await?;
+    create_file(
+        &root.join("儿童动画/2010/果宝特攻 (2010) {tmdb-118968}/Season 1/果宝特攻-S01E18-480p.mkv"),
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    let report = LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    assert_eq!(report.created_sources, 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_items
+             WHERE library_id = ? AND item_type = 'SERIES' AND removed_at IS NULL",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn series_scan_repairs_legacy_identity_keys_without_creating_duplicates()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
