@@ -6084,10 +6084,12 @@ async fn setup_complete(
                 (request.first_library, setup_kind, state.libraries.as_ref())
             {
                 let library = match libraries
-                    .create_library(
+                    .create_library_with_scraper(
                         &first_library.name,
                         kind,
                         first_library.realtime_watch_enabled,
+                        None,
+                        true,
                     )
                     .await
                 {
@@ -9365,13 +9367,17 @@ struct CreateLibraryRequest {
     kind: String,
     #[serde(default = "default_realtime_watch_enabled")]
     realtime_watch_enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_realtime_metadata_auto_match_enabled")]
     realtime_metadata_auto_match_enabled: bool,
     scraper_id: Option<String>,
     chapter_source_id: Option<String>,
 }
 
 fn default_realtime_watch_enabled() -> bool {
+    true
+}
+
+fn default_realtime_metadata_auto_match_enabled() -> bool {
     true
 }
 

@@ -40,7 +40,7 @@ export function AdminLibrariesPage() {
   const [kind, setKind] = useState("MOVIE");
   const [scraperId, setScraperId] = useState("");
   const [chapterSourceId, setChapterSourceId] = useState("");
-  const [createRealtimeMetadataAutoMatch, setCreateRealtimeMetadataAutoMatch] = useState(false);
+  const [createRealtimeMetadataAutoMatch, setCreateRealtimeMetadataAutoMatch] = useState(true);
   const [createRootPath, setCreateRootPath] = useState("");
   const [createRootPaths, setCreateRootPaths] = useState<string[]>([]);
   const [createDirectoryPickerOpen, setCreateDirectoryPickerOpen] = useState(false);
@@ -114,7 +114,7 @@ export function AdminLibrariesPage() {
       setName("");
       setScraperId("");
       setChapterSourceId("");
-      setCreateRealtimeMetadataAutoMatch(false);
+      setCreateRealtimeMetadataAutoMatch(true);
       setCreateRootPath("");
       setCreateRootPaths([]);
       setCreateDirectoryPickerOpen(false);
@@ -131,7 +131,7 @@ export function AdminLibrariesPage() {
     setKind("MOVIE");
     setScraperId("");
     setChapterSourceId("");
-    setCreateRealtimeMetadataAutoMatch(false);
+    setCreateRealtimeMetadataAutoMatch(true);
     setCreateRootPath("");
     setCreateRootPaths([]);
     setCreateDirectoryPickerOpen(false);

@@ -168,6 +168,9 @@ describe("AdminLibrariesPage library cards", () => {
 
     const dialog = container.querySelector('[role="dialog"]');
     expect(dialog?.textContent).toContain("文件夹");
+    expect(
+      dialog?.querySelector<HTMLInputElement>("[aria-label='新媒体库实时新增资源自动刮削']")?.checked,
+    ).toBe(true);
     const nameInput = dialog?.querySelector<HTMLInputElement>("#new-library-name");
     const rootInput = dialog?.querySelector<HTMLInputElement>("[aria-label='新媒体库根路径']");
     expect(nameInput).toBeTruthy();
@@ -211,7 +214,7 @@ describe("AdminLibrariesPage library cards", () => {
       name: "电影库",
       kind: "MOVIE",
       scraperId: null,
-      realtimeMetadataAutoMatchEnabled: false,
+      realtimeMetadataAutoMatchEnabled: true,
     });
     expect(createLibrary.mock.invocationCallOrder[0]).toBeLessThan(addRoot.mock.invocationCallOrder[0]);
     expect(addRoot).toHaveBeenNthCalledWith(1, "library-2", "/media");
