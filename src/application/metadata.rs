@@ -871,6 +871,47 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
+        if let Some(current) = self.database.find_media_item_metadata(item_id).await? {
+            let mut state = MetadataState::from_persisted(
+                NfoMetadata {
+                    title: Some(current.title.clone()),
+                    original_title: current.original_title.clone(),
+                    overview: current.overview.clone(),
+                    production_year: current
+                        .production_year
+                        .and_then(|year| i32::try_from(year).ok()),
+                },
+                current.provenance_json.as_deref(),
+                current.locked_fields_json.as_deref(),
+            );
+            state.apply_automatic(&MetadataCandidate {
+                source: MetadataSource::LocalNfo,
+                metadata: projection.metadata.clone(),
+            });
+            let title_changed = state.metadata.title.as_deref() != Some(current.title.as_str());
+            let year_changed =
+                state.metadata.production_year.map(i64::from) != current.production_year;
+            if (title_changed || year_changed)
+                && let Some(production_year) = state.metadata.production_year
+                && self
+                    .database
+                    .movie_metadata_identity_conflicts(
+                        item_id,
+                        &state
+                            .metadata
+                            .title
+                            .as_deref()
+                            .unwrap_or(&current.title)
+                            .to_lowercase(),
+                        i64::from(production_year),
+                    )
+                    .await?
+            {
+                return Err(MetadataError::ConflictingMovieIdentity {
+                    item_id: item_id.to_owned(),
+                });
+            }
+        }
         let source_fingerprint = nfo_content_fingerprint(&bytes);
         if let Some(local_nfo) = &self.local_nfo {
             let current = local_nfo
@@ -1325,6 +1366,9 @@ pub enum MetadataError {
     },
     Storage(StorageError),
     NfoCache(LocalNfoMetadataStoreError),
+    ConflictingMovieIdentity {
+        item_id: String,
+    },
 }
 
 impl fmt::Display for MetadataError {
@@ -1340,6 +1384,10 @@ impl fmt::Display for MetadataError {
             ),
             Self::Storage(error) => error.fmt(formatter),
             Self::NfoCache(error) => error.fmt(formatter),
+            Self::ConflictingMovieIdentity { item_id } => write!(
+                formatter,
+                "local movie NFO conflicts with another movie identity: {item_id}"
+            ),
         }
     }
 }
@@ -1351,6 +1399,7 @@ impl std::error::Error for MetadataError {
             Self::FileSizeOutOfRange { .. } => None,
             Self::Storage(error) => Some(error),
             Self::NfoCache(error) => Some(error),
+            Self::ConflictingMovieIdentity { .. } => None,
         }
     }
 }
