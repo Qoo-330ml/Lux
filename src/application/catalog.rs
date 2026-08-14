@@ -372,7 +372,7 @@ impl CatalogService {
             .database
             .count_resume_items(
                 user_id,
-                &library_ids,
+                library_ids,
                 &item_types,
                 played_percent,
                 minimum_ticks,
@@ -382,7 +382,7 @@ impl CatalogService {
             .database
             .list_resume_items(&ResumeItemsQuery {
                 user_id,
-                library_ids: &library_ids,
+                library_ids,
                 item_types: &item_types,
                 played_percent,
                 minimum_ticks,
