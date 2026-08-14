@@ -195,6 +195,11 @@ export class LuxApiClient {
     return this.request<HomeResponse>("/api/v1/home");
   }
 
+  favorites(page = 1) {
+    const params = new URLSearchParams({ page: String(page), pageSize: "24" });
+    return this.request<PageResponse<MediaItem>>(`/api/v1/favorites?${params}`);
+  }
+
   libraries() {
     return this.request<{ libraries?: Library[] }>("/api/v1/libraries");
   }
@@ -333,6 +338,20 @@ export class LuxApiClient {
     return this.request<PlaybackState>(
       `/api/v1/items/${encodeURIComponent(itemId)}/playback`,
     );
+  }
+
+  setFavorite(itemId: string, favorite: boolean) {
+    return this.request<void>(`/api/v1/items/${encodeURIComponent(itemId)}/favorite`, {
+      method: "PUT",
+      body: JSON.stringify({ favorite }),
+    });
+  }
+
+  setPlayed(itemId: string, played: boolean) {
+    return this.request<void>(`/api/v1/items/${encodeURIComponent(itemId)}/played`, {
+      method: "PUT",
+      body: JSON.stringify({ played }),
+    });
   }
 
   progress(

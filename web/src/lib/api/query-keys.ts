@@ -3,6 +3,7 @@ export const queryKeys = {
   setupDatabase: ["setup", "database"] as const,
   me: ["me"] as const,
   home: ["home"] as const,
+  favorites: ["favorites"] as const,
   libraries: ["libraries"] as const,
   library: (
     libraryId: string,

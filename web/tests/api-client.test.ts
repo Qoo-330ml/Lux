@@ -164,6 +164,40 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
   });
 
+  it("updates favorite and played state through the Lux item endpoints", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(null, { status: 204 }),
+    );
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    await new LuxApiClient().setFavorite("movie-1", true);
+    await new LuxApiClient().setPlayed("movie-1", false);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/items/movie-1/favorite");
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("PUT");
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({ favorite: true });
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/items/movie-1/played");
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({ played: false });
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
+  it("lists the current user's favorites with a bounded page", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], page: 2, pageSize: 24, total: 0 }), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().favorites(2)).resolves.toEqual({
+      items: [],
+      page: 2,
+      pageSize: 24,
+      total: 0,
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/favorites?page=2&pageSize=24");
+  });
+
   it("supports administrator candidate search and selection for identification", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
