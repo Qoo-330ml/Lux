@@ -12,7 +12,7 @@ export function LoginPage() {
   const login = useMutation({
     mutationFn: () => api.login(username, password),
     onSuccess: (user) => {
-      queryClient.setQueryData(queryKeys.me, user);
+      queryClient.setQueryData(queryKeys.me, { user });
     },
   });
 
