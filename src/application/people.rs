@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    fmt::Write as _,
     path::{Component, Path, PathBuf},
 };
 
@@ -7,6 +8,7 @@ use quick_xml::escape::escape;
 use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
@@ -20,7 +22,7 @@ const LEGACY_ITEMS_DIR: &str = "items";
 const LEGACY_PROFILES_DIR: &str = "profiles";
 const PERSON_NFO: &str = "person.nfo";
 const PERSON_IMAGE: &str = "folder";
-const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 1;
+const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 2;
 const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
 const PENDING_PERSON_NFO: &str = "personNfo";
 const PENDING_PROFILE_IMAGE: &str = "profileImage";
@@ -47,8 +49,8 @@ pub struct ActorCredit {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredActor {
-    #[serde(deserialize_with = "deserialize_person_id")]
-    id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_person_id")]
+    id: Option<String>,
     name: String,
     #[serde(default = "default_provider")]
     provider: String,
@@ -168,24 +170,33 @@ impl PeopleService {
             PeopleError::Serialization("people relation path has no parent".to_owned())
         })?;
         create_private_dir(relation_dir).await?;
-        let index_dir = people_index_directory(&self.config_dir);
-        create_private_dir(&index_dir).await?;
 
         let mut stored = Vec::new();
         let mut pending_assets = Vec::new();
         let provider = provider.trim().to_ascii_lowercase();
         for actor in actors.iter().take(MAX_ACTORS) {
-            if !is_valid_person_id(&actor.id) || actor.name.trim().is_empty() {
+            let actor_id = actor.id.trim();
+            if actor.name.trim().is_empty() {
                 continue;
             }
-            let assets = self.persist_person_assets(actor, &provider).await;
-            if !assets.pending_assets.is_empty() {
-                pending_assets.push(actor.id.clone());
+            let has_stable_identity = is_valid_person_id(actor_id);
+            let assets = if has_stable_identity {
+                self.persist_person_assets(actor, &provider).await
+            } else {
+                PersonAssetResult {
+                    image_file: None,
+                    pending_assets: Vec::new(),
+                }
+            };
+            if has_stable_identity && !assets.pending_assets.is_empty() {
+                pending_assets.push(actor_id.to_owned());
             }
             stored.push(StoredActor {
-                id: actor.id.clone(),
+                id: has_stable_identity.then(|| actor_id.to_owned()),
                 name: actor.name.trim().to_owned(),
-                provider: provider.clone(),
+                provider: has_stable_identity
+                    .then(|| provider.clone())
+                    .unwrap_or_default(),
                 character: actor
                     .character
                     .as_deref()
@@ -253,6 +264,14 @@ impl PeopleService {
         };
 
         let nfo_path = person_dir.join(PERSON_NFO);
+        let index_dir = people_index_directory(&self.config_dir);
+        if let Err(error) = create_private_dir(&index_dir).await {
+            tracing::warn!(
+                person_id = %actor.id,
+                %error,
+                "actor people index directory was not prepared"
+            );
+        }
         if let Err(error) = write_atomically(
             &nfo_path,
             &person_nfo_bytes(&actor.name, provider, &actor.id),
@@ -397,24 +416,31 @@ impl PeopleService {
             .actors
             .into_iter()
             .take(MAX_ACTORS)
-            .filter(|actor| is_valid_person_id(&actor.id) && !actor.name.trim().is_empty())
+            .filter(|actor| !actor.name.trim().is_empty())
         {
-            let id = actor.id;
+            let id = actor
+                .id
+                .filter(|id| is_valid_person_id(id))
+                .unwrap_or_else(|| local_actor_id(&actor.name, actor.character.as_deref()));
             let provider = actor.provider;
-            let image_url = match self.profile_image_for_provider(Some(&provider), &id).await {
-                Ok(Some(_)) => {
-                    if provider.eq_ignore_ascii_case("tmdb") {
-                        Some(format!("/api/v1/people/{id}/image"))
-                    } else if validate_component(&provider).is_ok() {
-                        Some(format!("/api/v1/people/{provider}/{id}/image"))
-                    } else {
+            let image_url = if provider.is_empty() {
+                None
+            } else {
+                match self.profile_image_for_provider(Some(&provider), &id).await {
+                    Ok(Some(_)) => {
+                        if provider.eq_ignore_ascii_case("tmdb") {
+                            Some(format!("/api/v1/people/{id}/image"))
+                        } else if validate_component(&provider).is_ok() {
+                            Some(format!("/api/v1/people/{provider}/{id}/image"))
+                        } else {
+                            None
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(person_id = %id, %error, "actor profile image lookup failed; using placeholder");
                         None
                     }
-                }
-                Ok(None) => None,
-                Err(error) => {
-                    tracing::warn!(person_id = %id, %error, "actor profile image lookup failed; using placeholder");
-                    None
                 }
             };
             views.push(ActorView {
@@ -848,6 +874,19 @@ fn is_valid_person_id(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+fn local_actor_id(name: &str, character: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.trim().as_bytes());
+    hasher.update([0]);
+    hasher.update(character.unwrap_or_default().trim().as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    format!("local-{encoded}")
+}
+
 fn deserialize_person_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -858,6 +897,21 @@ where
         Value::Number(value) => Ok(value.to_string()),
         _ => Err(serde::de::Error::custom(
             "person ID must be a string or number",
+        )),
+    }
+}
+
+fn deserialize_optional_person_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok(Some(value)),
+        Value::Number(value) => Ok(Some(value.to_string())),
+        _ => Err(serde::de::Error::custom(
+            "person ID must be null, a string, or a number",
         )),
     }
 }
@@ -1087,7 +1141,7 @@ mod tests {
         let relation = library_item_directory(config.path(), "item-1")?.join("people.json");
         let relation: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(relation).await?)?;
-        assert_eq!(relation["schemaVersion"], 1);
+        assert_eq!(relation["schemaVersion"], 2);
         assert_eq!(relation["actors"][0]["provider"], "tmdb");
         assert_eq!(relation["actors"][0]["imageFile"], "folder.png");
 
@@ -1191,6 +1245,40 @@ mod tests {
             .await
             .expect_err("symlinked metadata parent must be rejected");
         assert!(matches!(error, PeopleError::Symlink(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_actor_without_provider_id_is_kept_without_person_assets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let count = service
+            .persist_item_actors(
+                "item-local",
+                "local",
+                &[ActorCredit {
+                    id: String::new(),
+                    name: "本地演员".to_owned(),
+                    character: Some("本地角色".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                }],
+            )
+            .await?;
+
+        assert_eq!(count, 1);
+        let relation = library_item_directory(config.path(), "item-local")?.join("people.json");
+        let relation: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(relation).await?)?;
+        assert_eq!(relation["actors"][0]["name"], "本地演员");
+        assert!(relation["actors"][0]["id"].is_null());
+        assert!(!config.path().join("metadata/people").exists());
+
+        let actors = service.list_item_actors("item-local").await?;
+        assert_eq!(actors.len(), 1);
+        assert_eq!(actors[0].name, "本地演员");
+        assert!(actors[0].image_url.is_none());
         Ok(())
     }
 

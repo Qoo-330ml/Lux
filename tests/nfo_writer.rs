@@ -3,10 +3,10 @@ use luxd::{
         libraries::LibraryService,
         metadata::{MetadataEnricher, NfoMetadata},
         nfo::{
-            LocalNfoMetadataStore, MovieNfoCredit, MovieNfoMetadata, NfoWriteError,
-            NfoWriteService, parse_local_nfo_actors, parse_local_nfo_details,
-            parse_local_nfo_projection, parse_movie_nfo_actors, parse_movie_nfo_details,
-            rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
+            LocalNfoMetadataStore, MovieNfoCredit, MovieNfoMetadata, NfoWriteService,
+            parse_local_nfo_actors, parse_local_nfo_details, parse_local_nfo_projection,
+            parse_movie_nfo_actors, parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo,
+            write_nfo_atomically,
         },
         people::ActorCredit,
         scanner::LibraryScanner,
@@ -172,12 +172,12 @@ fn movie_nfo_rewrite_keeps_existing_rich_fields_when_patch_is_partial()
 }
 
 #[test]
-fn movie_nfo_rewrite_rejects_actor_without_valid_tmdb_id() {
+fn movie_nfo_rewrite_keeps_actor_without_provider_id() -> Result<(), Box<dyn std::error::Error>> {
     let result = rewrite_movie_nfo(
         b"<movie><title>Movie</title></movie>",
         &MovieNfoMetadata {
             actors: vec![ActorCredit {
-                id: "person-9".to_owned(),
+                id: String::new(),
                 name: "演员甲".to_owned(),
                 character: None,
                 order: None,
@@ -187,7 +187,10 @@ fn movie_nfo_rewrite_rejects_actor_without_valid_tmdb_id() {
         },
     );
 
-    assert!(matches!(result, Err(NfoWriteError::InvalidMetadata(_))));
+    let text = String::from_utf8(result?)?;
+    assert!(text.contains("<name>演员甲</name>"));
+    assert!(!text.contains("<tmdbid>"));
+    Ok(())
 }
 
 #[test]
@@ -203,6 +206,20 @@ fn movie_nfo_parser_reads_emby_actor_nodes_without_online_metadata() {
     assert_eq!(actors[0].name, "演员甲");
     assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
     assert_eq!(actors[1].order, Some(1));
+}
+
+#[test]
+fn movie_nfo_parser_keeps_actor_without_provider_id() {
+    let actors = parse_movie_nfo_actors(
+        r#"<movie><actor><name>本地演员</name><role>本地角色</role><order>2</order></actor></movie>"#
+            .as_bytes(),
+    )
+    .expect("valid actor without provider id");
+
+    assert_eq!(actors.len(), 1);
+    assert!(actors[0].id.is_empty());
+    assert_eq!(actors[0].name, "本地演员");
+    assert_eq!(actors[0].character.as_deref(), Some("本地角色"));
 }
 
 #[test]
