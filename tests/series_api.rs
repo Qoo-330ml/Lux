@@ -374,6 +374,49 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         1920
     );
 
+    let episode_primary_image = client
+        .get(format!(
+            "{base_url}/emby/Items/{episode_id}/Images/Primary?tag={episode_thumb_id}"
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(episode_primary_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        episode_primary_image.bytes().await?.as_ref(),
+        b"episode-thumbnail"
+    );
+
+    let filmly_primary_image_without_auth = client
+        .get(format!(
+            "{base_url}/emby/Items/{episode_id}/Images/Primary?tag={episode_thumb_id}"
+        ))
+        .header("User-Agent", "Filmly/2.12.3-423")
+        .send()
+        .await?;
+    assert_eq!(
+        filmly_primary_image_without_auth.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        filmly_primary_image_without_auth.bytes().await?.as_ref(),
+        b"episode-thumbnail"
+    );
+
+    let filmly_primary_image_without_tag = client
+        .get(format!("{base_url}/emby/Items/{episode_id}/Images/Primary"))
+        .header("User-Agent", "Filmly/2.12.3-423")
+        .send()
+        .await?;
+    assert_eq!(
+        filmly_primary_image_without_tag.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        filmly_primary_image_without_tag.bytes().await?.as_ref(),
+        b"episode-thumbnail"
+    );
+
     let episodes_with_empty_season = client
         .get(format!(
             "{base_url}/Shows/{series_id}/Episodes?SeasonId=&Limit=10"

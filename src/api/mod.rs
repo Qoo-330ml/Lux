@@ -8582,6 +8582,20 @@ async fn serve_image(
         .await
     {
         Ok(Some(image)) => image,
+        Ok(None) if image_type == "POSTER" => match images
+            .resolve(principal, item_id, "THUMB", image_index)
+            .await
+        {
+            Ok(Some(image)) => image,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
             return StatusCode::FORBIDDEN.into_response();
@@ -8620,6 +8634,20 @@ async fn serve_tagged_image(
         .await
     {
         Ok(Some(image)) => image,
+        Ok(None) if image_type == "POSTER" => match images
+            .resolve_tagged(item_id, "THUMB", image_index, tag)
+            .await
+        {
+            Ok(Some(image)) => image,
+            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
             return StatusCode::FORBIDDEN.into_response();
@@ -8654,6 +8682,20 @@ async fn serve_filmly_compat_image(
         .await
     {
         Ok(Some(image)) => image,
+        Ok(None) if image_type == "POSTER" => match images
+            .resolve_filmly_compat(item_id, "THUMB", image_index)
+            .await
+        {
+            Ok(Some(image)) => image,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
             return StatusCode::FORBIDDEN.into_response();
