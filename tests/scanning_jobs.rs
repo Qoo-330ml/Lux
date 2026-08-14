@@ -113,12 +113,16 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     let completed = restarted_jobs.run_batch(&job.id, 10).await?;
     assert_eq!(completed.status, "COMPLETED");
     assert!(completed.completed);
-    let final_status: (String, i64, Option<String>) =
-        sqlx::query_as("SELECT status, processed_count, cursor FROM scan_jobs WHERE id = ?")
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-    assert_eq!(final_status, ("COMPLETED".to_owned(), 3, None));
+    let final_status: (String, i64, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, processed_count, cursor, finished_at FROM scan_jobs WHERE id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(final_status.0, "COMPLETED");
+    assert_eq!(final_status.1, 3);
+    assert_eq!(final_status.2, None);
+    assert!(final_status.3.is_some());
     assert!(
         !restarted_jobs
             .active_job_ids()

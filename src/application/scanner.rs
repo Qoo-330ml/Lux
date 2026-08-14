@@ -2880,6 +2880,7 @@ pub struct ScanJob {
     pub total_count: i64,
     pub cancel_requested: bool,
     pub error: Option<String>,
+    pub finished_at: Option<i64>,
 }
 
 fn scan_job(job: StoredScanJob) -> ScanJob {
@@ -2894,6 +2895,7 @@ fn scan_job(job: StoredScanJob) -> ScanJob {
         total_count: job.total_count,
         cancel_requested: job.cancel_requested,
         error: job.error,
+        finished_at: job.finished_at,
     }
 }
 

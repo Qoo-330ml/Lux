@@ -3901,6 +3901,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
+                    finished_at,
                     discovery_completed, auto_metadata_match
              FROM scan_jobs WHERE id = ?",
         )
@@ -3924,6 +3925,7 @@ impl Database {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
+                        finished_at,
                         discovery_completed, auto_metadata_match
                  FROM scan_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -3937,6 +3939,7 @@ impl Database {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
+                        finished_at,
                         discovery_completed, auto_metadata_match
                  FROM scan_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -3997,6 +4000,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
+                    finished_at,
                     discovery_completed, auto_metadata_match
              FROM scan_jobs
              WHERE library_id = ? AND job_type = ? AND status IN ('PENDING', 'RUNNING')
@@ -10454,6 +10458,7 @@ pub(crate) struct StoredScanJob {
     pub(crate) total_count: i64,
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
+    pub(crate) finished_at: Option<i64>,
     pub(crate) discovery_completed: bool,
     pub(crate) auto_metadata_match: bool,
 }
@@ -10537,6 +10542,7 @@ fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
         total_count: row.get("total_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
+        finished_at: row.get("finished_at"),
         discovery_completed: row.get::<i64, _>("discovery_completed") != 0,
         auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
     }

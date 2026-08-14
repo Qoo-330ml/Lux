@@ -11975,6 +11975,7 @@ fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) -> Value {
         "totalCount": job.total_count,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
+        "finishedAt": job.finished_at,
     })
 }
 
@@ -12029,6 +12030,7 @@ fn scan_job_json(job: &crate::application::scanner::ScanJob) -> Value {
         "totalCount": job.total_count,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
+        "finishedAt": job.finished_at,
     })
 }
 
