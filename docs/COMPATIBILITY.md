@@ -38,6 +38,7 @@
 - 2026-08-14 Filmly 2.12.3 剧集详情集列表 DTO 对齐：针对真实请求 `Fields=BasicSyncInfo,Overview,ProviderIds,Path,Size,People,RuntimeTicks,Chapters,MediaSources,CanDownload`，剧集单集在没有独立海报时将本地 `-thumb` 映射为 `ImageTags.Primary`，补齐 `SupportsSync`、Overview、ProviderIds、SeasonName、ParentThumbItemId、Size/Container/Bitrate、People 空集合，并在 `MediaSources` 内返回 `MediaStreams`。`tests/series_api.rs` 已覆盖脱敏请求和关键字段；真实安卓设备复测仍待完成，不据此宣称完全兼容。
 - 2026-08-14 Filmly Episode 媒体流 shape 进一步对齐参考 Emby：集列表在请求媒体源时保留 `PremiereDate`，媒体源补齐 `SupportsProbing`，媒体流补齐 `AttachmentSize`、`IsAnamorphic`、`Protocol` 和 `SupportsExternalStream`，并由剧集协议回归锁定；远端设备仍需重新部署后复测。
 - 2026-08-14 Filmly 图片兼容修复：实测 Android/Filmly 图片加载不携带 Emby token，且部分集只有 `THUMB` 图片却在 DTO 中作为 `ImageTags.Primary` 使用，导致 `/Items/{id}/Images/Primary` 返回 401/404。Emby 图片端点现在在 Primary 无 Poster 时回退到 Thumb，覆盖带 tag、无 tag 和已认证请求；`tests/series_api.rs` 已加入三种路径回归，真实设备需部署后复测。
+- 2026-08-14 Filmly 详情状态请求补齐：`Shows/NextUp` 现在按请求的 `SeriesId` 过滤，并遵守 `EnableTotalRecordCount=false` 的分页 shape；季度列表请求 `Genres` 时补齐 `Genres`/`GenreItems` 空集合，避免客户端收到错误剧集状态或不完整季度 DTO。
 - 2026-08-11 Filmly 2.12.3 首页请求修复：`/Users/{userId}/Items` 现在支持 `ExcludeItemTypes`，未指定递归和类型时按 Emby 根层级返回电影/剧集，列表 DTO 补充用户 `CanDownload` 和请求的 `Chapters` 字段；已用真实请求参数加入剧集层级协议回归，真实设备刷新复测仍待完成。
 - 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - 播放会话失活保护：若第三方客户端异常退出、网络中断或未发送 `Stopped`，`PLAYING`/`PAUSED` 会话在连续 90 秒没有事件后从 Emby `GET /Sessions`、管理员控制台和 Web 播放状态中隐藏；显式 `Stopped` 仍立即清理活动会话。

@@ -1782,6 +1782,8 @@ struct EmbyItemsQuery {
     api_key: Option<String>,
     #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
     user_id: Option<String>,
+    #[serde(rename = "SeriesId", alias = "seriesId", default)]
+    series_id: Option<String>,
     #[serde(rename = "ParentId", default)]
     parent_id: Option<String>,
     #[serde(rename = "Ids", default)]
@@ -1810,6 +1812,8 @@ struct EmbyItemsQuery {
     fields: Option<String>,
     #[serde(rename = "GroupItems", default)]
     group_items: Option<bool>,
+    #[serde(rename = "EnableTotalRecordCount", default)]
+    enable_total_record_count: Option<bool>,
     #[serde(rename = "Recursive", default)]
     recursive: Option<bool>,
 }
@@ -2411,18 +2415,21 @@ async fn emby_next_up_response(
         .list_next_up(
             AccessPrincipal::new(user.id, user.is_admin),
             user_id,
+            query.series_id.as_deref(),
             offset,
             limit,
         )
         .await
     {
         Ok(page) => {
-            emby_catalog_page_for_user_with_fields(
+            emby_catalog_page_for_user_with_preferred_source(
                 state,
                 user_id,
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
+                None,
+                query.enable_total_record_count != Some(false),
             )
             .await
         }
@@ -4623,6 +4630,12 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
             // preserve Emby's non-null collection contract for clients that
             // map this field eagerly. Full item details add the populated list.
             object.insert("People".to_owned(), json!([]));
+        }
+        if emby_fields_include(fields, "Genres") {
+            object.insert("Genres".to_owned(), json!([]));
+            object.insert("GenreItems".to_owned(), json!([]));
+        } else if emby_fields_include(fields, "GenreItems") {
+            object.insert("GenreItems".to_owned(), json!([]));
         }
         if emby_fields_include(fields, "ProductionYear") {
             emby_insert_optional(

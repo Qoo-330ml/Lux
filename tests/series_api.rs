@@ -247,7 +247,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
 
     let seasons = client
         .get(format!(
-            "{base_url}/Shows/{series_id}/Seasons?Fields=BasicSyncInfo,Overview,PremiereDate,ChildCount,People&Limit=10"
+            "{base_url}/Shows/{series_id}/Seasons?Fields=BasicSyncInfo,Overview,PremiereDate,ChildCount,Genres,People&Limit=10"
         ))
         .header(headers[0].0, headers[0].1)
         .send()
@@ -264,6 +264,11 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(seasons_body["Items"][0]["ChildCount"], 3);
     assert_eq!(seasons_body["Items"][0]["ParentBackdropItemId"], series_id);
     assert_eq!(seasons_body["Items"][0]["ParentLogoItemId"], series_id);
+    assert_eq!(seasons_body["Items"][0]["Genres"], serde_json::json!([]));
+    assert_eq!(
+        seasons_body["Items"][0]["GenreItems"],
+        serde_json::json!([])
+    );
 
     let seasons_without_child_count = client
         .get(format!(
@@ -651,6 +656,19 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         12345
     );
     assert_eq!(next_up_body["Items"][0]["UserData"]["IsFavorite"], true);
+
+    let series_next_up = client
+        .get(format!(
+            "{base_url}/Shows/NextUp?SeriesId={series_id}&UserId={}&Limit=1&EnableTotalRecordCount=false",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(series_next_up.status(), reqwest::StatusCode::OK);
+    let series_next_up_body: Value = series_next_up.json().await?;
+    assert_eq!(series_next_up_body["Items"][0]["SeriesId"], series_id);
+    assert!(series_next_up_body.get("StartIndex").is_none());
 
     let shows_next_up = client
         .get(format!(

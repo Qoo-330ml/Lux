@@ -338,10 +338,11 @@ impl CatalogService {
         &self,
         principal: AccessPrincipal,
         user_id: &str,
+        series_id: Option<&str>,
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
-        self.list_progress_items(principal, user_id, offset, limit, &["EPISODE"])
+        self.list_progress_items(principal, user_id, series_id, offset, limit, &["EPISODE"])
             .await
     }
 
@@ -389,6 +390,7 @@ impl CatalogService {
         &self,
         principal: AccessPrincipal,
         user_id: &str,
+        series_id: Option<&str>,
         offset: i64,
         limit: i64,
         item_types: &[&str],
@@ -396,11 +398,11 @@ impl CatalogService {
         let library_ids = self.access.accessible_library_ids(principal).await?;
         let total = self
             .database
-            .count_progress_items(user_id, &library_ids, item_types)
+            .count_progress_items(user_id, &library_ids, item_types, series_id)
             .await?;
         let rows = self
             .database
-            .list_progress_items(user_id, &library_ids, item_types, offset, limit)
+            .list_progress_items(user_id, &library_ids, item_types, series_id, offset, limit)
             .await?;
         Ok(CatalogPage {
             items: assemble_items(rows),
