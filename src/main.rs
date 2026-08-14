@@ -30,6 +30,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let schema_version = database.schema_version().await?;
     info!(schema_version, "database migrations applied");
+    let scanner = luxd::application::scanner::LibraryScanner::new(database.clone());
+    let repaired_identity_keys = scanner.repair_legacy_identity_keys().await?;
+    if repaired_identity_keys > 0 {
+        info!(repaired_identity_keys, "legacy media identities repaired");
+    }
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;

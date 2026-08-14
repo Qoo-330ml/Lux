@@ -251,16 +251,30 @@ impl LibraryService {
             warnings.push(LibraryWarningCode::PathNotWritable);
         }
 
-        let id = LibraryRootId::new();
+        let canonical_path = inspection.canonical_path.to_string_lossy().into_owned();
+        let id = self
+            .database
+            .find_deleted_library_root_id(&library_id_text, &canonical_path)
+            .await?
+            .map(|value| {
+                value
+                    .parse::<LibraryRootId>()
+                    .map_err(|_| LibraryServiceError::RootNotFoundAfterInsert)
+            })
+            .transpose()?
+            .unwrap_or_else(LibraryRootId::new);
         self.database
             .insert_library_root(NewLibraryRoot {
                 id: &id.to_string(),
                 library_id: &library_id_text,
-                canonical_path: &inspection.canonical_path.to_string_lossy(),
+                canonical_path: &canonical_path,
                 display_path,
                 is_available: inspection.is_available,
                 is_writable: inspection.is_writable,
             })
+            .await?;
+        self.database
+            .delete_library_root_history(&library_id_text, &canonical_path)
             .await?;
         let root = self
             .database

@@ -2422,16 +2422,99 @@ impl Database {
         library_id: &str,
         root_id: &str,
     ) -> Result<bool, StorageError> {
-        self.query("DELETE FROM library_roots WHERE id = ? AND library_id = ?")
-            .bind(root_id)
-            .bind(library_id)
-            .execute(&self.pool)
+        let mut transaction = self
+            .pool
+            .begin()
             .await
-            .map(|result| result.rows_affected() == 1)
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+        let history = self
+            .query(
+                "INSERT INTO library_root_history (library_id, canonical_path, root_id)
+                 SELECT library_id, canonical_path, id
+                 FROM library_roots
+                 WHERE id = ? AND library_id = ?
+                 ON CONFLICT(library_id, canonical_path) DO UPDATE SET
+                     root_id = excluded.root_id,
+                     deleted_at = unixepoch()",
+            )
+            .bind(root_id)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if history.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        self.query("DELETE FROM library_roots WHERE id = ? AND library_id = ?")
+            .bind(root_id)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    pub(crate) async fn find_deleted_library_root_id(
+        &self,
+        library_id: &str,
+        canonical_path: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT root_id
+             FROM library_root_history
+             WHERE library_id = ? AND canonical_path = ?",
+        )
+        .bind(library_id)
+        .bind(canonical_path)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn delete_library_root_history(
+        &self,
+        library_id: &str,
+        canonical_path: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "DELETE FROM library_root_history
+             WHERE library_id = ? AND canonical_path = ?",
+        )
+        .bind(library_id)
+        .bind(canonical_path)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn list_all_library_roots(
@@ -4403,6 +4486,113 @@ impl Database {
         Ok(entries)
     }
 
+    pub(crate) async fn find_filesystem_entry_by_inode(
+        &self,
+        library_id: &str,
+        target_root_id: &str,
+        inode: i64,
+        relative_path: &str,
+    ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
+                 FROM filesystem_entries fe
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                 WHERE lr.library_id = ? AND fe.inode = ?
+                   AND NOT (fe.library_root_id = ? AND fe.relative_path = ?)
+                 LIMIT 2",
+            )
+            .bind(library_id)
+            .bind(inode)
+            .bind(target_root_id)
+            .bind(relative_path)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+        Ok(rows.into_iter().next().map(stored_filesystem_entry))
+    }
+
+    pub(crate) async fn list_episode_identity_repair_candidates(
+        &self,
+    ) -> Result<Vec<StoredEpisodeIdentityCandidate>, StorageError> {
+        self.query(
+            "SELECT DISTINCT ms.item_id, fe.id, fe.library_root_id, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN media_items episode ON episode.id = ms.item_id
+             WHERE episode.item_type = 'EPISODE' AND fe.is_missing = 0
+             ORDER BY fe.library_root_id, fe.relative_path, ms.item_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredEpisodeIdentityCandidate {
+                    episode_id: row.get("item_id"),
+                    filesystem_entry_id: row.get("id"),
+                    library_root_id: row.get("library_root_id"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn move_filesystem_entry(
+        &self,
+        entry: FilesystemEntryMove<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE filesystem_entries
+             SET library_root_id = ?, relative_path = ?, size = ?, modified_at = ?, inode = ?,
+                 fingerprint = ?, last_seen_generation = ?, is_missing = 0,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(entry.library_root_id)
+        .bind(entry.relative_path)
+        .bind(entry.size)
+        .bind(entry.modified_at)
+        .bind(entry.inode)
+        .bind(entry.fingerprint)
+        .bind(entry.generation)
+        .bind(entry.entry_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_filesystem_entry_inode(
+        &self,
+        entry_id: &str,
+        inode: Option<i64>,
+    ) -> Result<(), StorageError> {
+        self.query("UPDATE filesystem_entries SET inode = ?, updated_at = unixepoch() WHERE id = ?")
+            .bind(inode)
+            .bind(entry_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn list_existing_filesystem_paths(
         &self,
         library_root_id: &str,
@@ -4851,8 +5041,8 @@ impl Database {
         self.query(
             "INSERT INTO filesystem_entries (
                 id, library_root_id, relative_path, entry_kind, size,
-                modified_at, fingerprint, last_seen_generation, is_missing
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                modified_at, inode, fingerprint, last_seen_generation, is_missing
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         )
         .bind(entry.id)
         .bind(entry.library_root_id)
@@ -4860,6 +5050,7 @@ impl Database {
         .bind(entry.entry_kind)
         .bind(entry.size)
         .bind(entry.modified_at)
+        .bind(entry.inode)
         .bind(entry.fingerprint)
         .bind(entry.last_seen_generation)
         .execute(&self.pool)
@@ -5061,14 +5252,15 @@ impl Database {
             self.query(
                 "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, fingerprint, last_seen_generation, is_missing
-                ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, 0)",
+                    modified_at, inode, fingerprint, last_seen_generation, is_missing
+                ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)",
             )
             .bind(&file.filesystem_entry_id)
             .bind(library_root_id)
             .bind(&file.relative_path)
             .bind(file.size)
             .bind(file.modified_at)
+            .bind(Option::<i64>::None)
             .bind(&file.fingerprint)
             .bind(generation)
             .execute(&mut *transaction)
@@ -5249,6 +5441,163 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn adopt_media_item_identity(
+        &self,
+        item_id: &str,
+        identity_key: &str,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let occupied = self
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM media_items
+                 WHERE identity_key = ? AND id <> ?",
+            )
+            .bind(identity_key)
+            .bind(item_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if occupied != 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        self.query(
+            "UPDATE media_items
+             SET identity_key = ?, removed_at = NULL
+             WHERE id = ?",
+        )
+        .bind(identity_key)
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    pub(crate) async fn repair_episode_hierarchy_identities(
+        &self,
+        episode_id: &str,
+        series_identity: &str,
+        season_identity: &str,
+        episode_identity: &str,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let hierarchy = self
+            .query_as::<(String, String, String)>(
+                "SELECT episode.id, season.id, series.id
+                 FROM media_items episode
+                 JOIN media_items season
+                   ON season.id = episode.parent_id AND season.item_type = 'SEASON'
+                 JOIN media_items series
+                   ON series.id = episode.series_id AND series.item_type = 'SERIES'
+                 WHERE episode.id = ? AND episode.item_type = 'EPISODE'",
+            )
+            .bind(episode_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((episode_id, season_id, series_id)) = hierarchy else {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        };
+
+        let conflicts = self
+            .query_scalar::<i64>(
+                "SELECT COUNT(*)
+                 FROM media_items
+                 WHERE identity_key IN (?, ?, ?)
+                   AND id NOT IN (?, ?, ?)",
+            )
+            .bind(series_identity)
+            .bind(season_identity)
+            .bind(episode_identity)
+            .bind(&series_id)
+            .bind(&season_id)
+            .bind(&episode_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if conflicts != 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+
+        for (item_id, identity_key) in [
+            (&series_id, series_identity),
+            (&season_id, season_identity),
+            (&episode_id, episode_identity),
+        ] {
+            self.query("UPDATE media_items SET identity_key = ?, removed_at = NULL WHERE id = ?")
+                .bind(identity_key)
+                .bind(item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
     }
 
     pub(crate) async fn find_media_item_metadata(
@@ -10190,6 +10539,36 @@ impl Database {
             })
     }
 
+    pub(crate) async fn identity_stability_repair_completed(&self) -> Result<bool, StorageError> {
+        self.query_scalar::<String>(
+            "SELECT value FROM lux_meta WHERE key = 'identity_stability_repair_v1'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value| value.as_deref() == Some("completed"))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_identity_stability_repair_completed(
+        &self,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO lux_meta (key, value)
+             VALUES ('identity_stability_repair_v1', 'completed')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     /// Verifies that SQLite can commit a real write transaction.
     ///
     /// The probe only changes a reserved metadata key and never touches
@@ -10654,6 +11033,14 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) item_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredEpisodeIdentityCandidate {
+    pub(crate) episode_id: String,
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
 }
 
 fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
@@ -11652,8 +12039,20 @@ pub(crate) struct NewFilesystemEntry<'a> {
     pub(crate) entry_kind: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) last_seen_generation: &'a str,
+}
+
+pub(crate) struct FilesystemEntryMove<'a> {
+    pub(crate) entry_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: &'a [u8],
+    pub(crate) generation: &'a str,
 }
 
 pub(crate) struct NewMediaItem<'a> {
