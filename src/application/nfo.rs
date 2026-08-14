@@ -427,6 +427,7 @@ fn push_parsed_actor(actors: &mut Vec<ActorCredit>, actor: ParsedMovieActor) {
         .unwrap_or_default();
     actors.push(ActorCredit {
         provider: actor.provider,
+        identities: Vec::new(),
         id,
         name,
         character: actor.role,

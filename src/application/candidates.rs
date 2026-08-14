@@ -810,6 +810,7 @@ fn generic_candidate_actors(
             (!name.is_empty()).then(|| ActorCredit {
                 id: id.to_owned(),
                 provider: None,
+                identities: Vec::new(),
                 name: name.to_owned(),
                 character: member
                     .character
@@ -1623,6 +1624,7 @@ fn tmdb_candidate_actors(cast: &[TmdbCastMember]) -> Vec<ActorCredit> {
             Some(ActorCredit {
                 id: member.id.to_string(),
                 provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
                 name: name.to_owned(),
                 character: member
                     .character

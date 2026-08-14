@@ -13,8 +13,9 @@ use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::application::metadata_paths::{
-    MetadataPathError, library_item_directory, metadata_root, people_directory,
-    people_index_directory, people_index_path, people_index_path_for_provider, readable_component,
+    MetadataPathError, canonical_person_directory, library_item_directory, metadata_root,
+    people_directory, people_index_directory, people_index_path, people_index_path_for_provider,
+    readable_component,
 };
 
 const LEGACY_PEOPLE_DIR: &str = "people";
@@ -39,6 +40,8 @@ pub struct ActorCredit {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identities: Vec<PersonIdentity>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character: Option<String>,
@@ -50,12 +53,23 @@ pub struct ActorCredit {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PersonIdentity {
+    pub provider: String,
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StoredActor {
     #[serde(default, deserialize_with = "deserialize_optional_person_id")]
     id: Option<String>,
     name: String,
     #[serde(default = "default_provider")]
     provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    person_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    identities: Vec<PersonIdentity>,
     #[serde(default)]
     character: Option<String>,
     #[serde(default)]
@@ -92,6 +106,8 @@ struct PersonAssetResult {
 #[serde(rename_all = "camelCase")]
 struct StoredPersonIndex {
     image_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    person_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -177,19 +193,28 @@ impl PeopleService {
         let mut pending_assets = Vec::new();
         let provider = provider.trim().to_ascii_lowercase();
         for actor in actors.iter().take(MAX_ACTORS) {
-            let actor_id = actor.id.trim();
             if actor.name.trim().is_empty() {
                 continue;
             }
-            let actor_provider = actor
-                .provider
-                .as_deref()
-                .unwrap_or(&provider)
-                .trim()
-                .to_ascii_lowercase();
-            let has_stable_identity = is_valid_person_id(actor_id);
+            let identities = actor_identities(actor, &provider);
+            let primary = identities.first();
+            let actor_id = primary
+                .map(|identity| identity.id.as_str())
+                .unwrap_or_default();
+            let actor_provider = primary
+                .map(|identity| identity.provider.as_str())
+                .unwrap_or_default();
+            let person_key = person_key_for_identities(&identities);
+            let has_stable_identity = person_key.is_some();
             let assets = if has_stable_identity {
-                self.persist_person_assets(actor, &actor_provider).await
+                self.persist_person_assets(
+                    actor,
+                    actor_provider,
+                    actor_id,
+                    person_key.as_deref(),
+                    &identities,
+                )
+                .await
             } else {
                 PersonAssetResult {
                     image_file: None,
@@ -203,8 +228,10 @@ impl PeopleService {
                 id: has_stable_identity.then(|| actor_id.to_owned()),
                 name: actor.name.trim().to_owned(),
                 provider: has_stable_identity
-                    .then_some(actor_provider)
+                    .then(|| actor_provider.to_owned())
                     .unwrap_or_default(),
+                person_key,
+                identities,
                 character: actor
                     .character
                     .as_deref()
@@ -238,16 +265,48 @@ impl PeopleService {
         &self,
         actor: &ActorCredit,
         provider: &str,
+        provider_id: &str,
+        person_key: Option<&str>,
+        identities: &[PersonIdentity],
     ) -> PersonAssetResult {
         let mut pending_assets = Vec::new();
-        let person_dir = match people_directory(&self.config_dir, &actor.name, provider, &actor.id)
-        {
-            Ok(person_dir) => {
-                if let Err(error) = create_private_dir(&person_dir).await {
+        let person_dir =
+            match people_directory(&self.config_dir, &actor.name, provider, provider_id) {
+                Ok(legacy_dir) => {
+                    let path = if safe_metadata(&legacy_dir).await.ok().flatten().is_some() {
+                        Ok(legacy_dir)
+                    } else if let Some(person_key) = person_key {
+                        canonical_person_directory(&self.config_dir, person_key)
+                            .map_err(PeopleError::from)
+                    } else {
+                        Ok(legacy_dir)
+                    };
+                    let Ok(person_dir) = path else {
+                        pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
+                        return PersonAssetResult {
+                            image_file: None,
+                            pending_assets,
+                        };
+                    };
+                    if let Err(error) = create_private_dir(&person_dir).await {
+                        tracing::warn!(
+                            person_id = %provider_id,
+                            %error,
+                            "actor person directory was not prepared"
+                        );
+                        pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
+                        return PersonAssetResult {
+                            image_file: None,
+                            pending_assets,
+                        };
+                    }
+                    person_dir
+                }
+                Err(error) => {
                     tracing::warn!(
-                        person_id = %actor.id,
+                        person_id = %provider_id,
                         %error,
-                        "actor person directory was not prepared"
+                        "actor person path was not prepared"
                     );
                     pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
                     return PersonAssetResult {
@@ -255,44 +314,30 @@ impl PeopleService {
                         pending_assets,
                     };
                 }
-                person_dir
-            }
-            Err(error) => {
-                tracing::warn!(
-                    person_id = %actor.id,
-                    %error,
-                    "actor person path was not prepared"
-                );
-                pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
-                return PersonAssetResult {
-                    image_file: None,
-                    pending_assets,
-                };
-            }
-        };
+            };
 
         let nfo_path = person_dir.join(PERSON_NFO);
         let index_dir = people_index_directory(&self.config_dir);
         if let Err(error) = create_private_dir(&index_dir).await {
             tracing::warn!(
-                person_id = %actor.id,
+                person_id = %provider_id,
                 %error,
                 "actor people index directory was not prepared"
             );
         }
         if let Err(error) = write_atomically(
             &nfo_path,
-            &person_nfo_bytes(&actor.name, provider, &actor.id),
+            &person_nfo_bytes(&actor.name, provider, provider_id),
         )
         .await
         {
-            tracing::warn!(person_id = %actor.id, %error, "actor person NFO was not cached");
+            tracing::warn!(person_id = %provider_id, %error, "actor person NFO was not cached");
             pending_assets.push(PENDING_PERSON_NFO.to_owned());
         }
 
         let image_file = match self
             .ensure_profile_image(
-                &actor.id,
+                provider_id,
                 provider,
                 actor.profile_url.as_deref(),
                 &person_dir,
@@ -301,14 +346,14 @@ impl PeopleService {
         {
             Ok(image_file) => image_file,
             Err(error) => {
-                tracing::warn!(person_id = %actor.id, %error, "actor profile image was not cached");
+                tracing::warn!(person_id = %provider_id, %error, "actor profile image was not cached");
                 pending_assets.push(PENDING_PROFILE_IMAGE.to_owned());
                 None
             }
         };
         let image_available = image_file.is_some()
             || matches!(
-                self.profile_image_for_provider(Some(provider), &actor.id)
+                self.profile_image_for_provider(Some(provider), provider_id)
                     .await,
                 Ok(Some(_))
             );
@@ -328,16 +373,30 @@ impl PeopleService {
                 Ok(relative) => {
                     let index = StoredPersonIndex {
                         image_path: relative.to_string_lossy().into_owned(),
+                        person_key: person_key.map(str::to_owned),
                     };
                     match serde_json::to_vec_pretty(&index) {
-                        Ok(bytes) => match people_index_path_for_provider(
-                            &self.config_dir,
-                            provider,
-                            &actor.id,
-                        ) {
-                            Ok(index_path) => write_atomically(&index_path, &bytes).await,
-                            Err(error) => Err(PeopleError::from(error)),
-                        },
+                        Ok(bytes) => {
+                            let mut result = Ok(());
+                            for identity in identities {
+                                let index_path = match people_index_path_for_provider(
+                                    &self.config_dir,
+                                    &identity.provider,
+                                    &identity.id,
+                                ) {
+                                    Ok(index_path) => index_path,
+                                    Err(error) => {
+                                        result = Err(PeopleError::from(error));
+                                        break;
+                                    }
+                                };
+                                if let Err(error) = write_atomically(&index_path, &bytes).await {
+                                    result = Err(error);
+                                    break;
+                                }
+                            }
+                            result
+                        }
                         Err(error) => Err(PeopleError::Serialization(error.to_string())),
                     }
                 }
@@ -347,7 +406,7 @@ impl PeopleService {
             };
             if let Err(error) = index_result {
                 tracing::warn!(
-                    person_id = %actor.id,
+                    person_id = %provider_id,
                     %error,
                     "actor person image index was not cached"
                 );
@@ -915,6 +974,63 @@ fn is_valid_person_id(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+fn actor_identities(actor: &ActorCredit, fallback_provider: &str) -> Vec<PersonIdentity> {
+    let mut identities = actor
+        .identities
+        .iter()
+        .filter_map(|identity| {
+            let provider = identity.provider.trim().to_ascii_lowercase();
+            let id = identity.id.trim().to_owned();
+            (is_valid_person_id(&provider) && is_valid_person_id(&id))
+                .then_some(PersonIdentity { provider, id })
+        })
+        .collect::<Vec<_>>();
+    let provider = actor
+        .provider
+        .as_deref()
+        .unwrap_or(fallback_provider)
+        .trim()
+        .to_ascii_lowercase();
+    let id = actor.id.trim();
+    if is_valid_person_id(&provider)
+        && is_valid_person_id(id)
+        && !identities
+            .iter()
+            .any(|identity| identity.provider == provider && identity.id == id)
+    {
+        identities.push(PersonIdentity {
+            provider,
+            id: id.to_owned(),
+        });
+    }
+    identities.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then(left.id.cmp(&right.id))
+    });
+    identities.dedup_by(|left, right| left.provider == right.provider && left.id == right.id);
+    identities
+}
+
+fn person_key_for_identities(identities: &[PersonIdentity]) -> Option<String> {
+    if identities.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    for identity in identities {
+        hasher.update(identity.provider.as_bytes());
+        hasher.update([b':']);
+        hasher.update(identity.id.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    Some(format!("person-{encoded}"))
+}
+
 fn local_actor_id(name: &str, character: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name.trim().as_bytes());
@@ -1131,9 +1247,10 @@ impl From<MetadataPathError> for PeopleError {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{ActorCredit, PeopleError, PeopleService};
+    use super::{ActorCredit, PeopleError, PeopleService, PersonIdentity};
     use crate::application::metadata_paths::{
-        library_item_directory, people_directory, people_index_path_for_provider,
+        canonical_person_directory, library_item_directory, people_directory,
+        people_index_path_for_provider,
     };
 
     #[tokio::test]
@@ -1170,6 +1287,7 @@ mod tests {
                 &[ActorCredit {
                     id: "9".to_owned(),
                     provider: None,
+                    identities: Vec::new(),
                     name: "演员甲".to_owned(),
                     character: Some("角色甲".to_owned()),
                     order: Some(0),
@@ -1221,6 +1339,7 @@ mod tests {
                     &[ActorCredit {
                         id: "9".to_owned(),
                         provider: None,
+                        identities: Vec::new(),
                         name: name.to_owned(),
                         character: None,
                         order: Some(0),
@@ -1280,6 +1399,7 @@ mod tests {
                 &[ActorCredit {
                     id: "9".to_owned(),
                     provider: None,
+                    identities: Vec::new(),
                     name: "演员甲".to_owned(),
                     character: None,
                     order: None,
@@ -1304,6 +1424,7 @@ mod tests {
                 &[ActorCredit {
                     id: String::new(),
                     provider: None,
+                    identities: Vec::new(),
                     name: "本地演员".to_owned(),
                     character: Some("本地角色".to_owned()),
                     order: Some(0),
@@ -1346,6 +1467,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_provider_identities_share_one_person_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let identities = vec![
+            PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "124".to_owned(),
+            },
+            PersonIdentity {
+                provider: "imdb".to_owned(),
+                id: "nm123".to_owned(),
+            },
+        ];
+        service
+            .persist_item_actors(
+                "item-multi-provider",
+                "tmdb",
+                &[ActorCredit {
+                    id: "124".to_owned(),
+                    provider: Some("tmdb".to_owned()),
+                    identities,
+                    name: "演员甲".to_owned(),
+                    character: None,
+                    order: Some(0),
+                    profile_url: None,
+                }],
+            )
+            .await?;
+
+        let relation_path =
+            library_item_directory(config.path(), "item-multi-provider")?.join("people.json");
+        let relation: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(relation_path).await?)?;
+        let person_key = relation["actors"][0]["personKey"]
+            .as_str()
+            .ok_or("missing canonical person key")?;
+        let person_dir = canonical_person_directory(config.path(), person_key)?;
+        assert!(person_dir.join("person.nfo").exists());
+        assert!(!config.path().join("metadata/people/演").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn nfo_relation_tracks_source_revision_and_reuses_it()
     -> Result<(), Box<dyn std::error::Error>> {
         let config = tempfile::tempdir()?;
@@ -1355,6 +1520,7 @@ mod tests {
         let actors = [ActorCredit {
             id: "9".to_owned(),
             provider: None,
+            identities: Vec::new(),
             name: "演员甲".to_owned(),
             character: None,
             order: Some(0),
@@ -1397,6 +1563,7 @@ mod tests {
                 &[ActorCredit {
                     id: "9".to_owned(),
                     provider: None,
+                    identities: Vec::new(),
                     name: "演员甲".to_owned(),
                     character: Some("角色甲".to_owned()),
                     order: Some(0),

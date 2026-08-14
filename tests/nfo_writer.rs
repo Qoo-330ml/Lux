@@ -101,6 +101,7 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
             actors: vec![ActorCredit {
                 id: "124".to_owned(),
                 provider: None,
+                identities: Vec::new(),
                 name: "沈腾".to_owned(),
                 character: Some("张驰".to_owned()),
                 order: Some(0),
@@ -180,6 +181,7 @@ fn movie_nfo_rewrite_keeps_actor_without_provider_id() -> Result<(), Box<dyn std
             actors: vec![ActorCredit {
                 id: String::new(),
                 provider: None,
+                identities: Vec::new(),
                 name: "演员甲".to_owned(),
                 character: None,
                 order: None,
@@ -233,6 +235,7 @@ fn movie_nfo_uses_actor_provider_specific_identity_tags() -> Result<(), Box<dyn 
             actors: vec![ActorCredit {
                 id: "nm123".to_owned(),
                 provider: Some("imdb".to_owned()),
+                identities: Vec::new(),
                 name: "演员甲".to_owned(),
                 character: None,
                 order: None,
