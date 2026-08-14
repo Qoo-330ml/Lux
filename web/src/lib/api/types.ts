@@ -32,6 +32,10 @@ export type LuxUser = {
   canDownload?: boolean;
 };
 
+export type UserPlaybackSettings = {
+  playedPercent: number;
+};
+
 export type AuthSession = {
   user: LuxUser;
   serverName?: string | null;

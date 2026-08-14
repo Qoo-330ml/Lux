@@ -93,6 +93,27 @@ describe("LuxApiClient", () => {
     } satisfies Partial<ApiError>);
   });
 
+  it("reads and updates the current user's playback threshold", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (!init?.method) {
+        return new Response(JSON.stringify({ playedPercent: 95 }), { status: 200 });
+      }
+      expect(String(input)).toBe("/api/v1/auth/settings");
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(String(init.body))).toEqual({ playedPercent: 80 });
+      return new Response(JSON.stringify({ playedPercent: 80 }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.userSettings()).resolves.toEqual({ playedPercent: 95 });
+    await expect(client.updateUserSettings({ playedPercent: 80 })).resolves.toEqual({ playedPercent: 80 });
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
   it("filters library browse requests by the requested root item type", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),

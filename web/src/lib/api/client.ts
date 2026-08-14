@@ -36,6 +36,7 @@ import type {
   SetupDatabaseBackend,
   SetupDatabaseStatus,
   MetadataRefreshMode,
+  UserPlaybackSettings,
 } from "./types";
 
 const csrfCookie = "lux_csrf";
@@ -178,6 +179,17 @@ export class LuxApiClient {
 
   me() {
     return this.request<AuthSession>("/api/v1/auth/me");
+  }
+
+  userSettings() {
+    return this.request<UserPlaybackSettings>("/api/v1/auth/settings");
+  }
+
+  updateUserSettings(input: Partial<UserPlaybackSettings>) {
+    return this.request<UserPlaybackSettings>("/api/v1/auth/settings", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
   }
 
   avatarUrl(cacheKey?: string) {

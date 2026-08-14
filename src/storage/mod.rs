@@ -14,10 +14,22 @@ static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
 pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
+pub(crate) const DEFAULT_PLAYED_PERCENT: i64 = 95;
 const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 
 fn database_flag(value: bool) -> i64 {
     i64::from(value)
+}
+
+fn playback_reached_played_threshold(
+    position_ticks: i64,
+    duration_ticks: i64,
+    played_percent: i64,
+) -> bool {
+    position_ticks > 0
+        && duration_ticks > 0
+        && i128::from(position_ticks) * 100
+            >= i128::from(duration_ticks) * i128::from(played_percent.clamp(1, 100))
 }
 
 #[derive(Clone)]
@@ -1806,6 +1818,44 @@ impl Database {
         Ok((percent, min_ticks))
     }
 
+    pub(crate) async fn user_played_percent(&self, user_id: &str) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT played_percent FROM user_playback_settings
+             WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value: Option<i64>| value.unwrap_or(DEFAULT_PLAYED_PERCENT).clamp(1, 100))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_user_played_percent(
+        &self,
+        user_id: &str,
+        played_percent: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_playback_settings (user_id, played_percent)
+             VALUES (?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 played_percent = excluded.played_percent,
+                 updated_at = unixepoch()",
+        )
+        .bind(user_id)
+        .bind(played_percent)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn set_server_settings(
         &self,
         percent: i64,
@@ -1993,6 +2043,13 @@ impl Database {
                 source,
             })?;
         let max_function = self.scalar_max_function();
+        let auto_played = event.duration_ticks.is_some_and(|duration_ticks| {
+            playback_reached_played_threshold(
+                event.position_ticks,
+                duration_ticks,
+                event.played_percent,
+            )
+        });
         let playback_session_query = format!(
             "INSERT INTO playback_sessions (
                 id, user_id, item_id, media_source_id, play_session_id,
@@ -2060,6 +2117,127 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        if auto_played {
+            self.query(
+                "UPDATE user_item_state
+                 SET is_played = 1,
+                     play_count = CASE WHEN is_played = 0 THEN play_count + 1 ELSE play_count END,
+                     last_played_at = unixepoch(),
+                     version = version + CASE WHEN is_played = 0 THEN 1 ELSE 0 END
+                 WHERE user_id = ? AND item_id = ?",
+            )
+            .bind(event.user_id)
+            .bind(event.item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn sync_played_container_states(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<(), StorageError> {
+        let parent_ids: Vec<String> = self
+            .query(
+                "SELECT parent_id FROM media_items
+                 WHERE id = ? AND item_type = 'EPISODE' AND parent_id IS NOT NULL
+                 UNION
+                 SELECT series_id FROM media_items
+                 WHERE id = ? AND item_type = 'EPISODE' AND series_id IS NOT NULL",
+            )
+            .bind(item_id)
+            .bind(item_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect();
+        if parent_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for parent_id in parent_ids {
+            let is_played: i64 = self
+                .query_scalar(
+                    "WITH eligible AS (
+                         SELECT episode.id
+                         FROM media_items episode
+                         JOIN media_items parent ON parent.id = ?
+                         WHERE episode.item_type = 'EPISODE'
+                           AND episode.removed_at IS NULL
+                           AND episode.has_available_source = 1
+                           AND ((parent.item_type = 'SEASON' AND episode.parent_id = parent.id)
+                             OR (parent.item_type = 'SERIES' AND episode.series_id = parent.id))
+                     )
+                     SELECT CASE WHEN EXISTS (SELECT 1 FROM eligible)
+                                      AND NOT EXISTS (
+                                          SELECT 1
+                                          FROM eligible
+                                          LEFT JOIN user_item_state state
+                                            ON state.user_id = ? AND state.item_id = eligible.id
+                                          WHERE COALESCE(state.is_played, 0) = 0
+                                      )
+                                 THEN 1 ELSE 0 END",
+                )
+                .bind(&parent_id)
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
+                 VALUES (?, ?, ?, CASE WHEN ? = 1 THEN 1 ELSE 0 END,
+                         CASE WHEN ? = 1 THEN unixepoch() ELSE NULL END)
+                 ON CONFLICT(user_id, item_id) DO UPDATE SET
+                     is_played = excluded.is_played,
+                     play_count = CASE
+                         WHEN excluded.is_played = 1 AND user_item_state.is_played = 0
+                         THEN user_item_state.play_count + 1 ELSE user_item_state.play_count END,
+                     last_played_at = CASE
+                         WHEN excluded.is_played = 1 THEN unixepoch()
+                         ELSE user_item_state.last_played_at END,
+                     version = user_item_state.version + CASE
+                         WHEN excluded.is_played != user_item_state.is_played THEN 1 ELSE 0 END",
+            )
+            .bind(user_id)
+            .bind(&parent_id)
+            .bind(is_played)
+            .bind(is_played)
+            .bind(is_played)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -10692,6 +10870,7 @@ pub(crate) struct NewPlaybackEvent<'a> {
     pub(crate) state: &'a str,
     pub(crate) position_ticks: i64,
     pub(crate) duration_ticks: Option<i64>,
+    pub(crate) played_percent: i64,
     pub(crate) is_paused: bool,
 }
 

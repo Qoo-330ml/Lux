@@ -31,6 +31,7 @@ describe("account settings", () => {
         { id: "series", name: "剧集", kind: "SERIES" },
       ],
     });
+    vi.spyOn(api, "userSettings").mockResolvedValue({ playedPercent: 95 });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -115,6 +116,38 @@ describe("account settings", () => {
     expect(container.textContent).toContain("账户");
     expect(container.querySelector("#appearance .lux-setting-divider")).toBeNull();
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
+  });
+
+  it("saves the personal automatic watched threshold", async () => {
+    const update = vi.spyOn(api, "updateUserSettings").mockResolvedValue({ playedPercent: 82 });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const input = container.querySelector<HTMLInputElement>('[aria-label="自动标记已看百分比"]');
+    expect(input?.value).toBe("95");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "82");
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+      input?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "保存")?.click();
+    });
+
+    expect(update).toHaveBeenCalledWith({ playedPercent: 82 });
+    expect(container.textContent).toContain("播放阈值已保存");
   });
 
   it("uploads an avatar to the server only after the user explicitly saves it", async () => {

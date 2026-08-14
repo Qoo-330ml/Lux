@@ -66,7 +66,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     .bind(1_300_000_000_i64)
     .bind(&admin_id)
     .bind(&almost_id)
-    .bind(1_850_000_000_i64)
+    .bind(1_900_000_000_i64)
     .execute(database.pool())
     .await?;
 
@@ -133,6 +133,14 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .send()
         .await?;
     assert_eq!(settings.status(), reqwest::StatusCode::OK);
+    let personal_settings = client
+        .patch(format!("{base_url}/api/v1/auth/settings"))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "playedPercent": 100 }))
+        .send()
+        .await?;
+    assert_eq!(personal_settings.status(), reqwest::StatusCode::OK);
     let default_settings = client
         .get(format!("{base_url}/api/v1/admin/settings"))
         .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))

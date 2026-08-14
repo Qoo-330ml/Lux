@@ -538,6 +538,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/me", get(auth_me))
         .route(
+            "/api/v1/auth/settings",
+            get(auth_settings).patch(auth_update_settings),
+        )
+        .route(
             "/api/v1/auth/avatar",
             get(auth_avatar)
                 .put(auth_update_avatar)
@@ -3715,6 +3719,10 @@ async fn handle_emby_playback_event(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("{}:{device_id}", request.item_id));
     let user_id = user.id.to_string();
+    let played_percent = match database.user_played_percent(&user_id).await {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let previous_session = match database
         .find_playback_session(&user_id, &play_session_id)
         .await
@@ -3738,11 +3746,19 @@ async fn handle_emby_playback_event(
             state: state_name,
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
+            played_percent,
             is_paused: request.is_paused || state_name == "PAUSED",
         })
         .await
     {
         Ok(()) => {
+            if database
+                .sync_played_container_states(&user_id, &request.item_id)
+                .await
+                .is_err()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             if let Some(event_type) = activity_event {
                 record_activity_event(
                     Some(database),
@@ -3981,11 +3997,22 @@ async fn lux_post_progress(
             state: playback_state.as_str(),
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
+            played_percent: match database.user_played_percent(&user_id).await {
+                Ok(value) => value,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            },
             is_paused: matches!(playback_state, LuxPlaybackState::Paused),
         })
         .await
     {
         Ok(()) => {
+            if database
+                .sync_played_container_states(&user_id, &item_id)
+                .await
+                .is_err()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             if let Some(event_type) = activity_event {
                 record_activity_event(
                     Some(database),
@@ -4084,7 +4111,17 @@ async fn handle_emby_user_flag(
             .await
     };
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if played
+                && database
+                    .sync_played_container_states(&user_id, &item_id)
+                    .await
+                    .is_err()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -4168,7 +4205,16 @@ async fn lux_set_played(
         .set_user_item_played(&user.id.to_string(), &item_id, request.played)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if database
+                .sync_played_container_states(&user.id.to_string(), &item_id)
+                .await
+                .is_err()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -6239,6 +6285,59 @@ async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response 
             "认证暂时不可用",
         )
         .into_response(),
+    }
+}
+
+async fn auth_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.user_played_percent(&user.id.to_string()).await {
+        Ok(played_percent) => Json(json!({ "playedPercent": played_percent })).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthSettingsPatch {
+    played_percent: i64,
+}
+
+async fn auth_update_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<AuthSettingsPatch>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    if !(1..=100).contains(&request.played_percent) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "自动标记已看百分比必须在 1 到 100 之间",
+        )
+        .into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .set_user_played_percent(&user.id.to_string(), request.played_percent)
+        .await
+    {
+        Ok(()) => Json(json!({ "playedPercent": request.played_percent })).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
