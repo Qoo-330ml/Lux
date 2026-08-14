@@ -5657,6 +5657,7 @@ impl Database {
         &self,
         update: SelectedMetadataUpdate<'_>,
     ) -> Result<bool, StorageError> {
+        let sort_title = update.title.to_lowercase();
         let mut transaction = self
             .pool
             .begin()
@@ -5667,7 +5668,7 @@ impl Database {
             })?;
         self.query(
             "UPDATE media_items
-             SET title = ?, original_title = ?, overview = ?, production_year = ?,
+             SET title = ?, sort_title = ?, original_title = ?, overview = ?, production_year = ?,
                  premiere_date = COALESCE(?, premiere_date),
                  last_air_date = COALESCE(?, last_air_date),
                  status = COALESCE(?, status),
@@ -5680,6 +5681,7 @@ impl Database {
              WHERE id = ? AND removed_at IS NULL",
         )
         .bind(update.title)
+        .bind(sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
@@ -6745,8 +6747,8 @@ impl Database {
                 "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
                  mi.rating ASC, mi.sort_title ASC, mi.id ASC"
             }
-            (CatalogSort::Name, true) => "mi.sort_title DESC, mi.id DESC",
-            (CatalogSort::Name, false) => "mi.sort_title ASC, mi.id ASC",
+            (CatalogSort::Name, true) => "LOWER(mi.title) DESC, mi.id DESC",
+            (CatalogSort::Name, false) => "LOWER(mi.title) ASC, mi.id ASC",
         };
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
@@ -9256,9 +9258,11 @@ impl Database {
         &self,
         update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
+        let sort_title = update.title.to_lowercase();
         self.query(
             "UPDATE media_items
              SET title = ?,
+                 sort_title = ?,
                  original_title = ?,
                  overview = ?,
                  production_year = ?,
@@ -9268,6 +9272,7 @@ impl Database {
              WHERE id = ?",
         )
         .bind(update.title)
+        .bind(sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
