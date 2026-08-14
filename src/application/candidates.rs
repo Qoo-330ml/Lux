@@ -803,12 +803,7 @@ fn generic_candidate_actors(
         .take(MAX_MOVIE_NFO_ACTORS)
         .filter_map(|member| {
             let id = member.provider_id.trim();
-            if id.is_empty()
-                || id.len() > 128
-                || !id.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-                })
-            {
+            if !valid_tmdb_actor_id(id) {
                 return None;
             }
             let name = member.name.as_deref()?.trim();
@@ -1651,14 +1646,24 @@ fn candidate_actors(value: &Value) -> Result<Vec<ActorCredit>, MetadataSelection
             let actor = serde_json::from_value::<ActorCredit>(actor.clone()).map_err(|error| {
                 MetadataSelectionError::InvalidCandidate(format!("actor is invalid: {error}"))
             })?;
-            if actor.id.trim().is_empty() || actor.name.trim().is_empty() {
+            let id = actor.id.trim();
+            let name = actor.name.trim();
+            if !valid_tmdb_actor_id(id) || name.is_empty() {
                 return Err(MetadataSelectionError::InvalidCandidate(
-                    "actor ID and name are required".to_owned(),
+                    "actor TMDb ID and name are required".to_owned(),
                 ));
             }
-            Ok(actor)
+            Ok(ActorCredit {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                ..actor
+            })
         })
         .collect()
+}
+
+fn valid_tmdb_actor_id(id: &str) -> bool {
+    id.trim().parse::<u64>().ok().is_some_and(|value| value > 0)
 }
 
 fn candidate_images(value: &Value) -> (BTreeMap<String, Vec<String>>, bool) {
@@ -1857,10 +1862,11 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TmdbCastMember, default_image_selection_policy, generic_candidate_images,
-        tmdb_candidate_actors,
+        MetadataSelectionError, TmdbCastMember, candidate_actors, default_image_selection_policy,
+        generic_candidate_images, tmdb_candidate_actors,
     };
     use crate::application::scraper::{ScraperImage, ScraperItemType};
+    use serde_json::json;
 
     #[test]
     fn metadata_refresh_keeps_backdrop_images_as_fanart() {
@@ -1916,5 +1922,18 @@ mod tests {
             Some("https://image.tmdb.org/t/p/w185/profile.jpg")
         );
         assert_eq!(actors[1].id, "10");
+    }
+
+    #[test]
+    fn candidate_actors_require_numeric_tmdb_ids() {
+        let result = candidate_actors(&json!({
+            "actors": [{"id": "person-9", "name": "演员甲"}]
+        }));
+
+        assert!(matches!(
+            result,
+            Err(MetadataSelectionError::InvalidCandidate(message))
+                if message.contains("TMDb ID")
+        ));
     }
 }

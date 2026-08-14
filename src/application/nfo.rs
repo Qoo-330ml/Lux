@@ -959,6 +959,7 @@ pub fn rewrite_movie_nfo(
     original: &[u8],
     patch: &MovieNfoMetadata,
 ) -> Result<Vec<u8>, NfoWriteError> {
+    validate_movie_nfo_actors(patch)?;
     let base = rewrite_nfo(original, &patch.base)?;
     let mut reader = Reader::from_reader(base.as_slice());
     reader.config_mut().trim_text(false);
@@ -1183,16 +1184,13 @@ fn append_movie_nfo_fields(
     patch: &MovieNfoMetadata,
 ) -> Result<(), NfoWriteError> {
     for actor in &patch.actors {
-        if actor.id.trim().is_empty() || actor.name.trim().is_empty() {
-            continue;
-        }
         start_element(writer, "actor", None)?;
-        write_simple_element(writer, "name", &actor.name)?;
+        write_simple_element(writer, "name", actor.name.trim())?;
         if let Some(character) = non_empty(actor.character.as_deref()) {
             write_simple_element(writer, "role", character)?;
         }
         write_simple_element(writer, "type", "Actor")?;
-        write_simple_element(writer, "tmdbid", &actor.id)?;
+        write_simple_element(writer, "tmdbid", actor.id.trim())?;
         if let Some(order) = actor.order {
             write_simple_element(writer, "order", &order.to_string())?;
         }
@@ -1287,6 +1285,21 @@ fn append_movie_nfo_fields(
     }
     append_provider_ids(writer, &patch.provider_ids)?;
     Ok(())
+}
+
+fn validate_movie_nfo_actors(patch: &MovieNfoMetadata) -> Result<(), NfoWriteError> {
+    for actor in &patch.actors {
+        if actor.name.trim().is_empty() || !valid_tmdb_actor_id(&actor.id) {
+            return Err(NfoWriteError::InvalidMetadata(
+                "movie actor requires a valid TMDb ID and name".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_tmdb_actor_id(id: &str) -> bool {
+    id.trim().parse::<u64>().ok().is_some_and(|value| value > 0)
 }
 
 fn write_credit_element(

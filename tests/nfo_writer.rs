@@ -3,10 +3,10 @@ use luxd::{
         libraries::LibraryService,
         metadata::{MetadataEnricher, NfoMetadata},
         nfo::{
-            LocalNfoMetadataStore, MovieNfoCredit, MovieNfoMetadata, NfoWriteService,
-            parse_local_nfo_actors, parse_local_nfo_details, parse_local_nfo_projection,
-            parse_movie_nfo_actors, parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo,
-            write_nfo_atomically,
+            LocalNfoMetadataStore, MovieNfoCredit, MovieNfoMetadata, NfoWriteError,
+            NfoWriteService, parse_local_nfo_actors, parse_local_nfo_details,
+            parse_local_nfo_projection, parse_movie_nfo_actors, parse_movie_nfo_details,
+            rewrite_movie_nfo, rewrite_nfo, write_nfo_atomically,
         },
         people::ActorCredit,
         scanner::LibraryScanner,
@@ -169,6 +169,25 @@ fn movie_nfo_rewrite_keeps_existing_rich_fields_when_patch_is_partial()
     assert!(text.contains("<genre>旧类型</genre>"));
     assert!(text.contains("<name>旧演员</name>"));
     Ok(())
+}
+
+#[test]
+fn movie_nfo_rewrite_rejects_actor_without_valid_tmdb_id() {
+    let result = rewrite_movie_nfo(
+        b"<movie><title>Movie</title></movie>",
+        &MovieNfoMetadata {
+            actors: vec![ActorCredit {
+                id: "person-9".to_owned(),
+                name: "演员甲".to_owned(),
+                character: None,
+                order: None,
+                profile_url: None,
+            }],
+            ..MovieNfoMetadata::default()
+        },
+    );
+
+    assert!(matches!(result, Err(NfoWriteError::InvalidMetadata(_))));
 }
 
 #[test]

@@ -133,6 +133,7 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     assert!(nfo.contains("<director tmdbid=\"11\">导演甲</director>"));
     assert!(nfo.contains("<actor>"));
     assert!(nfo.contains("<name>演员甲</name>"));
+    assert!(nfo.contains("<tmdbid>9</tmdbid>"));
     assert!(nfo.contains("<trailer>https://www.youtube.com/watch?v=abc123</trailer>"));
     let metadata_item_dir = tokio::fs::canonicalize(library_item_directory(
         &fixture.config.config_dir,
