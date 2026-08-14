@@ -397,6 +397,13 @@ export class LuxApiClient {
     );
   }
 
+  uninstallAdminPlugin(pluginId: string) {
+    return this.request<void>(
+      `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}`,
+      { method: "DELETE" },
+    );
+  }
+
   updateAdminPluginEnabled(pluginId: string, enabled: boolean) {
     return this.request<{ plugin: AdminPlugin }>(
       `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/enabled`,

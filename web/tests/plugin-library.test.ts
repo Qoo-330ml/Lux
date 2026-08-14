@@ -68,6 +68,7 @@ describe("AdminPluginsPage plugin cards", () => {
     vi.spyOn(api, "updateAdminPluginEnabled").mockImplementation(async (_pluginId, enabled) => ({ plugin: { ...currentPlugin, enabled, available: enabled } }));
     vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
     vi.spyOn(api, "installAdminPlugin").mockResolvedValue({ plugin: configuredPlugin });
+    vi.spyOn(api, "uninstallAdminPlugin").mockResolvedValue(undefined);
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -313,6 +314,27 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(toggle?.getAttribute("aria-checked")).toBe("false");
     expect(toggle?.getAttribute("aria-label")).toBe("启用 TMDb 元数据插件");
     expect(toggle?.textContent).toContain("已禁用");
+  });
+
+  it("confirms before uninstalling a plugin from installed management", async () => {
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-pressed="false"]')?.click();
+    });
+
+    const uninstall = container.querySelector<HTMLButtonElement>('[aria-label="卸载 TMDb 元数据插件"]');
+    expect(uninstall).toBeTruthy();
+    await act(async () => uninstall?.click());
+
+    const dialog = container.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(dialog?.textContent).toContain("确定要卸载 TMDb 元数据插件吗？");
+    expect(api.uninstallAdminPlugin).not.toHaveBeenCalled();
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('[aria-label="确认卸载 TMDb 元数据插件"]')?.click();
+    });
+    expect(api.uninstallAdminPlugin).toHaveBeenCalledWith("org.lux.tmdb");
   });
 
   it("renders media-info settings and runs with the saved plugin configuration", async () => {

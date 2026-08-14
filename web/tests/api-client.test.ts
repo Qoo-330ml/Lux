@@ -514,6 +514,10 @@ describe("LuxApiClient", () => {
         expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
         return new Response(JSON.stringify({ plugin: { id: "tmdb", installed: true, enabled: false } }), { status: 200 });
       }
+      if (path === "/api/v1/admin/plugins/tmdb" && init?.method === "DELETE") {
+        expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+        return new Response(null, { status: 204 });
+      }
       expect(path).toBe("/api/v1/admin/plugins/tmdb/config");
       expect(init?.method).toBe("PUT");
       expect(JSON.parse(String(init?.body))).toEqual({ apiKey: "custom-key" });
@@ -530,8 +534,9 @@ describe("LuxApiClient", () => {
     await expect(client.adminInstalledPlugins()).resolves.toEqual({ plugins: [{ id: "tmdb", installed: true }] });
     await expect(client.installAdminPlugin("tmdb")).resolves.toEqual({ plugin: { id: "tmdb", installed: true } });
     await expect(client.updateAdminPluginEnabled("tmdb", false)).resolves.toEqual({ plugin: { id: "tmdb", installed: true, enabled: false } });
+    await expect(client.uninstallAdminPlugin("tmdb")).resolves.toBeUndefined();
     await expect(client.updateAdminPluginConfig("tmdb", "custom-key")).resolves.toEqual({ plugin: { id: "tmdb", installed: true, configSource: "CUSTOM" } });
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
   });
 
   it("unwraps the authenticated user from the login envelope", async () => {
