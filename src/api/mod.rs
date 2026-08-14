@@ -124,6 +124,8 @@ pub struct AppState {
     // Temporary Filmly A/B hook. It is disabled unless an operator explicitly
     // sets the series id in the process environment.
     filmly_ab_no_media_streams_series_id: Option<String>,
+    filmly_ab_no_subtitles_series_id: Option<String>,
+    filmly_ab_strip_advanced_video_fields_series_id: Option<String>,
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
     emby_auth: Option<EmbyAuthService>,
@@ -183,6 +185,16 @@ impl AppState {
         let server_id = database.server_id().to_owned();
         let filmly_ab_no_media_streams_series_id =
             std::env::var("LUX_FILMLY_AB_NO_MEDIA_STREAMS_SERIES_ID")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+        let filmly_ab_no_subtitles_series_id =
+            std::env::var("LUX_FILMLY_AB_NO_SUBTITLES_SERIES_ID")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+        let filmly_ab_strip_advanced_video_fields_series_id =
+            std::env::var("LUX_FILMLY_AB_STRIP_ADVANCED_VIDEO_FIELDS_SERIES_ID")
                 .ok()
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty());
@@ -280,6 +292,8 @@ impl AppState {
             database_selection_required: false,
             server_id,
             filmly_ab_no_media_streams_series_id,
+            filmly_ab_no_subtitles_series_id,
+            filmly_ab_strip_advanced_video_fields_series_id,
             setup: Some(setup),
             auth: Some(auth),
             emby_auth: Some(emby_auth),
@@ -2523,8 +2537,12 @@ async fn emby_show_episodes(
     let episodes = catalog
         .list_series_episodes(principal, &series_id, season_id, offset, limit)
         .await;
-    let omit_media_streams = should_omit_media_streams_for_filmly_ab(
+    let media_stream_profile = filmly_media_stream_profile_for_series(
         state.filmly_ab_no_media_streams_series_id.as_deref(),
+        state.filmly_ab_no_subtitles_series_id.as_deref(),
+        state
+            .filmly_ab_strip_advanced_video_fields_series_id
+            .as_deref(),
         &series_id,
         header_str(&headers, "user-agent"),
     );
@@ -2539,7 +2557,7 @@ async fn emby_show_episodes(
                 EmbyCatalogPageOptions {
                     preferred_source_id: None,
                     include_start_index: true,
-                    omit_media_streams,
+                    media_stream_profile,
                 },
             )
             .await
@@ -2561,7 +2579,7 @@ async fn emby_show_episodes(
                     EmbyCatalogPageOptions {
                         preferred_source_id: None,
                         include_start_index: true,
-                        omit_media_streams,
+                        media_stream_profile,
                     },
                 )
                 .await
@@ -2658,7 +2676,7 @@ async fn emby_catalog_page_for_user_with_preferred_source(
         EmbyCatalogPageOptions {
             preferred_source_id,
             include_start_index,
-            omit_media_streams: false,
+            media_stream_profile: None,
         },
     )
     .await
@@ -2667,7 +2685,7 @@ async fn emby_catalog_page_for_user_with_preferred_source(
 struct EmbyCatalogPageOptions<'a> {
     preferred_source_id: Option<&'a str>,
     include_start_index: bool,
-    omit_media_streams: bool,
+    media_stream_profile: Option<FilmlyMediaStreamAbProfile>,
 }
 
 async fn emby_catalog_page_for_user_with_preferred_source_and_options(
@@ -2689,8 +2707,8 @@ async fn emby_catalog_page_for_user_with_preferred_source_and_options(
     .await
     {
         Ok(mut items) => {
-            if options.omit_media_streams {
-                strip_emby_media_streams_for_filmly_ab(&mut items);
+            if let Some(profile) = options.media_stream_profile {
+                apply_filmly_media_stream_profile(&mut items, profile);
             }
             let mut body = json!({
                 "Items": items,
@@ -4974,25 +4992,75 @@ fn emby_insert_optional(
     }
 }
 
-fn strip_emby_media_streams_for_filmly_ab(items: &mut [Value]) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilmlyMediaStreamAbProfile {
+    OmitAll,
+    OmitSubtitles,
+    StripAdvancedVideoFields,
+}
+
+fn apply_filmly_media_stream_profile(items: &mut [Value], profile: FilmlyMediaStreamAbProfile) {
     for item in items {
         let Some(sources) = item.get_mut("MediaSources").and_then(Value::as_array_mut) else {
             continue;
         };
         for source in sources {
             if let Some(object) = source.as_object_mut() {
-                object.insert("MediaStreams".to_owned(), Value::Array(Vec::new()));
+                let Some(streams) = object.get_mut("MediaStreams").and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                match profile {
+                    FilmlyMediaStreamAbProfile::OmitAll => streams.clear(),
+                    FilmlyMediaStreamAbProfile::OmitSubtitles => streams.retain(|stream| {
+                        stream
+                            .get("Type")
+                            .and_then(Value::as_str)
+                            .is_none_or(|stream_type| !stream_type.eq_ignore_ascii_case("Subtitle"))
+                    }),
+                    FilmlyMediaStreamAbProfile::StripAdvancedVideoFields => {
+                        for stream in streams {
+                            let is_video = stream.get("Type").and_then(Value::as_str).is_some_and(
+                                |stream_type| stream_type.eq_ignore_ascii_case("Video"),
+                            );
+                            if is_video && let Some(stream) = stream.as_object_mut() {
+                                for key in [
+                                    "VideoRange",
+                                    "ExtendedVideoType",
+                                    "ExtendedVideoSubType",
+                                    "ExtendedVideoSubTypeDescription",
+                                ] {
+                                    stream.remove(key);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-fn should_omit_media_streams_for_filmly_ab(
+fn filmly_media_stream_profile_for_series(
     configured_series_id: Option<&str>,
+    configured_no_subtitles_series_id: Option<&str>,
+    configured_strip_advanced_video_fields_series_id: Option<&str>,
     series_id: &str,
     user_agent: Option<&str>,
-) -> bool {
-    configured_series_id == Some(series_id) && user_agent.is_some_and(is_filmly_user_agent)
+) -> Option<FilmlyMediaStreamAbProfile> {
+    if !user_agent.is_some_and(is_filmly_user_agent) {
+        return None;
+    }
+    if configured_series_id == Some(series_id) {
+        return Some(FilmlyMediaStreamAbProfile::OmitAll);
+    }
+    if configured_no_subtitles_series_id == Some(series_id) {
+        return Some(FilmlyMediaStreamAbProfile::OmitSubtitles);
+    }
+    if configured_strip_advanced_video_fields_series_id == Some(series_id) {
+        return Some(FilmlyMediaStreamAbProfile::StripAdvancedVideoFields);
+    }
+    None
 }
 
 /// Stable, server-local identifier that mirrors Emby's per-item Etag. Emby uses
@@ -15290,15 +15358,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CatalogSort, MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
+        CatalogSort, FilmlyMediaStreamAbProfile, MediaStrategySettings,
+        MetadataCandidateFailureKind, apply_filmly_media_stream_profile, build_cookie,
         catalog_filter_from_emby, emby_media_source_json, emby_media_source_json_with_resolver,
         emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
-        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
-        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        playback_client_label, playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request, should_omit_media_streams_for_filmly_ab,
-        strip_emby_media_streams_for_filmly_ab, validate_media_strategy,
+        filmly_media_stream_profile_for_series, is_catalog_aggregation_path,
+        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
+        is_emby_subtitle_path, is_emby_video_path, is_registered_emby_video_path,
+        lux_catalog_source_json, metadata_candidate_failure_kind, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -15667,38 +15736,93 @@ mod tests {
     }
 
     #[test]
-    fn filmly_ab_profile_can_remove_nested_media_streams_without_removing_sources() {
+    fn filmly_ab_profile_can_remove_subtitles_without_removing_video_streams() {
         let mut items = vec![json!({
             "Id": "episode-1",
             "MediaSources": [{
                 "Id": "source-1",
-                "MediaStreams": [{"Type": "Video"}]
+                "MediaStreams": [{"Type": "Video"}, {"Type": "Subtitle"}]
             }]
         })];
 
-        strip_emby_media_streams_for_filmly_ab(&mut items);
+        apply_filmly_media_stream_profile(&mut items, FilmlyMediaStreamAbProfile::OmitSubtitles);
 
         assert_eq!(items[0]["MediaSources"][0]["Id"], "source-1");
-        assert_eq!(items[0]["MediaSources"][0]["MediaStreams"], json!([]));
+        assert_eq!(
+            items[0]["MediaSources"][0]["MediaStreams"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            items[0]["MediaSources"][0]["MediaStreams"][0]["Type"],
+            "Video"
+        );
     }
 
     #[test]
-    fn filmly_ab_profile_is_scoped_to_filmly_user_agents() {
-        assert!(should_omit_media_streams_for_filmly_ab(
-            Some("series-1"),
-            "series-1",
-            Some("Filmly/2.12.3-423")
-        ));
-        assert!(!should_omit_media_streams_for_filmly_ab(
-            Some("series-1"),
-            "series-1",
-            Some("VidHub/1.0")
-        ));
-        assert!(!should_omit_media_streams_for_filmly_ab(
-            Some("series-1"),
-            "series-2",
-            Some("Filmly/2.12.3-423")
-        ));
+    fn filmly_ab_profile_strips_only_advanced_video_fields() {
+        let mut items = vec![json!({
+            "MediaSources": [{
+                "MediaStreams": [{
+                    "Type": "Video",
+                    "VideoRange": "DolbyVision",
+                    "ExtendedVideoType": "DolbyVision",
+                    "ExtendedVideoSubType": "DoviProfile50",
+                    "ExtendedVideoSubTypeDescription": "Dolby Vision"
+                }, {"Type": "Audio", "VideoRange": "should-remain"}]
+            }]
+        })];
+
+        apply_filmly_media_stream_profile(
+            &mut items,
+            FilmlyMediaStreamAbProfile::StripAdvancedVideoFields,
+        );
+
+        assert!(
+            items[0]["MediaSources"][0]["MediaStreams"][0]
+                .get("VideoRange")
+                .is_none()
+        );
+        assert_eq!(
+            items[0]["MediaSources"][0]["MediaStreams"][1]["VideoRange"],
+            "should-remain"
+        );
+    }
+
+    #[test]
+    fn filmly_ab_profiles_are_scoped_to_filmly_user_agents() {
+        assert_eq!(
+            filmly_media_stream_profile_for_series(
+                Some("series-1"),
+                None,
+                None,
+                "series-1",
+                Some("Filmly/2.12.3-423")
+            ),
+            Some(FilmlyMediaStreamAbProfile::OmitAll)
+        );
+        assert_eq!(
+            filmly_media_stream_profile_for_series(
+                Some("series-1"),
+                None,
+                None,
+                "series-1",
+                Some("VidHub/1.0")
+            ),
+            None
+        );
+        assert_eq!(
+            filmly_media_stream_profile_for_series(
+                None,
+                Some("series-1"),
+                None,
+                "series-2",
+                Some("Filmly/2.12.3-423")
+            ),
+            None
+        );
     }
 
     #[test]
