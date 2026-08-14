@@ -6,7 +6,6 @@ import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
-import { MediaInfoPanel } from "./MediaInfoPanel";
 import { MediaCast } from "./MediaCast";
 import { MediaNfoPanel } from "./MediaNfoPanel";
 import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, runtimeLabel } from "../home/media";
@@ -215,16 +214,16 @@ export function MediaDetailPage() {
           </div>
         </div>
         <MediaCast actors={media.actors ?? []} />
-        <MediaNfoPanel details={localNfo} />
-        {source ? (
-          <MediaInfoPanel
-            source={source}
-            itemType={media.itemType}
-            lastAirDate={media.lastAirDate}
-            status={status}
-            originalLanguage={originalLanguage}
-          />
-        ) : null}
+        <MediaNfoPanel
+          details={localNfo}
+          mediaInfo={source ? {
+            source,
+            itemType: media.itemType,
+            lastAirDate: media.lastAirDate,
+            status,
+            originalLanguage,
+          } : undefined}
+        />
         {isSeries ? (
           <SeriesChildren
             seasons={seasons.data?.items ?? []}

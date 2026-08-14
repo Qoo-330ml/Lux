@@ -360,7 +360,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-stream-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .lux-media-stream-badges span { padding: 3px 6px; border: 1px solid rgba(255,255,255,.1); border-radius: 4px; color: var(--lux-muted); font-size: .66rem; }
 .lux-media-stream-details { display: grid; gap: 0; margin: 16px 0 0; }
-.lux-media-stream-details .lux-media-info-row { padding: 5px 0; background: transparent; }
+.lux-media-stream-details .lux-media-nfo-row { padding: 5px 0; background: transparent; }
 .lux-series-children { max-width: none; margin-top: 76px; padding-top: 25px; }
 .lux-season-episodes, .lux-episode-rail { max-width: none; margin-top: 76px; padding-top: 25px; border-top: 1px solid var(--lux-line-soft); }
 .lux-season-rail { display: flex; gap: 16px; margin-top: 22px; padding: 0 2px 14px; overflow-x: auto; scrollbar-width: thin; }

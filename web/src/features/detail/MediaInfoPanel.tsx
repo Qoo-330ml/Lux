@@ -15,31 +15,41 @@ const LANGUAGE_NAMES: Record<string, string> = {
   und: "未知语言",
 };
 
-export function MediaInfoPanel({
-  source,
-  itemType,
-  lastAirDate,
-  status,
-  originalLanguage,
-}: {
+export type MediaInfoPanelProps = {
   source: MediaSource;
   itemType?: string | null;
   lastAirDate?: string | null;
   status?: string | null;
   originalLanguage?: string | null;
-}) {
+};
+
+export function MediaInfoPanel(props: MediaInfoPanelProps) {
+  return (
+    <section className="lux-media-info" aria-labelledby="media-info-heading">
+      <div className="lux-media-info-heading">
+        <h2 id="media-info-heading">媒体信息</h2>
+        <span>{props.source.streams?.length ? `${props.source.streams.length} 条媒体轨` : "暂无轨道信息"}</span>
+      </div>
+      <MediaInfoContent {...props} />
+    </section>
+  );
+}
+
+export function MediaInfoContent({
+  source,
+  itemType,
+  lastAirDate,
+  status,
+  originalLanguage,
+}: MediaInfoPanelProps) {
   const streams = source.streams ?? [];
   const streamGroups = ["VIDEO", "AUDIO", "SUBTITLE"]
     .map((type) => ({ type, streams: streams.filter((stream) => stream.type?.toUpperCase() === type) }))
     .filter((group) => group.streams.length);
 
   return (
-    <section className="lux-media-info" aria-labelledby="media-info-heading">
-      <div className="lux-media-info-heading">
-        <h2 id="media-info-heading">媒体信息</h2>
-        <span>{streams.length ? `${streams.length} 条媒体轨` : "暂无轨道信息"}</span>
-      </div>
-      <div className="lux-media-info-summary">
+    <>
+      <div className="lux-media-nfo-summary">
         <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
         <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
         <InfoRow label="状态" value={status ?? undefined} />
@@ -48,12 +58,12 @@ export function MediaInfoPanel({
         <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
       </div>
       {source.externalUrl ? (
-        <div className="lux-media-info-address">
+        <div className="lux-media-nfo-row lux-media-info-address">
           <span>媒体地址</span>
           <code>{source.externalUrl}</code>
         </div>
       ) : null}
-      <div className="lux-media-source-meta" aria-label="媒体文件摘要">
+      <div className="lux-media-nfo-tags" aria-label="媒体文件摘要">
         {source.container ? <span>{source.container.toUpperCase()}</span> : null}
         {formatBytes(source.size) ? <span>{formatBytes(source.size)}</span> : null}
         {formatBitrate(source.bitrate) ? <span>{formatBitrate(source.bitrate)}</span> : null}
@@ -72,7 +82,7 @@ export function MediaInfoPanel({
           </div>
         </HorizontalScrollRail>
       ) : null}
-    </section>
+    </>
   );
 }
 
@@ -247,5 +257,5 @@ function stripTrailingZeros(value: number) {
 
 function InfoRow({ label, value }: { label: string; value?: string }) {
   if (!value) return null;
-  return <div className="lux-media-info-row"><span>{label}</span><strong>{value}</strong></div>;
+  return <div className="lux-media-nfo-row"><span>{label}</span><strong>{value}</strong></div>;
 }

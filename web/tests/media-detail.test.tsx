@@ -133,9 +133,9 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("TMDb 60625");
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("评分 8.7");
     expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
-    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("最后播出2025-05-25");
-    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("状态Ended");
-    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("原始语言英语");
+    expect(container.querySelector(".lux-media-nfo-summary")?.textContent).toContain("最后播出2025-05-25");
+    expect(container.querySelector(".lux-media-nfo-summary")?.textContent).toContain("状态Ended");
+    expect(container.querySelector(".lux-media-nfo-summary")?.textContent).toContain("原始语言英语");
     expect(container.querySelector(".lux-season-rail")).not.toBeNull();
   });
 
@@ -201,6 +201,9 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("https://example.com/movie");
     expect(container.querySelector("a[aria-label=\"预告片 1\"]")?.getAttribute("href"))
       .toBe("https://example.com/trailer");
+    expect(container.querySelectorAll(".lux-media-nfo")).toHaveLength(1);
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("来源本地媒体文件");
+    expect(container.querySelector(".lux-media-info")).toBeNull();
   });
 
   it("shows landscape episode rows on a season detail", async () => {
@@ -595,8 +598,8 @@ describe("MediaDetailPage series hierarchy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const details = container.querySelector(".lux-media-info");
-    expect(details?.textContent).toContain("媒体信息");
+    const details = container.querySelector(".lux-media-nfo");
+    expect(details?.textContent).toContain("更多信息");
     expect(details?.textContent).toContain("https://example.invalid/video.mkv");
     expect(details?.textContent).toContain("1920 × 1080");
     expect(details?.textContent).toContain("H264");
