@@ -5022,6 +5022,7 @@ enum FilmlyMediaStreamAbProfile {
     KeepFirstVideo,
     KeepFirstAudio,
     OmitLanguage,
+    NormalizeNullLanguage,
     OmitSubtitleDisplayLanguage,
     OmitSubtitleTextFlag,
     FillSourceName,
@@ -5075,6 +5076,15 @@ fn apply_filmly_media_stream_profile(items: &mut [Value], profile: FilmlyMediaSt
                         for stream in streams {
                             if let Some(object) = stream.as_object_mut() {
                                 object.remove("Language");
+                            }
+                        }
+                    }
+                    FilmlyMediaStreamAbProfile::NormalizeNullLanguage => {
+                        for stream in streams {
+                            if let Some(object) = stream.as_object_mut()
+                                && object.get("Language").is_some_and(Value::is_null)
+                            {
+                                object.insert("Language".to_owned(), json!("und"));
                             }
                         }
                     }
@@ -5182,6 +5192,7 @@ fn parse_filmly_ab_field_matrix() -> HashMap<String, FilmlyMediaStreamAbProfile>
                 "keepfirstvideo" => FilmlyMediaStreamAbProfile::KeepFirstVideo,
                 "keepfirstaudio" => FilmlyMediaStreamAbProfile::KeepFirstAudio,
                 "omitlanguage" => FilmlyMediaStreamAbProfile::OmitLanguage,
+                "normalizenulllanguage" => FilmlyMediaStreamAbProfile::NormalizeNullLanguage,
                 "omitsubtitledisplaylanguage" => {
                     FilmlyMediaStreamAbProfile::OmitSubtitleDisplayLanguage
                 }
@@ -15968,6 +15979,32 @@ mod tests {
             "Audio"
         );
         assert_eq!(items[0]["MediaSources"][0]["MediaStreams"][0]["Index"], 1);
+    }
+
+    #[test]
+    fn filmly_ab_profile_normalizes_only_null_languages() {
+        let mut items = vec![json!({
+            "MediaSources": [{
+                "MediaStreams": [
+                    {"Type": "Video", "Language": null},
+                    {"Type": "Audio", "Language": "chi"}
+                ]
+            }]
+        })];
+
+        apply_filmly_media_stream_profile(
+            &mut items,
+            FilmlyMediaStreamAbProfile::NormalizeNullLanguage,
+        );
+
+        assert_eq!(
+            items[0]["MediaSources"][0]["MediaStreams"][0]["Language"],
+            "und"
+        );
+        assert_eq!(
+            items[0]["MediaSources"][0]["MediaStreams"][1]["Language"],
+            "chi"
+        );
     }
 
     #[test]
