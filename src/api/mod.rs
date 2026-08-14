@@ -121,6 +121,9 @@ pub struct AppState {
     database_setup: Option<DatabaseSetupService>,
     database_selection_required: bool,
     server_id: String,
+    // Temporary Filmly A/B hook. It is disabled unless an operator explicitly
+    // sets the series id in the process environment.
+    filmly_ab_no_media_streams_series_id: Option<String>,
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
     emby_auth: Option<EmbyAuthService>,
@@ -178,6 +181,11 @@ impl AppState {
         network_proxy_url: Option<String>,
     ) -> Self {
         let server_id = database.server_id().to_owned();
+        let filmly_ab_no_media_streams_series_id =
+            std::env::var("LUX_FILMLY_AB_NO_MEDIA_STREAMS_SERIES_ID")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
         let config_dir = config.config_dir.clone();
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
         let resources = ResourceMetrics::new();
@@ -271,6 +279,7 @@ impl AppState {
             database_setup,
             database_selection_required: false,
             server_id,
+            filmly_ab_no_media_streams_series_id,
             setup: Some(setup),
             auth: Some(auth),
             emby_auth: Some(emby_auth),
@@ -2514,14 +2523,23 @@ async fn emby_show_episodes(
     let episodes = catalog
         .list_series_episodes(principal, &series_id, season_id, offset, limit)
         .await;
+    let omit_media_streams = state
+        .filmly_ab_no_media_streams_series_id
+        .as_deref()
+        .is_some_and(|configured_series_id| configured_series_id == series_id);
     match episodes {
         Ok(page) => {
-            emby_catalog_page_for_user_with_fields(
+            emby_catalog_page_for_user_with_preferred_source_and_options(
                 &state,
                 &user.id.to_string(),
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
+                EmbyCatalogPageOptions {
+                    preferred_source_id: None,
+                    include_start_index: true,
+                    omit_media_streams,
+                },
             )
             .await
         }
@@ -2533,12 +2551,17 @@ async fn emby_show_episodes(
             .await
         {
             Ok(page) => {
-                emby_catalog_page_for_user_with_fields(
+                emby_catalog_page_for_user_with_preferred_source_and_options(
                     &state,
                     &user.id.to_string(),
                     &page,
                     query.fields.as_deref(),
                     user.can_download,
+                    EmbyCatalogPageOptions {
+                        preferred_source_id: None,
+                        include_start_index: true,
+                        omit_media_streams,
+                    },
                 )
                 .await
             }
@@ -2625,22 +2648,56 @@ async fn emby_catalog_page_for_user_with_preferred_source(
     preferred_source_id: Option<&str>,
     include_start_index: bool,
 ) -> Response {
+    emby_catalog_page_for_user_with_preferred_source_and_options(
+        state,
+        user_id,
+        page,
+        fields,
+        can_download,
+        EmbyCatalogPageOptions {
+            preferred_source_id,
+            include_start_index,
+            omit_media_streams: false,
+        },
+    )
+    .await
+}
+
+struct EmbyCatalogPageOptions<'a> {
+    preferred_source_id: Option<&'a str>,
+    include_start_index: bool,
+    omit_media_streams: bool,
+}
+
+async fn emby_catalog_page_for_user_with_preferred_source_and_options(
+    state: &AppState,
+    user_id: &str,
+    page: &CatalogPage,
+    fields: Option<&str>,
+    can_download: bool,
+    options: EmbyCatalogPageOptions<'_>,
+) -> Response {
     match emby_catalog_items_for_user_with_preferred_source(
         state,
         user_id,
         page,
         fields,
         can_download,
-        preferred_source_id,
+        options.preferred_source_id,
     )
     .await
     {
-        Ok(items) => {
+        Ok(mut items) => {
+            if options.omit_media_streams {
+                strip_emby_media_streams_for_filmly_ab(&mut items);
+            }
             let mut body = json!({
                 "Items": items,
                 "TotalRecordCount": page.total,
             });
-            if include_start_index && let Value::Object(object) = &mut body {
+            if options.include_start_index
+                && let Value::Object(object) = &mut body
+            {
                 object.insert("StartIndex".to_owned(), json!(page.offset));
             }
             Json(body).into_response()
@@ -4913,6 +4970,19 @@ fn emby_insert_optional(
 ) {
     if let Some(value) = value {
         object.insert(key.to_owned(), value);
+    }
+}
+
+fn strip_emby_media_streams_for_filmly_ab(items: &mut [Value]) {
+    for item in items {
+        let Some(sources) = item.get_mut("MediaSources").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for source in sources {
+            if let Some(object) = source.as_object_mut() {
+                object.insert("MediaStreams".to_owned(), Value::Array(Vec::new()));
+            }
+        }
     }
 }
 
@@ -15216,7 +15286,7 @@ mod tests {
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
         is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
         playback_client_label, playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request, validate_media_strategy,
+        secure_cookie_for_request, strip_emby_media_streams_for_filmly_ab, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -15582,6 +15652,22 @@ mod tests {
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);
         assert_eq!(body["MediaStreams"][0]["Height"], 1080);
         assert_eq!(body["MediaStreams"][0]["Profile"], "High");
+    }
+
+    #[test]
+    fn filmly_ab_profile_can_remove_nested_media_streams_without_removing_sources() {
+        let mut items = vec![json!({
+            "Id": "episode-1",
+            "MediaSources": [{
+                "Id": "source-1",
+                "MediaStreams": [{"Type": "Video"}]
+            }]
+        })];
+
+        strip_emby_media_streams_for_filmly_ab(&mut items);
+
+        assert_eq!(items[0]["MediaSources"][0]["Id"], "source-1");
+        assert_eq!(items[0]["MediaSources"][0]["MediaStreams"], json!([]));
     }
 
     #[test]
