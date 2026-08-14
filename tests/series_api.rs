@@ -76,6 +76,40 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
             .bind(&episode_id)
             .fetch_one(database.pool())
             .await?;
+    let episode_source_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_sources WHERE item_id = ? ORDER BY is_default DESC, id LIMIT 1",
+    )
+    .bind(&episode_id)
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items
+         SET overview = ?, premiere_date = ?, provider_ids_json = ?
+         WHERE id = ?",
+    )
+    .bind("Episode overview")
+    .bind("2024-01-02")
+    .bind(r#"{"tmdb":"123456"}"#)
+    .bind(&episode_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_sources SET container = ?, size = ?, bitrate = ? WHERE id = ?")
+        .bind("mkv")
+        .bind(123_i64)
+        .bind(456_i64)
+        .bind(&episode_source_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams
+         (id, media_source_id, stream_index, stream_type, codec, title, details_json, is_default)
+         VALUES (?, ?, 0, 'VIDEO', 'h264', '1080p', ?, 1)",
+    )
+    .bind("filmly-episode-video")
+    .bind(&episode_source_id)
+    .bind(r#"{"Width":"1920","Height":"1080","BitRate":"8145838"}"#)
+    .execute(database.pool())
+    .await?;
     let played_episode_id: String = sqlx::query_scalar(
         "SELECT id FROM media_items WHERE item_type = 'EPISODE' AND episode_number = 2",
     )
@@ -292,6 +326,32 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(episodes_from_season_body["Items"][0]["IndexNumber"], 1);
     assert_eq!(episodes_from_season_body["Items"][0]["Index"], 1);
+
+    let filmly_episodes = client
+        .get(format!(
+            "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Fields=BasicSyncInfo,Overview,ProviderIds,Path,Size,People,RuntimeTicks,Chapters,MediaSources,CanDownload&Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(filmly_episodes.status(), reqwest::StatusCode::OK);
+    let filmly_episodes_body: Value = filmly_episodes.json().await?;
+    let filmly_episode = &filmly_episodes_body["Items"][0];
+    assert_eq!(filmly_episode["ImageTags"]["Primary"], episode_thumb_id);
+    assert_eq!(filmly_episode["SupportsSync"], true);
+    assert_eq!(filmly_episode["Overview"], "Episode overview");
+    assert_eq!(filmly_episode["ProviderIds"]["Tmdb"], "123456");
+    assert_eq!(filmly_episode["SeasonName"], "Season 01");
+    assert_eq!(filmly_episode["ParentThumbItemId"], series_id);
+    assert_eq!(filmly_episode["Container"], "mkv");
+    assert_eq!(filmly_episode["Size"], 123);
+    assert_eq!(filmly_episode["Bitrate"], 456);
+    assert!(filmly_episode["People"].is_array());
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["MediaStreams"][0]["Width"],
+        1920
+    );
 
     let episodes_with_empty_season = client
         .get(format!(

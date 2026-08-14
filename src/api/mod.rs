@@ -4192,6 +4192,13 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
     let mut image_tags = serde_json::Map::new();
     if let Some(tag) = item.poster_image_tag.as_ref() {
         image_tags.insert("Primary".to_owned(), json!(tag));
+    } else if item.item_type == "EPISODE"
+        && let Some(tag) = item.thumb_image_tag.as_ref()
+    {
+        // Filmly requests episode thumbnails through the standard Primary
+        // image tag. A local Kodi-style `-thumb` image is the episode's
+        // primary artwork when no dedicated poster exists.
+        image_tags.insert("Primary".to_owned(), json!(tag));
     }
     if let Some(tag) = item.logo_image_tag.as_ref() {
         image_tags.insert("Logo".to_owned(), json!(tag));
@@ -4238,6 +4245,10 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
         .clone()
         .or_else(|| (item.item_type == "SEASON").then(|| item.parent_id.clone())?);
     let season_name = (item.item_type == "SEASON").then(|| item.title.clone());
+    let episode_season_name = (item.item_type == "EPISODE")
+        .then_some(item.season_number)
+        .flatten()
+        .map(|number| format!("Season {number:02}"));
     let is_folder = matches!(
         item.item_type.as_str(),
         "SERIES" | "SEASON" | "BOX_SET" | "FOLDER"
@@ -4245,8 +4256,11 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
     // Emby advertises sync capability on item details for playable media and
     // series containers. The list projection intentionally keeps the legacy
     // compact capability shape used by existing clients.
-    let supports_sync =
-        include_top_level_media_streams && (!is_folder || item.item_type == "SERIES");
+    let basic_sync_requested =
+        fields.is_some_and(|fields| emby_fields_include(Some(fields), "BasicSyncInfo"));
+    let supports_sync = (!is_folder || item.item_type == "SERIES")
+        && (include_top_level_media_streams
+            || (basic_sync_requested && item.item_type == "EPISODE"));
     let mut user_data = serde_json::Map::from_iter([
         (
             "PlaybackPositionTicks".to_owned(),
@@ -4518,7 +4532,10 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
             emby_insert_optional(
                 &mut object,
                 "SeasonName",
-                season_name.clone().map(|value| json!(value)),
+                season_name
+                    .clone()
+                    .or_else(|| episode_season_name.clone())
+                    .map(|value| json!(value)),
             );
             emby_insert_optional(
                 &mut object,
@@ -4579,6 +4596,25 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
         if emby_fields_include(fields, "CanDownload") {
             object.insert("CanDownload".to_owned(), json!(can_download && !is_folder));
         }
+        if emby_fields_include(fields, "Overview") {
+            emby_insert_optional(
+                &mut object,
+                "Overview",
+                item.overview.clone().map(Value::from),
+            );
+        }
+        if emby_fields_include(fields, "ProviderIds") {
+            object.insert(
+                "ProviderIds".to_owned(),
+                json!(emby_provider_ids(&item.provider_ids)),
+            );
+        }
+        if emby_fields_include(fields, "People") {
+            // Catalog pages do not load the potentially large people snapshot;
+            // preserve Emby's non-null collection contract for clients that
+            // map this field eagerly. Full item details add the populated list.
+            object.insert("People".to_owned(), json!([]));
+        }
         if emby_fields_include(fields, "ProductionYear") {
             emby_insert_optional(
                 &mut object,
@@ -4621,13 +4657,48 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 recursive_item_count.map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "Container") {
+        if emby_fields_include(fields, "Container") || emby_fields_include(fields, "MediaSources") {
             emby_insert_optional(
                 &mut object,
                 "Container",
                 default_source
                     .and_then(|source| source.container.clone())
                     .map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "Size") {
+            emby_insert_optional(
+                &mut object,
+                "Size",
+                default_source
+                    .and_then(|source| source.size)
+                    .map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "Bitrate") || emby_fields_include(fields, "MediaSources") {
+            emby_insert_optional(
+                &mut object,
+                "Bitrate",
+                default_source
+                    .and_then(|source| source.bitrate)
+                    .map(|value| json!(value)),
+            );
+        }
+        if item.item_type == "EPISODE" {
+            emby_insert_optional(
+                &mut object,
+                "ParentLogoImageTag",
+                item.series_logo_image_tag.clone().map(Value::from),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ParentThumbImageTag",
+                item.series_thumb_image_tag.clone().map(Value::from),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ParentThumbItemId",
+                series_id.as_ref().map(|value| json!(value)),
             );
         }
         if emby_fields_include(fields, "PrimaryImageAspectRatio") {
@@ -4642,7 +4713,7 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
     let include_media_streams = !is_folder
         && (fields.is_none()
             || emby_fields_include(fields, "MediaStreams")
-            || (include_top_level_media_streams && emby_fields_include(fields, "MediaSources")));
+            || emby_fields_include(fields, "MediaSources"));
     if !is_folder
         && emby_fields_include(fields, "MediaSources")
         && let Value::Object(object) = &mut value
