@@ -2523,10 +2523,11 @@ async fn emby_show_episodes(
     let episodes = catalog
         .list_series_episodes(principal, &series_id, season_id, offset, limit)
         .await;
-    let omit_media_streams = state
-        .filmly_ab_no_media_streams_series_id
-        .as_deref()
-        .is_some_and(|configured_series_id| configured_series_id == series_id);
+    let omit_media_streams = should_omit_media_streams_for_filmly_ab(
+        state.filmly_ab_no_media_streams_series_id.as_deref(),
+        &series_id,
+        header_str(&headers, "user-agent"),
+    );
     match episodes {
         Ok(page) => {
             emby_catalog_page_for_user_with_preferred_source_and_options(
@@ -4984,6 +4985,14 @@ fn strip_emby_media_streams_for_filmly_ab(items: &mut [Value]) {
             }
         }
     }
+}
+
+fn should_omit_media_streams_for_filmly_ab(
+    configured_series_id: Option<&str>,
+    series_id: &str,
+    user_agent: Option<&str>,
+) -> bool {
+    configured_series_id == Some(series_id) && user_agent.is_some_and(is_filmly_user_agent)
 }
 
 /// Stable, server-local identifier that mirrors Emby's per-item Etag. Emby uses
@@ -7895,14 +7904,16 @@ async fn emby_image(
 }
 
 fn is_filmly_image_request(headers: &HeaderMap) -> bool {
-    header_str(headers, "user-agent").is_some_and(|value| {
-        value.split_ascii_whitespace().next().is_some_and(|client| {
-            client.starts_with("网易爆米花")
-                || client.starts_with("%E7%BD%91%E6%98%93%E7%88%86%E7%B1%B3%E8%8A%B1")
-                || client
-                    .get(.."Filmly/".len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Filmly/"))
-        })
+    header_str(headers, "user-agent").is_some_and(is_filmly_user_agent)
+}
+
+fn is_filmly_user_agent(value: &str) -> bool {
+    value.split_ascii_whitespace().next().is_some_and(|client| {
+        client.starts_with("网易爆米花")
+            || client.starts_with("%E7%BD%91%E6%98%93%E7%88%86%E7%B1%B3%E8%8A%B1")
+            || client
+                .get(.."Filmly/".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Filmly/"))
     })
 }
 
@@ -15286,7 +15297,8 @@ mod tests {
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
         is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
         playback_client_label, playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request, strip_emby_media_streams_for_filmly_ab, validate_media_strategy,
+        secure_cookie_for_request, should_omit_media_streams_for_filmly_ab,
+        strip_emby_media_streams_for_filmly_ab, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -15668,6 +15680,25 @@ mod tests {
 
         assert_eq!(items[0]["MediaSources"][0]["Id"], "source-1");
         assert_eq!(items[0]["MediaSources"][0]["MediaStreams"], json!([]));
+    }
+
+    #[test]
+    fn filmly_ab_profile_is_scoped_to_filmly_user_agents() {
+        assert!(should_omit_media_streams_for_filmly_ab(
+            Some("series-1"),
+            "series-1",
+            Some("Filmly/2.12.3-423")
+        ));
+        assert!(!should_omit_media_streams_for_filmly_ab(
+            Some("series-1"),
+            "series-1",
+            Some("VidHub/1.0")
+        ));
+        assert!(!should_omit_media_streams_for_filmly_ab(
+            Some("series-1"),
+            "series-2",
+            Some("Filmly/2.12.3-423")
+        ));
     }
 
     #[test]
