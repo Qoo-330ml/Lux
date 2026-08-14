@@ -126,9 +126,10 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
             .iter()
             .any(|id| id == &job.id)
     );
-    let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
-        .fetch_one(database.pool())
-        .await?;
+    let item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type <> 'FOLDER'")
+            .fetch_one(database.pool())
+            .await?;
     assert_eq!(item_count, 3);
     let root_cursor: Option<String> =
         sqlx::query_scalar("SELECT scan_cursor FROM library_roots WHERE library_id = ?")
@@ -149,6 +150,14 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
 
     let cancel_job = restarted_jobs.create_movie_scan_job(library.id).await?;
     restarted_jobs.cancel(&cancel_job.id).await?;
+    let cancelled_before_worker: (String, i64, Option<i64>) =
+        sqlx::query_as("SELECT status, cancel_requested, finished_at FROM scan_jobs WHERE id = ?")
+            .bind(&cancel_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cancelled_before_worker.0, "CANCELLED");
+    assert_eq!(cancelled_before_worker.1, 1);
+    assert!(cancelled_before_worker.2.is_some());
     let cancelled = restarted_jobs.run_batch(&cancel_job.id, 1).await?;
     assert_eq!(cancelled.status, "CANCELLED");
     assert!(cancelled.completed);
@@ -698,6 +707,91 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
     .fetch_all(database.pool())
     .await?;
     assert!(event_codes.iter().any(|code| code == "PROBE_COMPLETED"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_scan_releases_global_lock_before_post_scan_probe()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let first_library = libraries
+        .create_library("First Movies", LibraryKind::Movie, false)
+        .await?;
+    let second_library = libraries
+        .create_library("Second Movies", LibraryKind::Movie, false)
+        .await?;
+    let first_root = temp_dir.path().join("first");
+    let second_root = temp_dir.path().join("second");
+    tokio::fs::create_dir_all(&first_root).await?;
+    tokio::fs::create_dir_all(&second_root).await?;
+    tokio::fs::write(first_root.join("First.Movie.2024.mkv"), b"fixture").await?;
+    tokio::fs::write(second_root.join("Second.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(
+            first_library.id,
+            first_root.to_str().ok_or("non-utf8 first root")?,
+        )
+        .await?;
+    libraries
+        .add_root(
+            second_library.id,
+            second_root.to_str().ok_or("non-utf8 second root")?,
+        )
+        .await?;
+
+    let marker = temp_dir.path().join("probe-started");
+    let fake_ffprobe = temp_dir.path().join("slow-ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        format!(
+            "#!/bin/sh\ntouch \"{}\"\nsleep 2\nprintf '%s' '{{\"format\":{{\"format_name\":\"matroska\",\"duration\":\"1\",\"bit_rate\":\"1\"}},\"streams\":[]}}'\n",
+            marker.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let scan_lock = Arc::new(Semaphore::new(1));
+    let first_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
+    let second_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock);
+    let probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    let first_job = first_jobs.create_movie_scan_job(first_library.id).await?;
+    let second_job = second_jobs.create_movie_scan_job(second_library.id).await?;
+    let first_job_id = first_job.id.clone();
+    let first_worker = tokio::spawn(async move {
+        first_jobs
+            .run_to_completion(&first_job_id, 100, Some(probe))
+            .await
+    });
+
+    for _ in 0..100 {
+        if tokio::fs::try_exists(&marker).await? {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(tokio::fs::try_exists(&marker).await?);
+
+    let second_job_id = second_job.id.clone();
+    tokio::time::timeout(
+        Duration::from_millis(750),
+        second_jobs.run_to_completion(&second_job_id, 100, None),
+    )
+    .await??;
+    first_worker.await??;
     Ok(())
 }
 

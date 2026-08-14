@@ -2308,13 +2308,17 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
-        let _scan_permit = self.acquire_scan_lock().await?;
+        let scan_permit = self.acquire_scan_lock().await?;
         loop {
             let report = self.run_batch_unlocked(job_id, batch_size).await?;
             if !report.completed {
                 tokio::task::yield_now().await;
                 continue;
             }
+            // Keep different libraries' filesystem scans serialized, but release the
+            // global permit before potentially long post-scan work. Otherwise a completed
+            // movie scan can keep every queued library in PENDING for minutes or hours.
+            drop(scan_permit);
             if report.status == "COMPLETED" {
                 let completed_job = self
                     .database
@@ -2794,7 +2798,22 @@ impl ScanJobService {
     }
 
     pub async fn cancel(&self, job_id: &str) -> Result<(), ScanJobError> {
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
         self.database.request_scan_job_cancel(job_id).await?;
+        if job.status == "PENDING" {
+            if job.job_type == "RECONCILE_LIBRARY" {
+                self.database
+                    .clear_reconciliation_scan_entries(job_id)
+                    .await?;
+            }
+            self.database
+                .finish_scan_job(job_id, "CANCELLED", None)
+                .await?;
+            self.record_event(job_id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
+                .await;
+        }
         Ok(())
     }
 
