@@ -121,6 +121,7 @@ pub struct AppState {
     database_setup: Option<DatabaseSetupService>,
     database_selection_required: bool,
     server_id: String,
+    filmly_image_compat_mode: FilmlyImageCompatMode,
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
     emby_auth: Option<EmbyAuthService>,
@@ -178,6 +179,9 @@ impl AppState {
         network_proxy_url: Option<String>,
     ) -> Self {
         let server_id = database.server_id().to_owned();
+        let filmly_image_compat_mode = filmly_image_compat_mode_from_env_value(
+            std::env::var("LUX_FILMLY_IMAGE_MODE").ok().as_deref(),
+        );
         let config_dir = config.config_dir.clone();
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
         let resources = ResourceMetrics::new();
@@ -271,6 +275,7 @@ impl AppState {
             database_setup,
             database_selection_required: false,
             server_id,
+            filmly_image_compat_mode,
             setup: Some(setup),
             auth: Some(auth),
             emby_auth: Some(emby_auth),
@@ -7813,7 +7818,9 @@ async fn emby_image(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let filmly_compat = is_filmly_image_request(&headers) && query.tag.is_none();
+    let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
+        && is_filmly_image_request(&headers)
+        && query.tag.is_none();
     let user = match require_emby_user_with_query(&headers, &state, &query).await {
         Ok(user) => Some(user),
         Err(StatusCode::UNAUTHORIZED) => None,
@@ -7855,7 +7862,8 @@ async fn emby_image(
     // Filmly's native image loader drops Emby auth headers and image tags. Its Windows
     // WebView can also issue the backdrop request with a browser UA, so keep the exception
     // limited to untagged backdrop artwork; media streams and tagged images remain gated.
-    let untagged_backdrop_compat = user.is_none()
+    let untagged_backdrop_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
+        && user.is_none()
         && query.tag.is_none()
         && normalize_image_type(&image_type) == Some("FANART");
     if (filmly_compat || untagged_backdrop_compat) && user.is_none() {
@@ -7894,6 +7902,21 @@ fn is_filmly_image_request(headers: &HeaderMap) -> bool {
     header_str(headers, "user-agent").is_some_and(is_filmly_user_agent)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FilmlyImageCompatMode {
+    Generic,
+    #[default]
+    Compat,
+}
+
+fn filmly_image_compat_mode_from_env_value(value: Option<&str>) -> FilmlyImageCompatMode {
+    if value.is_some_and(|value| value.trim().eq_ignore_ascii_case("generic")) {
+        FilmlyImageCompatMode::Generic
+    } else {
+        FilmlyImageCompatMode::Compat
+    }
+}
+
 fn is_filmly_user_agent(value: &str) -> bool {
     value.split_ascii_whitespace().next().is_some_and(|client| {
         client.starts_with("网易爆米花")
@@ -7914,7 +7937,9 @@ async fn emby_image_at_index(
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let filmly_compat = is_filmly_image_request(&headers) && query.tag.is_none();
+    let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
+        && is_filmly_image_request(&headers)
+        && query.tag.is_none();
     let user = match require_emby_user_with_query(&headers, &state, &query).await {
         Ok(user) => Some(user),
         Err(StatusCode::UNAUTHORIZED) => None,
@@ -15277,9 +15302,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CatalogSort, MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
-        catalog_filter_from_emby, emby_media_source_json, emby_media_source_json_with_resolver,
-        emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
+        CatalogSort, FilmlyImageCompatMode, MediaStrategySettings, MetadataCandidateFailureKind,
+        build_cookie, catalog_filter_from_emby, emby_media_source_json,
+        emby_media_source_json_with_resolver, emby_media_stream_item_id, emby_media_stream_json,
+        emby_playback_info_item_id, filmly_image_compat_mode_from_env_value,
         is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
         is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
@@ -15687,6 +15713,26 @@ mod tests {
         assert!(is_filmly_user_agent("Filmly/2.12.3-423"));
         assert!(is_filmly_user_agent("网易爆米花/2.12.3-423"));
         assert!(!is_filmly_user_agent("VidHub/1.0"));
+    }
+
+    #[test]
+    fn filmly_image_compat_mode_defaults_to_compat_and_accepts_generic_ab_value() {
+        assert_eq!(
+            filmly_image_compat_mode_from_env_value(None),
+            FilmlyImageCompatMode::Compat
+        );
+        assert_eq!(
+            filmly_image_compat_mode_from_env_value(Some("generic")),
+            FilmlyImageCompatMode::Generic
+        );
+        assert_eq!(
+            filmly_image_compat_mode_from_env_value(Some("compat")),
+            FilmlyImageCompatMode::Compat
+        );
+        assert_eq!(
+            filmly_image_compat_mode_from_env_value(Some("unexpected")),
+            FilmlyImageCompatMode::Compat
+        );
     }
 
     #[test]
