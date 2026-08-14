@@ -42,6 +42,7 @@ export function AdminLibrariesPage() {
   const [chapterSourceId, setChapterSourceId] = useState("");
   const [createRealtimeMetadataAutoMatch, setCreateRealtimeMetadataAutoMatch] = useState(false);
   const [createRootPath, setCreateRootPath] = useState("");
+  const [createRootPaths, setCreateRootPaths] = useState<string[]>([]);
   const [createDirectoryPickerOpen, setCreateDirectoryPickerOpen] = useState(false);
   const [formError, setFormError] = useState("");
   const [createNotice, setCreateNotice] = useState("");
@@ -75,8 +76,23 @@ export function AdminLibrariesPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
     },
   });
+  function addCreateRootPath(path: string) {
+    const normalizedPath = path.trim();
+    if (!normalizedPath) return;
+    if (createRootPaths.includes(normalizedPath)) {
+      setFormError("该文件夹已经添加");
+      return;
+    }
+    setCreateRootPaths((current) => [...current, normalizedPath]);
+    setCreateRootPath("");
+    setFormError("");
+    setCreateDirectoryPickerOpen(false);
+  }
+  function removeCreateRootPath(path: string) {
+    setCreateRootPaths((current) => current.filter((item) => item !== path));
+  }
   const create = useMutation({
-      mutationFn: async (values: { name: string; kind: string; scraperId: string | null; chapterSourceId: string | null; rootPath: string; realtimeMetadataAutoMatchEnabled: boolean }) => {
+      mutationFn: async (values: { name: string; kind: string; scraperId: string | null; chapterSourceId: string | null; rootPaths: string[]; realtimeMetadataAutoMatchEnabled: boolean }) => {
       const response = await api.createAdminLibrary({
         name: values.name,
         kind: values.kind,
@@ -84,23 +100,26 @@ export function AdminLibrariesPage() {
         ...(values.chapterSourceId ? { chapterSourceId: values.chapterSourceId } : {}),
         realtimeMetadataAutoMatchEnabled: values.realtimeMetadataAutoMatchEnabled,
       });
-      if (!values.rootPath) return { ...response, rootError: "" };
-      try {
-        await api.addAdminLibraryRoot(response.library.id, values.rootPath);
-        return { ...response, rootError: "" };
-      } catch (error) {
-        return { ...response, rootError: error instanceof Error ? error.message : "文件夹添加失败" };
+      const rootErrors: string[] = [];
+      for (const rootPath of values.rootPaths) {
+        try {
+          await api.addAdminLibraryRoot(response.library.id, rootPath);
+        } catch (error) {
+          rootErrors.push(`${rootPath}：${error instanceof Error ? error.message : "文件夹添加失败"}`);
+        }
       }
+      return { ...response, rootErrors };
     },
-    onSuccess: ({ rootError }) => {
+    onSuccess: ({ rootErrors }) => {
       setName("");
       setScraperId("");
       setChapterSourceId("");
       setCreateRealtimeMetadataAutoMatch(false);
       setCreateRootPath("");
+      setCreateRootPaths([]);
       setCreateDirectoryPickerOpen(false);
       setFormError("");
-      setCreateNotice(rootError ? `媒体库已创建，但文件夹添加未完成：${rootError}。请在“编辑”中检查并添加文件夹。` : "");
+      setCreateNotice(rootErrors.length > 0 ? `媒体库已创建，但以下文件夹添加未完成：${rootErrors.join("；")}。请在“编辑”中检查并添加文件夹。` : "");
       setCreateOpen(false);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
     },
@@ -114,6 +133,7 @@ export function AdminLibrariesPage() {
     setChapterSourceId("");
     setCreateRealtimeMetadataAutoMatch(false);
     setCreateRootPath("");
+    setCreateRootPaths([]);
     setCreateDirectoryPickerOpen(false);
     setFormError("");
     setCreateNotice("");
@@ -131,12 +151,16 @@ export function AdminLibrariesPage() {
       setFormError("请输入媒体库名称");
       return;
     }
+    const pendingRootPath = createRootPath.trim();
+    const rootPaths = pendingRootPath && !createRootPaths.includes(pendingRootPath)
+      ? [...createRootPaths, pendingRootPath]
+      : createRootPaths;
     create.mutate({
       name: name.trim(),
       kind,
       scraperId: scraperId || null,
       chapterSourceId: supportsChapterSource(kind) ? chapterSourceId || null : null,
-      rootPath: createRootPath.trim(),
+      rootPaths,
       realtimeMetadataAutoMatchEnabled: createRealtimeMetadataAutoMatch,
     });
   }
@@ -179,9 +203,10 @@ export function AdminLibrariesPage() {
             <p className="lux-library-create-root-help">开启后，实时索引完成会为受影响的新资源提交元数据和图片补全任务。</p>
             <section className="lux-library-dialog-section lux-library-create-root-section">
               <div className="lux-library-dialog-section-heading"><div><h3>文件夹</h3><span>创建后自动开始扫描</span></div><Folder size={18} aria-hidden="true" /></div>
-              <div className="lux-library-root-form"><input id="new-library-root-path" value={createRootPath} onChange={(event) => { setCreateRootPath(event.target.value); setFormError(""); }} placeholder="输入 Docker 内的媒体路径" aria-label="新媒体库根路径" /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setCreateDirectoryPickerOpen(true)}><Folder size={17} /></button></div>
-              <p className="lux-library-create-root-help">可选。选择后，创建媒体库时会同时添加此文件夹，无需再进入编辑。</p>
-              {createDirectoryPickerOpen ? <DirectoryPicker initialPath={createRootPath.trim()} isSubmitting={create.isPending} onClose={() => setCreateDirectoryPickerOpen(false)} onSelect={(path) => { setCreateRootPath(path); setFormError(""); setCreateDirectoryPickerOpen(false); }} /> : null}
+              {createRootPaths.length > 0 ? <div className="lux-library-dialog-root-list">{createRootPaths.map((path) => <div className="lux-library-dialog-root-row" key={path}><span title={path}>{path}</span><button className="lux-library-dialog-icon" type="button" aria-label={`移除新媒体库路径 ${path}`} onClick={() => removeCreateRootPath(path)} disabled={create.isPending}><MinusCircle size={18} /></button></div>)}</div> : null}
+              <div className="lux-library-root-form"><input id="new-library-root-path" value={createRootPath} onChange={(event) => { setCreateRootPath(event.target.value); setFormError(""); }} placeholder="输入 Docker 内的媒体路径" aria-label="新媒体库根路径" /><button className="lux-library-toolbar-button" type="button" aria-label="添加新媒体库路径" onClick={() => addCreateRootPath(createRootPath)} disabled={!createRootPath.trim() || create.isPending}><Plus size={16} /> 添加</button><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setCreateDirectoryPickerOpen(true)} disabled={create.isPending}><Folder size={17} /></button></div>
+              <p className="lux-library-create-root-help">可选。选择或输入路径后点击“添加”，可以继续添加多个文件夹；创建时会一起保存。</p>
+              {createDirectoryPickerOpen ? <DirectoryPicker initialPath={createRootPath.trim()} isSubmitting={create.isPending} onClose={() => setCreateDirectoryPickerOpen(false)} onSelect={addCreateRootPath} /> : null}
             </section>
             {formError ? <p className="lux-error-copy">{formError}</p> : null}
             <div className="lux-library-dialog-actions"><button className="lux-library-toolbar-button" type="button" onClick={() => setCreateOpen(false)}>取消</button><button className="lux-library-toolbar-button is-primary" type="submit" disabled={create.isPending}><Plus size={16} /> {create.isPending ? "创建中…" : "创建媒体库"}</button></div>

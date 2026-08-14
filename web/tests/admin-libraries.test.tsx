@@ -137,7 +137,7 @@ describe("AdminLibrariesPage library cards", () => {
     });
   }
 
-  it("creates a library and adds the selected folder from the same dialog", async () => {
+  it("creates a library with multiple folders selected from the same dialog", async () => {
     const createdLibrary = { ...library, id: "library-2", name: "电影库", roots: [] };
     const createLibrary = vi.spyOn(api, "createAdminLibrary").mockResolvedValue({ library: createdLibrary });
     const addRoot = vi.spyOn(api, "addAdminLibraryRoot").mockResolvedValue({
@@ -189,12 +189,22 @@ describe("AdminLibrariesPage library cards", () => {
       .find((button) => button.textContent?.includes("使用此路径"));
     await act(async () => usePathButton?.click());
 
-    expect(rootInput?.value).toBe("/media");
+    expect(rootInput?.value).toBe("");
+    expect(dialog?.textContent).toContain("/media");
+    await act(async () => {
+      if (!rootInput) throw new Error("new library root input missing");
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(rootInput, "/shows");
+      rootInput.dispatchEvent(new Event("input", { bubbles: true }));
+      rootInput.dispatchEvent(new Event("change", { bubbles: true }));
+      dialog?.querySelector<HTMLButtonElement>("[aria-label='添加新媒体库路径']")?.click();
+    });
+    expect(rootInput?.value).toBe("");
+    expect(dialog?.textContent).toContain("/shows");
     await act(async () => {
       [...(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])]
         .find((button) => button.textContent?.includes("创建媒体库"))
         ?.click();
-      await vi.waitFor(() => expect(addRoot).toHaveBeenCalledWith("library-2", "/media"));
+      await vi.waitFor(() => expect(addRoot).toHaveBeenCalledTimes(2));
     });
 
     expect(createLibrary).toHaveBeenCalledWith({
@@ -204,6 +214,8 @@ describe("AdminLibrariesPage library cards", () => {
       realtimeMetadataAutoMatchEnabled: false,
     });
     expect(createLibrary.mock.invocationCallOrder[0]).toBeLessThan(addRoot.mock.invocationCallOrder[0]);
+    expect(addRoot).toHaveBeenNthCalledWith(1, "library-2", "/media");
+    expect(addRoot).toHaveBeenNthCalledWith(2, "library-2", "/shows");
     expect(container.querySelector("#new-library-title")).toBeNull();
   });
 
