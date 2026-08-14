@@ -9,6 +9,11 @@ const LANGUAGE_NAMES: Record<string, string> = {
   eng: "英语",
   jpn: "日语",
   kor: "韩语",
+  zh: "中文",
+  "zh-cn": "中文",
+  "zh-hk": "中文",
+  "zh-sg": "中文",
+  "zh-tw": "中文",
   fre: "法语",
   fra: "法语",
   spa: "西班牙语",
@@ -21,6 +26,7 @@ export type MediaInfoPanelProps = {
   lastAirDate?: string | null;
   status?: string | null;
   originalLanguage?: string | null;
+  includeMetadataRows?: boolean;
 };
 
 export function MediaInfoPanel(props: MediaInfoPanelProps) {
@@ -41,6 +47,7 @@ export function MediaInfoContent({
   lastAirDate,
   status,
   originalLanguage,
+  includeMetadataRows = true,
 }: MediaInfoPanelProps) {
   const streams = source.streams ?? [];
   const streamGroups = ["VIDEO", "AUDIO", "SUBTITLE"]
@@ -51,9 +58,11 @@ export function MediaInfoContent({
     <>
       <div className="lux-media-nfo-summary">
         <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
-        <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
-        <InfoRow label="状态" value={status ?? undefined} />
-        <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} />
+        {includeMetadataRows ? <>
+          <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
+          <InfoRow label="状态" value={status ?? undefined} />
+          <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} />
+        </> : null}
         <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} />
         <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
       </div>
@@ -169,7 +178,7 @@ function streamTypeLabel(type: string) {
   }
 }
 
-function languageLabel(language: string) {
+export function languageLabel(language: string) {
   return LANGUAGE_NAMES[language.toLowerCase()] ?? language;
 }
 

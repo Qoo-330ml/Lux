@@ -150,6 +150,8 @@ describe("MediaDetailPage series hierarchy", () => {
         tagline: "大漠路远",
         premiered: "2026-02-17",
         releaseDate: "2026-02-20",
+        aired: "2026-02-21",
+        lastAirDate: "2026-03-01",
         runtime: 126,
         status: "Released",
         originalLanguage: "zh",
@@ -197,6 +199,13 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("导演甲");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("编剧甲");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("123 票");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("评分8.1 / 10");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("原始语言中文");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("合集 ID77");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("首播日期2026-02-17");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("发行日期2026-02-20");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("播出日期2026-02-21");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("最后播出2026-03-01");
     expect(container.querySelector("a[aria-label=\"官方网站\"]")?.getAttribute("href"))
       .toBe("https://example.com/movie");
     expect(container.querySelector("a[aria-label=\"预告片 1\"]")?.getAttribute("href"))

@@ -1,6 +1,6 @@
 import { CalendarDays, ExternalLink, Link2, UsersRound } from "lucide-react";
 import type { MediaNfoCredit, MediaNfoDetails } from "../../lib/api/types";
-import { MediaInfoContent, type MediaInfoPanelProps } from "./MediaInfoPanel";
+import { MediaInfoContent, languageLabel, type MediaInfoPanelProps } from "./MediaInfoPanel";
 
 export function MediaNfoPanel({
   details,
@@ -23,6 +23,9 @@ export function MediaNfoPanel({
   const mediaInfoStreams = mediaInfo?.source.streams ?? [];
   const headingSource = hasNfoDetails ? "来自本地 NFO" : "媒体技术信息";
   const headingSuffix = mediaInfoStreams.length ? ` · ${mediaInfoStreams.length} 条媒体轨` : "";
+  const lastAirDate = details?.lastAirDate ?? mediaInfo?.lastAirDate;
+  const status = details?.status ?? mediaInfo?.status;
+  const originalLanguage = details?.originalLanguage ?? mediaInfo?.originalLanguage;
 
   return (
     <section className="lux-media-nfo" aria-labelledby="media-nfo-heading">
@@ -39,12 +42,17 @@ export function MediaNfoPanel({
         ) : null}
         {hasNfoDetails ? (
           <div className="lux-media-nfo-summary">
+            <NfoRow label="评分" value={details?.rating != null ? `${details.rating} / 10` : undefined} />
             <NfoRow label="投票数" value={details?.votes != null ? `${details.votes} 票` : undefined} />
-            <NfoRow label="播出日期" value={details?.aired ?? details?.releaseDate ?? details?.premiered} icon={<CalendarDays size={14} />} />
-            <NfoRow label="最后播出" value={mediaInfo ? undefined : details?.lastAirDate} icon={<CalendarDays size={14} />} />
+            <NfoRow label="首播日期" value={details?.premiered} icon={<CalendarDays size={14} />} />
+            <NfoRow label="发行日期" value={details?.releaseDate} icon={<CalendarDays size={14} />} />
+            <NfoRow label="播出日期" value={details?.aired} icon={<CalendarDays size={14} />} />
+            <NfoRow label="最后播出" value={lastAirDate} icon={<CalendarDays size={14} />} />
             <NfoRow label="运行时长" value={details?.runtime != null ? `${details.runtime} 分钟` : undefined} />
             <NfoRow label="季 / 集" value={formatSeasonEpisode(details?.seasonNumber, details?.episodeNumber)} />
-            <NfoRow label="状态" value={mediaInfo ? undefined : details?.status} />
+            <NfoRow label="状态" value={status} />
+            <NfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} />
+            <NfoRow label="合集 ID" value={details?.setId} />
           </div>
         ) : null}
         {details?.directors?.length ? <CreditRow label="导演" credits={details.directors} /> : null}
@@ -59,8 +67,7 @@ export function MediaNfoPanel({
         {mediaInfo ? (
           <MediaInfoContent
             {...mediaInfo}
-            lastAirDate={mediaInfo.lastAirDate ?? details?.lastAirDate}
-            status={mediaInfo.status ?? details?.status}
+            includeMetadataRows={!hasNfoDetails}
           />
         ) : null}
       </div>
@@ -98,9 +105,9 @@ function NfoRow({ label, value, icon }: { label: string; value?: string | null; 
 
 function hasDetails(details: MediaNfoDetails) {
   return Boolean(
-    details.tagline || details.votes != null || details.premiered || details.releaseDate || details.aired
+    details.rating != null || details.tagline || details.votes != null || details.premiered || details.releaseDate || details.aired
       || details.lastAirDate || details.runtime != null || details.seasonNumber != null || details.episodeNumber != null
-      || details.status || details.website || details.setName
+      || details.status || details.originalLanguage || details.website || details.setName || details.setId
       || details.certification || details.genres?.length || details.countries?.length
       || details.studios?.length || details.directors?.length || details.writers?.length
       || Object.keys(details.providerIds ?? {}).length || details.trailers?.length,
