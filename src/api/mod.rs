@@ -3372,19 +3372,33 @@ fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
     })
 }
 
+fn emby_stable_named_id(kind: &str, name: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"lux-emby:");
+    digest.update(kind.as_bytes());
+    digest.update(b":");
+    digest.update(name.as_bytes());
+    let suffix = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{kind}-{suffix}")
+}
+
 fn emby_nfo_crew_json(nfo: &LocalNfoDetails) -> Vec<Value> {
     let mut people = Vec::with_capacity(nfo.directors.len() + nfo.writers.len());
     for (person_type, credits) in [("Director", &nfo.directors), ("Writer", &nfo.writers)] {
         for credit in credits {
-            let mut person = json!({
+            let person = json!({
                 "Name": credit.name,
+                "Id": if credit.provider_id.is_empty() {
+                    emby_stable_named_id(person_type, &credit.name)
+                } else {
+                    credit.provider_id.clone()
+                },
                 "Type": person_type,
             });
-            if !credit.provider_id.is_empty()
-                && let Value::Object(object) = &mut person
-            {
-                object.insert("Id".to_owned(), json!(credit.provider_id));
-            }
             people.push(person);
         }
     }
@@ -4997,7 +5011,12 @@ fn apply_emby_nfo_details(
             json!(
                 nfo.genres
                     .iter()
-                    .map(|name| json!({ "Name": name }))
+                    .map(|name| {
+                        json!({
+                            "Name": name,
+                            "Id": emby_stable_named_id("genre", name),
+                        })
+                    })
                     .collect::<Vec<_>>()
             ),
         );
@@ -5008,7 +5027,12 @@ fn apply_emby_nfo_details(
             json!(
                 nfo.studios
                     .iter()
-                    .map(|name| json!({ "Name": name }))
+                    .map(|name| {
+                        json!({
+                            "Name": name,
+                            "Id": emby_stable_named_id("studio", name),
+                        })
+                    })
                     .collect::<Vec<_>>()
             ),
         );
