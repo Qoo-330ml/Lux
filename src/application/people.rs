@@ -35,8 +35,10 @@ const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActorCredit {
-    #[serde(deserialize_with = "deserialize_person_id")]
+    #[serde(default, deserialize_with = "deserialize_person_id")]
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character: Option<String>,
@@ -179,9 +181,15 @@ impl PeopleService {
             if actor.name.trim().is_empty() {
                 continue;
             }
+            let actor_provider = actor
+                .provider
+                .as_deref()
+                .unwrap_or(&provider)
+                .trim()
+                .to_ascii_lowercase();
             let has_stable_identity = is_valid_person_id(actor_id);
             let assets = if has_stable_identity {
-                self.persist_person_assets(actor, &provider).await
+                self.persist_person_assets(actor, &actor_provider).await
             } else {
                 PersonAssetResult {
                     image_file: None,
@@ -195,7 +203,7 @@ impl PeopleService {
                 id: has_stable_identity.then(|| actor_id.to_owned()),
                 name: actor.name.trim().to_owned(),
                 provider: has_stable_identity
-                    .then(|| provider.clone())
+                    .then_some(actor_provider)
                     .unwrap_or_default(),
                 character: actor
                     .character
@@ -1128,6 +1136,7 @@ mod tests {
                 "TMDb",
                 &[ActorCredit {
                     id: "9".to_owned(),
+                    provider: None,
                     name: "演员甲".to_owned(),
                     character: Some("角色甲".to_owned()),
                     order: Some(0),
@@ -1178,6 +1187,7 @@ mod tests {
                     provider,
                     &[ActorCredit {
                         id: "9".to_owned(),
+                        provider: None,
                         name: name.to_owned(),
                         character: None,
                         order: Some(0),
@@ -1236,6 +1246,7 @@ mod tests {
                 "TMDb",
                 &[ActorCredit {
                     id: "9".to_owned(),
+                    provider: None,
                     name: "演员甲".to_owned(),
                     character: None,
                     order: None,
@@ -1259,6 +1270,7 @@ mod tests {
                 "local",
                 &[ActorCredit {
                     id: String::new(),
+                    provider: None,
                     name: "本地演员".to_owned(),
                     character: Some("本地角色".to_owned()),
                     order: Some(0),
@@ -1291,6 +1303,7 @@ mod tests {
         let second = [4_u8, 5, 6];
         let actors = [ActorCredit {
             id: "9".to_owned(),
+            provider: None,
             name: "演员甲".to_owned(),
             character: None,
             order: Some(0),
@@ -1332,6 +1345,7 @@ mod tests {
                 "tmdb",
                 &[ActorCredit {
                     id: "9".to_owned(),
+                    provider: None,
                     name: "演员甲".to_owned(),
                     character: Some("角色甲".to_owned()),
                     order: Some(0),

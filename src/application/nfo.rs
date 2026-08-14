@@ -243,6 +243,7 @@ struct ParsedMovieActor {
     name: Option<String>,
     role: Option<String>,
     tmdb_id: Option<String>,
+    provider: Option<String>,
     order: Option<i32>,
 }
 
@@ -251,6 +252,8 @@ enum MovieActorField {
     Name,
     Role,
     TmdbId,
+    ImdbId,
+    DoubanId,
     Order,
 }
 
@@ -259,6 +262,8 @@ fn movie_actor_field(tag: &[u8]) -> Option<MovieActorField> {
         b"name" => Some(MovieActorField::Name),
         b"role" | b"character" => Some(MovieActorField::Role),
         b"tmdbid" => Some(MovieActorField::TmdbId),
+        b"imdbid" => Some(MovieActorField::ImdbId),
+        b"doubanid" => Some(MovieActorField::DoubanId),
         b"order" => Some(MovieActorField::Order),
         _ => None,
     }
@@ -278,7 +283,18 @@ fn assign_movie_actor_field(
     match field {
         MovieActorField::Name => actor.name = Some(value),
         MovieActorField::Role => actor.role = Some(value),
-        MovieActorField::TmdbId => actor.tmdb_id = Some(value),
+        MovieActorField::TmdbId => {
+            actor.tmdb_id = Some(value);
+            actor.provider = Some("tmdb".to_owned());
+        }
+        MovieActorField::ImdbId => {
+            actor.tmdb_id = Some(value);
+            actor.provider = Some("imdb".to_owned());
+        }
+        MovieActorField::DoubanId => {
+            actor.tmdb_id = Some(value);
+            actor.provider = Some("douban".to_owned());
+        }
         MovieActorField::Order => actor.order = value.parse::<i32>().ok(),
     }
     Ok(())
@@ -405,11 +421,13 @@ fn push_parsed_actor(actors: &mut Vec<ActorCredit>, actor: ParsedMovieActor) {
     if name.is_empty() || actors.len() >= MAX_MOVIE_NFO_ACTORS {
         return;
     }
+    let id = actor
+        .tmdb_id
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
     actors.push(ActorCredit {
-        id: actor
-            .tmdb_id
-            .map(|value| value.trim().to_owned())
-            .unwrap_or_default(),
+        provider: actor.provider,
+        id,
         name,
         character: actor.role,
         order: actor.order,
@@ -1191,7 +1209,12 @@ fn append_movie_nfo_fields(
         }
         write_simple_element(writer, "type", "Actor")?;
         if !actor.id.trim().is_empty() {
-            write_simple_element(writer, "tmdbid", actor.id.trim())?;
+            let tag = match actor.provider.as_deref().map(str::trim) {
+                Some("imdb") => "imdbid",
+                Some("douban") => "doubanid",
+                _ => "tmdbid",
+            };
+            write_simple_element(writer, tag, actor.id.trim())?;
         }
         if let Some(order) = actor.order {
             write_simple_element(writer, "order", &order.to_string())?;

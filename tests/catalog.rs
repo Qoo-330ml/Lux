@@ -148,6 +148,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             "tmdb",
             &[ActorCredit {
                 id: "9".to_owned(),
+                provider: None,
                 name: "演员甲".to_owned(),
                 character: Some("角色甲".to_owned()),
                 order: Some(0),
