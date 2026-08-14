@@ -376,6 +376,53 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(actionItems[3]?.querySelector(".lux-media-actions-trigger")).not.toBeNull();
   });
 
+  it("writes favorite and played state and refreshes dependent shelves", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-1",
+      title: "示例电影",
+      itemType: "MOVIE",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ isFavorite: false, isPlayed: false });
+    const setFavorite = vi.spyOn(api, "setFavorite").mockResolvedValue(undefined);
+    const setPlayed = vi.spyOn(api, "setPlayed").mockResolvedValue(undefined);
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/movie-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const favorite = container.querySelector<HTMLButtonElement>("[data-action=toggle-favorite]");
+    const played = container.querySelector<HTMLButtonElement>("[data-action=toggle-played]");
+    expect(favorite).not.toBeNull();
+    expect(played).not.toBeNull();
+
+    await act(async () => favorite?.click());
+    await act(async () => played?.click());
+
+    expect(setFavorite).toHaveBeenCalledWith("movie-1", true);
+    expect(setPlayed).toHaveBeenCalledWith("movie-1", true);
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.playback("movie-1") });
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.home });
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.favorites });
+  });
+
   it("shows identified actors with local portraits or initial placeholders", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",

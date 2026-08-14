@@ -63,6 +63,9 @@ export function LuxShell({ user }: LuxShellProps) {
               <NavLink className={navClass} to="/libraries">
                 媒体库
               </NavLink>
+              <NavLink className={navClass} to="/favorites">
+                收藏
+              </NavLink>
               <NavLink className={navClass} to="/search">
                 搜索
               </NavLink>
@@ -112,6 +115,9 @@ export function LuxShell({ user }: LuxShellProps) {
               </NavLink>
               <NavLink className={navClass} to="/libraries" onClick={() => setMobileOpen(false)}>
                 媒体库
+              </NavLink>
+              <NavLink className={navClass} to="/favorites" onClick={() => setMobileOpen(false)}>
+                收藏
               </NavLink>
               <NavLink className={navClass} to="/search" onClick={() => setMobileOpen(false)}>
                 搜索

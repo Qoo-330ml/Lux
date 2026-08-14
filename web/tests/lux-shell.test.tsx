@@ -141,6 +141,29 @@ describe("LuxShell user control", () => {
     expect(container.querySelector(".lux-grid-button")).toBeNull();
   });
 
+  it("exposes the user's favorites in desktop and mobile navigation", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LuxShell
+            user={{
+              id: "user-1",
+              usernameNormalized: "test",
+            }}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector('.lux-desktop-nav a[href="/favorites"]')?.textContent).toBe("收藏");
+    act(() => container.querySelector<HTMLButtonElement>(".lux-menu-button")?.click());
+    expect(container.querySelector('.lux-mobile-nav a[href="/favorites"]')?.textContent).toBe("收藏");
+  });
+
   it("hides the back button on the home page", () => {
     container = document.createElement("div");
     document.body.append(container);

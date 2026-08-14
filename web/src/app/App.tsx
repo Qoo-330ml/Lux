@@ -12,6 +12,7 @@ import { HomePage } from "../features/home/HomePage";
 const LibrariesPage = lazy(() => import("../features/library/LibrariesPage").then(({ LibrariesPage }) => ({ default: LibrariesPage })));
 const LibraryPage = lazy(() => import("../features/library/LibraryPage").then(({ LibraryPage }) => ({ default: LibraryPage })));
 const SearchPage = lazy(() => import("../features/search/SearchPage").then(({ SearchPage }) => ({ default: SearchPage })));
+const FavoritesPage = lazy(() => import("../features/favorites/FavoritesPage").then(({ FavoritesPage }) => ({ default: FavoritesPage })));
 const MediaDetailPage = lazy(() => import("../features/detail/MediaDetailPage").then(({ MediaDetailPage }) => ({ default: MediaDetailPage })));
 const PlayerPage = lazy(() => import("../features/player/PlayerPage").then(({ PlayerPage }) => ({ default: PlayerPage })));
 const AccountPage = lazy(() => import("../features/account/AccountPage").then(({ AccountPage }) => ({ default: AccountPage })));
@@ -69,6 +70,7 @@ function AuthenticatedRoutes({ user }: { user: LuxUser }) {
           <Route index element={<HomePage user={user} />} />
           <Route path="libraries" element={<LibrariesPage />} />
           <Route path="libraries/:libraryId" element={<LibraryPage />} />
+          <Route path="favorites" element={<FavoritesPage />} />
           <Route path="items/:itemId" element={<MediaDetailPage />} />
           <Route path="watch/:itemId" element={<PlayerPage />} />
           <Route path="search" element={<SearchPage />} />

@@ -42,6 +42,7 @@ export function MediaDetailPage() {
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
+  const [pendingPlaybackAction, setPendingPlaybackAction] = useState<"favorite" | "played">();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const isSeries = item.data?.itemType === "SERIES";
   const isSeason = item.data?.itemType === "SEASON";
@@ -148,6 +149,32 @@ export function MediaDetailPage() {
     }
   }
 
+  async function updatePlaybackFlag(kind: "favorite" | "played") {
+    if (!playback.data || pendingPlaybackAction) return;
+    setActionError(undefined);
+    setActionNotice(undefined);
+    setPendingPlaybackAction(kind);
+    try {
+      if (kind === "favorite") {
+        await api.setFavorite(media.id, !playback.data.isFavorite);
+        setActionNotice(playback.data.isFavorite ? "已移出收藏。" : "已加入收藏。");
+      } else {
+        await api.setPlayed(media.id, !playback.data.isPlayed);
+        setActionNotice(playback.data.isPlayed ? "已取消已看标记。" : "已标记为已看。");
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.playback(media.id) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.home }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.favorites }),
+      ]);
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "播放状态更新失败，请重试。");
+    } finally {
+      setPendingPlaybackAction(undefined);
+    }
+  }
+
   return (
     <article className={`lux-detail-page lux-detail-page-${detailKind}`}>
       {backdrop ? <img className="lux-detail-backdrop" src={backdrop} alt="" /> : null}
@@ -190,15 +217,21 @@ export function MediaDetailPage() {
             <ExpandableOverview overview={media.overview || "暂无简介。"} />
             <div className="lux-hero-actions">
               <Link className="lux-button lux-button-primary" to={watchHref}><Play size={17} fill="currentColor" /> 播放</Link>
-              <button className="lux-button lux-button-glass" type="button"><Heart size={17} /> {playback.data?.isFavorite ? "已收藏" : "收藏"}</button>
-              <span
+              <button className="lux-button lux-button-glass" type="button" data-action="toggle-favorite" aria-pressed={Boolean(playback.data?.isFavorite)} disabled={pendingPlaybackAction !== undefined} onClick={() => void updatePlaybackFlag("favorite")}>
+                <Heart size={17} fill={playback.data?.isFavorite ? "currentColor" : "none"} /> {playback.data?.isFavorite ? "已收藏" : "收藏"}
+              </button>
+              <button
                 className={`lux-detail-watched-status${playback.data?.isPlayed ? " is-played" : ""}`}
-                role="img"
-                aria-label={playback.data?.isPlayed ? "已看" : "未看"}
-                title={playback.data?.isPlayed ? "已看" : "未看"}
+                type="button"
+                data-action="toggle-played"
+                aria-pressed={Boolean(playback.data?.isPlayed)}
+                aria-label={playback.data?.isPlayed ? "已看" : "标记为已看"}
+                title={playback.data?.isPlayed ? "取消已看" : "标记为已看"}
+                disabled={pendingPlaybackAction !== undefined}
+                onClick={() => void updatePlaybackFlag("played")}
               >
                 <Check size={20} strokeWidth={2.4} />
-              </span>
+              </button>
               <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
               {source ? <span className="lux-detail-source"><Radio size={16} /> {source.container || "DIRECT PLAY"}</span> : null}
             </div>
