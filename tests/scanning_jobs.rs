@@ -177,6 +177,67 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
+async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let full_scan = jobs.create_movie_scan_job(library.id).await?;
+    let error = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "New.Movie.2024.mkv".to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await
+        .expect_err("an active full scan must exclude incremental index work");
+
+    assert!(matches!(
+        error,
+        ScanJobError::AlreadyActive(id) if id == full_scan.id
+    ));
+
+    jobs.run_to_completion(&full_scan.id, 100, None).await?;
+    let incremental_scan = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "Another.Movie.2024.mkv".to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    let error = jobs
+        .create_movie_scan_job(library.id)
+        .await
+        .expect_err("an active incremental scan must exclude full index work");
+    assert!(matches!(
+        error,
+        ScanJobError::AlreadyActive(id) if id == incremental_scan.id
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconciliation_job_discovers_once_and_processes_a_persisted_snapshot()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

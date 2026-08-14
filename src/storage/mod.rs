@@ -4013,10 +4013,9 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_active_scan_job(
+    pub(crate) async fn find_active_scan_job_for_library(
         &self,
         library_id: &str,
-        job_type: &str,
     ) -> Result<Option<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
@@ -4024,11 +4023,10 @@ impl Database {
                     finished_at,
                     discovery_completed, auto_metadata_match
              FROM scan_jobs
-             WHERE library_id = ? AND job_type = ? AND status IN ('PENDING', 'RUNNING')
+             WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(library_id)
-        .bind(job_type)
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_scan_job))
@@ -11780,6 +11778,18 @@ pub enum StorageError {
         source: MigrateError,
     },
     LastManager,
+}
+
+impl StorageError {
+    pub(crate) fn is_unique_violation(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlx { source, .. }
+                if source
+                    .as_database_error()
+                    .is_some_and(|error| error.is_unique_violation())
+        )
+    }
 }
 
 impl std::fmt::Display for StorageError {

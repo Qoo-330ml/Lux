@@ -1383,14 +1383,18 @@ impl ScanJobService {
         }
         let job = if let Some(active) = self
             .database
-            .find_active_scan_job(&library_id_text, "INCREMENTAL_SCAN")
+            .find_active_scan_job_for_library(&library_id_text)
             .await?
         {
+            if active.job_type != "INCREMENTAL_SCAN" {
+                return Err(ScanJobError::AlreadyActive(active.id));
+            }
             active
         } else {
             let id = Uuid::now_v7().to_string();
             let generation = Uuid::now_v7().to_string();
-            self.database
+            if let Err(error) = self
+                .database
                 .create_scan_job(
                     &id,
                     &library_id_text,
@@ -1399,7 +1403,18 @@ impl ScanJobService {
                     0,
                     false,
                 )
-                .await?;
+                .await
+            {
+                if error.is_unique_violation()
+                    && let Some(active) = self
+                        .database
+                        .find_active_scan_job_for_library(&library_id_text)
+                        .await?
+                {
+                    return Err(ScanJobError::AlreadyActive(active.id));
+                }
+                return Err(error.into());
+            }
             self.database
                 .find_scan_job(&id)
                 .await?
@@ -1448,7 +1463,7 @@ impl ScanJobService {
         }
         if let Some(active) = self
             .database
-            .find_active_scan_job(&library_id_text, "RECONCILE_LIBRARY")
+            .find_active_scan_job_for_library(&library_id_text)
             .await?
         {
             return Err(ScanJobError::AlreadyActive(active.id));
@@ -1457,7 +1472,8 @@ impl ScanJobService {
         let id = Uuid::now_v7().to_string();
         let generation = Uuid::now_v7().to_string();
         let root_ids = roots.into_iter().map(|root| root.id).collect::<Vec<_>>();
-        self.database
+        if let Err(error) = self
+            .database
             .create_reconciliation_scan_job(
                 &id,
                 &library_id_text,
@@ -1465,7 +1481,18 @@ impl ScanJobService {
                 &root_ids,
                 auto_metadata_match,
             )
-            .await?;
+            .await
+        {
+            if error.is_unique_violation()
+                && let Some(active) = self
+                    .database
+                    .find_active_scan_job_for_library(&library_id_text)
+                    .await?
+            {
+                return Err(ScanJobError::AlreadyActive(active.id));
+            }
+            return Err(error.into());
+        }
         self.record_event(&id, "INFO", "JOB_CREATED", "任务已创建", "{}")
             .await;
         self.get_job(&id).await

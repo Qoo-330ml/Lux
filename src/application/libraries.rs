@@ -298,7 +298,7 @@ impl LibraryService {
         }
         if self
             .database
-            .find_active_scan_job(&library_id_text, "RECONCILE_LIBRARY")
+            .find_active_scan_job_for_library(&library_id_text)
             .await?
             .is_some()
         {
