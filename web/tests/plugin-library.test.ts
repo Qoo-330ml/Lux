@@ -240,12 +240,15 @@ describe("AdminPluginsPage plugin cards", () => {
     });
 
     const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
-    const selects = Array.from(dialog?.querySelectorAll("select") ?? []);
-    expect(selects[0]?.value).toBe("zh-CN");
-    expect(selects[1]?.multiple).toBe(true);
-    expect(Array.from(selects[1]?.selectedOptions ?? [], (option) => option.value)).toEqual(["zh-SG", "zh-HK", "zh-TW"]);
-    expect(selects[2]?.value).toBe("official");
-    expect(selects[2]?.options[1]?.textContent).toBe("https://api.tmdb.org");
+    const selects = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("[role='combobox']") ?? []);
+    expect(selects[0]?.textContent).toContain("简体中文");
+    expect(selects[1]?.textContent).toContain("3 项已选择");
+    expect(selects[2]?.textContent).toContain("https://api.themoviedb.org");
+    await act(async () => selects[1]?.click());
+    const fallbackListbox = document.querySelector<HTMLElement>("[role='listbox']");
+    expect(fallbackListbox?.getAttribute("aria-multiselectable")).toBe("true");
+    expect([...fallbackListbox?.querySelectorAll<HTMLElement>("[role='option'][aria-selected='true']") ?? []].map((option) => option.textContent?.trim())).toEqual(["zh-SG", "zh-HK", "zh-TW"]);
+    await act(async () => selects[1]?.click());
     expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(2);
 
     await act(async () => {
@@ -372,11 +375,15 @@ describe("AdminPluginsPage plugin cards", () => {
       container.querySelector<HTMLButtonElement>('[aria-label="配置 strm媒体信息提取"]')?.click();
     });
     const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
-    const selects = Array.from(dialog?.querySelectorAll("select") ?? []);
-    expect(selects[0]?.multiple).toBe(true);
-    expect(selects[0]?.options[0]?.textContent).toBe("电影库");
+    const selects = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("[role='combobox']") ?? []);
+    expect(selects[0]?.textContent).toContain("电影库");
+    await act(async () => selects[0]?.click());
+    const libraryListbox = document.querySelector<HTMLElement>("[role='listbox']");
+    expect(libraryListbox?.getAttribute("aria-multiselectable")).toBe("true");
+    expect(libraryListbox?.querySelector("[role='option']")?.textContent).toContain("电影库");
+    await act(async () => selects[0]?.click());
     expect(dialog?.querySelector('input[type="number"]')).toBeTruthy();
-    expect(dialog?.querySelectorAll('select')).toHaveLength(2);
+    expect(dialog?.querySelectorAll('[role="combobox"]')).toHaveLength(2);
     expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(3);
     expect(dialog?.textContent).toContain("提取媒体信息");
     expect(dialog?.textContent).toContain("补全 STRM 缩略图");

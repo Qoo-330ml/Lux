@@ -98,4 +98,34 @@ describe("LuxSelect", () => {
 
     expect(onChange).toHaveBeenCalledWith("last");
   });
+
+  it("supports multiple selection without rendering a native select", async () => {
+    const onChange = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <LuxSelect
+          multiple
+          value={["first"]}
+          options={[{ value: "first", label: "第一项" }, { value: "second", label: "第二项" }]}
+          onChange={onChange}
+          aria-label="多选项"
+        />,
+      );
+    });
+
+    const trigger = container.querySelector<HTMLButtonElement>("[role='combobox']");
+    expect(container.querySelector("select")).toBeNull();
+
+    await act(async () => trigger?.click());
+
+    const listbox = document.querySelector<HTMLElement>("[role='listbox']");
+    expect(listbox?.getAttribute("aria-multiselectable")).toBe("true");
+
+    const second = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((option) => option.textContent?.includes("第二项"));
+    await act(async () => second?.click());
+
+    expect(onChange).toHaveBeenCalledWith(["first", "second"]);
+    expect(trigger?.getAttribute("aria-expanded")).toBe("true");
+  });
 });
