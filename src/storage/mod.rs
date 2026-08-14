@@ -3491,7 +3491,14 @@ impl Database {
                      FROM metadata_reidentify_job_items
                      JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
                      WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                    ) AS library_id
+                    ) AS library_id,
+                    (SELECT COUNT(DISTINCT pending_candidates.item_id)
+                     FROM metadata_candidates pending_candidates
+                     JOIN metadata_reidentify_job_items pending_job_items
+                       ON pending_job_items.item_id = pending_candidates.item_id
+                      AND pending_job_items.job_id = metadata_reidentify_jobs.id
+                     WHERE pending_candidates.status = 'PENDING'
+                    ) AS pending_count
              FROM metadata_reidentify_jobs WHERE id = ?",
         )
         .bind(job_id)
@@ -3521,7 +3528,14 @@ impl Database {
                          FROM metadata_reidentify_job_items
                          JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
                          WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                        ) AS library_id
+                        ) AS library_id,
+                        (SELECT COUNT(DISTINCT pending_candidates.item_id)
+                         FROM metadata_candidates pending_candidates
+                         JOIN metadata_reidentify_job_items pending_job_items
+                           ON pending_job_items.item_id = pending_candidates.item_id
+                          AND pending_job_items.job_id = metadata_reidentify_jobs.id
+                         WHERE pending_candidates.status = 'PENDING'
+                        ) AS pending_count
                  FROM metadata_reidentify_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -3541,7 +3555,14 @@ impl Database {
                          FROM metadata_reidentify_job_items
                          JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
                          WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                        ) AS library_id
+                        ) AS library_id,
+                        (SELECT COUNT(DISTINCT pending_candidates.item_id)
+                         FROM metadata_candidates pending_candidates
+                         JOIN metadata_reidentify_job_items pending_job_items
+                           ON pending_job_items.item_id = pending_candidates.item_id
+                          AND pending_job_items.job_id = metadata_reidentify_jobs.id
+                         WHERE pending_candidates.status = 'PENDING'
+                        ) AS pending_count
                  FROM metadata_reidentify_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -10729,6 +10750,7 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) mode: String,
     pub(crate) cancel_requested: bool,
     pub(crate) library_id: Option<String>,
+    pub(crate) pending_count: i64,
 }
 
 #[derive(Debug)]
@@ -10755,6 +10777,7 @@ fn stored_metadata_reidentify_job(row: sqlx::any::AnyRow) -> StoredMetadataReide
         mode: row.get("mode"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         library_id: row.get("library_id"),
+        pending_count: row.get("pending_count"),
     }
 }
 
@@ -11001,6 +11024,7 @@ fn catalog_filter_where_clause<'a>(
     let years = filter.years;
     let is_played = filter.is_played;
     let is_favorite = filter.is_favorite;
+    let metadata_pending = filter.metadata_pending;
     let mut where_clause = format!(
         "WHERE mi.removed_at IS NULL
          AND mi.library_id IN ({})",
@@ -11114,6 +11138,15 @@ fn catalog_filter_where_clause<'a>(
         binds.push(CatalogBind::Text(user_id));
         binds.push(CatalogBind::Integer(i64::from(is_favorite)));
     }
+    if metadata_pending {
+        where_clause.push_str(
+            " AND EXISTS (
+                SELECT 1 FROM metadata_candidates pending_metadata
+                WHERE pending_metadata.item_id = mi.id
+                  AND pending_metadata.status = 'PENDING'
+            )",
+        );
+    }
     (where_clause, binds)
 }
 
@@ -11210,6 +11243,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
+    pub(crate) metadata_pending: bool,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
     pub(crate) offset: i64,
@@ -11881,6 +11915,7 @@ mod tests {
                 years: &empty_years,
                 is_played: None,
                 is_favorite: None,
+                metadata_pending: false,
                 sort_by,
                 descending,
                 offset: 0,

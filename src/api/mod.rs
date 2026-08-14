@@ -1893,6 +1893,7 @@ fn catalog_filter_from_values(
     is_favorite: Option<bool>,
     sort_by: Option<&str>,
     sort_order: Option<&str>,
+    metadata_pending: bool,
 ) -> CatalogFilter {
     let item_types = item_types
         .map(|values| {
@@ -1928,6 +1929,7 @@ fn catalog_filter_from_values(
         years,
         is_played,
         is_favorite,
+        metadata_pending,
         sort_by: match sort_by {
             Some(value)
                 if value
@@ -1965,6 +1967,7 @@ fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
         query.is_favorite,
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
+        false,
     );
     let ids = query.ids.as_deref().map(|values| {
         values
@@ -2339,6 +2342,7 @@ async fn emby_group_latest_page(
             years: Vec::new(),
             is_played: None,
             is_favorite: None,
+            metadata_pending: false,
             sort_by: CatalogSort::Name,
             descending: false,
         };
@@ -6635,6 +6639,8 @@ struct LuxPageQuery {
     sort_by: Option<String>,
     #[serde(rename = "sort_order", alias = "sortOrder", default)]
     sort_order: Option<String>,
+    #[serde(rename = "metadataStatus", default)]
+    metadata_status: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -7254,6 +7260,19 @@ async fn lux_list_library_items(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let metadata_pending = match query.metadata_status.as_deref() {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("PENDING") => true,
+        Some(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "元数据状态无效",
+            )
+            .into_response();
+        }
+    };
     let filter = catalog_filter_from_values(
         query.item_type.as_deref(),
         query.year.map(|year| year.to_string()).as_deref(),
@@ -7261,6 +7280,7 @@ async fn lux_list_library_items(
         query.is_favorite,
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
+        metadata_pending,
     );
     match catalog
         .list_library_items_filtered(principal, &library_id, &filter, offset, limit)
@@ -13851,6 +13871,7 @@ fn metadata_reidentify_job_json(
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
         "libraryId": job.library_id,
+        "pendingCount": job.pending_count,
         "items": job.items.iter().map(|item| json!({
             "jobId": item.job_id,
             "itemId": item.item_id,
@@ -13878,6 +13899,7 @@ fn metadata_reidentify_job_summary_json(
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
         "libraryId": job.library_id,
+        "pendingCount": job.pending_count,
     })
 }
 
