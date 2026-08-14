@@ -6729,23 +6729,23 @@ impl Database {
             })?;
 
         let item_order = match (filter.sort_by, filter.descending) {
-            (CatalogSort::DateCreated, true) => "mi.added_at DESC, mi.sort_title ASC, mi.id ASC",
-            (CatalogSort::DateCreated, false) => "mi.added_at ASC, mi.sort_title ASC, mi.id ASC",
+            (CatalogSort::DateCreated, true) => "mi.added_at DESC, LOWER(mi.title) ASC, mi.id ASC",
+            (CatalogSort::DateCreated, false) => "mi.added_at ASC, LOWER(mi.title) ASC, mi.id ASC",
             (CatalogSort::PremiereDate, true) => {
                 "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.premiere_date DESC, mi.sort_title ASC, mi.id ASC"
+                 mi.premiere_date DESC, LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::PremiereDate, false) => {
                 "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.premiere_date ASC, mi.sort_title ASC, mi.id ASC"
+                 mi.premiere_date ASC, LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::Rating, true) => {
                 "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.rating DESC, mi.sort_title ASC, mi.id ASC"
+                 mi.rating DESC, LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::Rating, false) => {
                 "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.rating ASC, mi.sort_title ASC, mi.id ASC"
+                 mi.rating ASC, LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::Name, true) => "LOWER(mi.title) DESC, mi.id DESC",
             (CatalogSort::Name, false) => "LOWER(mi.title) ASC, mi.id ASC",
@@ -11645,6 +11645,72 @@ mod tests {
         config::Config,
         library::LibraryKind,
     };
+
+    #[tokio::test]
+    async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, premiere_date,
+                rating, identification_status, added_at, has_available_source
+             ) VALUES
+                ('item-alpha', ?, 'MOVIE', 'Alpha', 'zzz', '2020-01-01', 8.0, 'LOCAL_CONFIRMED', 100, 1),
+                ('item-beta', ?, 'MOVIE', 'Beta', 'aaa', '2020-01-01', 8.0, 'LOCAL_CONFIRMED', 100, 1)",
+        )
+        .bind(&library_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("media items");
+
+        let library_ids = vec![library_id];
+        let item_types = vec!["MOVIE".to_owned()];
+        let empty = Vec::new();
+        let empty_years = Vec::<i64>::new();
+        for (sort_by, descending) in [
+            (CatalogSort::DateCreated, false),
+            (CatalogSort::DateCreated, true),
+            (CatalogSort::PremiereDate, false),
+            (CatalogSort::PremiereDate, true),
+            (CatalogSort::Rating, false),
+            (CatalogSort::Rating, true),
+        ] {
+            let filter = CatalogFilterQuery {
+                library_ids: &library_ids,
+                user_id: "test-user",
+                item_types: &item_types,
+                excluded_item_types: &empty,
+                item_ids: None,
+                media_source_ids: None,
+                years: &empty_years,
+                is_played: None,
+                is_favorite: None,
+                sort_by,
+                descending,
+                offset: 0,
+                limit: 10,
+            };
+            let (rows, total) = database
+                .list_filtered_catalog_rows(&filter)
+                .await
+                .expect("catalog rows");
+            let titles = rows.into_iter().map(|row| row.title).collect::<Vec<_>>();
+            let expected = vec!["Alpha", "Beta"];
+            assert_eq!(total, 2);
+            assert_eq!(titles, expected, "descending={descending}");
+        }
+    }
 
     #[tokio::test]
     async fn media_source_library_page_respects_limit_and_offset() {
