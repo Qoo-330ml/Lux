@@ -15,6 +15,27 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.1",
+    date: "2026-08-14",
+    sections: [
+      { kind: "added", items: [
+        "增加管理台更新日志页面，展示版本变更和项目发布历史。",
+        "增加元数据确认结果、任务完成时间和低置信度元数据处理流程的管理能力。",
+        "增加共享表单控件与 LuxSelect，统一管理界面交互样式。",
+      ] },
+      { kind: "fixed", items: [
+        "修复登录缓存与 session 路由不兼容的问题。",
+        "修复同一媒体库同时运行多个扫描索引任务的问题，保证扫描任务串行化。",
+        "补充 Emby 元数据 DTO 的条目 ID，改善客户端关联媒体和元数据的能力。",
+      ] },
+      { kind: "changed", items: [
+        "优化首页性能：复用访问状态查询、减少后台轮询，并采用异步图片解码。",
+        "移除独立的元数据纠正页面，将确认结果和后续处理统一到管理流程中。",
+        "记录首页性能基线与后续聚合优化结果。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.0",
     date: "2026-08-14",
     sections: [
