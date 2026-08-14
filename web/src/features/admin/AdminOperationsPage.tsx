@@ -29,11 +29,9 @@ import type {
 import { formatAdminDate } from "./date";
 
 type OperationsTab = "registered" | "runs" | "logs";
-type OperationsJob = (AdminJob | AdminMetadataReidentifyJob) & {
-  kind: "scan" | "metadata";
-  jobType: string;
-  libraryId?: string | null;
-};
+type OperationsJob =
+  | (AdminJob & { kind: "scan"; jobType: string; libraryId?: string | null })
+  | (AdminMetadataReidentifyJob & { kind: "metadata"; jobType: string; libraryId?: string | null });
 
 const JOB_STATUS_LABELS: Record<string, string> = {
   PENDING: "等待中",
@@ -373,7 +371,7 @@ function RunsSection({
   onRetry: (job: OperationsJob) => void;
   busy: boolean;
 }) {
-  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="runs-title"><div className="lux-operations-section-heading"><div><span className="lux-eyebrow">执行历史</span><h2 id="runs-title">运行记录</h2><p>查看后台任务进度；失败或取消的任务可以从这里重试。</p></div><LuxSelect className="lux-admin-filter-select" value={status} options={[{ value: "", label: "全部状态" }, { value: "PENDING", label: "等待中" }, { value: "RUNNING", label: "运行中" }, { value: "FAILED", label: "失败" }, { value: "COMPLETED", label: "已完成" }, { value: "CANCELLED", label: "已取消" }]} onChange={onStatusChange} aria-label="运行记录状态" /></div><p className="lux-admin-muted">整库元数据操作会调用所属媒体库的注册刮削任务，低置信度条目请到 <Link to="/admin/metadata">元数据纠错</Link> 处理。</p><div className="lux-admin-job-list">{jobs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无运行记录</strong><p>手动或计划任务开始执行后，状态会显示在这里。</p></div></div> : jobs.map((job) => <JobRow key={`${job.kind}-${job.id}`} job={job} libraryNames={libraryNames} onCancel={() => onCancel(job)} onRetry={() => onRetry(job)} busy={busy} />)}</div></section>;
+  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="runs-title"><div className="lux-operations-section-heading"><div><span className="lux-eyebrow">执行历史</span><h2 id="runs-title">运行记录</h2><p>查看后台任务进度；失败或取消的任务可以从这里重试。</p></div><LuxSelect className="lux-admin-filter-select" value={status} options={[{ value: "", label: "全部状态" }, { value: "PENDING", label: "等待中" }, { value: "RUNNING", label: "运行中" }, { value: "FAILED", label: "失败" }, { value: "COMPLETED", label: "已完成" }, { value: "CANCELLED", label: "已取消" }]} onChange={onStatusChange} aria-label="运行记录状态" /></div><p className="lux-admin-muted">整库元数据操作会调用所属媒体库的注册刮削任务，低匹配项可从对应媒体库的“待确认”筛选处理。</p><div className="lux-admin-job-list">{jobs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无运行记录</strong><p>手动或计划任务开始执行后，状态会显示在这里。</p></div></div> : jobs.map((job) => <JobRow key={`${job.kind}-${job.id}`} job={job} libraryNames={libraryNames} onCancel={() => onCancel(job)} onRetry={() => onRetry(job)} busy={busy} />)}</div></section>;
 }
 
 function LogsSection({
@@ -459,7 +457,9 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
   const retryable = job.status === "FAILED" || job.status === "CANCELLED";
   const error = formatJobError(job.error);
   const libraryLabel = job.libraryId ? libraryNames.get(job.libraryId) ?? job.libraryId : "";
-  return <article className="lux-admin-job-row"><div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div><div className="lux-admin-job-main"><div className="lux-admin-job-heading"><strong>{formatJobType(job.jobType)}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{formatJobStatus(job.status)}</span></div><small>{job.kind === "metadata" ? "元数据任务" : "扫描任务"}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""} · {job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}{error ? ` · ${error}` : ""}</small>{progress !== null ? <div className="lux-job-progress"><span style={{ width: `${progress}%` }} /></div> : null}</div><div className="lux-admin-job-actions">{active ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消任务" onClick={onCancel} disabled={busy}><StopCircle size={15} /></button> : null}{retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}</div></article>;
+  const pendingCount = job.kind === "metadata" ? job.pendingCount ?? 0 : 0;
+  const pendingHref = job.libraryId ? `/libraries/${encodeURIComponent(job.libraryId)}?metadataStatus=pending` : undefined;
+  return <article className="lux-admin-job-row"><div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div><div className="lux-admin-job-main"><div className="lux-admin-job-heading"><strong>{formatJobType(job.jobType)}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{formatJobStatus(job.status)}</span></div><small>{job.kind === "metadata" ? "元数据任务" : "扫描任务"}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""} · {job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}{error ? ` · ${error}` : ""}</small><time className="lux-admin-job-finished-at">完成时间：{job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>{progress !== null ? <div className="lux-job-progress"><span style={{ width: `${progress}%` }} /></div> : null}{pendingCount > 0 ? pendingHref ? <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link> : <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span> : null}</div><div className="lux-admin-job-actions">{active ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消任务" onClick={onCancel} disabled={busy}><StopCircle size={15} /></button> : null}{retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}</div></article>;
 }
 
 function metadataStatusFilter(status: string) {

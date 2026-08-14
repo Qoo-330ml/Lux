@@ -127,6 +127,7 @@ export type MediaNfoDetails = {
 
 export type MediaItem = {
   id: string;
+  libraryId?: string | null;
   title?: string | null;
   name?: string | null;
   originalTitle?: string | null;
@@ -434,6 +435,7 @@ export type AdminJob = {
   cancelRequested?: boolean;
   error?: string | null;
   createdAt?: string | number;
+  finishedAt?: string | number | null;
 };
 
 export type AdminScheduledTask = {
@@ -468,6 +470,7 @@ export type AdminMetadataReidentifyJob = {
   mode: "REIDENTIFY" | "FILL_MISSING" | "FULL_REFRESH" | string;
   processedCount: number;
   totalCount: number;
+  pendingCount?: number;
   error?: string | null;
   createdAt: string | number;
   updatedAt?: string | number;

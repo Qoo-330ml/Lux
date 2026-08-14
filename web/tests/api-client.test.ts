@@ -141,6 +141,20 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("requests only metadata items that still need confirmation", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().libraryItems("movie-library", 1, "MOVIE", {
+      metadataStatus: "PENDING",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/libraries/movie-library/items?page=1&pageSize=24&itemType=MOVIE&metadataStatus=PENDING",
+    );
+  });
+
   it("requests the children for a series or a selected season", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),

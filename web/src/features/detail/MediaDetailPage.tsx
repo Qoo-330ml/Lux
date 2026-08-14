@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Heart, Play, Radio, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
@@ -19,6 +19,8 @@ import { MediaDeleteDialog } from "../media/MediaDeleteDialog";
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const pendingReview = searchParams.get("metadataStatus")?.toUpperCase() === "PENDING";
   const queryClient = useQueryClient();
   const item = useQuery({
     queryKey: queryKeys.item(itemId),
@@ -37,6 +39,12 @@ export function MediaDetailPage() {
     queryFn: () => api.playback(itemId),
     enabled: Boolean(itemId),
     refetchInterval: queryRefreshIntervals.mediaSurface,
+  });
+  const pendingItemsQueryKey = queryKeys.library(item.data?.libraryId ?? "", 1, undefined, "Name", "Ascending", "PENDING");
+  const pendingItems = useQuery({
+    queryKey: pendingItemsQueryKey,
+    queryFn: () => api.libraryItems(item.data?.libraryId ?? "", 1, undefined, { metadataStatus: "PENDING", pageSize: 100 }),
+    enabled: pendingReview && Boolean(item.data?.libraryId),
   });
   const [selectedSourceId, setSelectedSourceId] = useState<string>();
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
@@ -115,6 +123,11 @@ export function MediaDetailPage() {
   const watchHref = source
     ? `/watch/${media.id}?sourceId=${encodeURIComponent(source.id)}`
     : `/watch/${media.id}`;
+  const pendingReviewItems = pendingItems.data?.items ?? [];
+  const pendingIndex = pendingReviewItems.findIndex((entry) => entry.id === media.id);
+  const nextPendingItem = pendingIndex >= 0
+    ? pendingReviewItems[pendingIndex + 1]
+    : pendingReviewItems[0];
 
   async function setMetadataLock(locked: boolean) {
     setActionError(undefined);
@@ -233,6 +246,7 @@ export function MediaDetailPage() {
                 <Check size={20} strokeWidth={2.4} />
               </button>
               <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+              {pendingReview && nextPendingItem ? <Link className="lux-button lux-button-glass lux-detail-next-pending" data-action="next-pending" to={`/items/${nextPendingItem.id}?metadataStatus=pending`}>下一个待确认</Link> : null}
               {source ? <span className="lux-detail-source"><Radio size={16} /> {source.container || "DIRECT PLAY"}</span> : null}
             </div>
             {actionError ? <p className="lux-editor-error lux-detail-action-error" role="alert">{actionError}</p> : null}
@@ -272,7 +286,7 @@ export function MediaDetailPage() {
       }} /> : null}
       {editor === "subtitles" ? <MediaSubtitleEditor item={media} sourceId={source?.id} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
       {deleteOpen ? <MediaDeleteDialog item={media} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(media.id, source?.id)} onDeleted={() => navigate("/libraries")} /> : null}
-      {editor === "identify" ? <MediaIdentifier item={media} onClose={() => setEditor(undefined)} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) })} /> : null}
+      {editor === "identify" ? <MediaIdentifier item={media} onClose={() => setEditor(undefined)} onSaved={() => { void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) }); void queryClient.invalidateQueries({ queryKey: pendingItemsQueryKey }); }} /> : null}
     </article>
   );
 }

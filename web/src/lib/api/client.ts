@@ -46,6 +46,8 @@ export type LibrarySortOrder = "Ascending" | "Descending";
 export type LibraryItemsOptions = {
   sortBy?: LibrarySortBy;
   sortOrder?: LibrarySortOrder;
+  metadataStatus?: "PENDING";
+  pageSize?: number;
 };
 
 export type AdminDirectoryEntry = {
@@ -223,10 +225,11 @@ export class LuxApiClient {
     itemTypes?: string,
     options: LibraryItemsOptions = {},
   ) {
-    const params = new URLSearchParams({ page: String(page), pageSize: "24" });
+    const params = new URLSearchParams({ page: String(page), pageSize: String(options.pageSize ?? 24) });
     if (itemTypes) params.set("itemType", itemTypes);
     if (options.sortBy) params.set("sortBy", options.sortBy);
     if (options.sortOrder) params.set("sortOrder", options.sortOrder);
+    if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
     );
@@ -694,12 +697,6 @@ export class LuxApiClient {
         method: "POST",
         body: JSON.stringify(networkProxyUrl ? { networkProxyUrl } : {}),
       },
-    );
-  }
-
-  adminPendingMetadata() {
-    return this.request<{ items?: AdminMetadataCandidate[]; total?: number }>(
-      "/api/v1/admin/metadata/pending?page=1&pageSize=50",
     );
   }
 

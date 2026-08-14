@@ -12,7 +12,8 @@ export const queryKeys = {
     itemTypes?: string,
     sortBy = "Name",
     sortOrder = "Ascending",
-  ) => ["library", libraryId, page, itemTypes ?? "root", sortBy, sortOrder] as const,
+    metadataStatus = "all",
+  ) => ["library", libraryId, page, itemTypes ?? "root", sortBy, sortOrder, metadataStatus] as const,
   item: (itemId: string) => ["item", itemId] as const,
   itemImages: (itemId: string) => ["item-images", itemId] as const,
   children: (itemId: string, itemType?: string, seasonId?: string) =>
@@ -31,7 +32,6 @@ export const queryKeys = {
   adminMetadataJobs: (status?: string) => ["admin", "metadata-jobs", status ?? "all"] as const,
   adminLogs: ["admin", "logs"] as const,
   adminSettings: ["admin", "settings"] as const,
-  adminPendingMetadata: ["admin", "metadata", "pending"] as const,
   adminItemImages: (itemId: string) => ["admin", "item-images", itemId] as const,
 };
 

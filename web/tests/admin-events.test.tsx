@@ -109,4 +109,27 @@ describe("admin SSE events", () => {
     act(() => root.unmount());
     expect(source.closed).toBe(true);
   });
+
+  it("refreshes metadata jobs without a standalone pending-metadata query", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+
+    act(() => {
+      root = createRoot(container);
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminLayout />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => await Promise.resolve());
+
+    act(() => FakeEventSource.instances[0].emit("invalidate", JSON.stringify({ scope: "metadata" })));
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "metadata-jobs"] },
+      { queryKey: ["admin", "logs"] },
+    ]);
+  });
 });

@@ -3,7 +3,6 @@ export const ADMIN_NAV_ITEMS = Object.freeze([
   { id: "libraries", label: "媒体库与计划", glyph: "▣" },
   { id: "users", label: "用户与权限", glyph: "◉" },
   { id: "jobs", label: "任务与日志", glyph: "↻" },
-  { id: "metadata", label: "元数据与图片", glyph: "✦" },
   { id: "settings", label: "服务端设置", glyph: "⚙" },
 ]);
 

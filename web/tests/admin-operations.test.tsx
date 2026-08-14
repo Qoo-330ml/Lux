@@ -27,8 +27,9 @@ describe("AdminOperationsPage", () => {
       jobType: "INCREMENTAL_SCAN",
       status: "COMPLETED",
       processedCount: 1,
-      totalCount: 1,
-      createdAt: 1_700_000_001,
+        totalCount: 1,
+        createdAt: 1_700_000_001,
+        finishedAt: 1_700_000_002,
     }] });
     const cancelMetadata = vi.spyOn(api, "cancelMetadataReidentify").mockResolvedValue(undefined);
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({
@@ -38,6 +39,7 @@ describe("AdminOperationsPage", () => {
         mode: "REIDENTIFY",
         processedCount: 3,
         totalCount: 10,
+        pendingCount: 2,
         error: null,
         createdAt: 1_700_000_000,
         libraryId: "library-1",
@@ -64,6 +66,9 @@ describe("AdminOperationsPage", () => {
     act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
     expect(container.textContent).toContain("整库元数据匹配");
     expect(container.textContent).toContain("运行中");
+    expect(container.textContent).toContain("低匹配 2 项");
+    expect(container.querySelector<HTMLAnchorElement>('a[href="/libraries/library-1?metadataStatus=pending"]')).not.toBeNull();
+    expect(container.textContent).toContain("完成时间");
     const runList = container.querySelector<HTMLElement>(".lux-admin-job-list");
     expect(runList?.textContent).toContain("媒体库：电影库");
     expect(runList?.textContent).not.toContain("library-1");
