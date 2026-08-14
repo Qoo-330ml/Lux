@@ -243,6 +243,7 @@ struct ParsedMovieActor {
     name: Option<String>,
     role: Option<String>,
     tmdb_id: Option<String>,
+    provider: Option<String>,
     order: Option<i32>,
 }
 
@@ -251,6 +252,8 @@ enum MovieActorField {
     Name,
     Role,
     TmdbId,
+    ImdbId,
+    DoubanId,
     Order,
 }
 
@@ -259,6 +262,8 @@ fn movie_actor_field(tag: &[u8]) -> Option<MovieActorField> {
         b"name" => Some(MovieActorField::Name),
         b"role" | b"character" => Some(MovieActorField::Role),
         b"tmdbid" => Some(MovieActorField::TmdbId),
+        b"imdbid" => Some(MovieActorField::ImdbId),
+        b"doubanid" => Some(MovieActorField::DoubanId),
         b"order" => Some(MovieActorField::Order),
         _ => None,
     }
@@ -278,7 +283,18 @@ fn assign_movie_actor_field(
     match field {
         MovieActorField::Name => actor.name = Some(value),
         MovieActorField::Role => actor.role = Some(value),
-        MovieActorField::TmdbId => actor.tmdb_id = Some(value),
+        MovieActorField::TmdbId => {
+            actor.tmdb_id = Some(value);
+            actor.provider = Some("tmdb".to_owned());
+        }
+        MovieActorField::ImdbId => {
+            actor.tmdb_id = Some(value);
+            actor.provider = Some("imdb".to_owned());
+        }
+        MovieActorField::DoubanId => {
+            actor.tmdb_id = Some(value);
+            actor.provider = Some("douban".to_owned());
+        }
         MovieActorField::Order => actor.order = value.parse::<i32>().ok(),
     }
     Ok(())
@@ -399,16 +415,19 @@ fn assign_base_value(
 }
 
 fn push_parsed_actor(actors: &mut Vec<ActorCredit>, actor: ParsedMovieActor) {
-    let Some(id) = actor.tmdb_id.map(|value| value.trim().to_owned()) else {
-        return;
-    };
     let Some(name) = actor.name.map(|value| value.trim().to_owned()) else {
         return;
     };
-    if id.is_empty() || name.is_empty() || actors.len() >= MAX_MOVIE_NFO_ACTORS {
+    if name.is_empty() || actors.len() >= MAX_MOVIE_NFO_ACTORS {
         return;
     }
+    let id = actor
+        .tmdb_id
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
     actors.push(ActorCredit {
+        provider: actor.provider,
+        identities: Vec::new(),
         id,
         name,
         character: actor.role,
@@ -959,6 +978,7 @@ pub fn rewrite_movie_nfo(
     original: &[u8],
     patch: &MovieNfoMetadata,
 ) -> Result<Vec<u8>, NfoWriteError> {
+    validate_movie_nfo_actors(patch)?;
     let base = rewrite_nfo(original, &patch.base)?;
     let mut reader = Reader::from_reader(base.as_slice());
     reader.config_mut().trim_text(false);
@@ -1183,16 +1203,20 @@ fn append_movie_nfo_fields(
     patch: &MovieNfoMetadata,
 ) -> Result<(), NfoWriteError> {
     for actor in &patch.actors {
-        if actor.id.trim().is_empty() || actor.name.trim().is_empty() {
-            continue;
-        }
         start_element(writer, "actor", None)?;
-        write_simple_element(writer, "name", &actor.name)?;
+        write_simple_element(writer, "name", actor.name.trim())?;
         if let Some(character) = non_empty(actor.character.as_deref()) {
             write_simple_element(writer, "role", character)?;
         }
         write_simple_element(writer, "type", "Actor")?;
-        write_simple_element(writer, "tmdbid", &actor.id)?;
+        if !actor.id.trim().is_empty() {
+            let tag = match actor.provider.as_deref().map(str::trim) {
+                Some("imdb") => "imdbid",
+                Some("douban") => "doubanid",
+                _ => "tmdbid",
+            };
+            write_simple_element(writer, tag, actor.id.trim())?;
+        }
         if let Some(order) = actor.order {
             write_simple_element(writer, "order", &order.to_string())?;
         }
@@ -1286,6 +1310,17 @@ fn append_movie_nfo_fields(
         write_simple_element(writer, "studio", studio)?;
     }
     append_provider_ids(writer, &patch.provider_ids)?;
+    Ok(())
+}
+
+fn validate_movie_nfo_actors(patch: &MovieNfoMetadata) -> Result<(), NfoWriteError> {
+    for actor in &patch.actors {
+        if actor.name.trim().is_empty() {
+            return Err(NfoWriteError::InvalidMetadata(
+                "movie actor requires a name".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 

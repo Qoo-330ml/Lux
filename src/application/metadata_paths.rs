@@ -80,6 +80,18 @@ pub fn people_directory(
         .join(format!("{display_name}-{provider}-{provider_id}")))
 }
 
+pub fn canonical_person_directory(
+    config_dir: &Path,
+    person_key: &str,
+) -> Result<PathBuf, MetadataPathError> {
+    validate_component(person_key, "person key")?;
+    Ok(metadata_root(config_dir)
+        .join(PEOPLE_DIR)
+        .join("person")
+        .join(stable_shard(person_key))
+        .join(person_key))
+}
+
 pub fn people_index_path(config_dir: &Path, person_id: &str) -> Result<PathBuf, MetadataPathError> {
     validate_component(person_id, "person ID")?;
     Ok(metadata_root(config_dir)

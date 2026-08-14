@@ -48,7 +48,21 @@ test("homepage library cards wrap into an adaptive grid instead of one horizonta
   const libraryRailRule = stylesheet.match(/\.lux-library-rail\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(libraryRailRule, /display:\s*grid/);
-  assert.match(libraryRailRule, /grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(min\(180px,\s*100%\),\s*1fr\)\)/);
+  assert.match(libraryRailRule, /grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(min\(300px,\s*100%\),\s*1fr\)\)/);
   assert.match(libraryRailRule, /width:\s*100%/);
   assert.match(libraryRailRule, /min-width:\s*0/);
+
+  const continueCardRule = stylesheet.match(/\.lux-continue-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.match(continueCardRule, /flex:\s*0 0 280px/);
+  assert.match(mediaSource, /className="lux-continue-card"/);
+});
+
+test("continue-watching titles shrink before the remaining-time label", () => {
+  const copyItemRule = stylesheet.match(/\.lux-continue-copy\s*>\s*div\s*\{([^}]*)\}/)?.[1] ?? "";
+  const titleRule = stylesheet.match(/\.lux-continue-copy\s+strong\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(copyItemRule, /min-width:\s*0/);
+  assert.match(titleRule, /overflow:\s*hidden/);
+  assert.match(titleRule, /text-overflow:\s*ellipsis/);
+  assert.match(titleRule, /white-space:\s*nowrap/);
 });

@@ -121,7 +121,7 @@ function escapeHtml(value) {
 
 function brandLogo(className, alt = "") {
   const decorative = alt ? "" : " aria-hidden=\"true\"";
-  return `<img class="${className}" src="/logo.svg" alt="${escapeHtml(alt)}" width="223" height="250"${decorative} decoding="async">`;
+  return `<img class="${className}" src="/logo.svg" alt="${escapeHtml(alt)}" width="306" height="346"${decorative} decoding="async">`;
 }
 
 function imageUrl(item, imageType = "poster") {

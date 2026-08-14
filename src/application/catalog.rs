@@ -354,7 +354,8 @@ impl CatalogService {
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
-        let (played_percent, minimum_ticks) = self.database.resume_settings().await?;
+        let played_percent = self.database.user_played_percent(user_id).await?;
+        let (_, minimum_ticks) = self.database.resume_settings().await?;
         let item_types = ["MOVIE", "EPISODE"];
         let total = self
             .database

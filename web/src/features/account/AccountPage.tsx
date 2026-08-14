@@ -33,6 +33,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
+  const playbackSettings = useQuery({ queryKey: queryKeys.userSettings, queryFn: () => api.userSettings() });
   const { avatarUrl, setAvatarUrl } = useAvatar();
   const [settings, setSettings] = useState<AccountSettings>(() => readAccountSettings(user.id));
   const [draggedLibraryId, setDraggedLibraryId] = useState<string | null>(null);
@@ -42,7 +43,13 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const [avatarReading, setAvatarReading] = useState(false);
   const [avatarNotice, setAvatarNotice] = useState<string | null>(null);
   const [accountNotice, setAccountNotice] = useState<string | null>(null);
+  const [playedPercent, setPlayedPercent] = useState("95");
+  const [playedPercentNotice, setPlayedPercentNotice] = useState<string | null>(null);
   const [profileName, setProfileName] = useState(user.displayName || user.usernameNormalized);
+
+  useEffect(() => {
+    if (playbackSettings.data) setPlayedPercent(String(playbackSettings.data.playedPercent));
+  }, [playbackSettings.data]);
 
   const orderedLibraries = useMemo(
     () => orderLibraries(libraries.data?.libraries ?? [], settings.libraryOrder),
@@ -84,6 +91,16 @@ export function AccountPage({ user }: { user: LuxUser }) {
     onError: (error) => {
       setAvatarNotice(error instanceof Error ? `头像保存失败：${error.message}` : "头像保存失败，请重试。");
     },
+  });
+
+  const savePlaybackSettings = useMutation({
+    mutationFn: () => api.updateUserSettings({ playedPercent: Number(playedPercent) }),
+    onSuccess: (data) => {
+      setPlayedPercent(String(data.playedPercent));
+      setPlayedPercentNotice("播放阈值已保存");
+      void queryClient.invalidateQueries({ queryKey: queryKeys.userSettings });
+    },
+    onError: (error) => setPlayedPercentNotice(error instanceof Error ? error.message : "播放阈值保存失败，请重试。"),
   });
 
   const updateSettings = (patch: Partial<AccountSettings>) => {
@@ -285,6 +302,23 @@ export function AccountPage({ user }: { user: LuxUser }) {
             </div>
             <div className="lux-setting-divider" />
             <ToggleRow title="自动播放下一集" description="一集结束后自动开始播放下一集。" checked={settings.autoPlayNextEpisode} onChange={(checked) => updateSettings({ autoPlayNextEpisode: checked })} />
+            <div className="lux-setting-divider" />
+            <div className="lux-setting-row">
+              <div>
+                <strong>自动标记已看</strong>
+                <p>播放达到此百分比后，当前电影或单集会自动标记为已看。默认 95%。</p>
+              </div>
+              <form className="lux-account-playback-threshold" onSubmit={(event) => { event.preventDefault(); setPlayedPercentNotice(null); savePlaybackSettings.mutate(); }}>
+                <div className="lux-admin-input-with-suffix">
+                  <input aria-label="自动标记已看百分比" type="number" min="1" max="100" value={playedPercent} onChange={(event) => { setPlayedPercentNotice(null); setPlayedPercent(event.target.value); }} />
+                  <em>%</em>
+                </div>
+                <button className="lux-button lux-button-secondary" type="submit" disabled={savePlaybackSettings.isPending || playbackSettings.isPending}>
+                  {savePlaybackSettings.isPending ? "保存中…" : "保存"}
+                </button>
+                {playedPercentNotice ? <span role="status">{playedPercentNotice}</span> : null}
+              </form>
+            </div>
           </SettingsSection>
 
           <SettingsSection id="account" icon={<UserRound size={18} />} title="账户">

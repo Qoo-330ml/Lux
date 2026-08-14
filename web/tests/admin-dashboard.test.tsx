@@ -12,7 +12,7 @@ import type { AdminDashboard, AdminSettings } from "../src/lib/api/types";
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const dashboard: AdminDashboard = {
-  server: { name: "客厅 Lux", version: "0.1.18", commit: "abc1234", schemaVersion: 37 },
+  server: { name: "客厅 Lux", version: "0.2.0", commit: "abc1234", schemaVersion: 37 },
   stats: { movieCount: 42, seriesCount: 7, userCount: 3 },
   health: {
     status: "ok",
@@ -109,6 +109,7 @@ describe("AdminDashboardPage", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    document.title = "Lux";
     vi.restoreAllMocks();
   });
 
@@ -132,16 +133,17 @@ describe("AdminDashboardPage", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-server-name")?.textContent).toBe("客厅 Lux"));
     });
+    expect(document.title).toBe("客厅 Lux - Lux");
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.adminDashboard })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.liveDashboard);
     expect(load).toHaveBeenCalledOnce();
-    expect(container.textContent).toContain("v0.1.18");
+    expect(container.textContent).toContain("v0.2.0");
     const overview = container.querySelector(".lux-admin-overview-card");
     expect(overview).not.toBeNull();
     expect(overview?.querySelector(".lux-admin-overview-status")?.textContent).toContain("在线");
-    expect(overview?.querySelector('[data-overview-value="版本"] strong')?.textContent).toBe("v0.1.18");
+    expect(overview?.querySelector('[data-overview-value="版本"] strong')?.textContent).toBe("v0.2.0");
     expect(overview?.querySelector('[data-overview-value="运行时长"] strong')?.textContent).toBe("1天 1时 1分 1秒");
-    expect(overview?.querySelector('[data-overview-value="版本"]')?.textContent).toBe("版本：v0.1.18");
+    expect(overview?.querySelector('[data-overview-value="版本"]')?.textContent).toBe("版本：v0.2.0");
     expect(overview?.querySelector('[data-overview-value="运行时长"]')?.textContent).toBe("运行时长：1天 1时 1分 1秒");
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-value")).toHaveLength(6);
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-icon")).toHaveLength(0);

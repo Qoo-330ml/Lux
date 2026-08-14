@@ -1,4 +1,5 @@
 import type {
+  AuthSession,
   AdminAuditEvent,
   AdminDashboard,
   AdminHealth,
@@ -35,6 +36,7 @@ import type {
   SetupDatabaseBackend,
   SetupDatabaseStatus,
   MetadataRefreshMode,
+  UserPlaybackSettings,
 } from "./types";
 
 const csrfCookie = "lux_csrf";
@@ -176,7 +178,18 @@ export class LuxApiClient {
   }
 
   me() {
-    return this.request<{ user: LuxUser }>("/api/v1/auth/me").then((response) => response.user);
+    return this.request<AuthSession>("/api/v1/auth/me");
+  }
+
+  userSettings() {
+    return this.request<UserPlaybackSettings>("/api/v1/auth/settings");
+  }
+
+  updateUserSettings(input: Partial<UserPlaybackSettings>) {
+    return this.request<UserPlaybackSettings>("/api/v1/auth/settings", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
   }
 
   avatarUrl(cacheKey?: string) {
@@ -193,6 +206,11 @@ export class LuxApiClient {
 
   home() {
     return this.request<HomeResponse>("/api/v1/home");
+  }
+
+  favorites(page = 1) {
+    const params = new URLSearchParams({ page: String(page), pageSize: "24" });
+    return this.request<PageResponse<MediaItem>>(`/api/v1/favorites?${params}`);
   }
 
   libraries() {
@@ -335,6 +353,20 @@ export class LuxApiClient {
     );
   }
 
+  setFavorite(itemId: string, favorite: boolean) {
+    return this.request<void>(`/api/v1/items/${encodeURIComponent(itemId)}/favorite`, {
+      method: "PUT",
+      body: JSON.stringify({ favorite }),
+    });
+  }
+
+  setPlayed(itemId: string, played: boolean) {
+    return this.request<void>(`/api/v1/items/${encodeURIComponent(itemId)}/played`, {
+      method: "PUT",
+      body: JSON.stringify({ played }),
+    });
+  }
+
   progress(
     itemId: string,
     positionTicks: number,
@@ -394,6 +426,13 @@ export class LuxApiClient {
     return this.request<{ plugin: AdminPlugin }>(
       `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/install`,
       { method: "POST" },
+    );
+  }
+
+  uninstallAdminPlugin(pluginId: string) {
+    return this.request<void>(
+      `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}`,
+      { method: "DELETE" },
     );
   }
 

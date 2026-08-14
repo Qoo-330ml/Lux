@@ -93,6 +93,21 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     assert_eq!(hints_body["TotalRecordCount"], 1);
     assert_eq!(hints_body["SearchHints"][0]["Id"], chinese_id);
 
+    let item_search = client
+        .get(format!("{base_url}/Users/{}/Items", admin.id))
+        .query(&[
+            ("api_key", token.as_str()),
+            ("SearchTerm", "星际守护者"),
+            ("IncludeItemTypes", "Movie,Series"),
+            ("Recursive", "true"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(item_search.status(), reqwest::StatusCode::OK);
+    let item_search_body = item_search.json::<Value>().await?;
+    assert_eq!(item_search_body["TotalRecordCount"], 1);
+    assert_eq!(item_search_body["Items"][0]["Id"], chinese_id);
+
     let lux_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))

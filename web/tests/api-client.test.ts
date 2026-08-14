@@ -93,6 +93,27 @@ describe("LuxApiClient", () => {
     } satisfies Partial<ApiError>);
   });
 
+  it("reads and updates the current user's playback threshold", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (!init?.method) {
+        return new Response(JSON.stringify({ playedPercent: 95 }), { status: 200 });
+      }
+      expect(String(input)).toBe("/api/v1/auth/settings");
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(String(init.body))).toEqual({ playedPercent: 80 });
+      return new Response(JSON.stringify({ playedPercent: 80 }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.userSettings()).resolves.toEqual({ playedPercent: 95 });
+    await expect(client.updateUserSettings({ playedPercent: 80 })).resolves.toEqual({ playedPercent: 80 });
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
   it("filters library browse requests by the requested root item type", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
@@ -162,6 +183,40 @@ describe("LuxApiClient", () => {
       state: "PAUSED",
     });
     expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
+  it("updates favorite and played state through the Lux item endpoints", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(null, { status: 204 }),
+    );
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    await new LuxApiClient().setFavorite("movie-1", true);
+    await new LuxApiClient().setPlayed("movie-1", false);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/items/movie-1/favorite");
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("PUT");
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({ favorite: true });
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/items/movie-1/played");
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({ played: false });
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
+  it("lists the current user's favorites with a bounded page", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], page: 2, pageSize: 24, total: 0 }), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().favorites(2)).resolves.toEqual({
+      items: [],
+      page: 2,
+      pageSize: 24,
+      total: 0,
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/favorites?page=2&pageSize=24");
   });
 
   it("supports administrator candidate search and selection for identification", async () => {
@@ -450,7 +505,7 @@ describe("LuxApiClient", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
       if (path === "/api/v1/admin/dashboard") {
-        return new Response(JSON.stringify({ server: { name: "Lux", version: "0.1.18" }, health: {}, nowPlaying: [], activity: [] }), { status: 200 });
+        return new Response(JSON.stringify({ server: { name: "Lux", version: "0.2.0" }, health: {}, nowPlaying: [], activity: [] }), { status: 200 });
       }
       expect(path).toBe("/api/v1/admin/settings");
       expect(init?.method).toBe("PATCH");
@@ -465,7 +520,7 @@ describe("LuxApiClient", () => {
 
     const client = new LuxApiClient();
     await expect(client.adminDashboard()).resolves.toMatchObject({
-      server: { name: "Lux", version: "0.1.18" },
+      server: { name: "Lux", version: "0.2.0" },
       nowPlaying: [],
       activity: [],
     });
@@ -514,6 +569,10 @@ describe("LuxApiClient", () => {
         expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
         return new Response(JSON.stringify({ plugin: { id: "tmdb", installed: true, enabled: false } }), { status: 200 });
       }
+      if (path === "/api/v1/admin/plugins/tmdb" && init?.method === "DELETE") {
+        expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+        return new Response(null, { status: 204 });
+      }
       expect(path).toBe("/api/v1/admin/plugins/tmdb/config");
       expect(init?.method).toBe("PUT");
       expect(JSON.parse(String(init?.body))).toEqual({ apiKey: "custom-key" });
@@ -530,8 +589,9 @@ describe("LuxApiClient", () => {
     await expect(client.adminInstalledPlugins()).resolves.toEqual({ plugins: [{ id: "tmdb", installed: true }] });
     await expect(client.installAdminPlugin("tmdb")).resolves.toEqual({ plugin: { id: "tmdb", installed: true } });
     await expect(client.updateAdminPluginEnabled("tmdb", false)).resolves.toEqual({ plugin: { id: "tmdb", installed: true, enabled: false } });
+    await expect(client.uninstallAdminPlugin("tmdb")).resolves.toBeUndefined();
     await expect(client.updateAdminPluginConfig("tmdb", "custom-key")).resolves.toEqual({ plugin: { id: "tmdb", installed: true, configSource: "CUSTOM" } });
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
   });
 
   it("unwraps the authenticated user from the login envelope", async () => {
@@ -611,14 +671,17 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("unwraps the authenticated user when restoring a session", async () => {
+  it("returns the authenticated user and server name when restoring a session", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ user: { id: "admin-1", canManageServer: true } }), { status: 200 }),
+      new Response(JSON.stringify({ user: { id: "admin-1", canManageServer: true }, serverName: "客厅 Lux" }), { status: 200 }),
     );
 
     await expect(new LuxApiClient().me()).resolves.toEqual({
-      id: "admin-1",
-      canManageServer: true,
+      user: {
+        id: "admin-1",
+        canManageServer: true,
+      },
+      serverName: "客厅 Lux",
     });
   });
 });

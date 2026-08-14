@@ -23,7 +23,7 @@ describe("light theme contrast", () => {
   it("uses a light hero mask and readable dark hero copy", () => {
     expect(lightThemeRule(".lux-hero-overlay")).toContain("rgba(244,243,241");
     expect(lightThemeRule(".lux-hero-overlay")).not.toContain("rgba(0,0,0");
-    expect(lightThemeRule(".lux-hero h1")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-hero-title")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-hero-copy p")).toContain("color: var(--lux-muted)");
     expect(lightThemeRule(".lux-app.is-home-route .lux-header::before")).toContain("rgba(244,243,241");
     expect(lightThemeRule(".lux-header::before")).toContain("rgba(244,243,241");

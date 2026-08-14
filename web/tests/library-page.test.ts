@@ -32,10 +32,54 @@ describe("LibraryPage infinite scroll", () => {
   afterEach(() => {
     if (root) act(() => root?.unmount());
     container?.remove();
+    document.title = "Lux";
     localStorage.clear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     triggerIntersection = undefined;
+  });
+
+  it("shows the library name in the browser tab title", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影收藏", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [],
+      page: 1,
+      pageSize: 24,
+      total: 0,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage, { serverName: "客厅 Lux" }) }),
+          ),
+        ),
+      ));
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(document.title).toBe("电影收藏 - Lux"));
+    });
+
+    act(() => {
+      root?.unmount();
+      root = undefined;
+    });
+    expect(document.title).toBe("客厅 Lux - Lux");
   });
 
   it("loads the next library page when the scroll sentinel becomes visible", async () => {

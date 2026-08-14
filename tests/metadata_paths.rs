@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use luxd::application::metadata_paths::{
-    MetadataObjectKind, library_item_directory, metadata_object_directory, metadata_root,
-    people_directory, people_index_path, people_index_path_for_provider,
+    MetadataObjectKind, canonical_person_directory, library_item_directory,
+    metadata_object_directory, metadata_root, people_directory, people_index_path,
+    people_index_path_for_provider,
 };
 
 #[test]
@@ -40,6 +41,23 @@ fn people_paths_are_readable_but_identity_uses_provider_and_id() {
     assert_eq!(
         people_index_path_for_provider(config, "TMDb", "1391125").expect("valid provider ID"),
         Path::new("/config/metadata/people/index/tmdb-1391125.json")
+    );
+}
+
+#[test]
+fn canonical_person_paths_are_provider_independent() {
+    let config = Path::new("/config");
+    let path = canonical_person_directory(config, "person-abc123").expect("valid person key");
+    assert_eq!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some("person-abc123")
+    );
+    assert_eq!(
+        path.parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str()),
+        Some("person")
     );
 }
 

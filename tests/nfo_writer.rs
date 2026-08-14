@@ -100,6 +100,8 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
             }],
             actors: vec![ActorCredit {
                 id: "124".to_owned(),
+                provider: None,
+                identities: Vec::new(),
                 name: "沈腾".to_owned(),
                 character: Some("张驰".to_owned()),
                 order: Some(0),
@@ -172,6 +174,30 @@ fn movie_nfo_rewrite_keeps_existing_rich_fields_when_patch_is_partial()
 }
 
 #[test]
+fn movie_nfo_rewrite_keeps_actor_without_provider_id() -> Result<(), Box<dyn std::error::Error>> {
+    let result = rewrite_movie_nfo(
+        b"<movie><title>Movie</title></movie>",
+        &MovieNfoMetadata {
+            actors: vec![ActorCredit {
+                id: String::new(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: None,
+                order: None,
+                profile_url: None,
+            }],
+            ..MovieNfoMetadata::default()
+        },
+    );
+
+    let text = String::from_utf8(result?)?;
+    assert!(text.contains("<name>演员甲</name>"));
+    assert!(!text.contains("<tmdbid>"));
+    Ok(())
+}
+
+#[test]
 fn movie_nfo_parser_reads_emby_actor_nodes_without_online_metadata() {
     let actors = parse_movie_nfo_actors(
         r#"<movie><title>本地电影</title><actor><name>演员甲</name><role>角色甲</role><type>Actor</type><tmdbid>9</tmdbid><order>0</order></actor><actor><name>演员乙</name><role>角色乙</role><type>Actor</type><tmdbid>10</tmdbid><order>1</order></actor></movie>"#
@@ -184,6 +210,50 @@ fn movie_nfo_parser_reads_emby_actor_nodes_without_online_metadata() {
     assert_eq!(actors[0].name, "演员甲");
     assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
     assert_eq!(actors[1].order, Some(1));
+}
+
+#[test]
+fn movie_nfo_parser_keeps_actor_without_provider_id() {
+    let actors = parse_movie_nfo_actors(
+        r#"<movie><actor><name>本地演员</name><role>本地角色</role><order>2</order></actor></movie>"#
+            .as_bytes(),
+    )
+    .expect("valid actor without provider id");
+
+    assert_eq!(actors.len(), 1);
+    assert!(actors[0].id.is_empty());
+    assert_eq!(actors[0].name, "本地演员");
+    assert_eq!(actors[0].character.as_deref(), Some("本地角色"));
+}
+
+#[test]
+fn movie_nfo_uses_actor_provider_specific_identity_tags() -> Result<(), Box<dyn std::error::Error>>
+{
+    let rewritten = rewrite_movie_nfo(
+        b"<movie><title>Movie</title></movie>",
+        &MovieNfoMetadata {
+            actors: vec![ActorCredit {
+                id: "nm123".to_owned(),
+                provider: Some("imdb".to_owned()),
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: None,
+                order: None,
+                profile_url: None,
+            }],
+            ..MovieNfoMetadata::default()
+        },
+    )?;
+    let text = String::from_utf8(rewritten)?;
+    assert!(text.contains("<imdbid>nm123</imdbid>"));
+    assert!(!text.contains("<tmdbid>nm123</tmdbid>"));
+
+    let actors = parse_movie_nfo_actors(
+        b"<movie><actor><name>Actor</name><imdbid>nm123</imdbid></actor></movie>",
+    )?;
+    assert_eq!(actors[0].provider.as_deref(), Some("imdb"));
+    assert_eq!(actors[0].id, "nm123");
+    Ok(())
 }
 
 #[test]
@@ -336,9 +406,10 @@ async fn nfo_service_checks_library_root_and_refreshes_metadata_fingerprint()
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
 
     let report = NfoWriteService::new(database.clone())
         .write_item_nfo(
@@ -395,9 +466,10 @@ async fn nfo_writeback_only_invalidates_rich_snapshot_when_content_changes()
         .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
         .enrich_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     let initial: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
         "SELECT nfo_metadata_json, nfo_metadata_fingerprint
          FROM media_items WHERE id = ?",
@@ -477,9 +549,10 @@ async fn nfo_service_writes_next_to_strm_source() -> Result<(), Box<dyn std::err
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
 
     let report = NfoWriteService::new(database)
         .write_item_nfo(
@@ -495,6 +568,59 @@ async fn nfo_service_writes_next_to_strm_source() -> Result<(), Box<dyn std::err
     assert_eq!(report.path, canonical_movie_dir.join("movie.nfo"));
     let output = tokio::fs::read_to_string(&report.path).await?;
     assert!(output.contains("<title>已识别 STRM 电影</title>"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn nfo_service_reuses_an_existing_nonstandard_movie_nfo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example STRM Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(
+        movie_dir.join("Example.STRM.Movie.2020.strm"),
+        "https://example.invalid/movie",
+    )
+    .await?;
+    let existing_nfo = movie_dir.join("metadata-export.nfo");
+    tokio::fs::write(&existing_nfo, "<movie><custom>keep</custom></movie>").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+
+    let report = NfoWriteService::new(database)
+        .write_item_nfo(
+            &item_id,
+            &NfoMetadata {
+                title: Some("已更新标题".to_owned()),
+                ..NfoMetadata::default()
+            },
+        )
+        .await?;
+
+    assert_eq!(report.path, tokio::fs::canonicalize(&existing_nfo).await?);
+    assert!(!movie_dir.join("movie.nfo").exists());
+    let output = tokio::fs::read_to_string(existing_nfo).await?;
+    assert!(output.contains("<custom>keep</custom>"));
+    assert!(output.contains("<title>已更新标题</title>"));
     Ok(())
 }
 

@@ -20,7 +20,6 @@ const emptyNetworkProxy: AdminNetworkProxySettings = {
 export function AdminSettingsPage() {
   const queryClient = useQueryClient();
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
-  const [playedPercent, setPlayedPercent] = useState("90");
   const [minimumMinutes, setMinimumMinutes] = useState("2");
   const [proxyUrl, setProxyUrl] = useState("");
   const [saved, setSaved] = useState(false);
@@ -29,18 +28,15 @@ export function AdminSettingsPage() {
 
   useEffect(() => {
     if (!settings.data) return;
-    setPlayedPercent(String(settings.data.resumePlayedPercent));
     setMinimumMinutes(String(Math.round(settings.data.resumeMinTicks / 600000000)));
     setProxyUrl(settings.data.networkProxy?.url ?? "");
   }, [settings.data]);
 
   const save = useMutation({
     mutationFn: () => api.updateAdminSettings({
-      resumePlayedPercent: Number(playedPercent),
       resumeMinTicks: Number(minimumMinutes) * 600000000,
     }),
     onSuccess: (data) => {
-      setPlayedPercent(String(data.resumePlayedPercent));
       setMinimumMinutes(String(Math.round(data.resumeMinTicks / 600000000)));
       setSaved(true);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminSettings });
@@ -84,14 +80,6 @@ export function AdminSettingsPage() {
           <Settings2 size={20} className="lux-admin-panel-icon" />
         </div>
         <div className="lux-admin-settings-form">
-          <label>
-            <span>标记为已看</span>
-            <small>播放进度达到此百分比后，媒体会自动标记为已看。</small>
-            <div className="lux-admin-input-with-suffix">
-              <input type="number" min="1" max="100" value={playedPercent} onChange={(event) => { setSaved(false); setPlayedPercent(event.target.value); }} />
-              <em>%</em>
-            </div>
-          </label>
           <label>
             <span>继续观看最小进度</span>
             <small>低于此播放时长的记录不会显示在“继续观看”。</small>

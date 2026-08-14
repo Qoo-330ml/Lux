@@ -133,9 +133,9 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("TMDb 60625");
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("评分 8.7");
     expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
-    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("最后播出2025-05-25");
-    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("状态Ended");
-    expect(container.querySelector(".lux-media-info-summary")?.textContent).toContain("原始语言英语");
+    expect(container.querySelector(".lux-media-nfo-summary")?.textContent).toContain("最后播出2025-05-25");
+    expect(container.querySelector(".lux-media-nfo-summary")?.textContent).toContain("状态Ended");
+    expect(container.querySelector(".lux-media-nfo-summary")?.textContent).toContain("原始语言英语");
     expect(container.querySelector(".lux-season-rail")).not.toBeNull();
   });
 
@@ -150,6 +150,8 @@ describe("MediaDetailPage series hierarchy", () => {
         tagline: "大漠路远",
         premiered: "2026-02-17",
         releaseDate: "2026-02-20",
+        aired: "2026-02-21",
+        lastAirDate: "2026-03-01",
         runtime: 126,
         status: "Released",
         originalLanguage: "zh",
@@ -197,10 +199,20 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("导演甲");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("编剧甲");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("123 票");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("评分8.1 / 10");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("原始语言中文");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("合集 ID77");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("首播日期2026-02-17");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("发行日期2026-02-20");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("播出日期2026-02-21");
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("最后播出2026-03-01");
     expect(container.querySelector("a[aria-label=\"官方网站\"]")?.getAttribute("href"))
       .toBe("https://example.com/movie");
     expect(container.querySelector("a[aria-label=\"预告片 1\"]")?.getAttribute("href"))
       .toBe("https://example.com/trailer");
+    expect(container.querySelectorAll(".lux-media-nfo")).toHaveLength(1);
+    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("来源本地媒体文件");
+    expect(container.querySelector(".lux-media-info")).toBeNull();
   });
 
   it("shows landscape episode rows on a season detail", async () => {
@@ -362,6 +374,53 @@ describe("MediaDetailPage series hierarchy", () => {
     const actionItems = [...(container.querySelector(".lux-hero-actions")?.children ?? [])];
     expect(actionItems[3]?.classList.contains("lux-media-actions")).toBe(true);
     expect(actionItems[3]?.querySelector(".lux-media-actions-trigger")).not.toBeNull();
+  });
+
+  it("writes favorite and played state and refreshes dependent shelves", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-1",
+      title: "示例电影",
+      itemType: "MOVIE",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ isFavorite: false, isPlayed: false });
+    const setFavorite = vi.spyOn(api, "setFavorite").mockResolvedValue(undefined);
+    const setPlayed = vi.spyOn(api, "setPlayed").mockResolvedValue(undefined);
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/movie-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const favorite = container.querySelector<HTMLButtonElement>("[data-action=toggle-favorite]");
+    const played = container.querySelector<HTMLButtonElement>("[data-action=toggle-played]");
+    expect(favorite).not.toBeNull();
+    expect(played).not.toBeNull();
+
+    await act(async () => favorite?.click());
+    await act(async () => played?.click());
+
+    expect(setFavorite).toHaveBeenCalledWith("movie-1", true);
+    expect(setPlayed).toHaveBeenCalledWith("movie-1", true);
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.playback("movie-1") });
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.home });
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.favorites });
   });
 
   it("shows identified actors with local portraits or initial placeholders", async () => {
@@ -595,8 +654,8 @@ describe("MediaDetailPage series hierarchy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const details = container.querySelector(".lux-media-info");
-    expect(details?.textContent).toContain("媒体信息");
+    const details = container.querySelector(".lux-media-nfo");
+    expect(details?.textContent).toContain("更多信息");
     expect(details?.textContent).toContain("https://example.invalid/video.mkv");
     expect(details?.textContent).toContain("1920 × 1080");
     expect(details?.textContent).toContain("H264");

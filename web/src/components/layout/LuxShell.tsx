@@ -1,9 +1,6 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  Home,
-  Library,
   Menu,
-  Search,
   Settings2,
   X,
 } from "lucide-react";
@@ -12,8 +9,9 @@ import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import type { LuxUser } from "../../lib/api/types";
 import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
+import { LuxLogo } from "../LuxLogo";
 
-type LuxShellProps = { user: LuxUser };
+type LuxShellProps = { user: LuxUser; serverName?: string | null };
 type AvatarContextValue = {
   avatarUrl: string | null;
   setAvatarUrl: (url: string) => void;
@@ -26,7 +24,7 @@ export function useAvatar(): AvatarContextValue {
   return useContext(AvatarContext) ?? EMPTY_AVATAR_CONTEXT;
 }
 
-export function LuxShell({ user }: LuxShellProps) {
+export function LuxShell({ user, serverName }: LuxShellProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -50,13 +48,24 @@ export function LuxShell({ user }: LuxShellProps) {
     setAvatarImageFailed(false);
   }, [avatarUrl]);
 
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (isDetail) return;
+
+    const name = serverName?.trim();
+    document.title = name ? `${name} - Lux` : "Lux";
+    return () => {
+      document.title = "Lux";
+    };
+  }, [isDetail, serverName]);
+
   return (
     <AvatarContext.Provider value={{ avatarUrl, setAvatarUrl }}>
       <div className={isHome ? "lux-app is-home-route" : "lux-app"}>
         <header className="lux-header">
           <div className="lux-header-left">
             <NavLink className="lux-brand" to="/" aria-label="Lux 首页">
-              <img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" />
+              <LuxLogo className="lux-brand-logo" />
               <span className="lux-brand-name">Lux</span>
             </NavLink>
             <nav className="lux-desktop-nav" aria-label="主导航">
@@ -65,6 +74,9 @@ export function LuxShell({ user }: LuxShellProps) {
               </NavLink>
               <NavLink className={navClass} to="/libraries">
                 媒体库
+              </NavLink>
+              <NavLink className={navClass} to="/favorites">
+                收藏
               </NavLink>
               <NavLink className={navClass} to="/search">
                 搜索
@@ -110,17 +122,20 @@ export function LuxShell({ user }: LuxShellProps) {
               exit={{ opacity: 0, y: -12 }}
               transition={{ duration: 0.18 }}
             >
-              <NavLink className={mobileNavClass} to="/" onClick={() => setMobileOpen(false)}>
-                <Home size={17} aria-hidden="true" /> 首页
+              <NavLink className={navClass} to="/" onClick={() => setMobileOpen(false)}>
+                首页
               </NavLink>
-              <NavLink className={mobileNavClass} to="/libraries" onClick={() => setMobileOpen(false)}>
-                <Library size={17} aria-hidden="true" /> 媒体库
+              <NavLink className={navClass} to="/libraries" onClick={() => setMobileOpen(false)}>
+                媒体库
               </NavLink>
-              <NavLink className={mobileNavClass} to="/search" onClick={() => setMobileOpen(false)}>
-                <Search size={17} aria-hidden="true" /> 搜索
+              <NavLink className={navClass} to="/favorites" onClick={() => setMobileOpen(false)}>
+                收藏
+              </NavLink>
+              <NavLink className={navClass} to="/search" onClick={() => setMobileOpen(false)}>
+                搜索
               </NavLink>
               {user.canManageServer ? (
-                <NavLink className={mobileNavClass} to="/admin" onClick={() => setMobileOpen(false)}><Settings2 size={17} aria-hidden="true" /> 管理控制台</NavLink>
+                <NavLink className={navClass} to="/admin" onClick={() => setMobileOpen(false)}><Settings2 size={15} /> 管理控制台</NavLink>
               ) : null}
             </motion.nav>
           ) : null}
@@ -136,8 +151,4 @@ export function LuxShell({ user }: LuxShellProps) {
 
 function navClass({ isActive }: { isActive: boolean }) {
   return isActive ? "lux-nav-link is-active" : "lux-nav-link";
-}
-
-function mobileNavClass({ isActive }: { isActive: boolean }) {
-  return isActive ? "lux-nav-link lux-mobile-nav-link is-active" : "lux-nav-link lux-mobile-nav-link";
 }

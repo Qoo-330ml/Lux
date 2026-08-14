@@ -12,6 +12,7 @@ import { HomePage } from "../features/home/HomePage";
 const LibrariesPage = lazy(() => import("../features/library/LibrariesPage").then(({ LibrariesPage }) => ({ default: LibrariesPage })));
 const LibraryPage = lazy(() => import("../features/library/LibraryPage").then(({ LibraryPage }) => ({ default: LibraryPage })));
 const SearchPage = lazy(() => import("../features/search/SearchPage").then(({ SearchPage }) => ({ default: SearchPage })));
+const FavoritesPage = lazy(() => import("../features/favorites/FavoritesPage").then(({ FavoritesPage }) => ({ default: FavoritesPage })));
 const MediaDetailPage = lazy(() => import("../features/detail/MediaDetailPage").then(({ MediaDetailPage }) => ({ default: MediaDetailPage })));
 const PlayerPage = lazy(() => import("../features/player/PlayerPage").then(({ PlayerPage }) => ({ default: PlayerPage })));
 const AccountPage = lazy(() => import("../features/account/AccountPage").then(({ AccountPage }) => ({ default: AccountPage })));
@@ -58,17 +59,18 @@ function SessionRoutes() {
     );
   }
 
-  return <AuthenticatedRoutes user={me.data} />;
+  return <AuthenticatedRoutes user={me.data.user} serverName={me.data.serverName} />;
 }
 
-function AuthenticatedRoutes({ user }: { user: LuxUser }) {
+function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?: string | null }) {
   return (
     <Suspense fallback={<LoadingScreen label="正在打开页面" />}>
       <Routes>
-        <Route element={<LuxShell user={user} />}>
+        <Route element={<LuxShell user={user} serverName={serverName} />}>
           <Route index element={<HomePage user={user} />} />
           <Route path="libraries" element={<LibrariesPage />} />
-          <Route path="libraries/:libraryId" element={<LibraryPage />} />
+          <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
+          <Route path="favorites" element={<FavoritesPage />} />
           <Route path="items/:itemId" element={<MediaDetailPage />} />
           <Route path="watch/:itemId" element={<PlayerPage />} />
           <Route path="search" element={<SearchPage />} />
