@@ -207,7 +207,26 @@ describe("LuxShell user control", () => {
 
     expect(container.querySelector('.lux-desktop-nav a[href="/favorites"]')?.textContent).toBe("收藏");
     act(() => container.querySelector<HTMLButtonElement>(".lux-menu-button")?.click());
-    expect(container.querySelector('.lux-mobile-nav a[href="/favorites"]')?.textContent).toBe("收藏");
+    expect(container.querySelector('.lux-mobile-nav a[href="/favorites"]')?.textContent?.trim()).toBe("收藏");
+  });
+
+  it("keeps mobile navigation rows consistent and touch-sized", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LuxShell user={{ id: "user-1", usernameNormalized: "test", canManageServer: true }} />
+        </MemoryRouter>,
+      );
+    });
+    act(() => container.querySelector<HTMLButtonElement>(".lux-menu-button")?.click());
+
+    const links = Array.from(container.querySelectorAll<HTMLAnchorElement>(".lux-mobile-nav-link"));
+    expect(links).toHaveLength(5);
+    expect(links.every((link) => link.querySelector("svg") && link.textContent?.trim())).toBe(true);
   });
 
   it("hides the back button on the home page", () => {

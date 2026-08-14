@@ -1,6 +1,10 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
+  Heart,
+  Home,
+  Library,
   Menu,
+  Search,
   Settings2,
   X,
 } from "lucide-react";
@@ -122,20 +126,20 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
               exit={{ opacity: 0, y: -12 }}
               transition={{ duration: 0.18 }}
             >
-              <NavLink className={navClass} to="/" onClick={() => setMobileOpen(false)}>
-                首页
+              <NavLink className={mobileNavClass} to="/" onClick={() => setMobileOpen(false)}>
+                <Home size={17} aria-hidden="true" /> 首页
               </NavLink>
-              <NavLink className={navClass} to="/libraries" onClick={() => setMobileOpen(false)}>
-                媒体库
+              <NavLink className={mobileNavClass} to="/libraries" onClick={() => setMobileOpen(false)}>
+                <Library size={17} aria-hidden="true" /> 媒体库
               </NavLink>
-              <NavLink className={navClass} to="/favorites" onClick={() => setMobileOpen(false)}>
-                收藏
+              <NavLink className={mobileNavClass} to="/favorites" onClick={() => setMobileOpen(false)}>
+                <Heart size={17} aria-hidden="true" /> 收藏
               </NavLink>
-              <NavLink className={navClass} to="/search" onClick={() => setMobileOpen(false)}>
-                搜索
+              <NavLink className={mobileNavClass} to="/search" onClick={() => setMobileOpen(false)}>
+                <Search size={17} aria-hidden="true" /> 搜索
               </NavLink>
               {user.canManageServer ? (
-                <NavLink className={navClass} to="/admin" onClick={() => setMobileOpen(false)}><Settings2 size={15} /> 管理控制台</NavLink>
+                <NavLink className={mobileNavClass} to="/admin" onClick={() => setMobileOpen(false)}><Settings2 size={17} aria-hidden="true" /> 管理控制台</NavLink>
               ) : null}
             </motion.nav>
           ) : null}
@@ -151,4 +155,8 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
 
 function navClass({ isActive }: { isActive: boolean }) {
   return isActive ? "lux-nav-link is-active" : "lux-nav-link";
+}
+
+function mobileNavClass({ isActive }: { isActive: boolean }) {
+  return isActive ? "lux-nav-link lux-mobile-nav-link is-active" : "lux-nav-link lux-mobile-nav-link";
 }
