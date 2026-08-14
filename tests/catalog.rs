@@ -1057,6 +1057,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
     assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
     assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");
+    assert_eq!(
+        home_body["recentlyAdded"][0]["userData"]["positionTicks"],
+        1_700_000_000_i64
+    );
     assert_eq!(home_body["libraries"].as_array().map(Vec::len), Some(2));
     let home_movie_library = home_body["libraries"]
         .as_array()
@@ -1071,6 +1075,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         Some(2)
     );
     assert_eq!(home_movie_library["latest"][0]["title"], "Alpha Movie");
+    assert_eq!(
+        home_movie_library["latest"][0]["userData"]["positionTicks"],
+        1_700_000_000_i64
+    );
     assert_eq!(
         home_movie_library["latest"][0]["imageTags"]["poster"],
         alpha_poster_id

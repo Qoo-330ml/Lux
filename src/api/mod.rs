@@ -6843,28 +6843,64 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let user_id = user.id.to_string();
-    let (continue_watching, recently_added, recommended, latest_groups) = match tokio::try_join!(
-        catalog.list_continue_watching(principal, &user_id, 0, 10),
-        catalog.list_recently_added(principal, 0, 12),
-        catalog.list_recommended(principal, &user_id, 12),
-        catalog.list_recently_added_by_library(principal, 12),
-    ) {
-        Ok(values) => values,
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let (
+        continue_watching_result,
+        recently_added_result,
+        recommended_result,
+        latest_groups_result,
+        views_result,
+    ) = tokio::join!(
+        catalog.list_continue_watching_for_library_ids(&accessible_library_ids, &user_id, 0, 10),
+        catalog.list_recently_added_for_library_ids(&accessible_library_ids, 0, 12),
+        catalog.list_recommended_for_library_ids(&accessible_library_ids, &user_id, 12),
+        catalog.list_recently_added_by_library_ids(&accessible_library_ids, 12),
+        libraries.list_libraries(),
+    );
+    let continue_watching = match continue_watching_result {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let recently_added = match recently_added_result {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let recommended = match recommended_result {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let latest_groups = match latest_groups_result {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let views = match views_result {
+        Ok(value) => value,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let latest_items = latest_groups
         .iter()
         .flat_map(|(_, items)| items.iter().cloned())
         .collect::<Vec<_>>();
-    let (continue_watching_items, recently_added_items, recommended_items, latest_values) = match tokio::try_join!(
-        lux_catalog_items_json_for_user(database, &user_id, &continue_watching.items),
-        lux_catalog_items_json_for_user(database, &user_id, &recently_added.items),
-        lux_catalog_items_json_for_user(database, &user_id, &recommended),
-        lux_catalog_items_json_for_user(database, &user_id, &latest_items),
-    ) {
+    let all_items = continue_watching
+        .items
+        .iter()
+        .chain(recently_added.items.iter())
+        .chain(recommended.iter())
+        .chain(latest_items.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let user_values = match lux_catalog_item_values_by_id(database, &user_id, &all_items).await {
         Ok(values) => values,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let continue_watching_items =
+        lux_catalog_items_from_values(&continue_watching.items, &user_values);
+    let recently_added_items = lux_catalog_items_from_values(&recently_added.items, &user_values);
+    let recommended_items = lux_catalog_items_from_values(&recommended, &user_values);
+    let latest_values = lux_catalog_items_from_values(&latest_items, &user_values);
     let mut latest_by_library = BTreeMap::<String, Vec<Value>>::new();
     for (item, value) in latest_items.iter().zip(latest_values) {
         latest_by_library
@@ -6872,18 +6908,7 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
             .or_default()
             .push(value);
     }
-    let (views_result, accessible_library_ids_result) = tokio::join!(
-        libraries.list_libraries(),
-        access.accessible_library_ids(principal),
-    );
-    let views = match views_result {
-        Ok(views) => views,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let accessible_library_ids = match accessible_library_ids_result {
-        Ok(ids) => ids.into_iter().collect::<HashSet<_>>(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
     let mut visible = Vec::new();
     for view in views {
         let library_id = view.library.id.to_string();
@@ -9064,16 +9089,42 @@ async fn lux_catalog_items_json_for_user(
     user_id: &str,
     items: &[CatalogItem],
 ) -> Result<Vec<Value>, StorageError> {
-    let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-    let states = database.list_user_item_states(user_id, &item_ids).await?;
-    let mut values = Vec::with_capacity(items.len());
+    let values = lux_catalog_item_values_by_id(database, user_id, items).await?;
+    Ok(lux_catalog_items_from_values(items, &values))
+}
+
+async fn lux_catalog_item_values_by_id(
+    database: &Database,
+    user_id: &str,
+    items: &[CatalogItem],
+) -> Result<HashMap<String, Value>, StorageError> {
+    let mut item_ids = Vec::with_capacity(items.len());
+    let mut seen = HashSet::with_capacity(items.len());
     for item in items {
-        values.push(lux_catalog_item_json_with_user_state(
-            item,
-            states.get(&item.id),
-        ));
+        if seen.insert(item.id.clone()) {
+            item_ids.push(item.id.clone());
+        }
     }
-    Ok(values)
+    let states = database.list_user_item_states(user_id, &item_ids).await?;
+    Ok(items
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                lux_catalog_item_json_with_user_state(item, states.get(&item.id)),
+            )
+        })
+        .collect())
+}
+
+fn lux_catalog_items_from_values(
+    items: &[CatalogItem],
+    values: &HashMap<String, Value>,
+) -> Vec<Value> {
+    items
+        .iter()
+        .filter_map(|item| values.get(&item.id).cloned())
+        .collect()
 }
 
 async fn lux_catalog_page_json_for_user(
