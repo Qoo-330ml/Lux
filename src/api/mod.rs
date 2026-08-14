@@ -2698,10 +2698,16 @@ async fn emby_catalog_items_for_user_with_preferred_source(
     }
     let mut items = Vec::with_capacity(catalog_items.len());
     for item in &catalog_items {
+        let nfo = if emby_nfo_fields_requested(fields) {
+            read_local_nfo_details(state, &item.id).await
+        } else {
+            None
+        };
         let mut value = emby_catalog_item_json_with_state(
             item,
             &state.server_id,
             user_states.get(&item.id),
+            nfo.as_ref(),
             can_download,
             fields,
         );
@@ -2713,6 +2719,29 @@ async fn emby_catalog_items_for_user_with_preferred_source(
         {
             let source = sources.remove(index);
             sources.insert(0, source);
+        }
+        if fields.is_some_and(|fields| emby_fields_include(Some(fields), "People")) {
+            let actors = match state.people.as_ref() {
+                Some(people) => match people.list_item_actors(&item.id).await {
+                    Ok(actors) => actors,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %item.id,
+                            %error,
+                            "derived actor relation is unavailable for Emby list response"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+            if let Value::Object(object) = &mut value {
+                let mut people = actors.into_iter().map(emby_person_json).collect::<Vec<_>>();
+                if let Some(nfo) = nfo.as_ref() {
+                    people.extend(emby_nfo_crew_json(nfo));
+                }
+                object.insert("People".to_owned(), Value::Array(people));
+            }
         }
         items.push(value);
     }
@@ -3130,6 +3159,7 @@ async fn emby_item_response(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            let nfo = read_local_nfo_details(state, &item.id).await;
             let user_id = principal.user_id.to_string();
             let user_state = match database.find_user_item_state(&user_id, item_id).await {
                 Ok(state) => state,
@@ -3140,10 +3170,13 @@ async fn emby_item_response(
                 &item,
                 &state.server_id,
                 user_state.as_ref(),
-                can_download,
-                fields,
-                aspect_ratio,
-                true,
+                EmbyItemJsonOptions {
+                    nfo: nfo.as_ref(),
+                    can_download,
+                    fields,
+                    primary_image_aspect_ratio: aspect_ratio,
+                    include_top_level_media_streams: true,
+                },
             );
             let actors = match state.people.as_ref() {
                 Some(people) => match people.list_item_actors(&item.id).await {
@@ -3160,10 +3193,11 @@ async fn emby_item_response(
                 None => Vec::new(),
             };
             if let Value::Object(object) = &mut item_json {
-                object.insert(
-                    "People".to_owned(),
-                    Value::Array(actors.into_iter().map(emby_person_json).collect()),
-                );
+                let mut people = actors.into_iter().map(emby_person_json).collect::<Vec<_>>();
+                if let Some(nfo) = nfo.as_ref() {
+                    people.extend(emby_nfo_crew_json(nfo));
+                }
+                object.insert("People".to_owned(), Value::Array(people));
             }
             Json(item_json).into_response()
         }
@@ -3244,6 +3278,66 @@ fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
         "Role": actor.character,
         "Type": "Actor",
         "PrimaryImageTag": image_tag,
+    })
+}
+
+fn emby_nfo_crew_json(nfo: &LocalNfoDetails) -> Vec<Value> {
+    let mut people = Vec::with_capacity(nfo.directors.len() + nfo.writers.len());
+    for (person_type, credits) in [("Director", &nfo.directors), ("Writer", &nfo.writers)] {
+        for credit in credits {
+            let mut person = json!({
+                "Name": credit.name,
+                "Type": person_type,
+            });
+            if !credit.provider_id.is_empty()
+                && let Value::Object(object) = &mut person
+            {
+                object.insert("Id".to_owned(), json!(credit.provider_id));
+            }
+            people.push(person);
+        }
+    }
+    people
+}
+
+async fn read_local_nfo_details(state: &AppState, item_id: &str) -> Option<LocalNfoDetails> {
+    let store = state.local_nfo.as_ref()?;
+    match store.read_item(item_id).await {
+        Ok(details) => details,
+        Err(error) => {
+            tracing::warn!(
+                item_id,
+                %error,
+                "derived local NFO cache is unavailable for Emby response"
+            );
+            None
+        }
+    }
+}
+
+fn emby_nfo_fields_requested(fields: Option<&str>) -> bool {
+    const NFO_FIELDS: [&str; 16] = [
+        "CommunityRating",
+        "PremiereDate",
+        "EndDate",
+        "RunTimeTicks",
+        "OriginalLanguage",
+        "Status",
+        "OfficialRating",
+        "ProviderIds",
+        "Taglines",
+        "Genres",
+        "GenreItems",
+        "Studios",
+        "RemoteTrailers",
+        "ExternalUrls",
+        "HomePageUrl",
+        "People",
+    ];
+    fields.is_none_or(|fields| {
+        NFO_FIELDS
+            .iter()
+            .any(|field| emby_fields_include(Some(fields), field))
     })
 }
 
@@ -4041,6 +4135,7 @@ fn emby_catalog_item_json_with_state(
     item: &CatalogItem,
     server_id: &str,
     user_state: Option<&crate::storage::StoredUserItemState>,
+    nfo: Option<&LocalNfoDetails>,
     can_download: bool,
     fields: Option<&str>,
 ) -> Value {
@@ -4048,22 +4143,37 @@ fn emby_catalog_item_json_with_state(
         item,
         server_id,
         user_state,
-        can_download,
-        fields,
-        None,
-        false,
+        EmbyItemJsonOptions {
+            nfo,
+            can_download,
+            fields,
+            primary_image_aspect_ratio: None,
+            include_top_level_media_streams: false,
+        },
     )
+}
+
+struct EmbyItemJsonOptions<'a> {
+    nfo: Option<&'a LocalNfoDetails>,
+    can_download: bool,
+    fields: Option<&'a str>,
+    primary_image_aspect_ratio: Option<f64>,
+    include_top_level_media_streams: bool,
 }
 
 fn emby_catalog_item_json_with_state_and_aspect_ratio(
     item: &CatalogItem,
     server_id: &str,
     user_state: Option<&crate::storage::StoredUserItemState>,
-    can_download: bool,
-    fields: Option<&str>,
-    primary_image_aspect_ratio: Option<f64>,
-    include_top_level_media_streams: bool,
+    options: EmbyItemJsonOptions<'_>,
 ) -> Value {
+    let EmbyItemJsonOptions {
+        nfo,
+        can_download,
+        fields,
+        primary_image_aspect_ratio,
+        include_top_level_media_streams,
+    } = options;
     let default_source = item
         .media_sources
         .iter()
@@ -4581,7 +4691,126 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
             ),
         );
     }
+    apply_emby_nfo_details(&mut value, item, nfo, fields);
     value
+}
+
+fn apply_emby_nfo_details(
+    value: &mut Value,
+    item: &CatalogItem,
+    nfo: Option<&LocalNfoDetails>,
+    fields: Option<&str>,
+) {
+    let Some(nfo) = nfo else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let include = |field: &str| emby_fields_include(fields, field);
+
+    if include("CommunityRating")
+        && let Some(rating) = nfo.rating
+    {
+        object.insert("CommunityRating".to_owned(), json!(rating));
+    }
+    if include("PremiereDate")
+        && let Some(date) = nfo
+            .premiered
+            .as_deref()
+            .or(nfo.release_date.as_deref())
+            .or(nfo.aired.as_deref())
+            .or(item.premiere_date.as_deref())
+    {
+        object.insert(
+            "PremiereDate".to_owned(),
+            emby_datetime(Some(date)).unwrap_or(Value::Null),
+        );
+    }
+    if include("EndDate")
+        && let Some(date) = nfo.last_air_date.as_deref()
+    {
+        object.insert(
+            "EndDate".to_owned(),
+            emby_datetime(Some(date)).unwrap_or(Value::Null),
+        );
+    }
+    if include("RunTimeTicks")
+        && let Some(runtime) = nfo.runtime
+        && let Some(runtime_ticks) = i64::from(runtime)
+            .checked_mul(60)
+            .and_then(|value| value.checked_mul(10_000_000))
+    {
+        object.insert("RunTimeTicks".to_owned(), json!(runtime_ticks));
+    }
+    if include("OriginalLanguage")
+        && let Some(language) = nfo.original_language.as_deref()
+    {
+        object.insert("OriginalLanguage".to_owned(), json!(language));
+    }
+    if include("Status")
+        && let Some(status) = nfo.status.as_deref()
+    {
+        object.insert("Status".to_owned(), json!(status));
+    }
+    if include("OfficialRating")
+        && let Some(certification) = nfo.certification.as_deref()
+    {
+        object.insert("OfficialRating".to_owned(), json!(certification));
+    }
+    if include("ProviderIds") {
+        let mut provider_ids = item.provider_ids.clone();
+        provider_ids.extend(nfo.provider_ids.clone());
+        object.insert(
+            "ProviderIds".to_owned(),
+            json!(emby_provider_ids(&provider_ids)),
+        );
+    }
+    if include("Taglines") && !nfo.tagline.as_deref().unwrap_or_default().is_empty() {
+        object.insert("Taglines".to_owned(), json!([nfo.tagline]));
+    }
+    if include("Genres") && !nfo.genres.is_empty() {
+        object.insert("Genres".to_owned(), json!(nfo.genres));
+    }
+    if include("GenreItems") && !nfo.genres.is_empty() {
+        object.insert(
+            "GenreItems".to_owned(),
+            json!(
+                nfo.genres
+                    .iter()
+                    .map(|name| json!({ "Name": name }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    if include("Studios") && !nfo.studios.is_empty() {
+        object.insert(
+            "Studios".to_owned(),
+            json!(
+                nfo.studios
+                    .iter()
+                    .map(|name| json!({ "Name": name }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    if include("RemoteTrailers") && !nfo.trailers.is_empty() {
+        let trailers = nfo
+            .trailers
+            .iter()
+            .enumerate()
+            .map(|(index, url)| json!({ "Url": url, "Name": format!("Trailer {}", index + 1) }))
+            .collect::<Vec<_>>();
+        object.insert("RemoteTrailers".to_owned(), json!(trailers));
+    }
+    if (include("ExternalUrls") || include("HomePageUrl"))
+        && let Some(website) = nfo.website.as_deref()
+    {
+        object.insert(
+            "ExternalUrls".to_owned(),
+            json!([{ "Name": "Website", "Url": website }]),
+        );
+    }
 }
 
 fn emby_insert_optional(

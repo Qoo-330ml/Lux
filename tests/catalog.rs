@@ -62,7 +62,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     tokio::fs::write(first_dir.join("disc.jpg"), b"alpha-disc").await?;
     tokio::fs::write(
         first_dir.join("movie.nfo"),
-        r#"<movie><rating>8.1</rating><votes>123</votes><tagline>本地标语</tagline><premiered>2020-01-02</premiered><runtime>126</runtime><status>Released</status><language>zh</language><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>本地影业</studio><tmdbid>12345</tmdbid><director tmdbid="88">导演甲</director><writer tmdbid="99">编剧甲</writer><trailer>https://example.com/trailer</trailer></movie>"#,
+        r#"<movie><rating>8.1</rating><votes>123</votes><tagline>本地标语</tagline><premiered>2020-01-02</premiered><runtime>126</runtime><status>Released</status><language>zh</language><website>https://example.com/movie</website><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>本地影业</studio><tmdbid>12345</tmdbid><director tmdbid="88">导演甲</director><writer tmdbid="99">编剧甲</writer><trailer>https://example.com/trailer</trailer></movie>"#,
     )
     .await?;
     tokio::fs::write(second_dir.join("Beta.Movie.2021.mp4"), b"beta").await?;
@@ -419,6 +419,18 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_page_body["Items"][0]["Type"], "Movie");
     assert_eq!(emby_page_body["Items"][0]["SupportsSync"], false);
     assert_eq!(emby_page_body["Items"][0]["Name"], "Alpha Movie");
+    assert_eq!(emby_page_body["Items"][0]["CommunityRating"], 8.1);
+    assert_eq!(
+        emby_page_body["Items"][0]["PremiereDate"],
+        "2020-01-02T00:00:00.0000000Z"
+    );
+    assert_eq!(emby_page_body["Items"][0]["RunTimeTicks"], 75600000000_i64);
+    assert_eq!(emby_page_body["Items"][0]["OfficialRating"], "PG-13");
+    assert_eq!(emby_page_body["Items"][0]["Genres"], json!(["动作"]));
+    assert_eq!(
+        emby_page_body["Items"][0]["Studios"],
+        json!([{ "Name": "本地影业" }])
+    );
     assert_eq!(emby_page_body["Items"][0]["PrimaryImageItemId"], item_id);
     assert_eq!(
         emby_page_body["Items"][0]["ImageTags"]["Primary"],
@@ -432,6 +444,29 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(
         emby_page_body["Items"][0]["MediaSources"][0]["Container"],
         "mkv"
+    );
+
+    let emby_people_page = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&Limit=1&Fields=People",
+            admin.id, library.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_people_page.status(), reqwest::StatusCode::OK);
+    let emby_people_page_body: Value = emby_people_page.json().await?;
+    assert_eq!(
+        emby_people_page_body["Items"][0]["People"][0]["Type"],
+        "Actor"
+    );
+    assert_eq!(
+        emby_people_page_body["Items"][0]["People"][1]["Type"],
+        "Director"
+    );
+    assert_eq!(
+        emby_people_page_body["Items"][0]["People"][2]["Type"],
+        "Writer"
     );
 
     let popcorn_items = client
@@ -513,7 +548,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         popcorn_item["BackdropImageTags"].as_array().map(Vec::len),
         Some(2)
     );
-    assert_eq!(popcorn_item["PremiereDate"], "2021-01-01T00:00:00.0000000Z");
+    assert_eq!(popcorn_item["PremiereDate"], "2020-01-02T00:00:00.0000000Z");
     assert_eq!(popcorn_item["ParentId"], alpha_parent_id);
     assert!(
         !popcorn_item["UserData"]
@@ -728,6 +763,12 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(user_scoped_detail_body["People"][0]["Id"], "9");
     assert_eq!(user_scoped_detail_body["People"][0]["Role"], "角色甲");
     assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Actor");
+    assert_eq!(user_scoped_detail_body["People"][1]["Id"], "88");
+    assert_eq!(user_scoped_detail_body["People"][1]["Name"], "导演甲");
+    assert_eq!(user_scoped_detail_body["People"][1]["Type"], "Director");
+    assert_eq!(user_scoped_detail_body["People"][2]["Id"], "99");
+    assert_eq!(user_scoped_detail_body["People"][2]["Name"], "编剧甲");
+    assert_eq!(user_scoped_detail_body["People"][2]["Type"], "Writer");
 
     // Filmly/网易爆米花 sends ShareLevel as a capability hint, while still
     // requiring the complete detail payload needed to start playback.
@@ -745,18 +786,30 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert!(popcorn_detail_body["MediaSources"].is_array());
     assert_eq!(popcorn_detail_body["MediaSources"][0]["ItemId"], item_id);
     assert_eq!(popcorn_detail_body["SupportsSync"], true);
-    assert_eq!(popcorn_detail_body["RunTimeTicks"], 2000000000_i64);
+    assert_eq!(popcorn_detail_body["RunTimeTicks"], 75600000000_i64);
     // The Android filmly client maps the standard Emby detail scaffolding as
     // non-null; empty collections and stable identifiers keep the DTO parseable.
     assert_eq!(popcorn_detail_body["CanDelete"], false);
     assert_eq!(popcorn_detail_body["LockData"], false);
     assert_eq!(popcorn_detail_body["LockedFields"], serde_json::json!([]));
-    assert_eq!(popcorn_detail_body["ExternalUrls"], serde_json::json!([]));
-    assert_eq!(popcorn_detail_body["RemoteTrailers"], serde_json::json!([]));
-    assert_eq!(popcorn_detail_body["Taglines"], serde_json::json!([]));
-    assert_eq!(popcorn_detail_body["Genres"], serde_json::json!([]));
-    assert_eq!(popcorn_detail_body["GenreItems"], serde_json::json!([]));
-    assert_eq!(popcorn_detail_body["Studios"], serde_json::json!([]));
+    assert_eq!(
+        popcorn_detail_body["ExternalUrls"],
+        json!([{ "Name": "Website", "Url": "https://example.com/movie" }])
+    );
+    assert_eq!(
+        popcorn_detail_body["RemoteTrailers"],
+        json!([{ "Url": "https://example.com/trailer", "Name": "Trailer 1" }])
+    );
+    assert_eq!(popcorn_detail_body["Taglines"], json!(["本地标语"]));
+    assert_eq!(popcorn_detail_body["Genres"], json!(["动作"]));
+    assert_eq!(
+        popcorn_detail_body["GenreItems"],
+        json!([{ "Name": "动作" }])
+    );
+    assert_eq!(
+        popcorn_detail_body["Studios"],
+        json!([{ "Name": "本地影业" }])
+    );
     assert_eq!(popcorn_detail_body["TagItems"], serde_json::json!([]));
     assert_eq!(popcorn_detail_body["LocalTrailerCount"], 0);
     assert_eq!(popcorn_detail_body["PartCount"], 1);
@@ -770,7 +823,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert!(popcorn_detail_body["DateCreated"].is_string());
     assert!(popcorn_detail_body["DateModified"].is_string());
     assert!(popcorn_detail_body["Path"].is_string());
-    assert_eq!(popcorn_detail_body["OfficialRating"], serde_json::json!(""));
+    assert_eq!(popcorn_detail_body["OfficialRating"], "PG-13");
+    assert_eq!(popcorn_detail_body["CommunityRating"], 8.1);
+    assert_eq!(popcorn_detail_body["OriginalLanguage"], "zh");
+    assert_eq!(popcorn_detail_body["Status"], "Released");
+    assert_eq!(popcorn_detail_body["ProviderIds"]["Tmdb"], "12345");
 
     let person_image_tag = user_scoped_detail_body["People"][0]["PrimaryImageTag"]
         .as_str()
