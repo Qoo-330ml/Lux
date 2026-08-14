@@ -396,11 +396,10 @@ async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
     assert_eq!(provenance["originalTitle"], "LOCAL_NFO");
     assert_eq!(provenance["overview"], "LOCAL_NFO");
     assert_eq!(provenance["productionYear"], "LOCAL_NFO");
-    let locked_fields: String = sqlx::query_scalar(
-        "SELECT locked_fields_json FROM media_items WHERE title = '本地电影'",
-    )
-    .fetch_one(database.pool())
-    .await?;
+    let locked_fields: String =
+        sqlx::query_scalar("SELECT locked_fields_json FROM media_items WHERE title = '本地电影'")
+            .fetch_one(database.pool())
+            .await?;
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&locked_fields)?,
         serde_json::json!([])

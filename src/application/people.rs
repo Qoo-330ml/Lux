@@ -227,9 +227,11 @@ impl PeopleService {
             stored.push(StoredActor {
                 id: has_stable_identity.then(|| actor_id.to_owned()),
                 name: actor.name.trim().to_owned(),
-                provider: has_stable_identity
-                    .then(|| actor_provider.to_owned())
-                    .unwrap_or_default(),
+                provider: if has_stable_identity {
+                    actor_provider.to_owned()
+                } else {
+                    String::new()
+                },
                 person_key,
                 identities,
                 character: actor
@@ -1019,7 +1021,7 @@ fn person_key_for_identities(identities: &[PersonIdentity]) -> Option<String> {
     let mut hasher = Sha256::new();
     for identity in identities {
         hasher.update(identity.provider.as_bytes());
-        hasher.update([b':']);
+        hasher.update(*b":");
         hasher.update(identity.id.as_bytes());
         hasher.update([0]);
     }
