@@ -9,6 +9,7 @@ import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import type { LuxUser } from "../../lib/api/types";
 import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
+import { LuxLogo } from "../LuxLogo";
 
 type LuxShellProps = { user: LuxUser };
 type AvatarContextValue = {
@@ -53,7 +54,7 @@ export function LuxShell({ user }: LuxShellProps) {
         <header className="lux-header">
           <div className="lux-header-left">
             <NavLink className="lux-brand" to="/" aria-label="Lux 首页">
-              <img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" />
+              <LuxLogo className="lux-brand-logo" />
               <span className="lux-brand-name">Lux</span>
             </NavLink>
             <nav className="lux-desktop-nav" aria-label="主导航">

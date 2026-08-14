@@ -89,6 +89,8 @@ export function orderLibraries<T extends { id: string }>(libraries: T[], savedOr
 export function applyAccountTheme(theme: LuxTheme): void {
   if (typeof document !== "undefined") {
     document.documentElement.dataset.luxTheme = theme;
+    const favicon = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (favicon) favicon.href = theme === "light" ? "/favicon.svg" : "/favicon-white.svg";
   }
 }
 

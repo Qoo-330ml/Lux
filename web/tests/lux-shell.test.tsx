@@ -93,7 +93,7 @@ describe("LuxShell user control", () => {
     );
   });
 
-  it("renders the project logo in the brand link", () => {
+  it("renders black and white project logo variants in the brand link", () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -114,8 +114,34 @@ describe("LuxShell user control", () => {
 
     const logo = container.querySelector<HTMLImageElement>(".lux-brand-logo");
 
-    expect(logo?.getAttribute("src")).toBe("/logo.svg");
-    expect(logo?.getAttribute("alt")).toBe("");
+    expect(logo?.querySelector<HTMLImageElement>(".lux-theme-logo-light")?.getAttribute("src")).toBe("/logo-black.svg");
+    expect(logo?.querySelector<HTMLImageElement>(".lux-theme-logo-dark")?.getAttribute("src")).toBe("/logo-white.svg");
+    expect(logo?.querySelector<HTMLImageElement>(".lux-theme-logo-light")?.getAttribute("alt")).toBe("");
+  });
+
+  it("keeps the light theme mapped to the black logo variant", () => {
+    document.documentElement.dataset.luxTheme = "light";
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LuxShell
+            user={{
+              id: "user-1",
+              usernameNormalized: "test",
+              displayName: "test",
+            }}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const logo = container.querySelector<HTMLImageElement>(".lux-brand-logo");
+    expect(logo?.querySelector(".lux-theme-logo-light")).toBeTruthy();
+    expect(logo?.querySelector(".lux-theme-logo-dark")).toBeTruthy();
   });
 
   it("does not render duplicate search or library actions in the header", () => {

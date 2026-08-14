@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountPage } from "../src/features/account/AccountPage";
 import { LuxShell } from "../src/components/layout/LuxShell";
 import { api } from "../src/lib/api/client";
-import { accountSettingsStorageKey, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings } from "../src/features/account/account-settings";
+import { accountSettingsStorageKey, applyAccountTheme, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings } from "../src/features/account/account-settings";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -53,6 +53,18 @@ describe("account settings", () => {
 
     expect(readAccountSettings("user-a").theme).toBe("light");
     expect(readAccountSettings("user-b").theme).toBe("dark");
+  });
+
+  it("switches the favicon to match the selected theme", () => {
+    const favicon = document.createElement("link");
+    favicon.rel = "icon";
+    document.head.append(favicon);
+
+    applyAccountTheme("light");
+    expect(favicon.href).toBe("http://localhost:3000/favicon.svg");
+
+    applyAccountTheme("dark");
+    expect(favicon.href).toBe("http://localhost:3000/favicon-white.svg");
   });
 
   it("persists the selected accent color for the current account", async () => {
