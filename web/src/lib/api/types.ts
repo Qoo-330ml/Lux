@@ -32,6 +32,11 @@ export type LuxUser = {
   canDownload?: boolean;
 };
 
+export type AuthSession = {
+  user: LuxUser;
+  serverName?: string | null;
+};
+
 export type Library = {
   id: string;
   name: string;

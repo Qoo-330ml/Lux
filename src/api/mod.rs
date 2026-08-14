@@ -6218,7 +6218,12 @@ async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response 
                 )
                 .into_response();
             }
-            Json(json!({ "user": user_json(&session.user) })).into_response()
+            let server_name = current_emby_server_name(&state).await;
+            Json(json!({
+                "user": user_json(&session.user),
+                "serverName": server_name,
+            }))
+            .into_response()
         }
         Ok(None) => api_error(
             &headers,

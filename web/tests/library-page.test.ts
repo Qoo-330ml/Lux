@@ -65,7 +65,7 @@ describe("LibraryPage infinite scroll", () => {
           createElement(
             Routes,
             null,
-            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage, { serverName: "客厅 Lux" }) }),
           ),
         ),
       ));
@@ -79,7 +79,7 @@ describe("LibraryPage infinite scroll", () => {
       root?.unmount();
       root = undefined;
     });
-    expect(document.title).toBe("Lux");
+    expect(document.title).toBe("客厅 Lux - Lux");
   });
 
   it("loads the next library page when the scroll sentinel becomes visible", async () => {

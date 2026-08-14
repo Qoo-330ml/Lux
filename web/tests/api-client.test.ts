@@ -650,14 +650,17 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("unwraps the authenticated user when restoring a session", async () => {
+  it("returns the authenticated user and server name when restoring a session", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ user: { id: "admin-1", canManageServer: true } }), { status: 200 }),
+      new Response(JSON.stringify({ user: { id: "admin-1", canManageServer: true }, serverName: "客厅 Lux" }), { status: 200 }),
     );
 
     await expect(new LuxApiClient().me()).resolves.toEqual({
-      id: "admin-1",
-      canManageServer: true,
+      user: {
+        id: "admin-1",
+        canManageServer: true,
+      },
+      serverName: "客厅 Lux",
     });
   });
 });

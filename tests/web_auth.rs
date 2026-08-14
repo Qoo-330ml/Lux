@@ -130,10 +130,9 @@ async fn login_me_logout_and_csrf_are_session_backed() -> Result<(), Box<dyn std
         .send()
         .await?;
     assert_eq!(me.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        me.json::<serde_json::Value>().await?["user"]["isAdmin"],
-        true
-    );
+    let me_body = me.json::<serde_json::Value>().await?;
+    assert_eq!(me_body["user"]["isAdmin"], true);
+    assert_eq!(me_body["serverName"], "Lux Server");
 
     let missing_csrf = client
         .post(format!("{base_url}/api/v1/auth/logout"))

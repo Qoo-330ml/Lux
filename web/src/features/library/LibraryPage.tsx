@@ -73,7 +73,7 @@ function getStorage(): Storage | null {
   }
 }
 
-export function LibraryPage() {
+export function LibraryPage({ serverName }: { serverName?: string | null } = {}) {
   const { libraryId = "" } = useParams();
   const [sortState, setSortState] = useState(() => ({
     libraryId,
@@ -91,9 +91,10 @@ export function LibraryPage() {
     const libraryName = library?.name.trim();
     document.title = libraryName ? `${libraryName} - Lux` : "Lux";
     return () => {
-      document.title = "Lux";
+      const serverTitle = serverName?.trim();
+      document.title = serverTitle ? `${serverTitle} - Lux` : "Lux";
     };
-  }, [library?.name]);
+  }, [library?.name, serverName]);
 
   const pages = useInfiniteQuery({
     queryKey: queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder),

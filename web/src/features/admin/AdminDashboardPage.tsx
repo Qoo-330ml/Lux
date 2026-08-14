@@ -29,10 +29,7 @@ export function AdminDashboardPage() {
     if (typeof document === "undefined") return;
 
     const name = (serverName ?? dashboard.data?.server.name)?.trim();
-    document.title = name ? `${name} - Lux` : "Lux";
-    return () => {
-      document.title = "Lux";
-    };
+    if (name) document.title = `${name} - Lux`;
   }, [dashboard.data?.server.name, serverName]);
 
   const openServerNameEditor = () => {

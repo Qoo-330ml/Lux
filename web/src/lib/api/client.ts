@@ -1,4 +1,5 @@
 import type {
+  AuthSession,
   AdminAuditEvent,
   AdminDashboard,
   AdminHealth,
@@ -176,7 +177,7 @@ export class LuxApiClient {
   }
 
   me() {
-    return this.request<{ user: LuxUser }>("/api/v1/auth/me").then((response) => response.user);
+    return this.request<AuthSession>("/api/v1/auth/me");
   }
 
   avatarUrl(cacheKey?: string) {

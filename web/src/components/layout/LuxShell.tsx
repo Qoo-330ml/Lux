@@ -11,7 +11,7 @@ import type { LuxUser } from "../../lib/api/types";
 import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
 import { LuxLogo } from "../LuxLogo";
 
-type LuxShellProps = { user: LuxUser };
+type LuxShellProps = { user: LuxUser; serverName?: string | null };
 type AvatarContextValue = {
   avatarUrl: string | null;
   setAvatarUrl: (url: string) => void;
@@ -24,7 +24,7 @@ export function useAvatar(): AvatarContextValue {
   return useContext(AvatarContext) ?? EMPTY_AVATAR_CONTEXT;
 }
 
-export function LuxShell({ user }: LuxShellProps) {
+export function LuxShell({ user, serverName }: LuxShellProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -47,6 +47,17 @@ export function LuxShell({ user }: LuxShellProps) {
   useEffect(() => {
     setAvatarImageFailed(false);
   }, [avatarUrl]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (isDetail) return;
+
+    const name = serverName?.trim();
+    document.title = name ? `${name} - Lux` : "Lux";
+    return () => {
+      document.title = "Lux";
+    };
+  }, [isDetail, serverName]);
 
   return (
     <AvatarContext.Provider value={{ avatarUrl, setAvatarUrl }}>

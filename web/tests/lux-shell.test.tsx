@@ -21,6 +21,26 @@ describe("LuxShell user control", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    document.title = "Lux";
+  });
+
+  it("uses the server name as the default browser tab title", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LuxShell
+            user={{ id: "user-1", usernameNormalized: "test" }}
+            serverName="客厅 Lux"
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(document.title).toBe("客厅 Lux - Lux");
   });
 
   it("renders the server avatar and falls back to initials when it is unavailable", () => {
