@@ -167,8 +167,10 @@ Lux 的核心价值不是功能数量，而是：
 - 匹配结果只保存当前媒体库所选刮削器对应的 provider ID；选择 TMDb 时保存 TMDb ID，选择其他刮削器时保存该刮削器返回的 ID。
 - 自动匹配必须达到高置信度阈值；候选接近或信息不足时进入“待处理”。
 - “待处理”条目保留原始文件名和可播放能力，不因缺少在线元数据从库中消失。
-- 管理员 Web 控制台提供待处理列表。
-- 管理员可搜索候选、查看差异、选择正确条目并确认。
+- 低置信度匹配保留为“待确认”状态，但不提供独立的元数据纠错控制台页面。
+- 整库匹配任务完成后，任务结果显示自动确认、待确认、无候选和写回失败的数量；待确认数量链接到对应媒体库的“待确认”筛选。
+- 媒体库列表支持“待确认”筛选，条目卡片显示待确认标记；管理员从媒体详情页搜索候选、查看差异、选择正确条目并确认。
+- 媒体详情页在完成待确认匹配后提供“下一个待确认”入口，支持连续处理同一媒体库中的异常条目。
 - 元数据匹配错误时支持“重新匹配”。
 - 重新匹配可选择仅补缺字段或刷新在线字段；无论哪种模式都不覆盖已锁定字段。
 - 成功编辑或匹配后，将 NFO 回写到媒体目录，将选中的 Lux 管理图片写入
@@ -1434,7 +1436,7 @@ Web 使用 HttpOnly、Secure（HTTPS 下）、SameSite Cookie。改变状态的 
 
 - GET /api/v1/home
 - GET /api/v1/libraries
-- GET /api/v1/libraries/{id}/items
+- GET /api/v1/libraries/{id}/items（支持 `metadataStatus=PENDING` 待确认筛选）
 - GET /api/v1/items/{id}
 - GET /api/v1/search
 - GET /api/v1/items/{id}/playback
@@ -1454,7 +1456,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - POST /api/v1/admin/jobs/{id}/retry
 - GET/POST/PATCH/DELETE /api/v1/admin/users
 - PATCH /api/v1/admin/users/{id}/policy
-- GET /api/v1/admin/metadata/pending
+- GET /api/v1/admin/metadata/pending（兼容接口；Web 控制台通过媒体库待确认筛选处理）
 - GET /api/v1/admin/items/{id}/identify/candidates
 - POST /api/v1/admin/items/{id}/identify/candidates
 - POST /api/v1/admin/items/{id}/identify/candidates/{candidateId}/select
@@ -2737,9 +2739,11 @@ services:
 
 验收：
 
-- 查看候选和 diff。
-- 仅补缺/刷新未锁定选择。
-- 写回成功/失败状态。
+- 不提供独立的元数据纠错控制台页面或导航入口。
+- 整库匹配任务结果显示待确认数量，并能跳转到对应媒体库的待确认筛选。
+- 媒体库列表支持服务端分页的待确认筛选，待确认条目保留可播放能力并显示状态标记。
+- 从媒体详情页查看候选和 diff，选择仅补缺/刷新未锁定字段并处理写回成功/失败状态。
+- 完成一项待确认匹配后可以继续打开下一项待确认媒体。
 - poster/fanart 选择。
 
 验证：Playwright 完整元数据重新匹配流程。
@@ -2748,7 +2752,7 @@ services:
 
 阶段门：
 
-- 管理员无需调用 API 即可完成初始化、用户、媒体库、扫描和纠错。
+- 管理员无需调用 API 即可完成初始化、用户、媒体库、扫描和低置信度匹配确认。
 - 普通用户无法进入控制台。
 
 ### 阶段 11：普通用户 Web 客户端
