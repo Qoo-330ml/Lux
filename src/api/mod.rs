@@ -121,14 +121,6 @@ pub struct AppState {
     database_setup: Option<DatabaseSetupService>,
     database_selection_required: bool,
     server_id: String,
-    // Temporary Filmly A/B hook. It is disabled unless an operator explicitly
-    // sets the series id in the process environment.
-    filmly_ab_no_media_streams_series_id: Option<String>,
-    filmly_ab_no_subtitles_series_id: Option<String>,
-    filmly_ab_strip_advanced_video_fields_series_id: Option<String>,
-    filmly_ab_keep_first_video_series_id: Option<String>,
-    filmly_ab_keep_first_audio_series_id: Option<String>,
-    filmly_ab_field_matrix: HashMap<String, FilmlyMediaStreamAbProfile>,
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
     emby_auth: Option<EmbyAuthService>,
@@ -186,32 +178,6 @@ impl AppState {
         network_proxy_url: Option<String>,
     ) -> Self {
         let server_id = database.server_id().to_owned();
-        let filmly_ab_no_media_streams_series_id =
-            std::env::var("LUX_FILMLY_AB_NO_MEDIA_STREAMS_SERIES_ID")
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty());
-        let filmly_ab_no_subtitles_series_id =
-            std::env::var("LUX_FILMLY_AB_NO_SUBTITLES_SERIES_ID")
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty());
-        let filmly_ab_strip_advanced_video_fields_series_id =
-            std::env::var("LUX_FILMLY_AB_STRIP_ADVANCED_VIDEO_FIELDS_SERIES_ID")
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty());
-        let filmly_ab_keep_first_video_series_id =
-            std::env::var("LUX_FILMLY_AB_KEEP_FIRST_VIDEO_SERIES_ID")
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty());
-        let filmly_ab_keep_first_audio_series_id =
-            std::env::var("LUX_FILMLY_AB_KEEP_FIRST_AUDIO_SERIES_ID")
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty());
-        let filmly_ab_field_matrix = parse_filmly_ab_field_matrix();
         let config_dir = config.config_dir.clone();
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
         let resources = ResourceMetrics::new();
@@ -305,12 +271,6 @@ impl AppState {
             database_setup,
             database_selection_required: false,
             server_id,
-            filmly_ab_no_media_streams_series_id,
-            filmly_ab_no_subtitles_series_id,
-            filmly_ab_strip_advanced_video_fields_series_id,
-            filmly_ab_keep_first_video_series_id,
-            filmly_ab_keep_first_audio_series_id,
-            filmly_ab_field_matrix,
             setup: Some(setup),
             auth: Some(auth),
             emby_auth: Some(emby_auth),
@@ -2554,20 +2514,8 @@ async fn emby_show_episodes(
     let episodes = catalog
         .list_series_episodes(principal, &series_id, season_id, offset, limit)
         .await;
-    let media_stream_profile = filmly_media_stream_profile_for_series(
-        FilmlyMediaStreamAbSeriesConfig {
-            matrix_profile: state.filmly_ab_field_matrix.get(&series_id).copied(),
-            no_media_streams_series_id: state.filmly_ab_no_media_streams_series_id.as_deref(),
-            no_subtitles_series_id: state.filmly_ab_no_subtitles_series_id.as_deref(),
-            strip_advanced_video_fields_series_id: state
-                .filmly_ab_strip_advanced_video_fields_series_id
-                .as_deref(),
-            keep_first_video_series_id: state.filmly_ab_keep_first_video_series_id.as_deref(),
-            keep_first_audio_series_id: state.filmly_ab_keep_first_audio_series_id.as_deref(),
-        },
-        &series_id,
-        header_str(&headers, "user-agent"),
-    );
+    let normalize_filmly_null_languages =
+        header_str(&headers, "user-agent").is_some_and(is_filmly_user_agent);
     match episodes {
         Ok(page) => {
             emby_catalog_page_for_user_with_preferred_source_and_options(
@@ -2579,7 +2527,7 @@ async fn emby_show_episodes(
                 EmbyCatalogPageOptions {
                     preferred_source_id: None,
                     include_start_index: true,
-                    media_stream_profile,
+                    normalize_filmly_null_languages,
                 },
             )
             .await
@@ -2601,7 +2549,7 @@ async fn emby_show_episodes(
                     EmbyCatalogPageOptions {
                         preferred_source_id: None,
                         include_start_index: true,
-                        media_stream_profile,
+                        normalize_filmly_null_languages,
                     },
                 )
                 .await
@@ -2698,7 +2646,7 @@ async fn emby_catalog_page_for_user_with_preferred_source(
         EmbyCatalogPageOptions {
             preferred_source_id,
             include_start_index,
-            media_stream_profile: None,
+            normalize_filmly_null_languages: false,
         },
     )
     .await
@@ -2707,7 +2655,7 @@ async fn emby_catalog_page_for_user_with_preferred_source(
 struct EmbyCatalogPageOptions<'a> {
     preferred_source_id: Option<&'a str>,
     include_start_index: bool,
-    media_stream_profile: Option<FilmlyMediaStreamAbProfile>,
+    normalize_filmly_null_languages: bool,
 }
 
 async fn emby_catalog_page_for_user_with_preferred_source_and_options(
@@ -2729,8 +2677,8 @@ async fn emby_catalog_page_for_user_with_preferred_source_and_options(
     .await
     {
         Ok(mut items) => {
-            if let Some(profile) = options.media_stream_profile {
-                apply_filmly_media_stream_profile(&mut items, profile);
+            if options.normalize_filmly_null_languages {
+                normalize_filmly_null_languages(&mut items);
             }
             let mut body = json!({
                 "Items": items,
@@ -5014,215 +4962,24 @@ fn emby_insert_optional(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FilmlyMediaStreamAbProfile {
-    OmitAll,
-    OmitSubtitles,
-    StripAdvancedVideoFields,
-    KeepFirstVideo,
-    KeepFirstAudio,
-    OmitLanguage,
-    NormalizeNullLanguage,
-    OmitSubtitleDisplayLanguage,
-    OmitSubtitleTextFlag,
-    FillSourceName,
-    EnableTranscoding,
-    OmitDefaultAudioStreamIndex,
-}
-
-fn apply_filmly_media_stream_profile(items: &mut [Value], profile: FilmlyMediaStreamAbProfile) {
+fn normalize_filmly_null_languages(items: &mut [Value]) {
     for item in items {
         let Some(sources) = item.get_mut("MediaSources").and_then(Value::as_array_mut) else {
             continue;
         };
         for source in sources {
-            if let Some(object) = source.as_object_mut() {
-                let Some(streams) = object.get_mut("MediaStreams").and_then(Value::as_array_mut)
-                else {
-                    continue;
-                };
-                match profile {
-                    FilmlyMediaStreamAbProfile::OmitAll => streams.clear(),
-                    FilmlyMediaStreamAbProfile::OmitSubtitles => streams.retain(|stream| {
-                        stream
-                            .get("Type")
-                            .and_then(Value::as_str)
-                            .is_none_or(|stream_type| !stream_type.eq_ignore_ascii_case("Subtitle"))
-                    }),
-                    FilmlyMediaStreamAbProfile::StripAdvancedVideoFields => {
-                        for stream in streams {
-                            let is_video = stream.get("Type").and_then(Value::as_str).is_some_and(
-                                |stream_type| stream_type.eq_ignore_ascii_case("Video"),
-                            );
-                            if is_video && let Some(stream) = stream.as_object_mut() {
-                                for key in [
-                                    "VideoRange",
-                                    "ExtendedVideoType",
-                                    "ExtendedVideoSubType",
-                                    "ExtendedVideoSubTypeDescription",
-                                ] {
-                                    stream.remove(key);
-                                }
-                            }
-                        }
-                    }
-                    FilmlyMediaStreamAbProfile::KeepFirstVideo => {
-                        keep_first_stream_of_type(streams, "Video");
-                    }
-                    FilmlyMediaStreamAbProfile::KeepFirstAudio => {
-                        keep_first_stream_of_type(streams, "Audio");
-                    }
-                    FilmlyMediaStreamAbProfile::OmitLanguage => {
-                        for stream in streams {
-                            if let Some(object) = stream.as_object_mut() {
-                                object.remove("Language");
-                            }
-                        }
-                    }
-                    FilmlyMediaStreamAbProfile::NormalizeNullLanguage => {
-                        for stream in streams {
-                            if let Some(object) = stream.as_object_mut()
-                                && object.get("Language").is_some_and(Value::is_null)
-                            {
-                                object.insert("Language".to_owned(), json!("und"));
-                            }
-                        }
-                    }
-                    FilmlyMediaStreamAbProfile::OmitSubtitleDisplayLanguage => {
-                        for stream in streams {
-                            let is_subtitle = stream
-                                .get("Type")
-                                .and_then(Value::as_str)
-                                .is_some_and(|value| value.eq_ignore_ascii_case("Subtitle"));
-                            if is_subtitle && let Some(object) = stream.as_object_mut() {
-                                object.remove("DisplayLanguage");
-                            }
-                        }
-                    }
-                    FilmlyMediaStreamAbProfile::OmitSubtitleTextFlag => {
-                        for stream in streams {
-                            let is_subtitle = stream
-                                .get("Type")
-                                .and_then(Value::as_str)
-                                .is_some_and(|value| value.eq_ignore_ascii_case("Subtitle"));
-                            if is_subtitle && let Some(object) = stream.as_object_mut() {
-                                object.remove("IsTextSubtitleStream");
-                            }
-                        }
-                    }
-                    FilmlyMediaStreamAbProfile::FillSourceName => {}
-                    FilmlyMediaStreamAbProfile::EnableTranscoding => {}
-                    FilmlyMediaStreamAbProfile::OmitDefaultAudioStreamIndex => {}
-                }
-                match profile {
-                    FilmlyMediaStreamAbProfile::FillSourceName => {
-                        if object.get("Name").is_none_or(Value::is_null) {
-                            let fallback = object
-                                .get("Quality")
-                                .cloned()
-                                .filter(|value| !value.is_null())
-                                .or_else(|| object.get("Container").cloned());
-                            if let Some(fallback) = fallback {
-                                object.insert("Name".to_owned(), fallback);
-                            }
-                        }
-                    }
-                    FilmlyMediaStreamAbProfile::EnableTranscoding => {
-                        object.insert("SupportsTranscoding".to_owned(), json!(true));
-                    }
-                    FilmlyMediaStreamAbProfile::OmitDefaultAudioStreamIndex => {
-                        object.remove("DefaultAudioStreamIndex");
-                    }
-                    _ => {}
+            let Some(streams) = source.get_mut("MediaStreams").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for stream in streams {
+                if let Some(object) = stream.as_object_mut()
+                    && object.get("Language").is_some_and(Value::is_null)
+                {
+                    object.insert("Language".to_owned(), json!("und"));
                 }
             }
         }
     }
-}
-
-struct FilmlyMediaStreamAbSeriesConfig<'a> {
-    matrix_profile: Option<FilmlyMediaStreamAbProfile>,
-    no_media_streams_series_id: Option<&'a str>,
-    no_subtitles_series_id: Option<&'a str>,
-    strip_advanced_video_fields_series_id: Option<&'a str>,
-    keep_first_video_series_id: Option<&'a str>,
-    keep_first_audio_series_id: Option<&'a str>,
-}
-
-fn filmly_media_stream_profile_for_series(
-    config: FilmlyMediaStreamAbSeriesConfig<'_>,
-    series_id: &str,
-    user_agent: Option<&str>,
-) -> Option<FilmlyMediaStreamAbProfile> {
-    if !user_agent.is_some_and(is_filmly_user_agent) {
-        return None;
-    }
-    if config.matrix_profile.is_some() {
-        return config.matrix_profile;
-    }
-    if config.no_media_streams_series_id == Some(series_id) {
-        return Some(FilmlyMediaStreamAbProfile::OmitAll);
-    }
-    if config.no_subtitles_series_id == Some(series_id) {
-        return Some(FilmlyMediaStreamAbProfile::OmitSubtitles);
-    }
-    if config.strip_advanced_video_fields_series_id == Some(series_id) {
-        return Some(FilmlyMediaStreamAbProfile::StripAdvancedVideoFields);
-    }
-    if config.keep_first_video_series_id == Some(series_id) {
-        return Some(FilmlyMediaStreamAbProfile::KeepFirstVideo);
-    }
-    if config.keep_first_audio_series_id == Some(series_id) {
-        return Some(FilmlyMediaStreamAbProfile::KeepFirstAudio);
-    }
-    None
-}
-
-fn parse_filmly_ab_field_matrix() -> HashMap<String, FilmlyMediaStreamAbProfile> {
-    let Ok(raw) = std::env::var("LUX_FILMLY_AB_FIELD_TESTS") else {
-        return HashMap::new();
-    };
-    raw.split(',')
-        .filter_map(|entry| {
-            let (series_id, profile) = entry.trim().split_once('=')?;
-            let profile = match profile.trim().to_ascii_lowercase().as_str() {
-                "omitall" => FilmlyMediaStreamAbProfile::OmitAll,
-                "omitsubtitles" => FilmlyMediaStreamAbProfile::OmitSubtitles,
-                "stripadvancedvideofields" => FilmlyMediaStreamAbProfile::StripAdvancedVideoFields,
-                "keepfirstvideo" => FilmlyMediaStreamAbProfile::KeepFirstVideo,
-                "keepfirstaudio" => FilmlyMediaStreamAbProfile::KeepFirstAudio,
-                "omitlanguage" => FilmlyMediaStreamAbProfile::OmitLanguage,
-                "normalizenulllanguage" => FilmlyMediaStreamAbProfile::NormalizeNullLanguage,
-                "omitsubtitledisplaylanguage" => {
-                    FilmlyMediaStreamAbProfile::OmitSubtitleDisplayLanguage
-                }
-                "omitsubtitletextflag" => FilmlyMediaStreamAbProfile::OmitSubtitleTextFlag,
-                "fillsourcename" => FilmlyMediaStreamAbProfile::FillSourceName,
-                "enabletranscoding" => FilmlyMediaStreamAbProfile::EnableTranscoding,
-                "omitdefaultaudiostreamindex" => {
-                    FilmlyMediaStreamAbProfile::OmitDefaultAudioStreamIndex
-                }
-                _ => return None,
-            };
-            let series_id = series_id.trim();
-            (!series_id.is_empty()).then(|| (series_id.to_owned(), profile))
-        })
-        .collect()
-}
-
-fn keep_first_stream_of_type(streams: &mut Vec<Value>, stream_type: &str) {
-    let first = streams.iter().find(|stream| {
-        stream
-            .get("Type")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case(stream_type))
-    });
-    let Some(first) = first.cloned() else {
-        streams.clear();
-        return;
-    };
-    streams.clear();
-    streams.push(first);
 }
 
 /// Stable, server-local identifier that mirrors Emby's per-item Etag. Emby uses
@@ -15520,15 +15277,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CatalogSort, FilmlyMediaStreamAbProfile, FilmlyMediaStreamAbSeriesConfig,
-        MediaStrategySettings, MetadataCandidateFailureKind, apply_filmly_media_stream_profile,
-        build_cookie, catalog_filter_from_emby, emby_media_source_json,
-        emby_media_source_json_with_resolver, emby_media_stream_item_id, emby_media_stream_json,
-        emby_playback_info_item_id, filmly_media_stream_profile_for_series,
+        CatalogSort, MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
+        catalog_filter_from_emby, emby_media_source_json, emby_media_source_json_with_resolver,
+        emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
         is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        playback_client_label, playback_identifier_prefix, record_activity_event, safe_trace_path,
+        is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
+        metadata_candidate_failure_kind, normalize_filmly_null_languages, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
         secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
@@ -15898,104 +15654,18 @@ mod tests {
     }
 
     #[test]
-    fn filmly_ab_profile_can_remove_subtitles_without_removing_video_streams() {
-        let mut items = vec![json!({
-            "Id": "episode-1",
-            "MediaSources": [{
-                "Id": "source-1",
-                "MediaStreams": [{"Type": "Video"}, {"Type": "Subtitle"}]
-            }]
-        })];
-
-        apply_filmly_media_stream_profile(&mut items, FilmlyMediaStreamAbProfile::OmitSubtitles);
-
-        assert_eq!(items[0]["MediaSources"][0]["Id"], "source-1");
-        assert_eq!(
-            items[0]["MediaSources"][0]["MediaStreams"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            items[0]["MediaSources"][0]["MediaStreams"][0]["Type"],
-            "Video"
-        );
-    }
-
-    #[test]
-    fn filmly_ab_profile_strips_only_advanced_video_fields() {
-        let mut items = vec![json!({
-            "MediaSources": [{
-                "MediaStreams": [{
-                    "Type": "Video",
-                    "VideoRange": "DolbyVision",
-                    "ExtendedVideoType": "DolbyVision",
-                    "ExtendedVideoSubType": "DoviProfile50",
-                    "ExtendedVideoSubTypeDescription": "Dolby Vision"
-                }, {"Type": "Audio", "VideoRange": "should-remain"}]
-            }]
-        })];
-
-        apply_filmly_media_stream_profile(
-            &mut items,
-            FilmlyMediaStreamAbProfile::StripAdvancedVideoFields,
-        );
-
-        assert!(
-            items[0]["MediaSources"][0]["MediaStreams"][0]
-                .get("VideoRange")
-                .is_none()
-        );
-        assert_eq!(
-            items[0]["MediaSources"][0]["MediaStreams"][1]["VideoRange"],
-            "should-remain"
-        );
-    }
-
-    #[test]
-    fn filmly_ab_profile_can_keep_one_stream_of_a_requested_type() {
-        let mut items = vec![json!({
-            "MediaSources": [{
-                "MediaStreams": [
-                    {"Type": "Video", "Index": 0},
-                    {"Type": "Audio", "Index": 1},
-                    {"Type": "Audio", "Index": 2}
-                ]
-            }]
-        })];
-
-        apply_filmly_media_stream_profile(&mut items, FilmlyMediaStreamAbProfile::KeepFirstAudio);
-
-        assert_eq!(
-            items[0]["MediaSources"][0]["MediaStreams"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            items[0]["MediaSources"][0]["MediaStreams"][0]["Type"],
-            "Audio"
-        );
-        assert_eq!(items[0]["MediaSources"][0]["MediaStreams"][0]["Index"], 1);
-    }
-
-    #[test]
-    fn filmly_ab_profile_normalizes_only_null_languages() {
+    fn filmly_episode_stream_normalization_replaces_only_null_languages() {
         let mut items = vec![json!({
             "MediaSources": [{
                 "MediaStreams": [
                     {"Type": "Video", "Language": null},
-                    {"Type": "Audio", "Language": "chi"}
+                    {"Type": "Audio", "Language": "chi"},
+                    {"Type": "Subtitle"}
                 ]
             }]
         })];
 
-        apply_filmly_media_stream_profile(
-            &mut items,
-            FilmlyMediaStreamAbProfile::NormalizeNullLanguage,
-        );
+        normalize_filmly_null_languages(&mut items);
 
         assert_eq!(
             items[0]["MediaSources"][0]["MediaStreams"][0]["Language"],
@@ -16005,55 +15675,18 @@ mod tests {
             items[0]["MediaSources"][0]["MediaStreams"][1]["Language"],
             "chi"
         );
+        assert!(
+            items[0]["MediaSources"][0]["MediaStreams"][2]
+                .get("Language")
+                .is_none()
+        );
     }
 
     #[test]
-    fn filmly_ab_profiles_are_scoped_to_filmly_user_agents() {
-        assert_eq!(
-            filmly_media_stream_profile_for_series(
-                FilmlyMediaStreamAbSeriesConfig {
-                    matrix_profile: None,
-                    no_media_streams_series_id: Some("series-1"),
-                    no_subtitles_series_id: None,
-                    strip_advanced_video_fields_series_id: None,
-                    keep_first_video_series_id: None,
-                    keep_first_audio_series_id: None,
-                },
-                "series-1",
-                Some("Filmly/2.12.3-423")
-            ),
-            Some(FilmlyMediaStreamAbProfile::OmitAll)
-        );
-        assert_eq!(
-            filmly_media_stream_profile_for_series(
-                FilmlyMediaStreamAbSeriesConfig {
-                    matrix_profile: None,
-                    no_media_streams_series_id: Some("series-1"),
-                    no_subtitles_series_id: None,
-                    strip_advanced_video_fields_series_id: None,
-                    keep_first_video_series_id: None,
-                    keep_first_audio_series_id: None,
-                },
-                "series-1",
-                Some("VidHub/1.0")
-            ),
-            None
-        );
-        assert_eq!(
-            filmly_media_stream_profile_for_series(
-                FilmlyMediaStreamAbSeriesConfig {
-                    matrix_profile: None,
-                    no_media_streams_series_id: Some("series-1"),
-                    no_subtitles_series_id: None,
-                    strip_advanced_video_fields_series_id: None,
-                    keep_first_video_series_id: None,
-                    keep_first_audio_series_id: None,
-                },
-                "series-2",
-                Some("Filmly/2.12.3-423")
-            ),
-            None
-        );
+    fn filmly_episode_normalization_is_scoped_to_filmly_user_agents() {
+        assert!(is_filmly_user_agent("Filmly/2.12.3-423"));
+        assert!(is_filmly_user_agent("网易爆米花/2.12.3-423"));
+        assert!(!is_filmly_user_agent("VidHub/1.0"));
     }
 
     #[test]

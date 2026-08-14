@@ -332,11 +332,28 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(episodes_from_season_body["Items"][0]["IndexNumber"], 1);
     assert_eq!(episodes_from_season_body["Items"][0]["Index"], 1);
 
+    let vidhub_episodes = client
+        .get(format!(
+            "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Fields=BasicSyncInfo,Overview,ProviderIds,Path,Size,People,RuntimeTicks,Chapters,MediaSources,CanDownload&Limit=10",
+            admin.id
+        ))
+        .header("User-Agent", "VidHub/1.0")
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(vidhub_episodes.status(), reqwest::StatusCode::OK);
+    let vidhub_episodes_body: Value = vidhub_episodes.json().await?;
+    assert!(
+        vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Language"]
+            .is_null()
+    );
+
     let filmly_episodes = client
         .get(format!(
             "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Fields=BasicSyncInfo,Overview,ProviderIds,Path,Size,People,RuntimeTicks,Chapters,MediaSources,CanDownload&Limit=10",
             admin.id
         ))
+        .header("User-Agent", "Filmly/2.12.3-423")
         .header(headers[0].0, headers[0].1)
         .send()
         .await?;
@@ -377,6 +394,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(
         filmly_episode["MediaSources"][0]["MediaStreams"][0]["Width"],
         1920
+    );
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["MediaStreams"][0]["Language"],
+        "und"
     );
 
     let episode_primary_image = client
