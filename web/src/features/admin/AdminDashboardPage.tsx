@@ -25,6 +25,16 @@ export function AdminDashboardPage() {
     if (dashboard.data) setServerName(dashboard.data.server.name);
   }, [dashboard.data]);
 
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+
+    const name = (serverName ?? dashboard.data?.server.name)?.trim();
+    document.title = name ? `${name} - Lux` : "Lux";
+    return () => {
+      document.title = "Lux";
+    };
+  }, [dashboard.data?.server.name, serverName]);
+
   const openServerNameEditor = () => {
     setDraftServerName((serverName ?? dashboard.data?.server.name ?? "").trim());
     setNameEditorOpen(true);

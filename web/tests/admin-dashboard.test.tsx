@@ -109,6 +109,7 @@ describe("AdminDashboardPage", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    document.title = "Lux";
     vi.restoreAllMocks();
   });
 
@@ -132,6 +133,7 @@ describe("AdminDashboardPage", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-server-name")?.textContent).toBe("客厅 Lux"));
     });
+    expect(document.title).toBe("客厅 Lux - Lux");
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.adminDashboard })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.liveDashboard);
     expect(load).toHaveBeenCalledOnce();
