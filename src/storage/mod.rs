@@ -772,6 +772,7 @@ impl Database {
         self.query_scalar(
             "SELECT id FROM media_items
              WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
              ORDER BY CASE item_type
                           WHEN 'SERIES' THEN 0
                           WHEN 'SEASON' THEN 1

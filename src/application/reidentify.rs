@@ -394,7 +394,12 @@ impl MetadataReidentifyService {
     async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
         let result = match self.database.find_media_item_metadata(item_id).await {
             Ok(Some(item)) => {
-                if item.title.trim().is_empty() {
+                if !matches!(
+                    item.item_type.as_str(),
+                    "MOVIE" | "SERIES" | "SEASON" | "EPISODE"
+                ) {
+                    Ok(0)
+                } else if item.title.trim().is_empty() {
                     Err(MetadataReidentifyError::InvalidSearch)
                 } else {
                     let skip = if matches!(mode, MetadataRefreshMode::FillMissing) {

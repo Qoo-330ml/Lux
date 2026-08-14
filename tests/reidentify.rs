@@ -92,6 +92,51 @@ async fn delayed_tmdb_stub(AxumState(tracker): AxumState<ConcurrencyTracker>) ->
     tmdb_search_stub().await
 }
 
+async fn setup_movie_library_with_parent_folder()
+-> Result<(tempfile::TempDir, Database, String, String), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Batch Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Batch.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let folder_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'FOLDER' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    Ok((temp_dir, database, library.id.to_string(), folder_id))
+}
+
+fn unreachable_tmdb_provider() -> Result<TmdbProvider, Box<dyn std::error::Error>> {
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: "http://127.0.0.1:1".to_owned(),
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_millis(100),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        ..TmdbClientConfig::default()
+    })?;
+    Ok(TmdbProvider::from(tmdb))
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)
@@ -129,9 +174,12 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
 
     let tmdb_app = Router::new().fallback(any(tmdb_search_stub));
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -733,5 +781,33 @@ async fn library_metadata_job_processes_items_concurrently()
     assert_eq!(completed.status, "COMPLETED");
     assert!(tracker.maximum.load(Ordering::SeqCst) > 1);
     tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_metadata_job_excludes_parent_folders() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
+
+    let job = metadata.create_library_job(&library_id).await?;
+
+    assert_eq!(job.total_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_job_skips_explicit_parent_folder_without_failing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
+
+    let job = metadata.create_job(vec![folder_id]).await?;
+    metadata.run(&job.id).await;
+
+    let finished = metadata.get_job(&job.id).await?;
+    assert_eq!(finished.status, "COMPLETED");
+    assert_eq!(finished.processed_count, 1);
     Ok(())
 }
