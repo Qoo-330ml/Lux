@@ -1807,6 +1807,8 @@ struct EmbyItemsQuery {
     exclude_item_types: Option<String>,
     #[serde(rename = "SeasonId", default)]
     season_id: Option<String>,
+    #[serde(rename = "SearchTerm", alias = "searchTerm", default)]
+    search_term: Option<String>,
     #[serde(rename = "StartIndex", default)]
     start_index: Option<i64>,
     #[serde(rename = "Limit", default)]
@@ -3019,6 +3021,25 @@ async fn emby_catalog_page_from_query(
     let Some(catalog) = state.catalog.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
+    if let Some(raw_query) = query.search_term.as_deref().map(str::trim)
+        && !raw_query.is_empty()
+    {
+        let (Some(search_query), Some(like_query)) = (
+            normalize_search_query(raw_query),
+            normalize_search_like_query(raw_query),
+        ) else {
+            return Ok(CatalogPage {
+                items: Vec::new(),
+                total: 0,
+                offset,
+                limit,
+            });
+        };
+        return catalog
+            .search_items(principal, &search_query, &like_query, offset, limit)
+            .await
+            .map_err(emby_catalog_error_status);
+    }
     let mut filter = catalog_filter_from_emby(query);
     let root_scope = match query.parent_id.as_deref() {
         Some(parent_id) => emby_parent_is_library(state, parent_id).await,
@@ -13521,7 +13542,6 @@ async fn admin_select_candidate(
 }
 
 fn metadata_selection_error(headers: &HeaderMap, error: MetadataSelectionError) -> Response {
-    eprintln!("metadata selection error: {error}");
     match error {
         MetadataSelectionError::ItemNotFound | MetadataSelectionError::CandidateNotFound => {
             api_error(
