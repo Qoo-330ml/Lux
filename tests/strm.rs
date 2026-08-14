@@ -133,10 +133,55 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         .json(&json!({ "Username": "admin", "Pw": "correct password" }))
         .send()
         .await?;
-    let token = login.json::<Value>().await?["AccessToken"]
+    let login_body = login.json::<Value>().await?;
+    let token = login_body["AccessToken"]
         .as_str()
         .ok_or("missing token")?
         .to_owned();
+    let user_id = login_body["User"]["Id"]
+        .as_str()
+        .ok_or("missing user id")?
+        .to_owned();
+
+    let popcorn_detail = client
+        .get(format!(
+            "http://{address}/emby/Users/{user_id}/Items/{remote_item_id}?Fields=ShareLevel"
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(popcorn_detail.status(), reqwest::StatusCode::OK);
+    let popcorn_detail_body = popcorn_detail.json::<Value>().await?;
+    assert!(popcorn_detail_body["MediaSources"].is_array());
+    assert_eq!(
+        popcorn_detail_body["MediaSources"][0]["Id"],
+        remote_source_id
+    );
+
+    let popcorn_playback = client
+        .post(format!(
+            "http://{address}/emby/Items/{remote_item_id}/PlaybackInfo"
+        ))
+        .header("X-Emby-Token", &token)
+        .query(&[
+            ("UserId", user_id.as_str()),
+            ("MediaSourceId", remote_source_id.as_str()),
+            ("IsPlayback", "true"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(popcorn_playback.status(), reqwest::StatusCode::OK);
+    let popcorn_playback_body = popcorn_playback.json::<Value>().await?;
+    assert_eq!(
+        popcorn_playback_body["MediaSources"][0]["Id"],
+        remote_source_id
+    );
+    assert_eq!(
+        popcorn_playback_body["MediaSources"][0]["SupportsDirectPlay"],
+        true
+    );
+    assert!(popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"].is_null());
+
     let playback = client
         .get(format!(
             "http://{address}/Items/{remote_item_id}/PlaybackInfo"
@@ -149,10 +194,8 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     assert_eq!(body["MediaSources"][0]["Protocol"], "Http");
     assert_eq!(body["MediaSources"][0]["IsRemote"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
-    assert_eq!(
-        body["MediaSources"][0]["DirectStreamUrl"],
-        "https://media.example.test/video?id=7&token=secret"
-    );
+    assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
+    assert!(body["MediaSources"][0]["DirectStreamUrl"].is_null());
 
     let path_playback = client
         .get(format!(

@@ -171,16 +171,16 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Videos/{itemId}/{mediaSourceId}/Subtitles/{streamIndex}/Stream`：按指定媒体源读取外挂字幕。
 - `GET|HEAD /Items/{itemId}/Subtitles/{streamIndex}/Stream`：按条目读取默认媒体源的外挂字幕。
 - `GET|HEAD /Videos/{itemId}/stream`、`/Videos/{itemId}/stream.{container}`：读取默认媒体源；同时接受客户端常用的小写 `/videos` 变体。
-- `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定媒体源；本地源返回文件流，`.strm` 源返回临时重定向到首个非空外部 URL。
+- `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定媒体源；本地源返回文件流，HTTP `.strm` 源返回临时重定向到首个非空外部 URL，路径型/其他 `.strm` 源按解析器结果返回 `307 Location`。
 - `GET|HEAD /Items/{itemId}/Download`：需要 `can_download` 和媒体库 ACL，返回所选单个媒体源的附件下载流；不打包同目录旁车文件。`mediaSourceId` 可选择源，`LOCAL_FILE` 直接读取库内文件，`STRM_URL` 读取 `.strm` 的首个非空 URL 后由 Lux 流式转发远程资源。
 - `GET|HEAD /api/v1/items/{itemId}/download`：Lux 下载端点，需要 Web session、`can_download` 和媒体库 ACL；返回所选单个媒体源，不打包 ZIP。`sourceId` 可选择源；本地源直接流式读取，`.strm` 读取首个非空远程 URL 并由 Lux 请求、流式转发该资源，不返回 `.strm` 文本。
-- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流、DirectPlay 能力和服务端生成的 `PlaySessionId`；支持 `MediaSourceId` 显式选择，当前不声明转码或 DirectStream。每个媒体源可带 `Edition`/`Quality` 版本标签。
+- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流、DirectPlay 能力和服务端生成的 `PlaySessionId`；支持 `MediaSourceId` 显式选择，支持 DirectPlay/DirectStream，不声明转码。每个媒体源可带 `Edition`/`Quality` 版本标签。
 - 本地媒体源的 `MediaSources.Container` 使用实际文件扩展名（例如 `mkv`、`mp4`），不暴露 ffprobe 的复合 `format_name`。`DirectStreamUrl` 通过 `MediaSourceId` 定位源；`stream.{container}` 的后缀仅作兼容性后缀，服务端仍按媒体源记录读取文件。
 - `MediaSources.Path` 对 `.strm` 源返回旁车记录中的外部媒体地址；`MediaStreams` 除基础轨道字段外，还返回旁车中的分辨率、画面比例、码率、色深、帧率、Profile、像素格式、声道布局和采样率等已验证字段。
 - `MediaStreams` 不返回 Matroska/MP4 中标记为 `attached_pic` 的封面附加图轨，避免客户端将封面误认为可播放视频轨。
 - `GET /Items/{collectionId}/Children`：返回按当前用户媒体库权限过滤的合集成员。
 
-`.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 和原始 `DirectStreamUrl` 返回；服务端不请求、不验证、不代理该 URL。若客户端仍按 Emby 习惯请求 Lux 的 `/Videos/.../stream` 地址，Lux 仅返回 `307 Location` 让客户端直连该外部 URL，不代理媒体字节。具有媒体库访问权限的客户端会直接获得该地址，因此 URL 中的令牌也会按产品设计暴露给客户端。
+`.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 返回；`Path` 保存原始绝对上游地址，`DirectStreamUrl` 缺省（`null`），与普通 Emby 服务器一致，客户端按标准 `/Videos/.../stream` 端点发起播放。该端点对 HTTP `.strm` 返回 `307 Location` 到首个非空外部 URL，让客户端自行跟随上游重定向；路径型/其他目标由解析器处理并返回 `307 Location`。具有媒体库访问权限的客户端仍可能获得包含令牌的上游地址，因此 URL 中的令牌仍按产品设计明文保存和返回。
 
 - `GET /Sessions`：返回当前用户的活动播放会话；管理员可查看全部活动会话。每个会话按 Emby 兼容字段返回 `Client`、`DeviceName`、`DeviceId`、`DeviceType`、`ApplicationVersion` 和 `RemoteEndPoint`；无法获得的值为 `null`。
 - `POST /Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`：幂等记录播放事件，并将位置单调写入用户状态；事件体中的设备/客户端字段优先，缺失时从上述认证头回填。
@@ -195,7 +195,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 媒体 DTO 只返回客户端所需的标题、年份、简介、时长、容器、大小、码率和轨道信息，不返回服务器内部文件路径。图片内容端点属于 LUX-035。
 
-媒体探测对本地文件使用 ffprobe；`.strm` 源优先读取同名 `-mediainfo.json` 和 NFO 的 `<fileinfo><streamdetails>`。管理员显式创建 STRM 探测任务后，宿主才会按 URL 安全策略调用 `org.lux.strm-media-info`，成功结果写入媒体源/媒体流并可选写回兼容旁车。播放和 PlaybackInfo 请求本身不访问外部地址，首次播放仍由客户端直连。旁车内容和插件结果只接受受限字段，不写入原始 ffprobe JSON、完整 URL 或凭据。
+媒体探测对本地文件使用 ffprobe；`.strm` 源优先读取同名 `-mediainfo.json` 和 NFO 的 `<fileinfo><streamdetails>`。管理员显式创建 STRM 探测任务后，宿主才会按 URL 安全策略调用 `org.lux.strm-media-info`，成功结果写入媒体源/媒体流并可选写回兼容旁车。PlaybackInfo 请求本身不访问外部地址；HTTP `.strm` 的播放入口只为解析重定向访问上游响应头，媒体内容仍由客户端按最终地址直连。旁车内容和插件结果只接受受限字段，不写入原始 ffprobe JSON、完整 URL 或凭据。
 
 ## 媒体库 ACL（LUX-036）
 

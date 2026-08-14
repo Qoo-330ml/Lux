@@ -1782,6 +1782,8 @@ struct EmbyItemsQuery {
     api_key: Option<String>,
     #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
     user_id: Option<String>,
+    #[serde(rename = "SeriesId", alias = "seriesId", default)]
+    series_id: Option<String>,
     #[serde(rename = "ParentId", default)]
     parent_id: Option<String>,
     #[serde(rename = "Ids", default)]
@@ -1810,6 +1812,8 @@ struct EmbyItemsQuery {
     fields: Option<String>,
     #[serde(rename = "GroupItems", default)]
     group_items: Option<bool>,
+    #[serde(rename = "EnableTotalRecordCount", default)]
+    enable_total_record_count: Option<bool>,
     #[serde(rename = "Recursive", default)]
     recursive: Option<bool>,
 }
@@ -1840,6 +1844,19 @@ fn emby_fields_include(fields: Option<&str>, field: &str) -> bool {
             .map(str::trim)
             .any(|value| value.eq_ignore_ascii_case(field))
     })
+}
+
+/// Filmly sends `ShareLevel` as a capability hint on item detail requests. It
+/// is not a field selector, so discard it before applying the Emby field
+/// projection; if it is the only value, keep the normal full-detail response.
+fn emby_detail_fields(fields: Option<&str>) -> Option<String> {
+    let fields = fields?;
+    let filtered = fields
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty() && !field.eq_ignore_ascii_case("ShareLevel"))
+        .collect::<Vec<_>>();
+    (!filtered.is_empty()).then(|| filtered.join(","))
 }
 
 fn normalize_emby_item_type(value: &str) -> Option<String> {
@@ -2398,18 +2415,21 @@ async fn emby_next_up_response(
         .list_next_up(
             AccessPrincipal::new(user.id, user.is_admin),
             user_id,
+            query.series_id.as_deref(),
             offset,
             limit,
         )
         .await
     {
         Ok(page) => {
-            emby_catalog_page_for_user_with_fields(
+            emby_catalog_page_for_user_with_preferred_source(
                 state,
                 user_id,
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
+                None,
+                query.enable_total_record_count != Some(false),
             )
             .await
         }
@@ -2481,26 +2501,64 @@ async fn emby_show_episodes(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match catalog
-        .list_series_episodes(
-            AccessPrincipal::new(user.id, user.is_admin),
-            &series_id,
-            query.season_id.as_deref(),
-            offset,
-            limit,
-        )
-        .await
-    {
+    // Emby clients commonly serialize an unset season selector as `SeasonId=`.
+    // Treat it the same as an omitted selector instead of looking up an empty ID.
+    let season_id = query.season_id.as_deref().and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()
+            && !value.eq_ignore_ascii_case("null")
+            && !value.eq_ignore_ascii_case("undefined"))
+        .then_some(value)
+    });
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let episodes = catalog
+        .list_series_episodes(principal, &series_id, season_id, offset, limit)
+        .await;
+    let normalize_filmly_null_languages =
+        header_str(&headers, "user-agent").is_some_and(is_filmly_user_agent);
+    match episodes {
         Ok(page) => {
-            emby_catalog_page_for_user_with_fields(
+            emby_catalog_page_for_user_with_preferred_source_and_options(
                 &state,
                 &user.id.to_string(),
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
+                EmbyCatalogPageOptions {
+                    preferred_source_id: None,
+                    include_start_index: true,
+                    normalize_filmly_null_languages,
+                },
             )
             .await
         }
+        // VidHub can retain a stale season identifier after a library refresh.
+        // Emby still serves the show's episode list in that case; retry without
+        // the optional season filter so one stale selector cannot blank the page.
+        Err(CatalogError::LibraryNotFound) if season_id.is_some() => match catalog
+            .list_series_episodes(principal, &series_id, None, offset, limit)
+            .await
+        {
+            Ok(page) => {
+                emby_catalog_page_for_user_with_preferred_source_and_options(
+                    &state,
+                    &user.id.to_string(),
+                    &page,
+                    query.fields.as_deref(),
+                    user.can_download,
+                    EmbyCatalogPageOptions {
+                        preferred_source_id: None,
+                        include_start_index: true,
+                        normalize_filmly_null_languages,
+                    },
+                )
+                .await
+            }
+            Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+                StatusCode::NOT_FOUND.into_response()
+            }
+            Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::NOT_FOUND.into_response()
         }
@@ -2579,22 +2637,56 @@ async fn emby_catalog_page_for_user_with_preferred_source(
     preferred_source_id: Option<&str>,
     include_start_index: bool,
 ) -> Response {
+    emby_catalog_page_for_user_with_preferred_source_and_options(
+        state,
+        user_id,
+        page,
+        fields,
+        can_download,
+        EmbyCatalogPageOptions {
+            preferred_source_id,
+            include_start_index,
+            normalize_filmly_null_languages: false,
+        },
+    )
+    .await
+}
+
+struct EmbyCatalogPageOptions<'a> {
+    preferred_source_id: Option<&'a str>,
+    include_start_index: bool,
+    normalize_filmly_null_languages: bool,
+}
+
+async fn emby_catalog_page_for_user_with_preferred_source_and_options(
+    state: &AppState,
+    user_id: &str,
+    page: &CatalogPage,
+    fields: Option<&str>,
+    can_download: bool,
+    options: EmbyCatalogPageOptions<'_>,
+) -> Response {
     match emby_catalog_items_for_user_with_preferred_source(
         state,
         user_id,
         page,
         fields,
         can_download,
-        preferred_source_id,
+        options.preferred_source_id,
     )
     .await
     {
-        Ok(items) => {
+        Ok(mut items) => {
+            if options.normalize_filmly_null_languages {
+                normalize_filmly_null_languages(&mut items);
+            }
             let mut body = json!({
                 "Items": items,
                 "TotalRecordCount": page.total,
             });
-            if include_start_index && let Value::Object(object) = &mut body {
+            if options.include_start_index
+                && let Value::Object(object) = &mut body
+            {
                 object.insert("StartIndex".to_owned(), json!(page.offset));
             }
             Json(body).into_response()
@@ -2659,10 +2751,16 @@ async fn emby_catalog_items_for_user_with_preferred_source(
     }
     let mut items = Vec::with_capacity(catalog_items.len());
     for item in &catalog_items {
+        let nfo = if emby_nfo_fields_requested(fields) {
+            read_local_nfo_details(state, &item.id).await
+        } else {
+            None
+        };
         let mut value = emby_catalog_item_json_with_state(
             item,
             &state.server_id,
             user_states.get(&item.id),
+            nfo.as_ref(),
             can_download,
             fields,
         );
@@ -2674,6 +2772,29 @@ async fn emby_catalog_items_for_user_with_preferred_source(
         {
             let source = sources.remove(index);
             sources.insert(0, source);
+        }
+        if fields.is_some_and(|fields| emby_fields_include(Some(fields), "People")) {
+            let actors = match state.people.as_ref() {
+                Some(people) => match people.list_item_actors(&item.id).await {
+                    Ok(actors) => actors,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %item.id,
+                            %error,
+                            "derived actor relation is unavailable for Emby list response"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+            if let Value::Object(object) = &mut value {
+                let mut people = actors.into_iter().map(emby_person_json).collect::<Vec<_>>();
+                if let Some(nfo) = nfo.as_ref() {
+                    people.extend(emby_nfo_crew_json(nfo));
+                }
+                object.insert("People".to_owned(), Value::Array(people));
+            }
         }
         items.push(value);
     }
@@ -2817,12 +2938,41 @@ async fn emby_list_items(
                 query.fields.as_deref(),
                 can_download,
                 preferred_source_id,
-                false,
+                emby_query_requests_series_children(state, principal, query).await,
             )
             .await
         }
         Err(status) => status.into_response(),
     }
+}
+
+async fn emby_query_requests_series_children(
+    state: &AppState,
+    principal: AccessPrincipal,
+    query: &EmbyItemsQuery,
+) -> bool {
+    if query.include_item_types.as_deref().is_some_and(|types| {
+        types.split(',').any(|item_type| {
+            matches!(
+                item_type.trim().to_ascii_lowercase().as_str(),
+                "season" | "episode"
+            )
+        })
+    }) {
+        return true;
+    }
+    // Emby infers the child type from ParentId when IncludeItemTypes is omitted.
+    // VidHub uses this compact form on the series detail screen.
+    let Some(parent_id) = query.parent_id.as_deref() else {
+        return false;
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return false;
+    };
+    matches!(
+        catalog.find_item(principal, parent_id).await,
+        Ok(Some(item)) if matches!(item.item_type.as_str(), "SERIES" | "SEASON")
+    )
 }
 
 fn emby_query_targets_user_root_views(query: &EmbyItemsQuery, root_id: &str) -> bool {
@@ -2969,12 +3119,13 @@ async fn emby_item(
         Err(status) => return status.into_response(),
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let fields = emby_detail_fields(query.fields.as_deref());
     emby_item_response(
         &state,
         principal,
         &item_id,
         user.can_download,
-        query.fields.as_deref(),
+        fields.as_deref(),
     )
     .await
 }
@@ -2993,12 +3144,13 @@ async fn emby_user_item(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let fields = emby_detail_fields(query.fields.as_deref());
     emby_item_response(
         &state,
         principal,
         &item_id,
         user.can_download,
-        query.fields.as_deref(),
+        fields.as_deref(),
     )
     .await
 }
@@ -3060,6 +3212,7 @@ async fn emby_item_response(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            let nfo = read_local_nfo_details(state, &item.id).await;
             let user_id = principal.user_id.to_string();
             let user_state = match database.find_user_item_state(&user_id, item_id).await {
                 Ok(state) => state,
@@ -3070,10 +3223,13 @@ async fn emby_item_response(
                 &item,
                 &state.server_id,
                 user_state.as_ref(),
-                can_download,
-                fields,
-                aspect_ratio,
-                true,
+                EmbyItemJsonOptions {
+                    nfo: nfo.as_ref(),
+                    can_download,
+                    fields,
+                    primary_image_aspect_ratio: aspect_ratio,
+                    include_top_level_media_streams: true,
+                },
             );
             let actors = match state.people.as_ref() {
                 Some(people) => match people.list_item_actors(&item.id).await {
@@ -3090,10 +3246,11 @@ async fn emby_item_response(
                 None => Vec::new(),
             };
             if let Value::Object(object) = &mut item_json {
-                object.insert(
-                    "People".to_owned(),
-                    Value::Array(actors.into_iter().map(emby_person_json).collect()),
-                );
+                let mut people = actors.into_iter().map(emby_person_json).collect::<Vec<_>>();
+                if let Some(nfo) = nfo.as_ref() {
+                    people.extend(emby_nfo_crew_json(nfo));
+                }
+                object.insert("People".to_owned(), Value::Array(people));
             }
             Json(item_json).into_response()
         }
@@ -3174,6 +3331,66 @@ fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
         "Role": actor.character,
         "Type": "Actor",
         "PrimaryImageTag": image_tag,
+    })
+}
+
+fn emby_nfo_crew_json(nfo: &LocalNfoDetails) -> Vec<Value> {
+    let mut people = Vec::with_capacity(nfo.directors.len() + nfo.writers.len());
+    for (person_type, credits) in [("Director", &nfo.directors), ("Writer", &nfo.writers)] {
+        for credit in credits {
+            let mut person = json!({
+                "Name": credit.name,
+                "Type": person_type,
+            });
+            if !credit.provider_id.is_empty()
+                && let Value::Object(object) = &mut person
+            {
+                object.insert("Id".to_owned(), json!(credit.provider_id));
+            }
+            people.push(person);
+        }
+    }
+    people
+}
+
+async fn read_local_nfo_details(state: &AppState, item_id: &str) -> Option<LocalNfoDetails> {
+    let store = state.local_nfo.as_ref()?;
+    match store.read_item(item_id).await {
+        Ok(details) => details,
+        Err(error) => {
+            tracing::warn!(
+                item_id,
+                %error,
+                "derived local NFO cache is unavailable for Emby response"
+            );
+            None
+        }
+    }
+}
+
+fn emby_nfo_fields_requested(fields: Option<&str>) -> bool {
+    const NFO_FIELDS: [&str; 16] = [
+        "CommunityRating",
+        "PremiereDate",
+        "EndDate",
+        "RunTimeTicks",
+        "OriginalLanguage",
+        "Status",
+        "OfficialRating",
+        "ProviderIds",
+        "Taglines",
+        "Genres",
+        "GenreItems",
+        "Studios",
+        "RemoteTrailers",
+        "ExternalUrls",
+        "HomePageUrl",
+        "People",
+    ];
+    fields.is_none_or(|fields| {
+        NFO_FIELDS
+            .iter()
+            .any(|field| emby_fields_include(Some(fields), field))
     })
 }
 
@@ -3971,6 +4188,7 @@ fn emby_catalog_item_json_with_state(
     item: &CatalogItem,
     server_id: &str,
     user_state: Option<&crate::storage::StoredUserItemState>,
+    nfo: Option<&LocalNfoDetails>,
     can_download: bool,
     fields: Option<&str>,
 ) -> Value {
@@ -3978,22 +4196,37 @@ fn emby_catalog_item_json_with_state(
         item,
         server_id,
         user_state,
-        can_download,
-        fields,
-        None,
-        false,
+        EmbyItemJsonOptions {
+            nfo,
+            can_download,
+            fields,
+            primary_image_aspect_ratio: None,
+            include_top_level_media_streams: false,
+        },
     )
+}
+
+struct EmbyItemJsonOptions<'a> {
+    nfo: Option<&'a LocalNfoDetails>,
+    can_download: bool,
+    fields: Option<&'a str>,
+    primary_image_aspect_ratio: Option<f64>,
+    include_top_level_media_streams: bool,
 }
 
 fn emby_catalog_item_json_with_state_and_aspect_ratio(
     item: &CatalogItem,
     server_id: &str,
     user_state: Option<&crate::storage::StoredUserItemState>,
-    can_download: bool,
-    fields: Option<&str>,
-    primary_image_aspect_ratio: Option<f64>,
-    include_top_level_media_streams: bool,
+    options: EmbyItemJsonOptions<'_>,
 ) -> Value {
+    let EmbyItemJsonOptions {
+        nfo,
+        can_download,
+        fields,
+        primary_image_aspect_ratio,
+        include_top_level_media_streams,
+    } = options;
     let default_source = item
         .media_sources
         .iter()
@@ -4011,6 +4244,13 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
     });
     let mut image_tags = serde_json::Map::new();
     if let Some(tag) = item.poster_image_tag.as_ref() {
+        image_tags.insert("Primary".to_owned(), json!(tag));
+    } else if item.item_type == "EPISODE"
+        && let Some(tag) = item.thumb_image_tag.as_ref()
+    {
+        // Filmly requests episode thumbnails through the standard Primary
+        // image tag. A local Kodi-style `-thumb` image is the episode's
+        // primary artwork when no dedicated poster exists.
         image_tags.insert("Primary".to_owned(), json!(tag));
     }
     if let Some(tag) = item.logo_image_tag.as_ref() {
@@ -4051,6 +4291,29 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
     } else {
         None
     };
+    // Emby always exposes the series relationship on season and episode DTOs.
+    // Filmly uses the season's SeriesId to construct the subsequent Episodes URL.
+    let series_id = item
+        .series_id
+        .clone()
+        .or_else(|| (item.item_type == "SEASON").then(|| item.parent_id.clone())?);
+    let season_name = (item.item_type == "SEASON").then(|| item.title.clone());
+    let episode_season_name = (item.item_type == "EPISODE")
+        .then_some(item.season_number)
+        .flatten()
+        .map(|number| format!("Season {number:02}"));
+    let is_folder = matches!(
+        item.item_type.as_str(),
+        "SERIES" | "SEASON" | "BOX_SET" | "FOLDER"
+    );
+    // Emby advertises sync capability on item details for playable media and
+    // series containers. The list projection intentionally keeps the legacy
+    // compact capability shape used by existing clients.
+    let basic_sync_requested =
+        fields.is_some_and(|fields| emby_fields_include(Some(fields), "BasicSyncInfo"));
+    let supports_sync = (!is_folder || item.item_type == "SERIES")
+        && (include_top_level_media_streams
+            || (basic_sync_requested && item.item_type == "EPISODE"));
     let mut user_data = serde_json::Map::from_iter([
         (
             "PlaybackPositionTicks".to_owned(),
@@ -4075,6 +4338,11 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
     ]);
     if let Some(played_percentage) = played_percentage {
         user_data.insert("PlayedPercentage".to_owned(), json!(played_percentage));
+    }
+    if let Some(last_played_at) = user_state.and_then(|state| state.last_played_at) {
+        if let Some(last_played_date) = emby_timestamp(last_played_at) {
+            user_data.insert("LastPlayedDate".to_owned(), json!(last_played_date));
+        }
     }
 
     let mut object = serde_json::Map::from_iter([
@@ -4109,55 +4377,311 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
     if fields.is_none() {
         object.extend([
             ("SortName".to_owned(), json!(item.sort_title)),
-            ("OriginalTitle".to_owned(), json!(item.original_title)),
-            ("SupportsSync".to_owned(), json!(false)),
+            ("ForcedSortName".to_owned(), json!(item.sort_title)),
             (
-                "CollectionType".to_owned(),
-                json!((item.item_type == "BOX_SET").then_some("movies")),
+                "OriginalTitle".to_owned(),
+                json!(item.original_title.clone().unwrap_or_default()),
             ),
+            ("SupportsSync".to_owned(), json!(supports_sync)),
+            ("CanDelete".to_owned(), json!(false)),
+            ("LockData".to_owned(), json!(false)),
+            ("LockedFields".to_owned(), json!([])),
+            ("ExternalUrls".to_owned(), json!([])),
+            ("RemoteTrailers".to_owned(), json!([])),
+            ("Taglines".to_owned(), json!([])),
+            ("Genres".to_owned(), json!([])),
+            ("GenreItems".to_owned(), json!([])),
+            ("Studios".to_owned(), json!([])),
+            ("TagItems".to_owned(), json!([])),
+            ("LocalTrailerCount".to_owned(), json!(0)),
+            ("Etag".to_owned(), json!(emby_item_etag(&item.id))),
+            ("DisplayPreferencesId".to_owned(), json!(item.id)),
+            ("PresentationUniqueKey".to_owned(), json!(item.id)),
             (
-                "PrimaryImageItemId".to_owned(),
-                json!(item.poster_image_tag.as_ref().map(|_| item.id.clone())),
+                "ParentBackdropImageTags".to_owned(),
+                json!(item.series_fanart_image_tags),
             ),
-            ("SeriesId".to_owned(), json!(item.series_id)),
-            ("SeasonId".to_owned(), json!(season_id)),
-            ("IndexNumber".to_owned(), json!(index_number)),
-            ("ParentIndexNumber".to_owned(), json!(item.season_number)),
-            ("Index".to_owned(), json!(item.episode_number)),
-            ("ProductionYear".to_owned(), json!(item.production_year)),
-            ("PremiereDate".to_owned(), json!(item.premiere_date)),
             (
                 "ProviderIds".to_owned(),
                 json!(emby_provider_ids(&item.provider_ids)),
             ),
-            ("CommunityRating".to_owned(), json!(item.rating)),
-            ("Overview".to_owned(), json!(item.overview)),
-            ("RunTimeTicks".to_owned(), json!(runtime_ticks)),
-            (
-                "Container".to_owned(),
-                json!(default_source.and_then(|source| source.container.clone())),
-            ),
-            (
-                "Size".to_owned(),
-                json!(default_source.and_then(|source| source.size)),
-            ),
-            (
-                "Bitrate".to_owned(),
-                json!(default_source.and_then(|source| source.bitrate)),
-            ),
-            ("CanDownload".to_owned(), json!(can_download)),
-            ("ChildCount".to_owned(), json!(child_count)),
-            ("RecursiveItemCount".to_owned(), json!(recursive_item_count)),
+            ("CanDownload".to_owned(), json!(can_download && !is_folder)),
         ]);
+        // Emby always emits the item's creation/modification timestamps and a
+        // filesystem path on detail DTOs. Lux ids are UUIDv7, so the embedded
+        // timestamp is the real item creation time; the path is a stable,
+        // harmless label because Lux never reveals real local paths.
+        if let Some(created) = emby_item_timestamp(&item.id) {
+            object.insert("DateCreated".to_owned(), json!(created));
+            object.insert("DateModified".to_owned(), json!(created));
+        }
+        object.insert(
+            "Path".to_owned(),
+            json!(emby_safe_path(item, default_source)),
+        );
+        if matches!(item.item_type.as_str(), "MOVIE" | "SERIES") {
+            object.insert("OfficialRating".to_owned(), json!(""));
+        }
+        if item.item_type == "SERIES" {
+            object.extend([
+                ("AirDays".to_owned(), json!([])),
+                ("DisplayOrder".to_owned(), json!("Aired")),
+            ]);
+            emby_insert_optional(&mut object, "Status", item.status.clone().map(Value::from));
+        }
+        if let Some(file_name) = emby_file_name(item, default_source) {
+            object.insert("FileName".to_owned(), json!(file_name));
+        }
+        if !is_folder {
+            emby_insert_optional(&mut object, "PartCount", default_source.map(|_| json!(1)));
+            emby_insert_optional(
+                &mut object,
+                "Container",
+                default_source
+                    .and_then(|source| source.container.clone())
+                    .map(Value::from),
+            );
+            emby_insert_optional(
+                &mut object,
+                "Size",
+                default_source
+                    .and_then(|source| source.size)
+                    .map(Value::from),
+            );
+            emby_insert_optional(
+                &mut object,
+                "Bitrate",
+                default_source
+                    .and_then(|source| source.bitrate)
+                    .map(Value::from),
+            );
+            if let Some(width) = emby_video_stream_dimension(default_source, "Width") {
+                object.insert("Width".to_owned(), json!(width));
+            }
+            if let Some(height) = emby_video_stream_dimension(default_source, "Height") {
+                object.insert("Height".to_owned(), json!(height));
+            }
+        }
+        emby_insert_optional(
+            &mut object,
+            "CollectionType",
+            (item.item_type == "BOX_SET").then(|| json!("movies")),
+        );
+        emby_insert_optional(
+            &mut object,
+            "PrimaryImageItemId",
+            item.poster_image_tag
+                .as_ref()
+                .map(|_| json!(item.id.clone())),
+        );
+        emby_insert_optional(
+            &mut object,
+            "SeriesId",
+            series_id.as_ref().map(|value| json!(value)),
+        );
+        emby_insert_optional(
+            &mut object,
+            "SeriesName",
+            item.series_name.clone().map(Value::from),
+        );
+        emby_insert_optional(
+            &mut object,
+            "SeriesPrimaryImageTag",
+            item.series_primary_image_tag.clone().map(Value::from),
+        );
+        let episode_season_name = (item.item_type == "EPISODE")
+            .then_some(item.season_number)
+            .flatten()
+            .map(|number| format!("Season {number:02}"));
+        emby_insert_optional(
+            &mut object,
+            "SeasonName",
+            season_name.or(episode_season_name).map(Value::from),
+        );
+        emby_insert_optional(
+            &mut object,
+            "ParentLogoItemId",
+            series_id.as_ref().map(|value| json!(value)),
+        );
+        emby_insert_optional(
+            &mut object,
+            "ParentBackdropItemId",
+            series_id.as_ref().map(|value| json!(value)),
+        );
+        emby_insert_optional(
+            &mut object,
+            "SeasonId",
+            season_id.as_ref().map(|value| json!(value)),
+        );
+        emby_insert_optional(&mut object, "IndexNumber", index_number.map(Value::from));
+        emby_insert_optional(
+            &mut object,
+            "ParentIndexNumber",
+            item.season_number.map(Value::from),
+        );
+        emby_insert_optional(&mut object, "Index", item.episode_number.map(Value::from));
+        emby_insert_optional(
+            &mut object,
+            "ProductionYear",
+            item.production_year.map(Value::from),
+        );
+        emby_insert_optional(
+            &mut object,
+            "PremiereDate",
+            emby_datetime(item.premiere_date.as_deref()),
+        );
+        emby_insert_optional(&mut object, "CommunityRating", item.rating.map(Value::from));
+        emby_insert_optional(
+            &mut object,
+            "Overview",
+            item.overview.clone().map(Value::from),
+        );
+        emby_insert_optional(&mut object, "RunTimeTicks", runtime_ticks.map(Value::from));
+        emby_insert_optional(&mut object, "ChildCount", child_count.map(Value::from));
+        emby_insert_optional(
+            &mut object,
+            "RecursiveItemCount",
+            recursive_item_count.map(Value::from),
+        );
+        if item.item_type == "EPISODE" {
+            emby_insert_optional(
+                &mut object,
+                "ParentLogoImageTag",
+                item.series_logo_image_tag.clone().map(Value::from),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ParentThumbImageTag",
+                item.series_thumb_image_tag.clone().map(Value::from),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ParentThumbItemId",
+                series_id.as_ref().map(|value| json!(value)),
+            );
+        }
         if let Some(aspect_ratio) = primary_image_aspect_ratio {
             object.insert("PrimaryImageAspectRatio".to_owned(), json!(aspect_ratio));
         }
     } else {
+        if matches!(item.item_type.as_str(), "SEASON" | "EPISODE") {
+            emby_insert_optional(
+                &mut object,
+                "SeriesId",
+                series_id.as_ref().map(|value| json!(value)),
+            );
+            emby_insert_optional(
+                &mut object,
+                "SeriesName",
+                item.series_name.clone().map(|value| json!(value)),
+            );
+            emby_insert_optional(
+                &mut object,
+                "SeriesPrimaryImageTag",
+                item.series_primary_image_tag
+                    .clone()
+                    .map(|value| json!(value)),
+            );
+            emby_insert_optional(
+                &mut object,
+                "SeasonName",
+                season_name
+                    .clone()
+                    .or_else(|| episode_season_name.clone())
+                    .map(|value| json!(value)),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ParentLogoItemId",
+                series_id.clone().map(|value| json!(value)),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ParentBackdropItemId",
+                series_id.clone().map(|value| json!(value)),
+            );
+            object.insert(
+                "ParentBackdropImageTags".to_owned(),
+                json!(item.series_fanart_image_tags),
+            );
+            emby_insert_optional(
+                &mut object,
+                "IndexNumber",
+                index_number.map(|value| json!(value)),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ChildCount",
+                child_count.map(|value| json!(value)),
+            );
+            if item.item_type == "EPISODE" {
+                emby_insert_optional(
+                    &mut object,
+                    "SeasonId",
+                    season_id.clone().map(|value| json!(value)),
+                );
+                emby_insert_optional(
+                    &mut object,
+                    "ParentIndexNumber",
+                    item.season_number.map(|value| json!(value)),
+                );
+                emby_insert_optional(
+                    &mut object,
+                    "Index",
+                    item.episode_number.map(|value| json!(value)),
+                );
+            }
+        }
         if emby_fields_include(fields, "BasicSyncInfo") {
-            object.insert("SupportsSync".to_owned(), json!(false));
+            object.insert("SupportsSync".to_owned(), json!(supports_sync));
+        }
+        if emby_fields_include(fields, "DateModified") {
+            if let Some(modified) = emby_item_timestamp(&item.id) {
+                object.insert("DateModified".to_owned(), json!(modified));
+            }
+        }
+        if emby_fields_include(fields, "Path") {
+            object.insert(
+                "Path".to_owned(),
+                json!(emby_safe_path(item, default_source)),
+            );
         }
         if emby_fields_include(fields, "CanDownload") {
-            object.insert("CanDownload".to_owned(), json!(can_download));
+            object.insert("CanDownload".to_owned(), json!(can_download && !is_folder));
+        }
+        if emby_fields_include(fields, "Overview") {
+            emby_insert_optional(
+                &mut object,
+                "Overview",
+                item.overview.clone().map(Value::from),
+            );
+        }
+        if emby_fields_include(fields, "PremiereDate")
+            || (item.item_type == "EPISODE" && emby_fields_include(fields, "MediaSources"))
+        {
+            emby_insert_optional(
+                &mut object,
+                "PremiereDate",
+                emby_datetime(item.premiere_date.as_deref()),
+            );
+        }
+        if emby_fields_include(fields, "ProviderIds") {
+            object.insert(
+                "ProviderIds".to_owned(),
+                json!(emby_provider_ids(&item.provider_ids)),
+            );
+        }
+        if emby_fields_include(fields, "People") {
+            // Catalog pages do not load the potentially large people snapshot;
+            // preserve Emby's non-null collection contract for clients that
+            // map this field eagerly. Full item details add the populated list.
+            object.insert("People".to_owned(), json!([]));
+        }
+        if emby_fields_include(fields, "Genres") {
+            object.insert("Genres".to_owned(), json!([]));
+            object.insert("GenreItems".to_owned(), json!([]));
+        } else if emby_fields_include(fields, "GenreItems") {
+            object.insert("GenreItems".to_owned(), json!([]));
         }
         if emby_fields_include(fields, "ProductionYear") {
             emby_insert_optional(
@@ -4201,13 +4725,48 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 recursive_item_count.map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "Container") {
+        if emby_fields_include(fields, "Container") || emby_fields_include(fields, "MediaSources") {
             emby_insert_optional(
                 &mut object,
                 "Container",
                 default_source
                     .and_then(|source| source.container.clone())
                     .map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "Size") {
+            emby_insert_optional(
+                &mut object,
+                "Size",
+                default_source
+                    .and_then(|source| source.size)
+                    .map(|value| json!(value)),
+            );
+        }
+        if emby_fields_include(fields, "Bitrate") || emby_fields_include(fields, "MediaSources") {
+            emby_insert_optional(
+                &mut object,
+                "Bitrate",
+                default_source
+                    .and_then(|source| source.bitrate)
+                    .map(|value| json!(value)),
+            );
+        }
+        if item.item_type == "EPISODE" {
+            emby_insert_optional(
+                &mut object,
+                "ParentLogoImageTag",
+                item.series_logo_image_tag.clone().map(Value::from),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ParentThumbImageTag",
+                item.series_thumb_image_tag.clone().map(Value::from),
+            );
+            emby_insert_optional(
+                &mut object,
+                "ParentThumbItemId",
+                series_id.as_ref().map(|value| json!(value)),
             );
         }
         if emby_fields_include(fields, "PrimaryImageAspectRatio") {
@@ -4219,10 +4778,12 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
         }
     }
     let mut value = Value::Object(object);
-    let include_media_streams = fields.is_none()
-        || emby_fields_include(fields, "MediaStreams")
-        || (include_top_level_media_streams && emby_fields_include(fields, "MediaSources"));
-    if emby_fields_include(fields, "MediaSources")
+    let include_media_streams = !is_folder
+        && (fields.is_none()
+            || emby_fields_include(fields, "MediaStreams")
+            || emby_fields_include(fields, "MediaSources"));
+    if !is_folder
+        && emby_fields_include(fields, "MediaSources")
         && let Value::Object(object) = &mut value
     {
         object.insert(
@@ -4243,7 +4804,10 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
             ),
         );
     }
-    if include_top_level_media_streams && let Value::Object(object) = &mut value {
+    if !is_folder
+        && include_top_level_media_streams
+        && let Value::Object(object) = &mut value
+    {
         object.insert(
             "MediaStreams".to_owned(),
             Value::Array(
@@ -4253,7 +4817,8 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
             ),
         );
     }
-    if emby_fields_include(fields, "Chapters")
+    if !is_folder
+        && emby_fields_include(fields, "Chapters")
         && let Value::Object(object) = &mut value
     {
         object.insert(
@@ -4265,7 +4830,126 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
             ),
         );
     }
+    apply_emby_nfo_details(&mut value, item, nfo, fields);
     value
+}
+
+fn apply_emby_nfo_details(
+    value: &mut Value,
+    item: &CatalogItem,
+    nfo: Option<&LocalNfoDetails>,
+    fields: Option<&str>,
+) {
+    let Some(nfo) = nfo else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let include = |field: &str| emby_fields_include(fields, field);
+
+    if include("CommunityRating")
+        && let Some(rating) = nfo.rating
+    {
+        object.insert("CommunityRating".to_owned(), json!(rating));
+    }
+    if include("PremiereDate")
+        && let Some(date) = nfo
+            .premiered
+            .as_deref()
+            .or(nfo.release_date.as_deref())
+            .or(nfo.aired.as_deref())
+            .or(item.premiere_date.as_deref())
+    {
+        object.insert(
+            "PremiereDate".to_owned(),
+            emby_datetime(Some(date)).unwrap_or(Value::Null),
+        );
+    }
+    if include("EndDate")
+        && let Some(date) = nfo.last_air_date.as_deref()
+    {
+        object.insert(
+            "EndDate".to_owned(),
+            emby_datetime(Some(date)).unwrap_or(Value::Null),
+        );
+    }
+    if include("RunTimeTicks")
+        && let Some(runtime) = nfo.runtime
+        && let Some(runtime_ticks) = i64::from(runtime)
+            .checked_mul(60)
+            .and_then(|value| value.checked_mul(10_000_000))
+    {
+        object.insert("RunTimeTicks".to_owned(), json!(runtime_ticks));
+    }
+    if include("OriginalLanguage")
+        && let Some(language) = nfo.original_language.as_deref()
+    {
+        object.insert("OriginalLanguage".to_owned(), json!(language));
+    }
+    if include("Status")
+        && let Some(status) = nfo.status.as_deref()
+    {
+        object.insert("Status".to_owned(), json!(status));
+    }
+    if include("OfficialRating")
+        && let Some(certification) = nfo.certification.as_deref()
+    {
+        object.insert("OfficialRating".to_owned(), json!(certification));
+    }
+    if include("ProviderIds") {
+        let mut provider_ids = item.provider_ids.clone();
+        provider_ids.extend(nfo.provider_ids.clone());
+        object.insert(
+            "ProviderIds".to_owned(),
+            json!(emby_provider_ids(&provider_ids)),
+        );
+    }
+    if include("Taglines") && !nfo.tagline.as_deref().unwrap_or_default().is_empty() {
+        object.insert("Taglines".to_owned(), json!([nfo.tagline]));
+    }
+    if include("Genres") && !nfo.genres.is_empty() {
+        object.insert("Genres".to_owned(), json!(nfo.genres));
+    }
+    if include("GenreItems") && !nfo.genres.is_empty() {
+        object.insert(
+            "GenreItems".to_owned(),
+            json!(
+                nfo.genres
+                    .iter()
+                    .map(|name| json!({ "Name": name }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    if include("Studios") && !nfo.studios.is_empty() {
+        object.insert(
+            "Studios".to_owned(),
+            json!(
+                nfo.studios
+                    .iter()
+                    .map(|name| json!({ "Name": name }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    if include("RemoteTrailers") && !nfo.trailers.is_empty() {
+        let trailers = nfo
+            .trailers
+            .iter()
+            .enumerate()
+            .map(|(index, url)| json!({ "Url": url, "Name": format!("Trailer {}", index + 1) }))
+            .collect::<Vec<_>>();
+        object.insert("RemoteTrailers".to_owned(), json!(trailers));
+    }
+    if (include("ExternalUrls") || include("HomePageUrl"))
+        && let Some(website) = nfo.website.as_deref()
+    {
+        object.insert(
+            "ExternalUrls".to_owned(),
+            json!([{ "Name": "Website", "Url": website }]),
+        );
+    }
 }
 
 fn emby_insert_optional(
@@ -4276,6 +4960,120 @@ fn emby_insert_optional(
     if let Some(value) = value {
         object.insert(key.to_owned(), value);
     }
+}
+
+fn normalize_filmly_null_languages(items: &mut [Value]) {
+    for item in items {
+        let Some(sources) = item.get_mut("MediaSources").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for source in sources {
+            let Some(streams) = source.get_mut("MediaStreams").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for stream in streams {
+                if let Some(object) = stream.as_object_mut()
+                    && object.get("Language").is_some_and(Value::is_null)
+                {
+                    object.insert("Language".to_owned(), json!("und"));
+                }
+            }
+        }
+    }
+}
+
+/// Stable, server-local identifier that mirrors Emby's per-item Etag. Emby uses
+/// a content hash; Lux derives one from the item id so it stays stable across
+/// requests without leaking library paths.
+fn emby_item_etag(item_id: &str) -> String {
+    Sha256::digest(item_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Emby serializes timestamps as UTC with seven fractional digits, e.g.
+/// `2026-03-29T17:51:26.0000000Z`. Lux stores unix seconds in user state.
+fn emby_timestamp(unix_seconds: i64) -> Option<String> {
+    let datetime = time::OffsetDateTime::from_unix_timestamp(unix_seconds).ok()?;
+    Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.0000000Z",
+        datetime.year(),
+        u8::from(datetime.month()),
+        datetime.day(),
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second(),
+    ))
+}
+
+/// Emby exposes a display filename on every item DTO. Lux does not store source
+/// file names, so derive a stable, harmless label from the title and container.
+fn emby_file_name(item: &CatalogItem, default_source: Option<&CatalogSource>) -> Option<String> {
+    if matches!(
+        item.item_type.as_str(),
+        "SERIES" | "SEASON" | "BOX_SET" | "FOLDER"
+    ) {
+        return Some(item.title.clone());
+    }
+    let container = default_source
+        .and_then(|source| source.container.as_deref())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("strm");
+    Some(format!("{}.{}", item.title, container))
+}
+
+/// Emby always exposes a filesystem path on item DTOs. Lux never reveals real
+/// local paths, so synthesize a stable, harmless path from the library id and
+/// title; clients only display this value.
+fn emby_safe_path(item: &CatalogItem, default_source: Option<&CatalogSource>) -> String {
+    let title = &item.title;
+    if matches!(
+        item.item_type.as_str(),
+        "SERIES" | "SEASON" | "BOX_SET" | "FOLDER"
+    ) {
+        return format!("/media/{}/{title}", item.library_id);
+    }
+    let container = default_source
+        .and_then(|source| source.container.as_deref())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("strm");
+    format!("/media/{}/{title}.{container}", item.library_id)
+}
+
+/// Extracts the creation timestamp embedded in Lux's UUIDv7 item ids. The first
+/// 48 bits of a v7 uuid are Unix milliseconds, which is exactly when Lux
+/// generated the id for the media item. Non-v7 ids (imported/migrated data)
+/// return None and the field is omitted instead of emitting a fabricated value.
+fn emby_item_timestamp(item_id: &str) -> Option<String> {
+    let compact = item_id.replace('-', "");
+    if compact.len() != 32 || !compact.as_bytes().get(12).is_some_and(|byte| *byte == b'7') {
+        return None;
+    }
+    let millis = u64::from_str_radix(&compact[..12], 16).ok()?;
+    emby_timestamp(i64::try_from(millis / 1000).ok()?)
+}
+
+/// Reads a video stream dimension (Width or Height) from the default source's
+/// probe details, matching Emby's per-item Width/Height fields.
+fn emby_video_stream_dimension(
+    default_source: Option<&CatalogSource>,
+    emby_key: &str,
+) -> Option<i64> {
+    let stream = default_source?
+        .streams
+        .iter()
+        .find(|stream| stream.stream_type.eq_ignore_ascii_case("video"))?;
+    let value = stream
+        .details
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(emby_key))?
+        .1;
+    value.as_i64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+    })
 }
 
 async fn emby_primary_image_aspect_ratio(
@@ -4398,14 +5196,7 @@ fn emby_media_source_json_with_resolver_and_chapters(
         })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
-    let direct_stream_url = if source.source_kind == "LOCAL_FILE" {
-        Some(format!(
-            "/Videos/{item_id}/{}/stream{stream_suffix}",
-            source.id
-        ))
-    } else if is_remote {
-        source.external_url.clone()
-    } else if is_resolver_target {
+    let direct_stream_url = if source.source_kind == "LOCAL_FILE" || is_resolver_target {
         Some(format!(
             "/Videos/{item_id}/{}/stream{stream_suffix}",
             source.id
@@ -4414,6 +5205,7 @@ fn emby_media_source_json_with_resolver_and_chapters(
         None
     };
     let is_remote_playback = is_remote || is_resolver_target;
+    let is_playable = source.source_kind == "LOCAL_FILE" || is_remote_playback;
     let mut value = json!({
         "Id": source.id,
         "ItemId": item_id,
@@ -4430,8 +5222,9 @@ fn emby_media_source_json_with_resolver_and_chapters(
         "Protocol": if is_remote_playback { "Http" } else { "File" },
         "Type": "Default",
         "IsRemote": is_remote_playback,
-        "SupportsDirectPlay": direct_stream_url.is_some(),
-        "SupportsDirectStream": false,
+        "SupportsDirectPlay": is_playable,
+        "SupportsDirectStream": is_playable,
+        "SupportsProbing": !source.probe_status.eq_ignore_ascii_case("FAILED"),
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
         "DefaultAudioStreamIndex": source
@@ -4500,6 +5293,10 @@ fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -
         "Codec": stream.codec,
         "Language": stream.language,
         "DisplayTitle": stream.title,
+        "AttachmentSize": 0,
+        "IsAnamorphic": false,
+        "Protocol": if stream.is_external { "Http" } else { "File" },
+        "SupportsExternalStream": stream.is_external,
         "IsExternal": stream.is_external,
         "IsDefault": stream.is_default,
         "IsForced": stream.is_forced,
@@ -7055,9 +7852,13 @@ async fn emby_image(
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    // Filmly's native image loader drops Emby auth headers and image tags. Keep this
-    // exception limited to artwork requests from that client; media streams remain gated.
-    if filmly_compat && user.is_none() {
+    // Filmly's native image loader drops Emby auth headers and image tags. Its Windows
+    // WebView can also issue the backdrop request with a browser UA, so keep the exception
+    // limited to untagged backdrop artwork; media streams and tagged images remain gated.
+    let untagged_backdrop_compat = user.is_none()
+        && query.tag.is_none()
+        && normalize_image_type(&image_type) == Some("FANART");
+    if (filmly_compat || untagged_backdrop_compat) && user.is_none() {
         return serve_filmly_compat_image(images, &headers, &method, &item_id, &image_type, 0)
             .await;
     }
@@ -7090,14 +7891,16 @@ async fn emby_image(
 }
 
 fn is_filmly_image_request(headers: &HeaderMap) -> bool {
-    header_str(headers, "user-agent").is_some_and(|value| {
-        value.split_ascii_whitespace().next().is_some_and(|client| {
-            client.starts_with("网易爆米花")
-                || client.starts_with("%E7%BD%91%E6%98%93%E7%88%86%E7%B1%B3%E8%8A%B1")
-                || client
-                    .get(.."Filmly/".len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Filmly/"))
-        })
+    header_str(headers, "user-agent").is_some_and(is_filmly_user_agent)
+}
+
+fn is_filmly_user_agent(value: &str) -> bool {
+    value.split_ascii_whitespace().next().is_some_and(|client| {
+        client.starts_with("网易爆米花")
+            || client.starts_with("%E7%BD%91%E6%98%93%E7%88%86%E7%B1%B3%E8%8A%B1")
+            || client
+                .get(.."Filmly/".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Filmly/"))
     })
 }
 
@@ -7860,6 +8663,20 @@ async fn serve_image(
         .await
     {
         Ok(Some(image)) => image,
+        Ok(None) if image_type == "POSTER" => match images
+            .resolve(principal, item_id, "THUMB", image_index)
+            .await
+        {
+            Ok(Some(image)) => image,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
             return StatusCode::FORBIDDEN.into_response();
@@ -7898,6 +8715,20 @@ async fn serve_tagged_image(
         .await
     {
         Ok(Some(image)) => image,
+        Ok(None) if image_type == "POSTER" => match images
+            .resolve_tagged(item_id, "THUMB", image_index, tag)
+            .await
+        {
+            Ok(Some(image)) => image,
+            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
             return StatusCode::FORBIDDEN.into_response();
@@ -7932,6 +8763,20 @@ async fn serve_filmly_compat_image(
         .await
     {
         Ok(Some(image)) => image,
+        Ok(None) if image_type == "POSTER" => match images
+            .resolve_filmly_compat(item_id, "THUMB", image_index)
+            .await
+        {
+            Ok(Some(image)) => image,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
             return StatusCode::FORBIDDEN.into_response();
@@ -14437,8 +15282,9 @@ mod tests {
         emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
         is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        playback_client_label, playback_identifier_prefix, record_activity_event, safe_trace_path,
+        is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
+        metadata_candidate_failure_kind, normalize_filmly_null_languages, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
         secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
@@ -14798,10 +15644,49 @@ mod tests {
         let body = emby_media_source_json("item-1", &source, true);
         assert_eq!(body["Path"], "https://example.invalid/media.mkv");
         assert_eq!(body["Size"], 1_234_567);
+        assert_eq!(body["SupportsDirectPlay"], true);
+        assert_eq!(body["SupportsDirectStream"], true);
+        assert!(body["DirectStreamUrl"].is_null());
         assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);
         assert_eq!(body["MediaStreams"][0]["Height"], 1080);
         assert_eq!(body["MediaStreams"][0]["Profile"], "High");
+    }
+
+    #[test]
+    fn filmly_episode_stream_normalization_replaces_only_null_languages() {
+        let mut items = vec![json!({
+            "MediaSources": [{
+                "MediaStreams": [
+                    {"Type": "Video", "Language": null},
+                    {"Type": "Audio", "Language": "chi"},
+                    {"Type": "Subtitle"}
+                ]
+            }]
+        })];
+
+        normalize_filmly_null_languages(&mut items);
+
+        assert_eq!(
+            items[0]["MediaSources"][0]["MediaStreams"][0]["Language"],
+            "und"
+        );
+        assert_eq!(
+            items[0]["MediaSources"][0]["MediaStreams"][1]["Language"],
+            "chi"
+        );
+        assert!(
+            items[0]["MediaSources"][0]["MediaStreams"][2]
+                .get("Language")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filmly_episode_normalization_is_scoped_to_filmly_user_agents() {
+        assert!(is_filmly_user_agent("Filmly/2.12.3-423"));
+        assert!(is_filmly_user_agent("网易爆米花/2.12.3-423"));
+        assert!(!is_filmly_user_agent("VidHub/1.0"));
     }
 
     #[test]

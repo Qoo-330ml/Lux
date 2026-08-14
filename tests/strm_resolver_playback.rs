@@ -126,6 +126,11 @@ fi
         format!("/Videos/{item_id}/{source_id}/stream")
     );
     assert_eq!(playback_body["MediaSources"][0]["Protocol"], "Http");
+    assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
+    assert_eq!(
+        playback_body["MediaSources"][0]["SupportsDirectStream"],
+        true
+    );
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

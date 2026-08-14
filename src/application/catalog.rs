@@ -219,6 +219,9 @@ impl CatalogService {
             .list_catalog_children(parent_id, item_type, offset, limit)
             .await?;
         let mut items = assemble_items(rows);
+        if matches!(item_type, "SEASON" | "EPISODE") {
+            self.populate_item_details(&mut items).await?;
+        }
         self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
             items,
@@ -264,10 +267,11 @@ impl CatalogService {
             .into_iter()
             .map(|item| (item.id.clone(), item))
             .collect::<HashMap<_, _>>();
-        let items = item_ids
+        let mut items = item_ids
             .iter()
             .filter_map(|item_id| items_by_id.get(item_id).cloned())
             .collect::<Vec<_>>();
+        self.populate_item_details(&mut items).await?;
         Ok(CatalogPage {
             items,
             total,
@@ -334,10 +338,11 @@ impl CatalogService {
         &self,
         principal: AccessPrincipal,
         user_id: &str,
+        series_id: Option<&str>,
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
-        self.list_progress_items(principal, user_id, offset, limit, &["EPISODE"])
+        self.list_progress_items(principal, user_id, series_id, offset, limit, &["EPISODE"])
             .await
     }
 
@@ -385,6 +390,7 @@ impl CatalogService {
         &self,
         principal: AccessPrincipal,
         user_id: &str,
+        series_id: Option<&str>,
         offset: i64,
         limit: i64,
         item_types: &[&str],
@@ -392,11 +398,11 @@ impl CatalogService {
         let library_ids = self.access.accessible_library_ids(principal).await?;
         let total = self
             .database
-            .count_progress_items(user_id, &library_ids, item_types)
+            .count_progress_items(user_id, &library_ids, item_types, series_id)
             .await?;
         let rows = self
             .database
-            .list_progress_items(user_id, &library_ids, item_types, offset, limit)
+            .list_progress_items(user_id, &library_ids, item_types, series_id, offset, limit)
             .await?;
         Ok(CatalogPage {
             items: assemble_items(rows),
@@ -485,9 +491,10 @@ impl CatalogService {
             .collect::<Vec<_>>();
         let episode_counts = self.database.list_episode_counts(&item_ids).await?;
         let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
-        for item in items {
+        for item in &mut *items {
             if let Some(detail) = details.get(&item.id) {
                 item.season_count = Some(detail.season_count);
+                item.series_name = detail.series_name.clone();
             }
             item.episode_count = episode_counts.get(&item.id).copied();
         }
@@ -553,7 +560,7 @@ impl CatalogService {
             .database
             .list_catalog_image_tags_by_ids(&item_ids)
             .await?;
-        for item in items {
+        for item in &mut *items {
             item.fanart_image_tags.clear();
             let Some(item_tags) = tags.get(&item.id) else {
                 continue;
@@ -575,6 +582,46 @@ impl CatalogService {
                 }
             }
             item.fanart_image_tag = item.fanart_image_tags.first().cloned();
+        }
+        let series_ids = items
+            .iter()
+            .filter(|item| matches!(item.item_type.as_str(), "SEASON" | "EPISODE"))
+            .filter_map(|item| item.series_id.clone().or_else(|| item.parent_id.clone()))
+            .collect::<Vec<_>>();
+        if !series_ids.is_empty() {
+            let series_tags = self
+                .database
+                .list_catalog_image_tags_by_ids(&series_ids)
+                .await?;
+            for item in items
+                .iter_mut()
+                .filter(|item| matches!(item.item_type.as_str(), "SEASON" | "EPISODE"))
+            {
+                let Some(series_id) = item.series_id.clone().or_else(|| item.parent_id.clone())
+                else {
+                    continue;
+                };
+                let Some(tags) = series_tags.get(&series_id) else {
+                    continue;
+                };
+                let mut fanart = Vec::new();
+                for tag in tags {
+                    match tag.image_type.as_str() {
+                        "POSTER" if tag.image_index == 0 => {
+                            item.series_primary_image_tag = Some(tag.id.clone())
+                        }
+                        "FANART" if tag.image_index == 0 => fanart.push(tag.id.clone()),
+                        "LOGO" if tag.image_index == 0 => {
+                            item.series_logo_image_tag = Some(tag.id.clone())
+                        }
+                        "THUMB" if tag.image_index == 0 => {
+                            item.series_thumb_image_tag = Some(tag.id.clone())
+                        }
+                        _ => {}
+                    }
+                }
+                item.series_fanart_image_tags = fanart;
+            }
         }
         Ok(())
     }
@@ -665,6 +712,7 @@ pub struct CatalogItem {
     pub item_type: String,
     pub parent_id: Option<String>,
     pub series_id: Option<String>,
+    pub series_name: Option<String>,
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
     pub title: String,
@@ -683,6 +731,10 @@ pub struct CatalogItem {
     pub rating_source: Option<String>,
     pub runtime_ticks: Option<i64>,
     pub poster_image_tag: Option<String>,
+    pub series_primary_image_tag: Option<String>,
+    pub series_fanart_image_tags: Vec<String>,
+    pub series_logo_image_tag: Option<String>,
+    pub series_thumb_image_tag: Option<String>,
     pub fanart_image_tag: Option<String>,
     pub fanart_image_tags: Vec<String>,
     pub thumb_image_tag: Option<String>,
@@ -758,6 +810,7 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     item_type: row.item_type.clone(),
                     parent_id: row.parent_id.clone(),
                     series_id: row.series_id.clone(),
+                    series_name: None,
                     season_number: row.season_number,
                     episode_number: row.episode_number,
                     title: row.title.clone(),
@@ -776,6 +829,10 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     rating_source: row.rating_source.clone(),
                     runtime_ticks: row.runtime_ticks,
                     poster_image_tag: row.poster_image_tag.clone(),
+                    series_primary_image_tag: None,
+                    series_fanart_image_tags: Vec::new(),
+                    series_logo_image_tag: None,
+                    series_thumb_image_tag: None,
                     fanart_image_tag: row.fanart_image_tag.clone(),
                     fanart_image_tags: row.fanart_image_tag.clone().into_iter().collect(),
                     thumb_image_tag: row.thumb_image_tag.clone(),
@@ -861,6 +918,7 @@ fn reorder_catalog_items(items: Vec<CatalogItem>, item_ids: &[String]) -> Vec<Ca
 }
 
 fn apply_catalog_detail(item: &mut CatalogItem, detail: &StoredCatalogDetail) {
+    item.series_name = detail.series_name.clone();
     item.premiere_date = detail.premiere_date.clone();
     item.last_air_date = detail.last_air_date.clone();
     item.status = detail.status.clone();
@@ -946,6 +1004,7 @@ mod tests {
             item_type: "MOVIE".to_owned(),
             parent_id: None,
             series_id: None,
+            series_name: None,
             season_number: None,
             episode_number: None,
             title: id.to_owned(),
@@ -964,6 +1023,10 @@ mod tests {
             rating_source: None,
             runtime_ticks: None,
             poster_image_tag: None,
+            series_primary_image_tag: None,
+            series_fanart_image_tags: Vec::new(),
+            series_logo_image_tag: None,
+            series_thumb_image_tag: None,
             fanart_image_tag: None,
             fanart_image_tags: Vec::new(),
             thumb_image_tag: None,

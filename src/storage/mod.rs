@@ -6542,6 +6542,7 @@ impl Database {
         user_id: &str,
         library_ids: &[String],
         item_types: &[&str],
+        series_id: Option<&str>,
     ) -> Result<i64, StorageError> {
         if library_ids.is_empty() || item_types.is_empty() {
             return Ok(0);
@@ -6552,13 +6553,14 @@ impl Database {
         let library_placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let series_predicate = series_id.map(|_| " AND mi.series_id = ?").unwrap_or("");
         let query = format!(
             "SELECT COUNT(*) FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
              WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                AND us.is_played = 0 AND us.position_ticks > 0
-               AND mi.library_id IN ({library_placeholders})"
+               AND mi.library_id IN ({library_placeholders}){series_predicate}"
         );
         let mut statement = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(query))
@@ -6568,6 +6570,9 @@ impl Database {
         }
         for library_id in library_ids {
             statement = statement.bind(library_id);
+        }
+        if let Some(series_id) = series_id {
+            statement = statement.bind(series_id);
         }
         statement
             .fetch_one(&self.pool)
@@ -6583,6 +6588,7 @@ impl Database {
         user_id: &str,
         library_ids: &[String],
         item_types: &[&str],
+        series_id: Option<&str>,
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
@@ -6595,6 +6601,7 @@ impl Database {
         let library_placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let series_predicate = series_id.map(|_| " AND mi.series_id = ?").unwrap_or("");
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -6629,15 +6636,18 @@ impl Database {
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                AND us.is_played = 0 AND us.position_ticks > 0
-               AND mi.library_id IN ({library_placeholders})
+               AND mi.library_id IN ({library_placeholders}){series_predicate}
              ORDER BY us.last_played_at DESC, mi.series_id, mi.season_number,
                       mi.episode_number, mi.id
              LIMIT ? OFFSET ?"
         );
-        let mut binds = Vec::with_capacity(item_types.len() + library_ids.len() + 3);
+        let mut binds = Vec::with_capacity(item_types.len() + library_ids.len() + 4);
         binds.push(CatalogBind::Text(user_id));
         binds.extend(item_types.iter().copied().map(CatalogBind::Text));
         binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
+        if let Some(series_id) = series_id {
+            binds.push(CatalogBind::Text(series_id));
+        }
         binds.push(CatalogBind::Integer(limit));
         binds.push(CatalogBind::Integer(offset));
         self.fetch_catalog_rows(&query, &binds).await
@@ -6972,6 +6982,13 @@ impl Database {
             let query = format!(
                 "SELECT mi.id AS item_id, mi.premiere_date, mi.last_air_date,
                         mi.status, mi.original_language, mi.provider_ids_json,
+                        (SELECT series.title
+                         FROM media_items series
+                         WHERE series.id = CASE
+                             WHEN mi.item_type = 'SEASON' THEN mi.parent_id
+                             ELSE mi.series_id
+                         END
+                           AND series.removed_at IS NULL) AS series_name,
                         (SELECT COUNT(*) FROM media_items child
                          WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
                            AND child.removed_at IS NULL) AS season_count,
@@ -7012,6 +7029,7 @@ impl Database {
                         status: row.get("status"),
                         original_language: row.get("original_language"),
                         provider_ids_json: row.get("provider_ids_json"),
+                        series_name: row.get("series_name"),
                         season_count: row.get("season_count"),
                         episode_count: row.get("episode_count"),
                     },
@@ -10581,6 +10599,7 @@ pub(crate) struct StoredCatalogRow {
 
 #[derive(Debug)]
 pub(crate) struct StoredCatalogDetail {
+    pub(crate) series_name: Option<String>,
     pub(crate) premiere_date: Option<String>,
     pub(crate) last_air_date: Option<String>,
     pub(crate) status: Option<String>,
