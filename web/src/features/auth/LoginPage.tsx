@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { FormEvent, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
+import { LuxLogo } from "../../components/LuxLogo";
 
 export function LoginPage() {
   const queryClient = useQueryClient();
@@ -24,7 +25,7 @@ export function LoginPage() {
     <main className="lux-auth-screen">
       <div className="lux-auth-backdrop" />
       <motion.section className="lux-auth-card" initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.35 }}>
-        <div className="lux-auth-brand"><img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" /><strong>Lux</strong></div>
+        <div className="lux-auth-brand"><LuxLogo className="lux-brand-logo" /><strong>Lux</strong></div>
         <h1>欢迎回到 Lux</h1>
         <p>进入你的私人电影空间。</p>
         <form className="lux-auth-form" onSubmit={submit}>

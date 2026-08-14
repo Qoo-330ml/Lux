@@ -1052,7 +1052,35 @@ pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
         return Some(movie_nfo);
     }
     let same_name = media_path.with_extension("nfo");
-    fs::try_exists(&same_name).await.ok()?.then_some(same_name)
+    if fs::try_exists(&same_name).await.ok()? {
+        return Some(same_name);
+    }
+    find_directory_nfo(directory).await
+}
+
+async fn find_directory_nfo(directory: &Path) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(directory).await.ok()?;
+    let mut candidates = Vec::new();
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                let file_type = entry.file_type().await.ok()?;
+                let is_nfo = file_type.is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"));
+                if is_nfo {
+                    candidates.push(entry.path());
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    candidates.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    candidates.into_iter().next()
 }
 
 async fn read_directory_paths(directory: &Path) -> Result<Vec<PathBuf>, MetadataError> {

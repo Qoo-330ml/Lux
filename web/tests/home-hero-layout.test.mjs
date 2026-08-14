@@ -33,3 +33,18 @@ test("hero logos fit inside the title area without distortion", () => {
   assert.match(logoRule, /object-fit:\s*contain/);
   assert.match(logoRule, /object-position:\s*left\s+center/);
 });
+
+test("hero text titles reserve three lines and clamp overflow", () => {
+  const titleRule = stylesheet.match(/\.lux-hero-title\s*\{([^}]*)\}/)?.[1] ?? "";
+  const titleTextRule = stylesheet.match(/\.lux-hero-title-text\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(titleRule, /--lux-hero-title-line-height:\s*\.94em/);
+  assert.match(titleRule, /min-height:\s*calc\(3\s*\*\s*var\(--lux-hero-title-line-height\)\)/);
+  assert.match(titleTextRule, /-webkit-line-clamp:\s*3/);
+  assert.match(titleTextRule, /overflow-wrap:\s*anywhere/);
+});
+
+test("hero text titles provide two smaller readable size levels", () => {
+  assert.match(stylesheet, /\.lux-hero-title--compact\s*\{[^}]*font-size:/);
+  assert.match(stylesheet, /\.lux-hero-title--small\s*\{[^}]*font-size:/);
+});

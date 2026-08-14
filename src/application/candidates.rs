@@ -803,17 +803,14 @@ fn generic_candidate_actors(
         .take(MAX_MOVIE_NFO_ACTORS)
         .filter_map(|member| {
             let id = member.provider_id.trim();
-            if id.is_empty()
-                || id.len() > 128
-                || !id.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-                })
-            {
+            if !id.is_empty() && !valid_person_id(id) {
                 return None;
             }
             let name = member.name.as_deref()?.trim();
             (!name.is_empty()).then(|| ActorCredit {
                 id: id.to_owned(),
+                provider: None,
+                identities: Vec::new(),
                 name: name.to_owned(),
                 character: member
                     .character
@@ -976,7 +973,14 @@ impl MetadataSelectionService {
                 candidate.status,
             ));
         }
-        let payload = candidate_payload(&candidate)?;
+        let mut payload = candidate_payload(&candidate)?;
+        let candidate_provider = candidate.provider.trim().to_ascii_lowercase();
+        for actor in &mut payload.actors {
+            if actor.provider.is_none() && !actor.id.trim().is_empty() {
+                actor.provider = Some(candidate_provider.clone());
+            }
+        }
+        payload.movie_nfo.actors = payload.actors.clone();
         let image_policy = self.image_selection_policy(item_id).await?;
         let mut state = metadata_state(&current);
         let metadata_candidate = MetadataCandidate {
@@ -1619,6 +1623,8 @@ fn tmdb_candidate_actors(cast: &[TmdbCastMember]) -> Vec<ActorCredit> {
             }
             Some(ActorCredit {
                 id: member.id.to_string(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
                 name: name.to_owned(),
                 character: member
                     .character
@@ -1651,12 +1657,19 @@ fn candidate_actors(value: &Value) -> Result<Vec<ActorCredit>, MetadataSelection
             let actor = serde_json::from_value::<ActorCredit>(actor.clone()).map_err(|error| {
                 MetadataSelectionError::InvalidCandidate(format!("actor is invalid: {error}"))
             })?;
-            if actor.id.trim().is_empty() || actor.name.trim().is_empty() {
+            let id = actor.id.trim();
+            let name = actor.name.trim();
+            if (!id.is_empty() && !valid_person_id(id)) || name.is_empty() {
                 return Err(MetadataSelectionError::InvalidCandidate(
-                    "actor ID and name are required".to_owned(),
+                    "actor provider ID and name are required".to_owned(),
                 ));
             }
-            Ok(actor)
+            Ok(ActorCredit {
+                id: id.to_owned(),
+                provider: actor.provider,
+                name: name.to_owned(),
+                ..actor
+            })
         })
         .collect()
 }
@@ -1857,10 +1870,11 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TmdbCastMember, default_image_selection_policy, generic_candidate_images,
+        TmdbCastMember, candidate_actors, default_image_selection_policy, generic_candidate_images,
         tmdb_candidate_actors,
     };
     use crate::application::scraper::{ScraperImage, ScraperItemType};
+    use serde_json::json;
 
     #[test]
     fn metadata_refresh_keeps_backdrop_images_as_fanart() {
@@ -1916,5 +1930,27 @@ mod tests {
             Some("https://image.tmdb.org/t/p/w185/profile.jpg")
         );
         assert_eq!(actors[1].id, "10");
+    }
+
+    #[test]
+    fn candidate_actors_allow_provider_scoped_ids() {
+        let result = candidate_actors(&json!({
+            "actors": [{"id": "person-9", "name": "演员甲"}]
+        }));
+
+        let actors = result.expect("provider-scoped actor ID");
+        assert_eq!(actors[0].id, "person-9");
+    }
+
+    #[test]
+    fn candidate_actors_allow_missing_provider_ids() {
+        let result = candidate_actors(&json!({
+            "actors": [{"name": "本地演员", "character": "本地角色"}]
+        }))
+        .expect("actor name is enough for display");
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].id.is_empty());
+        assert_eq!(result[0].name, "本地演员");
     }
 }

@@ -14,10 +14,22 @@ static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
 pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
+pub(crate) const DEFAULT_PLAYED_PERCENT: i64 = 95;
 const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 
 fn database_flag(value: bool) -> i64 {
     i64::from(value)
+}
+
+fn playback_reached_played_threshold(
+    position_ticks: i64,
+    duration_ticks: i64,
+    played_percent: i64,
+) -> bool {
+    position_ticks > 0
+        && duration_ticks > 0
+        && i128::from(position_ticks) * 100
+            >= i128::from(duration_ticks) * i128::from(played_percent.clamp(1, 100))
 }
 
 #[derive(Clone)]
@@ -1417,6 +1429,22 @@ impl Database {
         })
     }
 
+    pub(crate) async fn disable_strm_media_info_task(&self) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scheduled_task_configs
+             SET is_enabled = 0, cron_or_interval = NULL, updated_at = unixepoch()
+             WHERE owner_type = 'GLOBAL' AND owner_id = 'global'
+               AND task_type = 'STRM_MEDIA_INFO'",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn disable_chapter_detection_tasks(&self) -> Result<(), StorageError> {
         self.query(
             "UPDATE scheduled_task_configs
@@ -1790,6 +1818,44 @@ impl Database {
         Ok((percent, min_ticks))
     }
 
+    pub(crate) async fn user_played_percent(&self, user_id: &str) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT played_percent FROM user_playback_settings
+             WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value: Option<i64>| value.unwrap_or(DEFAULT_PLAYED_PERCENT).clamp(1, 100))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_user_played_percent(
+        &self,
+        user_id: &str,
+        played_percent: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_playback_settings (user_id, played_percent)
+             VALUES (?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 played_percent = excluded.played_percent,
+                 updated_at = unixepoch()",
+        )
+        .bind(user_id)
+        .bind(played_percent)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn set_server_settings(
         &self,
         percent: i64,
@@ -1826,6 +1892,35 @@ impl Database {
         transaction
             .commit()
             .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE libraries
+             SET scraper_id = CASE WHEN scraper_id = ? THEN NULL ELSE scraper_id END,
+                 chapter_source_id = CASE WHEN chapter_source_id = ? THEN NULL ELSE chapter_source_id END,
+                 updated_at = unixepoch()
+             WHERE scraper_id = ? OR chapter_source_id = ?",
+        )
+        .bind(plugin_id)
+        .bind(plugin_id)
+        .bind(plugin_id)
+        .bind(plugin_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query("DELETE FROM installed_plugins WHERE plugin_id = ?")
+            .bind(plugin_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
@@ -1948,6 +2043,13 @@ impl Database {
                 source,
             })?;
         let max_function = self.scalar_max_function();
+        let auto_played = event.duration_ticks.is_some_and(|duration_ticks| {
+            playback_reached_played_threshold(
+                event.position_ticks,
+                duration_ticks,
+                event.played_percent,
+            )
+        });
         let playback_session_query = format!(
             "INSERT INTO playback_sessions (
                 id, user_id, item_id, media_source_id, play_session_id,
@@ -2015,6 +2117,127 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        if auto_played {
+            self.query(
+                "UPDATE user_item_state
+                 SET is_played = 1,
+                     play_count = CASE WHEN is_played = 0 THEN play_count + 1 ELSE play_count END,
+                     last_played_at = unixepoch(),
+                     version = version + CASE WHEN is_played = 0 THEN 1 ELSE 0 END
+                 WHERE user_id = ? AND item_id = ?",
+            )
+            .bind(event.user_id)
+            .bind(event.item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn sync_played_container_states(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<(), StorageError> {
+        let parent_ids: Vec<String> = self
+            .query(
+                "SELECT parent_id FROM media_items
+                 WHERE id = ? AND item_type = 'EPISODE' AND parent_id IS NOT NULL
+                 UNION
+                 SELECT series_id FROM media_items
+                 WHERE id = ? AND item_type = 'EPISODE' AND series_id IS NOT NULL",
+            )
+            .bind(item_id)
+            .bind(item_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect();
+        if parent_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for parent_id in parent_ids {
+            let is_played: i64 = self
+                .query_scalar(
+                    "WITH eligible AS (
+                         SELECT episode.id
+                         FROM media_items episode
+                         JOIN media_items parent ON parent.id = ?
+                         WHERE episode.item_type = 'EPISODE'
+                           AND episode.removed_at IS NULL
+                           AND episode.has_available_source = 1
+                           AND ((parent.item_type = 'SEASON' AND episode.parent_id = parent.id)
+                             OR (parent.item_type = 'SERIES' AND episode.series_id = parent.id))
+                     )
+                     SELECT CASE WHEN EXISTS (SELECT 1 FROM eligible)
+                                      AND NOT EXISTS (
+                                          SELECT 1
+                                          FROM eligible
+                                          LEFT JOIN user_item_state state
+                                            ON state.user_id = ? AND state.item_id = eligible.id
+                                          WHERE COALESCE(state.is_played, 0) = 0
+                                      )
+                                 THEN 1 ELSE 0 END",
+                )
+                .bind(&parent_id)
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
+                 VALUES (?, ?, ?, CASE WHEN ? = 1 THEN 1 ELSE 0 END,
+                         CASE WHEN ? = 1 THEN unixepoch() ELSE NULL END)
+                 ON CONFLICT(user_id, item_id) DO UPDATE SET
+                     is_played = excluded.is_played,
+                     play_count = CASE
+                         WHEN excluded.is_played = 1 AND user_item_state.is_played = 0
+                         THEN user_item_state.play_count + 1 ELSE user_item_state.play_count END,
+                     last_played_at = CASE
+                         WHEN excluded.is_played = 1 THEN unixepoch()
+                         ELSE user_item_state.last_played_at END,
+                     version = user_item_state.version + CASE
+                         WHEN excluded.is_played != user_item_state.is_played THEN 1 ELSE 0 END",
+            )
+            .bind(user_id)
+            .bind(&parent_id)
+            .bind(is_played)
+            .bind(is_played)
+            .bind(is_played)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -5612,6 +5835,7 @@ impl Database {
         &self,
         update: SelectedMetadataUpdate<'_>,
     ) -> Result<bool, StorageError> {
+        let sort_title = update.title.to_lowercase();
         let mut transaction = self
             .pool
             .begin()
@@ -5622,7 +5846,7 @@ impl Database {
             })?;
         self.query(
             "UPDATE media_items
-             SET title = ?, original_title = ?, overview = ?, production_year = ?,
+             SET title = ?, sort_title = ?, original_title = ?, overview = ?, production_year = ?,
                  premiere_date = COALESCE(?, premiere_date),
                  last_air_date = COALESCE(?, last_air_date),
                  status = COALESCE(?, status),
@@ -5635,6 +5859,7 @@ impl Database {
              WHERE id = ? AND removed_at IS NULL",
         )
         .bind(update.title)
+        .bind(sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
@@ -6682,26 +6907,26 @@ impl Database {
             })?;
 
         let item_order = match (filter.sort_by, filter.descending) {
-            (CatalogSort::DateCreated, true) => "mi.added_at DESC, mi.sort_title ASC, mi.id ASC",
-            (CatalogSort::DateCreated, false) => "mi.added_at ASC, mi.sort_title ASC, mi.id ASC",
+            (CatalogSort::DateCreated, true) => "mi.added_at DESC, LOWER(mi.title) ASC, mi.id ASC",
+            (CatalogSort::DateCreated, false) => "mi.added_at ASC, LOWER(mi.title) ASC, mi.id ASC",
             (CatalogSort::PremiereDate, true) => {
                 "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.premiere_date DESC, mi.sort_title ASC, mi.id ASC"
+                 mi.premiere_date DESC, LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::PremiereDate, false) => {
                 "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.premiere_date ASC, mi.sort_title ASC, mi.id ASC"
+                 mi.premiere_date ASC, LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::Rating, true) => {
                 "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.rating DESC, mi.sort_title ASC, mi.id ASC"
+                 mi.rating DESC, LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::Rating, false) => {
                 "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.rating ASC, mi.sort_title ASC, mi.id ASC"
+                 mi.rating ASC, LOWER(mi.title) ASC, mi.id ASC"
             }
-            (CatalogSort::Name, true) => "mi.sort_title DESC, mi.id DESC",
-            (CatalogSort::Name, false) => "mi.sort_title ASC, mi.id ASC",
+            (CatalogSort::Name, true) => "LOWER(mi.title) DESC, mi.id DESC",
+            (CatalogSort::Name, false) => "LOWER(mi.title) ASC, mi.id ASC",
         };
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
@@ -9211,9 +9436,11 @@ impl Database {
         &self,
         update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
+        let sort_title = update.title.to_lowercase();
         self.query(
             "UPDATE media_items
              SET title = ?,
+                 sort_title = ?,
                  original_title = ?,
                  overview = ?,
                  production_year = ?,
@@ -9223,6 +9450,7 @@ impl Database {
              WHERE id = ?",
         )
         .bind(update.title)
+        .bind(sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
@@ -10642,6 +10870,7 @@ pub(crate) struct NewPlaybackEvent<'a> {
     pub(crate) state: &'a str,
     pub(crate) position_ticks: i64,
     pub(crate) duration_ticks: Option<i64>,
+    pub(crate) played_percent: i64,
     pub(crate) is_paused: bool,
 }
 
@@ -11595,6 +11824,72 @@ mod tests {
         config::Config,
         library::LibraryKind,
     };
+
+    #[tokio::test]
+    async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, premiere_date,
+                rating, identification_status, added_at, has_available_source
+             ) VALUES
+                ('item-alpha', ?, 'MOVIE', 'Alpha', 'zzz', '2020-01-01', 8.0, 'LOCAL_CONFIRMED', 100, 1),
+                ('item-beta', ?, 'MOVIE', 'Beta', 'aaa', '2020-01-01', 8.0, 'LOCAL_CONFIRMED', 100, 1)",
+        )
+        .bind(&library_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("media items");
+
+        let library_ids = vec![library_id];
+        let item_types = vec!["MOVIE".to_owned()];
+        let empty = Vec::new();
+        let empty_years = Vec::<i64>::new();
+        for (sort_by, descending) in [
+            (CatalogSort::DateCreated, false),
+            (CatalogSort::DateCreated, true),
+            (CatalogSort::PremiereDate, false),
+            (CatalogSort::PremiereDate, true),
+            (CatalogSort::Rating, false),
+            (CatalogSort::Rating, true),
+        ] {
+            let filter = CatalogFilterQuery {
+                library_ids: &library_ids,
+                user_id: "test-user",
+                item_types: &item_types,
+                excluded_item_types: &empty,
+                item_ids: None,
+                media_source_ids: None,
+                years: &empty_years,
+                is_played: None,
+                is_favorite: None,
+                sort_by,
+                descending,
+                offset: 0,
+                limit: 10,
+            };
+            let (rows, total) = database
+                .list_filtered_catalog_rows(&filter)
+                .await
+                .expect("catalog rows");
+            let titles = rows.into_iter().map(|row| row.title).collect::<Vec<_>>();
+            let expected = vec!["Alpha", "Beta"];
+            assert_eq!(total, 2);
+            assert_eq!(titles, expected, "descending={descending}");
+        }
+    }
 
     #[tokio::test]
     async fn media_source_library_page_respects_limit_and_offset() {

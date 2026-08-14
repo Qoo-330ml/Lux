@@ -3,6 +3,7 @@ import { useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { DatabaseSetupInput, SetupDatabaseBackend } from "../../lib/api/types";
+import { LuxLogo } from "../../components/LuxLogo";
 
 type DatabaseSetupPanelProps = {
   onSelected: (restartRequired: boolean) => void;
@@ -65,7 +66,7 @@ export function DatabaseSetupPanel({ onSelected }: DatabaseSetupPanelProps) {
 
   return (
     <section className="lux-auth-card lux-setup-card">
-      <div className="lux-auth-brand"><img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" /><strong>Lux</strong></div>
+      <div className="lux-auth-brand"><LuxLogo className="lux-brand-logo" /><strong>Lux</strong></div>
       <h1>选择数据库</h1>
       <p>选择 Lux 保存用户、媒体索引、播放进度和后台任务的位置。安装后不能直接切换数据库。</p>
       <fieldset className="lux-setup-database-options">

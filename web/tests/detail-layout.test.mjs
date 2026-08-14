@@ -68,6 +68,17 @@ test("media stream cards keep a compact width on wide detail pages", () => {
   assert.match(streamCardRule, /flex:\s*0\s*0\s*260px/);
 });
 
+test("shared horizontal rails hide native scrollbars while preserving horizontal scrolling", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const scrollViewportRule = stylesheet.match(/^\.lux-horizontal-scroll-viewport\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const webkitScrollbarRule = stylesheet.match(/\.lux-horizontal-scroll-viewport::\-webkit-scrollbar\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(scrollViewportRule, /overflow-x:\s*auto/);
+  assert.match(scrollViewportRule, /scrollbar-width:\s*none/);
+  assert.match(scrollViewportRule, /-ms-overflow-style:\s*none/);
+  assert.match(webkitScrollbarRule, /display:\s*none/);
+});
+
 test("shared horizontal scroll arrows are larger controls with a visible shadow", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const arrowRule = stylesheet.match(/\.lux-horizontal-scroll-arrow\s*\{([^}]*)\}/)?.[1] ?? "";

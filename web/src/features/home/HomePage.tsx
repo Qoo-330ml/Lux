@@ -8,7 +8,7 @@ import { orderLibraries, readAccountSettings } from "../account/account-settings
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { LuxUser, MediaItem } from "../../lib/api/types";
-import { HERO_CAROUSEL_INTERVAL_MS, heroSlides } from "./carousel";
+import { HERO_CAROUSEL_INTERVAL_MS, heroSlides, heroTitleScale } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 
 export function HomePage({ user }: { user: LuxUser }) {
@@ -62,6 +62,10 @@ function HeroCarousel({ items }: { items: MediaItem[] }) {
   const item = items[safeIndex];
   const logo = item ? imageUrl(item, "logo") : undefined;
   const image = item ? imageUrl(item, "fanart") ?? imageUrl(item) : undefined;
+  const title = item ? mediaTitle(item) : "你的私人影院";
+  const titleClassName = logo
+    ? "lux-hero-title has-logo"
+    : `lux-hero-title lux-hero-title--${heroTitleScale(title)}`;
   const goTo = (index: number) => setActiveIndex((index + items.length) % items.length);
 
   return (
@@ -72,8 +76,8 @@ function HeroCarousel({ items }: { items: MediaItem[] }) {
       <div className="lux-hero-overlay" />
       <AnimatePresence initial={false} mode="wait">
         <motion.div key={item?.id ?? "empty"} className="lux-hero-copy" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.38 }}>
-          <h1 className="lux-hero-title">
-            {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} /> : item ? mediaTitle(item) : "你的私人影院"}
+          <h1 className={titleClassName}>
+            {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} /> : <span className="lux-hero-title-text">{title}</span>}
           </h1>
           <div className="lux-hero-meta">
             {item?.productionYear ? <span>{item.productionYear}</span> : null}

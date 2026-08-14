@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Download, Globe2, PackageOpen, Save, Settings2, X } from "lucide-react";
+import { CheckCircle2, Download, Globe2, PackageOpen, Save, Settings2, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -27,6 +27,14 @@ export function AdminPluginsPage() {
   });
   const install = useMutation({
     mutationFn: (pluginId: string) => api.installAdminPlugin(pluginId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
+    },
+  });
+  const uninstall = useMutation({
+    mutationFn: (pluginId: string) => api.uninstallAdminPlugin(pluginId),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
@@ -92,16 +100,17 @@ export function AdminPluginsPage() {
         <button className={mode === "installed" ? "is-active" : ""} type="button" aria-pressed={mode === "installed"} onClick={() => setMode("installed")}>已安装管理<span>{installedPlugins.data.total ?? installedPlugins.data.plugins?.length ?? 0}</span></button>
       </nav>
       <section className="lux-admin-plugin-grid" aria-label="可用插件">
-        {items.length === 0 ? <div className="lux-admin-empty"><PackageOpen size={24} /><h2>{mode === "store" ? "暂无可用插件" : "还没有已安装插件"}</h2><p>{mode === "store" ? "插件目录为空，请稍后重试。" : "从插件商店安装插件后，会在这里统一配置和管理。"}</p></div> : items.map((plugin) => <PluginCard key={plugin.id} plugin={plugin} installing={install.isPending && install.variables === plugin.id} installedManagement={mode === "installed"} toggling={toggleEnabled.isPending && toggleEnabled.variables?.pluginId === plugin.id} onInstall={() => install.mutate(plugin.id)} onToggleEnabled={(enabled) => toggleEnabled.mutate({ pluginId: plugin.id, enabled })} />)}
+        {items.length === 0 ? <div className="lux-admin-empty"><PackageOpen size={24} /><h2>{mode === "store" ? "暂无可用插件" : "还没有已安装插件"}</h2><p>{mode === "store" ? "插件目录为空，请稍后重试。" : "从插件商店安装插件后，会在这里统一配置和管理。"}</p></div> : items.map((plugin) => <PluginCard key={plugin.id} plugin={plugin} installing={install.isPending && install.variables === plugin.id} installedManagement={mode === "installed"} toggling={toggleEnabled.isPending && toggleEnabled.variables?.pluginId === plugin.id} uninstalling={uninstall.isPending && uninstall.variables === plugin.id} onInstall={() => install.mutate(plugin.id)} onToggleEnabled={(enabled) => toggleEnabled.mutate({ pluginId: plugin.id, enabled })} onUninstall={() => uninstall.mutate(plugin.id)} />)}
       </section>
-      {install.error || toggleEnabled.error ? <p className="lux-error-copy" role="alert">{install.error?.message || toggleEnabled.error?.message}</p> : null}
+      {install.error || uninstall.error || toggleEnabled.error ? <p className="lux-error-copy" role="alert">{install.error?.message || uninstall.error?.message || toggleEnabled.error?.message}</p> : null}
     </div>
   );
 }
 
-function PluginCard({ plugin, installing, installedManagement, toggling, onInstall, onToggleEnabled }: { plugin: AdminPlugin; installing: boolean; installedManagement: boolean; toggling: boolean; onInstall: () => void; onToggleEnabled: (enabled: boolean) => void }) {
+function PluginCard({ plugin, installing, installedManagement, toggling, uninstalling, onInstall, onToggleEnabled, onUninstall }: { plugin: AdminPlugin; installing: boolean; installedManagement: boolean; toggling: boolean; uninstalling: boolean; onInstall: () => void; onToggleEnabled: (enabled: boolean) => void; onUninstall: () => void }) {
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
+  const [uninstallDialogOpen, setUninstallDialogOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [apiKeyDirty, setApiKeyDirty] = useState(false);
   const [preferredLanguage, setPreferredLanguage] = useState("zh-CN");
@@ -122,6 +131,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   const [writeSidecars, setWriteSidecars] = useState(true);
   const [schedule, setSchedule] = useState("0 3 * * *");
   const closeRef = useRef<HTMLButtonElement>(null);
+  const uninstallCancelRef = useRef<HTMLButtonElement>(null);
   const isMediaInfo = plugin.id === "org.lux.strm-media-info";
   const isChapterSource = plugin.capabilities?.some((capability) => capability === "chapters.detect" || capability === "chapters.lookup") === true;
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
@@ -202,6 +212,19 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
   }, [closeDialog, open]);
 
   useEffect(() => {
+    if (!uninstallDialogOpen) return;
+    uninstallCancelRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setUninstallDialogOpen(false);
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [uninstallDialogOpen]);
+
+  useEffect(() => {
     if (!open) return;
     const values = plugin.configValues ?? {};
     const preferred = typeof values.preferredLanguage === "string"
@@ -261,10 +284,13 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
       </div>
       <div className="lux-admin-plugin-actions">
         {plugin.installed && installedManagement ? (
-          <button className={`lux-admin-plugin-enable-switch${plugin.enabled ? " is-enabled" : ""}`} type="button" role="switch" aria-checked={plugin.enabled} aria-label={toggleBlockedByProvider ? `由其他插件停用 ${plugin.name}` : `${plugin.enabled ? "禁用" : "启用"} ${plugin.name}`} disabled={toggling || toggleBlockedByProvider} onClick={() => onToggleEnabled(!plugin.enabled)}>
-            <span className="lux-admin-plugin-enable-switch-track" aria-hidden="true"><span /></span>
-            <span>{plugin.enabled ? "已启用" : "已禁用"}</span>
-          </button>
+          <>
+            <button className={`lux-admin-plugin-enable-switch${plugin.enabled ? " is-enabled" : ""}`} type="button" role="switch" aria-checked={plugin.enabled} aria-label={toggleBlockedByProvider ? `由其他插件停用 ${plugin.name}` : `${plugin.enabled ? "禁用" : "启用"} ${plugin.name}`} disabled={toggling || uninstalling || toggleBlockedByProvider} onClick={() => onToggleEnabled(!plugin.enabled)}>
+              <span className="lux-admin-plugin-enable-switch-track" aria-hidden="true"><span /></span>
+              <span>{plugin.enabled ? "已启用" : "已禁用"}</span>
+            </button>
+            <button className="lux-admin-plugin-uninstall-button" type="button" aria-label={`卸载 ${plugin.name}`} disabled={uninstalling} onClick={() => setUninstallDialogOpen(true)}><Trash2 size={14} /> 卸载</button>
+          </>
         ) : plugin.installed ? (
           <span className="lux-admin-plugin-install-status is-installed" role="status" aria-label="插件状态：已安装"><CheckCircle2 size={15} /> 已安装</span>
         ) : (
@@ -315,6 +341,19 @@ function PluginCard({ plugin, installing, installedManagement, toggling, onInsta
               </div>
               {save.error ? <span className="lux-error-copy" role="alert">{save.error.message}</span> : null}
             </form>
+          </section>
+        </div>
+      ) : null}
+      {uninstallDialogOpen ? (
+        <div className="lux-admin-plugin-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setUninstallDialogOpen(false); }}>
+          <section className="lux-admin-plugin-dialog lux-admin-plugin-uninstall-dialog" role="alertdialog" aria-modal="true" aria-labelledby={`plugin-uninstall-title-${plugin.id}`}>
+            <div className="lux-admin-plugin-dialog-heading">
+              <div><h2 id={`plugin-uninstall-title-${plugin.id}`}>卸载插件</h2><p className="lux-admin-plugin-dialog-copy">确定要卸载 {plugin.name}吗？这会停止插件并移除已安装的插件包。</p></div>
+            </div>
+            <div className="lux-admin-plugin-dialog-actions">
+              <button ref={uninstallCancelRef} className="lux-button lux-button-secondary" type="button" onClick={() => setUninstallDialogOpen(false)}>取消</button>
+              <button className="lux-button lux-button-primary lux-admin-plugin-uninstall-confirm" type="button" aria-label={`确认卸载 ${plugin.name}`} disabled={uninstalling} onClick={() => { setUninstallDialogOpen(false); onUninstall(); }}>{uninstalling ? "卸载中…" : "确认卸载"}</button>
+            </div>
           </section>
         </div>
       ) : null}

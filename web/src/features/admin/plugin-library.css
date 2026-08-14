@@ -245,6 +245,28 @@
   transform: translateX(13px);
 }
 
+.lux-admin-plugin-uninstall-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--lux-muted);
+  background: transparent;
+  font-size: .72rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.lux-admin-plugin-uninstall-button:hover:not(:disabled) {
+  border-color: rgba(242, 151, 151, .32);
+  color: #f3a6a6;
+  background: rgba(242, 151, 151, .08);
+}
+
 .lux-admin-plugin-config-button {
   padding: 0 10px;
   border: 1px solid transparent;
@@ -260,6 +282,7 @@
 
 .lux-admin-plugin-install-status:focus-visible,
 .lux-admin-plugin-enable-switch:focus-visible,
+.lux-admin-plugin-uninstall-button:focus-visible,
 .lux-admin-plugin-config-button:focus-visible,
 .lux-admin-plugin-store-trigger:focus-visible,
 .lux-admin-plugin-dialog-close:focus-visible {

@@ -73,7 +73,7 @@ function getStorage(): Storage | null {
   }
 }
 
-export function LibraryPage() {
+export function LibraryPage({ serverName }: { serverName?: string | null } = {}) {
   const { libraryId = "" } = useParams();
   const [sortState, setSortState] = useState(() => ({
     libraryId,
@@ -84,6 +84,18 @@ export function LibraryPage() {
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
   const itemTypes = libraryItemTypeFilter(library?.kind);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+
+    const libraryName = library?.name.trim();
+    document.title = libraryName ? `${libraryName} - Lux` : "Lux";
+    return () => {
+      const serverTitle = serverName?.trim();
+      document.title = serverTitle ? `${serverTitle} - Lux` : "Lux";
+    };
+  }, [library?.name, serverName]);
+
   const pages = useInfiniteQuery({
     queryKey: queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder),
     queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, { sortBy, sortOrder }),

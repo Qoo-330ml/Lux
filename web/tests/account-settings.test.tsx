@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountPage } from "../src/features/account/AccountPage";
 import { LuxShell } from "../src/components/layout/LuxShell";
 import { api } from "../src/lib/api/client";
-import { accountSettingsStorageKey, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings } from "../src/features/account/account-settings";
+import { accountSettingsStorageKey, applyAccountTheme, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings } from "../src/features/account/account-settings";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -31,6 +31,7 @@ describe("account settings", () => {
         { id: "series", name: "剧集", kind: "SERIES" },
       ],
     });
+    vi.spyOn(api, "userSettings").mockResolvedValue({ playedPercent: 95 });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -53,6 +54,18 @@ describe("account settings", () => {
 
     expect(readAccountSettings("user-a").theme).toBe("light");
     expect(readAccountSettings("user-b").theme).toBe("dark");
+  });
+
+  it("switches the favicon to match the selected theme", () => {
+    const favicon = document.createElement("link");
+    favicon.rel = "icon";
+    document.head.append(favicon);
+
+    applyAccountTheme("light");
+    expect(favicon.href).toBe("http://localhost:3000/favicon.svg");
+
+    applyAccountTheme("dark");
+    expect(favicon.href).toBe("http://localhost:3000/favicon-white.svg");
   });
 
   it("persists the selected accent color for the current account", async () => {
@@ -103,6 +116,38 @@ describe("account settings", () => {
     expect(container.textContent).toContain("账户");
     expect(container.querySelector("#appearance .lux-setting-divider")).toBeNull();
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
+  });
+
+  it("saves the personal automatic watched threshold", async () => {
+    const update = vi.spyOn(api, "updateUserSettings").mockResolvedValue({ playedPercent: 82 });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const input = container.querySelector<HTMLInputElement>('[aria-label="自动标记已看百分比"]');
+    expect(input?.value).toBe("95");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "82");
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+      input?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "保存")?.click();
+    });
+
+    expect(update).toHaveBeenCalledWith({ playedPercent: 82 });
+    expect(container.textContent).toContain("播放阈值已保存");
   });
 
   it("uploads an avatar to the server only after the user explicitly saves it", async () => {

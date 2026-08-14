@@ -438,6 +438,38 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
     .await?;
     assert_eq!(item_state, (300, 0));
 
+    sqlx::query(
+        "INSERT INTO user_playback_settings (user_id, played_percent)
+         VALUES (?, 80)
+         ON CONFLICT(user_id) DO UPDATE SET played_percent = excluded.played_percent",
+    )
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let completed = client
+        .post(&playback_base)
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "mediaServerItemId": item_id,
+            "mediaServerMediaSourceId": source_id,
+            "mediaServerPlaySessionId": "vidhub-completed-session",
+            "RunTimeTicks": 1_000,
+            "playbackPositionTicks": 800,
+            "deviceId": "vidhub-device",
+            "client": "VidHub",
+            "deviceName": "Mac",
+        }))
+        .send()
+        .await?;
+    assert_eq!(completed.status(), reqwest::StatusCode::NO_CONTENT);
+    let completed_state = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT position_ticks, is_played FROM user_item_state WHERE item_id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(completed_state, (800, 1));
+
     server.abort();
     assert!(!admin.id.to_string().is_empty());
     Ok(())

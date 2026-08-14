@@ -35,9 +35,9 @@ use crate::{
             DEFAULT_STRM_MEDIA_INFO_SCHEDULE, validate_cron,
         },
         settings::{
-            TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, TmdbSettings, read_tmdb_settings,
-            tmdb_api_base_url_options, tmdb_language_options, write_tmdb_api_key,
-            write_tmdb_settings,
+            TMDB_API_KEY_FILE, TMDB_SETTINGS_FILE, TMDB_TOKEN_FILE, TmdbSettings,
+            read_tmdb_settings, tmdb_api_base_url_options, tmdb_language_options,
+            write_tmdb_api_key, write_tmdb_settings,
         },
     },
     domain::ids::LibraryId,
@@ -348,6 +348,34 @@ impl PluginService {
             plugin,
             was_installed,
         })
+    }
+
+    pub async fn uninstall(&self, plugin_id: &str) -> Result<(), PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !self.database.has_plugin_installation(&plugin_id).await? {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+
+        remove_plugin_config(&self.config_dir, &plugin_id)
+            .await
+            .map_err(PluginServiceError::ConfigIo)?;
+        self.supervisor.stop(&plugin_id).await;
+        remove_plugin_files(plugin)
+            .await
+            .map_err(PluginServiceError::ConfigIo)?;
+        self.database.uninstall_plugin(&plugin_id).await?;
+        if plugin_id == MEDIA_INFO_PLUGIN_ID {
+            self.database.disable_strm_media_info_task().await?;
+        } else if is_chapter_detector_plugin(plugin) {
+            self.sync_chapter_detection_scheduled_tasks().await?;
+        }
+        *self.catalog.write().await = PluginCatalog::discover(&self.config_dir.join("plugins"));
+        Ok(())
     }
 
     pub async fn set_enabled(
@@ -966,6 +994,7 @@ impl PluginService {
     pub async fn sync_media_info_scheduled_task(&self) -> Result<(), PluginServiceError> {
         let (installed, enabled) = self.plugin_state(MEDIA_INFO_PLUGIN_ID).await?;
         if !installed {
+            self.database.disable_strm_media_info_task().await?;
             return Ok(());
         }
         let catalog = self.catalog_snapshot().await;
@@ -1710,6 +1739,46 @@ fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) 
         config_fields: Vec::new(),
         config_source: CONFIG_SOURCE_NONE.to_owned(),
         config_values: Map::new(),
+    }
+}
+
+async fn remove_plugin_files(plugin: &DiscoveredPlugin) -> io::Result<()> {
+    if plugin.is_archive {
+        remove_directory_if_present(&plugin.root_path).await?;
+        remove_file_if_present(&plugin.source_path).await?;
+    } else {
+        remove_directory_if_present(&plugin.source_path).await?;
+    }
+    Ok(())
+}
+
+async fn remove_plugin_config(config_dir: &Path, plugin_id: &str) -> io::Result<()> {
+    remove_file_if_present(&plugin_config_path(config_dir, plugin_id)).await?;
+    if plugin_id == MEDIA_INFO_PLUGIN_ID {
+        remove_file_if_present(&plugin_config_path(config_dir, MEDIA_INFO_LEGACY_PLUGIN_ID))
+            .await?;
+    }
+    if is_tmdb_plugin_id(plugin_id) {
+        for file_name in [TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, TMDB_SETTINGS_FILE] {
+            remove_file_if_present(&config_dir.join(file_name)).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn remove_directory_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

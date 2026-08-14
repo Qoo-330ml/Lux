@@ -115,6 +115,20 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     )
     .fetch_one(database.pool())
     .await?;
+    let final_episode_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'EPISODE' AND episode_number = 3",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_sources SET duration_ticks = 1_000
+         WHERE item_id IN (?, ?, ?)",
+    )
+    .bind(&episode_id)
+    .bind(&played_episode_id)
+    .bind(&final_episode_id)
+    .execute(database.pool())
+    .await?;
     sqlx::query(
         "UPDATE media_items
          SET original_title = ?, premiere_date = ?, last_air_date = ?, status = ?,
@@ -819,6 +833,66 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
 
     let csrf = request_cookie(&web_cookie, "lux_csrf");
+    for item_id in [&episode_id, &final_episode_id] {
+        let auto_progress = client
+            .post(format!("{base_url}/api/v1/items/{item_id}/progress"))
+            .header(COOKIE, &web_cookie)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({
+                "positionTicks": 950,
+                "durationTicks": 1_000,
+                "state": "STOPPED",
+            }))
+            .send()
+            .await?;
+        assert_eq!(auto_progress.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+    let season_after_completion = client
+        .get(format!("{base_url}/api/v1/items/{season_id}/playback"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        season_after_completion.json::<Value>().await?["isPlayed"],
+        true
+    );
+    let series_after_completion = client
+        .get(format!("{base_url}/api/v1/items/{series_id}/playback"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        series_after_completion.json::<Value>().await?["isPlayed"],
+        true
+    );
+
+    let unmark_final = client
+        .put(format!("{base_url}/api/v1/items/{final_episode_id}/played"))
+        .header(COOKIE, &web_cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "played": false }))
+        .send()
+        .await?;
+    assert_eq!(unmark_final.status(), reqwest::StatusCode::NO_CONTENT);
+    let season_after_unmark = client
+        .get(format!("{base_url}/api/v1/items/{season_id}/playback"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        season_after_unmark.json::<Value>().await?["isPlayed"],
+        false
+    );
+    let series_after_unmark = client
+        .get(format!("{base_url}/api/v1/items/{series_id}/playback"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        series_after_unmark.json::<Value>().await?["isPlayed"],
+        false
+    );
+
     let missing_csrf = client
         .put(format!("{base_url}/api/v1/items/{episode_id}/played"))
         .header(COOKIE, &web_cookie)

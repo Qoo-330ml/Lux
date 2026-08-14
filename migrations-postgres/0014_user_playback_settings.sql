@@ -1,0 +1,5 @@
+CREATE TABLE user_playback_settings (
+    user_id TEXT PRIMARY KEY NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    played_percent BIGINT NOT NULL DEFAULT 95 CHECK (played_percent BETWEEN 1 AND 100),
+    updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+);

@@ -9,8 +9,9 @@ import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import type { LuxUser } from "../../lib/api/types";
 import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
+import { LuxLogo } from "../LuxLogo";
 
-type LuxShellProps = { user: LuxUser };
+type LuxShellProps = { user: LuxUser; serverName?: string | null };
 type AvatarContextValue = {
   avatarUrl: string | null;
   setAvatarUrl: (url: string) => void;
@@ -23,7 +24,7 @@ export function useAvatar(): AvatarContextValue {
   return useContext(AvatarContext) ?? EMPTY_AVATAR_CONTEXT;
 }
 
-export function LuxShell({ user }: LuxShellProps) {
+export function LuxShell({ user, serverName }: LuxShellProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -47,13 +48,24 @@ export function LuxShell({ user }: LuxShellProps) {
     setAvatarImageFailed(false);
   }, [avatarUrl]);
 
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (isDetail) return;
+
+    const name = serverName?.trim();
+    document.title = name ? `${name} - Lux` : "Lux";
+    return () => {
+      document.title = "Lux";
+    };
+  }, [isDetail, serverName]);
+
   return (
     <AvatarContext.Provider value={{ avatarUrl, setAvatarUrl }}>
       <div className={isHome ? "lux-app is-home-route" : "lux-app"}>
         <header className="lux-header">
           <div className="lux-header-left">
             <NavLink className="lux-brand" to="/" aria-label="Lux 首页">
-              <img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" />
+              <LuxLogo className="lux-brand-logo" />
               <span className="lux-brand-name">Lux</span>
             </NavLink>
             <nav className="lux-desktop-nav" aria-label="主导航">
@@ -62,6 +74,9 @@ export function LuxShell({ user }: LuxShellProps) {
               </NavLink>
               <NavLink className={navClass} to="/libraries">
                 媒体库
+              </NavLink>
+              <NavLink className={navClass} to="/favorites">
+                收藏
               </NavLink>
               <NavLink className={navClass} to="/search">
                 搜索
@@ -112,6 +127,9 @@ export function LuxShell({ user }: LuxShellProps) {
               </NavLink>
               <NavLink className={navClass} to="/libraries" onClick={() => setMobileOpen(false)}>
                 媒体库
+              </NavLink>
+              <NavLink className={navClass} to="/favorites" onClick={() => setMobileOpen(false)}>
+                收藏
               </NavLink>
               <NavLink className={navClass} to="/search" onClick={() => setMobileOpen(false)}>
                 搜索

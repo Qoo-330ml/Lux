@@ -3,6 +3,7 @@ import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
+import { LuxLogo } from "../../components/LuxLogo";
 
 export function AdminSetupForm() {
   const navigate = useNavigate();
@@ -31,7 +32,7 @@ export function AdminSetupForm() {
 
   return (
     <section className="lux-auth-card lux-setup-card">
-      <div className="lux-auth-brand"><img className="lux-brand-logo" src="/logo.svg" alt="" aria-hidden="true" /><strong>Lux</strong></div>
+      <div className="lux-auth-brand"><LuxLogo className="lux-brand-logo" /><strong>Lux</strong></div>
       <h1>创建管理员</h1>
       <p>数据库已准备好。创建首个服务器管理员，稍后可以继续配置媒体库。</p>
       <form className="lux-auth-form" onSubmit={submit}>

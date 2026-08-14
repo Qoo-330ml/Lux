@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { heroSlides } from "../src/features/home/carousel";
+import { heroSlides, heroTitleScale } from "../src/features/home/carousel";
 
 const item = (id: string, itemType = "MOVIE") => ({ id, title: id, itemType });
 
@@ -39,5 +39,23 @@ describe("heroSlides", () => {
       "recent-1",
       "recent-2",
     ]);
+  });
+});
+
+describe("heroTitleScale", () => {
+  it("keeps short titles at the default display size", () => {
+    expect(heroTitleScale("精选电影")).toBe("default");
+  });
+
+  it("uses the compact display size for moderately long titles", () => {
+    expect(heroTitleScale("这是一个包含很多中文字符的中长标题，用于测试轮播显示效果")).toBe("compact");
+  });
+
+  it("uses the smallest readable display size for very long mixed titles", () => {
+    expect(heroTitleScale("FC2-4916281 脸）强忍着因为嘘息而即将失禁，但在猛烈的冲击下不停地溢出")).toBe("small");
+  });
+
+  it("treats an empty title as a short title", () => {
+    expect(heroTitleScale("   ")).toBe("default");
   });
 });
