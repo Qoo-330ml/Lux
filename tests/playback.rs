@@ -124,7 +124,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(
         playback_body["MediaSources"][0]["SupportsDirectStream"],
-        false
+        true
     );
     assert_eq!(
         playback_body["MediaSources"][0]["SupportsTranscoding"],

@@ -6972,6 +6972,13 @@ impl Database {
             let query = format!(
                 "SELECT mi.id AS item_id, mi.premiere_date, mi.last_air_date,
                         mi.status, mi.original_language, mi.provider_ids_json,
+                        (SELECT series.title
+                         FROM media_items series
+                         WHERE series.id = CASE
+                             WHEN mi.item_type = 'SEASON' THEN mi.parent_id
+                             ELSE mi.series_id
+                         END
+                           AND series.removed_at IS NULL) AS series_name,
                         (SELECT COUNT(*) FROM media_items child
                          WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
                            AND child.removed_at IS NULL) AS season_count,
@@ -7012,6 +7019,7 @@ impl Database {
                         status: row.get("status"),
                         original_language: row.get("original_language"),
                         provider_ids_json: row.get("provider_ids_json"),
+                        series_name: row.get("series_name"),
                         season_count: row.get("season_count"),
                         episode_count: row.get("episode_count"),
                     },
@@ -10581,6 +10589,7 @@ pub(crate) struct StoredCatalogRow {
 
 #[derive(Debug)]
 pub(crate) struct StoredCatalogDetail {
+    pub(crate) series_name: Option<String>,
     pub(crate) premiere_date: Option<String>,
     pub(crate) last_air_date: Option<String>,
     pub(crate) status: Option<String>,

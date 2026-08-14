@@ -123,7 +123,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 首版仅支持直接播放，不支持音视频转码、容器转换或字幕转换。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。
-- URL 型 `.strm` 返回外部播放地址；路径型和其他目标返回其目标类型对应的播放计划。
+- URL 型 `.strm` 在 `Path` 保留外部播放地址，`DirectStreamUrl` 缺省并由客户端经标准视频端点直连；路径型和其他目标返回其目标类型对应的播放计划。
 - 浏览器无法原生播放的编码直接显示不支持，不提供转码兜底。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -1251,7 +1251,7 @@ locked local value
 只声明实际能力：
 
 - SupportsDirectPlay = true。
-- SupportsDirectStream/Transcoding 按首版实际实现返回 false。
+- SupportsDirectStream 按首版实际播放入口实现返回 true；Transcoding 返回 false。
 - MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
 - 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
   `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。

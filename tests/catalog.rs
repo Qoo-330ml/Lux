@@ -728,6 +728,50 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(user_scoped_detail_body["People"][0]["Id"], "9");
     assert_eq!(user_scoped_detail_body["People"][0]["Role"], "角色甲");
     assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Actor");
+
+    // Filmly/网易爆米花 sends ShareLevel as a capability hint, while still
+    // requiring the complete detail payload needed to start playback.
+    let popcorn_detail = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items/{item_id}?Fields=ShareLevel",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(popcorn_detail.status(), reqwest::StatusCode::OK);
+    let popcorn_detail_body: Value = popcorn_detail.json().await?;
+    assert_eq!(popcorn_detail_body["Id"], item_id);
+    assert!(popcorn_detail_body["MediaSources"].is_array());
+    assert_eq!(popcorn_detail_body["MediaSources"][0]["ItemId"], item_id);
+    assert_eq!(popcorn_detail_body["SupportsSync"], true);
+    assert_eq!(popcorn_detail_body["RunTimeTicks"], 2000000000_i64);
+    // The Android filmly client maps the standard Emby detail scaffolding as
+    // non-null; empty collections and stable identifiers keep the DTO parseable.
+    assert_eq!(popcorn_detail_body["CanDelete"], false);
+    assert_eq!(popcorn_detail_body["LockData"], false);
+    assert_eq!(popcorn_detail_body["LockedFields"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["ExternalUrls"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["RemoteTrailers"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["Taglines"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["Genres"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["GenreItems"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["Studios"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["TagItems"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["LocalTrailerCount"], 0);
+    assert_eq!(popcorn_detail_body["PartCount"], 1);
+    assert_eq!(popcorn_detail_body["ForcedSortName"], "alpha movie");
+    assert_eq!(popcorn_detail_body["DisplayPreferencesId"], item_id);
+    assert_eq!(popcorn_detail_body["PresentationUniqueKey"], item_id);
+    assert_eq!(popcorn_detail_body["Width"], 1920);
+    assert_eq!(popcorn_detail_body["Height"], 1080);
+    assert!(popcorn_detail_body["Etag"].is_string());
+    assert!(!popcorn_detail_body["Etag"].as_str().unwrap().is_empty());
+    assert!(popcorn_detail_body["DateCreated"].is_string());
+    assert!(popcorn_detail_body["DateModified"].is_string());
+    assert!(popcorn_detail_body["Path"].is_string());
+    assert_eq!(popcorn_detail_body["OfficialRating"], serde_json::json!(""));
+
     let person_image_tag = user_scoped_detail_body["People"][0]["PrimaryImageTag"]
         .as_str()
         .ok_or("missing person image tag")?;
