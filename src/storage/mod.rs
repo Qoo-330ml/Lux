@@ -4340,6 +4340,97 @@ impl Database {
         })
     }
 
+    pub(crate) async fn repair_legacy_episode_identity(
+        &self,
+        filesystem_entry_id: &str,
+        series_identity: &str,
+        season_identity: &str,
+        episode_identity: &str,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let hierarchy: Option<(Option<String>, Option<String>, String)> = self
+            .query_as(
+                "SELECT mi.parent_id, mi.series_id, mi.id
+                 FROM media_sources ms
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 WHERE ms.filesystem_entry_id = ?",
+            )
+            .bind(filesystem_entry_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((season_id, series_id, episode_id)) = hierarchy else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(());
+        };
+
+        let identities = [
+            (series_id, series_identity),
+            (season_id, season_identity),
+            (Some(episode_id), episode_identity),
+        ];
+        for (item_id, identity_key) in identities {
+            let Some(item_id) = item_id else {
+                continue;
+            };
+            let identity_taken: Option<String> = self
+                .query_scalar(
+                    "SELECT id FROM media_items
+                     WHERE identity_key = ? AND id <> ?
+                     LIMIT 1",
+                )
+                .bind(identity_key)
+                .bind(&item_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if identity_taken.is_some() {
+                continue;
+            }
+            self.query(
+                "UPDATE media_items
+                 SET identity_key = ?
+                 WHERE id = ?
+                   AND (identity_key IS NULL OR identity_key LIKE 'legacy:%')",
+            )
+            .bind(identity_key)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(())
+    }
+
     pub(crate) async fn list_filesystem_entries_for_paths(
         &self,
         library_root_id: &str,

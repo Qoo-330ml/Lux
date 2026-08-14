@@ -679,7 +679,7 @@ async fn actor_relation_failure_does_not_discard_nfo_and_is_retried_separately()
 }
 
 #[tokio::test]
-async fn metadata_enrichment_skips_conflicting_nfo_and_indexes_following_images()
+async fn metadata_enrichment_accepts_duplicate_identity_and_indexes_following_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -732,8 +732,11 @@ async fn metadata_enrichment_skips_conflicting_nfo_and_indexes_following_images(
         .enrich_movie_library(library.id)
         .await?;
 
-    assert_eq!(report.nfo_loaded, 0);
-    assert_eq!(report.nfo_failed, 1);
+    // Duplicate title/year values are valid when the files have distinct
+    // filesystem identities. Local NFO enrichment must therefore continue
+    // successfully after the legacy broad uniqueness constraint is removed.
+    assert_eq!(report.nfo_loaded, 1);
+    assert_eq!(report.nfo_failed, 0);
     assert_eq!(report.images_found, 2);
     let image_paths: Vec<String> =
         sqlx::query_scalar("SELECT local_path FROM item_images ORDER BY local_path")

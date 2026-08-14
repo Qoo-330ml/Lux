@@ -371,14 +371,26 @@ impl LibraryScanner {
             .database
             .find_filesystem_entry(&root.id, &relative_path)
             .await?;
+        let hierarchy = episode_hierarchy(&relative_path, &parsed);
+        let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
+        let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
+        let episode_identity = Self::episode_identity_key(root, &hierarchy, &parsed);
+        if let Some(existing_entry) = existing_entry.as_ref() {
+            self.database
+                .repair_legacy_episode_identity(
+                    &existing_entry.id,
+                    &series_identity,
+                    &season_identity,
+                    &episode_identity,
+                )
+                .await?;
+        }
         let fingerprint_unchanged = existing_entry
             .as_ref()
             .is_some_and(|entry| entry.fingerprint.as_deref() == Some(fingerprint.as_slice()));
         let episode_is_current = if fingerprint_unchanged {
-            let hierarchy = episode_hierarchy(&relative_path, &parsed);
-            let identity = Self::episode_identity_key(root, &hierarchy, &parsed);
             self.database
-                .find_media_item_by_identity(&identity)
+                .find_media_item_by_identity(&episode_identity)
                 .await?
                 .is_some_and(|item| {
                     existing_entry
@@ -409,7 +421,6 @@ impl LibraryScanner {
             });
         }
 
-        let hierarchy = episode_hierarchy(&relative_path, &parsed);
         let ensured = self
             .ensure_episode_hierarchy(library_id_text, root, &parsed, &hierarchy)
             .await?;

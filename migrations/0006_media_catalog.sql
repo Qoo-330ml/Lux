@@ -35,8 +35,7 @@ CREATE TABLE media_items (
     locked_fields_json TEXT,
     identification_status TEXT NOT NULL CHECK (identification_status IN ('LOCAL_CONFIRMED', 'ONLINE_CONFIRMED', 'PENDING', 'FAILED')),
     added_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    removed_at INTEGER,
-    UNIQUE (library_id, sort_title, production_year)
+    removed_at INTEGER
 );
 
 CREATE TABLE media_sources (

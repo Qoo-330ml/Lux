@@ -126,6 +126,88 @@ async fn series_scan_builds_stable_series_season_episode_hierarchy()
 }
 
 #[tokio::test]
+async fn series_scan_allows_same_named_shows_in_distinct_roots()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let first_root = temp_dir.path().join("Shows-1");
+    let second_root = temp_dir.path().join("Shows-2");
+    create_file(&first_root.join("Same Show (2024)/Season 1/Same.Show.S01E01.mkv")).await?;
+    create_file(&second_root.join("Same Show (2024)/Season 1/Same.Show.S01E01.mkv")).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            first_root.to_str().ok_or("non-utf8 first root")?,
+        )
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            second_root.to_str().ok_or("non-utf8 second root")?,
+        )
+        .await?;
+
+    let report = LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    assert_eq!(report.created_items, 6);
+    assert_eq!(report.created_sources, 2);
+    let series_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE item_type = 'SERIES' AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(series_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn series_scan_repairs_legacy_null_hierarchy_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    create_file(&root.join("Legacy Show (2024)/Season 1/Legacy.Show.S01E01.mkv")).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_series_library(library.id).await?;
+    sqlx::query("UPDATE media_items SET identity_key = NULL")
+        .execute(database.pool())
+        .await?;
+
+    let repaired = scanner.scan_series_library(library.id).await?;
+    assert_eq!(repaired.created_items, 0);
+    assert_eq!(repaired.created_sources, 0);
+    assert_eq!(repaired.skipped_files, 1);
+    let item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE removed_at IS NULL")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(item_count, 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn series_scan_repairs_existing_grouped_hierarchy() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;
