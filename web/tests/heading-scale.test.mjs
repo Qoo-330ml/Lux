@@ -5,7 +5,7 @@ import test from "node:test";
 const styles = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
 
 test("primary page headings stay within the compact type scale", () => {
-  assert.match(styles, /\.lux-hero h1 \{[^}]*font-size: clamp\(2\.75rem, 5\.5vw, 5rem\)/);
+  assert.match(styles, /\.lux-hero-title\s*\{[^}]*font-size: clamp\(2\.75rem, 5\.5vw, 5rem\)/);
   assert.match(styles, /\.lux-page-heading h1 \{[^}]*font-size: clamp\(1\.75rem, 3vw, 2\.6rem\)/);
   assert.match(styles, /\.lux-admin-page-heading h1 \{[^}]*font-size: clamp\(1\.75rem, 3vw, 2\.6rem\)/);
   assert.match(styles, /\.lux-account-page-heading h1 \{[^}]*font-size: clamp\(1\.75rem, 3vw, 2\.6rem\)/);

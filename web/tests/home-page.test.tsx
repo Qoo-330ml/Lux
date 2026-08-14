@@ -189,6 +189,38 @@ describe("HomePage shelves", () => {
     expect(actionRow?.querySelector(".lux-hero-carousel-controls")?.parentElement).toBe(actionRow);
   });
 
+  it("applies the smallest title size while keeping the complete title text available", async () => {
+    const title = "FC2-4916281 脸）强忍着因为嘘息而即将失禁，但在猛烈的冲击下不停地溢出";
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [],
+      recommended: [{ id: "featured-long-title", title, itemType: "MOVIE" }],
+      continueWatching: [],
+      recentlyAdded: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const heroTitle = container.querySelector(".lux-hero-title");
+    expect(heroTitle?.classList.contains("lux-hero-title--small")).toBe(true);
+    expect(heroTitle?.querySelector(".lux-hero-title-text")?.textContent).toBe(title);
+  });
+
   it("uses an available media logo in the carousel title area", async () => {
     vi.spyOn(api, "home").mockResolvedValue({
       libraries: [],
