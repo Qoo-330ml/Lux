@@ -1,14 +1,15 @@
-import { Activity, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
+import { Activity, BookOpen, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useAdminEvents } from "./useAdminEvents";
 
-const adminNav = [
+export const adminNav = [
   { to: "/admin", label: "仪表盘", icon: Activity, end: true },
   { to: "/admin/libraries", label: "媒体库", icon: Database },
   { to: "/admin/plugins", label: "插件库", icon: PackageOpen },
   { to: "/admin/users", label: "用户与权限", icon: Users },
   { to: "/admin/jobs", label: "任务与日志", icon: FileClock },
   { to: "/admin/settings", label: "服务器设置", icon: Settings2 },
+  { to: "/admin/changelog", label: "更新日志", icon: BookOpen },
 ];
 
 export function AdminLayout() {
