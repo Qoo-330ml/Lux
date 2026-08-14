@@ -156,6 +156,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-continue-card:hover .lux-media-art img { filter: brightness(.72); transform: scale(1.045); }
 .lux-continue-card:hover .lux-media-hover-play { opacity: 1; transform: translate(-50%, -50%) scale(1); }
 .lux-continue-copy { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: var(--lux-card-copy-padding); }
+.lux-continue-copy > div { min-width: 0; }
 .lux-continue-copy strong { display: block; overflow: hidden; color: rgba(255,255,255,.92); font-size: .88rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .lux-continue-copy small { display: block; margin-top: 4px; color: var(--lux-subtle); font-size: .74rem; }
 .lux-continue-remaining { flex: 0 0 auto; color: var(--lux-muted); font-size: .72rem; line-height: 1.4; white-space: nowrap; }
