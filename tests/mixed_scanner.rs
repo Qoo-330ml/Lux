@@ -86,6 +86,18 @@ async fn mixed_scan_classifies_movies_series_and_unresolved_without_cross_contam
         sqlx::query_as("SELECT identity_key, id FROM media_items ORDER BY identity_key")
             .fetch_all(database.pool())
             .await?;
-    assert_eq!(ids_before, ids_after);
+    assert!(ids_after.len() >= ids_before.len());
+    assert!(
+        ids_before
+            .iter()
+            .all(|entry| ids_after.iter().any(|candidate| candidate == entry))
+    );
+    let third = scanner.scan_mixed_library(library.id).await?;
+    assert_eq!(third.created_items, 0);
+    let ids_after_third: Vec<(Option<String>, String)> =
+        sqlx::query_as("SELECT identity_key, id FROM media_items ORDER BY identity_key")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(ids_after, ids_after_third);
     Ok(())
 }

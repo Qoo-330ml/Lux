@@ -129,9 +129,10 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type <> 'FOLDER' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
 
     let tmdb_app = Router::new().fallback(any(tmdb_search_stub));
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;

@@ -14,7 +14,7 @@ use luxd::{
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
-        metadata_paths::{library_item_directory, people_directory},
+        metadata_paths::{canonical_person_directory, library_item_directory, people_directory},
         people::PeopleService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
@@ -298,10 +298,13 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let people_file =
         library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
     let people: Value = serde_json::from_slice(&tokio::fs::read(people_file).await?)?;
-    assert_eq!(people["schemaVersion"], 1);
+    assert_eq!(people["schemaVersion"], 2);
     assert_eq!(people["actors"][0]["name"], "演员甲");
     assert_eq!(people["actors"][0]["provider"], "tmdb");
-    let person_dir = people_directory(&fixture.config.config_dir, "演员甲", "tmdb", "9")?;
+    let person_key = people["actors"][0]["personKey"]
+        .as_str()
+        .ok_or("missing canonical person key")?;
+    let person_dir = canonical_person_directory(&fixture.config.config_dir, person_key)?;
     assert!(person_dir.join("person.nfo").exists());
 
     let detail = client
@@ -896,9 +899,10 @@ async fn prepare_fixture(with_local_nfo: bool) -> Result<Fixture, Box<dyn std::e
             .enrich_movie_library(library.id)
             .await?;
     }
-    let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type <> 'FOLDER' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
     Ok(Fixture {
         _temp_dir: temp_dir,
         config,

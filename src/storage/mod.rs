@@ -771,7 +771,7 @@ impl Database {
     ) -> Result<Vec<String>, StorageError> {
         self.query_scalar(
             "SELECT id FROM media_items
-             WHERE library_id = ? AND removed_at IS NULL
+             WHERE library_id = ? AND removed_at IS NULL AND item_type <> 'FOLDER'
              ORDER BY CASE item_type
                           WHEN 'SERIES' THEN 0
                           WHEN 'SEASON' THEN 1
