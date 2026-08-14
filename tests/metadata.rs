@@ -370,9 +370,9 @@ async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
     assert_eq!(report.nfo_failed, 1);
     assert_eq!(report.images_found, 2);
 
-    let item: (String, String, i64, String) = sqlx::query_as(
-        "SELECT title, original_title, production_year, overview
-         FROM media_items WHERE sort_title = 'good movie'",
+    let item: (String, String, String, i64, String) = sqlx::query_as(
+        "SELECT title, sort_title, original_title, production_year, overview
+         FROM media_items WHERE title = '本地电影'",
     )
     .fetch_one(database.pool())
     .await?;
@@ -380,13 +380,14 @@ async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
         item,
         (
             "本地电影".to_owned(),
+            "本地电影".to_owned(),
             "Local Movie".to_owned(),
             2021,
             "本地简介".to_owned()
         )
     );
     let provenance: String = sqlx::query_scalar(
-        "SELECT metadata_provenance_json FROM media_items WHERE sort_title = 'good movie'",
+        "SELECT metadata_provenance_json FROM media_items WHERE title = '本地电影'",
     )
     .fetch_one(database.pool())
     .await?;
@@ -396,7 +397,7 @@ async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
     assert_eq!(provenance["overview"], "LOCAL_NFO");
     assert_eq!(provenance["productionYear"], "LOCAL_NFO");
     let locked_fields: String = sqlx::query_scalar(
-        "SELECT locked_fields_json FROM media_items WHERE sort_title = 'good movie'",
+        "SELECT locked_fields_json FROM media_items WHERE title = '本地电影'",
     )
     .fetch_one(database.pool())
     .await?;
@@ -442,7 +443,7 @@ async fn local_movie_nfo_actors_are_available_without_online_matching_and_reuse_
     tokio::fs::write(movie_dir.join("Local.Movie.2026.mkv"), b"movie").await?;
     tokio::fs::write(
         movie_dir.join("movie.nfo"),
-        r#"<movie><title>本地电影</title><actor><name>演员甲</name><role>角色甲</role><type>Actor</type><tmdbid>9</tmdbid><order>0</order></actor><actor><name>演员乙</name><role>角色乙</role><type>Actor</type><tmdbid>10</tmdbid><order>1</order></actor></movie>"#,
+        r#"<movie><title>本地电影</title><actor><name>演员甲</name><role>角色甲</role><type>Actor</type><tmdbid>9</tmdbid><order>0</order></actor><actor><name>演员乙</name><role>角色乙</role><type>Actor</type><tmdbid>10</tmdbid><order>1</order></actor><actor><name>本地演员</name><role>本地角色</role><order>2</order></actor></movie>"#,
     )
     .await?;
 
@@ -473,7 +474,7 @@ async fn local_movie_nfo_actors_are_available_without_online_matching_and_reuse_
             .fetch_one(database.pool())
             .await?;
     let actors = people.list_item_actors(&item_id).await?;
-    assert_eq!(actors.len(), 2);
+    assert_eq!(actors.len(), 3);
     assert_eq!(actors[0].name, "演员甲");
     assert_eq!(
         actors[0].image_url.as_deref(),
@@ -481,6 +482,9 @@ async fn local_movie_nfo_actors_are_available_without_online_matching_and_reuse_
     );
     assert_eq!(actors[1].name, "演员乙");
     assert_eq!(actors[1].image_url, None);
+    assert_eq!(actors[2].name, "本地演员");
+    assert_eq!(actors[2].character.as_deref(), Some("本地角色"));
+    assert_eq!(actors[2].image_url, None);
     Ok(())
 }
 
