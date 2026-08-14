@@ -4603,6 +4603,15 @@ fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 item.overview.clone().map(Value::from),
             );
         }
+        if emby_fields_include(fields, "PremiereDate")
+            || (item.item_type == "EPISODE" && emby_fields_include(fields, "MediaSources"))
+        {
+            emby_insert_optional(
+                &mut object,
+                "PremiereDate",
+                emby_datetime(item.premiere_date.as_deref()),
+            );
+        }
         if emby_fields_include(fields, "ProviderIds") {
             object.insert(
                 "ProviderIds".to_owned(),
@@ -5136,6 +5145,7 @@ fn emby_media_source_json_with_resolver_and_chapters(
         "IsRemote": is_remote_playback,
         "SupportsDirectPlay": is_playable,
         "SupportsDirectStream": is_playable,
+        "SupportsProbing": !source.probe_status.eq_ignore_ascii_case("FAILED"),
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
         "DefaultAudioStreamIndex": source
@@ -5204,6 +5214,10 @@ fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -
         "Codec": stream.codec,
         "Language": stream.language,
         "DisplayTitle": stream.title,
+        "AttachmentSize": 0,
+        "IsAnamorphic": false,
+        "Protocol": if stream.is_external { "Http" } else { "File" },
+        "SupportsExternalStream": stream.is_external,
         "IsExternal": stream.is_external,
         "IsDefault": stream.is_default,
         "IsForced": stream.is_forced,

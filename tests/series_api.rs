@@ -342,12 +342,33 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(filmly_episode["SupportsSync"], true);
     assert_eq!(filmly_episode["Overview"], "Episode overview");
     assert_eq!(filmly_episode["ProviderIds"]["Tmdb"], "123456");
+    assert_eq!(
+        filmly_episode["PremiereDate"],
+        "2024-01-02T00:00:00.0000000Z"
+    );
     assert_eq!(filmly_episode["SeasonName"], "Season 01");
     assert_eq!(filmly_episode["ParentThumbItemId"], series_id);
     assert_eq!(filmly_episode["Container"], "mkv");
     assert_eq!(filmly_episode["Size"], 123);
     assert_eq!(filmly_episode["Bitrate"], 456);
     assert!(filmly_episode["People"].is_array());
+    assert_eq!(filmly_episode["MediaSources"][0]["SupportsProbing"], true);
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["MediaStreams"][0]["AttachmentSize"],
+        0
+    );
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["MediaStreams"][0]["IsAnamorphic"],
+        false
+    );
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["MediaStreams"][0]["Protocol"],
+        "File"
+    );
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["MediaStreams"][0]["SupportsExternalStream"],
+        false
+    );
     assert_eq!(
         filmly_episode["MediaSources"][0]["MediaStreams"][0]["Width"],
         1920
