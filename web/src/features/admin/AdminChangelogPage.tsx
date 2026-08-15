@@ -21,12 +21,16 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "added", items: [
         "增加服务器级共享管理员 API Key，支持管理员查看、复制、生成、轮换和撤销。",
         "API Key 兼容 Lux 与已实现的 Emby 路由，并支持多种 Emby 风格认证头。",
+        "账户路由包含当前用户 ID，并限制访问其他用户账户路径。",
+        "Emby 兼容接口公开混合媒体库的 mixed 集合类型。",
       ] },
       { kind: "fixed", items: [
         "修复管理操作页运行时任务使用 ISO 时间戳时排序不正确的问题。",
+        "修复旧版 STRM media-info manifest 缺少计划字段时无法编辑和迁移执行计划的问题。",
       ] },
       { kind: "changed", items: [
         "完善 API Key 的受限文件存储、旧 Key 立即失效和审计标记，避免敏感凭据进入数据库或日志。",
+        "将共享管理员 API Key 管理入口从账户设置移动到服务器设置，保持管理员配置集中管理。",
       ] },
     ],
   },
