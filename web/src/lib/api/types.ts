@@ -432,6 +432,7 @@ export type AdminJob = {
   cursor?: string | null;
   processedCount?: number;
   totalCount?: number | null;
+  discoveryCompleted?: boolean;
   cancelRequested?: boolean;
   error?: string | null;
   createdAt?: string | number;

@@ -2890,6 +2890,18 @@ impl Database {
             })
     }
 
+    pub(crate) async fn clear_scan_job_paths(&self, job_id: &str) -> Result<(), StorageError> {
+        self.query("DELETE FROM scan_job_paths WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn create_reconciliation_scan_job(
         &self,
         id: &str,
@@ -3079,6 +3091,27 @@ impl Database {
                 source,
             })?;
         Ok(total_count)
+    }
+
+    pub(crate) async fn update_scan_job_discovery_progress(
+        &self,
+        job_id: &str,
+        discovered_count: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scan_jobs
+             SET total_count = ?, updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING' AND discovery_completed = 0",
+        )
+        .bind(discovered_count)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn complete_reconciliation_files(

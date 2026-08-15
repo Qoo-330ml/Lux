@@ -73,7 +73,7 @@ use crate::{
         people::{PeopleError, PeopleService},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
-        scanner::{ScanJob, ScanJobError, ScanJobService},
+        scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         scheduled_tasks::ScheduledTaskService,
         scraper::ScraperResolver,
         settings::{
@@ -405,7 +405,7 @@ impl AppState {
                 if let Err(error) = worker
                     .run_to_completion_with_metadata_and_thumbnails(
                         &job_id,
-                        100,
+                        BACKGROUND_SCAN_BATCH_SIZE,
                         worker_probe,
                         worker_metadata,
                         worker_thumbnails,
@@ -10275,7 +10275,11 @@ async fn admin_start_scan(
     tokio::spawn(async move {
         let _ = worker
             .run_to_completion_with_metadata_and_thumbnails(
-                &job_id, 100, probe, metadata, thumbnails,
+                &job_id,
+                BACKGROUND_SCAN_BATCH_SIZE,
+                probe,
+                metadata,
+                thumbnails,
             )
             .await;
     });
@@ -10381,7 +10385,11 @@ async fn spawn_library_scan(
     tokio::spawn(async move {
         let _ = worker
             .run_to_completion_with_metadata_and_thumbnails(
-                &job_id, 100, probe, metadata, thumbnails,
+                &job_id,
+                BACKGROUND_SCAN_BATCH_SIZE,
+                probe,
+                metadata,
+                thumbnails,
             )
             .await;
     });
@@ -11990,7 +11998,7 @@ async fn admin_retry_scan(
         let _ = worker
             .run_to_completion_with_metadata_and_thumbnails(
                 &new_job_id,
-                100,
+                BACKGROUND_SCAN_BATCH_SIZE,
                 probe,
                 metadata,
                 thumbnails,
@@ -12023,6 +12031,7 @@ fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) -> Value {
         "cursor": job.cursor,
         "processedCount": job.processed_count,
         "totalCount": job.total_count,
+        "discoveryCompleted": job.discovery_completed,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
         "finishedAt": job.finished_at,
@@ -12078,6 +12087,7 @@ fn scan_job_json(job: &crate::application::scanner::ScanJob) -> Value {
         "cursor": job.cursor,
         "processedCount": job.processed_count,
         "totalCount": job.total_count,
+        "discoveryCompleted": job.discovery_completed,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
         "finishedAt": job.finished_at,

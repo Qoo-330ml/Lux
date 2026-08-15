@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::UNIX_EPOCH,
 };
 
@@ -43,6 +46,8 @@ use crate::{
 };
 
 const FILE_BATCH_SIZE: usize = 500;
+pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 25;
+const DISCOVERY_BATCH_SIZE: usize = 16;
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -1451,6 +1456,7 @@ pub struct ScanJobService {
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
     resources: ResourceMetrics,
+    cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1472,6 +1478,7 @@ impl ScanJobService {
             people: None,
             local_nfo: None,
             resources: ResourceMetrics::new(),
+            cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1512,6 +1519,60 @@ impl ScanJobService {
     pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
         self.resources = resources;
         self
+    }
+
+    fn cancellation_flag(&self, job_id: &str) -> Arc<AtomicBool> {
+        let mut flags = match self.cancellation_flags.lock() {
+            Ok(flags) => flags,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        flags
+            .entry(job_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    fn clear_cancellation_flag(&self, job_id: &str) {
+        let mut flags = match self.cancellation_flags.lock() {
+            Ok(flags) => flags,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        flags.remove(job_id);
+    }
+
+    async fn cancel_running_job(&self, job_id: &str) -> Result<ScanBatchReport, ScanJobError> {
+        self.database
+            .clear_reconciliation_scan_entries(job_id)
+            .await?;
+        self.database.clear_scan_job_paths(job_id).await?;
+        self.database
+            .finish_scan_job(job_id, "CANCELLED", None)
+            .await?;
+        self.record_event(job_id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
+            .await;
+        self.clear_cancellation_flag(job_id);
+        Ok(ScanBatchReport {
+            status: "CANCELLED".to_owned(),
+            processed: 0,
+            completed: true,
+        })
+    }
+
+    async fn cancellation_requested(
+        &self,
+        job_id: &str,
+        job_cancel_requested: bool,
+        flag: &AtomicBool,
+    ) -> Result<bool, ScanJobError> {
+        if job_cancel_requested || flag.load(Ordering::Acquire) {
+            flag.store(true, Ordering::Release);
+            return Ok(true);
+        }
+        if self.database.scan_job_cancel_requested(job_id).await? {
+            flag.store(true, Ordering::Release);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub async fn enqueue_incremental_changes(
@@ -1579,6 +1640,7 @@ impl ScanJobService {
                 .await?
                 .ok_or(ScanJobError::JobNotFound)?
         };
+        self.cancellation_flag(&job.id);
         for (root_id, relative_path, kind) in valid_changes {
             self.database
                 .enqueue_incremental_scan_path(
@@ -1652,6 +1714,7 @@ impl ScanJobService {
             }
             return Err(error.into());
         }
+        self.cancellation_flag(&id);
         self.record_event(&id, "INFO", "JOB_CREATED", "任务已创建", "{}")
             .await;
         self.get_job(&id).await
@@ -1677,10 +1740,17 @@ impl ScanJobService {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Err(ScanJobError::JobNotFound);
         };
+        let cancellation = self.cancellation_flag(job_id);
+        if job.cancel_requested {
+            cancellation.store(true, Ordering::Release);
+        }
         if job.job_type == "INCREMENTAL_SCAN" {
-            return self.run_incremental_batch(job_id, batch_size).await;
+            return self
+                .run_incremental_batch(job_id, batch_size, &cancellation)
+                .await;
         }
         if matches!(job.status.as_str(), "COMPLETED" | "CANCELLED" | "FAILED") {
+            self.clear_cancellation_flag(job_id);
             return Ok(ScanBatchReport {
                 status: job.status,
                 processed: 0,
@@ -1694,42 +1764,39 @@ impl ScanJobService {
             self.record_event(job_id, "INFO", "JOB_STARTED", "任务开始执行", "{}")
                 .await;
         }
-        if self.database.scan_job_cancel_requested(job_id).await? {
-            self.database
-                .clear_reconciliation_scan_entries(job_id)
-                .await?;
-            self.database
-                .finish_scan_job(job_id, "CANCELLED", None)
-                .await?;
-            self.record_event(job_id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
-                .await;
-            return Ok(ScanBatchReport {
-                status: "CANCELLED".to_owned(),
-                processed: 0,
-                completed: true,
-            });
+        if self
+            .cancellation_requested(job_id, job.cancel_requested, &cancellation)
+            .await?
+        {
+            return self.cancel_running_job(job_id).await;
         }
 
         if !job.discovery_completed {
             return self
-                .run_reconciliation_discovery_batch(&job, batch_size)
+                .run_reconciliation_discovery_batch(&job, batch_size, &cancellation)
                 .await;
         }
-        self.run_reconciliation_file_batch(&job, batch_size).await
+        self.run_reconciliation_file_batch(&job, batch_size, &cancellation)
+            .await
     }
 
     async fn run_reconciliation_discovery_batch(
         &self,
         job: &StoredScanJob,
         batch_size: usize,
+        cancellation: &AtomicBool,
     ) -> Result<ScanBatchReport, ScanJobError> {
-        let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+        let limit = i64::try_from(batch_size.min(DISCOVERY_BATCH_SIZE)).unwrap_or(i64::MAX);
         let directories = self
             .database
             .list_reconciliation_scan_entries(&job.id, "DIRECTORY", limit)
             .await?;
         let mut unavailable_root_ids = HashSet::new();
+        let mut discovered_count = job.total_count;
         for directory in directories {
+            if cancellation.load(Ordering::Acquire) {
+                return self.cancel_running_job(&job.id).await;
+            }
             if unavailable_root_ids.contains(&directory.library_root_id) {
                 continue;
             }
@@ -1743,8 +1810,13 @@ impl ScanJobService {
                     .await?;
                 continue;
             };
-            match discover_reconciliation_directory(&root, &directory.relative_path).await {
-                Ok(discovered) => {
+            match discover_reconciliation_directory(&root, &directory.relative_path, cancellation)
+                .await
+            {
+                Ok(Some(discovered)) => {
+                    discovered_count = discovered_count.saturating_add(
+                        i64::try_from(discovered.media_files.len()).unwrap_or(i64::MAX),
+                    );
                     if !root.is_available {
                         self.database
                             .update_library_root_availability(&root.id, true)
@@ -1760,6 +1832,7 @@ impl ScanJobService {
                         )
                         .await?;
                 }
+                Ok(None) => return self.cancel_running_job(&job.id).await,
                 Err(ScannerError::Io { .. }) => {
                     unavailable_root_ids.insert(root.id.clone());
                     self.database
@@ -1790,12 +1863,26 @@ impl ScanJobService {
                 .database
                 .finish_reconciliation_discovery(&job.id)
                 .await?;
-            let details = format!(r#"{{"total":{total}}}"#);
+            let details = format!(r#"{{"discovered":{total},"discoveryCompleted":true}}"#);
             self.record_event(
                 &job.id,
                 "INFO",
                 "DISCOVERY_COMPLETED",
                 "媒体库目录发现完成",
+                &details,
+            )
+            .await;
+        } else {
+            self.database
+                .update_scan_job_discovery_progress(&job.id, discovered_count)
+                .await?;
+            let details =
+                format!(r#"{{"discovered":{discovered_count},"discoveryCompleted":false}}"#);
+            self.record_event(
+                &job.id,
+                "INFO",
+                "DISCOVERY_PROGRESS",
+                "媒体库目录发现进行中",
                 &details,
             )
             .await;
@@ -1811,6 +1898,7 @@ impl ScanJobService {
         &self,
         job: &StoredScanJob,
         batch_size: usize,
+        cancellation: &AtomicBool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let roots = self.database.list_library_roots(&job.library_id).await?;
         let library = self.database.find_library(&job.library_id).await?;
@@ -1872,7 +1960,13 @@ impl ScanJobService {
 
         if library_kind == "MOVIE" {
             return self
-                .run_movie_reconciliation_file_batch(job, &roots, &batch, scan_concurrency)
+                .run_movie_reconciliation_file_batch(
+                    job,
+                    &roots,
+                    &batch,
+                    scan_concurrency,
+                    cancellation,
+                )
                 .await;
         }
 
@@ -1880,6 +1974,9 @@ impl ScanJobService {
         let mut next_count = job.processed_count;
         let mut completed_entries = Vec::<StoredReconciliationScanEntry>::new();
         for entry in &batch {
+            if cancellation.load(Ordering::Acquire) {
+                return self.cancel_running_job(&job.id).await;
+            }
             let Some(root) = roots.iter().find(|root| root.id == entry.library_root_id) else {
                 self.database
                     .discard_reconciliation_root_entries(&job.id, &entry.library_root_id)
@@ -2015,6 +2112,7 @@ impl ScanJobService {
         roots: &[StoredLibraryRoot],
         batch: &[StoredReconciliationScanEntry],
         configured_concurrency: i64,
+        cancellation: &AtomicBool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let mut processed = 0_usize;
         let mut next_count = job.processed_count;
@@ -2049,6 +2147,9 @@ impl ScanJobService {
         }
 
         for (index, entry) in batch.iter().enumerate() {
+            if cancellation.load(Ordering::Acquire) {
+                return self.cancel_running_job(&job.id).await;
+            }
             if unavailable_root_ids.contains(&entry.library_root_id) {
                 continue;
             }
@@ -2152,6 +2253,10 @@ impl ScanJobService {
         let mut active_tasks = 0_usize;
         let mut prepared_files = HashMap::<String, Vec<NewMovieFile>>::new();
         for (index, root_id, root_path, path, entry) in new_files {
+            if cancellation.load(Ordering::Acquire) {
+                preparation_tasks.abort_all();
+                return self.cancel_running_job(&job.id).await;
+            }
             if active_tasks >= concurrency {
                 let prepared = join_movie_preparation(&mut preparation_tasks).await;
                 let (index, root_id, entry, file) = match prepared {
@@ -2159,6 +2264,10 @@ impl ScanJobService {
                     Err(error) => return self.fail_reconciliation_job(job, error).await,
                 };
                 active_tasks = active_tasks.saturating_sub(1);
+                if cancellation.load(Ordering::Acquire) {
+                    preparation_tasks.abort_all();
+                    return self.cancel_running_job(&job.id).await;
+                }
                 if let Some(file) = file {
                     prepared_files.entry(root_id).or_default().push(file);
                 }
@@ -2180,6 +2289,10 @@ impl ScanJobService {
                 Err(error) => return self.fail_reconciliation_job(job, error).await,
             };
             active_tasks = active_tasks.saturating_sub(1);
+            if cancellation.load(Ordering::Acquire) {
+                preparation_tasks.abort_all();
+                return self.cancel_running_job(&job.id).await;
+            }
             if let Some(file) = file {
                 prepared_files.entry(root_id).or_default().push(file);
             }
@@ -2242,19 +2355,9 @@ impl ScanJobService {
         )
         .await;
         if self.database.scan_job_cancel_requested(&job.id).await? {
-            self.database
-                .clear_reconciliation_scan_entries(&job.id)
-                .await?;
-            self.database
-                .finish_scan_job(&job.id, "CANCELLED", None)
-                .await?;
-            self.record_event(&job.id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
-                .await;
-            return Ok(ScanBatchReport {
-                status: "CANCELLED".to_owned(),
-                processed,
-                completed: true,
-            });
+            let mut cancelled = self.cancel_running_job(&job.id).await?;
+            cancelled.processed = processed;
+            return Ok(cancelled);
         }
         Ok(ScanBatchReport {
             status: "RUNNING".to_owned(),
@@ -2277,6 +2380,7 @@ impl ScanJobService {
             .await?;
         self.record_event(&job.id, "ERROR", error_code, "扫描任务失败", "{}")
             .await;
+        self.clear_cancellation_flag(&job.id);
         Err(error.into())
     }
 
@@ -2284,11 +2388,13 @@ impl ScanJobService {
         &self,
         job_id: &str,
         batch_size: usize,
+        cancellation: &AtomicBool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Err(ScanJobError::JobNotFound);
         };
         if matches!(job.status.as_str(), "COMPLETED" | "CANCELLED" | "FAILED") {
+            self.clear_cancellation_flag(job_id);
             return Ok(ScanBatchReport {
                 status: job.status,
                 processed: 0,
@@ -2302,17 +2408,11 @@ impl ScanJobService {
             self.record_event(job_id, "INFO", "JOB_STARTED", "局部扫描任务开始执行", "{}")
                 .await;
         }
-        if self.database.scan_job_cancel_requested(job_id).await? {
-            self.database
-                .finish_scan_job(job_id, "CANCELLED", None)
-                .await?;
-            self.record_event(job_id, "INFO", "JOB_CANCELLED", "扫描任务已取消", "{}")
-                .await;
-            return Ok(ScanBatchReport {
-                status: "CANCELLED".to_owned(),
-                processed: 0,
-                completed: true,
-            });
+        if self
+            .cancellation_requested(job_id, job.cancel_requested, cancellation)
+            .await?
+        {
+            return self.cancel_running_job(job_id).await;
         }
         let paths = self
             .database
@@ -2325,6 +2425,7 @@ impl ScanJobService {
                     .await?;
                 self.record_event(job_id, "INFO", "JOB_COMPLETED", "局部扫描任务已完成", "{}")
                     .await;
+                self.clear_cancellation_flag(job_id);
                 return Ok(ScanBatchReport {
                     status: "COMPLETED".to_owned(),
                     processed: 0,
@@ -2343,8 +2444,11 @@ impl ScanJobService {
             .await?
             .ok_or(ScanJobError::LibraryNotFound)?;
         for path in &paths {
+            if cancellation.load(Ordering::Acquire) {
+                return self.cancel_running_job(job_id).await;
+            }
             if let Err(error) = self
-                .process_incremental_path(&library.kind, &job, path)
+                .process_incremental_path(&library.kind, &job, path, cancellation)
                 .await
             {
                 self.database
@@ -2353,6 +2457,9 @@ impl ScanJobService {
                 self.record_event(job_id, "ERROR", error.code(), "局部扫描任务失败", "{}")
                     .await;
                 return Err(error.into());
+            }
+            if cancellation.load(Ordering::Acquire) {
+                return self.cancel_running_job(job_id).await;
             }
             self.database
                 .mark_scan_job_path_processed(job_id, &path.library_root_id, &path.relative_path)
@@ -2383,6 +2490,7 @@ impl ScanJobService {
         library_kind: &str,
         job: &StoredScanJob,
         path: &StoredScanJobPath,
+        cancellation: &AtomicBool,
     ) -> Result<(), ScannerError> {
         let root = self
             .database
@@ -2407,11 +2515,17 @@ impl ScanJobService {
             let mut walker = FileBatchWalker::new(&media_path);
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
                 for file in files {
+                    if cancellation.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     self.process_incremental_file(library_kind, job, &root, root_path, &file)
                         .await?;
                 }
             }
         } else if is_supported_movie_file(&media_path) {
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.process_incremental_file(library_kind, job, &root, root_path, &media_path)
                 .await?;
         }
@@ -2980,7 +3094,17 @@ impl ScanJobService {
     }
 
     pub async fn cancel(&self, job_id: &str) -> Result<(), ScanJobError> {
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Err(ScanJobError::JobNotFound);
+        };
+        if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
+            return Ok(());
+        }
+        let cancellation = self.cancellation_flag(job_id);
+        cancellation.store(true, Ordering::Release);
         self.database.request_scan_job_cancel(job_id).await?;
+        self.record_event(job_id, "INFO", "CANCEL_REQUESTED", "已请求取消任务", "{}")
+            .await;
         Ok(())
     }
 
@@ -3064,6 +3188,7 @@ pub struct ScanJob {
     pub cursor: Option<String>,
     pub processed_count: i64,
     pub total_count: i64,
+    pub discovery_completed: bool,
     pub cancel_requested: bool,
     pub error: Option<String>,
     pub finished_at: Option<i64>,
@@ -3079,6 +3204,7 @@ fn scan_job(job: StoredScanJob) -> ScanJob {
         cursor: job.cursor,
         processed_count: job.processed_count,
         total_count: job.total_count,
+        discovery_completed: job.discovery_completed,
         cancel_requested: job.cancel_requested,
         error: job.error,
         finished_at: job.finished_at,
@@ -3504,7 +3630,8 @@ struct ReconciliationDirectoryEntries {
 async fn discover_reconciliation_directory(
     root: &StoredLibraryRoot,
     relative_directory: &str,
-) -> Result<ReconciliationDirectoryEntries, ScannerError> {
+    cancellation: &AtomicBool,
+) -> Result<Option<ReconciliationDirectoryEntries>, ScannerError> {
     let relative = Path::new(relative_directory);
     if relative.is_absolute()
         || relative.components().any(|component| {
@@ -3538,6 +3665,9 @@ async fn discover_reconciliation_directory(
             source,
         })?
     {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let path = entry.path();
         let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
             path: path.clone(),
@@ -3560,7 +3690,7 @@ async fn discover_reconciliation_directory(
     }
     discovered.directories.sort();
     discovered.media_files.sort();
-    Ok(discovered)
+    Ok(Some(discovered))
 }
 
 fn is_supported_movie_file(path: &Path) -> bool {

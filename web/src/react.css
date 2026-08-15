@@ -840,6 +840,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .status-cancelled { color: var(--lux-subtle); background: rgba(255,255,255,.07); }
 .lux-job-progress { height: 3px; margin-top: 9px; overflow: hidden; border-radius: 4px; background: rgba(255,255,255,.12); }
 .lux-job-progress span { display: block; height: 100%; background: var(--lux-accent); }
+.lux-job-progress.is-indeterminate span { width: 35%; animation: lux-job-progress-indeterminate 1.2s ease-in-out infinite; }
+@keyframes lux-job-progress-indeterminate { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
 .lux-admin-job-actions { display: flex; gap: 6px; }
 .lux-admin-log-row { grid-template-columns: 30px minmax(0, 1fr) auto; }
 .lux-admin-log-icon { color: var(--lux-subtle); }
