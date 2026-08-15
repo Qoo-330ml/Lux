@@ -127,19 +127,26 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
               transition={{ duration: 0.18 }}
             >
               <NavLink className={mobileNavClass} to="/" onClick={() => setMobileOpen(false)}>
-                <Home size={17} aria-hidden="true" /> 首页
+                <span className="lux-mobile-nav-icon" aria-hidden="true"><Home size={18} /></span>
+                <span className="lux-mobile-nav-label">首页</span>
               </NavLink>
               <NavLink className={mobileNavClass} to="/libraries" onClick={() => setMobileOpen(false)}>
-                <Library size={17} aria-hidden="true" /> 媒体库
+                <span className="lux-mobile-nav-icon" aria-hidden="true"><Library size={18} /></span>
+                <span className="lux-mobile-nav-label">媒体库</span>
               </NavLink>
               <NavLink className={mobileNavClass} to="/favorites" onClick={() => setMobileOpen(false)}>
-                <Heart size={17} aria-hidden="true" /> 收藏
+                <span className="lux-mobile-nav-icon" aria-hidden="true"><Heart size={18} /></span>
+                <span className="lux-mobile-nav-label">收藏</span>
               </NavLink>
               <NavLink className={mobileNavClass} to="/search" onClick={() => setMobileOpen(false)}>
-                <Search size={17} aria-hidden="true" /> 搜索
+                <span className="lux-mobile-nav-icon" aria-hidden="true"><Search size={18} /></span>
+                <span className="lux-mobile-nav-label">搜索</span>
               </NavLink>
               {user.canManageServer ? (
-                <NavLink className={mobileNavClass} to="/admin" onClick={() => setMobileOpen(false)}><Settings2 size={17} aria-hidden="true" /> 管理控制台</NavLink>
+                <NavLink className={mobileNavClass} to="/admin" onClick={() => setMobileOpen(false)}>
+                  <span className="lux-mobile-nav-icon" aria-hidden="true"><Settings2 size={18} /></span>
+                  <span className="lux-mobile-nav-label">管理控制台</span>
+                </NavLink>
               ) : null}
             </motion.nav>
           ) : null}

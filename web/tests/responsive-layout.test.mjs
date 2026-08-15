@@ -69,3 +69,9 @@ test("mobile navigation stays attached below the fixed header", () => {
   assert.match(fixedMobileNavRule, /position:\s*fixed/);
   assert.match(fixedMobileNavRule, /top:\s*var\(--lux-header-height\)/);
 });
+
+test("mobile navigation uses the active row surface without a bottom underline", () => {
+  const activeMobileNavRule = stylesheet.match(/\.lux-mobile-nav \.lux-mobile-nav-link\.is-active::after\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(activeMobileNavRule, /content:\s*none/);
+});

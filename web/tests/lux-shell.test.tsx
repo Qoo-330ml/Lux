@@ -226,7 +226,8 @@ describe("LuxShell user control", () => {
 
     const links = Array.from(container.querySelectorAll<HTMLAnchorElement>(".lux-mobile-nav-link"));
     expect(links).toHaveLength(5);
-    expect(links.every((link) => link.querySelector("svg") && link.textContent?.trim())).toBe(true);
+    expect(links.every((link) => link.querySelector(".lux-mobile-nav-icon svg") && link.querySelector(".lux-mobile-nav-label")?.textContent?.trim())).toBe(true);
+    expect(links.every((link) => link.querySelectorAll(".lux-mobile-nav-icon").length === 1)).toBe(true);
   });
 
   it("hides the back button on the home page", () => {
