@@ -3106,6 +3106,25 @@ impl Database {
             })
     }
 
+    pub(crate) async fn has_reconciliation_scan_entries(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM reconciliation_scan_entries WHERE job_id = ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_active_strm_probe_job_ids(&self) -> Result<Vec<String>, StorageError> {
         self.query_scalar(
             "SELECT id FROM strm_probe_jobs
@@ -4234,6 +4253,23 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn retry_scan_job(&self, id: &str) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE scan_jobs
+             SET status = 'PENDING', cancel_requested = 0, error = NULL,
+                 started_at = NULL, finished_at = NULL, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('FAILED', 'CANCELLED')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
