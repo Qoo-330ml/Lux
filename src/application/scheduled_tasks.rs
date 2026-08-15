@@ -20,7 +20,7 @@ use crate::{
             MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyJob,
             MetadataReidentifyService,
         },
-        scanner::{ScanJob, ScanJobError, ScanJobService},
+        scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::{
             CHAPTER_DETECTION_TASK_TYPE, CronSchedule, STRM_MEDIA_INFO_TASK_TYPE, parse_cron,
         },
@@ -314,7 +314,11 @@ impl ScheduledTaskService {
         tokio::spawn(async move {
             if let Err(error) = worker
                 .run_to_completion_with_metadata_and_thumbnails(
-                    &job_id, 100, probe, metadata, thumbnails,
+                    &job_id,
+                    BACKGROUND_SCAN_BATCH_SIZE,
+                    probe,
+                    metadata,
+                    thumbnails,
                 )
                 .await
             {

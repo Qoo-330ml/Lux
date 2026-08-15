@@ -62,34 +62,71 @@ impl ThumbnailService {
                 )
                 .await?;
             let last_page = candidates.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            for candidate in candidates {
-                if !seen_items.insert(candidate.item_id.clone()) {
-                    continue;
-                }
-                if is_strm_path(&candidate.relative_path) {
-                    report.skipped_strm += 1;
-                    continue;
-                }
-                report.considered += 1;
-                match self.generate_for_source(&candidate).await {
-                    Ok(ThumbnailOutcome::Generated) => report.generated += 1,
-                    Ok(ThumbnailOutcome::Reused) => report.reused += 1,
-                    Err(error) => {
-                        report.failed += 1;
-                        tracing::warn!(
-                            item_id = %candidate.item_id,
-                            error = %error,
-                            "thumbnail generation failed"
-                        );
-                    }
-                }
-            }
+            self.generate_sources(candidates, &mut seen_items, &mut report)
+                .await;
             if last_page {
                 break;
             }
             offset = offset.saturating_add(LIBRARY_SOURCE_PAGE_SIZE as i64);
         }
         Ok(report)
+    }
+
+    pub async fn generate_incremental_scan(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<ThumbnailReport, ThumbnailError> {
+        let mut seen_items = HashSet::new();
+        let mut report = ThumbnailReport::default();
+        let mut offset = 0_i64;
+        loop {
+            let candidates = self
+                .database
+                .list_local_thumbnail_sources_for_incremental_scan_page(
+                    scan_job_id,
+                    LIBRARY_SOURCE_PAGE_SIZE as i64,
+                    offset,
+                )
+                .await?;
+            let last_page = candidates.len() < LIBRARY_SOURCE_PAGE_SIZE;
+            self.generate_sources(candidates, &mut seen_items, &mut report)
+                .await;
+            if last_page {
+                break;
+            }
+            offset = offset.saturating_add(LIBRARY_SOURCE_PAGE_SIZE as i64);
+        }
+        Ok(report)
+    }
+
+    async fn generate_sources(
+        &self,
+        candidates: Vec<StoredThumbnailSource>,
+        seen_items: &mut HashSet<String>,
+        report: &mut ThumbnailReport,
+    ) {
+        for candidate in candidates {
+            if !seen_items.insert(candidate.item_id.clone()) {
+                continue;
+            }
+            if is_strm_path(&candidate.relative_path) {
+                report.skipped_strm += 1;
+                continue;
+            }
+            report.considered += 1;
+            match self.generate_for_source(&candidate).await {
+                Ok(ThumbnailOutcome::Generated) => report.generated += 1,
+                Ok(ThumbnailOutcome::Reused) => report.reused += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        item_id = %candidate.item_id,
+                        error = %error,
+                        "thumbnail generation failed"
+                    );
+                }
+            }
+        }
     }
 
     async fn generate_for_source(

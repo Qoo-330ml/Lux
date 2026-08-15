@@ -5,7 +5,10 @@ use luxd::{
         access::{AccessPrincipal, MediaAccessService},
         catalog::CatalogService,
         libraries::{LibraryService, LibrarySettingsPatch},
+        plugins::PluginService,
+        scanner::LibraryScanner,
         setup::SetupService,
+        strm_probe::{StrmProbeOptions, StrmProbeService},
     },
     auth::sessions::WebAuthService,
     config::{Config, DatabaseConfiguration, PostgresConnection},
@@ -159,5 +162,90 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].id, item_id);
     database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_rescan_of_existing_movie_uses_integer_boolean_projection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = DatabaseConfiguration::Postgres(PostgresConnection {
+        host: env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: env::var("POSTGRES_TEST_PORT")
+            .unwrap_or_else(|_| "55432".to_owned())
+            .parse()?,
+        database: env::var("POSTGRES_TEST_DATABASE").unwrap_or_else(|_| "lux".to_owned()),
+        username: env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    });
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library_name = format!("PostgreSQL rescan {}", uuid::Uuid::now_v7());
+    let library = libraries
+        .create_library(&library_name, luxd::library::LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Existing.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_movie_library(library.id).await?;
+    scanner.scan_movie_library(library.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_strm_probe_job_accepts_boolean_options() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = DatabaseConfiguration::Postgres(PostgresConnection {
+        host: env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: env::var("POSTGRES_TEST_PORT")
+            .unwrap_or_else(|_| "55432".to_owned())
+            .parse()?,
+        database: env::var("POSTGRES_TEST_DATABASE").unwrap_or_else(|_| "lux".to_owned()),
+        username: env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    });
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library_name = format!("PostgreSQL STRM {}", uuid::Uuid::now_v7());
+    let library = libraries
+        .create_library(&library_name, luxd::library::LibraryKind::Movie, false)
+        .await?;
+    let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+    let service = StrmProbeService::new(database, plugins);
+    let jobs = service
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 1,
+                include_ready: false,
+                write_sidecars: false,
+                media_info_enabled: true,
+                thumbnail_enabled: false,
+                thumbnail_position_percent: 30,
+            },
+        )
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert!(!jobs[0].include_ready);
     Ok(())
 }

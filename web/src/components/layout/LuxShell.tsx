@@ -94,7 +94,7 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
               className="lux-user-button"
               type="button"
               aria-label="打开账户"
-              onClick={() => navigate("/account")}
+              onClick={() => navigate(`/account/${encodeURIComponent(user.id)}`)}
             >
               <span className="lux-avatar">
                 {avatarUrl && !avatarImageFailed ? (

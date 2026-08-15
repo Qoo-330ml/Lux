@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Route, Routes, Navigate, useLocation } from "react-router-dom";
+import { Route, Routes, Navigate, useLocation, useParams } from "react-router-dom";
 import { lazy, Suspense } from "react";
 import { api, ApiError } from "../lib/api/client";
 import { queryKeys } from "../lib/api/query-keys";
@@ -74,7 +74,8 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
           <Route path="items/:itemId" element={<MediaDetailPage />} />
           <Route path="watch/:itemId" element={<PlayerPage />} />
           <Route path="search" element={<SearchPage />} />
-          <Route path="account" element={<AccountPage user={user} />} />
+          <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />
+          <Route path="account/:userId" element={<AccountRoute user={user} />} />
           <Route path="admin" element={user.canManageServer ? <AdminLayout /> : <Navigate to="/" replace />}>
             <Route index element={<AdminDashboardPage />} />
             <Route path="libraries" element={<AdminLibrariesPage />} />
@@ -89,6 +90,14 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
       </Routes>
     </Suspense>
   );
+}
+
+function AccountRoute({ user }: { user: LuxUser }) {
+  const { userId } = useParams();
+  if (userId !== user.id) {
+    return <Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />;
+  }
+  return <AccountPage user={user} />;
 }
 
 function LoadingScreen({ label }: { label: string }) {

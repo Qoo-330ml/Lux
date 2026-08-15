@@ -2774,10 +2774,10 @@ impl Database {
         .bind(job.operation_id)
         .bind(job.library_id)
         .bind(job.concurrency)
-        .bind(job.include_ready)
-        .bind(job.write_sidecars)
-        .bind(job.media_info_enabled)
-        .bind(job.thumbnail_enabled)
+        .bind(database_flag(job.include_ready))
+        .bind(database_flag(job.write_sidecars))
+        .bind(database_flag(job.media_info_enabled))
+        .bind(database_flag(job.thumbnail_enabled))
         .bind(job.thumbnail_position_percent)
         .bind(job.target_scan_job_id)
         .bind(job.total_count)
@@ -2884,6 +2884,18 @@ impl Database {
             .await
         };
         rows.map(|rows| rows.into_iter().map(stored_strm_probe_job).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn clear_scan_job_paths(&self, job_id: &str) -> Result<(), StorageError> {
+        self.query("DELETE FROM scan_job_paths WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
@@ -3079,6 +3091,27 @@ impl Database {
                 source,
             })?;
         Ok(total_count)
+    }
+
+    pub(crate) async fn update_scan_job_discovery_progress(
+        &self,
+        job_id: &str,
+        discovered_count: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scan_jobs
+             SET total_count = ?, updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING' AND discovery_completed = 0",
+        )
+        .bind(discovered_count)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn complete_reconciliation_files(
@@ -5227,14 +5260,14 @@ impl Database {
         let expected_identity_key = movie_parent_folder_identity(library_root_id, relative_path);
         let parent_is_current = if let Some(expected_identity_key) = expected_identity_key {
             self.query_scalar::<i64>(
-                "SELECT EXISTS (
+                "SELECT CASE WHEN EXISTS (
                      SELECT 1
                      FROM media_items movie
                      JOIN media_items parent ON parent.id = movie.parent_id
                      WHERE movie.id = ? AND movie.item_type = 'MOVIE'
                        AND parent.item_type = 'FOLDER'
                        AND parent.identity_key = ? AND parent.removed_at IS NULL
-                 )",
+                 ) THEN 1 ELSE 0 END",
             )
             .bind(item_id)
             .bind(expected_identity_key)
@@ -5243,10 +5276,10 @@ impl Database {
             .map(|value| value != 0)
         } else {
             self.query_scalar::<i64>(
-                "SELECT EXISTS (
+                "SELECT CASE WHEN EXISTS (
                      SELECT 1 FROM media_items
                      WHERE id = ? AND item_type = 'MOVIE' AND parent_id IS NULL
-                 )",
+                 ) THEN 1 ELSE 0 END",
             )
             .bind(item_id)
             .fetch_one(&self.pool)
@@ -5503,7 +5536,7 @@ impl Database {
         production_year: i64,
     ) -> Result<bool, StorageError> {
         self.query_scalar::<i64>(
-            "SELECT EXISTS (
+            "SELECT CASE WHEN EXISTS (
                  SELECT 1
                  FROM media_items current_item
                  JOIN media_items conflicting_item
@@ -5516,7 +5549,7 @@ impl Database {
                  WHERE current_item.id = ?
                    AND current_item.item_type = 'MOVIE'
                    AND current_item.removed_at IS NULL
-             )",
+             ) THEN 1 ELSE 0 END",
         )
         .bind(sort_title)
         .bind(production_year)
@@ -8010,6 +8043,54 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_movie_metadata_sources_for_incremental_scan(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE mi.item_type = 'MOVIE'
+               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM scan_job_paths sjp
+                   WHERE sjp.job_id = ?
+                     AND sjp.processed_at IS NOT NULL
+                     AND sjp.library_root_id = fe.library_root_id
+                     AND (
+                           fe.relative_path = sjp.relative_path
+                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                              = sjp.relative_path || '/'
+                     )
+               )
+             ORDER BY ms.item_id, fe.relative_path",
+        )
+        .bind(scan_job_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_local_danmaku_source_for_item(
         &self,
         item_id: &str,
@@ -8100,7 +8181,7 @@ impl Database {
         )
         .bind(job.id)
         .bind(job.library_id)
-        .bind(job.overwrite)
+        .bind(database_flag(job.overwrite))
         .bind(job.concurrency)
         .bind(0_i64)
         .execute(&mut *transaction)
@@ -8498,6 +8579,61 @@ impl Database {
              LIMIT ? OFFSET ?",
         )
         .bind(library_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredThumbnailSource {
+                    item_id: row.get("item_id"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                    thumbnail_path: row.get("thumbnail_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_local_thumbnail_sources_for_incremental_scan_page(
+        &self,
+        scan_job_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
+        self.query(
+            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+                    ii.local_path AS thumbnail_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             LEFT JOIN item_images ii
+               ON ii.item_id = ms.item_id
+              AND ii.image_type = 'THUMB'
+              AND ii.image_index = 0
+             WHERE ms.source_kind = 'LOCAL_FILE'
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM scan_job_paths sjp
+                   WHERE sjp.job_id = ?
+                     AND sjp.processed_at IS NOT NULL
+                     AND sjp.library_root_id = fe.library_root_id
+                     AND (
+                           fe.relative_path = sjp.relative_path
+                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                              = sjp.relative_path || '/'
+                     )
+               )
+             ORDER BY ms.item_id, ms.is_default DESC, ms.id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(scan_job_id)
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .bind(offset.max(0))
         .fetch_all(&self.pool)
@@ -9128,6 +9264,60 @@ impl Database {
         .bind(library_id)
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredSeriesMetadataSource {
+                    series_id: row.get("series_id"),
+                    season_id: row.get("season_id"),
+                    episode_id: row.get("episode_id"),
+                    season_number: row.get("season_number"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_series_metadata_sources_for_incremental_scan(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
+        self.query(
+            "SELECT series.id AS series_id, season.id AS season_id,
+                    episode.id AS episode_id, season.season_number,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_items episode
+             JOIN media_items season ON season.id = episode.parent_id
+             JOIN media_items series ON series.id = episode.series_id
+             JOIN media_sources ms ON ms.item_id = episode.id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE episode.item_type = 'EPISODE'
+               AND season.item_type = 'SEASON'
+               AND series.item_type = 'SERIES'
+               AND episode.removed_at IS NULL
+               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
+               AND EXISTS (
+                   SELECT 1 FROM scan_job_paths sjp
+                   WHERE sjp.job_id = ?
+                     AND sjp.processed_at IS NOT NULL
+                     AND sjp.library_root_id = fe.library_root_id
+                     AND (
+                           fe.relative_path = sjp.relative_path
+                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                              = sjp.relative_path || '/'
+                     )
+               )
+             ORDER BY series.id, season.season_number, episode.id, fe.relative_path",
+        )
+        .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
         .map(|rows| {

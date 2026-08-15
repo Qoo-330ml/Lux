@@ -19,6 +19,16 @@ fn historical_media_catalog_migration_keeps_its_original_checksum() {
     );
 }
 
+#[test]
+fn postgres_bootstrap_migration_keeps_its_original_checksum() {
+    let migration = include_str!("../migrations-postgres/0001_bootstrap.sql");
+
+    assert_eq!(
+        format!("{:x}", Sha384::digest(migration.as_bytes())),
+        "81fb302801af162714b21496d70ca696af6f710145070a1b69b31c229d879806a2e36acd9aca651c0c96867d1bd5d4ca"
+    );
+}
+
 #[tokio::test]
 async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 -> Result<(), Box<dyn std::error::Error>> {

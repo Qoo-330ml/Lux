@@ -178,6 +178,94 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
+async fn reconciliation_persists_discovered_file_count_before_discovery_finishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Alpha.Movie.2020.mkv"), b"fixture").await?;
+    tokio::fs::write(root.join("Beta.Movie.2021.mkv"), b"fixture").await?;
+    tokio::fs::create_dir(root.join("Nested.Movie.2022")).await?;
+    tokio::fs::write(
+        root.join("Nested.Movie.2022").join("Nested.Movie.2022.mkv"),
+        b"fixture",
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let first_discovery = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(first_discovery.status, "RUNNING");
+
+    let discovered_count: i64 =
+        sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(discovered_count, 2);
+
+    let discovery_completed: i64 =
+        sqlx::query_scalar("SELECT discovery_completed FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(discovery_completed, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_a_pending_scan_emits_an_immediate_cancellation_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.cancel(&job.id).await?;
+
+    let cancel_requested: i64 =
+        sqlx::query_scalar("SELECT cancel_requested FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cancel_requested, 1);
+    let event_code: String = sqlx::query_scalar(
+        "SELECT event_code FROM scan_job_events
+         WHERE job_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(event_code, "CANCEL_REQUESTED");
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

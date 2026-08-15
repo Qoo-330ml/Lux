@@ -15,6 +15,52 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.5",
+    date: "2026-08-15",
+    sections: [
+      { kind: "added", items: [
+        "增加服务器级共享管理员 API Key，支持管理员查看、复制、生成、轮换和撤销。",
+        "API Key 兼容 Lux 与已实现的 Emby 路由，并支持多种 Emby 风格认证头。",
+        "账户路由包含当前用户 ID，并限制访问其他用户账户路径。",
+        "Emby 兼容接口公开混合媒体库的 mixed 集合类型。",
+      ] },
+      { kind: "fixed", items: [
+        "修复管理操作页运行时任务使用 ISO 时间戳时排序不正确的问题。",
+        "修复旧版 STRM media-info manifest 缺少计划字段时无法编辑和迁移执行计划的问题。",
+      ] },
+      { kind: "changed", items: [
+        "完善 API Key 的受限文件存储、旧 Key 立即失效和审计标记，避免敏感凭据进入数据库或日志。",
+        "将共享管理员 API Key 管理入口从账户设置移动到服务器设置，保持管理员配置集中管理。",
+      ] },
+    ],
+  },
+  {
+    version: "0.2.4",
+    date: "2026-08-15",
+    sections: [
+      { kind: "fixed", items: [
+        "修复 PostgreSQL 布尔值存储兼容性问题，避免布尔字段在 PostgreSQL 后端下读取或写入异常。",
+      ] },
+    ],
+  },
+  {
+    version: "0.2.3",
+    date: "2026-08-15",
+    sections: [
+      { kind: "added", items: [
+        "增加管理员删除用户功能及管理界面支持。",
+      ] },
+      { kind: "fixed", items: [
+        "修复后台扫描对进度更新和取消操作响应不及时的问题。",
+        "修复 PostgreSQL migration 校验和在迁移维护过程中被意外改变的问题。",
+      ] },
+      { kind: "changed", items: [
+        "优化后台扫描任务状态同步和取消流程。",
+        "完善管理员用户管理及相关 API 回归覆盖。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.2",
     date: "2026-08-15",
     sections: [

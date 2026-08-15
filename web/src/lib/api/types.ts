@@ -41,6 +41,11 @@ export type AuthSession = {
   serverName?: string | null;
 };
 
+export type AdminApiKey = {
+  configured: boolean;
+  apiKey?: string | null;
+};
+
 export type Library = {
   id: string;
   name: string;
@@ -432,6 +437,7 @@ export type AdminJob = {
   cursor?: string | null;
   processedCount?: number;
   totalCount?: number | null;
+  discoveryCompleted?: boolean;
   cancelRequested?: boolean;
   error?: string | null;
   createdAt?: string | number;

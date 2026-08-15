@@ -100,6 +100,46 @@ describe("AdminSettingsPage network proxy", () => {
     expect(update).toHaveBeenCalledWith({ networkProxyUrl: "http://192.168.1.2:7890/" });
   });
 
+  it("shows the shared API key in server settings", async () => {
+    vi.spyOn(api, "adminApiKey").mockResolvedValue({ configured: false, apiKey: null });
+    const rotate = vi.spyOn(api, "rotateAdminApiKey").mockResolvedValue({
+      configured: true,
+      apiKey: "lux_test_shared_key",
+    });
+    Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminSettingsPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.textContent).toContain("共享管理员 API Key");
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".lux-account-api-key-generate")?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(rotate).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("lux_test_shared_key");
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("复制 Key"))
+        ?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("lux_test_shared_key");
+    expect(container.textContent).toContain("API Key 已复制到剪贴板");
+  });
+
   it("tests the four network targets and shows egress details", async () => {
     const diagnostics = vi.spyOn(api, "testAdminNetworkProxy").mockResolvedValue({
       proxySource: "input",
