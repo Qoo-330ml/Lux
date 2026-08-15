@@ -2,7 +2,7 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
 import { LuxShell, useAvatar } from "../src/components/layout/LuxShell";
 
@@ -12,6 +12,10 @@ function AvatarUpdateFixture() {
   const { setAvatarUrl } = useAvatar();
 
   return <button type="button" onClick={() => setAvatarUrl("/api/v1/auth/avatar?v=updated")}>更新头像</button>;
+}
+
+function LocationFixture() {
+  return <output data-testid="location">{useLocation().pathname}</output>;
 }
 
 describe("LuxShell user control", () => {
@@ -41,6 +45,29 @@ describe("LuxShell user control", () => {
     });
 
     expect(document.title).toBe("客厅 Lux - Lux");
+  });
+
+  it("puts the current user id in the account route", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter initialEntries={["/"]}>
+          <Routes>
+            <Route element={<LuxShell user={{ id: "user-1", usernameNormalized: "test" }} />}>
+              <Route index element={<LocationFixture />} />
+              <Route path="account/:userId" element={<LocationFixture />} />
+            </Route>
+          </Routes>
+        </MemoryRouter>,
+      );
+    });
+
+    act(() => container.querySelector<HTMLButtonElement>(".lux-user-button")?.click());
+
+    expect(container.querySelector("[data-testid=location]")?.textContent).toBe("/account/user-1");
   });
 
   it("renders the server avatar and falls back to initials when it is unavailable", () => {
