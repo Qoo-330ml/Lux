@@ -3904,12 +3904,12 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 
 验收：
 
-- [ ] 支持 `X-Emby-Token`、`X-Lux-Api-Key`、`Authorization: Bearer` 和兼容的 `api_key` 查询参数。
-- [ ] Lux API 与 Emby 兼容 API 都接受共享 Key；现有用户 Web session 和 Emby 登录 AccessToken 行为不变。
-- [ ] Key 使用至少 256 bit 随机熵，持久化到 `/config` 的受限文件，重启后保持不变；生成、轮换和撤销使用原子写入。
-- [ ] 非管理员不能读取或操作 Key；Key 不能调用自身的查看、轮换和撤销接口。
-- [ ] Key 请求跳过 Cookie CSRF 但仍执行管理员权限和远程访问策略；日志、审计事件、错误响应和普通 API 响应不包含明文 Key。
-- [ ] 轮换立即使旧 Key 失效；审计明确标记共享 API Key，不能伪装成某一位管理员。
+- [x] 支持 `X-Emby-Token`、`X-Lux-Api-Key`、`Authorization: Bearer` 和兼容的 `api_key` 查询参数。
+- [x] Lux API 与 Emby 兼容 API 都接受共享 Key；现有用户 Web session 和 Emby 登录 AccessToken 行为不变。
+- [x] Key 使用至少 256 bit 随机熵，持久化到 `/config` 的受限文件，重启后保持不变；生成、轮换和撤销使用原子写入。
+- [x] 非管理员不能读取或操作 Key；Key 不能调用自身的查看、轮换和撤销接口。
+- [x] Key 请求跳过 Cookie CSRF 但仍执行管理员权限和远程访问策略；日志、审计事件、错误响应和普通 API 响应不包含明文 Key。
+- [x] 轮换立即使旧 Key 失效；审计明确标记共享 API Key，不能伪装成某一位管理员。
 
 验证：API Key 服务单测、SQLite 集成测试、Lux/Emby 路由鉴权测试、管理员管理接口测试、日志脱敏测试、Web 账户页测试，以及完整 Rust/Web 检查。
 

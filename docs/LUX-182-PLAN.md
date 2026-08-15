@@ -5,6 +5,8 @@
 提供一个服务器级共享管理员 API Key。所有管理员看到同一个 Key；Key 调用按服务器管理员权限执行，
 同时兼容 Lux API 和已实现的 Emby API。
 
+状态：已实现。
+
 ## 安全边界
 
 - Key 至少包含 256 bit 随机熵，保存于 `/config/lux_admin_api_key`，Unix 权限为 `0600`。
@@ -33,3 +35,13 @@
 3. 管理接口、审计与 API 文档。
 4. Web 管理页面、复制和轮换确认。
 5. 完整项目检查与安全审查。
+
+## 验证结果
+
+- API Key 专项测试、Rust build、fmt 和 clippy 通过。
+- Web 测试通过：191 个 Vitest 用例、61 个 Node 用例；Web 构建通过。
+- `uname -m`：`arm64`。
+- 全目标测试中存在两个已在干净 `main` 工作树复现的基线失败：
+  `admin_selection_persists_cast_in_config_and_detail_api` 与
+  `mixed_scan_classifies_movies_series_and_unresolved_without_cross_contamination`。
+  本任务新增和受影响的测试均通过，未修改这两个无关断言。
