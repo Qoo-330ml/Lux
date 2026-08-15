@@ -1237,6 +1237,15 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option<String> {
+    policy
+        .reported_client_ip(
+            header_str(headers, "x-lux-peer-ip"),
+            header_str(headers, "x-forwarded-for"),
+        )
+        .map(|address| address.to_string())
+}
+
 fn login_attempt_key(headers: &HeaderMap, username: &str) -> String {
     format!(
         "{}:{}",
@@ -3801,6 +3810,7 @@ async fn handle_emby_playback_event(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
+    let remote_ip = request_client_ip(&headers, &state.remote_access);
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -3812,7 +3822,7 @@ async fn handle_emby_playback_event(
             device_name,
             client_version,
             device_type,
-            remote_ip: header_str(&headers, "x-lux-peer-ip"),
+            remote_ip: remote_ip.as_deref(),
             state: state_name,
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -4052,6 +4062,7 @@ async fn lux_post_progress(
     };
     let activity_event =
         playback_activity_event_type(previous_session.as_ref(), playback_state.as_str());
+    let remote_ip = request_client_ip(&headers, &state.remote_access);
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -4063,7 +4074,7 @@ async fn lux_post_progress(
             device_name: Some("Web"),
             client_version: None,
             device_type: Some("Web"),
-            remote_ip: header_str(&headers, "x-lux-peer-ip"),
+            remote_ip: remote_ip.as_deref(),
             state: playback_state.as_str(),
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,

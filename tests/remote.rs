@@ -28,6 +28,25 @@ fn remote_policy_uses_forwarded_client_only_from_trusted_proxy() {
     assert!(!policy.is_remote(Some("100.64.12.4"), None));
 }
 
+#[test]
+fn remote_policy_returns_forwarded_client_only_from_trusted_proxy() {
+    let policy = RemoteAccessPolicy::from_cidrs(["10.0.0.0/8"]).expect("valid proxy CIDR");
+
+    assert_eq!(
+        policy.client_ip(Some("10.1.2.3"), Some("8.8.8.8")),
+        Some("8.8.8.8".parse().expect("valid client IP"))
+    );
+    assert_eq!(
+        policy.client_ip(Some("192.168.1.20"), Some("8.8.8.8")),
+        Some("192.168.1.20".parse().expect("valid peer IP"))
+    );
+    assert_eq!(policy.reported_client_ip(Some("10.1.2.3"), None), None);
+    assert_eq!(
+        policy.reported_client_ip(Some("192.168.1.20"), None),
+        Some("192.168.1.20".parse().expect("valid peer IP"))
+    );
+}
+
 #[tokio::test]
 async fn remote_policy_blocks_auth_and_media_until_user_is_allowed()
 -> Result<(), Box<dyn std::error::Error>> {
