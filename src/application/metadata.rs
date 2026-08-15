@@ -18,7 +18,10 @@ use crate::{
         people::PeopleService,
     },
     domain::ids::LibraryId,
-    storage::{Database, MediaMetadataUpdate, StorageError},
+    storage::{
+        Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath,
+        StoredSeriesMetadataSource,
+    },
 };
 
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
@@ -541,6 +544,35 @@ impl MetadataEnricher {
         self.with_nfo_store(local_nfo)
     }
 
+    pub async fn enrich_incremental_scan(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<MetadataReport, MetadataError> {
+        let mut report = MetadataReport::default();
+        let movie_sources = self
+            .database
+            .list_movie_metadata_sources_for_incremental_scan(scan_job_id)
+            .await?;
+        self.enrich_movie_sources(movie_sources, &mut report).await;
+
+        let series_sources = self
+            .database
+            .list_series_metadata_sources_for_incremental_scan(scan_job_id)
+            .await?;
+        let mut last_series_id = String::new();
+        let mut last_season_id = String::new();
+        let mut last_episode_id = String::new();
+        self.enrich_series_sources(
+            series_sources,
+            &mut report,
+            Some(&mut last_series_id),
+            Some(&mut last_season_id),
+            Some(&mut last_episode_id),
+        )
+        .await?;
+        Ok(report)
+    }
+
     pub async fn enrich_movie_library(
         &self,
         library_id: LibraryId,
@@ -558,37 +590,45 @@ impl MetadataEnricher {
                 )
                 .await?;
             let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            for source in sources {
-                let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-                match self.enrich_movie_nfo(&source.item_id, &media_path).await {
-                    Ok(nfo_report) => report.merge(nfo_report),
-                    Err(error) => {
-                        tracing::warn!(
-                            item_id = %source.item_id,
-                            %error,
-                            "local movie NFO failed; continuing with images and remaining items"
-                        );
-                        report.nfo_failed += 1;
-                    }
-                }
-
-                match self.index_movie_images(&source.item_id, &media_path).await {
-                    Ok(images_found) => report.images_found += images_found,
-                    Err(error) => {
-                        tracing::warn!(
-                            item_id = %source.item_id,
-                            %error,
-                            "local movie image directory failed; continuing with remaining items"
-                        );
-                    }
-                }
-            }
+            self.enrich_movie_sources(sources, &mut report).await;
             if last_page {
                 break;
             }
             offset = offset.saturating_add(LIBRARY_SOURCE_PAGE_SIZE as i64);
         }
         Ok(report)
+    }
+
+    async fn enrich_movie_sources(
+        &self,
+        sources: Vec<StoredMediaSourcePath>,
+        report: &mut MetadataReport,
+    ) {
+        for source in sources {
+            let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
+            match self.enrich_movie_nfo(&source.item_id, &media_path).await {
+                Ok(nfo_report) => report.merge(nfo_report),
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %source.item_id,
+                        %error,
+                        "local movie NFO failed; continuing with images and remaining items"
+                    );
+                    report.nfo_failed += 1;
+                }
+            }
+
+            match self.index_movie_images(&source.item_id, &media_path).await {
+                Ok(images_found) => report.images_found += images_found,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %source.item_id,
+                        %error,
+                        "local movie image directory failed; continuing with remaining items"
+                    );
+                }
+            }
+        }
     }
 
     pub async fn enrich_mixed_library(
@@ -706,81 +746,118 @@ impl MetadataEnricher {
                 )
                 .await?;
             let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            for source in sources {
-                let root = PathBuf::from(&source.root_path);
-                let media_path = root.join(&source.relative_path);
-                let Some(series_dir) = series_directory(&root, &source.relative_path) else {
-                    continue;
-                };
-                let series_paths = read_directory_paths(&series_dir).await?;
-                let new_series = last_series_id.as_deref() != Some(source.series_id.as_str());
-                if new_series {
-                    if let Some(nfo_path) = find_tvshow_nfo(&series_dir).await {
-                        self.enrich_nfo_item_best_effort(&mut report, &source.series_id, &nfo_path)
-                            .await;
-                    }
-                    report.images_found += self
-                        .index_images(&source.series_id, find_series_images(&series_paths, None))
-                        .await?;
-                    last_series_id = Some(source.series_id.clone());
-                    last_season_id = None;
-                    last_episode_id = None;
-                }
-
-                let season_number = source.season_number.unwrap_or_default();
-                let season_dir = media_path.parent().unwrap_or(&series_dir);
-                let new_season = last_season_id.as_deref() != Some(source.season_id.as_str());
-                let mut season_paths = series_paths;
-                if season_dir != series_dir {
-                    let mut directory_paths = read_directory_paths(season_dir).await?;
-                    season_paths = season_paths
-                        .iter()
-                        .filter(|path| is_prefixed_season_image(path, season_number))
-                        .cloned()
-                        .collect();
-                    season_paths.append(&mut directory_paths);
-                }
-                if new_season {
-                    if let Some(nfo_path) =
-                        find_season_nfo(&series_dir, season_dir, season_number).await
-                    {
-                        self.enrich_nfo_item_best_effort(&mut report, &source.season_id, &nfo_path)
-                            .await;
-                    }
-                    report.images_found += self
-                        .index_images(
-                            &source.season_id,
-                            find_series_images(&season_paths, Some(season_number)),
-                        )
-                        .await?;
-                    last_season_id = Some(source.season_id.clone());
-                    last_episode_id = None;
-                }
-
-                if last_episode_id.as_deref() != Some(source.episode_id.as_str()) {
-                    if let Some(nfo_path) = find_episode_nfo(&media_path).await {
-                        self.enrich_nfo_item_best_effort(
-                            &mut report,
-                            &source.episode_id,
-                            &nfo_path,
-                        )
-                        .await;
-                    }
-                    report.images_found += self
-                        .index_images(
-                            &source.episode_id,
-                            find_episode_images(&season_paths, &media_path),
-                        )
-                        .await?;
-                    last_episode_id = Some(source.episode_id.clone());
-                }
-            }
+            self.enrich_series_sources(
+                sources,
+                &mut report,
+                last_series_id.as_mut(),
+                last_season_id.as_mut(),
+                last_episode_id.as_mut(),
+            )
+            .await?;
             if last_page {
                 break;
             }
             offset = offset.saturating_add(LIBRARY_SOURCE_PAGE_SIZE as i64);
         }
         Ok(report)
+    }
+
+    async fn enrich_series_sources(
+        &self,
+        sources: Vec<StoredSeriesMetadataSource>,
+        report: &mut MetadataReport,
+        last_series_id: Option<&mut String>,
+        last_season_id: Option<&mut String>,
+        last_episode_id: Option<&mut String>,
+    ) -> Result<(), MetadataError> {
+        let mut last_series_id = last_series_id;
+        let mut last_season_id = last_season_id;
+        let mut last_episode_id = last_episode_id;
+        for source in sources {
+            let root = PathBuf::from(&source.root_path);
+            let media_path = root.join(&source.relative_path);
+            let Some(series_dir) = series_directory(&root, &source.relative_path) else {
+                continue;
+            };
+            let series_paths = read_directory_paths(&series_dir).await?;
+            let new_series = last_series_id
+                .as_deref()
+                .is_none_or(|id| id != source.series_id.as_str());
+            if new_series {
+                if let Some(nfo_path) = find_tvshow_nfo(&series_dir).await {
+                    self.enrich_nfo_item_best_effort(report, &source.series_id, &nfo_path)
+                        .await;
+                }
+                report.images_found += self
+                    .index_images(&source.series_id, find_series_images(&series_paths, None))
+                    .await?;
+                if let Some(last_series_id) = last_series_id.as_deref_mut() {
+                    *last_series_id = source.series_id.clone();
+                }
+                if let Some(last_season_id) = last_season_id.as_deref_mut() {
+                    last_season_id.clear();
+                }
+                if let Some(last_episode_id) = last_episode_id.as_deref_mut() {
+                    last_episode_id.clear();
+                }
+            }
+
+            let season_number = source.season_number.unwrap_or_default();
+            let season_dir = media_path.parent().unwrap_or(&series_dir);
+            let new_season = last_season_id
+                .as_deref()
+                .is_none_or(|id| id != source.season_id.as_str());
+            let mut season_paths = series_paths;
+            if season_dir != series_dir {
+                let mut directory_paths = read_directory_paths(season_dir).await?;
+                season_paths = season_paths
+                    .iter()
+                    .filter(|path| is_prefixed_season_image(path, season_number))
+                    .cloned()
+                    .collect();
+                season_paths.append(&mut directory_paths);
+            }
+            if new_season {
+                if let Some(nfo_path) =
+                    find_season_nfo(&series_dir, season_dir, season_number).await
+                {
+                    self.enrich_nfo_item_best_effort(report, &source.season_id, &nfo_path)
+                        .await;
+                }
+                report.images_found += self
+                    .index_images(
+                        &source.season_id,
+                        find_series_images(&season_paths, Some(season_number)),
+                    )
+                    .await?;
+                if let Some(last_season_id) = last_season_id.as_deref_mut() {
+                    *last_season_id = source.season_id.clone();
+                }
+                if let Some(last_episode_id) = last_episode_id.as_deref_mut() {
+                    last_episode_id.clear();
+                }
+            }
+
+            let new_episode = last_episode_id
+                .as_deref()
+                .is_none_or(|id| id != source.episode_id.as_str());
+            if new_episode {
+                if let Some(nfo_path) = find_episode_nfo(&media_path).await {
+                    self.enrich_nfo_item_best_effort(report, &source.episode_id, &nfo_path)
+                        .await;
+                }
+                report.images_found += self
+                    .index_images(
+                        &source.episode_id,
+                        find_episode_images(&season_paths, &media_path),
+                    )
+                    .await?;
+                if let Some(last_episode_id) = last_episode_id.as_deref_mut() {
+                    *last_episode_id = source.episode_id.clone();
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn enrich_nfo_item_best_effort(

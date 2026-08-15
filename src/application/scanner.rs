@@ -2623,6 +2623,9 @@ impl ScanJobService {
                     .ok_or(ScanJobError::JobNotFound)?;
                 let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
                 if incremental {
+                    self.run_metadata_after_incremental_scan(job_id).await?;
+                    self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
+                        .await?;
                     if let Some(metadata) = metadata {
                         self.schedule_online_metadata_after_incremental_scan(job_id, metadata)
                             .await;
@@ -3036,6 +3039,110 @@ impl ScanJobService {
                     "ERROR",
                     "METADATA_FAILED",
                     "本地元数据处理失败",
+                    "{}",
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_metadata_after_incremental_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
+        let enricher = MetadataEnricher::new(self.database.clone());
+        let enricher = match self.people.clone() {
+            Some(people) => enricher.with_people(people),
+            None => enricher,
+        };
+        let enricher = match self.local_nfo.clone() {
+            Some(local_nfo) => enricher.with_nfo_store(local_nfo),
+            None => enricher,
+        };
+        match enricher.enrich_incremental_scan(job_id).await {
+            Ok(report) => {
+                let details = format!(
+                    r#"{{"nfoLoaded":{},"nfoFailed":{},"nfoSkipped":{},"imagesFound":{}}}"#,
+                    report.nfo_loaded, report.nfo_failed, report.nfo_skipped, report.images_found,
+                );
+                self.record_event(
+                    job_id,
+                    "INFO",
+                    "METADATA_COMPLETED",
+                    "局部扫描本地元数据处理完成",
+                    &details,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    job_id,
+                    %error,
+                    "incremental scan local metadata enrichment failed"
+                );
+                self.record_event(
+                    job_id,
+                    "ERROR",
+                    "METADATA_FAILED",
+                    "局部扫描本地元数据处理失败",
+                    "{}",
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_thumbnails_after_incremental_scan(
+        &self,
+        job_id: &str,
+        thumbnails: Option<ThumbnailService>,
+    ) -> Result<(), ScanJobError> {
+        let Some(thumbnails) = thumbnails else {
+            return Ok(());
+        };
+        match thumbnails.generate_incremental_scan(job_id).await {
+            Ok(report) if report.failed == 0 => {
+                let details = format!(
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
+                    report.considered,
+                    report.generated,
+                    report.reused,
+                    report.failed,
+                    report.skipped_strm,
+                );
+                self.record_event(
+                    job_id,
+                    "INFO",
+                    "THUMBNAIL_COMPLETED",
+                    "局部扫描视频缩略图任务完成",
+                    &details,
+                )
+                .await;
+            }
+            Ok(report) => {
+                let details = format!(
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
+                    report.considered,
+                    report.generated,
+                    report.reused,
+                    report.failed,
+                    report.skipped_strm,
+                );
+                self.record_event(
+                    job_id,
+                    "WARN",
+                    "THUMBNAIL_FAILED",
+                    "局部扫描视频缩略图任务部分失败",
+                    &details,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(job_id, %error, "incremental scan thumbnail task failed");
+                self.record_event(
+                    job_id,
+                    "WARN",
+                    "THUMBNAIL_FAILED",
+                    "局部扫描视频缩略图任务失败",
                     "{}",
                 )
                 .await;
