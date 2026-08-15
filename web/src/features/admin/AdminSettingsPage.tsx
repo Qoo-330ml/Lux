@@ -3,6 +3,7 @@ import { Check, Save, Settings2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
+import { AdminApiKeyPanel } from "../account/AdminApiKeyPanel";
 import type {
   AdminNetworkProxySettings,
   NetworkProxyDiagnostics,
@@ -73,6 +74,10 @@ export function AdminSettingsPage() {
           <p>调整播放状态、网络访问和用户体验相关的全局策略。</p>
         </div>
       </header>
+
+      <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="admin-api-key-heading">
+        <AdminApiKeyPanel />
+      </section>
 
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="playback-settings-heading">
         <div className="lux-admin-panel-heading">

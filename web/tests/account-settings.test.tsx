@@ -150,46 +150,6 @@ describe("account settings", () => {
     expect(container.textContent).toContain("播放阈值已保存");
   });
 
-  it("lets administrators generate and copy the shared API key", async () => {
-    vi.spyOn(api, "adminApiKey").mockResolvedValue({ configured: false, apiKey: null });
-    const rotate = vi.spyOn(api, "rotateAdminApiKey").mockResolvedValue({
-      configured: true,
-      apiKey: "lux_test_shared_key",
-    });
-    Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-
-    await act(async () => {
-      root.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AccountPage user={{ ...user, canManageServer: true }} />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    expect(container.textContent).toContain("共享管理员 API Key");
-    await act(async () => {
-      container.querySelector<HTMLButtonElement>(".lux-account-api-key-generate")?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(rotate).toHaveBeenCalledOnce();
-    expect(container.textContent).toContain("lux_test_shared_key");
-
-    await act(async () => {
-      [...container.querySelectorAll<HTMLButtonElement>("button")]
-        .find((button) => button.textContent?.includes("复制 Key"))
-        ?.click();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("lux_test_shared_key");
-    expect(container.textContent).toContain("API Key 已复制到剪贴板");
-  });
-
   it("uploads an avatar to the server only after the user explicitly saves it", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(

@@ -19,7 +19,6 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { Library, LuxUser } from "../../lib/api/types";
 import { LuxSelect } from "../../components/LuxSelect";
 import { useAvatar } from "../../components/layout/LuxShell";
-import { AdminApiKeyPanel } from "./AdminApiKeyPanel";
 import {
   applyAccountTheme,
   applyAccountAccent,
@@ -352,8 +351,6 @@ export function AccountPage({ user }: { user: LuxUser }) {
               </div>
             </div>
             <div className="lux-setting-divider" />
-            {user.canManageServer ? <AdminApiKeyPanel /> : null}
-            {user.canManageServer ? <div className="lux-setting-divider" /> : null}
             <div className="lux-setting-form-grid lux-account-form-grid">
               <label className="lux-setting-field"><span>显示名称</span><input value={profileName} onChange={(event) => setProfileName(event.target.value)} /></label>
               <label className="lux-setting-field"><span>账号</span><input value={user.usernameNormalized} readOnly /></label>
