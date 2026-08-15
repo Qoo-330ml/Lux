@@ -12,6 +12,7 @@ import type {
   AdminRoot,
   AdminSettings,
   AdminSettingsPatch,
+  AdminApiKey,
   NetworkProxyDiagnostics,
   AdminUser,
   AdminMetadataCandidate,
@@ -192,6 +193,18 @@ export class LuxApiClient {
       method: "PATCH",
       body: JSON.stringify(input),
     });
+  }
+
+  adminApiKey() {
+    return this.request<AdminApiKey>("/api/v1/admin/api-key");
+  }
+
+  rotateAdminApiKey() {
+    return this.request<AdminApiKey>("/api/v1/admin/api-key/rotate", { method: "POST" });
+  }
+
+  revokeAdminApiKey() {
+    return this.request<void>("/api/v1/admin/api-key", { method: "DELETE" });
   }
 
   avatarUrl(cacheKey?: string) {

@@ -1474,6 +1474,16 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-setting-field input:focus, .lux-setting-field select:focus { border-color: rgba(255,255,255,.45); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
 .lux-setting-field input[readonly] { color: var(--lux-subtle); cursor: not-allowed; }
 .lux-account-profile-editor { display: flex; align-items: center; gap: 15px; padding: 17px 0; }
+.lux-account-api-key-panel { display: grid; gap: 13px; padding: 17px 0; }
+.lux-account-api-key-panel .lux-setting-block-heading strong { display: inline-flex; align-items: center; gap: 7px; }
+.lux-account-api-key-warning { padding: 10px 12px; border-left: 2px solid #d99a47; color: var(--lux-muted); background: rgba(217,154,71,.08); font-size: .72rem; line-height: 1.55; }
+.lux-account-api-key-status { margin: 0; color: var(--lux-subtle); font-size: .72rem; }
+.lux-account-api-key-value { display: grid; gap: 11px; padding: 13px; border: 1px solid var(--lux-settings-line); border-radius: 9px; background: rgba(255,255,255,.035); }
+.lux-account-api-key-value code { overflow-wrap: anywhere; color: var(--lux-text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; line-height: 1.5; }
+.lux-account-api-key-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.lux-account-api-key-actions .lux-button, .lux-account-api-key-generate { min-height: 35px; font-size: .72rem; }
+.lux-button-danger { border-color: rgba(219,100,100,.42); color: #f1a5a5; background: rgba(180,62,62,.1); }
+.lux-button-danger:hover:not(:disabled), .lux-button-danger:focus-visible { border-color: rgba(219,100,100,.7); background: rgba(180,62,62,.2); }
 .lux-settings-avatar-large { width: 68px; height: 68px; font-size: 1.4rem; }
 .lux-account-avatar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .lux-upload-button { display: inline-flex; align-items: center; min-height: 33px; margin-top: 10px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-settings-line); border-radius: 7px; color: var(--lux-text); background: rgba(255,255,255,.06); font-size: .72rem; cursor: pointer; transition: background .2s ease, border-color .2s ease; }
