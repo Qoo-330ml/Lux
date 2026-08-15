@@ -26,8 +26,8 @@ describe("AdminOperationsPage", () => {
       libraryId: "library-1",
       jobType: "INCREMENTAL_SCAN",
       status: "COMPLETED",
-      processedCount: 1,
-      totalCount: 1,
+      processedCount: 91800,
+      totalCount: 85999,
       createdAt: 1_700_000_001,
     }] });
     const cancelMetadata = vi.spyOn(api, "cancelMetadataReidentify").mockResolvedValue(undefined);
@@ -67,6 +67,7 @@ describe("AdminOperationsPage", () => {
     const runList = container.querySelector<HTMLElement>(".lux-admin-job-list");
     expect(runList?.textContent).toContain("媒体库：电影库");
     expect(runList?.textContent).not.toContain("library-1");
+    expect(runList?.querySelector<HTMLElement>(".lux-admin-job-count")?.textContent).toBe("· 91800 / 85999");
     const cancelButton = container.querySelector<HTMLButtonElement>('button[aria-label="取消任务"]');
     expect(cancelButton).not.toBeNull();
     act(() => cancelButton?.click());

@@ -756,6 +756,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-job-heading { display: flex; align-items: center; gap: 9px; }
 .lux-admin-job-heading strong, .lux-admin-log-row strong { overflow: hidden; color: #fff; font-size: .8rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-job-main > small, .lux-admin-log-row small { display: block; margin-top: 5px; overflow: hidden; color: var(--lux-subtle); font-size: .7rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-job-main > .lux-admin-job-meta { display: flex; align-items: baseline; gap: 0 6px; overflow: visible; text-overflow: clip; white-space: normal; }
+.lux-admin-job-context, .lux-admin-job-error { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-job-context { flex: 1 1 auto; }
+.lux-admin-job-count { flex: 0 0 auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.lux-admin-job-error { flex: 1 1 100%; }
 .lux-job-status { padding: 4px 7px; border-radius: 999px; font-size: .62rem; white-space: nowrap; }
 .status-running, .status-pending { color: #b8a4ec; background: rgba(154,126,232,.12); }
 .status-completed { color: #9bdcb3; background: rgba(96,194,132,.1); }
