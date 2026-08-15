@@ -5559,7 +5559,7 @@ fn emby_collection_type(kind: LibraryKind) -> Option<&'static str> {
     match kind {
         LibraryKind::Movie => Some("movies"),
         LibraryKind::Series => Some("tvshows"),
-        LibraryKind::Mixed => None,
+        LibraryKind::Mixed => Some("mixed"),
     }
 }
 
@@ -15778,7 +15778,7 @@ mod tests {
 
     use super::{
         CatalogSort, FilmlyImageCompatMode, MediaStrategySettings, MetadataCandidateFailureKind,
-        build_cookie, catalog_filter_from_emby, emby_media_source_json,
+        build_cookie, catalog_filter_from_emby, emby_collection_type, emby_media_source_json,
         emby_media_source_json_with_resolver, emby_media_stream_item_id, emby_media_stream_json,
         emby_playback_info_item_id, filmly_image_compat_mode_from_env_value,
         is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
@@ -15795,11 +15795,17 @@ mod tests {
     use crate::application::setup::SetupService;
     use crate::application::tmdb::TmdbError;
     use crate::config::Config;
+    use crate::library::LibraryKind;
     use crate::network::RemoteAccessPolicy;
     use crate::storage::{Database, StorageError};
     use axum::http::{HeaderMap, HeaderValue, Uri};
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn emby_collection_type_uses_mixed_for_mixed_libraries() {
+        assert_eq!(emby_collection_type(LibraryKind::Mixed), Some("mixed"));
+    }
 
     #[test]
     fn media_strategy_accepts_frontend_plugin_ids_and_no_image_language_preference() {
