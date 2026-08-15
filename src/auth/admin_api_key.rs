@@ -61,7 +61,6 @@ impl AdminApiKeyService {
             .find(|user| user.can_manage_server)
             .map(user_record)
             .transpose()
-            .map_err(Into::into)
     }
 
     fn key_path(&self) -> PathBuf {
