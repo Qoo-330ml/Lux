@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.5",
+    date: "2026-08-15",
+    sections: [
+      { kind: "added", items: [
+        "增加服务器级共享管理员 API Key，支持管理员查看、复制、生成、轮换和撤销。",
+        "API Key 兼容 Lux 与已实现的 Emby 路由，并支持多种 Emby 风格认证头。",
+      ] },
+      { kind: "fixed", items: [
+        "修复管理操作页运行时任务使用 ISO 时间戳时排序不正确的问题。",
+      ] },
+      { kind: "changed", items: [
+        "完善 API Key 的受限文件存储、旧 Key 立即失效和审计标记，避免敏感凭据进入数据库或日志。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.4",
     date: "2026-08-15",
     sections: [
