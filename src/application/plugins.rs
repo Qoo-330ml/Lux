@@ -1024,6 +1024,27 @@ impl PluginService {
         plugin: &DiscoveredPlugin,
     ) -> Result<Vec<PluginConfigField>, PluginServiceError> {
         let mut fields = plugin.manifest.config_fields.clone();
+        if plugin.manifest.id == MEDIA_INFO_PLUGIN_ID
+            && !fields.iter().any(|field| field.key == "schedule")
+        {
+            // Older STRM media-info manifests predate host-managed scheduling. Keep their
+            // persisted configuration editable from the task page and migrate the schedule
+            // into the same plugin config file when it is first changed.
+            fields.push(PluginConfigField {
+                key: "schedule".to_owned(),
+                label: "执行计划".to_owned(),
+                input_type: "text".to_owned(),
+                required: true,
+                sensitive: false,
+                description: None,
+                multiple: false,
+                options: Vec::new(),
+                options_source: None,
+                default_value: Some(Value::String(DEFAULT_STRM_MEDIA_INFO_SCHEDULE.to_owned())),
+                minimum: None,
+                maximum: None,
+            });
+        }
         if is_chapter_detector_plugin(plugin) {
             fields.retain(|field| field.key != "libraryIds");
         }

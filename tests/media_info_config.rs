@@ -248,5 +248,9 @@ async fn media_info_plugin_migrates_legacy_include_ready_configuration()
     assert!(!settings.write_sidecars);
     assert_eq!(settings.thumbnail_position_percent, 30);
     assert_eq!(settings.schedule, "0 3 * * *");
+
+    plugins.update_media_info_schedule("0 4 * * *").await?;
+    let updated_settings = plugins.media_info_settings().await?;
+    assert_eq!(updated_settings.schedule, "0 4 * * *");
     Ok(())
 }
