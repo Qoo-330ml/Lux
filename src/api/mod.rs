@@ -3395,6 +3395,11 @@ fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
         "Role": actor.character,
         "Type": "Actor",
         "PrimaryImageTag": image_tag,
+        "Overview": actor.biography,
+        "BirthDate": actor.birthday,
+        "DeathDate": actor.deathday,
+        "KnownForDepartment": actor.known_for_department,
+        "PlaceOfBirth": actor.place_of_birth,
     })
 }
 

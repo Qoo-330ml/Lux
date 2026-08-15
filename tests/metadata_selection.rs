@@ -14,7 +14,7 @@ use luxd::{
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
-        metadata_paths::{library_item_directory, people_directory},
+        metadata_paths::{canonical_person_directory, library_item_directory, people_directory},
         people::PeopleService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
@@ -85,7 +85,18 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
             "providerIds": {"Tmdb": "7", "Imdb": "tt0000007"},
             "directors": [{"providerId": "11", "name": "导演甲"}],
             "writers": [{"providerId": "12", "name": "编剧甲"}],
-            "actors": [{"id": "9", "name": "演员甲", "character": "角色甲", "order": 0}],
+            "actors": [{
+                "id": "9",
+                "name": "演员甲",
+                "character": "角色甲",
+                "order": 0,
+                "person": {
+                    "biography": "演员甲的生平介绍",
+                    "birthday": "1970-01-01",
+                    "knownForDepartment": "Acting",
+                    "placeOfBirth": "测试城市"
+                }
+            }],
             "trailers": ["https://www.youtube.com/watch?v=abc123"],
             "images": {
                 "POSTER": [format!("{image_url}/poster")],
@@ -272,7 +283,13 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
                 "name": "演员甲",
                 "character": "角色甲",
                 "order": 0,
-                "profileUrl": "https://image.tmdb.org/t/p/w185/profile.jpg"
+                "profileUrl": "https://image.tmdb.org/t/p/w185/profile.jpg",
+                "person": {
+                    "biography": "演员甲的生平介绍",
+                    "birthday": "1970-01-01",
+                    "knownForDepartment": "Acting",
+                    "placeOfBirth": "测试城市"
+                }
             }]
         }),
     )
@@ -298,10 +315,13 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let people_file =
         library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
     let people: Value = serde_json::from_slice(&tokio::fs::read(people_file).await?)?;
-    assert_eq!(people["schemaVersion"], 1);
+    assert_eq!(people["schemaVersion"], 2);
     assert_eq!(people["actors"][0]["name"], "演员甲");
     assert_eq!(people["actors"][0]["provider"], "tmdb");
-    let person_dir = people_directory(&fixture.config.config_dir, "演员甲", "tmdb", "9")?;
+    let person_key = people["actors"][0]["personKey"]
+        .as_str()
+        .ok_or("missing canonical person key")?;
+    let person_dir = canonical_person_directory(&fixture.config.config_dir, person_key)?;
     assert!(person_dir.join("person.nfo").exists());
 
     let detail = client
@@ -313,6 +333,10 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let detail_body: Value = detail.json().await?;
     assert_eq!(detail_body["actors"][0]["name"], "演员甲");
     assert_eq!(detail_body["actors"][0]["character"], "角色甲");
+    assert_eq!(detail_body["actors"][0]["biography"], "演员甲的生平介绍");
+    assert_eq!(detail_body["actors"][0]["birthday"], "1970-01-01");
+    assert_eq!(detail_body["actors"][0]["knownForDepartment"], "Acting");
+    assert_eq!(detail_body["actors"][0]["placeOfBirth"], "测试城市");
     assert_eq!(
         detail_body["actors"][0]["imageUrl"],
         "/api/v1/people/9/image"

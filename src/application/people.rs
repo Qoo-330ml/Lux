@@ -136,6 +136,11 @@ pub struct ActorView {
     pub name: String,
     pub character: Option<String>,
     pub image_url: Option<String>,
+    pub biography: Option<String>,
+    pub birthday: Option<String>,
+    pub deathday: Option<String>,
+    pub known_for_department: Option<String>,
+    pub place_of_birth: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -541,6 +546,26 @@ impl PeopleService {
                 name: actor.name,
                 character: actor.character,
                 image_url,
+                biography: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.biography.clone()),
+                birthday: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.birthday.clone()),
+                deathday: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.deathday.clone()),
+                known_for_department: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.known_for_department.clone()),
+                place_of_birth: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.place_of_birth.clone()),
             });
         }
         Ok(views)

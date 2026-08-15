@@ -97,6 +97,11 @@ export type MediaActor = {
   name: string;
   character?: string | null;
   imageUrl?: string | null;
+  biography?: string | null;
+  birthday?: string | null;
+  deathday?: string | null;
+  knownForDepartment?: string | null;
+  placeOfBirth?: string | null;
 };
 
 export type MediaNfoCredit = {
