@@ -820,6 +820,7 @@ fn generic_candidate_actors(
                     .map(str::to_owned),
                 order: member.order,
                 profile_url: member.profile_url.clone(),
+                person: None,
             })
         })
         .collect()
@@ -1638,6 +1639,7 @@ fn tmdb_candidate_actors(cast: &[TmdbCastMember]) -> Vec<ActorCredit> {
                     .as_deref()
                     .filter(|path| path.starts_with('/') && path.len() > 1)
                     .map(|path| format!("https://image.tmdb.org/t/p/w185{path}")),
+                person: None,
             })
         })
         .collect()
