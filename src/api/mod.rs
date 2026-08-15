@@ -1663,10 +1663,16 @@ async fn resolve_emby_user_with_auth(
 
 fn emby_token_from_headers(headers: &HeaderMap) -> Option<String> {
     headers
-        .get("X-Emby-Token")
-        .or_else(|| headers.get("X-MediaBrowser-Token"))
+        .get("X-Lux-Api-Key")
         .and_then(|value| value.to_str().ok())
         .and_then(emby_token_header_value)
+        .or_else(|| {
+            headers
+                .get("X-Emby-Token")
+                .or_else(|| headers.get("X-MediaBrowser-Token"))
+                .and_then(|value| value.to_str().ok())
+                .and_then(emby_token_header_value)
+        })
         .or_else(|| {
             headers
                 .get("X-Emby-Authorization")

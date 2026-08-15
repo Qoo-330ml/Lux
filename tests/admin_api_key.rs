@@ -143,6 +143,13 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
         .await?;
     assert_eq!(emby.status(), reqwest::StatusCode::OK);
 
+    let emby_with_lux_header = client
+        .get(format!("http://{address}/System/Info"))
+        .header("X-Lux-Api-Key", &key)
+        .send()
+        .await?;
+    assert_eq!(emby_with_lux_header.status(), reqwest::StatusCode::OK);
+
     server.abort();
     database.close().await;
     Ok(())
