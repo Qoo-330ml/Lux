@@ -1,0 +1,401 @@
+import { ArrowRightLeft, BookOpen, GitBranch, Sparkles, Wrench } from "lucide-react";
+
+type ChangelogSectionKind = "added" | "fixed" | "changed";
+
+type ChangelogSection = {
+  kind: ChangelogSectionKind;
+  items: string[];
+};
+
+type ChangelogRelease = {
+  version: string;
+  date: string;
+  sections: ChangelogSection[];
+};
+
+export const changelogReleases: ChangelogRelease[] = [
+  {
+    version: "0.2.2",
+    date: "2026-08-15",
+    sections: [
+      { kind: "added", items: [
+        "支持创建媒体库时配置多个根路径。",
+        "支持登录后恢复原有 session，减少重新登录带来的状态丢失。",
+      ] },
+      { kind: "fixed", items: [
+        "修复元数据匹配任务将文件夹误纳入处理的问题，并拒绝冲突的电影 NFO 身份信息。",
+        "修复媒体库重新扫描后媒体身份不稳定，以及同名同年份媒体路径无法共存的问题。",
+        "修复 SQLite migration 校验和在迁移维护过程中被意外改变的问题。",
+      ] },
+      { kind: "changed", items: [
+        "默认开启实时元数据匹配，使文件事件触发的增量扫描可以自动补全本地缺失元数据。",
+        "优化媒体库创建、媒体识别和登录恢复流程的回归覆盖。",
+      ] },
+    ],
+  },
+  {
+    version: "0.2.1",
+    date: "2026-08-14",
+    sections: [
+      { kind: "added", items: [
+        "增加管理台更新日志页面，展示版本变更和项目发布历史。",
+        "增加元数据确认结果、任务完成时间和低置信度元数据处理流程的管理能力。",
+        "增加共享表单控件与 LuxSelect，统一管理界面交互样式。",
+      ] },
+      { kind: "fixed", items: [
+        "修复登录缓存与 session 路由不兼容的问题。",
+        "修复同一媒体库同时运行多个扫描索引任务的问题，保证扫描任务串行化。",
+        "补充 Emby 元数据 DTO 的条目 ID，改善客户端关联媒体和元数据的能力。",
+      ] },
+      { kind: "changed", items: [
+        "优化首页性能：复用访问状态查询、减少后台轮询，并采用异步图片解码。",
+        "移除独立的元数据纠正页面，将确认结果和后续处理统一到管理流程中。",
+        "记录首页性能基线与后续聚合优化结果。",
+      ] },
+    ],
+  },
+  {
+    version: "0.2.0",
+    date: "2026-08-14",
+    sections: [
+      { kind: "added", items: [
+        "支持每个用户独立调整自动标记已看的播放阈值，默认值为 95%。",
+        "电影和单集达到用户阈值后自动标记为已看；季度和剧集按可播放单集状态自动聚合。",
+        "补全 Web 收藏、已看、播放进度和继续观看的实际 API 链路，并支持取消单集已看后重新计算父级状态。",
+        "增加本地 NFO 丰富元数据、跨来源人物身份和人物资源复用能力。",
+        "增加插件卸载、主题化品牌资源、媒体库/服务器名称浏览器标题和响应式首页布局。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 Emby/Filmly 搜索、剧集详情、分集媒体流和本地图像回退的兼容性问题。",
+        "修复本地 NFO 演员身份和既有电影 NFO 复用问题，避免重复写回或丢失本地字段。",
+      ] },
+      { kind: "changed", items: [
+        "将自动已看百分比从管理员全局设置调整为用户个人设置；管理员设置仅保留继续观看的最短进度。",
+        "扩展数据库迁移至 schema version 59，并同步 SQLite/PostgreSQL 用户播放设置结构。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.18",
+    date: "2026-08-14",
+    sections: [
+      { kind: "added", items: [
+        "支持将本地 NFO 丰富元数据通过 Emby 条目详情接口提供给客户端。",
+        "增强 Filmly 剧集、分集和媒体流的兼容字段，补充独立的系列字段矩阵与流配置覆盖。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 Filmly 分集列表、next-up、season DTO 和媒体流结构的兼容性问题。",
+        "修复 Filmly 主图缺失时无法回退到缩略图的问题。",
+        "归一化 Filmly 分集媒体流中的空语言值，避免客户端收到无效字段。",
+      ] },
+      { kind: "changed", items: [
+        "将 Filmly 媒体流 A/B 配置覆盖限制在对应客户端，并完善兼容性记录与回归覆盖。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.17",
+    date: "2026-08-13",
+    sections: [
+      { kind: "added", items: [
+        "增强 Emby/Filmly 媒体详情输出，补充媒体流、默认音频流、媒体源关联和主图宽高比等字段。",
+        "支持通过 Emby 条目图片路由读取人物头像，并完善人物详情和图片兼容接口。",
+        "持久化本地图片、缩略图及 STRM 缩略图的尺寸信息，减少重复读取图片文件。",
+      ] },
+      { kind: "fixed", items: [
+        "兼容更多 Emby token 参数写法，包括 X-Emby-Token、X-MediaBrowser-Token 及大小写变体。",
+        "修复媒体策略校验与插件 ID 不一致的问题，避免合法配置被拒绝。",
+        "规范化媒体流数值、帧率和布尔字段，避免第三方客户端收到字符串类型的媒体信息。",
+      ] },
+      { kind: "changed", items: [
+        "扩展目录详情和恢复播放相关回归覆盖，改善 Filmly 等客户端的媒体详情与继续观看体验。",
+        "更新 Lux Logo 资源。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.16",
+    date: "2026-08-13",
+    sections: [
+      { kind: "added", items: [
+        "增加章节持久化和 Emby ChapterInfo 输出；片头、片尾作为特殊章节保存于 Lux 数据库，不修改媒体文件、NFO 或 EDL。",
+        "增加本地音频指纹片头片尾检测插件，以及 TheIntroDB 在线章节源插件。",
+        "增加按媒体库选择章节来源、手动检测、任务取消/重试、重启恢复和后台自动任务调度。",
+        "增加章节来源状态与刷新策略：本地来源至少 3 集后检测、默认每周运行；在线来源至少 1 集后查询、默认每天运行；成功结果 30 天内不重复刷新，无结果或失败按退避策略重试。",
+        "增加章节来源配置、检测任务管理 API、Emby 条目章节/播放信息章节以及管理界面支持。",
+      ] },
+      { kind: "changed", items: [
+        "章节检测仅处理剧集/分集；电影库不会生成片头片尾标记，混合库仅处理其中的剧集内容。",
+        "章节结果按插件来源隔离，切换来源不会删除历史结果，运行时只输出当前媒体库选择的来源。",
+        "插件调度归属改为媒体库的 chapterSourceId，旧版插件 libraryIds 配置仅用于兼容迁移。",
+        "更新插件 SDK、API、兼容性和开发规范，补充本地检测与在线查询的边界约束。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.15",
+    date: "2026-08-12",
+    sections: [
+      { kind: "added", items: [
+        "增加本地 NFO 丰富元数据、演员关系和人物资源的持久化快照，详情页可展示更多本地影片信息。",
+        "增加带 provider 范围的人物头像接口，并支持人物资源失败后的独立重试状态。",
+        "增加 Emby 条目统计接口，补充目录排序参数的多值处理。",
+      ] },
+      { kind: "fixed", items: [
+        "修复本地 NFO 快照未按源内容变化失效的问题；仅时间戳变化时复用快照，内容变化时重新构建。",
+        "修复损坏或过大的派生元数据读取失败导致详情请求整体失败的问题，改为清理异常快照并返回基础条目。",
+        "修复演员关系、人物头像或人物 NFO 资源异常时演员文字信息丢失的问题。",
+      ] },
+      { kind: "changed", items: [
+        "将本地 NFO 基础字段、丰富字段和演员信息合并为一次受限投影解析，减少重复解析并保持数据一致。",
+        "优化详情接口在派生元数据不可用时的降级行为，并调整固定 Web 顶栏的视觉背景。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.14",
+    date: "2026-08-12",
+    sections: [
+      { kind: "added", items: [
+        "增加统一元数据对象和托管图片目录布局，支持元数据快照、图片管理及 NFO 关联资源写回。",
+        "支持从本地 NFO 读取演员等演职员信息，并写入更丰富的电影元数据。",
+        "支持从插件商店按 CPU 架构安装插件发行包。",
+      ] },
+      { kind: "fixed", items: [
+        "修复元数据写回校验失败后候选选择无法继续重试的问题。",
+        "增加 STRM 探测任务外键迁移，兼容已有探测任务数据。",
+      ] },
+      { kind: "changed", items: [
+        "升级 TMDb 插件至 0.1.5，调整插件打包和 Docker 启动流程以使用架构匹配的插件发行包。",
+        "将插件商店来源设置收纳到管理设置弹层，并同步更新 API 与兼容性文档。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.13",
+    date: "2026-08-11",
+    sections: [
+      { kind: "added", items: [
+        "增加通用 STRM 解析器协议、目标类型识别和插件解析链，支持通过解析器处理 STRM 播放路径。",
+        "增加两阶段 STRM 缩略图提取、缩略图位置配置、回退策略和管理界面设置。",
+        "增加持久化用户头像及认证头像 API，支持头像保存后的界面即时刷新。",
+        "升级 STRM 媒体信息插件至 0.2.0，并完善插件协议与打包支持。",
+        "增加可配置的远程插件商店来源，并提供管理界面和 API 配置入口。",
+      ] },
+      { kind: "fixed", items: [
+        "改善 Emby/Filmly 媒体库层级、首页媒体库入口和媒体流详情兼容性。",
+        "修复首页媒体卡片换行、媒体架标题链接和宽屏布局适配问题。",
+        "修复 STRM 缩略图回退条件，避免在不适用的来源上触发缩略图处理。",
+      ] },
+      { kind: "changed", items: [
+        "实时增量扫描完成后，针对新增或变化的 STRM 来源创建定向探测任务，与全库定时探测任务分离。",
+        "优化首页聚合、最近新增目录加载和非首页 Web 路由加载性能。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.12",
+    date: "2026-08-11",
+    sections: [{ kind: "fixed", items: [
+      "修复 STRM 探测在缺少媒体信息时的处理逻辑。",
+      "修复 STRM 探测目标被过早过滤的问题，使已通过宿主校验的目标可以正常传递给探测流程。",
+    ] }],
+  },
+  {
+    version: "0.1.11",
+    date: "2026-08-10",
+    sections: [{ kind: "added", items: [
+      "增加 STRM 媒体扫描的定时任务配置、注册、执行和管理界面。",
+      "支持按时间间隔或 cron 表达式调度任务，并支持从任务日志编辑 STRM 调度配置。",
+      "增加实时元数据自动匹配开关。",
+    ] }],
+  },
+  {
+    version: "0.1.10",
+    date: "2026-08-10",
+    sections: [
+      { kind: "fixed", items: [
+        "修复 Docker 构建时 luxd 占位文件路径准备问题。",
+        "将 STRM 媒体信息插件纳入 Docker 镜像。",
+      ] },
+      { kind: "changed", items: [
+        "对齐插件发布版本，优化插件打包、Rust 依赖和 Web 资源的 Docker 构建缓存。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.9",
+    date: "2026-08-10",
+    sections: [
+      { kind: "added", items: ["在任务运行记录中展示所属媒体库，提升多媒体库运维可读性。"] },
+      { kind: "fixed", items: ["保存并正确应用媒体库排序偏好及首页排序结果。"] },
+      { kind: "changed", items: [
+        "限制目录扫描、目录聚合、STRM 探测、弹幕任务和后台任务的并发量、队列长度与批次大小，降低内存压力。",
+        "对电影、剧集、合集、恢复进度和 STRM 来源查询增加分页或批量处理，改善大媒体库稳定性。",
+        "优化 Docker 构建缓存，减少 Web 资源变动引起的 Rust 重建。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.8",
+    date: "2026-08-10",
+    sections: [
+      { kind: "fixed", items: [
+        "支持带媒体前缀的电影图片命名。",
+        "修复媒体探测操作释放、Emby 文件夹与最新内容兼容性等问题。",
+      ] },
+      { kind: "changed", items: [
+        "将媒体扫描和目录处理改为有界批量执行，避免一次性加载完整目录或目录 catalog。",
+        "对 STRM 探测来源、Emby 恢复进度、剧集、合集成员等列表查询进行分页。",
+        "为 catalog、弹幕任务和 STRM 操作增加内存保护与并发限制。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.7",
+    date: "2026-08-09",
+    sections: [
+      { kind: "fixed", items: [
+        "改善元数据候选失败的分类，避免失败状态被误判。",
+        "修复实时媒体库 watcher 的调和逻辑。",
+        "修复 Web 横向滚动栏箭头与实际滚动位置不同步的问题。",
+      ] },
+      { kind: "changed", items: [
+        "调整元数据 worker 的后台处理方式，降低对首页响应延迟的影响。",
+        "完成后台扫描性能验证记录。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.6",
+    date: "2026-08-09",
+    sections: [
+      { kind: "fixed", items: ["修复横向媒体栏箭头状态，使其与实际滚动位置保持同步。"] },
+      { kind: "changed", items: ["补充后台扫描性能验证记录。"] },
+    ],
+  },
+  {
+    version: "0.1.5",
+    date: "2026-08-09",
+    sections: [{ kind: "changed", items: ["完成版本号维护更新；该版本区间没有额外的独立用户可见功能或修复提交。"] }],
+  },
+  {
+    version: "0.1.4",
+    date: "2026-08-09",
+    sections: [{ kind: "fixed", items: ["增加 Redia Emby 兼容回退，改善相关客户端的连接与请求兼容性。"] }],
+  },
+  {
+    version: "0.1.3",
+    date: "2026-08-09",
+    sections: [
+      { kind: "added", items: ["增加可选的 PostgreSQL Compose 服务配置，并将 PostgreSQL migration 纳入 Docker 构建。"] },
+      { kind: "fixed", items: [
+        "修复 PostgreSQL 数据目录和项目目录的存储路径处理。",
+        "修复新建媒体库对话框滚动、混合媒体库本地图片索引、播放诊断日志和 Emby Items ID 过滤。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.2",
+    date: "2026-08-09",
+    sections: [
+      { kind: "added", items: [
+        "支持在首次引导时选择 SQLite 或 PostgreSQL，并安全持久化数据库后端选择。",
+        "增加 PostgreSQL 存储初始化、数据库 setup API 和跨后端存储适配。",
+        "增加按日持久化结构化日志，以及管理员日志归档和单日下载。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 PostgreSQL 搜索、健康诊断、空值指纹、bootstrap 重启和数据库引导校验问题。",
+        "修复合集成员的 catalog 可见性和跨数据库存储查询兼容性。",
+        "对过大的日志导出进行安全分类和限制。",
+      ] },
+    ],
+  },
+  {
+    version: "0.1.1",
+    date: "2026-08-08",
+    sections: [{ kind: "fixed", items: [
+      "隔离本地元数据刷新失败，避免单个条目影响同批次任务。",
+      "修复 Emby 媒体库详情请求的兼容性问题。",
+    ] }],
+  },
+  {
+    version: "0.1.0",
+    date: "2026-08-02",
+    sections: [{ kind: "added", items: [
+      "建立 Lux Rust 模块化单体服务，包含健康检查、就绪检查、版本接口、SQLite migration、领域 ID 和统一 API 错误。",
+      "增加首次初始化、管理员账户、Argon2id 密码存储、Web 会话、Emby 认证 token 和 token 撤销。",
+      "支持电影、电视剧和混合媒体库，包含媒体库路径管理、增量扫描、断点续扫、文件事件监听、分页 catalog、访问控制和运行时调度。",
+      "支持本地 NFO、图片和 ffprobe 媒体信息索引；增加 TMDb 边界、候选匹配、字段来源、元数据锁定以及 NFO/图片原子写回。",
+      "支持剧集/季度/单集层级、混合媒体、合集、外部字幕、本地文件直放、单区间 Range、.strm 外部地址、多版本媒体源、播放进度、收藏、搜索、筛选、排序和下载权限。",
+      "建立 Lux Web 客户端和管理控制台，覆盖登录、首页、媒体库浏览、搜索、详情、继续观看、用户权限、元数据候选审核、扫描任务和管理诊断。",
+      "增加 Docker/Compose 部署、ARM64 本地验证、浏览器 smoke、兼容性探测、性能基线、恢复演练和结构化可观测性基础设施。",
+    ] }],
+  },
+];
+
+const sectionMeta: Record<ChangelogSectionKind, { label: string; icon: typeof Sparkles }> = {
+  added: { label: "新增", icon: Sparkles },
+  fixed: { label: "修复", icon: Wrench },
+  changed: { label: "变更", icon: ArrowRightLeft },
+};
+
+export function AdminChangelogPage() {
+  const latestRelease = changelogReleases[0];
+
+  return (
+    <main className="lux-admin-page lux-changelog-page">
+      <header className="lux-changelog-header">
+        <div className="lux-changelog-header-mark" aria-hidden="true"><BookOpen size={21} /></div>
+        <div>
+          <span className="lux-eyebrow">项目历史</span>
+          <h1>更新日志</h1>
+          <p>记录 Lux 每一次让媒体管理更清晰、更可靠的更新。</p>
+        </div>
+        <div className="lux-changelog-current" aria-label={`当前版本 ${latestRelease.version}`}>
+          <span>当前版本</span>
+          <strong>v{latestRelease.version}</strong>
+          <small>{latestRelease.date}</small>
+        </div>
+      </header>
+
+      <div className="lux-changelog-intro">
+        <div className="lux-changelog-intro-line" aria-hidden="true"><GitBranch size={16} /></div>
+        <p>从 <strong>0.1.0</strong> 开始，按版本倒序整理项目主要的用户可见变化。</p>
+        <span>{changelogReleases.length} 个版本</span>
+      </div>
+
+      <div className="lux-changelog-timeline">
+        {changelogReleases.map((release) => (
+          <article className="lux-changelog-release" key={release.version}>
+            <div className="lux-changelog-release-rail" aria-hidden="true"><span /></div>
+            <div className="lux-changelog-release-body">
+              <header className="lux-changelog-release-header">
+                <div>
+                  <span className="lux-changelog-release-kicker">RELEASE</span>
+                  <h2>v{release.version}</h2>
+                </div>
+                <time dateTime={release.date}>{release.date}</time>
+              </header>
+              <div className="lux-changelog-sections">
+                {release.sections.map((section) => {
+                  const { icon: Icon, label } = sectionMeta[section.kind];
+                  return (
+                    <section className={`lux-changelog-section is-${section.kind}`} key={section.kind}>
+                      <h3><Icon size={14} aria-hidden="true" />{label}</h3>
+                      <ul>
+                        {section.items.map((item) => <li key={item}>{item}</li>)}
+                      </ul>
+                    </section>
+                  );
+                })}
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>
+
+      <p className="lux-changelog-note">日志根据仓库源码版本记录整理，日期不等同于各渠道的正式发布日期。</p>
+    </main>
+  );
+}

@@ -124,6 +124,10 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
     let created_body: Value = created.json().await?;
     assert_eq!(created_body["library"]["name"], "Movies");
     assert_eq!(created_body["library"]["kind"], "MOVIE");
+    assert_eq!(
+        created_body["library"]["realtimeMetadataAutoMatchEnabled"],
+        true
+    );
     let library_id = created_body["library"]["id"]
         .as_str()
         .ok_or("missing library ID")?;
@@ -650,7 +654,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     let second_body: Value = second_update.json().await?;
     assert_eq!(
         second_body["library"]["realtimeMetadataAutoMatchEnabled"],
-        false
+        true
     );
 
     let library_strategy = json!({

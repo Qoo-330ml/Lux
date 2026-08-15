@@ -12,7 +12,11 @@ export function LoginPage() {
   const login = useMutation({
     mutationFn: () => api.login(username, password),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.me });
+      await queryClient.fetchQuery({
+        queryKey: queryKeys.me,
+        queryFn: () => api.me(),
+        retry: false,
+      });
     },
   });
 

@@ -62,7 +62,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     tokio::fs::write(first_dir.join("disc.jpg"), b"alpha-disc").await?;
     tokio::fs::write(
         first_dir.join("movie.nfo"),
-        r#"<movie><rating>8.1</rating><votes>123</votes><tagline>本地标语</tagline><premiered>2020-01-02</premiered><runtime>126</runtime><status>Released</status><language>zh</language><website>https://example.com/movie</website><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>本地影业</studio><tmdbid>12345</tmdbid><director tmdbid="88">导演甲</director><writer tmdbid="99">编剧甲</writer><trailer>https://example.com/trailer</trailer></movie>"#,
+        r#"<movie><rating>8.1</rating><votes>123</votes><tagline>本地标语</tagline><premiered>2020-01-02</premiered><runtime>126</runtime><status>Released</status><language>zh</language><website>https://example.com/movie</website><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>本地影业</studio><tmdbid>12345</tmdbid><director tmdbid="88">导演甲</director><writer tmdbid="99">编剧甲</writer><writer>编剧乙</writer><trailer>https://example.com/trailer</trailer></movie>"#,
     )
     .await?;
     tokio::fs::write(second_dir.join("Beta.Movie.2021.mp4"), b"beta").await?;
@@ -429,10 +429,8 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_page_body["Items"][0]["RunTimeTicks"], 75600000000_i64);
     assert_eq!(emby_page_body["Items"][0]["OfficialRating"], "PG-13");
     assert_eq!(emby_page_body["Items"][0]["Genres"], json!(["动作"]));
-    assert_eq!(
-        emby_page_body["Items"][0]["Studios"],
-        json!([{ "Name": "本地影业" }])
-    );
+    assert_eq!(emby_page_body["Items"][0]["Studios"][0]["Name"], "本地影业");
+    assert!(emby_page_body["Items"][0]["Studios"][0]["Id"].is_string());
     assert_eq!(emby_page_body["Items"][0]["PrimaryImageItemId"], item_id);
     assert_eq!(
         emby_page_body["Items"][0]["ImageTags"]["Primary"],
@@ -771,6 +769,13 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(user_scoped_detail_body["People"][2]["Id"], "99");
     assert_eq!(user_scoped_detail_body["People"][2]["Name"], "编剧甲");
     assert_eq!(user_scoped_detail_body["People"][2]["Type"], "Writer");
+    assert!(user_scoped_detail_body["People"][3]["Id"].is_string());
+    assert!(
+        !user_scoped_detail_body["People"][3]["Id"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    );
 
     // Filmly/网易爆米花 sends ShareLevel as a capability hint, while still
     // requiring the complete detail payload needed to start playback.
@@ -804,14 +809,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     );
     assert_eq!(popcorn_detail_body["Taglines"], json!(["本地标语"]));
     assert_eq!(popcorn_detail_body["Genres"], json!(["动作"]));
-    assert_eq!(
-        popcorn_detail_body["GenreItems"],
-        json!([{ "Name": "动作" }])
-    );
-    assert_eq!(
-        popcorn_detail_body["Studios"],
-        json!([{ "Name": "本地影业" }])
-    );
+    assert_eq!(popcorn_detail_body["GenreItems"][0]["Name"], "动作");
+    assert!(popcorn_detail_body["GenreItems"][0]["Id"].is_string());
+    assert_eq!(popcorn_detail_body["Studios"][0]["Name"], "本地影业");
+    assert!(popcorn_detail_body["Studios"][0]["Id"].is_string());
     assert_eq!(popcorn_detail_body["TagItems"], serde_json::json!([]));
     assert_eq!(popcorn_detail_body["LocalTrailerCount"], 0);
     assert_eq!(popcorn_detail_body["PartCount"], 1);
@@ -1057,6 +1058,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
     assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
     assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");
+    assert_eq!(
+        home_body["recentlyAdded"][0]["userData"]["positionTicks"],
+        1_700_000_000_i64
+    );
     assert_eq!(home_body["libraries"].as_array().map(Vec::len), Some(2));
     let home_movie_library = home_body["libraries"]
         .as_array()
@@ -1071,6 +1076,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         Some(2)
     );
     assert_eq!(home_movie_library["latest"][0]["title"], "Alpha Movie");
+    assert_eq!(
+        home_movie_library["latest"][0]["userData"]["positionTicks"],
+        1_700_000_000_i64
+    );
     assert_eq!(
         home_movie_library["latest"][0]["imageTags"]["poster"],
         alpha_poster_id

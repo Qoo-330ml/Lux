@@ -16,6 +16,7 @@ export function HomePage({ user }: { user: LuxUser }) {
     queryKey: queryKeys.home,
     queryFn: () => api.home(),
     refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchIntervalInBackground: false,
   });
 
   if (home.isPending) return <HomeSkeleton />;
@@ -71,13 +72,13 @@ function HeroCarousel({ items }: { items: MediaItem[] }) {
   return (
     <section className="lux-hero" aria-label="精选媒体轮播" aria-roledescription="carousel">
       <AnimatePresence initial={false}>
-        {image ? <motion.img key={`backdrop-${item?.id}`} className="lux-hero-backdrop" src={image} alt="" initial={{ opacity: 0, scale: 1.04 }} animate={{ opacity: 1, scale: 1.015 }} exit={{ opacity: 0 }} transition={{ duration: 0.55, ease: "easeOut" }} /> : <div className="lux-hero-backdrop lux-hero-backdrop-empty" />}
+        {image ? <motion.img key={`backdrop-${item?.id}`} className="lux-hero-backdrop" src={image} alt="" decoding="async" fetchPriority="high" initial={{ opacity: 0, scale: 1.04 }} animate={{ opacity: 1, scale: 1.015 }} exit={{ opacity: 0 }} transition={{ duration: 0.55, ease: "easeOut" }} /> : <div className="lux-hero-backdrop lux-hero-backdrop-empty" />}
       </AnimatePresence>
       <div className="lux-hero-overlay" />
       <AnimatePresence initial={false} mode="wait">
         <motion.div key={item?.id ?? "empty"} className="lux-hero-copy" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.38 }}>
           <h1 className={titleClassName}>
-            {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} /> : <span className="lux-hero-title-text">{title}</span>}
+            {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} decoding="async" /> : <span className="lux-hero-title-text">{title}</span>}
           </h1>
           <div className="lux-hero-meta">
             {item?.productionYear ? <span>{item.productionYear}</span> : null}

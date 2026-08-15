@@ -8,11 +8,9 @@ export type LuxSelectOption = {
   disabled?: boolean;
 };
 
-export type LuxSelectProps = {
+type LuxSelectCommonProps = {
   id?: string;
-  value: string;
   options: readonly LuxSelectOption[];
-  onChange: (value: string) => void;
   className?: string;
   placeholder?: string;
   disabled?: boolean;
@@ -20,21 +18,35 @@ export type LuxSelectProps = {
   "aria-labelledby"?: string;
 };
 
-export function LuxSelect({
-  id,
-  value,
-  options,
-  onChange,
-  className,
-  placeholder = "请选择",
-  disabled = false,
-  "aria-label": ariaLabel,
-  "aria-labelledby": ariaLabelledBy,
-}: LuxSelectProps) {
+export type LuxSelectProps = LuxSelectCommonProps & (
+  | {
+      multiple?: false;
+      value: string;
+      onChange: (value: string) => void;
+    }
+  | {
+      multiple: true;
+      value: readonly string[];
+      onChange: (value: string[]) => void;
+    }
+);
+
+export function LuxSelect(props: LuxSelectProps) {
+  const {
+    id,
+    options,
+    className,
+    placeholder = "请选择",
+    disabled = false,
+    "aria-label": ariaLabel,
+    "aria-labelledby": ariaLabelledBy,
+  } = props;
+  const multiple = props.multiple === true;
+  const selectedValues = multiple ? props.value : [props.value];
   const generatedId = useId();
   const triggerId = id ?? `lux-select-${generatedId}`;
   const listboxId = `${triggerId}-listbox`;
-  const selectedIndex = options.findIndex((option) => option.value === value);
+  const selectedIndex = multiple ? -1 : options.findIndex((option) => option.value === props.value);
   const firstEnabledIndex = findEnabledIndex(options, 0, 1);
   const initialActiveIndex = selectedIndex >= 0 && !options[selectedIndex]?.disabled ? selectedIndex : firstEnabledIndex;
   const [open, setOpen] = useState(false);
@@ -98,7 +110,15 @@ export function LuxSelect({
   const selectOption = (index: number) => {
     const option = options[index];
     if (!option || option.disabled) return;
-    onChange(option.value);
+    if (multiple) {
+      const nextValues = selectedValues.includes(option.value)
+        ? selectedValues.filter((selectedValue) => selectedValue !== option.value)
+        : [...selectedValues, option.value];
+      props.onChange(nextValues);
+      setActiveIndex(index);
+      return;
+    }
+    props.onChange(option.value);
     setOpen(false);
     triggerRef.current?.focus();
   };
@@ -133,7 +153,15 @@ export function LuxSelect({
     }
   };
 
+  const selectedOptions = options.filter((option) => selectedValues.includes(option.value));
   const selectedOption = selectedIndex >= 0 ? options[selectedIndex] : undefined;
+  const selectedLabel = multiple
+    ? selectedOptions.length === 0
+      ? placeholder
+      : selectedOptions.length === 1
+        ? selectedOptions[0]?.label
+        : `${selectedOptions.length} 项已选择`
+    : selectedOption?.label ?? placeholder;
   const rootClassName = ["lux-select", className].filter(Boolean).join(" ");
   const menu = open ? (
     <div
@@ -141,11 +169,12 @@ export function LuxSelect({
       className="lux-select-menu"
       id={listboxId}
       role="listbox"
+      aria-multiselectable={multiple || undefined}
       aria-label={ariaLabelledBy ? undefined : ariaLabel}
       style={menuPosition}
     >
       {options.map((option, index) => {
-        const selected = option.value === value;
+        const selected = selectedValues.includes(option.value);
         const active = index === activeIndex;
         return (
           <button
@@ -187,7 +216,7 @@ export function LuxSelect({
         onClick={() => (open ? setOpen(false) : openMenu())}
         onKeyDown={handleKeyDown}
       >
-        <span className="lux-select-value">{selectedOption?.label ?? placeholder}</span>
+        <span className="lux-select-value">{selectedLabel}</span>
         <ChevronDown className={open ? "lux-select-chevron is-open" : "lux-select-chevron"} size={16} aria-hidden="true" />
       </button>
       {typeof document === "undefined" || !menu ? null : createPortal(menu, document.body)}

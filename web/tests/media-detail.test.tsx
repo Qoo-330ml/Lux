@@ -825,4 +825,52 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-player-error")?.textContent)
       .toContain("浏览器无法播放这个媒体源");
   });
+
+  it("offers the next pending metadata item when opened from the pending filter", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-1",
+      libraryId: "library-1",
+      title: "待确认电影一",
+      itemType: "MOVIE",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 60 });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [
+        { id: "movie-1", title: "待确认电影一", itemType: "MOVIE" },
+        { id: "movie-2", title: "待确认电影二", itemType: "MOVIE" },
+      ],
+      page: 1,
+      pageSize: 100,
+      total: 2,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/movie-1?metadataStatus=pending"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector("[data-action='next-pending']")).not.toBeNull());
+    });
+    expect(container.querySelector<HTMLAnchorElement>("[data-action='next-pending']")?.getAttribute("href"))
+      .toBe("/items/movie-2?metadataStatus=pending");
+    expect(api.libraryItems).toHaveBeenCalledWith("library-1", 1, undefined, {
+      metadataStatus: "PENDING",
+      pageSize: 100,
+    });
+  });
 });

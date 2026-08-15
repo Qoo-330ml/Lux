@@ -139,7 +139,7 @@ http://127.0.0.1:8097
 发布镜像使用不可变版本标签和 digest，不使用 `latest` 作为唯一发布标识：
 
 ```bash
-docker build --build-arg LUX_VERSION=0.2.0 -t lux:0.2.0 .
+docker build --build-arg LUX_VERSION=0.2.2 -t lux:0.2.2 .
 docker compose up -d
 ```
 

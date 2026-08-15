@@ -96,7 +96,7 @@ export function EpisodeCount({ item }: { item: MediaItem }) {
   return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
 }
 
-export function MediaCard({ item, landscape = false, compactRating = false }: { item: MediaItem; landscape?: boolean; compactRating?: boolean }) {
+export function MediaCard({ item, landscape = false, compactRating = false, metadataAttention = false, detailSearch }: { item: MediaItem; landscape?: boolean; compactRating?: boolean; metadataAttention?: boolean; detailSearch?: string }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
@@ -138,14 +138,15 @@ export function MediaCard({ item, landscape = false, compactRating = false }: { 
   }
 
   if (deleted) return null;
+  const detailHref = `/items/${item.id}${detailSearch ?? ""}`;
 
   return (
     <>
       <article className={landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card"}>
         <div className="lux-media-art-shell">
-          <Link className="lux-media-card-link" to={`/items/${item.id}`} aria-label={`查看 ${mediaTitle(item)} 详情`}>
+          <Link className="lux-media-card-link" to={detailHref} aria-label={`查看 ${mediaTitle(item)} 详情`}>
             <div className="lux-media-art">
-              {image ? <img src={image} alt="" loading="lazy" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
+              {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
               <Rating value={item.rating} source={item.ratingSource} compact={compactRating} placement="card" />
               <EpisodeCount item={item} />
               <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
@@ -154,10 +155,11 @@ export function MediaCard({ item, landscape = false, compactRating = false }: { 
           </Link>
           <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
         </div>
-        <Link className="lux-media-card-link" to={`/items/${item.id}`}>
+        <Link className="lux-media-card-link" to={detailHref}>
           <div className="lux-media-copy">
             <strong>{mediaTitle(item)}</strong>
             <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
+            {metadataAttention ? <span className="lux-metadata-attention-badge">待确认</span> : null}
           </div>
         </Link>
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
@@ -195,7 +197,7 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
   return (
     <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={`继续播放 ${mediaTitle(item)}`}>
       <div className="lux-media-art">
-        {image ? <img src={image} alt="" loading="lazy" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
+        {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
         <Rating value={item.rating} source={item.ratingSource} compact placement="card" />
         <EpisodeCount item={item} />
         <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
@@ -346,7 +348,7 @@ export function LibraryCard({ library }: { library: Library }) {
     <article ref={cardRef} className="lux-library-card" onContextMenu={handleContextMenu}>
       <Link className="lux-library-card-link" to={`/libraries/${library.id}`}>
         <span className="lux-library-card-cover">
-          {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" /> : <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>}
+          {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" decoding="async" /> : <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>}
         </span>
         <span className="lux-library-card-copy"><strong>{library.name}</strong></span>
       </Link>

@@ -359,4 +359,47 @@ describe("LibraryPage infinite scroll", () => {
     });
     expect(container.querySelector("[role='combobox'][aria-label='排序方式']")?.textContent).toContain("发行日期");
   });
+
+  it("opens with the pending metadata filter from a task result", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "movie-1", title: "待确认电影", itemType: "MOVIE" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1?metadataStatus=pending"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+        sortBy: "Name",
+        sortOrder: "Ascending",
+        metadataStatus: "PENDING",
+      }));
+    });
+    expect(container.textContent).toContain("待确认");
+    expect(container.querySelector(".lux-metadata-attention-badge")?.textContent).toContain("待确认");
+  });
 });

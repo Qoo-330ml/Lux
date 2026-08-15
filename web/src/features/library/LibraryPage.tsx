@@ -1,5 +1,5 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api, type LibrarySortBy, type LibrarySortOrder } from "../../lib/api/client";
@@ -75,6 +75,8 @@ function getStorage(): Storage | null {
 
 export function LibraryPage({ serverName }: { serverName?: string | null } = {}) {
   const { libraryId = "" } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const metadataStatus = searchParams.get("metadataStatus")?.toUpperCase() === "PENDING" ? "PENDING" as const : undefined;
   const [sortState, setSortState] = useState(() => ({
     libraryId,
     preference: readLibrarySortPreference(libraryId),
@@ -97,8 +99,12 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   }, [library?.name, serverName]);
 
   const pages = useInfiniteQuery({
-    queryKey: queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder),
-    queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, { sortBy, sortOrder }),
+    queryKey: queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder, metadataStatus ?? "all"),
+    queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, {
+      sortBy,
+      sortOrder,
+      ...(metadataStatus ? { metadataStatus } : {}),
+    }),
     initialPageParam: 1,
     enabled: Boolean(libraryId && library),
     getNextPageParam: (lastPage) => {
@@ -139,6 +145,10 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     { value: "Ascending", label: ascendingLabel },
     { value: "Descending", label: descendingLabel },
   ] as const;
+  const metadataOptions = [
+    { value: "ALL", label: "全部内容" },
+    { value: "PENDING", label: "待确认" },
+  ] as const;
 
   function changeSortBy(value: string) {
     const nextSortBy = value as LibrarySortBy;
@@ -155,15 +165,23 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     saveLibrarySortPreference(libraryId, preference);
   }
 
+  function changeMetadataStatus(value: string) {
+    const next = new URLSearchParams(searchParams);
+    if (value === "PENDING") next.set("metadataStatus", "pending");
+    else next.delete("metadataStatus");
+    setSearchParams(next);
+  }
+
   return (
     <section className="lux-page lux-page-narrow">
-      <div className="lux-page-heading"><h1>{library?.name || "媒体库"}</h1><p>{total} 项内容</p></div>
+      <div className="lux-page-heading"><h1>{library?.name || "媒体库"}</h1><p>{metadataStatus ? `${total} 项待确认内容` : `${total} 项内容`}</p></div>
       <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
+        <div className="lux-library-sort-control"><span>元数据</span><LuxSelect value={metadataStatus ?? "ALL"} options={metadataOptions} onChange={changeMetadataStatus} aria-label="元数据状态" /></div>
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div>
       <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} />)}
+        {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} metadataAttention={metadataStatus === "PENDING"} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} />)}
       </div>
       {!loadedItems.length ? <div className="lux-empty-card"><span>这个媒体库还没有内容。</span><Link to="/libraries">返回媒体库</Link></div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />

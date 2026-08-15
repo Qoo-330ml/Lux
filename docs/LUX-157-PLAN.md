@@ -7,7 +7,7 @@
 ## 行为契约
 
 - `realtimeWatchEnabled` 保留为兼容字段，服务端始终按开启处理，不提供关闭文件监听的能力。
-- 新增 `realtimeMetadataAutoMatchEnabled`，默认 `false`，只控制实时增量扫描完成后的在线补全。
+- 新增 `realtimeMetadataAutoMatchEnabled`，默认 `true`，只控制实时增量扫描完成后的在线补全。
 - 手动“扫描媒体库文件”不创建在线元数据任务；新媒体库/新根路径首次自动扫描仍按既有规格提交 `FILL_MISSING`。
 - 实时自动补全只提交本次增量任务影响的、仍有可用媒体源的条目，不重新扫描整库。
 - 在线补全使用 `FILL_MISSING`，尊重本地 NFO、已有图片、锁定字段和高置信度门槛。

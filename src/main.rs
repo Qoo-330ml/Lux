@@ -53,6 +53,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app_state.resume_metadata_reidentify_jobs().await;
     let app = app_with_state(app_state);
 
+    // A large existing library can contain hundreds of thousands of episodes.
+    // Repairing their legacy identities is a one-time background operation and
+    // must not block the HTTP listener from becoming available.
+    let scanner = luxd::application::scanner::LibraryScanner::new(database.clone());
+    tokio::spawn(async move {
+        match scanner.repair_legacy_identity_keys().await {
+            Ok(repaired_identity_keys) if repaired_identity_keys > 0 => {
+                info!(repaired_identity_keys, "legacy media identities repaired");
+            }
+            Ok(_) => {}
+            Err(error) => error!(%error, "legacy media identity repair failed"),
+        }
+    });
+
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
 

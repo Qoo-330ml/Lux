@@ -394,7 +394,12 @@ impl MetadataReidentifyService {
     async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
         let result = match self.database.find_media_item_metadata(item_id).await {
             Ok(Some(item)) => {
-                if item.title.trim().is_empty() {
+                if !matches!(
+                    item.item_type.as_str(),
+                    "MOVIE" | "SERIES" | "SEASON" | "EPISODE"
+                ) {
+                    Ok(0)
+                } else if item.title.trim().is_empty() {
                     Err(MetadataReidentifyError::InvalidSearch)
                 } else {
                     let skip = if matches!(mode, MetadataRefreshMode::FillMissing) {
@@ -578,6 +583,7 @@ impl MetadataReidentifyService {
             items: items.into_iter().map(metadata_reidentify_item).collect(),
             cancel_requested: job.cancel_requested,
             library_id: job.library_id,
+            pending_count: job.pending_count,
         })
     }
 
@@ -635,6 +641,7 @@ pub struct MetadataReidentifyJob {
     pub items: Vec<MetadataReidentifyItem>,
     pub cancel_requested: bool,
     pub library_id: Option<String>,
+    pub pending_count: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

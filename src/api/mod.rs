@@ -1893,6 +1893,7 @@ fn catalog_filter_from_values(
     is_favorite: Option<bool>,
     sort_by: Option<&str>,
     sort_order: Option<&str>,
+    metadata_pending: bool,
 ) -> CatalogFilter {
     let item_types = item_types
         .map(|values| {
@@ -1928,6 +1929,7 @@ fn catalog_filter_from_values(
         years,
         is_played,
         is_favorite,
+        metadata_pending,
         sort_by: match sort_by {
             Some(value)
                 if value
@@ -1965,6 +1967,7 @@ fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
         query.is_favorite,
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
+        false,
     );
     let ids = query.ids.as_deref().map(|values| {
         values
@@ -2339,6 +2342,7 @@ async fn emby_group_latest_page(
             years: Vec::new(),
             is_played: None,
             is_favorite: None,
+            metadata_pending: false,
             sort_by: CatalogSort::Name,
             descending: false,
         };
@@ -3368,19 +3372,33 @@ fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
     })
 }
 
+fn emby_stable_named_id(kind: &str, name: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"lux-emby:");
+    digest.update(kind.as_bytes());
+    digest.update(b":");
+    digest.update(name.as_bytes());
+    let suffix = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{kind}-{suffix}")
+}
+
 fn emby_nfo_crew_json(nfo: &LocalNfoDetails) -> Vec<Value> {
     let mut people = Vec::with_capacity(nfo.directors.len() + nfo.writers.len());
     for (person_type, credits) in [("Director", &nfo.directors), ("Writer", &nfo.writers)] {
         for credit in credits {
-            let mut person = json!({
+            let person = json!({
                 "Name": credit.name,
+                "Id": if credit.provider_id.is_empty() {
+                    emby_stable_named_id(person_type, &credit.name)
+                } else {
+                    credit.provider_id.clone()
+                },
                 "Type": person_type,
             });
-            if !credit.provider_id.is_empty()
-                && let Value::Object(object) = &mut person
-            {
-                object.insert("Id".to_owned(), json!(credit.provider_id));
-            }
             people.push(person);
         }
     }
@@ -4993,7 +5011,12 @@ fn apply_emby_nfo_details(
             json!(
                 nfo.genres
                     .iter()
-                    .map(|name| json!({ "Name": name }))
+                    .map(|name| {
+                        json!({
+                            "Name": name,
+                            "Id": emby_stable_named_id("genre", name),
+                        })
+                    })
                     .collect::<Vec<_>>()
             ),
         );
@@ -5004,7 +5027,12 @@ fn apply_emby_nfo_details(
             json!(
                 nfo.studios
                     .iter()
-                    .map(|name| json!({ "Name": name }))
+                    .map(|name| {
+                        json!({
+                            "Name": name,
+                            "Id": emby_stable_named_id("studio", name),
+                        })
+                    })
                     .collect::<Vec<_>>()
             ),
         );
@@ -6056,10 +6084,12 @@ async fn setup_complete(
                 (request.first_library, setup_kind, state.libraries.as_ref())
             {
                 let library = match libraries
-                    .create_library(
+                    .create_library_with_scraper(
                         &first_library.name,
                         kind,
                         first_library.realtime_watch_enabled,
+                        None,
+                        true,
                     )
                     .await
                 {
@@ -6635,6 +6665,8 @@ struct LuxPageQuery {
     sort_by: Option<String>,
     #[serde(rename = "sort_order", alias = "sortOrder", default)]
     sort_order: Option<String>,
+    #[serde(rename = "metadataStatus", default)]
+    metadata_status: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -6843,28 +6875,64 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let user_id = user.id.to_string();
-    let (continue_watching, recently_added, recommended, latest_groups) = match tokio::try_join!(
-        catalog.list_continue_watching(principal, &user_id, 0, 10),
-        catalog.list_recently_added(principal, 0, 12),
-        catalog.list_recommended(principal, &user_id, 12),
-        catalog.list_recently_added_by_library(principal, 12),
-    ) {
-        Ok(values) => values,
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let (
+        continue_watching_result,
+        recently_added_result,
+        recommended_result,
+        latest_groups_result,
+        views_result,
+    ) = tokio::join!(
+        catalog.list_continue_watching_for_library_ids(&accessible_library_ids, &user_id, 0, 10),
+        catalog.list_recently_added_for_library_ids(&accessible_library_ids, 0, 12),
+        catalog.list_recommended_for_library_ids(&accessible_library_ids, &user_id, 12),
+        catalog.list_recently_added_by_library_ids(&accessible_library_ids, 12),
+        libraries.list_libraries(),
+    );
+    let continue_watching = match continue_watching_result {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let recently_added = match recently_added_result {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let recommended = match recommended_result {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let latest_groups = match latest_groups_result {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let views = match views_result {
+        Ok(value) => value,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let latest_items = latest_groups
         .iter()
         .flat_map(|(_, items)| items.iter().cloned())
         .collect::<Vec<_>>();
-    let (continue_watching_items, recently_added_items, recommended_items, latest_values) = match tokio::try_join!(
-        lux_catalog_items_json_for_user(database, &user_id, &continue_watching.items),
-        lux_catalog_items_json_for_user(database, &user_id, &recently_added.items),
-        lux_catalog_items_json_for_user(database, &user_id, &recommended),
-        lux_catalog_items_json_for_user(database, &user_id, &latest_items),
-    ) {
+    let all_items = continue_watching
+        .items
+        .iter()
+        .chain(recently_added.items.iter())
+        .chain(recommended.iter())
+        .chain(latest_items.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let user_values = match lux_catalog_item_values_by_id(database, &user_id, &all_items).await {
         Ok(values) => values,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let continue_watching_items =
+        lux_catalog_items_from_values(&continue_watching.items, &user_values);
+    let recently_added_items = lux_catalog_items_from_values(&recently_added.items, &user_values);
+    let recommended_items = lux_catalog_items_from_values(&recommended, &user_values);
+    let latest_values = lux_catalog_items_from_values(&latest_items, &user_values);
     let mut latest_by_library = BTreeMap::<String, Vec<Value>>::new();
     for (item, value) in latest_items.iter().zip(latest_values) {
         latest_by_library
@@ -6872,18 +6940,7 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
             .or_default()
             .push(value);
     }
-    let (views_result, accessible_library_ids_result) = tokio::join!(
-        libraries.list_libraries(),
-        access.accessible_library_ids(principal),
-    );
-    let views = match views_result {
-        Ok(views) => views,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let accessible_library_ids = match accessible_library_ids_result {
-        Ok(ids) => ids.into_iter().collect::<HashSet<_>>(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
     let mut visible = Vec::new();
     for view in views {
         let library_id = view.library.id.to_string();
@@ -7229,6 +7286,19 @@ async fn lux_list_library_items(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let metadata_pending = match query.metadata_status.as_deref() {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("PENDING") => true,
+        Some(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "元数据状态无效",
+            )
+            .into_response();
+        }
+    };
     let filter = catalog_filter_from_values(
         query.item_type.as_deref(),
         query.year.map(|year| year.to_string()).as_deref(),
@@ -7236,6 +7306,7 @@ async fn lux_list_library_items(
         query.is_favorite,
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
+        metadata_pending,
     );
     match catalog
         .list_library_items_filtered(principal, &library_id, &filter, offset, limit)
@@ -9064,16 +9135,42 @@ async fn lux_catalog_items_json_for_user(
     user_id: &str,
     items: &[CatalogItem],
 ) -> Result<Vec<Value>, StorageError> {
-    let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-    let states = database.list_user_item_states(user_id, &item_ids).await?;
-    let mut values = Vec::with_capacity(items.len());
+    let values = lux_catalog_item_values_by_id(database, user_id, items).await?;
+    Ok(lux_catalog_items_from_values(items, &values))
+}
+
+async fn lux_catalog_item_values_by_id(
+    database: &Database,
+    user_id: &str,
+    items: &[CatalogItem],
+) -> Result<HashMap<String, Value>, StorageError> {
+    let mut item_ids = Vec::with_capacity(items.len());
+    let mut seen = HashSet::with_capacity(items.len());
     for item in items {
-        values.push(lux_catalog_item_json_with_user_state(
-            item,
-            states.get(&item.id),
-        ));
+        if seen.insert(item.id.clone()) {
+            item_ids.push(item.id.clone());
+        }
     }
-    Ok(values)
+    let states = database.list_user_item_states(user_id, &item_ids).await?;
+    Ok(items
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                lux_catalog_item_json_with_user_state(item, states.get(&item.id)),
+            )
+        })
+        .collect())
+}
+
+fn lux_catalog_items_from_values(
+    items: &[CatalogItem],
+    values: &HashMap<String, Value>,
+) -> Vec<Value> {
+    items
+        .iter()
+        .filter_map(|item| values.get(&item.id).cloned())
+        .collect()
 }
 
 async fn lux_catalog_page_json_for_user(
@@ -9270,13 +9367,17 @@ struct CreateLibraryRequest {
     kind: String,
     #[serde(default = "default_realtime_watch_enabled")]
     realtime_watch_enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_realtime_metadata_auto_match_enabled")]
     realtime_metadata_auto_match_enabled: bool,
     scraper_id: Option<String>,
     chapter_source_id: Option<String>,
 }
 
 fn default_realtime_watch_enabled() -> bool {
+    true
+}
+
+fn default_realtime_metadata_auto_match_enabled() -> bool {
     true
 }
 
@@ -11924,6 +12025,7 @@ fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) -> Value {
         "totalCount": job.total_count,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
+        "finishedAt": job.finished_at,
     })
 }
 
@@ -11978,6 +12080,7 @@ fn scan_job_json(job: &crate::application::scanner::ScanJob) -> Value {
         "totalCount": job.total_count,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
+        "finishedAt": job.finished_at,
     })
 }
 
@@ -13798,6 +13901,7 @@ fn metadata_reidentify_job_json(
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
         "libraryId": job.library_id,
+        "pendingCount": job.pending_count,
         "items": job.items.iter().map(|item| json!({
             "jobId": item.job_id,
             "itemId": item.item_id,
@@ -13825,6 +13929,7 @@ fn metadata_reidentify_job_summary_json(
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
         "libraryId": job.library_id,
+        "pendingCount": job.pending_count,
     })
 }
 

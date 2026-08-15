@@ -141,6 +141,20 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("requests only metadata items that still need confirmation", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().libraryItems("movie-library", 1, "MOVIE", {
+      metadataStatus: "PENDING",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/libraries/movie-library/items?page=1&pageSize=24&itemType=MOVIE&metadataStatus=PENDING",
+    );
+  });
+
   it("requests the children for a series or a selected season", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
@@ -505,7 +519,7 @@ describe("LuxApiClient", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
       if (path === "/api/v1/admin/dashboard") {
-        return new Response(JSON.stringify({ server: { name: "Lux", version: "0.2.0" }, health: {}, nowPlaying: [], activity: [] }), { status: 200 });
+        return new Response(JSON.stringify({ server: { name: "Lux", version: "0.2.2" }, health: {}, nowPlaying: [], activity: [] }), { status: 200 });
       }
       expect(path).toBe("/api/v1/admin/settings");
       expect(init?.method).toBe("PATCH");
@@ -520,7 +534,7 @@ describe("LuxApiClient", () => {
 
     const client = new LuxApiClient();
     await expect(client.adminDashboard()).resolves.toMatchObject({
-      server: { name: "Lux", version: "0.2.0" },
+      server: { name: "Lux", version: "0.2.2" },
       nowPlaying: [],
       activity: [],
     });

@@ -23,7 +23,7 @@ const AdminPluginsPage = lazy(() => import("../features/admin/AdminPluginsPage")
 const AdminUsersPage = lazy(() => import("../features/admin/AdminUsersPage").then(({ AdminUsersPage }) => ({ default: AdminUsersPage })));
 const AdminOperationsPage = lazy(() => import("../features/admin/AdminOperationsPage").then(({ AdminOperationsPage }) => ({ default: AdminOperationsPage })));
 const AdminSettingsPage = lazy(() => import("../features/admin/AdminSettingsPage").then(({ AdminSettingsPage }) => ({ default: AdminSettingsPage })));
-const AdminMetadataPage = lazy(() => import("../features/admin/AdminMetadataPage").then(({ AdminMetadataPage }) => ({ default: AdminMetadataPage })));
+const AdminChangelogPage = lazy(() => import("../features/admin/AdminChangelogPage").then(({ AdminChangelogPage }) => ({ default: AdminChangelogPage })));
 
 export function App() {
   const setup = useQuery({
@@ -82,7 +82,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
             <Route path="users" element={<AdminUsersPage />} />
             <Route path="jobs" element={<AdminOperationsPage />} />
             <Route path="settings" element={<AdminSettingsPage />} />
-            <Route path="metadata" element={<AdminMetadataPage />} />
+            <Route path="changelog" element={<AdminChangelogPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

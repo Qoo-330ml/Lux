@@ -68,6 +68,7 @@ describe("HomePage shelves", () => {
 
     expect(container.querySelector('[aria-label="我的媒体库"] .lux-library-card')?.textContent)
       .toContain("华语电影");
+    expect(container.querySelector<HTMLImageElement>(".lux-library-cover")?.getAttribute("decoding")).toBe("async");
     expect(container.querySelector('[aria-label="我的媒体库"] .lux-horizontal-scroll-viewport')).not.toBeNull();
     expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
       .toContain("最新华语片");
@@ -78,6 +79,8 @@ describe("HomePage shelves", () => {
       .toEqual(["我的媒体库", "继续观看", "最新华语电影"]);
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.home })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.mediaSurface);
+    expect(queryClient.getQueryCache().find({ queryKey: queryKeys.home })?.options.refetchIntervalInBackground)
+      .toBe(false);
     expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影");
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
@@ -253,6 +256,7 @@ describe("HomePage shelves", () => {
 
     expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("src"))
       .toBe("/api/v1/items/featured-1/images/logo?tag=logo-tag");
+    expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("decoding")).toBe("async");
     expect(container.querySelector(".lux-hero-title")?.textContent).toBe("");
     expect(container.querySelector(".lux-hero-title")?.querySelector("img")?.getAttribute("alt"))
       .toBe("精选电影");

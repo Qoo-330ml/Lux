@@ -365,6 +365,273 @@ async fn series_scan_groups_episode_versions_into_one_item_and_labels_sources()
     Ok(())
 }
 
+#[tokio::test]
+async fn series_scan_allows_same_title_and_year_in_different_directories()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    create_file(
+        &root.join("中国动漫/2010/果宝特攻 (2010) {tmdb-118968}/Season 1/果宝特攻-S01E18-720p.mkv"),
+    )
+    .await?;
+    create_file(
+        &root.join("儿童动画/2010/果宝特攻 (2010) {tmdb-118968}/Season 1/果宝特攻-S01E18-480p.mkv"),
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    let report = LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    assert_eq!(report.created_sources, 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_items
+             WHERE library_id = ? AND item_type = 'SERIES' AND removed_at IS NULL",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn series_scan_repairs_legacy_identity_keys_without_creating_duplicates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    let episode_path = root.join("Example Show (2024)/Season 01/Example.Show.S01E01.mkv");
+    create_file(&episode_path).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_series_library(library.id).await?;
+
+    sqlx::query(
+        "UPDATE media_items
+         SET identity_key = CASE item_type
+             WHEN 'SERIES' THEN NULL
+             WHEN 'SEASON' THEN 'legacy:season'
+             WHEN 'EPISODE' THEN 'episode:legacy:relative/path'
+         END
+         WHERE library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(scanner.repair_legacy_identity_keys().await?, 1);
+    assert_eq!(scanner.repair_legacy_identity_keys().await?, 0);
+    let second = scanner.scan_series_library(library.id).await?;
+    assert_eq!(second.created_items, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_items WHERE library_id = ? AND removed_at IS NULL",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?,
+        3
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readding_a_deleted_root_reuses_existing_series_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    create_file(&root.join("Example Show (2024)/Season 01/Example.Show.S01E01.mkv")).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?
+        .root;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_series_library(library.id).await?;
+    let before: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_type, id FROM media_items WHERE library_id = ? ORDER BY item_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+
+    sqlx::query(
+        "UPDATE media_items
+         SET identity_key = CASE item_type
+             WHEN 'SERIES' THEN ?
+             WHEN 'SEASON' THEN ?
+             WHEN 'EPISODE' THEN ?
+         END
+         WHERE library_id = ?",
+    )
+    .bind(format!("series:{}:Example Show (2024)", root_record.id))
+    .bind(format!(
+        "series:{}:Example Show (2024):season:1",
+        root_record.id
+    ))
+    .bind(format!(
+        "episode:{}:Example Show (2024)/Season 01/Example.Show.S01E01.mkv",
+        root_record.id
+    ))
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    libraries.delete_root(library.id, root_record.id).await?;
+    let restored = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?
+        .root;
+    assert_eq!(restored.id, root_record.id);
+
+    let second = scanner.scan_series_library(library.id).await?;
+    assert_eq!(second.created_items, 0);
+    let after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_type, id FROM media_items WHERE library_id = ? ORDER BY item_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(after, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn series_scan_preserves_items_when_episode_directory_moves_by_inode()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    let old_episode = root.join("Updating Show/Season 01/Updating.Show.S01E01.mkv");
+    create_file(&old_episode).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_series_library(library.id).await?;
+    let before: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_type, id FROM media_items WHERE library_id = ? ORDER BY item_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+
+    let new_directory = root.join("Completed Show/Season 01");
+    tokio::fs::create_dir_all(&new_directory).await?;
+    tokio::fs::rename(
+        &old_episode,
+        new_directory.join("Completed.Show.S01E01.mkv"),
+    )
+    .await?;
+    tokio::fs::remove_dir_all(root.join("Updating Show")).await?;
+
+    let second = scanner.scan_series_library(library.id).await?;
+    assert_eq!(second.created_items, 0);
+    let after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_type, id FROM media_items WHERE library_id = ? ORDER BY item_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(after, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn series_scan_preserves_items_when_file_moves_between_roots()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let first_root = temp_dir.path().join("A");
+    let second_root = temp_dir.path().join("B");
+    let old_episode = first_root.join("Moving Show/Season 01/Moving.Show.S01E01.mkv");
+    create_file(&old_episode).await?;
+    tokio::fs::create_dir_all(&second_root).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, first_root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    libraries
+        .add_root(library.id, second_root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_series_library(library.id).await?;
+    let before: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_type, id FROM media_items WHERE library_id = ? ORDER BY item_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+
+    let new_directory = second_root.join("Moved Show/Season 01");
+    tokio::fs::create_dir_all(&new_directory).await?;
+    tokio::fs::rename(&old_episode, new_directory.join("Moved.Show.S01E01.mkv")).await?;
+    tokio::fs::remove_dir_all(first_root.join("Moving Show")).await?;
+
+    let second = scanner.scan_series_library(library.id).await?;
+    assert_eq!(second.created_items, 0);
+    let after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT item_type, id FROM media_items WHERE library_id = ? ORDER BY item_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(after, before);
+    Ok(())
+}
+
 async fn create_file(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;

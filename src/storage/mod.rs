@@ -1,7 +1,11 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use sqlx::{
-    Any, AnyPool, Executor, Row,
+    Acquire, Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
 };
@@ -119,6 +123,9 @@ impl Database {
         if let Err(source) = migrator.run(&pool).await {
             pool.close().await;
             return Err(StorageError::Migration { path, source });
+        }
+        if backend == DatabaseBackend::Sqlite {
+            remove_sqlite_title_year_unique(&pool, &path).await?;
         }
         let server_id =
             ensure_server_id(&pool, backend)
@@ -771,7 +778,8 @@ impl Database {
     ) -> Result<Vec<String>, StorageError> {
         self.query_scalar(
             "SELECT id FROM media_items
-             WHERE library_id = ? AND removed_at IS NULL AND item_type <> 'FOLDER'
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
              ORDER BY CASE item_type
                           WHEN 'SERIES' THEN 0
                           WHEN 'SEASON' THEN 1
@@ -2421,16 +2429,99 @@ impl Database {
         library_id: &str,
         root_id: &str,
     ) -> Result<bool, StorageError> {
-        self.query("DELETE FROM library_roots WHERE id = ? AND library_id = ?")
-            .bind(root_id)
-            .bind(library_id)
-            .execute(&self.pool)
+        let mut transaction = self
+            .pool
+            .begin()
             .await
-            .map(|result| result.rows_affected() == 1)
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+        let history = self
+            .query(
+                "INSERT INTO library_root_history (library_id, canonical_path, root_id)
+                 SELECT library_id, canonical_path, id
+                 FROM library_roots
+                 WHERE id = ? AND library_id = ?
+                 ON CONFLICT(library_id, canonical_path) DO UPDATE SET
+                     root_id = excluded.root_id,
+                     deleted_at = unixepoch()",
+            )
+            .bind(root_id)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if history.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        self.query("DELETE FROM library_roots WHERE id = ? AND library_id = ?")
+            .bind(root_id)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    pub(crate) async fn find_deleted_library_root_id(
+        &self,
+        library_id: &str,
+        canonical_path: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT root_id
+             FROM library_root_history
+             WHERE library_id = ? AND canonical_path = ?",
+        )
+        .bind(library_id)
+        .bind(canonical_path)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn delete_library_root_history(
+        &self,
+        library_id: &str,
+        canonical_path: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "DELETE FROM library_root_history
+             WHERE library_id = ? AND canonical_path = ?",
+        )
+        .bind(library_id)
+        .bind(canonical_path)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn list_all_library_roots(
@@ -3510,7 +3601,14 @@ impl Database {
                      FROM metadata_reidentify_job_items
                      JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
                      WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                    ) AS library_id
+                    ) AS library_id,
+                    (SELECT COUNT(DISTINCT pending_candidates.item_id)
+                     FROM metadata_candidates pending_candidates
+                     JOIN metadata_reidentify_job_items pending_job_items
+                       ON pending_job_items.item_id = pending_candidates.item_id
+                      AND pending_job_items.job_id = metadata_reidentify_jobs.id
+                     WHERE pending_candidates.status = 'PENDING'
+                    ) AS pending_count
              FROM metadata_reidentify_jobs WHERE id = ?",
         )
         .bind(job_id)
@@ -3540,7 +3638,14 @@ impl Database {
                          FROM metadata_reidentify_job_items
                          JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
                          WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                        ) AS library_id
+                        ) AS library_id,
+                        (SELECT COUNT(DISTINCT pending_candidates.item_id)
+                         FROM metadata_candidates pending_candidates
+                         JOIN metadata_reidentify_job_items pending_job_items
+                           ON pending_job_items.item_id = pending_candidates.item_id
+                          AND pending_job_items.job_id = metadata_reidentify_jobs.id
+                         WHERE pending_candidates.status = 'PENDING'
+                        ) AS pending_count
                  FROM metadata_reidentify_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -3560,7 +3665,14 @@ impl Database {
                          FROM metadata_reidentify_job_items
                          JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
                          WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                        ) AS library_id
+                        ) AS library_id,
+                        (SELECT COUNT(DISTINCT pending_candidates.item_id)
+                         FROM metadata_candidates pending_candidates
+                         JOIN metadata_reidentify_job_items pending_job_items
+                           ON pending_job_items.item_id = pending_candidates.item_id
+                          AND pending_job_items.job_id = metadata_reidentify_jobs.id
+                         WHERE pending_candidates.status = 'PENDING'
+                        ) AS pending_count
                  FROM metadata_reidentify_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -3920,6 +4032,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
+                    finished_at,
                     discovery_completed, auto_metadata_match
              FROM scan_jobs WHERE id = ?",
         )
@@ -3943,6 +4056,7 @@ impl Database {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
+                        finished_at,
                         discovery_completed, auto_metadata_match
                  FROM scan_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -3956,6 +4070,7 @@ impl Database {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
+                        finished_at,
                         discovery_completed, auto_metadata_match
                  FROM scan_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -4008,6 +4123,29 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_active_scan_job_for_library(
+        &self,
+        library_id: &str,
+    ) -> Result<Option<StoredScanJob>, StorageError> {
+        self.query(
+            "SELECT id, library_id, job_type, status, generation, cursor,
+                    processed_count, total_count, cancel_requested, error,
+                    finished_at,
+                    discovery_completed, auto_metadata_match
+             FROM scan_jobs
+             WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(library_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_scan_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_active_scan_job(
         &self,
         library_id: &str,
@@ -4016,6 +4154,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
+                    finished_at,
                     discovery_completed, auto_metadata_match
              FROM scan_jobs
              WHERE library_id = ? AND job_type = ? AND status IN ('PENDING', 'RUNNING')
@@ -4376,97 +4515,6 @@ impl Database {
         })
     }
 
-    pub(crate) async fn repair_legacy_episode_identity(
-        &self,
-        filesystem_entry_id: &str,
-        series_identity: &str,
-        season_identity: &str,
-        episode_identity: &str,
-    ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let hierarchy: Option<(Option<String>, Option<String>, String)> = self
-            .query_as(
-                "SELECT mi.parent_id, mi.series_id, mi.id
-                 FROM media_sources ms
-                 JOIN media_items mi ON mi.id = ms.item_id
-                 WHERE ms.filesystem_entry_id = ?",
-            )
-            .bind(filesystem_entry_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some((season_id, series_id, episode_id)) = hierarchy else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(());
-        };
-
-        let identities = [
-            (series_id, series_identity),
-            (season_id, season_identity),
-            (Some(episode_id), episode_identity),
-        ];
-        for (item_id, identity_key) in identities {
-            let Some(item_id) = item_id else {
-                continue;
-            };
-            let identity_taken: Option<String> = self
-                .query_scalar(
-                    "SELECT id FROM media_items
-                     WHERE identity_key = ? AND id <> ?
-                     LIMIT 1",
-                )
-                .bind(identity_key)
-                .bind(&item_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            if identity_taken.is_some() {
-                continue;
-            }
-            self.query(
-                "UPDATE media_items
-                 SET identity_key = ?
-                 WHERE id = ?
-                   AND (identity_key IS NULL OR identity_key LIKE 'legacy:%')",
-            )
-            .bind(identity_key)
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(())
-    }
-
     pub(crate) async fn list_filesystem_entries_for_paths(
         &self,
         library_root_id: &str,
@@ -4504,6 +4552,113 @@ impl Database {
             }
         }
         Ok(entries)
+    }
+
+    pub(crate) async fn find_filesystem_entry_by_inode(
+        &self,
+        library_id: &str,
+        target_root_id: &str,
+        inode: i64,
+        relative_path: &str,
+    ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
+                 FROM filesystem_entries fe
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                 WHERE lr.library_id = ? AND fe.inode = ?
+                   AND NOT (fe.library_root_id = ? AND fe.relative_path = ?)
+                 LIMIT 2",
+            )
+            .bind(library_id)
+            .bind(inode)
+            .bind(target_root_id)
+            .bind(relative_path)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+        Ok(rows.into_iter().next().map(stored_filesystem_entry))
+    }
+
+    pub(crate) async fn list_episode_identity_repair_candidates(
+        &self,
+    ) -> Result<Vec<StoredEpisodeIdentityCandidate>, StorageError> {
+        self.query(
+            "SELECT DISTINCT ms.item_id, fe.id, fe.library_root_id, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN media_items episode ON episode.id = ms.item_id
+             WHERE episode.item_type = 'EPISODE' AND fe.is_missing = 0
+             ORDER BY fe.library_root_id, fe.relative_path, ms.item_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredEpisodeIdentityCandidate {
+                    episode_id: row.get("item_id"),
+                    filesystem_entry_id: row.get("id"),
+                    library_root_id: row.get("library_root_id"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn move_filesystem_entry(
+        &self,
+        entry: FilesystemEntryMove<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE filesystem_entries
+             SET library_root_id = ?, relative_path = ?, size = ?, modified_at = ?, inode = ?,
+                 fingerprint = ?, last_seen_generation = ?, is_missing = 0,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(entry.library_root_id)
+        .bind(entry.relative_path)
+        .bind(entry.size)
+        .bind(entry.modified_at)
+        .bind(entry.inode)
+        .bind(entry.fingerprint)
+        .bind(entry.generation)
+        .bind(entry.entry_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_filesystem_entry_inode(
+        &self,
+        entry_id: &str,
+        inode: Option<i64>,
+    ) -> Result<(), StorageError> {
+        self.query("UPDATE filesystem_entries SET inode = ?, updated_at = unixepoch() WHERE id = ?")
+            .bind(inode)
+            .bind(entry_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_existing_filesystem_paths(
@@ -4954,8 +5109,8 @@ impl Database {
         self.query(
             "INSERT INTO filesystem_entries (
                 id, library_root_id, relative_path, entry_kind, size,
-                modified_at, fingerprint, last_seen_generation, is_missing
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                modified_at, inode, fingerprint, last_seen_generation, is_missing
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         )
         .bind(entry.id)
         .bind(entry.library_root_id)
@@ -4963,6 +5118,7 @@ impl Database {
         .bind(entry.entry_kind)
         .bind(entry.size)
         .bind(entry.modified_at)
+        .bind(entry.inode)
         .bind(entry.fingerprint)
         .bind(entry.last_seen_generation)
         .execute(&self.pool)
@@ -5164,14 +5320,15 @@ impl Database {
             self.query(
                 "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, fingerprint, last_seen_generation, is_missing
-                ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, 0)",
+                    modified_at, inode, fingerprint, last_seen_generation, is_missing
+                ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)",
             )
             .bind(&file.filesystem_entry_id)
             .bind(library_root_id)
             .bind(&file.relative_path)
             .bind(file.size)
             .bind(file.modified_at)
+            .bind(Option::<i64>::None)
             .bind(&file.fingerprint)
             .bind(generation)
             .execute(&mut *transaction)
@@ -5339,6 +5496,40 @@ impl Database {
             })
     }
 
+    pub(crate) async fn movie_metadata_identity_conflicts(
+        &self,
+        item_id: &str,
+        sort_title: &str,
+        production_year: i64,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar::<i64>(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM media_items current_item
+                 JOIN media_items conflicting_item
+                   ON conflicting_item.library_id = current_item.library_id
+                  AND conflicting_item.id <> current_item.id
+                  AND conflicting_item.item_type = 'MOVIE'
+                  AND conflicting_item.sort_title = ?
+                  AND conflicting_item.production_year = ?
+                  AND conflicting_item.removed_at IS NULL
+                 WHERE current_item.id = ?
+                   AND current_item.item_type = 'MOVIE'
+                   AND current_item.removed_at IS NULL
+             )",
+        )
+        .bind(sort_title)
+        .bind(production_year)
+        .bind(item_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_media_item_by_identity(
         &self,
         identity_key: &str,
@@ -5352,6 +5543,163 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn adopt_media_item_identity(
+        &self,
+        item_id: &str,
+        identity_key: &str,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let occupied = self
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM media_items
+                 WHERE identity_key = ? AND id <> ?",
+            )
+            .bind(identity_key)
+            .bind(item_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if occupied != 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        self.query(
+            "UPDATE media_items
+             SET identity_key = ?, removed_at = NULL
+             WHERE id = ?",
+        )
+        .bind(identity_key)
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    pub(crate) async fn repair_episode_hierarchy_identities(
+        &self,
+        episode_id: &str,
+        series_identity: &str,
+        season_identity: &str,
+        episode_identity: &str,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let hierarchy = self
+            .query_as::<(String, String, String)>(
+                "SELECT episode.id, season.id, series.id
+                 FROM media_items episode
+                 JOIN media_items season
+                   ON season.id = episode.parent_id AND season.item_type = 'SEASON'
+                 JOIN media_items series
+                   ON series.id = episode.series_id AND series.item_type = 'SERIES'
+                 WHERE episode.id = ? AND episode.item_type = 'EPISODE'",
+            )
+            .bind(episode_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((episode_id, season_id, series_id)) = hierarchy else {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        };
+
+        let conflicts = self
+            .query_scalar::<i64>(
+                "SELECT COUNT(*)
+                 FROM media_items
+                 WHERE identity_key IN (?, ?, ?)
+                   AND id NOT IN (?, ?, ?)",
+            )
+            .bind(series_identity)
+            .bind(season_identity)
+            .bind(episode_identity)
+            .bind(&series_id)
+            .bind(&season_id)
+            .bind(&episode_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if conflicts != 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+
+        for (item_id, identity_key) in [
+            (&series_id, series_identity),
+            (&season_id, season_identity),
+            (&episode_id, episode_identity),
+        ] {
+            self.query("UPDATE media_items SET identity_key = ?, removed_at = NULL WHERE id = ?")
+                .bind(identity_key)
+                .bind(item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
     }
 
     pub(crate) async fn find_media_item_metadata(
@@ -10293,6 +10641,36 @@ impl Database {
             })
     }
 
+    pub(crate) async fn identity_stability_repair_completed(&self) -> Result<bool, StorageError> {
+        self.query_scalar::<String>(
+            "SELECT value FROM lux_meta WHERE key = 'identity_stability_repair_v1'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value| value.as_deref() == Some("completed"))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_identity_stability_repair_completed(
+        &self,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO lux_meta (key, value)
+             VALUES ('identity_stability_repair_v1', 'completed')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     /// Verifies that SQLite can commit a real write transaction.
     ///
     /// The probe only changes a reserved metadata key and never touches
@@ -10367,6 +10745,217 @@ impl Database {
             sql,
         )))
     }
+}
+
+async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<(), StorageError> {
+    let mut connection = pool.acquire().await.map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let has_legacy_unique = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM sqlite_master
+             WHERE type = 'table'
+               AND name = 'media_items'
+               AND sql LIKE '%UNIQUE (library_id, sort_title, production_year)%'
+         )",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if has_legacy_unique == 0 {
+        return Ok(());
+    }
+
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let migration_result = async {
+        let mut transaction = connection
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let statements = [
+            "DROP TRIGGER IF EXISTS media_items_search_ai",
+            "DROP TRIGGER IF EXISTS media_items_search_au",
+            "DROP TRIGGER IF EXISTS media_items_search_ad",
+            "DROP TRIGGER IF EXISTS trg_media_sources_availability_insert",
+            "DROP TRIGGER IF EXISTS trg_media_sources_availability_update",
+            "DROP TRIGGER IF EXISTS trg_media_sources_availability_delete",
+            "DROP TRIGGER IF EXISTS trg_filesystem_entries_availability_update",
+            "CREATE TABLE media_items_new (
+                id TEXT PRIMARY KEY NOT NULL,
+                library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+                item_type TEXT NOT NULL CHECK (item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'BOX_SET', 'FOLDER', 'UNRESOLVED')),
+                parent_id TEXT,
+                series_id TEXT,
+                season_number INTEGER,
+                episode_number INTEGER,
+                absolute_number INTEGER,
+                title TEXT NOT NULL,
+                sort_title TEXT NOT NULL,
+                original_title TEXT,
+                overview TEXT,
+                production_year INTEGER,
+                premiere_date TEXT,
+                runtime_ticks INTEGER,
+                provider_ids_json TEXT,
+                metadata_provenance_json TEXT,
+                locked_fields_json TEXT,
+                identification_status TEXT NOT NULL CHECK (identification_status IN ('LOCAL_CONFIRMED', 'ONLINE_CONFIRMED', 'PENDING', 'FAILED')),
+                added_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                removed_at INTEGER,
+                metadata_fingerprint BLOB,
+                identity_key TEXT,
+                rating REAL,
+                rating_source TEXT,
+                last_air_date TEXT,
+                status TEXT,
+                original_language TEXT,
+                has_available_source INTEGER NOT NULL DEFAULT 0 CHECK (has_available_source IN (0, 1)),
+                thumbnail_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (thumbnail_fallback_required IN (0, 1)),
+                nfo_metadata_json TEXT,
+                nfo_metadata_fingerprint BLOB
+            )",
+            "INSERT INTO media_items_new (
+                id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+                absolute_number, title, sort_title, original_title, overview, production_year,
+                premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
+                locked_fields_json, identification_status, added_at, removed_at,
+                metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
+                original_language, has_available_source, thumbnail_fallback_required,
+                nfo_metadata_json, nfo_metadata_fingerprint
+             )
+             SELECT
+                id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+                absolute_number, title, sort_title, original_title, overview, production_year,
+                premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
+                locked_fields_json, identification_status, added_at, removed_at,
+                metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
+                original_language, has_available_source, thumbnail_fallback_required,
+                nfo_metadata_json, nfo_metadata_fingerprint
+             FROM media_items",
+            "DROP TABLE media_items",
+            "ALTER TABLE media_items_new RENAME TO media_items",
+            "CREATE INDEX idx_media_items_library_sort ON media_items(library_id, sort_title, id)",
+            "CREATE UNIQUE INDEX idx_media_items_identity_key
+             ON media_items(identity_key)
+             WHERE identity_key IS NOT NULL",
+            "CREATE INDEX idx_media_items_parent_removed
+             ON media_items(parent_id, removed_at)",
+            "CREATE INDEX idx_media_items_series_removed
+             ON media_items(series_id, removed_at)",
+            "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
+                INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
+                VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
+                        COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.id), ''));
+            END",
+            "CREATE TRIGGER media_items_search_au AFTER UPDATE OF title, sort_title, original_title ON media_items BEGIN
+                DELETE FROM media_search WHERE item_id = OLD.id;
+                INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
+                VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
+                        COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.id), ''));
+            END",
+            "CREATE TRIGGER media_items_search_ad AFTER DELETE ON media_items BEGIN
+                DELETE FROM media_search WHERE item_id = OLD.id;
+            END",
+            "CREATE TRIGGER trg_media_sources_availability_insert
+             AFTER INSERT ON media_sources
+             BEGIN
+                 UPDATE media_items
+                 SET has_available_source = 1
+                 WHERE id = NEW.item_id
+                   AND EXISTS (
+                       SELECT 1
+                       FROM filesystem_entries
+                       WHERE id = NEW.filesystem_entry_id
+                         AND is_missing = 0
+                   );
+             END",
+            "CREATE TRIGGER trg_media_sources_availability_update
+             AFTER UPDATE OF item_id, filesystem_entry_id ON media_sources
+             BEGIN
+                 UPDATE media_items
+                 SET has_available_source = EXISTS (
+                     SELECT 1
+                     FROM media_sources ms
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE ms.item_id = media_items.id
+                       AND fe.is_missing = 0
+                 )
+                 WHERE id IN (OLD.item_id, NEW.item_id);
+             END",
+            "CREATE TRIGGER trg_media_sources_availability_delete
+             AFTER DELETE ON media_sources
+             BEGIN
+                 UPDATE media_items
+                 SET has_available_source = EXISTS (
+                     SELECT 1
+                     FROM media_sources ms
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE ms.item_id = media_items.id
+                       AND fe.is_missing = 0
+                 )
+                 WHERE id = OLD.item_id;
+             END",
+            "CREATE TRIGGER trg_filesystem_entries_availability_update
+             AFTER UPDATE OF is_missing ON filesystem_entries
+             BEGIN
+                 UPDATE media_items
+                 SET has_available_source = EXISTS (
+                     SELECT 1
+                     FROM media_sources ms
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE ms.item_id = media_items.id
+                       AND fe.is_missing = 0
+                 )
+                 WHERE id IN (
+                     SELECT item_id
+                     FROM media_sources
+                     WHERE filesystem_entry_id = NEW.id
+                 );
+             END",
+        ];
+        for statement in statements {
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok::<(), StorageError>(())
+    }
+    .await;
+
+    let foreign_keys_result = sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *connection)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.to_path_buf(),
+            source,
+        });
+    migration_result.and(foreign_keys_result.map(|_| ()))
 }
 
 async fn validate_postgres_schema(pool: &AnyPool) -> Result<(), StorageError> {
@@ -10581,6 +11170,7 @@ pub(crate) struct StoredScanJob {
     pub(crate) total_count: i64,
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
+    pub(crate) finished_at: Option<i64>,
     pub(crate) discovery_completed: bool,
     pub(crate) auto_metadata_match: bool,
 }
@@ -10664,6 +11254,7 @@ fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
         total_count: row.get("total_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
+        finished_at: row.get("finished_at"),
         discovery_completed: row.get::<i64, _>("discovery_completed") != 0,
         auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
     }
@@ -10755,6 +11346,14 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) item_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredEpisodeIdentityCandidate {
+    pub(crate) episode_id: String,
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
 }
 
 fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
@@ -10850,6 +11449,7 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) mode: String,
     pub(crate) cancel_requested: bool,
     pub(crate) library_id: Option<String>,
+    pub(crate) pending_count: i64,
 }
 
 #[derive(Debug)]
@@ -10876,6 +11476,7 @@ fn stored_metadata_reidentify_job(row: sqlx::any::AnyRow) -> StoredMetadataReide
         mode: row.get("mode"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         library_id: row.get("library_id"),
+        pending_count: row.get("pending_count"),
     }
 }
 
@@ -11122,6 +11723,7 @@ fn catalog_filter_where_clause<'a>(
     let years = filter.years;
     let is_played = filter.is_played;
     let is_favorite = filter.is_favorite;
+    let metadata_pending = filter.metadata_pending;
     let mut where_clause = format!(
         "WHERE mi.removed_at IS NULL
          AND mi.library_id IN ({})",
@@ -11235,6 +11837,15 @@ fn catalog_filter_where_clause<'a>(
         binds.push(CatalogBind::Text(user_id));
         binds.push(CatalogBind::Integer(i64::from(is_favorite)));
     }
+    if metadata_pending {
+        where_clause.push_str(
+            " AND EXISTS (
+                SELECT 1 FROM metadata_candidates pending_metadata
+                WHERE pending_metadata.item_id = mi.id
+                  AND pending_metadata.status = 'PENDING'
+            )",
+        );
+    }
     (where_clause, binds)
 }
 
@@ -11331,6 +11942,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
+    pub(crate) metadata_pending: bool,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
     pub(crate) offset: i64,
@@ -11740,8 +12352,20 @@ pub(crate) struct NewFilesystemEntry<'a> {
     pub(crate) entry_kind: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) last_seen_generation: &'a str,
+}
+
+pub(crate) struct FilesystemEntryMove<'a> {
+    pub(crate) entry_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: &'a [u8],
+    pub(crate) generation: &'a str,
 }
 
 pub(crate) struct NewMediaItem<'a> {
@@ -11867,6 +12491,18 @@ pub enum StorageError {
         source: MigrateError,
     },
     LastManager,
+}
+
+impl StorageError {
+    pub(crate) fn is_unique_violation(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlx { source, .. }
+                if source
+                    .as_database_error()
+                    .is_some_and(|error| error.is_unique_violation())
+        )
+    }
 }
 
 impl std::fmt::Display for StorageError {
@@ -12002,6 +12638,7 @@ mod tests {
                 years: &empty_years,
                 is_played: None,
                 is_favorite: None,
+                metadata_pending: false,
                 sort_by,
                 descending,
                 offset: 0,

@@ -899,10 +899,12 @@ async fn prepare_fixture(with_local_nfo: bool) -> Result<Fixture, Box<dyn std::e
             .enrich_movie_library(library.id)
             .await?;
     }
-    let item_id: String =
-        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type <> 'FOLDER' LIMIT 1")
-            .fetch_one(database.pool())
-            .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
     Ok(Fixture {
         _temp_dir: temp_dir,
         config,

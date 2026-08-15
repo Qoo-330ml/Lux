@@ -97,6 +97,7 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
     assert_eq!(jobs.status(), reqwest::StatusCode::OK);
     let jobs_body = jobs.json::<Value>().await?;
     assert_eq!(jobs_body["jobs"].as_array().map(Vec::len), Some(1));
+    assert!(jobs_body["jobs"][0]["finishedAt"].is_null());
     let job_id = jobs_body["jobs"][0]["id"]
         .as_str()
         .ok_or("missing job id")?;

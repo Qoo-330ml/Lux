@@ -23,6 +23,7 @@ pub struct CatalogFilter {
     pub years: Vec<i64>,
     pub is_played: Option<bool>,
     pub is_favorite: Option<bool>,
+    pub metadata_pending: bool,
     pub sort_by: CatalogSort,
     pub descending: bool,
 }
@@ -136,6 +137,7 @@ impl CatalogService {
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
+            metadata_pending: filter.metadata_pending,
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
@@ -177,6 +179,7 @@ impl CatalogService {
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
+            metadata_pending: filter.metadata_pending,
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
@@ -354,6 +357,17 @@ impl CatalogService {
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
+        self.list_continue_watching_for_library_ids(&library_ids, user_id, offset, limit)
+            .await
+    }
+
+    pub(crate) async fn list_continue_watching_for_library_ids(
+        &self,
+        library_ids: &[String],
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
         let played_percent = self.database.user_played_percent(user_id).await?;
         let (_, minimum_ticks) = self.database.resume_settings().await?;
         let item_types = ["MOVIE", "EPISODE"];
@@ -361,7 +375,7 @@ impl CatalogService {
             .database
             .count_resume_items(
                 user_id,
-                &library_ids,
+                library_ids,
                 &item_types,
                 played_percent,
                 minimum_ticks,
@@ -371,7 +385,7 @@ impl CatalogService {
             .database
             .list_resume_items(&ResumeItemsQuery {
                 user_id,
-                library_ids: &library_ids,
+                library_ids,
                 item_types: &item_types,
                 played_percent,
                 minimum_ticks,
@@ -420,9 +434,19 @@ impl CatalogService {
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
+        self.list_recently_added_for_library_ids(&library_ids, offset, limit)
+            .await
+    }
+
+    pub(crate) async fn list_recently_added_for_library_ids(
+        &self,
+        library_ids: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
         let (item_ids, total) = self
             .database
-            .list_recent_catalog_item_ids(&library_ids, offset, limit)
+            .list_recent_catalog_item_ids(library_ids, offset, limit)
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
         let mut items = assemble_items(rows);
@@ -447,9 +471,18 @@ impl CatalogService {
         limit: i64,
     ) -> Result<Vec<(String, Vec<CatalogItem>)>, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
+        self.list_recently_added_by_library_ids(&library_ids, limit)
+            .await
+    }
+
+    pub(crate) async fn list_recently_added_by_library_ids(
+        &self,
+        library_ids: &[String],
+        limit: i64,
+    ) -> Result<Vec<(String, Vec<CatalogItem>)>, CatalogError> {
         let rows = self
             .database
-            .list_recent_catalog_rows_by_library(&library_ids, limit)
+            .list_recent_catalog_rows_by_library(library_ids, limit)
             .await?;
         let mut items = assemble_items(rows);
         self.populate_episode_counts(&mut items).await?;
@@ -470,9 +503,19 @@ impl CatalogService {
         limit: i64,
     ) -> Result<Vec<CatalogItem>, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
+        self.list_recommended_for_library_ids(&library_ids, user_id, limit)
+            .await
+    }
+
+    pub(crate) async fn list_recommended_for_library_ids(
+        &self,
+        library_ids: &[String],
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<CatalogItem>, CatalogError> {
         let rows = self
             .database
-            .list_recommended_catalog_rows(user_id, &library_ids, 0, RECOMMENDATION_CANDIDATE_POOL)
+            .list_recommended_catalog_rows(user_id, library_ids, 0, RECOMMENDATION_CANDIDATE_POOL)
             .await?;
         let mut items = assemble_items(rows);
         self.populate_episode_counts(&mut items).await?;

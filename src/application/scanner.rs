@@ -35,8 +35,9 @@ use crate::{
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     observability::resources::ResourceMetrics,
     storage::{
-        Database, NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource, NewMovieFile,
-        NewScanJobEvent, StorageError, StoredFilesystemEntry, StoredLibraryRoot,
+        Database, FilesystemEntryMove, NewFilesystemEntry, NewHierarchyItem, NewMediaItem,
+        NewMediaSource, NewMovieFile, NewScanJobEvent, StorageError,
+        StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
     },
 };
@@ -51,6 +52,71 @@ pub struct LibraryScanner {
 impl LibraryScanner {
     pub fn new(database: Database) -> Self {
         Self { database }
+    }
+
+    pub async fn repair_legacy_identity_keys(&self) -> Result<usize, ScannerError> {
+        if self.database.identity_stability_repair_completed().await? {
+            return Ok(0);
+        }
+        let candidates = self
+            .database
+            .list_episode_identity_repair_candidates()
+            .await?;
+        let mut repaired = 0;
+        for candidate in candidates {
+            if self.repair_identity_candidate(candidate).await? {
+                repaired += 1;
+            }
+        }
+        self.database
+            .mark_identity_stability_repair_completed()
+            .await?;
+        Ok(repaired)
+    }
+
+    async fn repair_identity_candidate(
+        &self,
+        candidate: StoredEpisodeIdentityCandidate,
+    ) -> Result<bool, ScannerError> {
+        let Some(root) = self
+            .database
+            .find_library_root(&candidate.library_root_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let Some(file_name) = Path::new(&candidate.relative_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+        else {
+            return Ok(false);
+        };
+        let Some(parsed) = parse_episode_filename(file_name) else {
+            return Ok(false);
+        };
+        if let Ok(metadata) =
+            fs::metadata(Path::new(&root.canonical_path).join(&candidate.relative_path)).await
+        {
+            let (_, inode) = file_identity(&metadata);
+            if let Some(inode) = inode.and_then(|value| i64::try_from(value).ok()) {
+                self.database
+                    .update_filesystem_entry_inode(&candidate.filesystem_entry_id, Some(inode))
+                    .await?;
+            }
+        }
+        let hierarchy = episode_hierarchy(&candidate.relative_path, &parsed);
+        let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
+        let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
+        let episode_identity = Self::episode_identity_key(&root, &hierarchy, &parsed);
+        self.database
+            .repair_episode_hierarchy_identities(
+                &candidate.episode_id,
+                &series_identity,
+                &season_identity,
+                &episode_identity,
+            )
+            .await
+            .map_err(ScannerError::from)
     }
 
     pub async fn scan_movie_library(
@@ -371,14 +437,50 @@ impl LibraryScanner {
             .database
             .find_filesystem_entry(&root.id, &relative_path)
             .await?;
+        let mut existing_entry = existing_entry;
+        let inode = inode.and_then(|value| i64::try_from(value).ok());
+        if existing_entry.is_none()
+            && let Some(inode) = inode
+            && let Some(entry) = self
+                .database
+                .find_filesystem_entry_by_inode(library_id_text, &root.id, inode, &relative_path)
+                .await?
+        {
+            self.database
+                .move_filesystem_entry(FilesystemEntryMove {
+                    entry_id: &entry.id,
+                    library_root_id: &root.id,
+                    relative_path: &relative_path,
+                    size,
+                    modified_at,
+                    inode: Some(inode),
+                    fingerprint: &fingerprint,
+                    generation,
+                })
+                .await?;
+            existing_entry = Some(entry);
+        }
         let hierarchy = episode_hierarchy(&relative_path, &parsed);
         let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
         let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
         let episode_identity = Self::episode_identity_key(root, &hierarchy, &parsed);
-        if let Some(existing_entry) = existing_entry.as_ref() {
+        let current_identity_item = if existing_entry.is_some() {
             self.database
-                .repair_legacy_episode_identity(
-                    &existing_entry.id,
+                .find_media_item_by_identity(&episode_identity)
+                .await?
+        } else {
+            None
+        };
+        if let Some(existing_item_id) = existing_entry
+            .as_ref()
+            .and_then(|entry| entry.item_id.as_deref())
+            && current_identity_item
+                .as_ref()
+                .is_none_or(|item| item.id.as_str() != existing_item_id)
+        {
+            self.database
+                .repair_episode_hierarchy_identities(
+                    existing_item_id,
                     &series_identity,
                     &season_identity,
                     &episode_identity,
@@ -389,15 +491,12 @@ impl LibraryScanner {
             .as_ref()
             .is_some_and(|entry| entry.fingerprint.as_deref() == Some(fingerprint.as_slice()));
         let episode_is_current = if fingerprint_unchanged {
-            self.database
-                .find_media_item_by_identity(&episode_identity)
-                .await?
-                .is_some_and(|item| {
-                    existing_entry
-                        .as_ref()
-                        .and_then(|entry| entry.item_id.as_deref())
-                        == Some(item.id.as_str())
-                })
+            current_identity_item.as_ref().is_some_and(|item| {
+                existing_entry
+                    .as_ref()
+                    .and_then(|entry| entry.item_id.as_deref())
+                    == Some(item.id.as_str())
+            })
         } else {
             false
         };
@@ -414,6 +513,9 @@ impl LibraryScanner {
             self.database
                 .mark_filesystem_entry_seen(&existing_entry.id, generation)
                 .await?;
+            self.database
+                .update_filesystem_entry_inode(&existing_entry.id, inode)
+                .await?;
             return Ok(ScanReport {
                 discovered_files: 1,
                 skipped_files: 1,
@@ -422,7 +524,7 @@ impl LibraryScanner {
         }
 
         let ensured = self
-            .ensure_episode_hierarchy(library_id_text, root, &parsed, &hierarchy)
+            .ensure_episode_hierarchy(library_id_text, root, &relative_path, &parsed, &hierarchy)
             .await?;
         if let Some(existing_entry) = existing_entry {
             let hierarchy_changed = self
@@ -449,6 +551,9 @@ impl LibraryScanner {
                 self.database
                     .mark_filesystem_entry_seen(&existing_entry.id, generation)
                     .await?;
+                self.database
+                    .update_filesystem_entry_inode(&existing_entry.id, inode)
+                    .await?;
                 return Ok(ScanReport {
                     discovered_files: 1,
                     created_items: ensured.created_items,
@@ -465,6 +570,9 @@ impl LibraryScanner {
                     &fingerprint,
                     generation,
                 )
+                .await?;
+            self.database
+                .update_filesystem_entry_inode(&existing_entry.id, inode)
                 .await?;
             self.database
                 .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
@@ -495,6 +603,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
+                inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
             })
@@ -670,6 +779,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
+                inode: inode.and_then(|value| i64::try_from(value).ok()),
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
             })
@@ -706,11 +816,33 @@ impl LibraryScanner {
     async fn ensure_hierarchy_item(
         &self,
         item: NewHierarchyItem<'_>,
+        legacy_identity: Option<&str>,
     ) -> Result<(String, bool), ScannerError> {
         if let Some(existing) = self
             .database
             .find_media_item_by_identity(item.identity_key)
             .await?
+        {
+            self.database
+                .update_unconfirmed_hierarchy_item(
+                    &existing.id,
+                    item.title,
+                    item.sort_title,
+                    item.original_title,
+                    item.production_year,
+                )
+                .await?;
+            return Ok((existing.id, false));
+        }
+        if let Some(legacy_identity) = legacy_identity
+            && let Some(existing) = self
+                .database
+                .find_media_item_by_identity(legacy_identity)
+                .await?
+            && self
+                .database
+                .adopt_media_item_identity(&existing.id, item.identity_key)
+                .await?
         {
             self.database
                 .update_unconfirmed_hierarchy_item(
@@ -748,29 +880,34 @@ impl LibraryScanner {
         &self,
         library_id_text: &str,
         root: &StoredLibraryRoot,
+        relative_path: &str,
         parsed: &ParsedEpisodeFilename,
         hierarchy: &EpisodeHierarchy,
     ) -> Result<EnsuredEpisodeHierarchy, ScannerError> {
         let series_sort_title = hierarchy.series_title.to_lowercase();
         let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
+        let legacy_series_identity = legacy_series_identity(root, hierarchy);
         let series_new_id = ItemId::new().to_string();
         let (series_id, series_created) = self
-            .ensure_hierarchy_item(NewHierarchyItem {
-                id: &series_new_id,
-                library_id: library_id_text,
-                item_type: "SERIES",
-                parent_id: None,
-                series_id: None,
-                season_number: None,
-                episode_number: None,
-                absolute_number: None,
-                title: &hierarchy.series_title,
-                sort_title: &series_sort_title,
-                original_title: Some(&hierarchy.series_title),
-                production_year: hierarchy.production_year.map(i64::from),
-                identification_status: "PENDING",
-                identity_key: &series_identity,
-            })
+            .ensure_hierarchy_item(
+                NewHierarchyItem {
+                    id: &series_new_id,
+                    library_id: library_id_text,
+                    item_type: "SERIES",
+                    parent_id: None,
+                    series_id: None,
+                    season_number: None,
+                    episode_number: None,
+                    absolute_number: None,
+                    title: &hierarchy.series_title,
+                    sort_title: &series_sort_title,
+                    original_title: Some(&hierarchy.series_title),
+                    production_year: hierarchy.production_year.map(i64::from),
+                    identification_status: "PENDING",
+                    identity_key: &series_identity,
+                },
+                legacy_series_identity.as_deref(),
+            )
             .await?;
         let season_title = if hierarchy.season_number == 0 {
             "Specials".to_owned()
@@ -780,45 +917,55 @@ impl LibraryScanner {
         let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
         let season_sort_title = season_title.to_lowercase();
         let season_new_id = ItemId::new().to_string();
+        let legacy_season_identity = legacy_series_identity
+            .as_deref()
+            .map(|identity| format!("{identity}:season:{}", hierarchy.season_number));
         let (season_id, season_created) = self
-            .ensure_hierarchy_item(NewHierarchyItem {
-                id: &season_new_id,
-                library_id: library_id_text,
-                item_type: "SEASON",
-                parent_id: Some(&series_id),
-                series_id: Some(&series_id),
-                season_number: Some(i64::from(hierarchy.season_number)),
-                episode_number: None,
-                absolute_number: None,
-                title: &season_title,
-                sort_title: &season_sort_title,
-                original_title: Some(&season_title),
-                production_year: None,
-                identification_status: "PENDING",
-                identity_key: &season_identity,
-            })
+            .ensure_hierarchy_item(
+                NewHierarchyItem {
+                    id: &season_new_id,
+                    library_id: library_id_text,
+                    item_type: "SEASON",
+                    parent_id: Some(&series_id),
+                    series_id: Some(&series_id),
+                    season_number: Some(i64::from(hierarchy.season_number)),
+                    episode_number: None,
+                    absolute_number: None,
+                    title: &season_title,
+                    sort_title: &season_sort_title,
+                    original_title: Some(&season_title),
+                    production_year: None,
+                    identification_status: "PENDING",
+                    identity_key: &season_identity,
+                },
+                legacy_season_identity.as_deref(),
+            )
             .await?;
         let episode_identity = Self::episode_identity_key(root, hierarchy, parsed);
         let episode_title = parsed.title.clone();
         let episode_sort_title = episode_title.to_lowercase();
         let episode_new_id = ItemId::new().to_string();
+        let legacy_episode_identity = format!("episode:{}:{}", root.id, relative_path);
         let (episode_id, episode_created) = self
-            .ensure_hierarchy_item(NewHierarchyItem {
-                id: &episode_new_id,
-                library_id: library_id_text,
-                item_type: "EPISODE",
-                parent_id: Some(&season_id),
-                series_id: Some(&series_id),
-                season_number: Some(i64::from(hierarchy.season_number)),
-                episode_number: Some(i64::from(parsed.episode)),
-                absolute_number: parsed.absolute_number.map(i64::from),
-                title: &episode_title,
-                sort_title: &episode_sort_title,
-                original_title: Some(&episode_title),
-                production_year: None,
-                identification_status: "PENDING",
-                identity_key: &episode_identity,
-            })
+            .ensure_hierarchy_item(
+                NewHierarchyItem {
+                    id: &episode_new_id,
+                    library_id: library_id_text,
+                    item_type: "EPISODE",
+                    parent_id: Some(&season_id),
+                    series_id: Some(&series_id),
+                    season_number: Some(i64::from(hierarchy.season_number)),
+                    episode_number: Some(i64::from(parsed.episode)),
+                    absolute_number: parsed.absolute_number.map(i64::from),
+                    title: &episode_title,
+                    sort_title: &episode_sort_title,
+                    original_title: Some(&episode_title),
+                    production_year: None,
+                    identification_status: "PENDING",
+                    identity_key: &episode_identity,
+                },
+                Some(&legacy_episode_identity),
+            )
             .await?;
         Ok(EnsuredEpisodeHierarchy {
             episode_id,
@@ -1261,6 +1408,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
+                inode: inode.and_then(|value| i64::try_from(value).ok()),
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
             })
@@ -1394,14 +1542,18 @@ impl ScanJobService {
         }
         let job = if let Some(active) = self
             .database
-            .find_active_scan_job(&library_id_text, "INCREMENTAL_SCAN")
+            .find_active_scan_job_for_library(&library_id_text)
             .await?
         {
+            if active.job_type != "INCREMENTAL_SCAN" {
+                return Err(ScanJobError::AlreadyActive(active.id));
+            }
             active
         } else {
             let id = Uuid::now_v7().to_string();
             let generation = Uuid::now_v7().to_string();
-            self.database
+            if let Err(error) = self
+                .database
                 .create_scan_job(
                     &id,
                     &library_id_text,
@@ -1410,7 +1562,18 @@ impl ScanJobService {
                     0,
                     false,
                 )
-                .await?;
+                .await
+            {
+                if error.is_unique_violation()
+                    && let Some(active) = self
+                        .database
+                        .find_active_scan_job_for_library(&library_id_text)
+                        .await?
+                {
+                    return Err(ScanJobError::AlreadyActive(active.id));
+                }
+                return Err(error.into());
+            }
             self.database
                 .find_scan_job(&id)
                 .await?
@@ -1459,7 +1622,7 @@ impl ScanJobService {
         }
         if let Some(active) = self
             .database
-            .find_active_scan_job(&library_id_text, "RECONCILE_LIBRARY")
+            .find_active_scan_job_for_library(&library_id_text)
             .await?
         {
             return Err(ScanJobError::AlreadyActive(active.id));
@@ -1468,7 +1631,8 @@ impl ScanJobService {
         let id = Uuid::now_v7().to_string();
         let generation = Uuid::now_v7().to_string();
         let root_ids = roots.into_iter().map(|root| root.id).collect::<Vec<_>>();
-        self.database
+        if let Err(error) = self
+            .database
             .create_reconciliation_scan_job(
                 &id,
                 &library_id_text,
@@ -1476,7 +1640,18 @@ impl ScanJobService {
                 &root_ids,
                 auto_metadata_match,
             )
-            .await?;
+            .await
+        {
+            if error.is_unique_violation()
+                && let Some(active) = self
+                    .database
+                    .find_active_scan_job_for_library(&library_id_text)
+                    .await?
+            {
+                return Err(ScanJobError::AlreadyActive(active.id));
+            }
+            return Err(error.into());
+        }
         self.record_event(&id, "INFO", "JOB_CREATED", "任务已创建", "{}")
             .await;
         self.get_job(&id).await
@@ -2357,17 +2532,13 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
-        let scan_permit = self.acquire_scan_lock().await?;
+        let _scan_permit = self.acquire_scan_lock().await?;
         loop {
             let report = self.run_batch_unlocked(job_id, batch_size).await?;
             if !report.completed {
                 tokio::task::yield_now().await;
                 continue;
             }
-            // Keep different libraries' filesystem scans serialized, but release the
-            // global permit before potentially long post-scan work. Otherwise a completed
-            // movie scan can keep every queued library in PENDING for minutes or hours.
-            drop(scan_permit);
             if report.status == "COMPLETED" {
                 let completed_job = self
                     .database
@@ -2847,22 +3018,7 @@ impl ScanJobService {
     }
 
     pub async fn cancel(&self, job_id: &str) -> Result<(), ScanJobError> {
-        let Some(job) = self.database.find_scan_job(job_id).await? else {
-            return Err(ScanJobError::JobNotFound);
-        };
         self.database.request_scan_job_cancel(job_id).await?;
-        if job.status == "PENDING" {
-            if job.job_type == "RECONCILE_LIBRARY" {
-                self.database
-                    .clear_reconciliation_scan_entries(job_id)
-                    .await?;
-            }
-            self.database
-                .finish_scan_job(job_id, "CANCELLED", None)
-                .await?;
-            self.record_event(job_id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
-                .await;
-        }
         Ok(())
     }
 
@@ -2975,6 +3131,7 @@ pub struct ScanJob {
     pub total_count: i64,
     pub cancel_requested: bool,
     pub error: Option<String>,
+    pub finished_at: Option<i64>,
 }
 
 fn scan_job(job: StoredScanJob) -> ScanJob {
@@ -2989,6 +3146,7 @@ fn scan_job(job: StoredScanJob) -> ScanJob {
         total_count: job.total_count,
         cancel_requested: job.cancel_requested,
         error: job.error,
+        finished_at: job.finished_at,
     }
 }
 
@@ -3293,6 +3451,18 @@ fn episode_hierarchy(relative_path: &str, parsed: &ParsedEpisodeFilename) -> Epi
     }
 }
 
+fn legacy_series_identity(
+    root: &StoredLibraryRoot,
+    hierarchy: &EpisodeHierarchy,
+) -> Option<String> {
+    hierarchy
+        .series_path
+        .split('/')
+        .next()
+        .filter(|component| !component.is_empty())
+        .map(|component| format!("series:{}:{component}", root.id))
+}
+
 fn season_directory_number(components: &[&str]) -> Option<u32> {
     components
         .iter()
@@ -3438,7 +3608,7 @@ async fn discover_reconciliation_directory(
             path: path.clone(),
             source,
         })?;
-        if !(file_type.is_dir() || file_type.is_file() && is_supported_movie_file(&path)) {
+        if !(file_type.is_dir() || (file_type.is_file() && is_supported_movie_file(&path))) {
             continue;
         }
         let relative_path = path

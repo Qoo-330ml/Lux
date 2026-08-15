@@ -92,7 +92,6 @@ const api = {
   updateSettings(data) { return this.request("/api/v1/admin/settings", { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
   testNetworkProxy(networkProxyUrl) { return this.request("/api/v1/admin/settings/network-proxy/test", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(networkProxyUrl ? { networkProxyUrl } : {}) }); },
   logs() { return this.request("/api/v1/admin/logs?page=1&pageSize=50"); },
-  pendingMetadata() { return this.request("/api/v1/admin/metadata/pending?page=1&pageSize=50"); },
   startBatchReidentify(itemIds) { return this.request("/api/v1/admin/metadata/reidentify", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ itemIds }) }); },
   metadataReidentifyJob(id) { return this.request("/api/v1/admin/metadata/reidentify/" + encodeURIComponent(id)); },
   retryMetadataReidentify(id) { return this.request("/api/v1/admin/metadata/reidentify/" + encodeURIComponent(id), { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },

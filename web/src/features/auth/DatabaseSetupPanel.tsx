@@ -4,6 +4,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { DatabaseSetupInput, SetupDatabaseBackend } from "../../lib/api/types";
 import { LuxLogo } from "../../components/LuxLogo";
+import { LuxSelect } from "../../components/LuxSelect";
 
 type DatabaseSetupPanelProps = {
   onSelected: (restartRequired: boolean) => void;
@@ -80,7 +81,7 @@ export function DatabaseSetupPanel({ onSelected }: DatabaseSetupPanelProps) {
         <label htmlFor="setup-pg-database">数据库名<input id="setup-pg-database" value={postgres.database} onChange={(event) => updatePostgres("database", event.target.value)} required /></label>
         <label htmlFor="setup-pg-username">用户名<input id="setup-pg-username" value={postgres.username} onChange={(event) => updatePostgres("username", event.target.value)} required /></label>
         <label htmlFor="setup-pg-password">密码<input id="setup-pg-password" value={postgres.password} onChange={(event) => updatePostgres("password", event.target.value)} type="password" autoComplete="new-password" /></label>
-        <label htmlFor="setup-pg-ssl">SSL 模式<select id="setup-pg-ssl" value={postgres.sslMode} onChange={(event) => updatePostgres("sslMode", event.target.value)}>{sslModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label htmlFor="setup-pg-ssl">SSL 模式<LuxSelect id="setup-pg-ssl" value={postgres.sslMode} options={sslModes.map(([value, label]) => ({ value, label }))} onChange={(value) => updatePostgres("sslMode", value as typeof postgres.sslMode)} aria-label="SSL 模式" /></label>
       </div> : null}
       <div className="lux-setup-database-actions">
         <button className="lux-button lux-button-secondary" type="button" onClick={() => test.mutate()} disabled={test.isPending || select.isPending}>{test.isPending ? "正在测试…" : "测试连接"}</button>
