@@ -116,6 +116,15 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
         .await?;
     assert_eq!(settings.status(), reqwest::StatusCode::OK);
 
+    let audit = client
+        .get(format!("http://{address}/api/v1/admin/audit"))
+        .header("X-Lux-Api-Key", &key)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let audit_body = audit.json::<serde_json::Value>().await?;
+    assert_eq!(audit_body["events"][0]["metadata"]["auth"], "admin_api_key");
+
     let emby = client
         .get(format!("http://{address}/System/Info?api_key={key}"))
         .send()

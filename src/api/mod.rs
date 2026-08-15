@@ -12345,24 +12345,36 @@ async fn record_audit_event(
     target_id: Option<&str>,
     metadata_json: &str,
 ) {
-    let (Some(auth), Some(database), Some(session_token)) = (
-        state.auth.as_ref(),
-        state.database.as_ref(),
-        request_cookie(headers, "lux_session"),
-    ) else {
+    let Some(database) = state.database.as_ref() else {
         return;
     };
-    let Ok(Some(session)) = auth.resolve(&session_token).await else {
-        return;
+    let (actor_user_id, metadata_json) = if let Some(candidate) = lux_api_key_from_headers(headers)
+    {
+        let Some(service) = state.admin_api_key.as_ref() else {
+            return;
+        };
+        let Ok(Some(_)) = service.resolve(&candidate).await else {
+            return;
+        };
+        (None, audit_metadata_for_shared_api_key(metadata_json))
+    } else {
+        let (Some(auth), Some(session_token)) =
+            (state.auth.as_ref(), request_cookie(headers, "lux_session"))
+        else {
+            return;
+        };
+        let Ok(Some(session)) = auth.resolve(&session_token).await else {
+            return;
+        };
+        (Some(session.user.id.to_string()), metadata_json.to_owned())
     };
-    let actor_user_id = session.user.id.to_string();
     if database
         .insert_audit_event(crate::storage::NewAuditEvent {
-            actor_user_id: Some(&actor_user_id),
+            actor_user_id: actor_user_id.as_deref(),
             event_type,
             target_type,
             target_id,
-            metadata_json,
+            metadata_json: &metadata_json,
         })
         .await
         .is_ok()
@@ -12371,6 +12383,18 @@ async fn record_audit_event(
             .admin_events
             .publish(admin_event_scope_for_audit(event_type));
     }
+}
+
+fn audit_metadata_for_shared_api_key(metadata_json: &str) -> String {
+    let Ok(mut metadata) = serde_json::from_str::<Value>(metadata_json) else {
+        return "{\"auth\":\"admin_api_key\"}".to_owned();
+    };
+    if let Value::Object(object) = &mut metadata {
+        object.insert("auth".to_owned(), Value::String("admin_api_key".to_owned()));
+    } else {
+        metadata = json!({ "auth": "admin_api_key", "details": metadata });
+    }
+    serde_json::to_string(&metadata).unwrap_or_else(|_| "{\"auth\":\"admin_api_key\"}".to_owned())
 }
 
 fn admin_event_scope_for_audit(event_type: &str) -> AdminEventScope {
