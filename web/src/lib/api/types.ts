@@ -41,6 +41,11 @@ export type AuthSession = {
   serverName?: string | null;
 };
 
+export type AdminApiKey = {
+  configured: boolean;
+  apiKey?: string | null;
+};
+
 export type Library = {
   id: string;
   name: string;

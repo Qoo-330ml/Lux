@@ -90,6 +90,7 @@ use crate::{
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
+        admin_api_key::AdminApiKeyService,
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
     },
@@ -125,6 +126,7 @@ pub struct AppState {
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
     emby_auth: Option<EmbyAuthService>,
+    admin_api_key: Option<AdminApiKeyService>,
     libraries: Option<LibraryService>,
     catalog: Option<CatalogService>,
     images: Option<ImageService>,
@@ -279,6 +281,10 @@ impl AppState {
             setup: Some(setup),
             auth: Some(auth),
             emby_auth: Some(emby_auth),
+            admin_api_key: Some(AdminApiKeyService::new(
+                config_dir.clone(),
+                database.clone(),
+            )),
             libraries: Some(LibraryService::new(database.clone())),
             catalog: Some(CatalogService::new(database.clone(), access.clone())),
             images: Some(ImageService::new(
@@ -768,6 +774,11 @@ pub fn app_with_state(state: AppState) -> Router {
             get(admin_settings).patch(admin_update_settings),
         )
         .route(
+            "/api/v1/admin/api-key",
+            get(admin_get_api_key).delete(admin_revoke_api_key),
+        )
+        .route("/api/v1/admin/api-key/rotate", post(admin_rotate_api_key))
+        .route(
             "/api/v1/admin/settings/network-proxy/test",
             post(admin_test_network_proxy),
         )
@@ -877,6 +888,7 @@ pub fn app_with_state(state: AppState) -> Router {
             },
         ))
         .layer(middleware::from_fn(attach_peer_address))
+        .layer(middleware::from_fn(normalize_lux_api_key_query))
         .layer(middleware::from_fn(trace_emby_playback_callback))
         .layer(middleware::from_fn(trace_emby_playback_info))
         .layer(middleware::from_fn(trace_emby_media_stream_failure))
@@ -1615,7 +1627,7 @@ async fn require_emby_token(
     auth: &EmbyAuthService,
     state: &AppState,
 ) -> Result<(), StatusCode> {
-    let user = resolve_emby_user_with_auth(headers, query, auth).await?;
+    let user = resolve_emby_user_with_auth(headers, query, auth, state).await?;
     if state.remote_access.is_remote(
         header_str(headers, "x-lux-peer-ip"),
         header_str(headers, "x-forwarded-for"),
@@ -1630,10 +1642,18 @@ async fn resolve_emby_user_with_auth(
     headers: &HeaderMap,
     query: &EmbyTokenQuery,
     auth: &EmbyAuthService,
+    state: &AppState,
 ) -> Result<UserRecord, StatusCode> {
     let token = emby_token_from_headers(headers)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
+    if let Some(service) = state.admin_api_key.as_ref() {
+        match service.resolve(&token).await {
+            Ok(Some(user)) => return Ok(user),
+            Ok(None) => {}
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
     match auth.resolve_token(&token).await {
         Ok(Some(user)) => Ok(user),
         Ok(None) => Err(StatusCode::UNAUTHORIZED),
@@ -1643,10 +1663,16 @@ async fn resolve_emby_user_with_auth(
 
 fn emby_token_from_headers(headers: &HeaderMap) -> Option<String> {
     headers
-        .get("X-Emby-Token")
-        .or_else(|| headers.get("X-MediaBrowser-Token"))
+        .get("X-Lux-Api-Key")
         .and_then(|value| value.to_str().ok())
         .and_then(emby_token_header_value)
+        .or_else(|| {
+            headers
+                .get("X-Emby-Token")
+                .or_else(|| headers.get("X-MediaBrowser-Token"))
+                .and_then(|value| value.to_str().ok())
+                .and_then(emby_token_header_value)
+        })
         .or_else(|| {
             headers
                 .get("X-Emby-Authorization")
@@ -1747,7 +1773,7 @@ async fn require_emby_user_with_query(
     let Some(auth) = state.emby_auth.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let user = resolve_emby_user_with_auth(headers, query, auth).await?;
+    let user = resolve_emby_user_with_auth(headers, query, auth, state).await?;
     if state.remote_access.is_remote(
         header_str(headers, "x-lux-peer-ip"),
         header_str(headers, "x-forwarded-for"),
@@ -6282,61 +6308,16 @@ async fn auth_login(
 }
 
 async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
     };
-    let Some(session_token) = request_cookie(&headers, "lux_session") else {
-        return api_error(
-            &headers,
-            StatusCode::UNAUTHORIZED,
-            lux::ApiErrorCode::AuthenticationRequired,
-            "需要登录",
-        )
-        .into_response();
-    };
-    match auth.resolve(&session_token).await {
-        Ok(Some(session)) => {
-            if state.remote_access.is_remote(
-                header_str(&headers, "x-lux-peer-ip"),
-                header_str(&headers, "x-forwarded-for"),
-            ) && !session.user.can_remote_access
-            {
-                return api_error(
-                    &headers,
-                    StatusCode::FORBIDDEN,
-                    lux::ApiErrorCode::PermissionDenied,
-                    "当前账户不允许远程访问",
-                )
-                .into_response();
-            }
-            let server_name = current_emby_server_name(&state).await;
-            Json(json!({
-                "user": user_json(&session.user),
-                "serverName": server_name,
-            }))
-            .into_response()
-        }
-        Ok(None) => api_error(
-            &headers,
-            StatusCode::UNAUTHORIZED,
-            lux::ApiErrorCode::AuthenticationRequired,
-            "需要登录",
-        )
-        .into_response(),
-        Err(_) => api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "认证暂时不可用",
-        )
-        .into_response(),
-    }
+    let server_name = current_emby_server_name(&state).await;
+    Json(json!({
+        "user": user_json(&user),
+        "serverName": server_name,
+    }))
+    .into_response()
 }
 
 async fn auth_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -6680,6 +6661,32 @@ struct DirectoryBrowseQuery {
 }
 
 async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserRecord, Response> {
+    if lux_api_key_from_headers(headers).is_some() {
+        let user = resolve_shared_admin_api_key(headers, state).await?;
+        let Some(user) = user else {
+            return Err(api_error(
+                headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要有效的 API Key",
+            )
+            .into_response());
+        };
+        if state.remote_access.is_remote(
+            header_str(headers, "x-lux-peer-ip"),
+            header_str(headers, "x-forwarded-for"),
+        ) && !user.can_remote_access
+        {
+            return Err(api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "当前管理员不允许远程访问",
+            )
+            .into_response());
+        }
+        return Ok(user);
+    }
     let Some(auth) = state.auth.as_ref() else {
         return Err(api_error(
             headers,
@@ -6733,6 +6740,19 @@ async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserR
 }
 
 async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
+    if lux_api_key_from_headers(headers).is_some() {
+        let user = resolve_shared_admin_api_key(headers, state).await?;
+        if user.is_some() {
+            return Ok(());
+        }
+        return Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要有效的 API Key",
+        )
+        .into_response());
+    }
     let Some(auth) = state.auth.as_ref() else {
         return Err(api_error(
             headers,
@@ -9922,6 +9942,75 @@ fn validate_media_strategy(settings: &MediaStrategySettings) -> bool {
             .all(|value| valid_strategy_code(value, 32))
 }
 
+async fn admin_get_api_key(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin_web_session(&headers, &state, false).await {
+        return response;
+    }
+    let Some(service) = state.admin_api_key.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.current().await {
+        Ok(api_key) => Json(json!({
+            "configured": api_key.is_some(),
+            "apiKey": api_key,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_rotate_api_key(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin_web_session(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.admin_api_key.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.rotate().await {
+        Ok(api_key) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "ADMIN_API_KEY_ROTATED",
+                Some("admin_api_key"),
+                None,
+                "{}",
+            )
+            .await;
+            Json(json!({
+                "configured": true,
+                "apiKey": api_key,
+            }))
+            .into_response()
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_revoke_api_key(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin_web_session(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.admin_api_key.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.revoke().await {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "ADMIN_API_KEY_REVOKED",
+                Some("admin_api_key"),
+                None,
+                "{}",
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn admin_update_settings(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -12099,46 +12188,8 @@ async fn require_admin(
     state: &AppState,
     require_csrf: bool,
 ) -> Result<(), Response> {
-    let Some(auth) = state.auth.as_ref() else {
-        return Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response());
-    };
-    let Some(session_token) = request_cookie(headers, "lux_session") else {
-        return Err(api_error(
-            headers,
-            StatusCode::UNAUTHORIZED,
-            lux::ApiErrorCode::AuthenticationRequired,
-            "需要登录",
-        )
-        .into_response());
-    };
-    let session = match auth.resolve(&session_token).await {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return Err(api_error(
-                headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::AuthenticationRequired,
-                "需要登录",
-            )
-            .into_response());
-        }
-        Err(_) => {
-            return Err(api_error(
-                headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "认证暂时不可用",
-            )
-            .into_response());
-        }
-    };
-    if !session.user.can_manage_server {
+    let user = require_web_user(headers, state).await?;
+    if !user.can_manage_server {
         return Err(api_error(
             headers,
             StatusCode::FORBIDDEN,
@@ -12147,7 +12198,46 @@ async fn require_admin(
         )
         .into_response());
     }
-    if require_csrf {
+    if require_csrf && lux_api_key_from_headers(headers).is_none() {
+        let Some(auth) = state.auth.as_ref() else {
+            return Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "服务尚未就绪",
+            )
+            .into_response());
+        };
+        let Some(session_token) = request_cookie(headers, "lux_session") else {
+            return Err(api_error(
+                headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要登录",
+            )
+            .into_response());
+        };
+        let session = match auth.resolve(&session_token).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                return Err(api_error(
+                    headers,
+                    StatusCode::UNAUTHORIZED,
+                    lux::ApiErrorCode::AuthenticationRequired,
+                    "需要登录",
+                )
+                .into_response());
+            }
+            Err(_) => {
+                return Err(api_error(
+                    headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "认证暂时不可用",
+                )
+                .into_response());
+            }
+        };
         let Some(csrf_token) = headers
             .get("x-csrf-token")
             .and_then(|value| value.to_str().ok())
@@ -12173,6 +12263,89 @@ async fn require_admin(
     Ok(())
 }
 
+async fn require_admin_web_session(
+    headers: &HeaderMap,
+    state: &AppState,
+    require_csrf: bool,
+) -> Result<(), Response> {
+    if lux_api_key_from_headers(headers).is_some() {
+        return Err(api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "API Key 不能管理 API Key",
+        )
+        .into_response());
+    }
+    require_admin(headers, state, require_csrf).await
+}
+
+async fn resolve_shared_admin_api_key(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<Option<UserRecord>, Response> {
+    let Some(candidate) = lux_api_key_from_headers(headers) else {
+        return Ok(None);
+    };
+    let Some(service) = state.admin_api_key.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "认证服务尚未就绪",
+        )
+        .into_response());
+    };
+    service.resolve(&candidate).await.map_err(|_| {
+        api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "认证暂时不可用",
+        )
+        .into_response()
+    })
+}
+
+fn lux_api_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("X-Lux-Api-Key")
+        .or_else(|| headers.get("X-Emby-Token"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().strip_prefix("Bearer "))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+async fn normalize_lux_api_key_query(request: Request<Body>, next: Next) -> Response {
+    let mut request = request;
+    if request.uri().path().starts_with("/api/v1")
+        && !request.headers().contains_key("X-Lux-Api-Key")
+        && !request.headers().contains_key("X-Emby-Token")
+        && !request.headers().contains_key("X-MediaBrowser-Token")
+        && !request.headers().contains_key("Authorization")
+        && let Some(query) = request.uri().query()
+        && let Some(key) =
+            url::form_urlencoded::parse(query.as_bytes()).find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("api_key")
+                    .then_some(value.into_owned())
+            })
+        && let Ok(value) = HeaderValue::from_str(&key)
+    {
+        request.headers_mut().insert("X-Lux-Api-Key", value);
+    }
+    next.run(request).await
+}
+
 async fn record_audit_event(
     state: &AppState,
     headers: &HeaderMap,
@@ -12181,24 +12354,36 @@ async fn record_audit_event(
     target_id: Option<&str>,
     metadata_json: &str,
 ) {
-    let (Some(auth), Some(database), Some(session_token)) = (
-        state.auth.as_ref(),
-        state.database.as_ref(),
-        request_cookie(headers, "lux_session"),
-    ) else {
+    let Some(database) = state.database.as_ref() else {
         return;
     };
-    let Ok(Some(session)) = auth.resolve(&session_token).await else {
-        return;
+    let (actor_user_id, metadata_json) = if let Some(candidate) = lux_api_key_from_headers(headers)
+    {
+        let Some(service) = state.admin_api_key.as_ref() else {
+            return;
+        };
+        let Ok(Some(_)) = service.resolve(&candidate).await else {
+            return;
+        };
+        (None, audit_metadata_for_shared_api_key(metadata_json))
+    } else {
+        let (Some(auth), Some(session_token)) =
+            (state.auth.as_ref(), request_cookie(headers, "lux_session"))
+        else {
+            return;
+        };
+        let Ok(Some(session)) = auth.resolve(&session_token).await else {
+            return;
+        };
+        (Some(session.user.id.to_string()), metadata_json.to_owned())
     };
-    let actor_user_id = session.user.id.to_string();
     if database
         .insert_audit_event(crate::storage::NewAuditEvent {
-            actor_user_id: Some(&actor_user_id),
+            actor_user_id: actor_user_id.as_deref(),
             event_type,
             target_type,
             target_id,
-            metadata_json,
+            metadata_json: &metadata_json,
         })
         .await
         .is_ok()
@@ -12207,6 +12392,18 @@ async fn record_audit_event(
             .admin_events
             .publish(admin_event_scope_for_audit(event_type));
     }
+}
+
+fn audit_metadata_for_shared_api_key(metadata_json: &str) -> String {
+    let Ok(mut metadata) = serde_json::from_str::<Value>(metadata_json) else {
+        return "{\"auth\":\"admin_api_key\"}".to_owned();
+    };
+    if let Value::Object(object) = &mut metadata {
+        object.insert("auth".to_owned(), Value::String("admin_api_key".to_owned()));
+    } else {
+        metadata = json!({ "auth": "admin_api_key", "details": metadata });
+    }
+    serde_json::to_string(&metadata).unwrap_or_else(|_| "{\"auth\":\"admin_api_key\"}".to_owned())
 }
 
 fn admin_event_scope_for_audit(event_type: &str) -> AdminEventScope {

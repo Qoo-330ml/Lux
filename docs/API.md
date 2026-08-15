@@ -117,6 +117,17 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 Emby access token 与 Web session 完全分离。access token 是高熵随机值，只在认证响应中返回；数据库只保存 SHA-256 哈希以及设备元数据。认证失败响应不区分“用户不存在”和“密码错误”。
 
+## 共享管理员 API Key（LUX-182）
+
+Lux 提供一个服务器级共享管理员 API Key，行为与 Emby API Key 兼容。所有拥有服务器管理权限的管理员看到同一个当前 Key；Key 调用按服务器管理员权限执行，不能区分具体管理员身份。
+
+- `GET /api/v1/admin/api-key`：管理员 Web session 查看当前 Key。响应为 `{ "configured": true, "apiKey": "lux_..." }`；没有 Key 时 `apiKey` 为 `null`。需要管理员权限。
+- `POST /api/v1/admin/api-key/rotate`：生成新 Key 并立即撤销旧 Key，需要管理员 Web session 和 `X-CSRF-Token`。
+- `DELETE /api/v1/admin/api-key`：撤销当前 Key，需要管理员 Web session 和 `X-CSRF-Token`。
+- API Key 认证支持 `X-Emby-Token`、`X-Lux-Api-Key`、`Authorization: Bearer <key>`，以及兼容的 `api_key` 查询参数。
+- 共享 Key 同时适用于已实现的 `/api/v1` 和 Emby 兼容路由。Key 本身不能查看、轮换或撤销 API Key；这些操作必须使用 Web session。
+- Key 持久化于 `/config/lux_admin_api_key` 的受限文件，至少使用 256 bit 随机熵。明文不会写入数据库、日志、审计事件或错误响应；轮换会使所有旧调用方立即失效。
+
 ## 当前边界
 
 `GET /health/ready` 在数据库可读但事务写入探针失败时返回 503 和 `reason=database_write_unavailable`；`/api/v1` 的写入接口统一返回 `DATABASE_UNAVAILABLE` 错误契约并包含 requestId。
