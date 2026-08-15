@@ -89,6 +89,25 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
         true
     );
 
+    for request in [
+        client
+            .get(format!("http://{address}/api/v1/auth/me?api_key={key}"))
+            .build()?,
+        client
+            .get(format!("http://{address}/api/v1/auth/me"))
+            .header("Authorization", format!("Bearer {key}"))
+            .build()?,
+        client
+            .get(format!("http://{address}/api/v1/auth/me"))
+            .header("X-Emby-Token", &key)
+            .build()?,
+    ] {
+        assert_eq!(
+            client.execute(request).await?.status(),
+            reqwest::StatusCode::OK
+        );
+    }
+
     let settings = client
         .patch(format!("http://{address}/api/v1/admin/settings"))
         .header("X-Lux-Api-Key", &key)
