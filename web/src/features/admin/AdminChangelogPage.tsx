@@ -15,6 +15,15 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.4",
+    date: "2026-08-15",
+    sections: [
+      { kind: "fixed", items: [
+        "修复 PostgreSQL 布尔值存储兼容性问题，避免布尔字段在 PostgreSQL 后端下读取或写入异常。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.3",
     date: "2026-08-15",
     sections: [
