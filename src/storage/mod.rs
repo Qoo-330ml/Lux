@@ -2774,10 +2774,10 @@ impl Database {
         .bind(job.operation_id)
         .bind(job.library_id)
         .bind(job.concurrency)
-        .bind(job.include_ready)
-        .bind(job.write_sidecars)
-        .bind(job.media_info_enabled)
-        .bind(job.thumbnail_enabled)
+        .bind(database_flag(job.include_ready))
+        .bind(database_flag(job.write_sidecars))
+        .bind(database_flag(job.media_info_enabled))
+        .bind(database_flag(job.thumbnail_enabled))
         .bind(job.thumbnail_position_percent)
         .bind(job.target_scan_job_id)
         .bind(job.total_count)
@@ -5199,14 +5199,14 @@ impl Database {
         let expected_identity_key = movie_parent_folder_identity(library_root_id, relative_path);
         let parent_is_current = if let Some(expected_identity_key) = expected_identity_key {
             self.query_scalar::<i64>(
-                "SELECT EXISTS (
+                "SELECT CASE WHEN EXISTS (
                      SELECT 1
                      FROM media_items movie
                      JOIN media_items parent ON parent.id = movie.parent_id
                      WHERE movie.id = ? AND movie.item_type = 'MOVIE'
                        AND parent.item_type = 'FOLDER'
                        AND parent.identity_key = ? AND parent.removed_at IS NULL
-                 )",
+                 ) THEN 1 ELSE 0 END",
             )
             .bind(item_id)
             .bind(expected_identity_key)
@@ -5215,10 +5215,10 @@ impl Database {
             .map(|value| value != 0)
         } else {
             self.query_scalar::<i64>(
-                "SELECT EXISTS (
+                "SELECT CASE WHEN EXISTS (
                      SELECT 1 FROM media_items
                      WHERE id = ? AND item_type = 'MOVIE' AND parent_id IS NULL
-                 )",
+                 ) THEN 1 ELSE 0 END",
             )
             .bind(item_id)
             .fetch_one(&self.pool)
@@ -5475,7 +5475,7 @@ impl Database {
         production_year: i64,
     ) -> Result<bool, StorageError> {
         self.query_scalar::<i64>(
-            "SELECT EXISTS (
+            "SELECT CASE WHEN EXISTS (
                  SELECT 1
                  FROM media_items current_item
                  JOIN media_items conflicting_item
@@ -5488,7 +5488,7 @@ impl Database {
                  WHERE current_item.id = ?
                    AND current_item.item_type = 'MOVIE'
                    AND current_item.removed_at IS NULL
-             )",
+             ) THEN 1 ELSE 0 END",
         )
         .bind(sort_title)
         .bind(production_year)
@@ -8072,7 +8072,7 @@ impl Database {
         )
         .bind(job.id)
         .bind(job.library_id)
-        .bind(job.overwrite)
+        .bind(database_flag(job.overwrite))
         .bind(job.concurrency)
         .bind(0_i64)
         .execute(&mut *transaction)
