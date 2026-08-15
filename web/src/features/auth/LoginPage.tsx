@@ -11,8 +11,8 @@ export function LoginPage() {
   const [password, setPassword] = useState("");
   const login = useMutation({
     mutationFn: () => api.login(username, password),
-    onSuccess: (user) => {
-      queryClient.setQueryData(queryKeys.me, user);
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.me });
     },
   });
 
