@@ -15,6 +15,25 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.2",
+    date: "2026-08-15",
+    sections: [
+      { kind: "added", items: [
+        "支持创建媒体库时配置多个根路径。",
+        "支持登录后恢复原有 session，减少重新登录带来的状态丢失。",
+      ] },
+      { kind: "fixed", items: [
+        "修复元数据匹配任务将文件夹误纳入处理的问题，并拒绝冲突的电影 NFO 身份信息。",
+        "修复媒体库重新扫描后媒体身份不稳定，以及同名同年份媒体路径无法共存的问题。",
+        "修复 SQLite migration 校验和在迁移维护过程中被意外改变的问题。",
+      ] },
+      { kind: "changed", items: [
+        "默认开启实时元数据匹配，使文件事件触发的增量扫描可以自动补全本地缺失元数据。",
+        "优化媒体库创建、媒体识别和登录恢复流程的回归覆盖。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.1",
     date: "2026-08-14",
     sections: [
