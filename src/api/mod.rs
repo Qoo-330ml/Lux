@@ -12324,6 +12324,9 @@ async fn normalize_lux_api_key_query(request: Request<Body>, next: Next) -> Resp
     let mut request = request;
     if request.uri().path().starts_with("/api/v1")
         && !request.headers().contains_key("X-Lux-Api-Key")
+        && !request.headers().contains_key("X-Emby-Token")
+        && !request.headers().contains_key("X-MediaBrowser-Token")
+        && !request.headers().contains_key("Authorization")
         && let Some(query) = request.uri().query()
         && let Some(key) =
             url::form_urlencoded::parse(query.as_bytes()).find_map(|(name, value)| {
