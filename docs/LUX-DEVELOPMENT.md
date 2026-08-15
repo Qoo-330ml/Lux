@@ -1849,6 +1849,7 @@ services:
 | LUX-171 | Cargo.toml、Dockerfile、docker-entrypoint.sh、src/application/plugins.rs、src/application/plugin_store.rs、src/bin/、plugins/、scripts/、tests/、web/、docs/ |
 | LUX-172 | migrations/、migrations-postgres/、src/application/nfo.rs、src/application/metadata.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/types.ts、tests/、docs/ |
 | LUX-177 至 181 | migrations/、migrations-postgres/、src/library.rs、src/storage/、src/application/libraries.rs、src/application/plugins.rs、src/application/chapter_detector.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
+| LUX-182 | src/auth/、src/api/mod.rs、web/src/features/account/、web/src/lib/api/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3894,6 +3895,25 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 - [x] 插件 manifest、独立仓库商店目录、aarch64/x86_64 发布工作流和使用说明已接入。
 
 依赖：LUX-175、LUX-176。
+
+#### LUX-182：Emby 风格共享管理员 API Key
+
+范围：增加一个服务器级共享 API Key，行为与 Emby API Key 高度兼容。只有拥有
+`can_manage_server` 的管理员可以查看、生成、轮换和撤销；所有管理员看到同一个当前 Key。
+该 Key 同时用于 Lux `/api/v1` 和已实现的 Emby 兼容路由，调用时按服务器管理员权限执行。
+
+验收：
+
+- [ ] 支持 `X-Emby-Token`、`X-Lux-Api-Key`、`Authorization: Bearer` 和兼容的 `api_key` 查询参数。
+- [ ] Lux API 与 Emby 兼容 API 都接受共享 Key；现有用户 Web session 和 Emby 登录 AccessToken 行为不变。
+- [ ] Key 使用至少 256 bit 随机熵，持久化到 `/config` 的受限文件，重启后保持不变；生成、轮换和撤销使用原子写入。
+- [ ] 非管理员不能读取或操作 Key；Key 不能调用自身的查看、轮换和撤销接口。
+- [ ] Key 请求跳过 Cookie CSRF 但仍执行管理员权限和远程访问策略；日志、审计事件、错误响应和普通 API 响应不包含明文 Key。
+- [ ] 轮换立即使旧 Key 失效；审计明确标记共享 API Key，不能伪装成某一位管理员。
+
+验证：API Key 服务单测、SQLite 集成测试、Lux/Emby 路由鉴权测试、管理员管理接口测试、日志脱敏测试、Web 账户页测试，以及完整 Rust/Web 检查。
+
+依赖：LUX-020、LUX-022、LUX-024。
 
 ## 26. 风险与缓解
 
