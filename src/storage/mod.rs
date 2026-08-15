@@ -10727,8 +10727,14 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 source,
             })?;
         let statements = [
-            "ALTER TABLE media_items RENAME TO media_items_legacy",
-            "CREATE TABLE media_items (
+            "DROP TRIGGER IF EXISTS media_items_search_ai",
+            "DROP TRIGGER IF EXISTS media_items_search_au",
+            "DROP TRIGGER IF EXISTS media_items_search_ad",
+            "DROP TRIGGER IF EXISTS trg_media_sources_availability_insert",
+            "DROP TRIGGER IF EXISTS trg_media_sources_availability_update",
+            "DROP TRIGGER IF EXISTS trg_media_sources_availability_delete",
+            "DROP TRIGGER IF EXISTS trg_filesystem_entries_availability_update",
+            "CREATE TABLE media_items_new (
                 id TEXT PRIMARY KEY NOT NULL,
                 library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
                 item_type TEXT NOT NULL CHECK (item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'BOX_SET', 'FOLDER', 'UNRESOLVED')),
@@ -10762,7 +10768,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 nfo_metadata_json TEXT,
                 nfo_metadata_fingerprint BLOB
             )",
-            "INSERT INTO media_items (
+            "INSERT INTO media_items_new (
                 id, library_id, item_type, parent_id, series_id, season_number, episode_number,
                 absolute_number, title, sort_title, original_title, overview, production_year,
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
@@ -10779,8 +10785,9 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
                 original_language, has_available_source, thumbnail_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
-             FROM media_items_legacy",
-            "DROP TABLE media_items_legacy",
+             FROM media_items",
+            "DROP TABLE media_items",
+            "ALTER TABLE media_items_new RENAME TO media_items",
             "CREATE INDEX idx_media_items_library_sort ON media_items(library_id, sort_title, id)",
             "CREATE UNIQUE INDEX idx_media_items_identity_key
              ON media_items(identity_key)
@@ -10803,6 +10810,62 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
             "CREATE TRIGGER media_items_search_ad AFTER DELETE ON media_items BEGIN
                 DELETE FROM media_search WHERE item_id = OLD.id;
             END",
+            "CREATE TRIGGER trg_media_sources_availability_insert
+             AFTER INSERT ON media_sources
+             BEGIN
+                 UPDATE media_items
+                 SET has_available_source = 1
+                 WHERE id = NEW.item_id
+                   AND EXISTS (
+                       SELECT 1
+                       FROM filesystem_entries
+                       WHERE id = NEW.filesystem_entry_id
+                         AND is_missing = 0
+                   );
+             END",
+            "CREATE TRIGGER trg_media_sources_availability_update
+             AFTER UPDATE OF item_id, filesystem_entry_id ON media_sources
+             BEGIN
+                 UPDATE media_items
+                 SET has_available_source = EXISTS (
+                     SELECT 1
+                     FROM media_sources ms
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE ms.item_id = media_items.id
+                       AND fe.is_missing = 0
+                 )
+                 WHERE id IN (OLD.item_id, NEW.item_id);
+             END",
+            "CREATE TRIGGER trg_media_sources_availability_delete
+             AFTER DELETE ON media_sources
+             BEGIN
+                 UPDATE media_items
+                 SET has_available_source = EXISTS (
+                     SELECT 1
+                     FROM media_sources ms
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE ms.item_id = media_items.id
+                       AND fe.is_missing = 0
+                 )
+                 WHERE id = OLD.item_id;
+             END",
+            "CREATE TRIGGER trg_filesystem_entries_availability_update
+             AFTER UPDATE OF is_missing ON filesystem_entries
+             BEGIN
+                 UPDATE media_items
+                 SET has_available_source = EXISTS (
+                     SELECT 1
+                     FROM media_sources ms
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE ms.item_id = media_items.id
+                       AND fe.is_missing = 0
+                 )
+                 WHERE id IN (
+                     SELECT item_id
+                     FROM media_sources
+                     WHERE filesystem_entry_id = NEW.id
+                 );
+             END",
         ];
         for statement in statements {
             sqlx::query(statement)

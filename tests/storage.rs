@@ -1,11 +1,23 @@
 use std::fs;
 
+use sha2::{Digest, Sha384};
+
 use luxd::{
     application::{libraries::LibraryService, scanner::LibraryScanner},
     config::Config,
     library::LibraryKind,
     storage::Database,
 };
+
+#[test]
+fn historical_media_catalog_migration_keeps_its_original_checksum() {
+    let migration = include_str!("../migrations/0006_media_catalog.sql");
+
+    assert_eq!(
+        format!("{:x}", Sha384::digest(migration.as_bytes())),
+        "4c0ce4f36416069631e85e66ad25c6808cf42b9ea60287db68e945e67f32860ab07bf9706dadc5a120fda8eba5bae323"
+    );
+}
 
 #[tokio::test]
 async fn empty_config_dir_runs_migrations_and_configures_sqlite()
@@ -41,6 +53,35 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     let second_database = Database::connect(&config).await?;
     assert_eq!(second_database.schema_version().await?, 62);
     second_database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_media_item_search_triggers_follow_rebuilt_table()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+
+    let trigger_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'trigger' AND name = 'media_items_search_ai'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(!trigger_sql.contains("media_items_legacy"));
+    let stale_references: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE sql LIKE '%media_items_legacy%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stale_references, 0);
+
+    database.close().await;
     Ok(())
 }
 
