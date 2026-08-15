@@ -84,6 +84,38 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).not.toContain("METADATA_REIDENTIFY_STARTED");
   });
 
+  it("puts the newest runtime record first when timestamps are ISO strings", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
+      id: "scan-job-1",
+      libraryId: "library-1",
+      jobType: "INCREMENTAL_SCAN",
+      status: "COMPLETED",
+      createdAt: "2026-08-15T09:00:00.000Z",
+    }] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [{
+      id: "metadata-job-1",
+      libraryId: "library-1",
+      status: "COMPLETED",
+      mode: "REIDENTIFY",
+      processedCount: 1,
+      totalCount: 1,
+      createdAt: "2026-08-15T10:00:00.000Z",
+    }] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+
+    const rows = [...container.querySelectorAll<HTMLElement>(".lux-admin-job-row")];
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.textContent).toContain("整库元数据匹配");
+    expect(rows[1]?.textContent).toContain("实时增量扫描");
+  });
+
   it("shows discovery progress and cancellation state immediately", async () => {
     const adminJobs = vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
       id: "scan-job-1",

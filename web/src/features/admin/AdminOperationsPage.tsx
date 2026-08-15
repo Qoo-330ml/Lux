@@ -153,7 +153,7 @@ export function AdminOperationsPage() {
       kind: "metadata",
       jobType: jobTypeForMetadataJob(job),
     })),
-  ].sort((left, right) => Number(right.createdAt ?? 0) - Number(left.createdAt ?? 0));
+  ].sort(compareOperationsJobs);
   const registeredTasks = tasks.data?.scheduledTasks ?? [];
   const logItems = useMemo(() => {
     const query = logSearch.trim().toLowerCase();
@@ -542,6 +542,19 @@ function auditLevel(log: AdminAuditEvent) {
 
 function isActiveJob(status: string) {
   return status === "PENDING" || status === "QUEUED" || status === "RUNNING";
+}
+
+function compareOperationsJobs(left: OperationsJob, right: OperationsJob) {
+  const createdAtDifference = adminTimestamp(right.createdAt) - adminTimestamp(left.createdAt);
+  return createdAtDifference || right.id.localeCompare(left.id);
+}
+
+function adminTimestamp(value?: string | number | null) {
+  if (value == null || value === "") return Number.NEGATIVE_INFINITY;
+  const timestamp = typeof value === "number" || /^\d+$/.test(value)
+    ? Number(value) * 1000
+    : Date.parse(value);
+  return Number.isNaN(timestamp) ? Number.NEGATIVE_INFINITY : timestamp;
 }
 
 function AdminOperationsState({ label, error = false }: { label: string; error?: boolean }) {
