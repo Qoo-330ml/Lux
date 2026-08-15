@@ -11,6 +11,9 @@ use luxd::{
 use serde_json::json;
 use tokio::net::TcpListener;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[tokio::test]
 async fn shared_admin_key_survives_restart_and_can_be_revoked()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -31,6 +34,14 @@ async fn shared_admin_key_survives_restart_and_can_be_revoked()
     let key = service.rotate().await?;
     assert!(key.starts_with("lux_"));
     assert_eq!(service.current().await?.as_deref(), Some(key.as_str()));
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(config.config_dir.join("lux_admin_api_key"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     assert_eq!(
         service.resolve(&key).await?.map(|user| user.id),
         Some(admin.id)
@@ -124,6 +135,7 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
     assert_eq!(audit.status(), reqwest::StatusCode::OK);
     let audit_body = audit.json::<serde_json::Value>().await?;
     assert_eq!(audit_body["events"][0]["metadata"]["auth"], "admin_api_key");
+    assert!(!audit_body.to_string().contains(&key));
 
     let emby = client
         .get(format!("http://{address}/System/Info?api_key={key}"))
