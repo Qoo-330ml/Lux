@@ -1,11 +1,13 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::setup::SetupService,
+    application::{libraries::LibraryService, scanner::LibraryScanner},
     auth::{
         admin_api_key::AdminApiKeyService, emby::EmbyAuthService, sessions::WebAuthService,
         users::UserStore,
     },
     config::Config,
+    library::LibraryKind,
     storage::Database,
 };
 use serde_json::json;
@@ -149,6 +151,88 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
         .send()
         .await?;
     assert_eq!(emby_with_lux_header.status(), reqwest::StatusCode::OK);
+
+    server.abort();
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_admin_key_can_follow_emby_library_discovery_flow()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct horse battery staple")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root).await?;
+    tokio::fs::write(media_root.join("Movie (2024).mkv"), b"movie").await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+
+    let views = client
+        .get(format!(
+            "http://{address}/Users/{}/Views?api_key={key}",
+            admin.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(views.status(), reqwest::StatusCode::OK);
+    let views_body = views.json::<serde_json::Value>().await?;
+    assert_eq!(views_body["TotalRecordCount"], 1);
+    assert_eq!(views_body["Items"][0]["Id"], library.id.to_string());
+
+    let root = client
+        .get(format!(
+            "http://{address}/Users/{}/Items/Root?api_key={key}",
+            admin.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(root.status(), reqwest::StatusCode::OK);
+    assert_eq!(root.json::<serde_json::Value>().await?["ChildCount"], 1);
+
+    let items = client
+        .get(format!(
+            "http://{address}/Users/{}/Items?ParentId={}&IncludeItemTypes=CollectionFolder&Limit=10&api_key={key}",
+            admin.id, admin.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(items.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        items.json::<serde_json::Value>().await?["TotalRecordCount"],
+        1
+    );
 
     server.abort();
     database.close().await;
