@@ -15,6 +15,23 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.3",
+    date: "2026-08-15",
+    sections: [
+      { kind: "added", items: [
+        "增加管理员删除用户功能及管理界面支持。",
+      ] },
+      { kind: "fixed", items: [
+        "修复后台扫描对进度更新和取消操作响应不及时的问题。",
+        "修复 PostgreSQL migration 校验和在迁移维护过程中被意外改变的问题。",
+      ] },
+      { kind: "changed", items: [
+        "优化后台扫描任务状态同步和取消流程。",
+        "完善管理员用户管理及相关 API 回归覆盖。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.2",
     date: "2026-08-15",
     sections: [
