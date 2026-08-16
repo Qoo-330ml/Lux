@@ -6750,7 +6750,7 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let count_query = format!(
-            "SELECT COALESCE(SUM(item_count), 0)
+            "SELECT CAST(COALESCE(SUM(item_count), 0) AS BIGINT)
              FROM (
                  SELECT COUNT(*) AS item_count
                  FROM media_items mi
