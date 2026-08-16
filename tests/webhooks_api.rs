@@ -232,6 +232,37 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
     let deliveries_body: Value = deliveries.json().await?;
     assert_eq!(deliveries_body["deliveries"][0]["status"], "DELIVERED");
 
+    let updated = client
+        .patch(format!(
+            "http://{lux_address}/api/v1/admin/notification-destinations/{destination_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({
+            "name": "Updated receiver",
+            "enabled": false,
+            "eventTypes": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        updated.json::<Value>().await?["destination"]["enabled"],
+        false
+    );
+    let fetched = client
+        .get(format!(
+            "http://{lux_address}/api/v1/admin/notification-destinations/{destination_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(fetched.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        fetched.json::<Value>().await?["destination"]["name"],
+        "Updated receiver"
+    );
+
     let rotated = client
         .post(format!(
             "http://{lux_address}/api/v1/admin/notification-destinations/{destination_id}/rotate-secret"
@@ -243,6 +274,16 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
     assert_eq!(rotated.status(), reqwest::StatusCode::OK);
     let rotated_body: Value = rotated.json().await?;
     assert_ne!(rotated_body["secret"], secret);
+
+    let deleted = client
+        .delete(format!(
+            "http://{lux_address}/api/v1/admin/notification-destinations/{destination_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
 
     lux_server.abort();
     receiver_server.abort();

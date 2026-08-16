@@ -1016,6 +1016,7 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::json;
     use std::time::{Duration, SystemTime};
+    use url::Url;
 
     #[test]
     fn retry_after_accepts_seconds_and_caps_long_delays() {
@@ -1046,9 +1047,17 @@ mod tests {
         assert!(is_retryable_http_status(StatusCode::TOO_EARLY));
         assert!(is_retryable_http_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(is_retryable_http_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_http_status(StatusCode::TEMPORARY_REDIRECT));
         assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
         assert!(!is_retryable_http_status(StatusCode::UNAUTHORIZED));
         assert_eq!(retry_delay(1), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_resolution_rejects_reserved_localhost_targets() {
+        let url = Url::parse("http://localhost:8097/hook").expect("test URL should parse");
+        let result = super::resolve_webhook_address(&url, false).await;
+        assert!(matches!(result, Err(super::WebhookError::Invalid(_))));
     }
 
     #[test]
