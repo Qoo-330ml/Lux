@@ -1851,6 +1851,7 @@ services:
 | LUX-172 | migrations/、migrations-postgres/、src/application/nfo.rs、src/application/metadata.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/types.ts、tests/、docs/ |
 | LUX-177 至 181 | migrations/、migrations-postgres/、src/library.rs、src/storage/、src/application/libraries.rs、src/application/plugins.rs、src/application/chapter_detector.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-182 | src/auth/、src/api/mod.rs、web/src/features/account/、web/src/lib/api/、tests/、docs/ |
+| LUX-183 至 186 | src/application/webhooks.rs、src/storage/、src/api/mod.rs、migrations/、migrations-postgres/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3915,6 +3916,33 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 验证：API Key 服务单测、SQLite 集成测试、Lux/Emby 路由鉴权测试、管理员管理接口测试、日志脱敏测试、Web 账户页测试，以及完整 Rust/Web 检查。
 
 依赖：LUX-020、LUX-022、LUX-024。
+
+#### LUX-183：Webhook 通知事件与持久化投递
+
+范围：为 Lux 增加管理员配置的出站 Webhook 通知器。第一版只提供 Lux 原生
+`schemaVersion: 1` JSON 合同，不声称完整兼容 Emby Webhooks 插件 payload；通知通过持久化事件和投递记录
+由有界后台 worker 发送，不能阻塞扫描、播放或元数据请求。
+
+第一版事件包括 `MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、
+`JOB_FAILED`；播放开始和停止事件保留为后续可选范围。事件不包含本地绝对路径、`.strm` 原始目标、令牌、
+完整外部 URL 或不必要的用户隐私字段。
+
+验收：
+
+- [ ] 从空 SQLite 和 PostgreSQL 数据库运行 migration，建立通知目标、事件和投递状态表。
+- [ ] 管理员可以创建、查看、修改、删除、启停 Webhook 目标并执行测试发送；secret 只在创建/轮换时返回，
+      普通列表和日志不返回明文。
+- [ ] Webhook 请求使用 `eventId`、时间戳和 HMAC-SHA256 签名；事件写入和匹配投递记录可恢复且按目标幂等。
+- [ ] 投递具备超时、固定并发、有限指数退避、429/5xx 重试、失败记录和服务重启恢复。
+- [ ] URL 校验阻止凭据、查询参数、重定向以及默认的 loopback、链路本地、私有和 metadata 地址；管理员显式
+      允许私有网络时仍拒绝危险保留地址。
+- [ ] 媒体/任务服务接入基础事件；重复扫描不会重复发送同一媒体新增事件。
+- [ ] API、存储、URL 安全、签名、重试、恢复、权限、CSRF、脱敏和本地接收器集成测试通过。
+
+验证：参见 `docs/LUX-183-PLAN.md`；完成后更新 `docs/COMPATIBILITY.md`，明确 Lux 原生 Webhook 合同及尚未
+实现的 Emby payload 兼容范围。
+
+依赖：LUX-020、LUX-022、LUX-041、LUX-073、LUX-093。
 
 ## 26. 风险与缓解
 
