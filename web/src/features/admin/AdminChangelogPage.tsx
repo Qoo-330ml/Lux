@@ -16,17 +16,20 @@ type ChangelogRelease = {
 export const changelogReleases: ChangelogRelease[] = [
   {
     version: "0.2.5",
-    date: "2026-08-15",
+    date: "2026-08-16",
     sections: [
       { kind: "added", items: [
         "增加服务器级共享管理员 API Key，支持管理员查看、复制、生成、轮换和撤销。",
         "API Key 兼容 Lux 与已实现的 Emby 路由，并支持多种 Emby 风格认证头。",
         "账户路由包含当前用户 ID，并限制访问其他用户账户路径。",
         "Emby 兼容接口公开混合媒体库的 mixed 集合类型。",
+        "增加 TMDb 人物资料的演员传记、生日、逝世日期、职业领域和出生地信息，并持久化到人物资料。",
       ] },
       { kind: "fixed", items: [
         "修复管理操作页运行时任务使用 ISO 时间戳时排序不正确的问题。",
         "修复旧版 STRM media-info manifest 缺少计划字段时无法编辑和迁移执行计划的问题。",
+        "修复可信代理下播放会话未正确记录转发客户端 IP 的问题。",
+        "修复无音频流媒体源的 Emby DefaultAudioStreamIndex 返回非数字值的问题。",
       ] },
       { kind: "changed", items: [
         "完善 API Key 的受限文件存储、旧 Key 立即失效和审计标记，避免敏感凭据进入数据库或日志。",
