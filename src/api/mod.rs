@@ -2082,12 +2082,30 @@ async fn emby_library_virtual_folders(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let media_strategy = match read_media_strategy_settings(database).await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let (resume_played_percent, resume_min_ticks) = match database.resume_settings().await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     match libraries.list_libraries().await {
         Ok(views) => Json(
             views
                 .iter()
                 .filter(|view| view.library.is_enabled)
-                .map(emby_virtual_folder_json)
+                .map(|view| {
+                    emby_virtual_folder_json(
+                        view,
+                        &media_strategy,
+                        resume_played_percent,
+                        resume_min_ticks,
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
         .into_response(),
@@ -5606,7 +5624,19 @@ fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count:
     })
 }
 
-fn emby_virtual_folder_json(view: &LibraryView) -> Value {
+fn emby_virtual_folder_json(
+    view: &LibraryView,
+    global_media_strategy: &MediaStrategySettings,
+    resume_played_percent: i64,
+    resume_min_ticks: i64,
+) -> Value {
+    let media_strategy = view
+        .library
+        .media_strategy_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<MediaStrategySettings>(value).ok())
+        .unwrap_or_else(|| global_media_strategy.clone());
+    let collection_type = emby_collection_type(view.library.kind);
     json!({
         "Name": view.library.name,
         "Locations": view
@@ -5614,7 +5644,13 @@ fn emby_virtual_folder_json(view: &LibraryView) -> Value {
             .iter()
             .map(|root| root.display_path.to_string_lossy().to_string())
             .collect::<Vec<_>>(),
-        "CollectionType": emby_collection_type(view.library.kind),
+        "CollectionType": collection_type,
+        "LibraryOptions": emby_virtual_folder_options_json(
+            view,
+            &media_strategy,
+            resume_played_percent,
+            resume_min_ticks,
+        ),
         "ItemId": view.library.id,
         "PrimaryImageItemId": view
             .library
@@ -5624,6 +5660,151 @@ fn emby_virtual_folder_json(view: &LibraryView) -> Value {
         "RefreshProgress": null,
         "RefreshStatus": "Idle",
     })
+}
+
+fn emby_virtual_folder_options_json(
+    view: &LibraryView,
+    media_strategy: &MediaStrategySettings,
+    resume_played_percent: i64,
+    resume_min_ticks: i64,
+) -> Value {
+    let collection_type = emby_collection_type(view.library.kind);
+    let type_options = match view.library.kind {
+        LibraryKind::Movie => vec![emby_library_type_options_json("Movie", media_strategy)],
+        LibraryKind::Series => vec![emby_library_type_options_json("Series", media_strategy)],
+        LibraryKind::Mixed => vec![
+            emby_library_type_options_json("Movie", media_strategy),
+            emby_library_type_options_json("Series", media_strategy),
+        ],
+    };
+    json!({
+        "EnableArchiveMediaFiles": false,
+        "EnablePhotos": false,
+        "EnableRealtimeMonitor": true,
+        "EnableChapterImageExtraction": false,
+        "ExtractChapterImagesDuringLibraryScan": false,
+        "DownloadImagesInAdvance": false,
+        "PathInfos": view.roots.iter().map(|root| json!({
+            "Path": root.display_path.to_string_lossy().to_string(),
+            "NetworkPath": "",
+        })).collect::<Vec<_>>(),
+        "SaveLocalMetadata": true,
+        "SaveLocalThumbnailSets": false,
+        "ImportMissingEpisodes": false,
+        "EnableAutomaticSeriesGrouping": false,
+        "EnableEmbeddedTitles": false,
+        "EnableAudioResume": false,
+        "AutomaticRefreshIntervalDays": 0,
+        "PreferredMetadataLanguage": media_strategy.metadata_language,
+        "ContentType": collection_type,
+        "MetadataCountryCode": media_strategy.region,
+        "SeasonZeroDisplayName": "Specials",
+        "MetadataSavers": ["Nfo"],
+        "DisabledLocalMetadataReaders": [],
+        "LocalMetadataReaderOrder": ["Nfo"],
+        "DisabledSubtitleFetchers": [],
+        "SubtitleFetcherOrder": [],
+        "SkipSubtitlesIfEmbeddedSubtitlesPresent": true,
+        "SkipSubtitlesIfAudioTrackMatches": false,
+        "SubtitleDownloadLanguages": media_strategy
+            .subtitles
+            .languages
+            .iter()
+            .map(|language| emby_subtitle_language_code(language))
+            .collect::<Vec<_>>(),
+        "RequirePerfectSubtitleMatch": false,
+        "SaveSubtitlesWithMedia": false,
+        "ForcedSubtitlesOnly": media_strategy.subtitles.forced_only,
+        "TypeOptions": type_options,
+        "CollapseSingleItemFolders": false,
+        "MinResumePct": 0,
+        "MaxResumePct": resume_played_percent,
+        "MinResumeDurationSeconds": resume_min_ticks
+            .max(0)
+            .saturating_add(9_999_999)
+            / 10_000_000,
+        "ThumbnailImagesIntervalSeconds": 0,
+    })
+}
+
+fn emby_library_type_options_json(
+    item_type: &str,
+    media_strategy: &MediaStrategySettings,
+) -> Value {
+    let mut image_options = Vec::new();
+    if media_strategy.images.poster {
+        image_options.push(json!({
+            "Type": "Primary",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.artwork {
+        image_options.push(json!({
+            "Type": "Art",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.banner {
+        image_options.push(json!({
+            "Type": "Banner",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.logo {
+        image_options.push(json!({
+            "Type": "Logo",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.thumbnail {
+        image_options.push(json!({
+            "Type": "Thumb",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.disc {
+        image_options.push(json!({
+            "Type": "Disc",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.max_backdrop_count > 0 {
+        image_options.push(json!({
+            "Type": "Backdrop",
+            "Limit": media_strategy.images.max_backdrop_count,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+
+    json!({
+        "Type": item_type,
+        "MetadataFetchers": [],
+        "MetadataFetcherOrder": [],
+        "ImageFetchers": [],
+        "ImageFetcherOrder": [],
+        "ImageOptions": image_options,
+    })
+}
+
+fn emby_subtitle_language_code(language: &str) -> String {
+    match language.split('-').next().unwrap_or(language) {
+        "zh" => "chi".to_owned(),
+        "en" => "eng".to_owned(),
+        "ja" => "jpn".to_owned(),
+        "ko" => "kor".to_owned(),
+        "fr" => "fra".to_owned(),
+        "de" => "deu".to_owned(),
+        "es" => "spa".to_owned(),
+        "it" => "ita".to_owned(),
+        "ru" => "rus".to_owned(),
+        _ => language.to_owned(),
+    }
 }
 
 fn emby_collection_type(kind: LibraryKind) -> Option<&'static str> {

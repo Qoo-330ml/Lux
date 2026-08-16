@@ -225,6 +225,66 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
             virtual_folders_body[0]["Locations"][0],
             media_root.to_string_lossy().to_string()
         );
+        let options = &virtual_folders_body[0]["LibraryOptions"];
+        for field in [
+            "EnableArchiveMediaFiles",
+            "EnablePhotos",
+            "EnableRealtimeMonitor",
+            "EnableChapterImageExtraction",
+            "ExtractChapterImagesDuringLibraryScan",
+            "DownloadImagesInAdvance",
+            "PathInfos",
+            "SaveLocalMetadata",
+            "SaveLocalThumbnailSets",
+            "ImportMissingEpisodes",
+            "EnableAutomaticSeriesGrouping",
+            "EnableEmbeddedTitles",
+            "EnableAudioResume",
+            "AutomaticRefreshIntervalDays",
+            "PreferredMetadataLanguage",
+            "ContentType",
+            "MetadataCountryCode",
+            "SeasonZeroDisplayName",
+            "MetadataSavers",
+            "DisabledLocalMetadataReaders",
+            "LocalMetadataReaderOrder",
+            "DisabledSubtitleFetchers",
+            "SubtitleFetcherOrder",
+            "SkipSubtitlesIfEmbeddedSubtitlesPresent",
+            "SkipSubtitlesIfAudioTrackMatches",
+            "SubtitleDownloadLanguages",
+            "RequirePerfectSubtitleMatch",
+            "SaveSubtitlesWithMedia",
+            "ForcedSubtitlesOnly",
+            "TypeOptions",
+            "CollapseSingleItemFolders",
+            "MinResumePct",
+            "MaxResumePct",
+            "MinResumeDurationSeconds",
+            "ThumbnailImagesIntervalSeconds",
+        ] {
+            assert!(!options[field].is_null(), "missing LibraryOptions.{field}");
+        }
+        assert_eq!(options["PreferredMetadataLanguage"], "zh-CN");
+        assert_eq!(options["MetadataCountryCode"], "CN");
+        assert_eq!(options["ContentType"], "movies");
+        assert_eq!(options["EnableRealtimeMonitor"], true);
+        assert_eq!(options["MaxResumePct"], 90);
+        assert_eq!(options["MinResumeDurationSeconds"], 120);
+        assert_eq!(options["SubtitleDownloadLanguages"][0], "chi");
+        assert_eq!(
+            options["PathInfos"][0]["Path"],
+            media_root.to_string_lossy().to_string()
+        );
+        assert_eq!(options["PathInfos"][0]["NetworkPath"], "");
+        assert_eq!(options["TypeOptions"][0]["Type"], "Movie");
+        assert!(options["TypeOptions"][0]["MetadataFetchers"].is_array());
+        assert!(options["TypeOptions"][0]["ImageFetchers"].is_array());
+        assert!(options["TypeOptions"][0]["ImageOptions"].is_array());
+        assert_eq!(
+            options["TypeOptions"][0]["ImageOptions"][0]["Type"],
+            "Primary"
+        );
     }
 
     let root = client
