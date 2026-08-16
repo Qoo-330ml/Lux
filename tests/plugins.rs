@@ -183,13 +183,13 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(catalog.status(), reqwest::StatusCode::OK);
     let catalog_body: Value = catalog.json().await?;
     let tmdb = plugin_by_id(&catalog_body, "org.lux.tmdb");
-    assert_eq!(catalog_body["total"], 4);
+    assert_eq!(catalog_body["total"], 6);
     assert_eq!(tmdb["category"], "SCRAPER");
     assert_eq!(tmdb["version"], "0.1.5");
     assert_eq!(tmdb["installed"], false);
     assert_eq!(tmdb["configured"], true);
     assert_eq!(tmdb["configurable"], true);
-    assert_eq!(tmdb["configSource"], "PLUGIN_DEFAULT");
+    assert_eq!(tmdb["configSource"], "CUSTOM");
     assert_eq!(tmdb["configFields"][0]["key"], "apiKey");
     assert_eq!(tmdb["configFields"][1]["key"], "preferredLanguage");
     assert_eq!(tmdb["configFields"][1]["options"][0]["value"], "zh-CN");
@@ -587,7 +587,7 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
         .json::<Value>()
         .await?;
     let tmdb = plugin_by_id(&catalog, "org.lux.tmdb");
-    assert_eq!(catalog["total"], 4);
+    assert_eq!(catalog["total"], 6);
     assert_eq!(tmdb["category"], "SCRAPER");
     assert_eq!(tmdb["version"], "1.0.0");
     assert_eq!(tmdb["runtime"], "process");
