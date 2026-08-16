@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::{
     application::{
         admin_events::{AdminEventHub, AdminEventScope},
+        home::HomeService,
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
         media_matching::{MediaKind, clean_title, has_multi_part_marker, parse_media_name},
         metadata::MetadataEnricher,
@@ -1455,6 +1456,7 @@ pub struct ScanJobService {
     strm_probe: Option<StrmProbeService>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
+    home: Option<HomeService>,
     resources: ResourceMetrics,
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
@@ -1477,6 +1479,7 @@ impl ScanJobService {
             strm_probe: None,
             people: None,
             local_nfo: None,
+            home: None,
             resources: ResourceMetrics::new(),
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1509,6 +1512,11 @@ impl ScanJobService {
 
     pub fn with_nfo_store(mut self, local_nfo: LocalNfoMetadataStore) -> Self {
         self.local_nfo = Some(local_nfo);
+        self
+    }
+
+    pub(crate) fn with_home(mut self, home: HomeService) -> Self {
+        self.home = Some(home);
         self
     }
 
@@ -1729,7 +1737,13 @@ impl ScanJobService {
             return Err(ScanJobError::InvalidBatchSize);
         }
         let _scan_permit = self.acquire_scan_lock().await?;
-        self.run_batch_unlocked(job_id, batch_size).await
+        let report = self.run_batch_unlocked(job_id, batch_size).await?;
+        if report.processed > 0 {
+            if let Some(home) = &self.home {
+                home.invalidate();
+            }
+        }
+        Ok(report)
     }
 
     async fn run_batch_unlocked(
@@ -2649,6 +2663,11 @@ impl ScanJobService {
         let _scan_permit = self.acquire_scan_lock().await?;
         loop {
             let report = self.run_batch_unlocked(job_id, batch_size).await?;
+            if report.processed > 0 {
+                if let Some(home) = &self.home {
+                    home.invalidate();
+                }
+            }
             if !report.completed {
                 tokio::task::yield_now().await;
                 continue;
@@ -2677,6 +2696,9 @@ impl ScanJobService {
                         .await;
                     }
                     self.run_auto_library_cover_after_scan(job_id).await?;
+                    if let Some(home) = &self.home {
+                        home.invalidate();
+                    }
                     return Ok(());
                 }
                 self.run_probe_after_scan(job_id, probe).await?;
@@ -2688,6 +2710,9 @@ impl ScanJobService {
                         self.schedule_online_metadata_after_scan(job_id, metadata)
                             .await;
                     }
+                }
+                if let Some(home) = &self.home {
+                    home.invalidate();
                 }
             }
             return Ok(());
