@@ -6750,13 +6750,49 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let count_query = format!(
-            "SELECT COUNT(*) FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL
-               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}
-               AND mi.library_id IN ({placeholders})"
+            "SELECT COALESCE(SUM(item_count), 0)
+             FROM (
+                 SELECT COUNT(*) AS item_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type <> 'FOLDER'
+                   AND mi.has_available_source = 1
+                   AND mi.library_id IN ({placeholders})
+                 UNION ALL
+                 SELECT COUNT(*) AS item_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')
+                   AND mi.has_available_source = 0
+                   AND mi.library_id IN ({placeholders})
+                   AND (
+                       EXISTS (
+                           SELECT 1
+                           FROM media_items visible_child
+                           WHERE visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                             AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM collection_items visible_collection_item
+                           JOIN collections visible_collection
+                             ON visible_collection.id = visible_collection_item.collection_id
+                           JOIN media_items visible_child
+                             ON visible_child.id = visible_collection_item.item_id
+                           WHERE visible_collection.item_id = mi.id
+                             AND visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                       )
+                   )
+             ) visible_catalog"
         );
         let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        for library_id in library_ids {
+            count_statement = count_statement.bind(library_id);
+        }
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
         }
