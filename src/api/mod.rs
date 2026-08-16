@@ -248,6 +248,10 @@ impl AppState {
                 None
             }
         };
+        let metadata_reidentify = metadata_reidentify.map(|service| match webhooks.clone() {
+            Some(webhooks) => service.with_webhooks(webhooks),
+            None => service,
+        });
         let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
         let probe = Some(MediaProbeService::new(

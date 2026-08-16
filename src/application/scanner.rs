@@ -1929,6 +1929,7 @@ impl ScanJobService {
             )
             .await?;
         if batch.is_empty() {
+            let mut removed_count = 0_usize;
             for root in &roots {
                 if !root.is_available {
                     continue;
@@ -1942,9 +1943,14 @@ impl ScanJobService {
                         .await?;
                     continue;
                 }
-                self.database
-                    .mark_missing_filesystem_entries(&root.id, &job.generation)
-                    .await?;
+                removed_count = removed_count.saturating_add(
+                    usize::try_from(
+                        self.database
+                            .mark_missing_filesystem_entries(&root.id, &job.generation)
+                            .await?,
+                    )
+                    .unwrap_or(usize::MAX),
+                );
                 self.database
                     .update_root_scan_cursor(&root.id, None)
                     .await?;
@@ -1963,6 +1969,15 @@ impl ScanJobService {
                 .await?;
             self.record_event(&job.id, "INFO", "JOB_COMPLETED", "任务已完成", "{}")
                 .await;
+            if removed_count > 0 {
+                self.publish_webhook_event_with_data(
+                    job,
+                    WebhookEventType::MediaRemoved,
+                    None,
+                    json!({ "removedCount": removed_count }),
+                )
+                .await;
+            }
             self.publish_webhook_event(job, WebhookEventType::ScanCompleted, None)
                 .await;
             return Ok(ScanBatchReport {

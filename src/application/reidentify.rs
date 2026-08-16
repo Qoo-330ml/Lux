@@ -1,5 +1,9 @@
-use std::fmt;
+use std::{
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use serde_json::{Value, json};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -12,6 +16,7 @@ use crate::{
         },
         scraper::{ScraperError, ScraperResolver},
         tmdb_plugin::TmdbProvider,
+        webhooks::{WebhookEventType, WebhookService},
     },
     observability::resources::ResourceMetrics,
     storage::{Database, StorageError, StoredMetadataReidentifyItem},
@@ -46,6 +51,7 @@ pub struct MetadataReidentifyService {
     resolver: Option<ScraperResolver>,
     admin_events: AdminEventHub,
     resources: ResourceMetrics,
+    webhooks: Option<WebhookService>,
 }
 
 impl MetadataReidentifyService {
@@ -61,6 +67,7 @@ impl MetadataReidentifyService {
             resolver: None,
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
+            webhooks: None,
         }
     }
 
@@ -87,6 +94,7 @@ impl MetadataReidentifyService {
             resolver: None,
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
+            webhooks: None,
         }
     }
 
@@ -107,6 +115,7 @@ impl MetadataReidentifyService {
             resolver: Some(resolver),
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
+            webhooks: None,
         }
     }
 
@@ -117,6 +126,11 @@ impl MetadataReidentifyService {
 
     pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
         self.resources = resources;
+        self
+    }
+
+    pub fn with_webhooks(mut self, webhooks: WebhookService) -> Self {
+        self.webhooks = Some(webhooks);
         self
     }
 
@@ -388,6 +402,22 @@ impl MetadataReidentifyService {
         {
             tracing::error!(job_id, "metadata refresh job status could not be recorded");
         }
+        if status == "FAILED" {
+            self.publish_webhook(
+                WebhookEventType::JobFailed,
+                &format!("job-failed:{job_id}"),
+                json!({
+                    "jobId": job_id,
+                    "jobType": "METADATA_REIDENTIFY",
+                    "mode": job.mode,
+                    "status": status,
+                    "totalCount": job.total_count,
+                    "processedCount": job.processed_count,
+                    "errorCode": "ITEM_FAILED",
+                }),
+            )
+            .await;
+        }
         self.admin_events.publish(AdminEventScope::Jobs);
     }
 
@@ -452,6 +482,20 @@ impl MetadataReidentifyService {
                     .await;
                 self.admin_events.publish(AdminEventScope::Jobs);
                 self.admin_events.publish(AdminEventScope::Metadata);
+                if !matches!(mode, MetadataRefreshMode::Reidentify) {
+                    self.publish_webhook(
+                        WebhookEventType::MetadataUpdated,
+                        &format!("metadata-updated:{job_id}:{item_id}"),
+                        json!({
+                            "jobId": job_id,
+                            "itemId": item_id,
+                            "mode": mode.as_str(),
+                            "status": "COMPLETED",
+                            "candidateCount": candidate_count,
+                        }),
+                    )
+                    .await;
+                }
             }
             Err(MetadataReidentifyError::LowConfidence) => {
                 let code = MetadataReidentifyError::LowConfidence.code();
@@ -489,6 +533,21 @@ impl MetadataReidentifyService {
                 self.admin_events.publish(AdminEventScope::Jobs);
                 self.admin_events.publish(AdminEventScope::Metadata);
             }
+        }
+    }
+
+    async fn publish_webhook(&self, event_type: WebhookEventType, dedupe_key: &str, data: Value) {
+        let Some(webhooks) = self.webhooks.as_ref() else {
+            return;
+        };
+        if let Err(_error) = webhooks
+            .publish(event_type, dedupe_key, unix_now(), data)
+            .await
+        {
+            tracing::warn!(
+                event_type = event_type.as_str(),
+                "failed to enqueue webhook event"
+            );
         }
     }
 
@@ -740,6 +799,14 @@ impl From<StorageError> for MetadataReidentifyError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 fn metadata_reidentify_item(item: StoredMetadataReidentifyItem) -> MetadataReidentifyItem {

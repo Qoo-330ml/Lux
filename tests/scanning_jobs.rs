@@ -242,6 +242,64 @@ async fn completed_scan_enqueues_new_media_once_for_webhook_destinations()
 }
 
 #[tokio::test]
+async fn completed_scan_enqueues_media_removed_for_missing_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let media = root.join("Alpha.Movie.2020.mkv");
+    tokio::fs::write(&media, b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let webhooks = WebhookService::new(database.clone(), config.config_dir.clone())?;
+    let event_types = vec!["MEDIA_REMOVED".to_owned()];
+    webhooks
+        .create_destination(
+            "Removal receiver",
+            "https://example.com/lux-hook",
+            true,
+            false,
+            &event_types,
+            Some("webhook-test-secret-1234"),
+        )
+        .await?;
+    let jobs = ScanJobService::new(database.clone()).with_webhooks(webhooks);
+    let first = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&first.id, 100, None).await?;
+    tokio::fs::remove_file(media).await?;
+
+    let second = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&second.id, 100, None).await?;
+    let removed_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_events WHERE event_type = 'MEDIA_REMOVED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_events, 1);
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM notification_events WHERE event_type = 'MEDIA_REMOVED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&payload)?["removedCount"],
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconciliation_persists_discovered_file_count_before_discovery_finishes()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
