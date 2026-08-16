@@ -22,11 +22,15 @@ export const changelogReleases: ChangelogRelease[] = [
         "增加 Emby GET /Library/VirtualFolders 接口，返回管理员可见的媒体库虚拟文件夹、根路径、集合类型和刷新状态。",
         "支持通过共享 API Key 访问虚拟文件夹接口，并兼容根路径和 /emby 前缀。",
         "增加持久化出站 Webhook 通知，支持媒体、扫描、元数据和后台任务事件。",
+        "Webhook 增加播放边沿/节流进度事件，并支持 Lux 原生与有限 Emby 风格 payload 选择。",
+        "增加管理员通知页面，支持 Webhook 目标管理、Secret 轮换、测试发送和失败投递重试。",
         "增加 Emby GET /Persons 人物列表接口，支持分页、媒体库权限和共享 API Key。",
       ] },
       { kind: "fixed", items: [
         "修复 Webhook 重试、租约恢复和 Retry-After 响应处理，提升通知投递可靠性。",
         "加强 Webhook 管理权限、CSRF、SSRF 和事件 payload 字段白名单校验，避免敏感数据外泄。",
+        "修复人物索引回填和人物列表查询中 provider identity 丢失的问题。",
+        "修复混合媒体库首次扫描时未创建电影父级文件夹的问题。",
       ] },
       { kind: "changed", items: [
         "完善虚拟文件夹的 LibraryOptions、PathInfos 和 TypeOptions 字段，映射媒体库策略、字幕语言和播放恢复设置，提升 Emby 客户端兼容性。",
