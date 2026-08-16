@@ -219,6 +219,8 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
         assert_eq!(virtual_folders.status(), reqwest::StatusCode::OK);
         let virtual_folders_body = virtual_folders.json::<serde_json::Value>().await?;
         assert_eq!(virtual_folders_body[0]["Name"], "Movies");
+        assert_eq!(virtual_folders_body[0]["Id"], library.id.to_string());
+        assert_eq!(virtual_folders_body[0]["Guid"], library.id.to_string());
         assert_eq!(virtual_folders_body[0]["ItemId"], library.id.to_string());
         assert_eq!(virtual_folders_body[0]["CollectionType"], "movies");
         assert_eq!(

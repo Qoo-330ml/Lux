@@ -30,7 +30,7 @@
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
 - Web 的“已实现”仅表示代码路径和服务端静态集成已完成；当前 Chrome smoke 覆盖登录、筛选、播放、收藏、账户会话和管理流程，不等同于所有浏览器/编码格式兼容。
 - LUX-121 兼容补齐：Emby `Views` 返回媒体库类型、`ChildCount` 和标准 `ImageTags.Primary`；条目详情同时返回本地徽标的 `ImageTags.Logo`，并通过 `/Items/{itemId}/Images/Logo` 提供标准图片读取；媒体库封面支持 `/Items/{libraryId}/Images/Primary` 及带索引、HEAD、ETag 和 ACL。尚待 VidHub UI 重新实测确认。
-- Emby `GET /Library/VirtualFolders` 现返回接近官方 `VirtualFolderInfo` 的完整结构：`LibraryOptions` 包含 `PathInfos`、按电影/剧集类型拆分的 `TypeOptions`、Lux 当前图片策略、NFO 本地元数据策略、字幕语言和播放恢复阈值。Lux 没有等价 Emby 刮削器时，metadata/image fetcher 数组保持为空；尚未以目标第三方客户端真实 UI 复测该管理端点。
+- Emby `GET /Library/VirtualFolders` 现返回接近官方 `VirtualFolderInfo` 的完整结构：`Id`、`Guid`、`ItemId` 使用同一个稳定媒体库 ID，`LibraryOptions` 包含 `PathInfos`、按电影/剧集类型拆分的 `TypeOptions`、Lux 当前图片策略、NFO 本地元数据策略、字幕语言和播放恢复阈值。Lux 没有等价 Emby 刮削器时，metadata/image fetcher 数组保持为空；尚未以目标第三方客户端真实 UI 复测该管理端点。
 - Harbor 1.4.6 兼容修复：Emby 媒体库自身的 `/Users/{userId}/Items/{libraryId}` 详情现在返回 `CollectionFolder`，并复用媒体库启用状态和 ACL 校验；本机 Harbor 真实 UI 已验证可进入库并显示条目。
 - 2026-08-10 Emby 目录兼容修复：`Items/Latest` 默认按 `GroupItems=true` 返回电影/剧集根条目，剧集与季度 DTO 补充 `ChildCount`/`RecursiveItemCount`；`ParentId` 现在支持媒体库、剧集和季度，并覆盖剧集单集查询。`tests/series_api.rs` 已加入协议回归覆盖；网易爆米花真实设备复测仍待完成。
 - 2026-08-11 网易爆米花 2.15.3 DTO 兼容修复：已观察到客户端可登录并加载部分首页，但尚未进入播放会话。Emby 条目现补齐 `SortName`、`SeasonId`、`IndexNumber`、`PremiereDate` 和 `ProviderIds`，季/集层级的标准字段已有协议回归覆盖；完整首页、详情页和播放仍待重启服务后的真实设备复测，不据此宣称完全兼容。

@@ -5651,6 +5651,8 @@ fn emby_virtual_folder_json(
             resume_played_percent,
             resume_min_ticks,
         ),
+        "Id": view.library.id,
+        "Guid": view.library.id,
         "ItemId": view.library.id,
         "PrimaryImageItemId": view
             .library
