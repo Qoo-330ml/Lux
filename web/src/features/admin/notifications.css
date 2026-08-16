@@ -1,0 +1,37 @@
+.lux-notifications-page { display: grid; gap: 18px; }
+.lux-notifications-heading { margin-bottom: 0; }
+.lux-notifications-create { border-bottom: 1px solid var(--lux-line-soft); }
+.lux-notification-form, .lux-notification-edit-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.lux-notification-form > label, .lux-notification-edit-form > label { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
+.lux-notification-form input, .lux-notification-edit-form input { min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
+.lux-notification-form input:focus, .lux-notification-edit-form input:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.lux-notification-form > button { justify-self: start; }
+.lux-notification-events { grid-column: 1 / -1; min-width: 0; padding: 0; border: 0; }
+.lux-notification-events legend { margin-bottom: 9px; color: var(--lux-muted); font-size: .74rem; }
+.lux-notification-event-grid { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.lux-notification-event-grid label { display: flex; align-items: center; gap: 7px; min-height: 32px; color: var(--lux-text); font-size: .82rem; }
+.lux-notification-event-grid input { width: 16px; min-height: 16px; accent-color: var(--lux-accent); }
+.lux-notification-events small { display: block; margin-top: 7px; color: var(--lux-subtle); font-size: .72rem; }
+.lux-notification-destination-list, .lux-notification-delivery-list { display: grid; gap: 10px; }
+.lux-notification-destination { display: grid; gap: 14px; padding: 16px 0; border-top: 1px solid var(--lux-line-soft); }
+.lux-notification-destination-summary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 12px; }
+.lux-notification-destination-icon { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--lux-line-soft); border-radius: 9px; color: var(--lux-accent); }
+.lux-notification-destination h3 { margin: 0 0 4px; color: var(--lux-text); font-size: .95rem; }
+.lux-notification-destination p, .lux-notification-destination small { display: block; max-width: 100%; margin: 0; overflow: hidden; color: var(--lux-muted); font-size: .76rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-notification-destination small { margin-top: 5px; color: var(--lux-subtle); }
+.lux-notification-destination-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.lux-notification-edit-form { padding-top: 4px; }
+.lux-notification-result { margin: 0; color: var(--lux-accent); font-size: .78rem; }
+.lux-notification-delivery { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--lux-line-soft); }
+.lux-notification-delivery > div { display: grid; gap: 3px; min-width: 0; }
+.lux-notification-delivery strong { color: var(--lux-text); font-size: .84rem; }
+.lux-notification-delivery span, .lux-notification-delivery small { color: var(--lux-muted); font-size: .74rem; }
+.lux-notification-delivery small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-state { display: grid; place-items: center; gap: 10px; min-height: 240px; color: var(--lux-muted); text-align: center; }
+.lux-admin-state p { margin: 0; }
+.lux-notification-secret-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(0,0,0,.62); }
+.lux-notification-secret { width: min(560px, 100%); padding: 22px; border: 1px solid var(--lux-line); border-radius: 14px; background: var(--lux-panel); box-shadow: 0 22px 80px rgba(0,0,0,.35); }
+.lux-notification-secret code { display: block; overflow-wrap: anywhere; padding: 14px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-text); background: rgba(255,255,255,.05); font-size: .82rem; }
+.lux-notification-secret-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+@media (max-width: 720px) { .lux-notification-form, .lux-notification-edit-form { grid-template-columns: 1fr; } .lux-notification-events { grid-column: auto; } .lux-notification-destination-summary { grid-template-columns: auto minmax(0, 1fr); } .lux-notification-destination-summary > .lux-user-badge { grid-column: 2; justify-self: start; } .lux-notification-delivery { grid-template-columns: minmax(0, 1fr) auto; } .lux-notification-delivery > .lux-icon-button { grid-column: 2; grid-row: 1; } }
+html[data-lux-theme="light"] .lux-notification-form input, html[data-lux-theme="light"] .lux-notification-edit-form input { color: var(--lux-text); background: rgba(28,28,34,.04); }

@@ -19,6 +19,8 @@ import type {
   AdminMetadataReidentifyStart,
   AdminPlugin,
   AdminPluginStore,
+  AdminWebhookDelivery,
+  AdminWebhookDestination,
   ChapterSource,
   ApiErrorBody,
   DatabaseSetupInput,
@@ -435,6 +437,73 @@ export class LuxApiClient {
   adminInstalledPlugins() {
     return this.request<{ plugins?: AdminPlugin[]; total?: number; page?: number; pageSize?: number }>(
       "/api/v1/admin/plugins/installed?page=1&pageSize=50",
+    );
+  }
+
+  adminWebhookDestinations() {
+    return this.request<{ destinations?: AdminWebhookDestination[]; page?: number; pageSize?: number }>(
+      "/api/v1/admin/notification-destinations?page=1&pageSize=50",
+    );
+  }
+
+  createAdminWebhookDestination(input: {
+    name: string;
+    url: string;
+    enabled: boolean;
+    allowPrivateNetwork: boolean;
+    eventTypes: string[];
+    secret?: string;
+  }) {
+    return this.request<{ destination: AdminWebhookDestination; secret: string }>(
+      "/api/v1/admin/notification-destinations",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  updateAdminWebhookDestination(destinationId: string, input: {
+    name?: string;
+    url?: string;
+    enabled?: boolean;
+    allowPrivateNetwork?: boolean;
+    eventTypes?: string[];
+  }) {
+    return this.request<{ destination: AdminWebhookDestination }>(
+      `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}`,
+      { method: "PATCH", body: JSON.stringify(input) },
+    );
+  }
+
+  deleteAdminWebhookDestination(destinationId: string) {
+    return this.request<void>(
+      `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  testAdminWebhookDestination(destinationId: string) {
+    return this.request<{ status: number }>(
+      `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}/test`,
+      { method: "POST" },
+    );
+  }
+
+  rotateAdminWebhookSecret(destinationId: string) {
+    return this.request<{ secret: string }>(
+      `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}/rotate-secret`,
+      { method: "POST" },
+    );
+  }
+
+  adminWebhookDeliveries() {
+    return this.request<{ deliveries?: AdminWebhookDelivery[]; page?: number; pageSize?: number }>(
+      "/api/v1/admin/notification-deliveries?page=1&pageSize=50",
+    );
+  }
+
+  retryAdminWebhookDelivery(deliveryId: string) {
+    return this.request<void>(
+      `/api/v1/admin/notification-deliveries/${encodeURIComponent(deliveryId)}/retry`,
+      { method: "POST" },
     );
   }
 

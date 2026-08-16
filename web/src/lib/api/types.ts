@@ -290,6 +290,34 @@ export type AdminPluginStore = {
   defaultUrl: string;
 };
 
+export type AdminWebhookDestination = {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  allowPrivateNetwork: boolean;
+  eventTypes: string[];
+  secretConfigured: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type AdminWebhookDelivery = {
+  id: string;
+  eventId: string;
+  destinationId: string;
+  destinationName: string;
+  eventType: string;
+  status: string;
+  attemptCount: number;
+  nextAttemptAt: number;
+  lastHttpStatus?: number | null;
+  lastError?: string | null;
+  deliveredAt?: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type AdminPluginConfigField = {
   key: string;
   label: string;
