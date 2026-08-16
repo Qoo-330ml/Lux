@@ -812,6 +812,9 @@ impl LibraryScanner {
                 is_default: true,
             })
             .await?;
+        self.database
+            .repair_movie_parent_folder(library_id_text, &root.id, &relative_path, &item_id)
+            .await?;
         Ok(ScanReport {
             discovered_files: 1,
             created_items: 1,
@@ -1350,6 +1353,9 @@ impl LibraryScanner {
                 .await?;
             (item_id, true)
         };
+        self.database
+            .repair_movie_parent_folder(library_id_text, &root.id, &relative_path, &item_id)
+            .await?;
         if let Some(existing_entry) = existing_entry {
             let reassigned = self
                 .database
