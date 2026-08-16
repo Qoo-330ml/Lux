@@ -24,6 +24,7 @@ export const changelogReleases: ChangelogRelease[] = [
       ] },
       { kind: "changed", items: [
         "完善虚拟文件夹的 LibraryOptions、PathInfos 和 TypeOptions 字段，映射媒体库策略、字幕语言和播放恢复设置，提升 Emby 客户端兼容性。",
+        "完善虚拟文件夹媒体库身份字段，确保 Id、Guid 和 ItemId 使用同一个稳定的媒体库 ID。",
       ] },
     ],
   },
