@@ -168,3 +168,59 @@ async fn webhook_delivery_records_retry_after_and_permanent_http_failures()
     database.close().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn expired_webhook_delivery_lease_is_reclaimed() -> Result<(), Box<dyn std::error::Error>> {
+    let receiver_app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+    );
+    let receiver_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let receiver_address = receiver_listener.local_addr()?;
+    let receiver_server =
+        tokio::spawn(async move { axum::serve(receiver_listener, receiver_app).await });
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let service = WebhookService::new(database.clone(), config.config_dir.clone())?;
+    service
+        .create_destination(
+            "Lease receiver",
+            &format!("http://{receiver_address}/hook"),
+            true,
+            true,
+            &[],
+            Some("webhook-test-secret-1234"),
+        )
+        .await?;
+    service
+        .publish(
+            WebhookEventType::ScanCompleted,
+            "scan:lease-test",
+            1_700_000_000,
+            json!({"libraryId": "library-1"}),
+        )
+        .await?;
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET status = 'RUNNING', attempt_count = 1,
+             claimed_until = unixepoch() - 1, next_attempt_at = unixepoch()",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(service.process_ready_deliveries().await?, 1);
+    let result: (String, i64) =
+        sqlx::query_as("SELECT status, attempt_count FROM notification_deliveries")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(result, ("DELIVERED".to_owned(), 2));
+
+    receiver_server.abort();
+    database.close().await;
+    Ok(())
+}
