@@ -349,7 +349,7 @@ impl AppState {
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
             resources,
-            remote_access: RemoteAccessPolicy::from_env(),
+            remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
         }
     }
@@ -551,11 +551,6 @@ impl AppState {
                 }
             });
         }
-    }
-
-    pub fn with_remote_access_policy(mut self, policy: RemoteAccessPolicy) -> Self {
-        self.remote_access = policy;
-        self
     }
 
     pub fn require_database_selection(mut self) -> Self {
@@ -16860,10 +16855,7 @@ mod tests {
     fn direct_http_cookie_is_not_marked_secure() {
         let headers = HeaderMap::new();
 
-        assert!(!secure_cookie_for_request(
-            &headers,
-            &RemoteAccessPolicy::default()
-        ));
+        assert!(!secure_cookie_for_request(&headers, &RemoteAccessPolicy));
         let cookie = build_cookie("lux_session", "token", true, None, false)
             .expect("cookie value should be valid");
         assert!(
@@ -16877,10 +16869,8 @@ mod tests {
     #[test]
     fn trusted_https_forwarding_marks_cookie_secure() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.2"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        let policy = RemoteAccessPolicy::from_cidrs(["10.0.0.0/8"])
-            .expect("trusted proxy CIDR should be valid");
+        let policy = RemoteAccessPolicy;
 
         assert!(secure_cookie_for_request(&headers, &policy));
         let cookie = build_cookie("lux_session", "token", true, None, true)
@@ -16894,15 +16884,12 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_forwarded_https_does_not_mark_cookie_secure() {
+    fn forwarded_https_marks_cookie_secure_without_proxy_allowlist() {
         let mut headers = HeaderMap::new();
         headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.2"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
 
-        assert!(!secure_cookie_for_request(
-            &headers,
-            &RemoteAccessPolicy::default()
-        ));
+        assert!(secure_cookie_for_request(&headers, &RemoteAccessPolicy));
     }
 
     #[test]

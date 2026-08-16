@@ -13,38 +13,25 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 #[test]
-fn remote_policy_ignores_forwarded_headers_from_untrusted_peers() {
-    let policy = RemoteAccessPolicy::from_cidrs(["10.0.0.0/8"]).expect("valid proxy CIDR");
+fn remote_policy_uses_forwarded_client_without_proxy_allowlist() {
+    let policy = RemoteAccessPolicy;
 
+    assert_eq!(
+        policy.client_ip(Some("192.168.1.2"), Some("8.8.8.8")),
+        Some("8.8.8.8".parse().expect("valid client IP"))
+    );
     assert!(!policy.is_remote(Some("192.168.1.2"), Some("8.8.8.8")));
 }
 
 #[test]
-fn remote_policy_uses_forwarded_client_only_from_trusted_proxy() {
-    let policy = RemoteAccessPolicy::from_cidrs(["10.0.0.0/8"]).expect("valid proxy CIDR");
-
-    assert!(policy.is_remote(Some("10.1.2.3"), Some("8.8.8.8")));
-    assert!(!policy.is_remote(Some("10.1.2.3"), Some("192.168.1.20")));
-    assert!(!policy.is_remote(Some("100.64.12.4"), None));
-}
-
-#[test]
-fn remote_policy_returns_forwarded_client_only_from_trusted_proxy() {
-    let policy = RemoteAccessPolicy::from_cidrs(["10.0.0.0/8"]).expect("valid proxy CIDR");
+fn remote_policy_reports_forwarded_client_without_proxy_allowlist() {
+    let policy = RemoteAccessPolicy;
 
     assert_eq!(
-        policy.client_ip(Some("10.1.2.3"), Some("8.8.8.8")),
+        policy.reported_client_ip(Some("192.168.1.2"), Some("8.8.8.8")),
         Some("8.8.8.8".parse().expect("valid client IP"))
     );
-    assert_eq!(
-        policy.client_ip(Some("192.168.1.20"), Some("8.8.8.8")),
-        Some("192.168.1.20".parse().expect("valid peer IP"))
-    );
-    assert_eq!(policy.reported_client_ip(Some("10.1.2.3"), None), None);
-    assert_eq!(
-        policy.reported_client_ip(Some("192.168.1.20"), None),
-        Some("192.168.1.20".parse().expect("valid peer IP"))
-    );
+    assert_eq!(policy.reported_client_ip(Some("192.168.1.20"), None), None);
 }
 
 #[tokio::test]
@@ -88,9 +75,7 @@ async fn remote_policy_blocks_auth_and_media_until_user_is_allowed()
 
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let policy = RemoteAccessPolicy::from_cidrs(["127.0.0.1/32"])?;
-    let state = AppState::ready(config, database.clone(), setup, web_auth, emby_auth)
-        .with_remote_access_policy(policy);
+    let state = AppState::ready(config, database.clone(), setup, web_auth, emby_auth);
     let app = app_with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -109,7 +94,7 @@ async fn remote_policy_blocks_auth_and_media_until_user_is_allowed()
         .json(&json!({ "username": "viewer", "password": "viewer password" }))
         .send()
         .await?;
-    assert_eq!(denied_login.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(denied_login.status(), reqwest::StatusCode::OK);
 
     sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
         .bind(viewer.id.to_string())
@@ -141,7 +126,7 @@ async fn remote_policy_blocks_auth_and_media_until_user_is_allowed()
         .header("x-forwarded-for", "8.8.8.8")
         .send()
         .await?;
-    assert_eq!(blocked_item.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(blocked_item.status(), reqwest::StatusCode::OK);
 
     server.abort();
     Ok(())

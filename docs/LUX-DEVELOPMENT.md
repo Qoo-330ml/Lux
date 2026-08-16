@@ -286,7 +286,7 @@ Lux 的核心价值不是功能数量，而是：
 - 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 Lux 发出的网络请求，包括 `.strm` 下载的上游请求，但不代理播放时由客户端直连的 `.strm` 地址和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
 - 远程访问权限由用户策略控制。
-- 只有受信代理来源的 X-Forwarded-For、X-Forwarded-Proto 等请求头可以影响远近端判断。
+- Lux 会优先使用 X-Forwarded-For、X-Forwarded-Proto 等反代请求头；远程访问权限不再依据来源 IP 判断。
 - 反向代理场景必须使用 HTTPS；用户名和密码登录协议本身不能替代 TLS。
 
 ### 3.14 管理与可观测性
@@ -2608,15 +2608,14 @@ services:
 
 依赖：LUX-090。
 
-#### LUX-092：可信代理和远近端判断
+#### LUX-092：转发客户端 IP 和远程访问行为
 
 验收：
 
-- 默认不信任转发头。
-- 只接受配置代理 CIDR 的转发头。
-- can_remote_access 在所有认证入口和媒体请求生效。
+- 无需配置代理 CIDR，始终优先使用有效的转发头。
+- 远程访问只依赖账号认证和媒体库 ACL，不再依据来源 IP 或 can_remote_access 阻止请求。
 
-验证：伪造头、可信代理、Tailscale 地址测试。
+验证：转发头解析、无转发头回退和反代 HTTPS Cookie 测试。
 
 依赖：LUX-090。
 
@@ -2928,7 +2927,7 @@ services:
 
 验收：
 
-- HTTPS、trusted proxy、Range、超时和流缓冲配置说明完整。
+- HTTPS、转发客户端 IP、Range、超时和流缓冲配置说明完整。
 - 明确不公开初始化中的实例。
 
 验证：至少一种真实反向代理手工验证。

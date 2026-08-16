@@ -6,7 +6,6 @@ use luxd::{
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
-    network::RemoteAccessPolicy,
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
@@ -62,10 +61,13 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(
-        AppState::ready(config, database.clone(), setup, auth, emby_auth)
-            .with_remote_access_policy(RemoteAccessPolicy::from_cidrs(["127.0.0.1/32"])?),
-    );
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move {

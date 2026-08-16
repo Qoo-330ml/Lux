@@ -55,7 +55,6 @@ docker run -d --rm \
     --name "$UPSTREAM_NAME" \
     --network "$NETWORK" \
     --network-alias lux-proxy-upstream \
-    -e "LUX_TRUSTED_PROXY_CIDRS=$SUBNET" \
     -v "$VOLUME:/config" \
     -v "$MEDIA_DIR:/media:rw" \
     "$IMAGE" >"$WORK_DIR/upstream.id"
@@ -123,7 +122,7 @@ remote_login_status="$(curl -ksS -o "$WORK_DIR/remote-login.json" -w '%{http_cod
     -H 'Content-Type: application/json' \
     -H 'X-Forwarded-For: 8.8.8.8' \
     -d '{"username":"proxy-viewer","password":"proxy-viewer-password"}')"
-[[ "$remote_login_status" == 403 ]]
+[[ "$remote_login_status" == 200 ]]
 
 local_login_status="$(curl -ksS -o "$WORK_DIR/local-login.json" -w '%{http_code}' \
     -X POST "https://127.0.0.1:$PORT/api/v1/auth/login" \
