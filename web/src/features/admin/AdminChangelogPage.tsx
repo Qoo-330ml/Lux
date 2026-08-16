@@ -22,6 +22,9 @@ export const changelogReleases: ChangelogRelease[] = [
         "增加 Emby GET /Library/VirtualFolders 接口，返回管理员可见的媒体库虚拟文件夹、根路径、集合类型和刷新状态。",
         "支持通过共享 API Key 访问虚拟文件夹接口，并兼容根路径和 /emby 前缀。",
       ] },
+      { kind: "changed", items: [
+        "完善虚拟文件夹的 LibraryOptions、PathInfos 和 TypeOptions 字段，映射媒体库策略、字幕语言和播放恢复设置，提升 Emby 客户端兼容性。",
+      ] },
     ],
   },
   {
