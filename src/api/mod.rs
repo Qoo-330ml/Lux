@@ -62,7 +62,7 @@ use crate::{
             ImageWriteService, normalize_image_type, read_image_dimensions,
         },
         ip_location::{IpLocation, IpLocationService},
-        libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
+        libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch, LibraryView},
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
         metadata::MetadataField,
         network_diagnostics::{NetworkDiagnostics, NetworkProbeResult, test_network},
@@ -1261,6 +1261,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/System/Ping", get(emby_ping).post(emby_ping))
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
+        .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
         .route("/Users/{user_id}", get(emby_user))
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Root", get(emby_user_root))
@@ -2063,6 +2064,34 @@ async fn emby_user_views(
             .into_response()
         }
         Err(status) => status.into_response(),
+    }
+}
+
+async fn emby_library_virtual_folders(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match libraries.list_libraries().await {
+        Ok(views) => Json(
+            views
+                .iter()
+                .filter(|view| view.library.is_enabled)
+                .map(emby_virtual_folder_json)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -5574,6 +5603,26 @@ fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count:
             "IsFavorite": false,
             "Played": false,
         },
+    })
+}
+
+fn emby_virtual_folder_json(view: &LibraryView) -> Value {
+    json!({
+        "Name": view.library.name,
+        "Locations": view
+            .roots
+            .iter()
+            .map(|root| root.display_path.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+        "CollectionType": emby_collection_type(view.library.kind),
+        "ItemId": view.library.id,
+        "PrimaryImageItemId": view
+            .library
+            .cover_image_tag
+            .as_ref()
+            .map(|_| view.library.id),
+        "RefreshProgress": null,
+        "RefreshStatus": "Idle",
     })
 }
 

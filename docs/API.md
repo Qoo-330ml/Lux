@@ -163,6 +163,7 @@ Lux 电影查询要求有效 Web session：
 Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 - `GET /Items/Counts`：返回当前用户可见媒体条目的 Emby 统计字段；支持 `UserId` 指定目标用户和 `IsFavorite=true|false` 按目标用户收藏状态过滤。Lux 当前支持电影、剧集、单集和合集计数，其余 Emby 类型返回 0；`ItemCount` 为过滤后所有可见目录条目（包含季度等层级条目）的总数。
+- `GET /Library/VirtualFolders`：管理员获取 Emby 兼容的媒体库列表；返回 `Name`、`Locations`、`CollectionType`、`ItemId`、`PrimaryImageItemId` 和刷新状态字段。支持根路径及 `/emby` 前缀，并接受共享 API Key。
 - `GET /Users/{userId}/Views`：返回电影媒体库视图。
 - `GET /Users/{userId}/Items/Root`、`GET /Items/Root?userId={userId}`：返回用户虚拟根目录；将该根 ID 作为 `ParentId` 并请求 `IncludeItemTypes=CollectionFolder` 时返回当前用户可见的媒体库文件夹。
 - `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`Recursive`、`StartIndex`、`Limit`、`IncludeItemTypes` 和 `ExcludeItemTypes`，`ParentId` 可指向虚拟根、媒体库、物理媒体目录、剧集或季度；电影扫描会为物理媒体目录建立稳定的 `FOLDER` 条目，普通电影列表和统计不会把这些内部目录项当成电影。网易爆米花首页使用的无 `ParentId`、无 `Recursive=true`、无 `IncludeItemTypes` 但带 `ExcludeItemTypes` 请求返回当前用户可见的媒体库 `CollectionFolder`，再按媒体库 ID 请求 `Items/Latest`；递归查询按排除类型过滤；默认从 0 开始、每页 50 条，单页上限 100。
