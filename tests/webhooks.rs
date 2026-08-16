@@ -30,11 +30,12 @@ fn webhook_url_rejects_credentials_queries_and_unsupported_schemes() {
 fn webhook_url_requires_explicit_private_network_opt_in() {
     assert!(matches!(
         validate_webhook_url("http://127.0.0.1:8080/hooks", false),
-        Err(WebhookUrlError::DangerousAddress)
+        Err(WebhookUrlError::PrivateNetwork)
     ));
+    assert!(validate_webhook_url("http://127.0.0.1:8080/hooks", true).is_ok());
     assert!(matches!(
-        validate_webhook_url("http://127.0.0.1:8080/hooks", true),
-        Err(WebhookUrlError::DangerousAddress)
+        validate_webhook_url("http://[::ffff:192.168.1.2]:8080/hooks", false),
+        Err(WebhookUrlError::PrivateNetwork)
     ));
 }
 

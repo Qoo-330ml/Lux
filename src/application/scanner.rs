@@ -6,10 +6,11 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::UNIX_EPOCH,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use quick_xml::{events::Event, reader::Reader};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -34,6 +35,7 @@ use crate::{
         strm_target::{StrmTarget, StrmTargetKind, classify_strm_target},
         thumbnails::ThumbnailService,
         watch::ChangeKind,
+        webhooks::{WebhookEventType, WebhookService},
     },
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     observability::resources::ResourceMetrics,
@@ -1455,6 +1457,7 @@ pub struct ScanJobService {
     strm_probe: Option<StrmProbeService>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
+    webhooks: Option<WebhookService>,
     resources: ResourceMetrics,
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
@@ -1477,6 +1480,7 @@ impl ScanJobService {
             strm_probe: None,
             people: None,
             local_nfo: None,
+            webhooks: None,
             resources: ResourceMetrics::new(),
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1509,6 +1513,11 @@ impl ScanJobService {
 
     pub fn with_nfo_store(mut self, local_nfo: LocalNfoMetadataStore) -> Self {
         self.local_nfo = Some(local_nfo);
+        self
+    }
+
+    pub fn with_webhooks(mut self, webhooks: WebhookService) -> Self {
+        self.webhooks = Some(webhooks);
         self
     }
 
@@ -1554,6 +1563,7 @@ impl ScanJobService {
         Ok(ScanBatchReport {
             status: "CANCELLED".to_owned(),
             processed: 0,
+            created_items: 0,
             completed: true,
         })
     }
@@ -1754,6 +1764,7 @@ impl ScanJobService {
             return Ok(ScanBatchReport {
                 status: job.status,
                 processed: 0,
+                created_items: 0,
                 completed: true,
             });
         }
@@ -1890,6 +1901,7 @@ impl ScanJobService {
         Ok(ScanBatchReport {
             status: "RUNNING".to_owned(),
             processed: 0,
+            created_items: 0,
             completed: false,
         })
     }
@@ -1951,9 +1963,12 @@ impl ScanJobService {
                 .await?;
             self.record_event(&job.id, "INFO", "JOB_COMPLETED", "任务已完成", "{}")
                 .await;
+            self.publish_webhook_event(job, WebhookEventType::ScanCompleted, None)
+                .await;
             return Ok(ScanBatchReport {
                 status: "COMPLETED".to_owned(),
                 processed: 0,
+                created_items: 0,
                 completed: true,
             });
         }
@@ -1973,6 +1988,7 @@ impl ScanJobService {
         let mut processed = 0_usize;
         let mut next_count = job.processed_count;
         let mut completed_entries = Vec::<StoredReconciliationScanEntry>::new();
+        let mut created_items = 0_usize;
         for entry in &batch {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(&job.id).await;
@@ -2095,15 +2111,24 @@ impl ScanJobService {
                 }
                 _ => Err(ScannerError::LibraryNotFound),
             };
-            if let Err(error) = result {
-                return self.fail_reconciliation_job(job, error).await;
-            }
+            let report = match result {
+                Ok(report) => report,
+                Err(error) => return self.fail_reconciliation_job(job, error).await,
+            };
+            created_items = created_items.saturating_add(report.created_items);
             next_count = next_count.saturating_add(1);
             processed = processed.saturating_add(1);
             completed_entries.push(entry.clone());
         }
-        self.finish_reconciliation_file_batch(job, completed_entries, processed, next_count, None)
-            .await
+        self.finish_reconciliation_file_batch(
+            job,
+            completed_entries,
+            processed,
+            created_items,
+            next_count,
+            None,
+        )
+        .await
     }
 
     async fn run_movie_reconciliation_file_batch(
@@ -2116,6 +2141,7 @@ impl ScanJobService {
     ) -> Result<ScanBatchReport, ScanJobError> {
         let mut processed = 0_usize;
         let mut next_count = job.processed_count;
+        let mut created_items = 0_usize;
         let mut completed_entries = Vec::<(usize, StoredReconciliationScanEntry)>::new();
         let mut unavailable_root_ids = HashSet::<String>::new();
         let mut existing_paths_by_root = HashMap::<String, HashSet<String>>::new();
@@ -2305,13 +2331,15 @@ impl ScanJobService {
             let Some(files) = prepared_files.get(&root.id) else {
                 continue;
             };
-            if let Err(error) = self
+            let inserted = match self
                 .database
                 .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
                 .await
             {
-                return self.fail_reconciliation_job(job, error.into()).await;
-            }
+                Ok(inserted) => inserted,
+                Err(error) => return self.fail_reconciliation_job(job, error.into()).await,
+            };
+            created_items = created_items.saturating_add(inserted);
         }
 
         completed_entries.sort_by_key(|(index, _)| *index);
@@ -2323,6 +2351,7 @@ impl ScanJobService {
             job,
             completed_entries,
             processed,
+            created_items,
             next_count,
             Some(concurrency),
         )
@@ -2334,6 +2363,7 @@ impl ScanJobService {
         job: &StoredScanJob,
         completed_entries: Vec<StoredReconciliationScanEntry>,
         processed: usize,
+        created_items: usize,
         next_count: i64,
         effective_concurrency: Option<usize>,
     ) -> Result<ScanBatchReport, ScanJobError> {
@@ -2357,11 +2387,13 @@ impl ScanJobService {
         if self.database.scan_job_cancel_requested(&job.id).await? {
             let mut cancelled = self.cancel_running_job(&job.id).await?;
             cancelled.processed = processed;
+            cancelled.created_items = created_items;
             return Ok(cancelled);
         }
         Ok(ScanBatchReport {
             status: "RUNNING".to_owned(),
             processed,
+            created_items,
             completed: false,
         })
     }
@@ -2379,6 +2411,8 @@ impl ScanJobService {
             .finish_scan_job(&job.id, "FAILED", Some(&error.to_string()))
             .await?;
         self.record_event(&job.id, "ERROR", error_code, "扫描任务失败", "{}")
+            .await;
+        self.publish_webhook_event(job, WebhookEventType::ScanFailed, Some(error_code))
             .await;
         self.clear_cancellation_flag(&job.id);
         Err(error.into())
@@ -2398,6 +2432,7 @@ impl ScanJobService {
             return Ok(ScanBatchReport {
                 status: job.status,
                 processed: 0,
+                created_items: 0,
                 completed: true,
             });
         }
@@ -2425,16 +2460,20 @@ impl ScanJobService {
                     .await?;
                 self.record_event(job_id, "INFO", "JOB_COMPLETED", "局部扫描任务已完成", "{}")
                     .await;
+                self.publish_webhook_event(&job, WebhookEventType::ScanCompleted, None)
+                    .await;
                 self.clear_cancellation_flag(job_id);
                 return Ok(ScanBatchReport {
                     status: "COMPLETED".to_owned(),
                     processed: 0,
+                    created_items: 0,
                     completed: true,
                 });
             }
             return Ok(ScanBatchReport {
                 status: "RUNNING".to_owned(),
                 processed: 0,
+                created_items: 0,
                 completed: false,
             });
         }
@@ -2443,21 +2482,32 @@ impl ScanJobService {
             .find_library(&job.library_id)
             .await?
             .ok_or(ScanJobError::LibraryNotFound)?;
+        let mut created_items = 0_usize;
         for path in &paths {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(job_id).await;
             }
-            if let Err(error) = self
+            let created = match self
                 .process_incremental_path(&library.kind, &job, path, cancellation)
                 .await
             {
-                self.database
-                    .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
-                    .await?;
-                self.record_event(job_id, "ERROR", error.code(), "局部扫描任务失败", "{}")
+                Ok(created) => created,
+                Err(error) => {
+                    self.database
+                        .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
+                        .await?;
+                    self.record_event(job_id, "ERROR", error.code(), "局部扫描任务失败", "{}")
+                        .await;
+                    self.publish_webhook_event(
+                        &job,
+                        WebhookEventType::ScanFailed,
+                        Some(error.code()),
+                    )
                     .await;
-                return Err(error.into());
-            }
+                    return Err(error.into());
+                }
+            };
+            created_items = created_items.saturating_add(created);
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(job_id).await;
             }
@@ -2481,8 +2531,67 @@ impl ScanJobService {
         Ok(ScanBatchReport {
             status: "RUNNING".to_owned(),
             processed,
+            created_items,
             completed: false,
         })
+    }
+
+    async fn publish_webhook_event(
+        &self,
+        job: &StoredScanJob,
+        event_type: WebhookEventType,
+        error_code: Option<&str>,
+    ) {
+        self.publish_webhook_event_with_data(job, event_type, error_code, json!({}))
+            .await;
+    }
+
+    async fn publish_media_added_event(&self, job: &StoredScanJob, added_count: usize) {
+        if added_count > 0 {
+            self.publish_webhook_event_with_data(
+                job,
+                WebhookEventType::MediaAdded,
+                None,
+                json!({ "addedCount": added_count }),
+            )
+            .await;
+        }
+    }
+
+    async fn publish_webhook_event_with_data(
+        &self,
+        job: &StoredScanJob,
+        event_type: WebhookEventType,
+        error_code: Option<&str>,
+        extra: Value,
+    ) {
+        let Some(webhooks) = self.webhooks.as_ref() else {
+            return;
+        };
+        let occurred_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+            .unwrap_or(0);
+        let dedupe_key = format!("scan:{}:{}", job.id, event_type.as_str());
+        let mut data = json!({
+            "jobId": job.id,
+            "libraryId": job.library_id,
+            "jobType": job.job_type,
+            "status": job.status,
+            "processedCount": job.processed_count,
+            "totalCount": job.total_count,
+            "errorCode": error_code,
+        });
+        if let (Value::Object(data), Value::Object(extra)) = (&mut data, extra) {
+            data.extend(extra);
+        }
+        let result = webhooks
+            .publish(event_type, &dedupe_key, occurred_at, data)
+            .await;
+        if result.is_err() {
+            tracing::warn!(job_id = %job.id, event_type = event_type.as_str(), "failed to enqueue webhook event");
+        }
     }
 
     async fn process_incremental_path(
@@ -2491,7 +2600,7 @@ impl ScanJobService {
         job: &StoredScanJob,
         path: &StoredScanJobPath,
         cancellation: &AtomicBool,
-    ) -> Result<(), ScannerError> {
+    ) -> Result<usize, ScannerError> {
         let root = self
             .database
             .find_library_root(&path.library_root_id)
@@ -2503,7 +2612,7 @@ impl ScanJobService {
             self.database
                 .mark_filesystem_entry_missing_by_path(&root.id, &path.relative_path)
                 .await?;
-            return Ok(());
+            return Ok(0);
         }
         let metadata = fs::metadata(&media_path)
             .await
@@ -2512,24 +2621,29 @@ impl ScanJobService {
                 source,
             })?;
         if metadata.is_dir() {
+            let mut created_items = 0_usize;
             let mut walker = FileBatchWalker::new(&media_path);
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
                 for file in files {
                     if cancellation.load(Ordering::Acquire) {
-                        return Ok(());
+                        return Ok(created_items);
                     }
-                    self.process_incremental_file(library_kind, job, &root, root_path, &file)
-                        .await?;
+                    created_items = created_items.saturating_add(
+                        self.process_incremental_file(library_kind, job, &root, root_path, &file)
+                            .await?,
+                    );
                 }
             }
+            Ok(created_items)
         } else if is_supported_movie_file(&media_path) {
             if cancellation.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(0);
             }
             self.process_incremental_file(library_kind, job, &root, root_path, &media_path)
-                .await?;
+                .await
+        } else {
+            Ok(0)
         }
-        Ok(())
     }
 
     async fn process_incremental_file(
@@ -2539,39 +2653,39 @@ impl ScanJobService {
         root: &StoredLibraryRoot,
         root_path: &Path,
         file: &Path,
-    ) -> Result<(), ScannerError> {
+    ) -> Result<usize, ScannerError> {
         let generation = &job.generation;
-        match library_kind {
+        let report = match library_kind {
             "MOVIE" => {
                 self.scanner
                     .scan_movie_file(&job.library_id, root, root_path, file, generation)
-                    .await?;
+                    .await?
             }
             "SERIES" => {
                 self.scanner
                     .scan_episode_file(&job.library_id, root, root_path, file, generation)
-                    .await?;
+                    .await?
             }
             "MIXED" => match classify_mixed_file(root_path, file).await {
                 MixedClassification::Movie => {
                     self.scanner
                         .scan_movie_file(&job.library_id, root, root_path, file, generation)
-                        .await?;
+                        .await?
                 }
                 MixedClassification::Episode => {
                     self.scanner
                         .scan_episode_file(&job.library_id, root, root_path, file, generation)
-                        .await?;
+                        .await?
                 }
                 MixedClassification::Unresolved => {
                     self.scanner
                         .scan_unresolved_file(&job.library_id, root, root_path, file, generation)
-                        .await?;
+                        .await?
                 }
             },
             _ => return Err(ScannerError::LibraryNotFound),
-        }
-        Ok(())
+        };
+        Ok(report.created_items)
     }
 
     pub async fn run_to_completion(
@@ -2609,8 +2723,10 @@ impl ScanJobService {
             return Err(ScanJobError::InvalidBatchSize);
         }
         let _scan_permit = self.acquire_scan_lock().await?;
+        let mut created_items = 0_usize;
         loop {
             let report = self.run_batch_unlocked(job_id, batch_size).await?;
+            created_items = created_items.saturating_add(report.created_items);
             if !report.completed {
                 tokio::task::yield_now().await;
                 continue;
@@ -2639,6 +2755,8 @@ impl ScanJobService {
                         .await;
                     }
                     self.run_auto_library_cover_after_scan(job_id).await?;
+                    self.publish_media_added_event(&completed_job, created_items)
+                        .await;
                     return Ok(());
                 }
                 self.run_probe_after_scan(job_id, probe).await?;
@@ -2651,6 +2769,8 @@ impl ScanJobService {
                             .await;
                     }
                 }
+                self.publish_media_added_event(&completed_job, created_items)
+                    .await;
             }
             return Ok(());
         }
@@ -3322,6 +3442,7 @@ fn scan_job(job: StoredScanJob) -> ScanJob {
 pub struct ScanBatchReport {
     pub status: String,
     pub processed: usize,
+    pub created_items: usize,
     pub completed: bool,
 }
 

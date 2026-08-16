@@ -87,6 +87,7 @@ use crate::{
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
+        webhooks::{WebhookError, WebhookService},
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
@@ -146,6 +147,7 @@ pub struct AppState {
     strm_probe: Option<StrmProbeService>,
     chapter_detection: Option<ChapterDetectionService>,
     scheduled_tasks: Option<ScheduledTaskService>,
+    webhooks: Option<WebhookService>,
     danmaku: Option<DanmakuService>,
     plugins: Option<PluginService>,
     scraper_resolver: Option<ScraperResolver>,
@@ -239,6 +241,13 @@ impl AppState {
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
         let chapter_detection = ChapterDetectionService::new(database.clone(), plugins.clone());
+        let webhooks = match WebhookService::new(database.clone(), config_dir.clone()) {
+            Ok(service) => Some(service),
+            Err(error) => {
+                tracing::error!(%error, "failed to initialize webhook notifications");
+                None
+            }
+        };
         let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
         let probe = Some(MediaProbeService::new(
@@ -254,10 +263,14 @@ impl AppState {
                 Some(covers) => service.with_library_covers(covers),
                 None => service,
             };
-            service
+            let service = service
                 .with_strm_probe(strm_probe.clone())
                 .with_people(people.clone())
-                .with_nfo_store(local_nfo.clone())
+                .with_nfo_store(local_nfo.clone());
+            match webhooks.clone() {
+                Some(webhooks) => service.with_webhooks(webhooks),
+                None => service,
+            }
         };
         let scheduled_tasks = ScheduledTaskService::new(
             database.clone(),
@@ -309,6 +322,7 @@ impl AppState {
             strm_probe: Some(strm_probe),
             chapter_detection: Some(chapter_detection),
             scheduled_tasks: Some(scheduled_tasks),
+            webhooks,
             danmaku: Some(
                 DanmakuService::new(
                     database.clone(),
@@ -488,6 +502,12 @@ impl AppState {
         }
         if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
             scheduled_tasks.spawn();
+        }
+    }
+
+    pub fn start_webhook_worker(&self) {
+        if let Some(webhooks) = self.webhooks.as_ref() {
+            webhooks.spawn_worker();
         }
     }
 
@@ -781,6 +801,32 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/settings/network-proxy/test",
             post(admin_test_network_proxy),
+        )
+        .route(
+            "/api/v1/admin/notification-destinations",
+            get(admin_list_webhook_destinations).post(admin_create_webhook_destination),
+        )
+        .route(
+            "/api/v1/admin/notification-destinations/{destination_id}",
+            get(admin_get_webhook_destination)
+                .patch(admin_update_webhook_destination)
+                .delete(admin_delete_webhook_destination),
+        )
+        .route(
+            "/api/v1/admin/notification-destinations/{destination_id}/test",
+            post(admin_test_webhook_destination),
+        )
+        .route(
+            "/api/v1/admin/notification-destinations/{destination_id}/rotate-secret",
+            post(admin_rotate_webhook_secret),
+        )
+        .route(
+            "/api/v1/admin/notification-deliveries",
+            get(admin_list_webhook_deliveries),
+        )
+        .route(
+            "/api/v1/admin/notification-deliveries/{delivery_id}/retry",
+            post(admin_retry_webhook_delivery),
         )
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
@@ -12998,6 +13044,340 @@ async fn probe_directory_writable(path: &FsPath) -> bool {
     .await;
     let _ = fs::remove_file(probe_path).await;
     result.is_ok()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WebhookDestinationCreateRequest {
+    name: String,
+    url: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    allow_private_network: bool,
+    #[serde(default)]
+    event_types: Vec<String>,
+    secret: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WebhookDestinationUpdateRequest {
+    name: Option<String>,
+    url: Option<String>,
+    enabled: Option<bool>,
+    allow_private_network: Option<bool>,
+    event_types: Option<Vec<String>>,
+}
+
+const fn default_enabled() -> bool {
+    true
+}
+
+async fn admin_list_webhook_destinations(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.list_destinations(offset, limit).await {
+        Ok(destinations) => Json(json!({
+            "destinations": destinations,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_get_webhook_destination(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.get_destination(&destination_id).await {
+        Ok(Some(destination)) => Json(json!({ "destination": destination })).into_response(),
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "Webhook 目标不存在",
+        )
+        .into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_create_webhook_destination(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<WebhookDestinationCreateRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service
+        .create_destination(
+            &request.name,
+            &request.url,
+            request.enabled,
+            request.allow_private_network,
+            &request.event_types,
+            request.secret.as_deref(),
+        )
+        .await
+    {
+        Ok((destination, secret)) => (
+            StatusCode::CREATED,
+            Json(json!({ "destination": destination, "secret": secret })),
+        )
+            .into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_update_webhook_destination(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<WebhookDestinationUpdateRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service
+        .update_destination(
+            &destination_id,
+            request.name.as_deref(),
+            request.url.as_deref(),
+            request.enabled,
+            request.allow_private_network,
+            request.event_types.as_deref(),
+        )
+        .await
+    {
+        Ok(destination) => Json(json!({ "destination": destination })).into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_delete_webhook_destination(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.delete_destination(&destination_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_test_webhook_destination(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.test_destination(&destination_id).await {
+        Ok(status) => Json(json!({ "status": status })).into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_rotate_webhook_secret(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.rotate_secret(&destination_id).await {
+        Ok(secret) => Json(json!({ "secret": secret })).into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_list_webhook_deliveries(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.list_deliveries(offset, limit).await {
+        Ok(deliveries) => Json(json!({
+            "deliveries": deliveries,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_retry_webhook_delivery(
+    headers: HeaderMap,
+    Path(delivery_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.retry_delivery(&delivery_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+fn webhook_error_response(headers: &HeaderMap, error: WebhookError) -> Response {
+    match error {
+        WebhookError::Invalid(message) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response(),
+        WebhookError::NotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "Webhook 目标或投递记录不存在",
+        )
+        .into_response(),
+        WebhookError::Storage(_)
+        | WebhookError::Io(_)
+        | WebhookError::Serialization(_)
+        | WebhookError::SecretUnavailable
+        | WebhookError::RequestSetup(_) => {
+            tracing::warn!("webhook operation failed");
+            api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "Webhook 通知服务暂时不可用",
+            )
+            .into_response()
+        }
+    }
 }
 
 async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Response {

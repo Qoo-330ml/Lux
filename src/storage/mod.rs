@@ -730,6 +730,357 @@ impl Database {
             })
     }
 
+    pub(crate) async fn create_notification_destination(
+        &self,
+        destination: NewNotificationDestination<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO notification_destinations (
+                id, name, url, enabled, allow_private_network, event_types_json
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(destination.id)
+        .bind(destination.name)
+        .bind(destination.url)
+        .bind(database_flag(destination.enabled))
+        .bind(database_flag(destination.allow_private_network))
+        .bind(destination.event_types_json)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_notification_destination(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredNotificationDestination>, StorageError> {
+        self.query(
+            "SELECT id, name, url, enabled, allow_private_network, event_types_json,
+                    created_at, updated_at
+             FROM notification_destinations WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_notification_destination))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_notification_destinations(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredNotificationDestination>, StorageError> {
+        self.query(
+            "SELECT id, name, url, enabled, allow_private_network, event_types_json,
+                    created_at, updated_at
+             FROM notification_destinations
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(stored_notification_destination)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_enabled_notification_destinations(
+        &self,
+    ) -> Result<Vec<StoredNotificationDestination>, StorageError> {
+        self.query(
+            "SELECT id, name, url, enabled, allow_private_network, event_types_json,
+                    created_at, updated_at
+             FROM notification_destinations
+             WHERE enabled = 1
+             ORDER BY id LIMIT 1000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(stored_notification_destination)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_notification_destination(
+        &self,
+        id: &str,
+        update: UpdateNotificationDestination<'_>,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE notification_destinations
+             SET name = COALESCE(?, name),
+                 url = COALESCE(?, url),
+                 enabled = COALESCE(?, enabled),
+                 allow_private_network = COALESCE(?, allow_private_network),
+                 event_types_json = COALESCE(?, event_types_json),
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(update.name)
+        .bind(update.url)
+        .bind(update.enabled.map(database_flag))
+        .bind(update.allow_private_network.map(database_flag))
+        .bind(update.event_types_json)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn delete_notification_destination(
+        &self,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query("DELETE FROM notification_destinations WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn insert_notification_event_with_deliveries(
+        &self,
+        event: NewNotificationEvent<'_>,
+        destination_ids: &[String],
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let inserted = self
+            .query(
+                "INSERT INTO notification_events (
+                    id, event_type, schema_version, occurred_at, dedupe_key, payload_json
+                 ) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(dedupe_key) DO NOTHING",
+            )
+            .bind(event.id)
+            .bind(event.event_type)
+            .bind(event.schema_version)
+            .bind(event.occurred_at)
+            .bind(event.dedupe_key)
+            .bind(event.payload_json)
+            .execute(&mut *transaction)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if inserted {
+            for destination_id in destination_ids {
+                self.query(
+                    "INSERT INTO notification_deliveries (
+                        id, event_id, destination_id, status
+                     ) VALUES (?, ?, ?, 'PENDING')
+                     ON CONFLICT(event_id, destination_id) DO NOTHING",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(event.id)
+                .bind(destination_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(inserted)
+    }
+
+    pub(crate) async fn list_ready_notification_deliveries(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StoredNotificationDelivery>, StorageError> {
+        self.query(
+            "SELECT d.id, d.event_id, d.destination_id, d.status, d.attempt_count,
+                    d.next_attempt_at, d.claimed_until, d.last_http_status, d.last_error,
+                    d.delivered_at, d.created_at, d.updated_at,
+                    e.event_type, e.schema_version, e.occurred_at, e.payload_json,
+                    n.name, n.url, n.allow_private_network
+             FROM notification_deliveries d
+             JOIN notification_events e ON e.id = d.event_id
+             JOIN notification_destinations n ON n.id = d.destination_id
+             WHERE n.enabled = 1
+               AND d.next_attempt_at <= unixepoch()
+               AND (d.status = 'PENDING'
+                    OR (d.status = 'RUNNING' AND d.claimed_until <= unixepoch()))
+             ORDER BY d.next_attempt_at, d.created_at, d.id
+             LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_notification_delivery).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_notification_deliveries(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredNotificationDelivery>, StorageError> {
+        self.query(
+            "SELECT d.id, d.event_id, d.destination_id, d.status, d.attempt_count,
+                    d.next_attempt_at, d.claimed_until, d.last_http_status, d.last_error,
+                    d.delivered_at, d.created_at, d.updated_at,
+                    e.event_type, e.schema_version, e.occurred_at, e.payload_json,
+                    n.name, n.url, n.allow_private_network
+             FROM notification_deliveries d
+             JOIN notification_events e ON e.id = d.event_id
+             JOIN notification_destinations n ON n.id = d.destination_id
+             ORDER BY d.created_at DESC, d.id DESC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_notification_delivery).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_notification_delivery(
+        &self,
+        id: &str,
+        lease_seconds: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE notification_deliveries
+             SET status = 'RUNNING',
+                 attempt_count = attempt_count + 1,
+                 claimed_until = unixepoch() + ?,
+                 updated_at = unixepoch()
+             WHERE id = ? AND (
+                 status = 'PENDING'
+                 OR (status = 'RUNNING' AND claimed_until <= unixepoch())
+             )",
+        )
+        .bind(lease_seconds.max(1))
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_notification_delivered(
+        &self,
+        id: &str,
+        http_status: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE notification_deliveries
+             SET status = 'DELIVERED', claimed_until = NULL, last_http_status = ?,
+                 last_error = NULL, delivered_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(http_status)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_notification_retry(
+        &self,
+        id: &str,
+        status: &str,
+        http_status: Option<i64>,
+        error: &str,
+        next_attempt_at: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE notification_deliveries
+             SET status = ?, claimed_until = NULL, last_http_status = ?, last_error = ?,
+                 next_attempt_at = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(http_status)
+        .bind(error)
+        .bind(next_attempt_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn retry_notification_delivery(&self, id: &str) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE notification_deliveries
+             SET status = 'PENDING', next_attempt_at = unixepoch(), claimed_until = NULL,
+                 last_error = NULL, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('FAILED', 'DELIVERED')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_item_library_id(
         &self,
         item_id: &str,
@@ -11257,6 +11608,64 @@ pub(crate) struct StoredScheduledTaskConfig {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredNotificationDestination {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) enabled: bool,
+    pub(crate) allow_private_network: bool,
+    pub(crate) event_types_json: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+pub(crate) struct NewNotificationDestination<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) url: &'a str,
+    pub(crate) enabled: bool,
+    pub(crate) allow_private_network: bool,
+    pub(crate) event_types_json: &'a str,
+}
+
+pub(crate) struct UpdateNotificationDestination<'a> {
+    pub(crate) name: Option<&'a str>,
+    pub(crate) url: Option<&'a str>,
+    pub(crate) enabled: Option<bool>,
+    pub(crate) allow_private_network: Option<bool>,
+    pub(crate) event_types_json: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredNotificationDelivery {
+    pub(crate) id: String,
+    pub(crate) event_id: String,
+    pub(crate) destination_id: String,
+    pub(crate) status: String,
+    pub(crate) attempt_count: i64,
+    pub(crate) next_attempt_at: i64,
+    pub(crate) last_http_status: Option<i64>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) delivered_at: Option<i64>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) event_type: String,
+    pub(crate) payload_json: String,
+    pub(crate) destination_name: String,
+    pub(crate) destination_url: String,
+    pub(crate) allow_private_network: bool,
+}
+
+pub(crate) struct NewNotificationEvent<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) event_type: &'a str,
+    pub(crate) schema_version: i64,
+    pub(crate) occurred_at: i64,
+    pub(crate) dedupe_key: &'a str,
+    pub(crate) payload_json: &'a str,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredLibraryRoot {
     pub(crate) id: String,
     pub(crate) library_id: String,
@@ -11284,6 +11693,40 @@ fn stored_scheduled_task(row: sqlx::any::AnyRow) -> StoredScheduledTaskConfig {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         library_name: row.get("library_name"),
+    }
+}
+
+fn stored_notification_destination(row: sqlx::any::AnyRow) -> StoredNotificationDestination {
+    StoredNotificationDestination {
+        id: row.get("id"),
+        name: row.get("name"),
+        url: row.get("url"),
+        enabled: row.get::<i64, _>("enabled") != 0,
+        allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
+        event_types_json: row.get("event_types_json"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn stored_notification_delivery(row: sqlx::any::AnyRow) -> StoredNotificationDelivery {
+    StoredNotificationDelivery {
+        id: row.get("id"),
+        event_id: row.get("event_id"),
+        destination_id: row.get("destination_id"),
+        status: row.get("status"),
+        attempt_count: row.get("attempt_count"),
+        next_attempt_at: row.get("next_attempt_at"),
+        last_http_status: row.get("last_http_status"),
+        last_error: row.get("last_error"),
+        delivered_at: row.get("delivered_at"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        event_type: row.get("event_type"),
+        payload_json: row.get("payload_json"),
+        destination_name: row.get("name"),
+        destination_url: row.get("url"),
+        allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
     }
 }
 
@@ -12716,6 +13159,24 @@ mod tests {
         config::Config,
         library::LibraryKind,
     };
+
+    #[tokio::test]
+    async fn person_credits_migration_creates_the_index_table() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'person_credits'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("person credits table");
+        assert_eq!(table_count, 1);
+    }
 
     #[tokio::test]
     async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {

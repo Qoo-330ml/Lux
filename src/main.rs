@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app_state.start_scheduled_tasks().await;
     app_state.resume_danmaku_match_jobs().await;
     app_state.resume_metadata_reidentify_jobs().await;
+    app_state.start_webhook_worker();
     let app = app_with_state(app_state);
 
     let listener = TcpListener::bind(config.http_addr).await?;
