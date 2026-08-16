@@ -135,8 +135,10 @@ impl HomeService {
             let cached = entry.value.lock().await;
             if let Some(cached) = cached.as_ref()
                 && cached.generation == generation
-                && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
             {
+                if cached.refreshed_at.elapsed() >= HOME_CACHE_TTL {
+                    self.schedule_refresh();
+                }
                 return Ok(cached.snapshot.clone());
             }
         }
