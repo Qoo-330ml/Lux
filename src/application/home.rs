@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::application::{
     access::{AccessPrincipal, MediaAccessService},
@@ -82,6 +82,7 @@ struct HomeServiceInner {
     generation: AtomicU64,
     entries: Mutex<HashMap<HomeCacheKey, Arc<HomeCacheEntry>>>,
     refresh_tx: mpsc::Sender<()>,
+    invalidation_notify: Notify,
 }
 
 #[derive(Clone)]
@@ -103,6 +104,7 @@ impl HomeService {
             generation: AtomicU64::new(0),
             entries: Mutex::new(HashMap::new()),
             refresh_tx,
+            invalidation_notify: Notify::new(),
         });
         let worker_inner = Arc::downgrade(&inner);
         tokio::spawn(async move {
@@ -156,6 +158,7 @@ impl HomeService {
 
     pub(crate) fn invalidate(&self) {
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.invalidation_notify.notify_waiters();
         self.schedule_refresh();
     }
 
@@ -187,7 +190,37 @@ impl HomeService {
             .cloned()
             .collect::<Vec<_>>();
         for entry in entries {
-            let _ = self.snapshot(entry.principal).await;
+            let Ok(_compute_guard) = entry.compute_lock.try_lock() else {
+                continue;
+            };
+            let generation = self.inner.generation.load(Ordering::Acquire);
+            {
+                let cached = entry.value.lock().await;
+                if cached.as_ref().is_some_and(|cached| {
+                    cached.generation == generation
+                        && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
+                }) {
+                    continue;
+                }
+            }
+            let notified = self.inner.invalidation_notify.notified();
+            let result = tokio::select! {
+                result = self.build_snapshot(entry.principal) => Some(result),
+                _ = notified => None,
+            };
+            match result {
+                Some(Ok(snapshot))
+                    if self.inner.generation.load(Ordering::Acquire) == generation =>
+                {
+                    *entry.value.lock().await = Some(CachedSnapshot {
+                        generation,
+                        refreshed_at: Instant::now(),
+                        snapshot: Arc::new(snapshot),
+                    });
+                }
+                Some(Ok(_)) | None => self.schedule_refresh(),
+                Some(Err(_)) => {}
+            }
         }
     }
 
