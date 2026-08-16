@@ -541,7 +541,7 @@ impl PeopleService {
             .filter(|actor| !actor.name.trim().is_empty())
         {
             let id = actor_id_from_stored_actor(&actor);
-            let provider = (!actor.provider.is_empty()).then(|| actor.provider.clone());
+            let provider = actor_provider_from_stored_actor(&actor);
             let image_url = match provider.as_deref() {
                 Some(provider_name) => match self
                     .profile_image_for_provider(Some(provider_name), &id)
@@ -1193,7 +1193,30 @@ fn actor_id_from_stored_actor(actor: &StoredActor) -> String {
         .as_deref()
         .filter(|id| is_valid_person_id(id))
         .map(str::to_owned)
+        .or_else(|| {
+            actor
+                .identities
+                .iter()
+                .find(|identity| {
+                    is_valid_person_id(&identity.provider) && is_valid_person_id(&identity.id)
+                })
+                .map(|identity| identity.id.clone())
+        })
         .unwrap_or_else(|| local_actor_id(&actor.name, actor.character.as_deref()))
+}
+
+fn actor_provider_from_stored_actor(actor: &StoredActor) -> Option<String> {
+    if actor.id.as_deref().is_some_and(is_valid_person_id)
+        && !actor.provider.is_empty()
+        && validate_component(&actor.provider).is_ok()
+    {
+        return Some(actor.provider.clone());
+    }
+    actor
+        .identities
+        .iter()
+        .find(|identity| is_valid_person_id(&identity.provider) && is_valid_person_id(&identity.id))
+        .map(|identity| identity.provider.clone())
 }
 
 fn person_credit_from_stored_actor(actor: &StoredActor) -> NewPersonCredit {
@@ -1201,7 +1224,7 @@ fn person_credit_from_stored_actor(actor: &StoredActor) -> NewPersonCredit {
         person_id: actor_id_from_stored_actor(actor),
         person_type: "Actor".to_owned(),
         person_name: actor.name.clone(),
-        provider: actor.provider.clone(),
+        provider: actor_provider_from_stored_actor(actor).unwrap_or_default(),
         role: actor.character.clone().unwrap_or_default(),
         sort_order: i64::from(actor.order.unwrap_or(i32::MAX)),
         biography: actor

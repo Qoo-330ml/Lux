@@ -2,6 +2,7 @@ use luxd::{
     api::{AppState, app_with_state},
     application::{
         libraries::LibraryService,
+        metadata_paths::library_item_directory,
         people::{ActorCredit, PeopleService},
         scanner::LibraryScanner,
         setup::SetupService,
@@ -48,6 +49,26 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     .fetch_one(database.pool())
     .await?;
 
+    let second_movie_dir = root.join("Second Movie (2023)");
+    tokio::fs::create_dir_all(&second_movie_dir).await?;
+    tokio::fs::write(
+        second_movie_dir.join("Second.Movie.2023.mkv"),
+        b"second movie",
+    )
+    .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let second_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND id <> ?
+         LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+
     PeopleService::new(config.config_dir.clone())
         .with_database(database.clone())
         .persist_item_actors(
@@ -77,6 +98,66 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
             ],
         )
         .await?;
+    PeopleService::new(config.config_dir.clone())
+        .with_database(database.clone())
+        .persist_item_actors(
+            &second_item_id,
+            "tmdb",
+            &[
+                ActorCredit {
+                    id: "101".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员甲".to_owned(),
+                    character: Some("角色乙".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                    person: None,
+                },
+                ActorCredit {
+                    id: "104".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员丁".to_owned(),
+                    character: None,
+                    order: Some(1),
+                    profile_url: None,
+                    person: None,
+                },
+            ],
+        )
+        .await?;
+    let relation_path = library_item_directory(&config.config_dir, &item_id)?.join("people.json");
+    tokio::fs::write(
+        &relation_path,
+        serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "actors": [
+                {
+                    "id": "101",
+                    "name": "演员甲",
+                    "provider": "tmdb",
+                    "character": "角色甲",
+                    "order": 0
+                },
+                {
+                    "id": null,
+                    "name": "演员乙",
+                    "provider": "",
+                    "identities": [{"provider": "tmdb", "id": "102"}],
+                    "order": 1
+                },
+                {
+                    "id": null,
+                    "name": "演员丙",
+                    "provider": "",
+                    "identities": [{"provider": "imdb", "id": "nm103"}],
+                    "order": 2
+                }
+            ]
+        }))?,
+    )
+    .await?;
     sqlx::query("DELETE FROM person_credits")
         .execute(database.pool())
         .await?;
@@ -111,15 +192,22 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         .await?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = response.json().await?;
-    assert_eq!(body["TotalRecordCount"], 2);
+    assert_eq!(body["TotalRecordCount"], 4);
     assert_eq!(body["StartIndex"], 0);
     let actors = body["Items"].as_array().ok_or("missing actor items")?;
     let actor_a = actors
         .iter()
         .find(|actor| actor["Id"] == "101")
         .ok_or("missing actor 101")?;
+    assert_eq!(
+        actors.iter().filter(|actor| actor["Id"] == "101").count(),
+        1
+    );
     assert_eq!(actor_a["Name"], "演员甲");
-    assert_eq!(actor_a["Role"], "角色甲");
+    assert!(matches!(
+        actor_a["Role"].as_str(),
+        Some("角色甲") | Some("角色乙")
+    ));
     assert_eq!(actor_a["Type"], "Actor");
     let actor_b = actors
         .iter()
@@ -127,6 +215,12 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         .ok_or("missing actor 102")?;
     assert_eq!(actor_b["Name"], "演员乙");
     assert!(actor_b["Role"].is_null());
+    let actor_c = actors
+        .iter()
+        .find(|actor| actor["Id"] == "nm103")
+        .ok_or("missing actor nm103")?;
+    assert_eq!(actor_c["Name"], "演员丙");
+    assert!(actors.iter().any(|actor| actor["Id"] == "104"));
 
     let prefixed = client
         .get(format!("http://{address}/emby/Persons?{query}"))
@@ -135,7 +229,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(prefixed.status(), reqwest::StatusCode::OK);
     assert_eq!(
         prefixed.json::<serde_json::Value>().await?["TotalRecordCount"],
-        2
+        4
     );
 
     let directors = client
