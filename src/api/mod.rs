@@ -13366,6 +13366,7 @@ fn webhook_error_response(headers: &HeaderMap, error: WebhookError) -> Response 
         WebhookError::Storage(_)
         | WebhookError::Io(_)
         | WebhookError::Serialization(_)
+        | WebhookError::HttpResponse { .. }
         | WebhookError::SecretUnavailable
         | WebhookError::RequestSetup(_) => {
             tracing::warn!("webhook operation failed");

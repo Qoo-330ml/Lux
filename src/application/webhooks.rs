@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{fs, net::lookup_host, sync::Mutex, time::sleep};
-use url::Url;
+use url::{Host, Url};
 
 use crate::storage::{
     Database, NewNotificationDestination, NewNotificationEvent, StorageError,
@@ -26,6 +26,7 @@ const MAX_NAME_LENGTH: usize = 128;
 const MAX_URL_LENGTH: usize = 2048;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_DELIVERY_ATTEMPTS: i64 = 8;
+const MAX_RETRY_DELAY_SECONDS: i64 = 7_200;
 const DELIVERY_LEASE_SECONDS: i64 = 60;
 const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -68,6 +69,10 @@ pub enum WebhookError {
     Io(io::Error),
     Serialization(String),
     Invalid(String),
+    HttpResponse {
+        status: StatusCode,
+        retry_after_seconds: Option<i64>,
+    },
     NotFound,
     SecretUnavailable,
     RequestSetup(String),
@@ -80,6 +85,9 @@ impl fmt::Display for WebhookError {
             Self::Io(error) => write!(formatter, "webhook secret storage error: {error}"),
             Self::Serialization(error) => write!(formatter, "webhook serialization error: {error}"),
             Self::Invalid(error) => write!(formatter, "invalid webhook configuration: {error}"),
+            Self::HttpResponse { status, .. } => {
+                write!(formatter, "webhook endpoint returned HTTP {status}")
+            }
             Self::NotFound => formatter.write_str("webhook destination not found"),
             Self::SecretUnavailable => formatter.write_str("webhook secret is unavailable"),
             Self::RequestSetup(error) => write!(formatter, "webhook request setup failed: {error}"),
@@ -412,19 +420,31 @@ impl WebhookService {
                     .await?
             }
             Err(error) => {
-                let retryable = matches!(error, WebhookError::RequestSetup(_))
-                    || matches!(error, WebhookError::Invalid(ref message) if message == "retryable HTTP response");
+                let (retryable, http_status, retry_after_seconds) = match &error {
+                    WebhookError::RequestSetup(_) => (true, None, None),
+                    WebhookError::HttpResponse {
+                        status,
+                        retry_after_seconds,
+                    } => (
+                        is_retryable_http_status(*status),
+                        Some(i64::from(status.as_u16())),
+                        *retry_after_seconds,
+                    ),
+                    _ => (false, None, None),
+                };
                 let status = if delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS || !retryable {
                     "FAILED"
                 } else {
                     "PENDING"
                 };
-                let delay = retry_delay(delivery.attempt_count);
+                let delay = retry_after_seconds
+                    .unwrap_or_default()
+                    .max(retry_delay(delivery.attempt_count));
                 self.database
                     .mark_notification_retry(
                         &delivery.id,
                         status,
-                        None,
+                        http_status,
                         &public_error_message(&error),
                         unix_now().saturating_add(delay),
                     )
@@ -470,13 +490,16 @@ impl WebhookService {
         if status.is_success() {
             return Ok(status.as_u16());
         }
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            return Err(WebhookError::Invalid("retryable HTTP response".to_owned()));
-        }
-        Err(WebhookError::Invalid(format!(
-            "HTTP {} response",
-            status.as_u16()
-        )))
+        Err(WebhookError::HttpResponse {
+            status,
+            retry_after_seconds: parse_retry_after(
+                response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|value| value.to_str().ok()),
+                SystemTime::now(),
+            ),
+        })
     }
 
     async fn view_by_id(&self, id: &str) -> Result<Option<WebhookDestinationView>, WebhookError> {
@@ -607,7 +630,12 @@ pub fn validate_webhook_url(
         return Err(WebhookUrlError::PrivateNetwork);
     }
 
-    if let Ok(address) = host.parse::<IpAddr>() {
+    let address = match url.host() {
+        Some(Host::Ipv4(address)) => Some(IpAddr::V4(address)),
+        Some(Host::Ipv6(address)) => Some(IpAddr::V6(address)),
+        Some(Host::Domain(_)) | None => None,
+    };
+    if let Some(address) = address {
         if is_dangerous_address(address) {
             return Err(WebhookUrlError::DangerousAddress);
         }
@@ -913,11 +941,77 @@ fn retry_delay(attempt_count: i64) -> i64 {
     }
 }
 
+fn is_retryable_http_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
+}
+
+fn parse_retry_after(value: Option<&str>, now: SystemTime) -> Option<i64> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(
+            i64::try_from(seconds)
+                .unwrap_or(MAX_RETRY_DELAY_SECONDS)
+                .min(MAX_RETRY_DELAY_SECONDS),
+        );
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    let seconds = retry_at
+        .duration_since(now)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0);
+    Some(seconds.min(MAX_RETRY_DELAY_SECONDS))
+}
+
 fn public_error_message(error: &WebhookError) -> String {
     let message = error.to_string();
     if message.len() <= 512 {
         message
     } else {
         message.chars().take(512).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_retryable_http_status, parse_retry_after, retry_delay};
+    use reqwest::StatusCode;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn retry_after_accepts_seconds_and_caps_long_delays() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        assert_eq!(parse_retry_after(Some("120"), now), Some(120));
+        assert_eq!(parse_retry_after(Some("999999"), now), Some(7_200));
+        assert_eq!(parse_retry_after(Some("-1"), now), None);
+        assert_eq!(parse_retry_after(Some("not-a-delay"), now), None);
+    }
+
+    #[test]
+    fn retry_after_accepts_http_dates_relative_to_now() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let retry_at = now + Duration::from_secs(45);
+        let header = httpdate::fmt_http_date(retry_at);
+
+        assert_eq!(parse_retry_after(Some(&header), now), Some(45));
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT"), now),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn retryable_http_statuses_are_limited_to_transient_responses() {
+        assert!(is_retryable_http_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_http_status(StatusCode::TOO_EARLY));
+        assert!(is_retryable_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_http_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_http_status(StatusCode::UNAUTHORIZED));
+        assert_eq!(retry_delay(1), 1);
     }
 }
