@@ -315,7 +315,10 @@ impl AppState {
             downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
                 .ok(),
             metadata_reidentify,
-            deletion: Some(MediaDeleteService::new(database.clone())),
+            deletion: Some(match webhooks.clone() {
+                Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
+                None => MediaDeleteService::new(database.clone()),
+            }),
             probe,
             thumbnails,
             scan_jobs: Some(scan_jobs),

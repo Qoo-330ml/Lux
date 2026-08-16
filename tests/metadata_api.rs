@@ -8,6 +8,7 @@ use luxd::{
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
+        webhooks::WebhookService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
@@ -759,6 +760,18 @@ async fn admin_can_delete_a_media_source_and_matching_sidecars()
         .fetch_one(database.pool())
         .await?;
 
+    let webhooks = WebhookService::new(database.clone(), config.config_dir.clone())?;
+    webhooks
+        .create_destination(
+            "Deletion test receiver",
+            "https://example.com/lux-hook",
+            true,
+            false,
+            &["MEDIA_REMOVED".to_owned()],
+            Some("webhook-test-secret-1234"),
+        )
+        .await?;
+
     let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
     let client = reqwest::Client::new();
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
@@ -780,6 +793,12 @@ async fn admin_can_delete_a_media_source_and_matching_sidecars()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(source_count, 0);
+    let removed_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_events WHERE event_type = 'MEDIA_REMOVED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_events, 1);
 
     server.abort();
     Ok(())

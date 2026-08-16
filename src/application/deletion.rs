@@ -1,23 +1,37 @@
 use std::{
     fmt,
     path::{Component, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::json;
 use tokio::fs;
 
 use crate::{
-    application::downloads::is_matching_sidecar,
+    application::{
+        downloads::is_matching_sidecar,
+        webhooks::{WebhookEventType, WebhookService},
+    },
     storage::{Database, StorageError},
 };
 
 #[derive(Clone)]
 pub struct MediaDeleteService {
     database: Database,
+    webhooks: Option<WebhookService>,
 }
 
 impl MediaDeleteService {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            webhooks: None,
+        }
+    }
+
+    pub fn with_webhooks(mut self, webhooks: WebhookService) -> Self {
+        self.webhooks = Some(webhooks);
+        self
     }
 
     pub async fn delete(
@@ -104,12 +118,43 @@ impl MediaDeleteService {
         {
             return Err(MediaDeleteError::ItemNotFound);
         }
-        Ok(MediaDeleteReport {
+        let report = MediaDeleteReport {
             item_id: item_id.to_owned(),
             source_id: source.source_id,
             deleted_file_count: paths.len(),
-        })
+        };
+        if let Some(webhooks) = self.webhooks.as_ref() {
+            let dedupe_key = format!("media-removed:{}:{}", report.item_id, report.source_id);
+            if let Err(_error) = webhooks
+                .publish(
+                    WebhookEventType::MediaRemoved,
+                    &dedupe_key,
+                    unix_now(),
+                    json!({
+                        "itemId": report.item_id.as_str(),
+                        "sourceId": report.source_id.as_str(),
+                        "deletedFileCount": report.deleted_file_count,
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(
+                    item_id = %report.item_id,
+                    event_type = WebhookEventType::MediaRemoved.as_str(),
+                    "failed to enqueue webhook event"
+                );
+            }
+        }
+        Ok(report)
     }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
