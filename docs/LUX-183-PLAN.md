@@ -2,10 +2,19 @@
 
 ## 当前范围
 
-第一版实现 Lux 原生出站 Webhook，不实现播放进度通知、用户通知中心、Email、Telegram 或完整 Emby Webhook
-payload 兼容。
+LUX-183 的原生出站 Webhook 后端和管理员 Web 页面已经完成。后续扩展继续沿用同一套持久化
+事件/投递记录，不另起通知系统：播放事件使用独立节流规则，Email/Telegram/企业微信使用独立
+payload adapter，Emby Webhooks 兼容使用独立 DTO adapter，不污染 Lux 原生合同。
 
-事件类型：`MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、`JOB_FAILED`。
+基础事件类型：`MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、`JOB_FAILED`。
+扩展事件类型：`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_PROGRESS`、`PLAYBACK_STOPPED`。
+
+## 后续完成标准
+
+- 管理员可以在 Web 控制台配置 Webhook、查看投递记录和手动重试；Secret 不进入普通响应或日志。
+- 播放开始、暂停、停止事件至少一次投递；播放进度按会话节流，乱序回调不会导致事件倒退或通知风暴。
+- 通知渠道 adapter 只接收已脱敏的统一事件，外部凭据受限存储，HTTP 超时、重试和错误分类沿用统一投递器。
+- Emby adapter 与 Lux 原生 adapter 分离，固定事件/模板字段有脱敏协议回归；未覆盖的 Emby 插件行为不得宣称兼容。
 
 ## 当前实施状态
 

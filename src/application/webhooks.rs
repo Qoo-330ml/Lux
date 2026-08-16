@@ -544,16 +544,24 @@ pub enum WebhookEventType {
     ScanFailed,
     MetadataUpdated,
     JobFailed,
+    PlaybackStarted,
+    PlaybackPaused,
+    PlaybackProgress,
+    PlaybackStopped,
 }
 
 impl WebhookEventType {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::MediaAdded,
         Self::MediaRemoved,
         Self::ScanCompleted,
         Self::ScanFailed,
         Self::MetadataUpdated,
         Self::JobFailed,
+        Self::PlaybackStarted,
+        Self::PlaybackPaused,
+        Self::PlaybackProgress,
+        Self::PlaybackStopped,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -564,6 +572,10 @@ impl WebhookEventType {
             Self::ScanFailed => "SCAN_FAILED",
             Self::MetadataUpdated => "METADATA_UPDATED",
             Self::JobFailed => "JOB_FAILED",
+            Self::PlaybackStarted => "PLAYBACK_STARTED",
+            Self::PlaybackPaused => "PLAYBACK_PAUSED",
+            Self::PlaybackProgress => "PLAYBACK_PROGRESS",
+            Self::PlaybackStopped => "PLAYBACK_STOPPED",
         }
     }
 
@@ -828,9 +840,17 @@ fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
         ),
         "addedCount" => matches!(event_type, WebhookEventType::MediaAdded),
         "removedCount" => matches!(event_type, WebhookEventType::MediaRemoved),
-        "itemId" | "sourceId" | "deletedFileCount" => {
+        "sourceId" | "deletedFileCount" => {
             matches!(event_type, WebhookEventType::MediaRemoved)
         }
+        "itemId" => matches!(
+            event_type,
+            WebhookEventType::MediaRemoved
+                | WebhookEventType::PlaybackStarted
+                | WebhookEventType::PlaybackPaused
+                | WebhookEventType::PlaybackProgress
+                | WebhookEventType::PlaybackStopped
+        ),
         "mode" | "candidateCount" => {
             matches!(
                 event_type,
@@ -838,6 +858,14 @@ fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
             )
         }
         "test" => matches!(event_type, WebhookEventType::JobFailed),
+        "mediaSourceId" | "playSessionId" | "state" | "positionTicks" | "durationTicks"
+        | "isPaused" | "client" | "deviceName" | "deviceType" | "clientVersion" => matches!(
+            event_type,
+            WebhookEventType::PlaybackStarted
+                | WebhookEventType::PlaybackPaused
+                | WebhookEventType::PlaybackProgress
+                | WebhookEventType::PlaybackStopped
+        ),
         _ => false,
     }
 }
@@ -1079,5 +1107,45 @@ mod tests {
         assert!(payload.get("path").is_none());
         assert!(payload.get("token").is_none());
         assert!(payload.get("strmUrl").is_none());
+    }
+
+    #[test]
+    fn playback_events_use_stable_names_and_safe_fields() {
+        assert_eq!(
+            WebhookEventType::PlaybackStarted.as_str(),
+            "PLAYBACK_STARTED"
+        );
+        assert_eq!(WebhookEventType::PlaybackPaused.as_str(), "PLAYBACK_PAUSED");
+        assert_eq!(
+            WebhookEventType::PlaybackProgress.as_str(),
+            "PLAYBACK_PROGRESS"
+        );
+        assert_eq!(
+            WebhookEventType::PlaybackStopped.as_str(),
+            "PLAYBACK_STOPPED"
+        );
+        let payload = build_event_payload(
+            "server-1",
+            "event-playback",
+            WebhookEventType::PlaybackProgress,
+            1_700_000_000,
+            json!({
+                "itemId": "item-1",
+                "mediaSourceId": "source-1",
+                "positionTicks": 123,
+                "durationTicks": 456,
+                "client": "VidHub",
+                "deviceName": "Living Room",
+                "userId": "private-user-id",
+                "path": "/private/movie.mkv"
+            }),
+        )
+        .expect("playback payload should be accepted");
+        assert_eq!(payload["itemId"], "item-1");
+        assert_eq!(payload["positionTicks"], 123);
+        assert_eq!(payload["durationTicks"], 456);
+        assert_eq!(payload["client"], "VidHub");
+        assert!(payload.get("userId").is_none());
+        assert!(payload.get("path").is_none());
     }
 }

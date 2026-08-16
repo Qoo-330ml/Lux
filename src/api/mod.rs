@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -87,7 +87,7 @@ use crate::{
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
-        webhooks::{WebhookError, WebhookService},
+        webhooks::{WebhookError, WebhookEventType, WebhookService},
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
@@ -4016,6 +4016,16 @@ async fn handle_emby_playback_event(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
+    let occurred_at = current_unix_timestamp();
+    let webhook_event = webhook_event_type_for_playback(
+        activity_event,
+        should_publish_playback_progress(
+            previous_session.as_ref(),
+            state_name,
+            request.position_ticks,
+            occurred_at,
+        ),
+    );
     let remote_ip = request_client_ip(&headers, &state.remote_access);
     match database
         .record_playback_event(NewPlaybackEvent {
@@ -4062,6 +4072,25 @@ async fn handle_emby_playback_event(
                 )
                 .await;
             }
+            if let Some(event_type) = webhook_event {
+                publish_playback_webhook(
+                    &state,
+                    event_type,
+                    occurred_at,
+                    &request.item_id,
+                    media_source_id,
+                    &play_session_id,
+                    state_name,
+                    request.position_ticks,
+                    request.duration_ticks,
+                    request.is_paused || state_name == "PAUSED",
+                    client,
+                    device_name,
+                    device_type,
+                    client_version,
+                )
+                .await;
+            }
             tracing::info!(
                 event = "emby_playback_callback_recorded",
                 playback_state = state_name,
@@ -4101,6 +4130,98 @@ fn playback_client_label(value: Option<&str>) -> &'static str {
         Some(_) => "other",
         None => "unknown",
     }
+}
+
+const PLAYBACK_WEBHOOK_PROGRESS_INTERVAL_SECONDS: i64 = 30;
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+fn should_publish_playback_progress(
+    previous: Option<&StoredPlaybackSession>,
+    state_name: &str,
+    position_ticks: i64,
+    occurred_at: i64,
+) -> bool {
+    matches!(state_name, "PLAYING" | "PAUSED")
+        && previous.is_some_and(|session| {
+            occurred_at.saturating_sub(session.last_event_at)
+                >= PLAYBACK_WEBHOOK_PROGRESS_INTERVAL_SECONDS
+                && position_ticks > session.position_ticks
+        })
+}
+
+fn webhook_event_type_for_playback(
+    activity_event: Option<&str>,
+    progress_due: bool,
+) -> Option<WebhookEventType> {
+    match activity_event {
+        Some("PLAYBACK_STARTED") => Some(WebhookEventType::PlaybackStarted),
+        Some("PLAYBACK_PAUSED") => Some(WebhookEventType::PlaybackPaused),
+        Some("PLAYBACK_STOPPED") => Some(WebhookEventType::PlaybackStopped),
+        _ if progress_due => Some(WebhookEventType::PlaybackProgress),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_playback_webhook(
+    state: &AppState,
+    event_type: WebhookEventType,
+    occurred_at: i64,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    play_session_id: &str,
+    state_name: &str,
+    position_ticks: i64,
+    duration_ticks: Option<i64>,
+    is_paused: bool,
+    client: Option<&str>,
+    device_name: Option<&str>,
+    device_type: Option<&str>,
+    client_version: Option<&str>,
+) {
+    let Some(webhooks) = state.webhooks.as_ref() else {
+        return;
+    };
+    let dedupe_key = format!(
+        "playback:{play_session_id}:{}:{occurred_at}",
+        event_type.as_str()
+    );
+    let data = json!({
+        "itemId": item_id,
+        "mediaSourceId": media_source_id,
+        "playSessionId": play_session_id,
+        "state": state_name,
+        "positionTicks": position_ticks,
+        "durationTicks": duration_ticks,
+        "isPaused": is_paused,
+        "client": bounded_playback_text(client),
+        "deviceName": bounded_playback_text(device_name),
+        "deviceType": bounded_playback_text(device_type),
+        "clientVersion": bounded_playback_text(client_version),
+    });
+    if let Err(error) = webhooks
+        .publish(event_type, &dedupe_key, occurred_at, data)
+        .await
+    {
+        tracing::warn!(
+            event = "playback_webhook_enqueue_failed",
+            webhook_event_type = event_type.as_str(),
+            error = %error,
+            "failed to enqueue playback webhook"
+        );
+    }
+}
+
+fn bounded_playback_text(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (value.chars().count() <= 128).then(|| value.to_owned())
 }
 
 async fn emby_sessions(
@@ -4268,6 +4389,16 @@ async fn lux_post_progress(
     };
     let activity_event =
         playback_activity_event_type(previous_session.as_ref(), playback_state.as_str());
+    let occurred_at = current_unix_timestamp();
+    let webhook_event = webhook_event_type_for_playback(
+        activity_event,
+        should_publish_playback_progress(
+            previous_session.as_ref(),
+            playback_state.as_str(),
+            request.position_ticks,
+            occurred_at,
+        ),
+    );
     let remote_ip = request_client_ip(&headers, &state.remote_access);
     match database
         .record_playback_event(NewPlaybackEvent {
@@ -4313,6 +4444,25 @@ async fn lux_post_progress(
                         "deviceName": "Web",
                         "state": playback_state.as_str(),
                     }),
+                )
+                .await;
+            }
+            if let Some(event_type) = webhook_event {
+                publish_playback_webhook(
+                    &state,
+                    event_type,
+                    occurred_at,
+                    &item_id,
+                    None,
+                    &play_session_id,
+                    playback_state.as_str(),
+                    request.position_ticks,
+                    request.duration_ticks,
+                    matches!(playback_state, LuxPlaybackState::Paused),
+                    Some("Lux"),
+                    Some("Web"),
+                    Some("Web"),
+                    None,
                 )
                 .await;
             }

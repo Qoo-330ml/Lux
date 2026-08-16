@@ -3926,8 +3926,8 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 由有界后台 worker 发送，不能阻塞扫描、播放或元数据请求。
 
 第一版事件包括 `MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、
-`JOB_FAILED`；播放开始和停止事件保留为后续可选范围。事件不包含本地绝对路径、`.strm` 原始目标、令牌、
-完整外部 URL 或不必要的用户隐私字段。
+`JOB_FAILED`；播放事件、渠道 adapter 和 Emby Webhooks adapter 作为 LUX-183 后续扩展实施。事件不包含
+本地绝对路径、`.strm` 原始目标、令牌、完整外部 URL 或不必要的用户隐私字段。
 
 验收：
 
