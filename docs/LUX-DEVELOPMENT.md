@@ -3921,12 +3921,13 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 
 #### LUX-183：Webhook 通知事件与持久化投递
 
-范围：为 Lux 增加管理员配置的出站 Webhook 通知器。第一版只提供 Lux 原生
-`schemaVersion: 1` JSON 合同，不声称完整兼容 Emby Webhooks 插件 payload；通知通过持久化事件和投递记录
-由有界后台 worker 发送，不能阻塞扫描、播放或元数据请求。
+范围：为 Lux 增加管理员配置的单一出站 Webhook 通知器。通知通过持久化事件和投递记录由有界后台 worker
+发送，不能阻塞扫描、播放或元数据请求。Lux 原生 `schemaVersion: 1` JSON 合同和 Emby 风格 payload 使用
+独立 adapter；不声称完整兼容 Emby Webhooks 插件的全部 payload/template 行为。Telegram、企业微信和 Email
+不属于当前任务。
 
-第一版事件包括 `MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、
-`JOB_FAILED`；播放事件、渠道 adapter 和 Emby Webhooks adapter 作为 LUX-183 后续扩展实施。事件不包含
+事件包括 `MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、
+`JOB_FAILED`、`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_PROGRESS`、`PLAYBACK_STOPPED`。事件不包含
 本地绝对路径、`.strm` 原始目标、令牌、完整外部 URL 或不必要的用户隐私字段。
 
 验收：
@@ -3939,10 +3940,12 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 - [x] URL 校验阻止凭据、查询参数、重定向以及默认的 loopback、链路本地、私有和 metadata 地址；管理员显式
       允许私有网络时仍拒绝危险保留地址。
 - [x] 媒体/任务服务接入基础事件；重复扫描不会重复发送同一媒体新增事件。
-- [ ] API、存储、URL 安全、签名、重试、恢复、权限、CSRF、脱敏和本地接收器集成测试通过。
+- [x] 播放边沿和节流进度事件接入；乱序回调不会造成位置倒退或通知风暴。
+- [x] Lux/Emby payload adapter 按目标独立生成事件，旧目标升级后继续使用 Lux 合同。
+- [x] API、存储、URL 安全、签名、重试、恢复、权限、CSRF、脱敏和本地接收器集成测试通过。
 
-验证：参见 `docs/LUX-183-PLAN.md`；完成后更新 `docs/COMPATIBILITY.md`，明确 Lux 原生 Webhook 合同及尚未
-实现的 Emby payload 兼容范围。
+验证：参见 `docs/LUX-183-PLAN.md`；完成后更新 `docs/COMPATIBILITY.md`，明确 Lux 原生 Webhook、Emby 风格
+payload 的实际支持范围，以及未实现的 Emby 插件行为。
 
 依赖：LUX-020、LUX-022、LUX-041、LUX-073、LUX-093。
 

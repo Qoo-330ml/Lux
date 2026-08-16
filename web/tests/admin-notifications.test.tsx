@@ -20,6 +20,7 @@ describe("AdminNotificationsPage", () => {
         id: "destination-1",
         name: "本地接收器",
         url: "http://127.0.0.1:8787/hooks",
+        payloadFormat: "LUX",
         enabled: true,
         allowPrivateNetwork: true,
         eventTypes: ["MEDIA_ADDED"],
@@ -54,6 +55,7 @@ describe("AdminNotificationsPage", () => {
         id: "destination-2",
         name: "新目标",
         url: "https://example.com/hooks",
+        payloadFormat: "EMBY",
         enabled: true,
         allowPrivateNetwork: false,
         eventTypes: [],
@@ -71,6 +73,7 @@ describe("AdminNotificationsPage", () => {
         id: "destination-1",
         name: "本地接收器",
         url: "http://127.0.0.1:8787/hooks",
+        payloadFormat: "LUX",
         enabled: false,
         allowPrivateNetwork: true,
         eventTypes: ["MEDIA_ADDED"],
@@ -106,6 +109,8 @@ describe("AdminNotificationsPage", () => {
     expect(container.textContent).toContain("本地接收器");
     expect(container.textContent).toContain("投递失败");
     expect(container.querySelector('input[name="event-MEDIA_ADDED"]')).toBeTruthy();
+    expect(container.querySelector('select[name="notification-payload-format"]')).toBeTruthy();
+    expect(container.textContent).toContain("Emby 风格");
     expect(container.querySelector('button[aria-label="重试投递 delivery-1"]')).toBeTruthy();
   });
 });

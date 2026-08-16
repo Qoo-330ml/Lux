@@ -150,6 +150,7 @@ impl WebhookService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_destination_with_format(
         &self,
         name: &str,
@@ -257,6 +258,7 @@ impl WebhookService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_destination_with_format(
         &self,
         id: &str,
@@ -373,6 +375,10 @@ impl WebhookService {
             }
             let payload_json = String::from_utf8(payload_json)
                 .map_err(|error| WebhookError::Serialization(error.to_string()))?;
+            let event_dedupe_key = match payload_format {
+                WebhookPayloadFormat::Lux => dedupe_key.to_owned(),
+                WebhookPayloadFormat::Emby => format!("{dedupe_key}:EMBY"),
+            };
             let inserted = self
                 .database
                 .insert_notification_event_with_deliveries(
@@ -381,7 +387,7 @@ impl WebhookService {
                         event_type: event_type.as_str(),
                         schema_version: 1,
                         occurred_at,
-                        dedupe_key: &format!("{dedupe_key}:{}", payload_format.as_str()),
+                        dedupe_key: &event_dedupe_key,
                         payload_json: &payload_json,
                     },
                     &destination_ids,

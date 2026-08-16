@@ -20,10 +20,12 @@
 
 ### Lux 原生出站 Webhook
 
-Lux 当前提供版本化的原生 Webhook 合同（`schemaVersion: 1`），用于发送媒体、扫描、元数据和后台任务事件。
-请求使用 `X-Lux-Event-Id`、时间戳和 HMAC-SHA256 签名，投递为至少一次语义，接收方应按 `eventId` 幂等。
-该功能不是 Emby Webhooks 插件的完整 payload 兼容实现；Emby 事件名称、模板变量和 Emby 专用 DTO 适配仍需单独实现和实测，
-因此不能仅凭 Lux 原生 Webhook 宣称兼容 Emby Webhooks 插件。
+Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`），用于发送媒体、扫描、元数据、后台任务
+和播放事件。请求使用 `X-Lux-Event-Id`、时间戳和 HMAC-SHA256 签名，投递为至少一次语义，接收方应按
+`eventId` 幂等。Webhook 目标可以选择 Lux 原生或 Emby 风格的有限 DTO payload；两者均经过字段白名单和脱敏
+处理。该功能不是 Emby Webhooks 插件的完整兼容实现，不支持未列入测试合同的模板变量、插件事件或行为。
+
+当前只提供 Webhook 渠道；Telegram、企业微信和 Email 尚未实现。
 
 - 媒体库实时监听默认开启。复制到已配置根路径中的新视频会进入局部 `INCREMENTAL_SCAN`，只处理该事件路径，通常在几秒内进入索引；旧版 `realtimeWatchEnabled` 请求字段不会关闭监听。
 - LUX-000 至 LUX-003：仅完成仓库工程检查，尚未连接任何真实客户端。

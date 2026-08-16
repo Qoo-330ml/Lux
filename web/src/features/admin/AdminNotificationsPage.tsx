@@ -21,6 +21,7 @@ type DestinationForm = {
   enabled: boolean;
   allowPrivateNetwork: boolean;
   eventTypes: string[];
+  payloadFormat: "LUX" | "EMBY";
   secret: string;
 };
 
@@ -30,6 +31,7 @@ const EMPTY_FORM: DestinationForm = {
   enabled: true,
   allowPrivateNetwork: false,
   eventTypes: [],
+  payloadFormat: "LUX",
   secret: "",
 };
 
@@ -52,6 +54,7 @@ export function AdminNotificationsPage() {
       enabled: form.enabled,
       allowPrivateNetwork: form.allowPrivateNetwork,
       eventTypes: form.eventTypes,
+      payloadFormat: form.payloadFormat,
       ...(form.secret.trim() ? { secret: form.secret.trim() } : {}),
     }),
     onSuccess: (result) => {
@@ -84,6 +87,7 @@ export function AdminNotificationsPage() {
         <form className="lux-admin-form lux-notification-form" onSubmit={(event) => { event.preventDefault(); create.mutate(); }}>
           <label htmlFor="notification-name">名称<input id="notification-name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} maxLength={128} required /></label>
           <label htmlFor="notification-url">接收地址<input id="notification-url" type="url" value={form.url} onChange={(event) => setForm({ ...form, url: event.target.value })} placeholder="https://example.com/lux-hook" maxLength={2048} required /></label>
+          <label htmlFor="notification-payload-format">Payload 格式<select id="notification-payload-format" name="notification-payload-format" value={form.payloadFormat} onChange={(event) => setForm({ ...form, payloadFormat: event.target.value as DestinationForm["payloadFormat"] })}><option value="LUX">Lux 原生</option><option value="EMBY">Emby 风格</option></select></label>
           <label htmlFor="notification-secret">Secret（可选）<input id="notification-secret" type="password" value={form.secret} onChange={(event) => setForm({ ...form, secret: event.target.value })} autoComplete="new-password" placeholder="留空由 Lux 生成" /></label>
           <fieldset className="lux-notification-events"><legend>接收事件</legend><div className="lux-notification-event-grid">{EVENT_OPTIONS.map(([value, label]) => <label key={value} htmlFor={`event-${value}`}><input id={`event-${value}`} name={`event-${value}`} type="checkbox" checked={form.eventTypes.includes(value)} onChange={() => setForm({ ...form, eventTypes: toggleEvent(form.eventTypes, value) })} /><span>{label}</span></label>)}</div><small>不勾选表示接收全部当前和未来兼容事件。</small></fieldset>
           <label className="lux-admin-toggle"><input type="checkbox" checked={form.allowPrivateNetwork} onChange={(event) => setForm({ ...form, allowPrivateNetwork: event.target.checked })} /><span>允许私有网络地址（仅限可信本地接收器）</span></label>
@@ -109,7 +113,8 @@ function DestinationRow({ destination, onSecret, onChanged }: { destination: Adm
   const [enabled, setEnabled] = useState(destination.enabled);
   const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(destination.allowPrivateNetwork);
   const [eventTypes, setEventTypes] = useState(destination.eventTypes);
-  const update = useMutation({ mutationFn: () => api.updateAdminWebhookDestination(destination.id, { name: name.trim(), url: url.trim(), enabled, allowPrivateNetwork, eventTypes }), onSuccess: () => { setEditing(false); onChanged(); } });
+  const [payloadFormat, setPayloadFormat] = useState(destination.payloadFormat);
+  const update = useMutation({ mutationFn: () => api.updateAdminWebhookDestination(destination.id, { name: name.trim(), url: url.trim(), enabled, allowPrivateNetwork, eventTypes, payloadFormat }), onSuccess: () => { setEditing(false); onChanged(); } });
   const toggle = useMutation({ mutationFn: (nextEnabled: boolean) => api.updateAdminWebhookDestination(destination.id, { enabled: nextEnabled }), onSuccess: onChanged });
   const test = useMutation({ mutationFn: () => api.testAdminWebhookDestination(destination.id) });
   const rotate = useMutation({ mutationFn: () => api.rotateAdminWebhookSecret(destination.id), onSuccess: (result) => onSecret(result.secret) });
@@ -117,9 +122,9 @@ function DestinationRow({ destination, onSecret, onChanged }: { destination: Adm
   const busy = update.isPending || toggle.isPending || test.isPending || rotate.isPending || remove.isPending;
   const error = update.error || toggle.error || test.error || rotate.error || remove.error;
   return <article className={`lux-notification-destination ${destination.enabled ? "is-enabled" : "is-disabled"}`}>
-    <div className="lux-notification-destination-summary"><span className="lux-notification-destination-icon"><Link2 size={17} /></span><div><h3>{destination.name}</h3><p>{destination.url}</p><small>{destination.eventTypes.length === 0 ? "全部事件" : destination.eventTypes.map(eventLabel).join(" · ")} · Secret {destination.secretConfigured ? "已配置" : "缺失"}</small></div><span className={destination.enabled ? "lux-user-badge is-ok" : "lux-user-badge is-warn"}>{destination.enabled ? "已启用" : "已停用"}</span></div>
+    <div className="lux-notification-destination-summary"><span className="lux-notification-destination-icon"><Link2 size={17} /></span><div><h3>{destination.name}</h3><p>{destination.url}</p><small>{destination.eventTypes.length === 0 ? "全部事件" : destination.eventTypes.map(eventLabel).join(" · ")} · {payloadFormatLabel(destination.payloadFormat)} · Secret {destination.secretConfigured ? "已配置" : "缺失"}</small></div><span className={destination.enabled ? "lux-user-badge is-ok" : "lux-user-badge is-warn"}>{destination.enabled ? "已启用" : "已停用"}</span></div>
     <div className="lux-notification-destination-actions"><button className="lux-button lux-button-secondary" type="button" onClick={() => setEditing((value) => !value)} disabled={busy}>{editing ? <X size={15} /> : <RefreshCw size={15} />}{editing ? "取消" : "编辑"}</button><button className="lux-button lux-button-secondary" type="button" onClick={() => toggle.mutate(!destination.enabled)} disabled={busy}>{destination.enabled ? "停用" : "启用"}</button><button className="lux-button lux-button-secondary" type="button" onClick={() => test.mutate()} disabled={busy}><Send size={15} />{test.isPending ? "发送中…" : "测试"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label={`轮换 ${destination.name} Secret`} title="轮换 Secret" onClick={() => rotate.mutate()} disabled={busy}><RotateCcw size={15} /></button><button className="lux-icon-button lux-icon-button-small lux-danger-icon" type="button" aria-label={`删除 ${destination.name}`} title="删除通知目标" onClick={() => { if (window.confirm(`确定删除通知目标“${destination.name}”？`)) remove.mutate(); }} disabled={busy}><Trash2 size={15} /></button></div>
-    {editing ? <form className="lux-notification-edit-form" onSubmit={(event) => { event.preventDefault(); update.mutate(); }}><label>名称<input value={name} onChange={(event) => setName(event.target.value)} maxLength={128} required /></label><label>接收地址<input type="url" value={url} onChange={(event) => setUrl(event.target.value)} maxLength={2048} required /></label><fieldset className="lux-notification-events"><legend>接收事件</legend><div className="lux-notification-event-grid">{EVENT_OPTIONS.map(([value, label]) => <label key={value}><input type="checkbox" checked={eventTypes.includes(value)} onChange={() => setEventTypes(toggleEvent(eventTypes, value))} /><span>{label}</span></label>)}</div></fieldset><label className="lux-admin-toggle"><input type="checkbox" checked={allowPrivateNetwork} onChange={(event) => setAllowPrivateNetwork(event.target.checked)} /><span>允许私有网络地址</span></label><label className="lux-admin-toggle"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用目标</span></label><button className="lux-button lux-button-primary" type="submit" disabled={update.isPending}>保存修改</button></form> : null}
+    {editing ? <form className="lux-notification-edit-form" onSubmit={(event) => { event.preventDefault(); update.mutate(); }}><label>名称<input value={name} onChange={(event) => setName(event.target.value)} maxLength={128} required /></label><label>接收地址<input type="url" value={url} onChange={(event) => setUrl(event.target.value)} maxLength={2048} required /></label><label>Payload 格式<select value={payloadFormat} onChange={(event) => setPayloadFormat(event.target.value as "LUX" | "EMBY")}><option value="LUX">Lux 原生</option><option value="EMBY">Emby 风格</option></select></label><fieldset className="lux-notification-events"><legend>接收事件</legend><div className="lux-notification-event-grid">{EVENT_OPTIONS.map(([value, label]) => <label key={value}><input type="checkbox" checked={eventTypes.includes(value)} onChange={() => setEventTypes(toggleEvent(eventTypes, value))} /><span>{label}</span></label>)}</div></fieldset><label className="lux-admin-toggle"><input type="checkbox" checked={allowPrivateNetwork} onChange={(event) => setAllowPrivateNetwork(event.target.checked)} /><span>允许私有网络地址</span></label><label className="lux-admin-toggle"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用目标</span></label><button className="lux-button lux-button-primary" type="submit" disabled={update.isPending}>保存修改</button></form> : null}
     {test.data ? <p className="lux-notification-result" role="status">测试发送成功，HTTP {test.data.status}</p> : null}{error ? <p className="lux-error-copy" role="alert">{error.message}</p> : null}
   </article>;
 }
@@ -151,6 +156,10 @@ function eventLabel(value: string) {
 
 function deliveryStatusLabel(value: string) {
   return value === "DELIVERED" ? "已送达" : value === "FAILED" ? "投递失败" : value === "PENDING" ? "等待重试" : value;
+}
+
+function payloadFormatLabel(value: "LUX" | "EMBY") {
+  return value === "EMBY" ? "Emby 风格" : "Lux 原生";
 }
 
 async function invalidateWebhookQueries(queryClient: ReturnType<typeof useQueryClient>) {

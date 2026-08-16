@@ -452,6 +452,7 @@ export class LuxApiClient {
     enabled: boolean;
     allowPrivateNetwork: boolean;
     eventTypes: string[];
+    payloadFormat: "LUX" | "EMBY";
     secret?: string;
   }) {
     return this.request<{ destination: AdminWebhookDestination; secret: string }>(
@@ -466,6 +467,7 @@ export class LuxApiClient {
     enabled?: boolean;
     allowPrivateNetwork?: boolean;
     eventTypes?: string[];
+    payloadFormat?: "LUX" | "EMBY";
   }) {
     return this.request<{ destination: AdminWebhookDestination }>(
       `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}`,

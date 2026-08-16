@@ -11,6 +11,7 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 - 增加 Emby `GET /Library/VirtualFolders` 接口，返回管理员可见的媒体库虚拟文件夹、根路径、集合类型和刷新状态。
 - 支持通过共享 API Key 访问虚拟文件夹接口，并兼容根路径和 `/emby` 前缀。
 - 增加持久化出站 Webhook 通知，支持媒体、扫描、元数据和后台任务事件。
+- Webhook 增加播放边沿/节流进度事件，并支持 Lux 原生与有限 Emby 风格 payload 选择。
 - 增加 Emby `GET /Persons` 人物列表接口，支持分页、媒体库权限和共享 API Key。
 
 ### Fixed
