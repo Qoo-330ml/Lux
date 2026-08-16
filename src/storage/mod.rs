@@ -1121,6 +1121,150 @@ impl Database {
         Ok(value.filter(|value| !value.trim().is_empty()))
     }
 
+    pub(crate) async fn replace_person_credits(
+        &self,
+        item_id: &str,
+        credits: &[NewPersonCredit],
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query("DELETE FROM person_credits WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for credit in credits {
+            self.query(
+                "INSERT INTO person_credits (
+                    item_id, person_id, person_type, person_name, provider, role,
+                    sort_order, biography, birthday, deathday, known_for_department,
+                    place_of_birth
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(item_id)
+            .bind(&credit.person_id)
+            .bind(&credit.person_type)
+            .bind(&credit.person_name)
+            .bind(&credit.provider)
+            .bind(&credit.role)
+            .bind(credit.sort_order)
+            .bind(&credit.biography)
+            .bind(&credit.birthday)
+            .bind(&credit.deathday)
+            .bind(&credit.known_for_department)
+            .bind(&credit.place_of_birth)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(())
+    }
+
+    pub(crate) async fn list_person_credits_for_library(
+        &self,
+        library_id: &str,
+        person_type: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredPersonCredit>, i64), StorageError> {
+        self.list_person_credits_for_libraries(&[library_id.to_owned()], person_type, offset, limit)
+            .await
+    }
+
+    pub(crate) async fn list_person_credits_for_libraries(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredPersonCredit>, i64), StorageError> {
+        if library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let count_query = format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT pc.provider, pc.person_id
+                 FROM person_credits pc
+                 JOIN media_items mi ON mi.id = pc.item_id
+                 WHERE mi.library_id IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   AND pc.person_type = ?
+                 GROUP BY pc.provider, pc.person_id
+             )"
+        );
+        let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        for library_id in library_ids {
+            count_statement = count_statement.bind(library_id);
+        }
+        let total: i64 = count_statement
+            .bind(person_type)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let list_query = format!(
+            "SELECT pc.person_id,
+                    pc.provider,
+                    MIN(pc.person_name) AS person_name,
+                    MIN(pc.role) AS role,
+                    MIN(pc.biography) AS biography,
+                    MIN(pc.birthday) AS birthday,
+                    MIN(pc.deathday) AS deathday,
+                    MIN(pc.known_for_department) AS known_for_department,
+                    MIN(pc.place_of_birth) AS place_of_birth
+             FROM person_credits pc
+             JOIN media_items mi ON mi.id = pc.item_id
+             WHERE mi.library_id IN ({placeholders})
+               AND mi.removed_at IS NULL
+               AND pc.person_type = ?
+             GROUP BY pc.provider, pc.person_id
+             ORDER BY MIN(pc.person_name), pc.provider, pc.person_id
+             LIMIT ? OFFSET ?"
+        );
+        let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
+        for library_id in library_ids {
+            list_statement = list_statement.bind(library_id);
+        }
+        let rows = list_statement
+            .bind(person_type)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(stored_person_credit)
+            .collect();
+        Ok((rows, total))
+    }
+
     pub(crate) async fn list_media_item_ids_for_library(
         &self,
         library_id: &str,
@@ -11943,6 +12087,48 @@ pub(crate) struct StoredMediaItem {
 }
 
 #[derive(Debug)]
+pub(crate) struct NewPersonCredit {
+    pub(crate) person_id: String,
+    pub(crate) person_type: String,
+    pub(crate) person_name: String,
+    pub(crate) provider: String,
+    pub(crate) role: String,
+    pub(crate) sort_order: i64,
+    pub(crate) biography: Option<String>,
+    pub(crate) birthday: Option<String>,
+    pub(crate) deathday: Option<String>,
+    pub(crate) known_for_department: Option<String>,
+    pub(crate) place_of_birth: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredPersonCredit {
+    pub(crate) person_id: String,
+    pub(crate) provider: String,
+    pub(crate) person_name: String,
+    pub(crate) role: String,
+    pub(crate) biography: Option<String>,
+    pub(crate) birthday: Option<String>,
+    pub(crate) deathday: Option<String>,
+    pub(crate) known_for_department: Option<String>,
+    pub(crate) place_of_birth: Option<String>,
+}
+
+fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
+    StoredPersonCredit {
+        person_id: row.get("person_id"),
+        provider: row.get("provider"),
+        person_name: row.get("person_name"),
+        role: row.get("role"),
+        biography: row.get("biography"),
+        birthday: row.get("birthday"),
+        deathday: row.get("deathday"),
+        known_for_department: row.get("known_for_department"),
+        place_of_birth: row.get("place_of_birth"),
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredCollectionRefresh {
     pub(crate) collection_item_id: String,
     pub(crate) member_count: usize,
@@ -13176,6 +13362,68 @@ mod tests {
         .await
         .expect("person credits table");
         assert_eq!(table_count, 1);
+
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-credits', ?, 'MOVIE', 'Credits', 'credits', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        database
+            .replace_person_credits(
+                "item-credits",
+                &[
+                    NewPersonCredit {
+                        person_id: "1".to_owned(),
+                        person_type: "Actor".to_owned(),
+                        person_name: "演员甲".to_owned(),
+                        provider: "tmdb".to_owned(),
+                        role: "角色甲".to_owned(),
+                        sort_order: 0,
+                        biography: None,
+                        birthday: None,
+                        deathday: None,
+                        known_for_department: None,
+                        place_of_birth: None,
+                    },
+                    NewPersonCredit {
+                        person_id: "2".to_owned(),
+                        person_type: "Actor".to_owned(),
+                        person_name: "演员乙".to_owned(),
+                        provider: "tmdb".to_owned(),
+                        role: "角色乙".to_owned(),
+                        sort_order: 1,
+                        biography: None,
+                        birthday: None,
+                        deathday: None,
+                        known_for_department: None,
+                        place_of_birth: None,
+                    },
+                ],
+            )
+            .await
+            .expect("person credits");
+        let (credits, total) = database
+            .list_person_credits_for_library(&library_id, "Actor", 0, 10)
+            .await
+            .expect("list person credits");
+        assert_eq!(total, 2);
+        assert_eq!(credits.len(), 2);
+        let names = credits
+            .iter()
+            .map(|credit| credit.person_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"演员甲"));
+        assert!(names.contains(&"演员乙"));
     }
 
     #[tokio::test]

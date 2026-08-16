@@ -1344,6 +1344,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - GET /Shows/{Id}/Seasons
 - GET /Shows/{Id}/Episodes
 - GET /Shows/NextUp
+- GET /Persons?ParentId={LibraryId}&Recursive=true&PersonTypes=Actor
 - GET /Search/Hints
 - GET/HEAD /Items/{Id}/Images/{Type}
 - GET/HEAD /Items/{Id}/Images/{Type}/{Index}
@@ -1387,6 +1388,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - Years。
 - Fields。
 - EnableImages、ImageTypeLimit。
+- `/Persons` 使用 `ParentId` 指定媒体库，`PersonTypes=Actor` 返回去重后的演员，响应必须保持 `Items`、`TotalRecordCount`、`StartIndex` 的 Emby 分页结构；人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
 - TotalRecordCount 与 Items 的一致性。
 
 Limit 默认 50，服务端硬上限 500。客户端请求更大时按兼容性策略截断或拒绝，并记录测试。
@@ -3929,14 +3931,14 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 
 验收：
 
-- [ ] 从空 SQLite 和 PostgreSQL 数据库运行 migration，建立通知目标、事件和投递状态表。
-- [ ] 管理员可以创建、查看、修改、删除、启停 Webhook 目标并执行测试发送；secret 只在创建/轮换时返回，
+- [x] 从空 SQLite 和 PostgreSQL 数据库运行 migration，建立通知目标、事件和投递状态表。
+- [x] 管理员可以创建、查看、修改、删除、启停 Webhook 目标并执行测试发送；secret 只在创建/轮换时返回，
       普通列表和日志不返回明文。
-- [ ] Webhook 请求使用 `eventId`、时间戳和 HMAC-SHA256 签名；事件写入和匹配投递记录可恢复且按目标幂等。
-- [ ] 投递具备超时、固定并发、有限指数退避、429/5xx 重试、失败记录和服务重启恢复。
-- [ ] URL 校验阻止凭据、查询参数、重定向以及默认的 loopback、链路本地、私有和 metadata 地址；管理员显式
+- [x] Webhook 请求使用 `eventId`、时间戳和 HMAC-SHA256 签名；事件写入和匹配投递记录可恢复且按目标幂等。
+- [x] 投递具备超时、固定并发、有限指数退避、`Retry-After`、429/5xx 重试、失败记录和服务重启恢复。
+- [x] URL 校验阻止凭据、查询参数、重定向以及默认的 loopback、链路本地、私有和 metadata 地址；管理员显式
       允许私有网络时仍拒绝危险保留地址。
-- [ ] 媒体/任务服务接入基础事件；重复扫描不会重复发送同一媒体新增事件。
+- [x] 媒体/任务服务接入基础事件；重复扫描不会重复发送同一媒体新增事件。
 - [ ] API、存储、URL 安全、签名、重试、恢复、权限、CSRF、脱敏和本地接收器集成测试通过。
 
 验证：参见 `docs/LUX-183-PLAN.md`；完成后更新 `docs/COMPATIBILITY.md`，明确 Lux 原生 Webhook 合同及尚未

@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if explicit_database_configuration.is_none() && !legacy_sqlite_database {
         app_state = app_state.require_database_selection();
     }
+    app_state.rebuild_people_index().await;
     app_state.resume_scan_jobs().await;
     app_state.start_realtime_watchers().await;
     app_state.resume_strm_probe_jobs().await;

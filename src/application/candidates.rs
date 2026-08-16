@@ -948,9 +948,10 @@ impl MetadataSelectionService {
     ) -> Self {
         Self {
             nfo: NfoWriteService::new(database.clone()),
-            database,
+            database: database.clone(),
             images,
-            people: crate::application::people::PeopleService::new(config_dir),
+            people: crate::application::people::PeopleService::new(config_dir)
+                .with_database(database.clone()),
         }
     }
 

@@ -252,7 +252,8 @@ impl AppState {
             Some(webhooks) => service.with_webhooks(webhooks),
             None => service,
         });
-        let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
+        let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone())
+            .with_database(database.clone());
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
         let probe = Some(MediaProbeService::new(
             database.clone(),
@@ -413,6 +414,22 @@ impl AppState {
                 worker.run(&job_id).await;
             });
         }
+    }
+
+    pub async fn rebuild_people_index(&self) {
+        let Some(service) = self.people.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match service.rebuild_person_credit_index().await {
+                Ok(rebuilt_items) => {
+                    tracing::info!(rebuilt_items, "person credit index rebuild completed");
+                }
+                Err(error) => {
+                    tracing::error!(%error, "person credit index rebuild failed");
+                }
+            }
+        });
     }
 
     pub async fn resume_scan_jobs(&self) {
@@ -1315,6 +1332,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
+        .route("/Persons", get(emby_persons))
         .route("/Users/{user_id}", get(emby_user))
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Root", get(emby_user_root))
@@ -1682,6 +1700,22 @@ struct EmbyTokenQuery {
     tag: Option<String>,
     #[serde(rename = "Fields", default)]
     fields: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct EmbyPersonsQuery {
+    #[serde(flatten)]
+    auth: EmbyTokenQuery,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    user_id: Option<String>,
+    #[serde(rename = "ParentId", alias = "parentId", default)]
+    parent_id: Option<String>,
+    #[serde(rename = "PersonTypes", alias = "personTypes", default)]
+    person_types: Option<String>,
+    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    start_index: Option<i64>,
+    #[serde(rename = "Limit", alias = "limit", default)]
+    limit: Option<i64>,
 }
 
 async fn require_emby_token(
@@ -2164,6 +2198,78 @@ async fn emby_library_virtual_folders(
         .into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+async fn emby_persons(
+    headers: HeaderMap,
+    Query(query): Query<EmbyPersonsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Some(user_id) = query.user_id.as_deref()
+        && let Err(status) = ensure_emby_user_scope(&user, user_id)
+    {
+        return status.into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let library_ids = match query.parent_id.as_deref() {
+        Some(parent_id) if accessible_library_ids.iter().any(|id| id == parent_id) => {
+            vec![parent_id.to_owned()]
+        }
+        Some(_) => return StatusCode::NOT_FOUND.into_response(),
+        None => accessible_library_ids,
+    };
+    let (offset, limit) = match emby_person_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let person_type = match emby_person_type_filter(query.person_types.as_deref()) {
+        Some(person_type) => person_type,
+        None => {
+            return Json(json!({
+                "Items": [],
+                "TotalRecordCount": 0,
+                "StartIndex": offset,
+            }))
+            .into_response();
+        }
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = match query.parent_id.as_deref() {
+        Some(parent_id) => {
+            people
+                .list_library_actors(parent_id, person_type, offset, limit)
+                .await
+        }
+        None => {
+            people
+                .list_libraries_actors(&library_ids, person_type, offset, limit)
+                .await
+        }
+    };
+    let (actors, total) = match result {
+        Ok(result) => result,
+        Err(PeopleError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(json!({
+        "Items": actors.into_iter().map(emby_person_json).collect::<Vec<_>>(),
+        "TotalRecordCount": total,
+        "StartIndex": offset,
+    }))
+    .into_response()
 }
 
 async fn emby_user_root(
@@ -4407,6 +4513,26 @@ fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
+}
+
+fn emby_person_page_params(query: &EmbyPersonsQuery) -> Result<(i64, i64), StatusCode> {
+    let offset = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50);
+    if offset < 0 || !(1..=100).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((offset, limit))
+}
+
+fn emby_person_type_filter(person_types: Option<&str>) -> Option<&'static str> {
+    let mut requested = person_types
+        .unwrap_or("Actor")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    requested
+        .find(|value| value.eq_ignore_ascii_case("Actor"))
+        .map(|_| "Actor")
 }
 
 fn ensure_emby_user_scope(user: &UserRecord, requested_id: &str) -> Result<(), StatusCode> {
