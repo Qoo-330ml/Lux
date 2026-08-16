@@ -38,7 +38,7 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
 #[tokio::test]
 async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (received_sender, mut received_receiver) = mpsc::channel::<ReceivedWebhook>(1);
+    let (received_sender, mut received_receiver) = mpsc::channel::<ReceivedWebhook>(2);
     let receiver_app = Router::new()
         .route(
             "/hook",
@@ -136,6 +136,29 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
         .ok_or("missing destination ID")?
         .to_owned();
     assert_eq!(created_body["secret"], secret);
+    assert_eq!(created_body["destination"]["payloadFormat"], "LUX");
+
+    let emby_created = client
+        .post(format!(
+            "http://{lux_address}/api/v1/admin/notification-destinations"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({
+            "name": "Emby receiver",
+            "url": format!("http://{receiver_address}/hook"),
+            "allowPrivateNetwork": true,
+            "eventTypes": ["SCAN_COMPLETED"],
+            "payloadFormat": "EMBY",
+            "secret": "emby-webhook-test-secret-1234"
+        }))
+        .send()
+        .await?;
+    assert_eq!(emby_created.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(
+        emby_created.json::<Value>().await?["destination"]["payloadFormat"],
+        "EMBY"
+    );
 
     #[cfg(unix)]
     {
@@ -205,21 +228,33 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
         .await?
         .ok_or("event was not inserted")?;
     assert!(event_id.len() > 10);
-    assert_eq!(service.process_ready_deliveries().await?, 1);
+    assert_eq!(service.process_ready_deliveries().await?, 2);
 
-    let received = received_receiver
-        .recv()
-        .await
-        .ok_or("missing webhook request")?;
-    let received_body: Value = serde_json::from_slice(&received.body)?;
-    assert_eq!(received_body["eventType"], "SCAN_COMPLETED");
-    assert_eq!(received_body["eventId"], event_id);
+    let mut received_bodies = Vec::new();
+    for _ in 0..2 {
+        let received = received_receiver
+            .recv()
+            .await
+            .ok_or("missing webhook request")?;
+        assert!(
+            received
+                .signature
+                .as_deref()
+                .is_some_and(|value| value.starts_with("sha256="))
+        );
+        received_bodies.push(serde_json::from_slice::<Value>(&received.body)?);
+    }
     assert!(
-        received
-            .signature
-            .as_deref()
-            .is_some_and(|value| value.starts_with("sha256="))
+        received_bodies
+            .iter()
+            .any(|body| { body["eventType"] == "SCAN_COMPLETED" && body["eventId"] == event_id })
     );
+    assert!(
+        received_bodies
+            .iter()
+            .any(|body| body["Event"] == "system.notification")
+    );
+    assert_ne!(received_bodies[0], received_bodies[1]);
 
     let deliveries = client
         .get(format!(

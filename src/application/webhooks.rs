@@ -40,6 +40,7 @@ pub struct WebhookDestinationView {
     pub enabled: bool,
     pub allow_private_network: bool,
     pub event_types: Vec<String>,
+    pub payload_format: String,
     pub secret_configured: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -137,9 +138,32 @@ impl WebhookService {
         event_types: &[String],
         secret: Option<&str>,
     ) -> Result<(WebhookDestinationView, String), WebhookError> {
+        self.create_destination_with_format(
+            name,
+            url,
+            enabled,
+            allow_private_network,
+            event_types,
+            secret,
+            WebhookPayloadFormat::Lux.as_str(),
+        )
+        .await
+    }
+
+    pub async fn create_destination_with_format(
+        &self,
+        name: &str,
+        url: &str,
+        enabled: bool,
+        allow_private_network: bool,
+        event_types: &[String],
+        secret: Option<&str>,
+        payload_format: &str,
+    ) -> Result<(WebhookDestinationView, String), WebhookError> {
         let name = validate_name(name)?;
         let url = validate_destination(url, allow_private_network)?;
         let event_types = normalize_event_types(event_types)?;
+        let payload_format = normalize_payload_format(payload_format)?;
         let secret = normalize_or_generate_secret(secret)?;
         let id = uuid::Uuid::now_v7().to_string();
         self.set_secret(&id, Some(&secret)).await?;
@@ -154,6 +178,7 @@ impl WebhookService {
                 enabled,
                 allow_private_network,
                 event_types_json: &event_types_json,
+                payload_format: payload_format.as_str(),
             })
             .await
         {
@@ -220,6 +245,28 @@ impl WebhookService {
         allow_private_network: Option<bool>,
         event_types: Option<&[String]>,
     ) -> Result<WebhookDestinationView, WebhookError> {
+        self.update_destination_with_format(
+            id,
+            name,
+            url,
+            enabled,
+            allow_private_network,
+            event_types,
+            None,
+        )
+        .await
+    }
+
+    pub async fn update_destination_with_format(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        url: Option<&str>,
+        enabled: Option<bool>,
+        allow_private_network: Option<bool>,
+        event_types: Option<&[String]>,
+        payload_format: Option<&str>,
+    ) -> Result<WebhookDestinationView, WebhookError> {
         let current = self
             .database
             .find_notification_destination(id)
@@ -237,6 +284,7 @@ impl WebhookService {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|error| WebhookError::Serialization(error.to_string()))?;
+        let normalized_payload_format = payload_format.map(normalize_payload_format).transpose()?;
         self.database
             .update_notification_destination(
                 id,
@@ -246,6 +294,7 @@ impl WebhookService {
                     enabled,
                     allow_private_network,
                     event_types_json: event_types_json.as_deref(),
+                    payload_format: normalized_payload_format.map(WebhookPayloadFormat::as_str),
                 },
             )
             .await?;
@@ -284,45 +333,65 @@ impl WebhookService {
             .database
             .list_enabled_notification_destinations()
             .await?;
-        let destination_ids = destinations
-            .iter()
-            .filter_map(|destination| {
-                event_types_from_json(&destination.event_types_json)
-                    .ok()
-                    .filter(|event_types| {
-                        event_types.is_empty()
-                            || event_types.iter().any(|value| value == event_type.as_str())
-                    })
-                    .map(|_| destination.id.clone())
-            })
-            .collect::<Vec<_>>();
-        let event_id = uuid::Uuid::now_v7().to_string();
-        let payload =
-            build_event_payload(&self.server_id, &event_id, event_type, occurred_at, data)?;
-        let payload_json = serde_json::to_vec(&payload)
-            .map_err(|error| WebhookError::Serialization(error.to_string()))?;
-        if payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
-            return Err(WebhookError::Invalid(
-                "event payload is too large".to_owned(),
-            ));
+        let mut destination_groups = BTreeMap::<WebhookPayloadFormat, Vec<String>>::new();
+        for destination in destinations {
+            let selected = event_types_from_json(&destination.event_types_json)
+                .ok()
+                .is_some_and(|event_types| {
+                    event_types.is_empty()
+                        || event_types.iter().any(|value| value == event_type.as_str())
+                });
+            if !selected {
+                continue;
+            }
+            let payload_format = WebhookPayloadFormat::from_wire_name(&destination.payload_format)
+                .ok_or_else(|| {
+                    WebhookError::Invalid("unknown webhook payload format".to_owned())
+                })?;
+            destination_groups
+                .entry(payload_format)
+                .or_default()
+                .push(destination.id);
         }
-        let payload_json = String::from_utf8(payload_json)
-            .map_err(|error| WebhookError::Serialization(error.to_string()))?;
-        let inserted = self
-            .database
-            .insert_notification_event_with_deliveries(
-                NewNotificationEvent {
-                    id: &event_id,
-                    event_type: event_type.as_str(),
-                    schema_version: 1,
-                    occurred_at,
-                    dedupe_key,
-                    payload_json: &payload_json,
-                },
-                &destination_ids,
-            )
-            .await?;
-        Ok(inserted.then_some(event_id))
+        let mut first_event_id = None;
+        for (payload_format, destination_ids) in destination_groups {
+            let event_id = uuid::Uuid::now_v7().to_string();
+            let payload = build_event_payload_for_format(
+                &self.server_id,
+                &event_id,
+                event_type,
+                occurred_at,
+                payload_format,
+                data.clone(),
+            )?;
+            let payload_json = serde_json::to_vec(&payload)
+                .map_err(|error| WebhookError::Serialization(error.to_string()))?;
+            if payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
+                return Err(WebhookError::Invalid(
+                    "event payload is too large".to_owned(),
+                ));
+            }
+            let payload_json = String::from_utf8(payload_json)
+                .map_err(|error| WebhookError::Serialization(error.to_string()))?;
+            let inserted = self
+                .database
+                .insert_notification_event_with_deliveries(
+                    NewNotificationEvent {
+                        id: &event_id,
+                        event_type: event_type.as_str(),
+                        schema_version: 1,
+                        occurred_at,
+                        dedupe_key: &format!("{dedupe_key}:{}", payload_format.as_str()),
+                        payload_json: &payload_json,
+                    },
+                    &destination_ids,
+                )
+                .await?;
+            if inserted && first_event_id.is_none() {
+                first_event_id = Some(event_id);
+            }
+        }
+        Ok(first_event_id)
     }
 
     pub async fn test_destination(&self, id: &str) -> Result<u16, WebhookError> {
@@ -337,11 +406,14 @@ impl WebhookService {
             .remove(id)
             .ok_or(WebhookError::SecretUnavailable)?;
         let event_id = uuid::Uuid::now_v7().to_string();
-        let payload = build_event_payload(
+        let payload = build_event_payload_for_format(
             &self.server_id,
             &event_id,
             WebhookEventType::JobFailed,
             unix_now(),
+            WebhookPayloadFormat::from_wire_name(&destination.payload_format).ok_or_else(|| {
+                WebhookError::Invalid("unknown webhook payload format".to_owned())
+            })?,
             json!({"test": true}),
         )?;
         let payload = serde_json::to_vec(&payload)
@@ -548,6 +620,29 @@ pub enum WebhookEventType {
     PlaybackPaused,
     PlaybackProgress,
     PlaybackStopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum WebhookPayloadFormat {
+    Lux,
+    Emby,
+}
+
+impl WebhookPayloadFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lux => "LUX",
+            Self::Emby => "EMBY",
+        }
+    }
+
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "LUX" => Some(Self::Lux),
+            "EMBY" => Some(Self::Emby),
+            _ => None,
+        }
+    }
 }
 
 impl WebhookEventType {
@@ -775,6 +870,11 @@ fn normalize_event_types(values: &[String]) -> Result<Vec<String>, WebhookError>
     Ok(result)
 }
 
+fn normalize_payload_format(value: &str) -> Result<WebhookPayloadFormat, WebhookError> {
+    WebhookPayloadFormat::from_wire_name(value)
+        .ok_or_else(|| WebhookError::Invalid("unknown webhook payload format".to_owned()))
+}
+
 fn event_types_from_json(value: &str) -> Result<Vec<String>, WebhookError> {
     let values = serde_json::from_str::<Vec<String>>(value)
         .map_err(|error| WebhookError::Serialization(error.to_string()))?;
@@ -824,6 +924,69 @@ fn build_event_payload(
     data.insert("occurredAt".to_owned(), json!(occurred_at));
     data.insert("serverId".to_owned(), json!(server_id));
     Ok(Value::Object(data))
+}
+
+fn build_event_payload_for_format(
+    server_id: &str,
+    event_id: &str,
+    event_type: WebhookEventType,
+    occurred_at: i64,
+    payload_format: WebhookPayloadFormat,
+    data: Value,
+) -> Result<Value, WebhookError> {
+    let lux_payload = build_event_payload(server_id, event_id, event_type, occurred_at, data)?;
+    if payload_format == WebhookPayloadFormat::Lux {
+        return Ok(lux_payload);
+    }
+    let item_id = lux_payload.get("itemId").and_then(Value::as_str);
+    let play_session_id = lux_payload.get("playSessionId").and_then(Value::as_str);
+    let mut payload = json!({
+        "Event": emby_event_name(event_type),
+        "EventId": event_id,
+        "Timestamp": occurred_at,
+        "Server": { "Id": server_id },
+    });
+    if let Some(item_id) = item_id {
+        payload["Item"] = json!({ "Id": item_id });
+    }
+    if let Some(play_session_id) = play_session_id {
+        payload["PlaySessionId"] = json!(play_session_id);
+    }
+    let mappings = [
+        ("mediaSourceId", "MediaSourceId"),
+        ("positionTicks", "PositionTicks"),
+        ("durationTicks", "RunTimeTicks"),
+        ("isPaused", "IsPaused"),
+        ("client", "Client"),
+        ("deviceName", "DeviceName"),
+        ("deviceType", "DeviceType"),
+        ("clientVersion", "ApplicationVersion"),
+        ("state", "PlaybackState"),
+        ("libraryId", "LibraryId"),
+        ("jobId", "JobId"),
+        ("status", "Status"),
+        ("errorCode", "ErrorCode"),
+    ];
+    for (source, target) in mappings {
+        if let Some(value) = lux_payload.get(source) {
+            payload[target] = value.clone();
+        }
+    }
+    Ok(payload)
+}
+
+fn emby_event_name(event_type: WebhookEventType) -> &'static str {
+    match event_type {
+        WebhookEventType::MediaAdded => "library.new",
+        WebhookEventType::MediaRemoved => "library.deleted",
+        WebhookEventType::ScanCompleted | WebhookEventType::ScanFailed => "system.notification",
+        WebhookEventType::MetadataUpdated => "item.updated",
+        WebhookEventType::JobFailed => "system.notification",
+        WebhookEventType::PlaybackStarted => "playback.start",
+        WebhookEventType::PlaybackPaused => "playback.pause",
+        WebhookEventType::PlaybackProgress => "playback.progress",
+        WebhookEventType::PlaybackStopped => "playback.stop",
+    }
 }
 
 fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
@@ -917,6 +1080,9 @@ fn destination_view(
         enabled: destination.enabled,
         allow_private_network: destination.allow_private_network,
         event_types: event_types_from_json(&destination.event_types_json)?,
+        payload_format: normalize_payload_format(&destination.payload_format)?
+            .as_str()
+            .to_owned(),
         secret_configured,
         created_at: destination.created_at,
         updated_at: destination.updated_at,
@@ -1038,8 +1204,8 @@ fn public_error_message(error: &WebhookError) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WebhookEventType, build_event_payload, is_retryable_http_status, parse_retry_after,
-        retry_delay,
+        WebhookEventType, WebhookPayloadFormat, build_event_payload,
+        build_event_payload_for_format, is_retryable_http_status, parse_retry_after, retry_delay,
     };
     use reqwest::StatusCode;
     use serde_json::json;
@@ -1147,5 +1313,33 @@ mod tests {
         assert_eq!(payload["client"], "VidHub");
         assert!(payload.get("userId").is_none());
         assert!(payload.get("path").is_none());
+    }
+
+    #[test]
+    fn emby_payload_adapter_keeps_a_separate_stable_contract() {
+        assert_eq!(
+            WebhookPayloadFormat::from_wire_name("emby"),
+            Some(WebhookPayloadFormat::Emby)
+        );
+        let payload = build_event_payload_for_format(
+            "server-1",
+            "event-emby",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            json!({
+                "itemId": "item-1",
+                "playSessionId": "session-1",
+                "positionTicks": 42,
+                "path": "/private/movie.mkv"
+            }),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(payload["Event"], "playback.start");
+        assert_eq!(payload["Item"]["Id"], "item-1");
+        assert_eq!(payload["PlaySessionId"], "session-1");
+        assert_eq!(payload["PositionTicks"], 42);
+        assert!(payload.get("path").is_none());
+        assert!(payload.get("userId").is_none());
     }
 }

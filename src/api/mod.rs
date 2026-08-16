@@ -13340,6 +13340,7 @@ struct WebhookDestinationCreateRequest {
     allow_private_network: bool,
     #[serde(default)]
     event_types: Vec<String>,
+    payload_format: Option<String>,
     secret: Option<String>,
 }
 
@@ -13351,6 +13352,7 @@ struct WebhookDestinationUpdateRequest {
     enabled: Option<bool>,
     allow_private_network: Option<bool>,
     event_types: Option<Vec<String>>,
+    payload_format: Option<String>,
 }
 
 const fn default_enabled() -> bool {
@@ -13445,13 +13447,14 @@ async fn admin_create_webhook_destination(
         .into_response();
     };
     match service
-        .create_destination(
+        .create_destination_with_format(
             &request.name,
             &request.url,
             request.enabled,
             request.allow_private_network,
             &request.event_types,
             request.secret.as_deref(),
+            request.payload_format.as_deref().unwrap_or("LUX"),
         )
         .await
     {
@@ -13483,13 +13486,14 @@ async fn admin_update_webhook_destination(
         .into_response();
     };
     match service
-        .update_destination(
+        .update_destination_with_format(
             &destination_id,
             request.name.as_deref(),
             request.url.as_deref(),
             request.enabled,
             request.allow_private_network,
             request.event_types.as_deref(),
+            request.payload_format.as_deref(),
         )
         .await
     {
