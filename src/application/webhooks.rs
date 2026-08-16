@@ -11,7 +11,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{fs, net::lookup_host, sync::Mutex, time::sleep};
 use url::{Host, Url};
@@ -797,17 +797,49 @@ fn build_event_payload(
     occurred_at: i64,
     data: Value,
 ) -> Result<Value, WebhookError> {
-    let Value::Object(mut data) = data else {
+    let Value::Object(data) = data else {
         return Err(WebhookError::Invalid(
             "webhook event data must be a JSON object".to_owned(),
         ));
     };
+    let mut data = data
+        .into_iter()
+        .filter(|(key, _)| event_field_allowed(event_type, key))
+        .collect::<Map<_, _>>();
     data.insert("schemaVersion".to_owned(), json!(1));
     data.insert("eventId".to_owned(), json!(event_id));
     data.insert("eventType".to_owned(), json!(event_type.as_str()));
     data.insert("occurredAt".to_owned(), json!(occurred_at));
     data.insert("serverId".to_owned(), json!(server_id));
     Ok(Value::Object(data))
+}
+
+fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
+    match key {
+        "jobId" | "libraryId" | "jobType" | "status" | "processedCount" | "totalCount"
+        | "errorCode" => matches!(
+            event_type,
+            WebhookEventType::MediaAdded
+                | WebhookEventType::MediaRemoved
+                | WebhookEventType::ScanCompleted
+                | WebhookEventType::ScanFailed
+                | WebhookEventType::MetadataUpdated
+                | WebhookEventType::JobFailed
+        ),
+        "addedCount" => matches!(event_type, WebhookEventType::MediaAdded),
+        "removedCount" => matches!(event_type, WebhookEventType::MediaRemoved),
+        "itemId" | "sourceId" | "deletedFileCount" => {
+            matches!(event_type, WebhookEventType::MediaRemoved)
+        }
+        "mode" | "candidateCount" => {
+            matches!(
+                event_type,
+                WebhookEventType::MetadataUpdated | WebhookEventType::JobFailed
+            )
+        }
+        "test" => matches!(event_type, WebhookEventType::JobFailed),
+        _ => false,
+    }
 }
 
 async fn resolve_webhook_address(
@@ -951,11 +983,11 @@ fn is_retryable_http_status(status: StatusCode) -> bool {
 fn parse_retry_after(value: Option<&str>, now: SystemTime) -> Option<i64> {
     let value = value?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
-        return Some(
-            i64::try_from(seconds)
-                .unwrap_or(MAX_RETRY_DELAY_SECONDS)
-                .min(MAX_RETRY_DELAY_SECONDS),
-        );
+        let seconds = match i64::try_from(seconds) {
+            Ok(seconds) => seconds,
+            Err(_) => MAX_RETRY_DELAY_SECONDS,
+        };
+        return Some(seconds.min(MAX_RETRY_DELAY_SECONDS));
     }
     let retry_at = httpdate::parse_http_date(value).ok()?;
     let seconds = retry_at
@@ -977,8 +1009,12 @@ fn public_error_message(error: &WebhookError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_retryable_http_status, parse_retry_after, retry_delay};
+    use super::{
+        WebhookEventType, build_event_payload, is_retryable_http_status, parse_retry_after,
+        retry_delay,
+    };
     use reqwest::StatusCode;
+    use serde_json::json;
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -1013,5 +1049,26 @@ mod tests {
         assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
         assert!(!is_retryable_http_status(StatusCode::UNAUTHORIZED));
         assert_eq!(retry_delay(1), 1);
+    }
+
+    #[test]
+    fn event_payload_keeps_only_fields_allowed_for_its_event_type() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-1",
+            WebhookEventType::MediaAdded,
+            1_700_000_000,
+            json!({
+                "libraryId": "library-1",
+                "path": "/srv/media/movie.mkv",
+                "token": "secret-token",
+                "strmUrl": "https://user:password@example.test/movie"
+            }),
+        )
+        .expect("object payload should be accepted");
+        assert_eq!(payload["libraryId"], "library-1");
+        assert!(payload.get("path").is_none());
+        assert!(payload.get("token").is_none());
+        assert!(payload.get("strmUrl").is_none());
     }
 }

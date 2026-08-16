@@ -100,6 +100,20 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
     let csrf = cookie_value(login.headers(), "lux_csrf");
     let secret = "webhook-test-secret-1234";
 
+    let missing_csrf = client
+        .post(format!(
+            "http://{lux_address}/api/v1/admin/notification-destinations"
+        ))
+        .header(COOKIE, &cookies)
+        .json(&json!({
+            "name": "CSRF receiver",
+            "url": "https://example.com/lux-hook",
+            "secret": secret
+        }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
     let created = client
         .post(format!(
             "http://{lux_address}/api/v1/admin/notification-destinations"
@@ -123,6 +137,17 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
         .to_owned();
     assert_eq!(created_body["secret"], secret);
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = tokio::fs::metadata(config.config_dir.join("lux_webhook_secrets.json"))
+            .await?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     let listed = client
         .get(format!(
             "http://{lux_address}/api/v1/admin/notification-destinations"
@@ -134,6 +159,40 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
     let listed_body: Value = listed.json().await?;
     assert_eq!(listed_body["destinations"][0]["secretConfigured"], true);
     assert!(!listed_body.to_string().contains(secret));
+
+    let regular = client
+        .post(format!("http://{lux_address}/api/v1/admin/users"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({
+            "username": "webhook-viewer",
+            "password": "webhook-viewer-password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(regular.status(), reqwest::StatusCode::CREATED);
+    let regular_login = client
+        .post(format!("http://{lux_address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "webhook-viewer",
+            "password": "webhook-viewer-password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(regular_login.status(), reqwest::StatusCode::OK);
+    let regular_cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(regular_login.headers(), "lux_session"),
+        cookie_value(regular_login.headers(), "lux_csrf")
+    );
+    let denied = client
+        .get(format!(
+            "http://{lux_address}/api/v1/admin/notification-destinations"
+        ))
+        .header(COOKIE, regular_cookies)
+        .send()
+        .await?;
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
 
     let service = WebhookService::new(database.clone(), config.config_dir.clone())?;
     let event_id = service
