@@ -29,7 +29,7 @@ Lux 原生和 Emby 风格 payload 使用独立 DTO adapter，不污染 Lux 原�
 - `94d88cdd`：播放开始、暂停、节流进度和停止事件。
 - `4fcab643`：Emby 风格 payload adapter、格式分组投递和兼容回归测试。
 
-当前阶段门仍需在 person credits 并行改动稳定后重新运行完整 Rust 检查；该并行改动曾使工作树暂时无法编译，不能据此宣称全量检查通过。
+当前阶段门已在 person credits 并行改动稳定后完成；本机 ARM64 的 Rust 全量测试、fmt、clippy、Web 测试和构建均已通过。
 
 ## 实施增量
 
