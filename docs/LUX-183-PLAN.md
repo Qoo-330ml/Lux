@@ -7,6 +7,19 @@ payload 兼容。
 
 事件类型：`MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、`JOB_FAILED`。
 
+## 当前实施状态
+
+后端核心已完成并拆分为以下原子提交：
+
+- `f96c392f`：事件类型、URL 校验和 HMAC-SHA256 签名基础。
+- `012625be`：持久化事件、投递记录和后台 worker。
+- `bde93835`：`Retry-After`、瞬态 HTTP 状态分类、失败状态和 IPv4-mapped IPv6 校验。
+- `70402954`：显式删除和扫描缺失媒体的 `MEDIA_REMOVED`。
+- `9e388279`：元数据刷新和任务失败事件。
+- `d03b2bee`、`822f64ed`：payload 白名单、权限/CSRF/secret 权限和 lease 回归测试。
+
+当前阶段门仍需在 person credits 并行改动稳定后重新运行完整 Rust 检查；该并行改动曾使工作树暂时无法编译，不能据此宣称全量检查通过。
+
 ## 实施增量
 
 ### 1. 事件合同和存储
