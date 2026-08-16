@@ -15,6 +15,16 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.6",
+    date: "2026-08-16",
+    sections: [
+      { kind: "added", items: [
+        "增加 Emby GET /Library/VirtualFolders 接口，返回管理员可见的媒体库虚拟文件夹、根路径、集合类型和刷新状态。",
+        "支持通过共享 API Key 访问虚拟文件夹接口，并兼容根路径和 /emby 前缀。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.5",
     date: "2026-08-16",
     sections: [
