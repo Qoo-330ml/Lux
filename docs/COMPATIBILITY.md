@@ -39,6 +39,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
 - Web 的“已实现”仅表示代码路径和服务端静态集成已完成；当前 Chrome smoke 覆盖登录、筛选、播放、收藏、账户会话和管理流程，不等同于所有浏览器/编码格式兼容。
 - LUX-121 兼容补齐：Emby `Views` 返回媒体库类型、`ChildCount` 和标准 `ImageTags.Primary`；条目详情同时返回本地徽标的 `ImageTags.Logo`，并通过 `/Items/{itemId}/Images/Logo` 提供标准图片读取；媒体库封面支持 `/Items/{libraryId}/Images/Primary` 及带索引、HEAD、ETag 和 ACL。尚待 VidHub UI 重新实测确认。
+- 2026-08-17 混合媒体库兼容修复：普通 Emby 客户端继续在混合库 DTO 中收到 `CollectionType: "mixed"`；VidHub 的认证设备收到历史兼容的 `CollectionType: null`，同时保留电影/剧集条目列表和 `TypeOptions`。原因是 VidHub 可连接服务器但会丢弃带 `mixed` 集合类型的库；`tests/mixed_library_api.rs` 覆盖两种客户端的分流。
 - Emby `GET /Library/VirtualFolders` 现返回接近官方 `VirtualFolderInfo` 的完整结构：`Id`、`Guid`、`ItemId` 使用同一个稳定媒体库 ID，`LibraryOptions` 包含 `PathInfos`、按电影/剧集类型拆分的 `TypeOptions`、Lux 当前图片策略、NFO 本地元数据策略、字幕语言和播放恢复阈值。Lux 没有等价 Emby 刮削器时，metadata/image fetcher 数组保持为空；尚未以目标第三方客户端真实 UI 复测该管理端点。
 - Emby `GET /Persons?ParentId={libraryId}&Recursive=true&PersonTypes=Actor` 已补齐：返回去重后的演员 `Items`、`TotalRecordCount`、`StartIndex`，支持根路径和 `/emby` 前缀、Emby token/API Key、媒体库 ACL，并在服务启动后台回填已有 `people.json` 关系到人物索引。`tests/people_api.rs` 已覆盖共享 API Key、人物字段、分页结构、前缀和回填；尚未以目标第三方客户端真实 UI 复测。
 - Harbor 1.4.6 兼容修复：Emby 媒体库自身的 `/Users/{userId}/Items/{libraryId}` 详情现在返回 `CollectionFolder`，并复用媒体库启用状态和 ACL 校验；本机 Harbor 真实 UI 已验证可进入库并显示条目。
