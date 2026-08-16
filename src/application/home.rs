@@ -129,7 +129,6 @@ impl HomeService {
             is_admin: principal.is_admin,
         };
         let entry = self.entry(key, principal).await;
-        let _compute_guard = entry.compute_lock.lock().await;
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
             let cached = entry.value.lock().await;
@@ -139,6 +138,18 @@ impl HomeService {
                 if cached.refreshed_at.elapsed() >= HOME_CACHE_TTL {
                     self.schedule_refresh();
                 }
+                return Ok(cached.snapshot.clone());
+            }
+        }
+
+        let _compute_guard = entry.compute_lock.lock().await;
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        {
+            let cached = entry.value.lock().await;
+            if let Some(cached) = cached.as_ref()
+                && cached.generation == generation
+                && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
+            {
                 return Ok(cached.snapshot.clone());
             }
         }
