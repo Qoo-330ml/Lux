@@ -49,6 +49,23 @@ pub struct ActorCredit {
     pub order: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<PersonMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub biography: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deathday: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_for_department: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_of_birth: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,6 +95,8 @@ struct StoredActor {
     image_file: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_assets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    person: Option<PersonMetadata>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,6 +136,11 @@ pub struct ActorView {
     pub name: String,
     pub character: Option<String>,
     pub image_url: Option<String>,
+    pub biography: Option<String>,
+    pub birthday: Option<String>,
+    pub deathday: Option<String>,
+    pub known_for_department: Option<String>,
+    pub place_of_birth: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +267,7 @@ impl PeopleService {
                 order: actor.order,
                 image_file: assets.image_file,
                 pending_assets: assets.pending_assets,
+                person: actor.person.clone(),
             });
         }
 
@@ -329,7 +354,7 @@ impl PeopleService {
         }
         if let Err(error) = write_atomically(
             &nfo_path,
-            &person_nfo_bytes(&actor.name, provider, provider_id),
+            &person_nfo_bytes(&actor.name, provider, provider_id, actor.person.as_ref()),
         )
         .await
         {
@@ -521,6 +546,26 @@ impl PeopleService {
                 name: actor.name,
                 character: actor.character,
                 image_url,
+                biography: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.biography.clone()),
+                birthday: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.birthday.clone()),
+                deathday: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.deathday.clone()),
+                known_for_department: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.known_for_department.clone()),
+                place_of_birth: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.place_of_birth.clone()),
             });
         }
         Ok(views)
@@ -942,15 +987,38 @@ async fn image_from_path(path: &Path) -> Result<Option<PersonImage>, PeopleError
     }))
 }
 
-fn person_nfo_bytes(name: &str, provider: &str, provider_id: &str) -> Vec<u8> {
+fn person_nfo_bytes(
+    name: &str,
+    provider: &str,
+    provider_id: &str,
+    metadata: Option<&PersonMetadata>,
+) -> Vec<u8> {
+    let metadata = metadata.map(person_metadata_xml).unwrap_or_default();
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-         <person><name>{}</name><uniqueid type=\"{}\">{}</uniqueid></person>\n",
+         <person><name>{}</name>{}<uniqueid type=\"{}\">{}</uniqueid></person>\n",
         escape(name),
+        metadata,
         escape(provider),
         escape(provider_id),
     )
     .into_bytes()
+}
+
+fn person_metadata_xml(metadata: &PersonMetadata) -> String {
+    let mut xml = String::new();
+    for (tag, value) in [
+        ("biography", metadata.biography.as_deref()),
+        ("birthday", metadata.birthday.as_deref()),
+        ("deathday", metadata.deathday.as_deref()),
+        ("knownfor", metadata.known_for_department.as_deref()),
+        ("placeofbirth", metadata.place_of_birth.as_deref()),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            xml.push_str(&format!("<{tag}>{}</{tag}>", escape(value)));
+        }
+    }
+    xml
 }
 
 fn default_provider() -> String {
@@ -1294,6 +1362,7 @@ mod tests {
                     character: Some("角色甲".to_owned()),
                     order: Some(0),
                     profile_url: None,
+                    person: None,
                 }],
             )
             .await?;
@@ -1315,6 +1384,44 @@ mod tests {
             service.profile_image("9").await?.map(|image| image.path),
             Some(person_dir.join("folder.png"))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_writes_available_person_biography_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let person_dir = people_directory(config.path(), "演员甲", "tmdb", "9")?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+
+        PeopleService::new(config.path().to_owned())
+            .persist_item_actors(
+                "item-biography",
+                "tmdb",
+                &[ActorCredit {
+                    id: "9".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员甲".to_owned(),
+                    character: Some("角色甲".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                    person: Some(super::PersonMetadata {
+                        biography: Some("演员甲的生平介绍".to_owned()),
+                        birthday: Some("1970-01-01".to_owned()),
+                        deathday: None,
+                        known_for_department: Some("Acting".to_owned()),
+                        place_of_birth: Some("测试城市".to_owned()),
+                    }),
+                }],
+            )
+            .await?;
+
+        let nfo = tokio::fs::read_to_string(person_dir.join("person.nfo")).await?;
+        assert!(nfo.contains("<biography>演员甲的生平介绍</biography>"));
+        assert!(nfo.contains("<birthday>1970-01-01</birthday>"));
+        assert!(nfo.contains("<knownfor>Acting</knownfor>"));
+        assert!(nfo.contains("<placeofbirth>测试城市</placeofbirth>"));
         Ok(())
     }
 
@@ -1346,6 +1453,7 @@ mod tests {
                         character: None,
                         order: Some(0),
                         profile_url: None,
+                        person: None,
                     }],
                 )
                 .await?;
@@ -1406,6 +1514,7 @@ mod tests {
                     character: None,
                     order: None,
                     profile_url: None,
+                    person: None,
                 }],
             )
             .await
@@ -1431,6 +1540,7 @@ mod tests {
                     character: Some("本地角色".to_owned()),
                     order: Some(0),
                     profile_url: None,
+                    person: None,
                 }],
             )
             .await?;
@@ -1495,6 +1605,7 @@ mod tests {
                     character: None,
                     order: Some(0),
                     profile_url: None,
+                    person: None,
                 }],
             )
             .await?;
@@ -1527,6 +1638,7 @@ mod tests {
             character: None,
             order: Some(0),
             profile_url: None,
+            person: None,
         }];
 
         service
@@ -1570,6 +1682,7 @@ mod tests {
                     character: Some("角色甲".to_owned()),
                     order: Some(0),
                     profile_url: None,
+                    person: None,
                 }],
                 &[1, 2, 3],
             )

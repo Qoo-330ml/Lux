@@ -1237,6 +1237,15 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option<String> {
+    policy
+        .reported_client_ip(
+            header_str(headers, "x-lux-peer-ip"),
+            header_str(headers, "x-forwarded-for"),
+        )
+        .map(|address| address.to_string())
+}
+
 fn login_attempt_key(headers: &HeaderMap, username: &str) -> String {
     format!(
         "{}:{}",
@@ -3395,6 +3404,11 @@ fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
         "Role": actor.character,
         "Type": "Actor",
         "PrimaryImageTag": image_tag,
+        "Overview": actor.biography,
+        "BirthDate": actor.birthday,
+        "DeathDate": actor.deathday,
+        "KnownForDepartment": actor.known_for_department,
+        "PlaceOfBirth": actor.place_of_birth,
     })
 }
 
@@ -3796,6 +3810,7 @@ async fn handle_emby_playback_event(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
+    let remote_ip = request_client_ip(&headers, &state.remote_access);
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -3807,7 +3822,7 @@ async fn handle_emby_playback_event(
             device_name,
             client_version,
             device_type,
-            remote_ip: header_str(&headers, "x-lux-peer-ip"),
+            remote_ip: remote_ip.as_deref(),
             state: state_name,
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -4047,6 +4062,7 @@ async fn lux_post_progress(
     };
     let activity_event =
         playback_activity_event_type(previous_session.as_ref(), playback_state.as_str());
+    let remote_ip = request_client_ip(&headers, &state.remote_access);
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -4058,7 +4074,7 @@ async fn lux_post_progress(
             device_name: Some("Web"),
             client_version: None,
             device_type: Some("Web"),
-            remote_ip: header_str(&headers, "x-lux-peer-ip"),
+            remote_ip: remote_ip.as_deref(),
             state: playback_state.as_str(),
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -5336,6 +5352,18 @@ fn emby_media_source_json_with_resolver_and_chapters(
     };
     let is_remote_playback = is_remote || is_resolver_target;
     let is_playable = source.source_kind == "LOCAL_FILE" || is_remote_playback;
+    let default_audio_stream_index = source
+        .streams
+        .iter()
+        .find(|stream| stream.stream_type == "AUDIO" && stream.is_default)
+        .or_else(|| {
+            source
+                .streams
+                .iter()
+                .find(|stream| stream.stream_type == "AUDIO")
+        })
+        .map(|stream| stream.index)
+        .unwrap_or(-1);
     let mut value = json!({
         "Id": source.id,
         "ItemId": item_id,
@@ -5357,17 +5385,11 @@ fn emby_media_source_json_with_resolver_and_chapters(
         "SupportsProbing": !source.probe_status.eq_ignore_ascii_case("FAILED"),
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
-        "DefaultAudioStreamIndex": source
-            .streams
-            .iter()
-            .find(|stream| stream.stream_type == "AUDIO" && stream.is_default)
-            .or_else(|| {
-                source
-                    .streams
-                    .iter()
-                    .find(|stream| stream.stream_type == "AUDIO")
-            })
-            .map(|stream| stream.index),
+        // Android clients deserialize this compatibility field as a number,
+        // even while a source is waiting for media probing and has no audio
+        // stream yet. Keep the wire type numeric without selecting a video
+        // stream as audio.
+        "DefaultAudioStreamIndex": default_audio_stream_index,
         "Formats": [],
         "HasMixedProtocols": false,
         "IsInfiniteStream": false,
@@ -16154,6 +16176,7 @@ mod tests {
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(body["SupportsDirectStream"], true);
         assert!(body["DirectStreamUrl"].is_null());
+        assert_eq!(body["DefaultAudioStreamIndex"], -1);
         assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);
         assert_eq!(body["MediaStreams"][0]["Height"], 1080);

@@ -194,7 +194,8 @@ impl MetadataCandidateService {
             } else {
                 crate::application::scraper::ScraperCreditsResponse::default()
             };
-            let actors = generic_candidate_actors(&credits.cast);
+            let mut actors = generic_candidate_actors(&credits.cast);
+            enrich_actor_metadata(tmdb, &mut actors).await;
             let mut provider_ids = details
                 .as_ref()
                 .map(|value| value.provider_ids.clone())
@@ -820,9 +821,38 @@ fn generic_candidate_actors(
                     .map(str::to_owned),
                 order: member.order,
                 profile_url: member.profile_url.clone(),
+                person: None,
             })
         })
         .collect()
+}
+
+async fn enrich_actor_metadata(scraper: &TmdbProvider, actors: &mut [ActorCredit]) {
+    for actor in actors.iter_mut() {
+        let provider_id = actor.id.trim();
+        if provider_id.is_empty() {
+            continue;
+        }
+        let request = ScraperGetRequest::new(ScraperItemType::Person, provider_id, "zh-CN");
+        let Ok(metadata) = scraper.get_generic(request).await else {
+            continue;
+        };
+        let person = crate::application::people::PersonMetadata {
+            biography: metadata.overview,
+            birthday: metadata.birthday,
+            deathday: metadata.deathday,
+            known_for_department: metadata.known_for_department,
+            place_of_birth: metadata.place_of_birth,
+        };
+        if person.biography.is_some()
+            || person.birthday.is_some()
+            || person.deathday.is_some()
+            || person.known_for_department.is_some()
+            || person.place_of_birth.is_some()
+        {
+            actor.person = Some(person);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1638,6 +1668,7 @@ fn tmdb_candidate_actors(cast: &[TmdbCastMember]) -> Vec<ActorCredit> {
                     .as_deref()
                     .filter(|path| path.starts_with('/') && path.len() > 1)
                     .map(|path| format!("https://image.tmdb.org/t/p/w185{path}")),
+                person: None,
             })
         })
         .collect()

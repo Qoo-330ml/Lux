@@ -6,6 +6,7 @@ use luxd::{
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
+    network::RemoteAccessPolicy,
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
@@ -35,7 +36,11 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup.complete("Admin", "Admin", "correct password").await?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Shows", LibraryKind::Series, false)
@@ -57,13 +62,10 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(
-        config,
-        database.clone(),
-        setup,
-        auth,
-        emby_auth,
-    ));
+    let app = app_with_state(
+        AppState::ready(config, database.clone(), setup, auth, emby_auth)
+            .with_remote_access_policy(RemoteAccessPolicy::from_cidrs(["127.0.0.1/32"])?),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move {
@@ -100,6 +102,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     let playing = client
         .post(format!("{base_url}/Sessions/Playing"))
         .header("X-Emby-Token", &token)
+        .header("X-Forwarded-For", "203.0.113.10")
         .json(&json!({
             "ItemId": item_id,
             "PlaySessionId": "dashboard-play-session",
@@ -159,7 +162,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(body["nowPlaying"][0]["deviceName"], "Mac");
     assert_eq!(body["nowPlaying"][0]["deviceType"], "Desktop");
     assert_eq!(body["nowPlaying"][0]["deviceId"], "dashboard-device");
-    assert_eq!(body["nowPlaying"][0]["remoteIp"], "127.0.0.1");
+    assert_eq!(body["nowPlaying"][0]["remoteIp"], "203.0.113.10");
     assert!(body["nowPlaying"][0]["remoteIpLocation"].is_null());
     let events = body["activity"].as_array().ok_or("missing activity")?;
     assert!(

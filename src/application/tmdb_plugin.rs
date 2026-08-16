@@ -13,10 +13,10 @@ use crate::application::{
     },
     tmdb::{
         TmdbClient, TmdbCollectionDetails, TmdbCreditsResponse, TmdbEpisodeDetails, TmdbError,
-        TmdbImagesResponse, TmdbMovieDetails, TmdbMovieSearchResponse, TmdbSeasonDetails,
-        TmdbSeriesDetails, TmdbTvSearchResponse, fill_if_empty, localized_fields_complete,
-        localized_tv_fields_complete, validate_id, validate_id_language, validate_search_response,
-        validate_tv_search_response,
+        TmdbImagesResponse, TmdbMovieDetails, TmdbMovieSearchResponse, TmdbPersonDetails,
+        TmdbSeasonDetails, TmdbSeriesDetails, TmdbTvSearchResponse, fill_if_empty,
+        localized_fields_complete, localized_tv_fields_complete, validate_id, validate_id_language,
+        validate_search_response, validate_tv_search_response,
     },
 };
 
@@ -388,6 +388,10 @@ fn generic_request(
             "metadata.get",
             json!({"itemType": "Movie", "providerId": id, "language": language}),
         ),
+        ["3", "person", id] => (
+            "metadata.get",
+            json!({"itemType": "Person", "providerId": id, "language": language}),
+        ),
         ["3", "movie", id, "credits"] => (
             "metadata.credits",
             json!({"itemType": "Movie", "providerId": id, "language": language}),
@@ -451,6 +455,7 @@ fn normalize_generic_response(endpoint: &str, value: Value) -> Result<Value, Tmd
         ["3", "search", "movie"] => normalize_search(value, "Movie", "releaseDate"),
         ["3", "search", "tv"] => normalize_search(value, "Series", "firstAirDate"),
         ["3", "movie", _] => normalize_metadata(value, "Movie"),
+        ["3", "person", _] => normalize_metadata(value, "Person"),
         ["3", "movie", _, "credits"] => normalize_credits(value),
         ["3", "tv", _, "credits"] => normalize_credits(value),
         ["3", "collection", _] => normalize_collection(value),
@@ -552,6 +557,16 @@ fn normalize_metadata(value: Value, _item_type: &str) -> Result<Value, TmdbError
         "title": metadata.get("Name").cloned().unwrap_or(Value::Null),
         "original_title": metadata.get("OriginalTitle").cloned().unwrap_or(Value::Null),
         "overview": metadata.get("Overview").cloned().unwrap_or(Value::Null),
+        "birthday": metadata.get("Birthday").cloned().unwrap_or(Value::Null),
+        "deathday": metadata.get("Deathday").cloned().unwrap_or(Value::Null),
+        "known_for_department": metadata
+            .get("KnownForDepartment")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "place_of_birth": metadata
+            .get("PlaceOfBirth")
+            .cloned()
+            .unwrap_or(Value::Null),
         "tagline": metadata.get("Tagline").cloned().unwrap_or(Value::Null),
         "homepage": metadata.get("Website").cloned().unwrap_or(Value::Null),
         "premiere_date": premiere_date,
@@ -1087,10 +1102,11 @@ async fn direct_get_generic(
             .await
             .map(collection_metadata_generic)
             .map_err(|error| ScraperError::Provider(error.to_string())),
-        item_type => Err(ScraperError::Provider(format!(
-            "TMDb direct scraper does not support generic metadata for {}",
-            item_type.as_str()
-        ))),
+        ScraperItemType::Person => client
+            .person_details(id, &request.language)
+            .await
+            .map(person_metadata_generic)
+            .map_err(|error| ScraperError::Provider(error.to_string())),
     }
 }
 
@@ -1399,6 +1415,20 @@ fn series_metadata_generic(details: TmdbSeriesDetails) -> ScraperMetadata {
     }
 }
 
+fn person_metadata_generic(details: TmdbPersonDetails) -> ScraperMetadata {
+    ScraperMetadata {
+        item_type: Some("Person".to_owned()),
+        title: details.name,
+        overview: details.biography,
+        birthday: details.birthday,
+        deathday: details.deathday,
+        known_for_department: details.known_for_department,
+        place_of_birth: details.place_of_birth,
+        provider_ids: BTreeMap::from([("Tmdb".to_owned(), details.id.to_string())]),
+        ..ScraperMetadata::default()
+    }
+}
+
 fn season_metadata_generic(details: TmdbSeasonDetails) -> ScraperMetadata {
     ScraperMetadata {
         item_type: Some("Season".to_owned()),
@@ -1509,5 +1539,27 @@ mod tests {
         assert_eq!(images.images[1].image_type, "Backdrop");
         assert_eq!(images.images[1].width, Some(1920));
         assert_eq!(images.images[1].height, Some(1080));
+    }
+
+    #[test]
+    fn maps_person_details_to_scraper_metadata() {
+        let metadata = person_metadata_generic(crate::application::tmdb::TmdbPersonDetails {
+            id: 9,
+            name: Some("演员甲".to_owned()),
+            biography: Some("人物简介".to_owned()),
+            birthday: Some("1970-01-01".to_owned()),
+            deathday: Some("2020-01-01".to_owned()),
+            known_for_department: Some("Acting".to_owned()),
+            place_of_birth: Some("测试城市".to_owned()),
+            profile_path: Some("/profile.jpg".to_owned()),
+        });
+
+        assert_eq!(metadata.item_type.as_deref(), Some("Person"));
+        assert_eq!(metadata.title.as_deref(), Some("演员甲"));
+        assert_eq!(metadata.overview.as_deref(), Some("人物简介"));
+        assert_eq!(metadata.birthday.as_deref(), Some("1970-01-01"));
+        assert_eq!(metadata.deathday.as_deref(), Some("2020-01-01"));
+        assert_eq!(metadata.known_for_department.as_deref(), Some("Acting"));
+        assert_eq!(metadata.place_of_birth.as_deref(), Some("测试城市"));
     }
 }

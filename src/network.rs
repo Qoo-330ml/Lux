@@ -112,15 +112,30 @@ impl RemoteAccessPolicy {
     }
 
     pub fn is_remote(&self, peer: Option<&str>, forwarded_for: Option<&str>) -> bool {
-        let Some(peer) = peer.and_then(|value| value.parse::<IpAddr>().ok()) else {
-            return false;
-        };
-        let client = if self.is_trusted_ip(peer) {
-            forwarded_for.and_then(first_forwarded_ip).unwrap_or(peer)
+        self.client_ip(peer, forwarded_for)
+            .is_some_and(is_public_address)
+    }
+
+    pub fn client_ip(&self, peer: Option<&str>, forwarded_for: Option<&str>) -> Option<IpAddr> {
+        let peer = peer.and_then(|value| value.parse::<IpAddr>().ok())?;
+        if self.is_trusted_ip(peer) {
+            Some(forwarded_for.and_then(first_forwarded_ip).unwrap_or(peer))
         } else {
-            peer
-        };
-        is_public_address(client)
+            Some(peer)
+        }
+    }
+
+    pub fn reported_client_ip(
+        &self,
+        peer: Option<&str>,
+        forwarded_for: Option<&str>,
+    ) -> Option<IpAddr> {
+        let peer = peer.and_then(|value| value.parse::<IpAddr>().ok())?;
+        if self.is_trusted_ip(peer) {
+            forwarded_for.and_then(first_forwarded_ip)
+        } else {
+            Some(peer)
+        }
     }
 
     pub fn is_trusted_proxy(&self, peer: Option<&str>) -> bool {

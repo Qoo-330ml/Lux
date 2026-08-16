@@ -266,6 +266,14 @@ pub struct ScraperMetadata {
     pub original_title: Option<String>,
     #[serde(rename = "Overview", alias = "overview", default)]
     pub overview: Option<String>,
+    #[serde(rename = "Birthday", alias = "birthday", default)]
+    pub birthday: Option<String>,
+    #[serde(rename = "Deathday", alias = "deathday", default)]
+    pub deathday: Option<String>,
+    #[serde(rename = "KnownForDepartment", alias = "knownForDepartment", default)]
+    pub known_for_department: Option<String>,
+    #[serde(rename = "PlaceOfBirth", alias = "placeOfBirth", default)]
+    pub place_of_birth: Option<String>,
     #[serde(rename = "Tagline", alias = "tagline", default)]
     pub tagline: Option<String>,
     #[serde(
