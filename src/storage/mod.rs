@@ -11047,6 +11047,15 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
              ON media_items(parent_id, removed_at)",
             "CREATE INDEX idx_media_items_series_removed
              ON media_items(series_id, removed_at)",
+            "CREATE INDEX idx_media_items_library_added_visible
+             ON media_items(library_id, added_at DESC, sort_title, id)
+             WHERE removed_at IS NULL
+               AND item_type <> 'FOLDER'
+               AND has_available_source = 1",
+            "CREATE INDEX idx_media_items_parent_available
+             ON media_items(parent_id, removed_at, has_available_source)",
+            "CREATE INDEX idx_media_items_series_available
+             ON media_items(series_id, removed_at, has_available_source)",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
                 VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
