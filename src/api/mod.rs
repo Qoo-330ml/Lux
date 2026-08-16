@@ -5352,6 +5352,18 @@ fn emby_media_source_json_with_resolver_and_chapters(
     };
     let is_remote_playback = is_remote || is_resolver_target;
     let is_playable = source.source_kind == "LOCAL_FILE" || is_remote_playback;
+    let default_audio_stream_index = source
+        .streams
+        .iter()
+        .find(|stream| stream.stream_type == "AUDIO" && stream.is_default)
+        .or_else(|| {
+            source
+                .streams
+                .iter()
+                .find(|stream| stream.stream_type == "AUDIO")
+        })
+        .map(|stream| stream.index)
+        .unwrap_or(-1);
     let mut value = json!({
         "Id": source.id,
         "ItemId": item_id,
@@ -5373,17 +5385,11 @@ fn emby_media_source_json_with_resolver_and_chapters(
         "SupportsProbing": !source.probe_status.eq_ignore_ascii_case("FAILED"),
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
-        "DefaultAudioStreamIndex": source
-            .streams
-            .iter()
-            .find(|stream| stream.stream_type == "AUDIO" && stream.is_default)
-            .or_else(|| {
-                source
-                    .streams
-                    .iter()
-                    .find(|stream| stream.stream_type == "AUDIO")
-            })
-            .map(|stream| stream.index),
+        // Android clients deserialize this compatibility field as a number,
+        // even while a source is waiting for media probing and has no audio
+        // stream yet. Keep the wire type numeric without selecting a video
+        // stream as audio.
+        "DefaultAudioStreamIndex": default_audio_stream_index,
         "Formats": [],
         "HasMixedProtocols": false,
         "IsInfiniteStream": false,
@@ -16170,6 +16176,7 @@ mod tests {
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(body["SupportsDirectStream"], true);
         assert!(body["DirectStreamUrl"].is_null());
+        assert_eq!(body["DefaultAudioStreamIndex"], -1);
         assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);
         assert_eq!(body["MediaStreams"][0]["Height"], 1080);
