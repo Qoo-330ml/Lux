@@ -9,6 +9,7 @@ pub mod database_setup;
 pub mod deletion;
 pub mod directory_browser;
 pub mod downloads;
+pub mod home;
 pub mod identification;
 pub mod images;
 pub mod ip_location;
