@@ -4,6 +4,7 @@ import {
   CODEC_PRESETS,
   buildDecoderConfig,
   normalizeNativeSupport,
+  playbackQualityDelta,
 } from "../public/media-capability-probe.js";
 
 test("normalizes native video capability results", () => {
@@ -42,4 +43,21 @@ test("ships probe presets for 4K HEVC and a browser baseline", () => {
   assert.equal(CODEC_PRESETS[1].height, 2160);
   assert.equal(CODEC_PRESETS[1].bitDepth, 10);
   assert.equal(CODEC_PRESETS[1].hdr, "HDR10");
+});
+
+test("reports playback quality for the current measurement interval", () => {
+  assert.deepEqual(
+    playbackQualityDelta(
+      { droppedVideoFrames: 10, totalVideoFrames: 100 },
+      { droppedVideoFrames: 13, totalVideoFrames: 145 },
+    ),
+    { droppedFrames: 3, totalFrames: 45 },
+  );
+  assert.deepEqual(playbackQualityDelta(undefined, undefined), { droppedFrames: null, totalFrames: null });
+});
+
+test("keeps the standalone probe page free of a default favicon request", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const html = await readFile(new URL("../public/media-capability-probe.html", import.meta.url), "utf8");
+  assert.match(html, /<link rel="icon" href="\/favicon\.svg" \/>/);
 });

@@ -57,6 +57,18 @@ export function buildDecoderConfig(input) {
   };
 }
 
+export function playbackQualityDelta(before, after) {
+  return {
+    droppedFrames: frameDelta(before?.droppedVideoFrames, after?.droppedVideoFrames),
+    totalFrames: frameDelta(before?.totalVideoFrames, after?.totalVideoFrames),
+  };
+}
+
+function frameDelta(before, after) {
+  if (!Number.isFinite(before) || !Number.isFinite(after)) return null;
+  return Math.max(0, after - before);
+}
+
 function positiveInteger(value, name) {
   const number = Number(value);
   if (!Number.isInteger(number) || number <= 0) throw new Error(`${name} must be a positive integer`);
@@ -135,6 +147,7 @@ function waitForVideoMetadata(video, timeoutMs = 10_000) {
 
 async function measureVideo(video, durationMs = 5_000) {
   const startedAt = performance.now();
+  const baselineQuality = video.getVideoPlaybackQuality?.();
   let renderedFrames = 0;
   let callbackId;
   const callback = () => {
@@ -148,12 +161,12 @@ async function measureVideo(video, durationMs = 5_000) {
   await new Promise((resolve) => window.setTimeout(resolve, durationMs));
   if (callbackId !== undefined && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(callbackId);
 
-  const quality = video.getVideoPlaybackQuality?.();
+  const quality = playbackQualityDelta(baselineQuality, video.getVideoPlaybackQuality?.());
   return {
     durationMs,
     renderedFrames,
-    droppedFrames: quality?.droppedVideoFrames ?? null,
-    totalFrames: quality?.totalVideoFrames ?? null,
+    droppedFrames: quality.droppedFrames,
+    totalFrames: quality.totalFrames,
     currentTime: Number.isFinite(video.currentTime) ? video.currentTime : null,
   };
 }

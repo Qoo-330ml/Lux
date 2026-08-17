@@ -18,6 +18,14 @@ LUX-184 已加入独立探针页面 `/media-capability-probe.html`，用于记�
 MediaCapabilities 和 WebCodecs 下的能力。当前尚未运行带 4K HEVC Main、HEVC Main10/HDR10 和 MKV 样本的
 真实矩阵，因此 Lux Web 暂不宣称 4K HEVC 兼容。
 
+2026-08-17 的本机探针记录：Playwright HeadlessChrome 151、macOS `arm64` 对 4K HEVC Main、HEVC Main10/HDR10
+和 H.264 的 3840×2160 配置均报告原生 `probably`、MediaCapabilities `supported/smooth/powerEfficient` 和
+WebCodecs `supported`。这只是浏览器能力声明，不是实际 4K 文件播放证据。
+
+同次使用公开 Sintel 片段生成的临时 12 秒 HEVC MP4 做解码链路烟测，浏览器实际识别为 854×480，metadata、
+播放位置和 5 秒播放均正常；该文件不是 4K 样本，不能用于 4K 性能结论。真实 4K、高码率、HDR10 和 MKV
+样本仍待补充。
+
 记录探针结果时必须包含浏览器版本、平台/设备、Lux 提交、`uname -m`、样本校验值、metadata 结果、实际
 播放时长、VideoFrame 数量、丢帧和音画同步观察。不得写入完整媒体 URL、令牌、Cookie 或用户数据。
 

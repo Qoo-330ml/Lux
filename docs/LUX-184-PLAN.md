@@ -30,6 +30,8 @@ Lux 同源 stream URL 或本地测试服务器 URL：
 - [x] `web/public/media-capability-probe.html` 提供 URL、MIME、codec、分辨率、码率和帧率输入。
 - [x] `web/public/media-capability-probe.js` 探测 `canPlayType`、MediaCapabilities 和 WebCodecs。
 - [x] 页面执行 metadata 加载、短时播放、VideoFrame 计数、丢帧和播放位置测量。
+- [x] 播放质量按当前测量区间计算，避免复用同一 video 元素时把历史丢帧累计到新结果。
+- [x] 探针页面声明 favicon，真实浏览器页面加载无控制台错误。
 - [x] 探针结果不显示完整媒体 URL。
 - [x] 4K HEVC Main、HEVC Main10 HDR10 和 H.264 基准预设已加入。
 - [x] 新增无浏览器依赖的探针逻辑单测。
