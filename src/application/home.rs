@@ -211,43 +211,45 @@ impl HomeService {
     }
 
     async fn prewarm(&self) -> Result<(), HomeError> {
-        self.refresh_shared_cache().await
+        self.refresh_shared_cache().await.map(|_| ())
     }
 
     async fn shared_snapshot(&self) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
-        loop {
-            let generation = self.inner.generation.load(Ordering::Acquire);
-            {
-                let cached = self.inner.shared.lock().await;
-                if let Some(cached) = cached.as_ref()
-                    && cached.generation == generation
-                {
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        {
+            let cached = self.inner.shared.lock().await;
+            if let Some(cached) = cached.as_ref() {
+                if cached.generation == generation {
                     if cached.refreshed_at.elapsed() >= HOME_CACHE_TTL {
                         self.schedule_refresh();
                     }
                     return Ok(cached.snapshot.clone());
                 }
-            }
-
-            self.refresh_shared_cache().await?;
-            let cached = self.inner.shared.lock().await;
-            if let Some(cached) = cached.as_ref()
-                && cached.generation == generation
-            {
+                // A scan may invalidate the shared snapshot repeatedly. The
+                // foreground request should use the last complete snapshot
+                // while the worker converges on the latest generation.
+                self.schedule_refresh();
                 return Ok(cached.snapshot.clone());
             }
         }
+
+        // No snapshot exists yet (for example immediately after startup), so
+        // wait for one complete calculation. If a scan invalidates it while
+        // it is being built, refresh_shared_cache still returns that complete
+        // snapshot for this foreground request and queues a newer refresh.
+        self.refresh_shared_cache().await
     }
 
-    async fn refresh_shared_cache(&self) -> Result<(), HomeError> {
+    async fn refresh_shared_cache(&self) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
         let _compute_guard = self.inner.shared_compute_lock.lock().await;
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
             let cached = self.inner.shared.lock().await;
-            if cached.as_ref().is_some_and(|cached| {
-                cached.generation == generation && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
-            }) {
-                return Ok(());
+            if let Some(cached) = cached.as_ref()
+                && cached.generation == generation
+                && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
+            {
+                return Ok(cached.snapshot.clone());
             }
         }
 
@@ -256,12 +258,12 @@ impl HomeService {
             *self.inner.shared.lock().await = Some(CachedSharedSnapshot {
                 generation,
                 refreshed_at: Instant::now(),
-                snapshot,
+                snapshot: snapshot.clone(),
             });
         } else {
             self.schedule_refresh();
         }
-        Ok(())
+        Ok(snapshot)
     }
 
     async fn refresh_cached_entries(&self) {
