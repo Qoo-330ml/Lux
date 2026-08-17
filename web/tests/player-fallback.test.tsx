@@ -11,6 +11,7 @@ import { shouldUseClientHevc } from "../src/features/player/playback-selection";
 
 vi.mock("../src/features/player/playback-selection", () => ({
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
+  shouldUseClientMkv: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock("../src/features/player/hevc-playback-engine", () => ({

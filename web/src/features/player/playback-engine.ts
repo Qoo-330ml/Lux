@@ -1,4 +1,4 @@
-export type PlaybackEngineKind = "native" | "client-hevc";
+export type PlaybackEngineKind = "native" | "client-hevc" | "client-mkv";
 
 export type PlaybackSnapshot = {
   currentTime: number;

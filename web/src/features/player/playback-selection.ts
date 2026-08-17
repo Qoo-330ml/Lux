@@ -2,6 +2,7 @@ import type { MediaSource } from "../../lib/api/types";
 import { isHevcCodec } from "./media-codec";
 
 const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
+const CLIENT_MKV_CONTAINERS = new Set(["mkv"]);
 const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
 
 export function h264CodecForDimensions(width: number, height: number) {
@@ -17,12 +18,29 @@ export function hasClientHevcCandidate(source: MediaSource | undefined) {
   return isHevcCodec(video?.codec);
 }
 
+export function hasClientMkvCandidate(source: MediaSource | undefined) {
+  if (!source || (source.sourceKind === "STRM_URL" && !source.externalUrl) || !CLIENT_MKV_CONTAINERS.has((source.container ?? "").toLowerCase())) return false;
+  const video = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
+  if (!isHevcCodec(video?.codec)) return false;
+  const audio = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "AUDIO");
+  return !audio?.codec || /^aac$|^mp4a\./i.test(audio.codec);
+}
+
 export async function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {
-  if (!hasClientHevcCandidate(source) || !hasClientHevcRuntime()) return false;
+  if (!source || !hasClientHevcCandidate(source) || !hasClientHevcRuntime()) return false;
+  return probeClientHevc(source, video, "video/mp4");
+}
+
+export async function shouldUseClientMkv(source: MediaSource | undefined, video: HTMLVideoElement) {
+  if (!source || !hasClientMkvCandidate(source) || !hasClientHevcRuntime()) return false;
+  return probeClientHevc(source, video, "video/x-matroska");
+}
+
+async function probeClientHevc(source: MediaSource, video: HTMLVideoElement, mime: string) {
   const videoStream = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
   const codec = videoStream?.codec;
   const codecHint = codec && /^(hvc1|hev1)\./i.test(codec) ? codec : "hvc1.1.6.L120.B0";
-  if (video.canPlayType(`video/mp4; codecs="${codecHint}"`) !== "") return false;
+  if (video.canPlayType(`${mime}; codecs="${codecHint}"`) !== "") return false;
   const browserGlobals = globalThis as typeof globalThis & {
     VideoEncoder?: {
       isConfigSupported: (config: Record<string, unknown>) => Promise<{ supported?: boolean }>;

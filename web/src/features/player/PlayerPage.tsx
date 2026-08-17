@@ -7,13 +7,13 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { PlaybackEventState } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
 import { NativeVideoEngine, PLAYBACK_PERFORMANCE_EVENT, type PlaybackEngine, type PlaybackPerformance } from "./playback-engine";
-import { shouldUseClientHevc } from "./playback-selection";
+import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 
 const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
 const HEVC_RUNTIME_ASSETS = {
   workerUrl: "/hevc/transcode-worker.js",
-  wasmUrl: "/hevc/hevc-decode.js",
+  wasmUrl: "/hevc/hevc-decode-module.js",
   wasmBinaryUrl: "/hevc/hevc-decode.wasm",
 };
 
@@ -126,12 +126,19 @@ export function PlayerPage() {
     };
     const load = async () => {
       try {
-        if (await shouldUseClientHevc(source, initialEngine.element)) {
+        const useMkvFallback = await shouldUseClientMkv(source, initialEngine.element);
+        const useHevcFallback = !useMkvFallback && await shouldUseClientHevc(source, initialEngine.element);
+        if (useMkvFallback || useHevcFallback) {
           setFallbackLoading(true);
-          const { ClientHevcEngine } = await import("./hevc-playback-engine");
           if (cancelled) return;
           initialEngine.destroy();
-          activeEngine = new ClientHevcEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
+          if (useMkvFallback) {
+            const { ClientMkvEngine } = await import("./mkv-playback-engine");
+            activeEngine = new ClientMkvEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
+          } else {
+            const { ClientHevcEngine } = await import("./hevc-playback-engine");
+            activeEngine = new ClientHevcEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
+          }
           engineRef.current = activeEngine;
           performanceElement = activeEngine.element;
           performanceElement.addEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);

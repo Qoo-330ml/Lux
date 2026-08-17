@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { hasClientHevcCandidate, shouldUseClientHevc } from "../src/features/player/playback-selection";
+import { hasClientHevcCandidate, hasClientMkvCandidate, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 
 describe("playback selection", () => {
   const source = {
@@ -16,6 +16,21 @@ describe("playback selection", () => {
     expect(hasClientHevcCandidate({ ...source, container: "mkv" })).toBe(false);
     expect(hasClientHevcCandidate({ ...source, sourceKind: "STRM_URL", externalUrl: "https://media.example.test/video.mp4" })).toBe(true);
     expect(hasClientHevcCandidate({ ...source, streams: [{ index: 0, type: "VIDEO", codec: "dvh1.05.06" }] })).toBe(false);
+  });
+
+  it("recognizes MKV HEVC with AAC as a separate client-fallback candidate", async () => {
+    const mkv = { ...source, container: "mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC", details: { width: 1920, height: 1080 } },
+      { index: 1, type: "AUDIO", codec: "AAC" },
+    ] };
+    expect(hasClientMkvCandidate(mkv)).toBe(true);
+    expect(hasClientMkvCandidate({ ...mkv, streams: [{ index: 0, type: "VIDEO", codec: "HEVC" }, { index: 1, type: "AUDIO", codec: "DTS" }] })).toBe(false);
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.stubGlobal("VideoEncoder", class VideoEncoder { static isConfigSupported() { return Promise.resolve({ supported: true }); } });
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("");
+    expect(await shouldUseClientMkv(mkv, video)).toBe(true);
   });
 
   it("uses the fallback only when native HEVC is unavailable", async () => {
