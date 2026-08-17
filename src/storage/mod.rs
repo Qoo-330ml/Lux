@@ -8122,14 +8122,6 @@ impl Database {
                 CatalogBind::Integer(value) => count_statement.bind(*value),
             };
         }
-        let total = count_statement
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-
         let item_order = match (filter.sort_by, filter.descending) {
             (CatalogSort::DateCreated, true) => "mi.added_at DESC, LOWER(mi.title) ASC, mi.id ASC",
             (CatalogSort::DateCreated, false) => "mi.added_at ASC, LOWER(mi.title) ASC, mi.id ASC",
@@ -8192,10 +8184,20 @@ impl Database {
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              ORDER BY {item_order}, ms.id, mt.stream_index"
         );
-        let mut list_binds = filter_binds;
+        let mut list_binds = filter_binds.clone();
         list_binds.push(CatalogBind::Integer(filter.limit));
         list_binds.push(CatalogBind::Integer(filter.offset));
-        let rows = self.fetch_catalog_rows(&query, &list_binds).await?;
+        let total_future = async {
+            count_statement
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })
+        };
+        let rows_future = self.fetch_catalog_rows(&query, &list_binds);
+        let (total, rows) = tokio::try_join!(total_future, rows_future)?;
         Ok((rows, total))
     }
 
@@ -11797,6 +11799,9 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
              WHERE removed_at IS NULL
                AND item_type <> 'FOLDER'
                AND has_available_source = 1",
+            "CREATE INDEX idx_media_items_library_type_visible
+             ON media_items(library_id, item_type, id)
+             WHERE removed_at IS NULL",
             "CREATE INDEX idx_media_items_parent_available
              ON media_items(parent_id, removed_at, has_available_source)",
             "CREATE INDEX idx_media_items_series_available

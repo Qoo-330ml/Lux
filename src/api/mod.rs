@@ -9958,8 +9958,10 @@ async fn lux_catalog_item_values_by_id(
             item_ids.push(item.id.clone());
         }
     }
-    let states = database.list_user_item_states(user_id, &item_ids).await?;
-    let pending_item_ids = database.list_pending_metadata_item_ids(&item_ids).await?;
+    let (states, pending_item_ids) = tokio::try_join!(
+        database.list_user_item_states(user_id, &item_ids),
+        database.list_pending_metadata_item_ids(&item_ids),
+    )?;
     Ok(items
         .iter()
         .map(|item| {

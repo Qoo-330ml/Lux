@@ -264,7 +264,7 @@ export function positionLibraryActionMenu(
   return { left, top };
 }
 
-export function LibraryCard({ library }: { library: Library }) {
+export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefetch?: () => void }) {
   const cardRef = useRef<HTMLElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
@@ -359,7 +359,7 @@ export function LibraryCard({ library }: { library: Library }) {
 
   return (
     <article ref={cardRef} className="lux-library-card" onContextMenu={handleContextMenu}>
-      <Link className="lux-library-card-link" to={`/libraries/${library.id}`}>
+      <Link className="lux-library-card-link" to={`/libraries/${library.id}`} onMouseEnter={onPrefetch} onFocus={onPrefetch}>
         <span className="lux-library-card-cover">
           {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" decoding="async" /> : <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>}
         </span>

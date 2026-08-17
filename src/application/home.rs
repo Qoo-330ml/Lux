@@ -203,6 +203,7 @@ impl HomeService {
 
     pub(crate) fn invalidate(&self) {
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.catalog.invalidate_library_pages();
         self.inner.invalidation_notify.notify_waiters();
         self.schedule_refresh();
     }

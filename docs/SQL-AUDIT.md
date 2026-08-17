@@ -6,7 +6,7 @@
 
 - 日期：2026-08-03
 - 架构：macOS `arm64`
-- 数据库：从空目录启动 `target/debug/luxd`，自动运行 migration 至 schema version 66
+- 数据库：从空目录启动 `target/debug/luxd`，自动运行 migration 至 schema version 68
 - 工具：SQLite `EXPLAIN QUERY PLAN`
 
 实际输出：
@@ -32,6 +32,6 @@ FTS 搜索：
 
 - 目录、扫描游标和批量用户状态查询均命中复合索引；FTS 查询使用 FTS5 虚拟表并通过媒体/库主键回查。
 - Web/Emby 列表的用户状态读取使用 `Database::list_user_item_states` 分块批量查询，单块上限为 500 个 ID；媒体源、流和图片标签由目录查询联结/子查询一次取回。
-- 首页最近添加查询使用 `idx_media_items_library_added_visible` 直接定位未删除、可用媒体的时间倒序候选；剧集/季度容器的可见性判断使用 `idx_media_items_parent_available` 和 `idx_media_items_series_available`，避免为每个容器扫描全部子项。SQLite 通过 0063 迁移和旧版唯一约束修复路径同时创建这些索引，PostgreSQL 通过 0018 迁移创建；上游新增迁移顺延为 SQLite 0064–0066、PostgreSQL 0019–0021，以保持已有数据库的迁移编号兼容。
+- 首页最近添加查询使用 `idx_media_items_library_added_visible` 直接定位未删除、可用媒体的时间倒序候选；剧集/季度容器的可见性判断使用 `idx_media_items_parent_available` 和 `idx_media_items_series_available`，避免为每个容器扫描全部子项。媒体库按类型分页查询另外使用 `idx_media_items_library_type_visible`，先把候选范围从整个媒体库缩小到请求的媒体类型。SQLite 通过 0063、0068 迁移和旧版唯一约束修复路径同时创建这些索引，PostgreSQL 通过 0018、0023 迁移创建；上游新增迁移顺延为 SQLite 0064–0068、PostgreSQL 0019–0023，以保持已有数据库的迁移编号兼容。
 - 本记录不宣称所有业务路径都没有 N+1；集合刷新、识别候选等后台流程仍需按真实数据量继续审计。
 - 该结果是本机 ARM64 的查询计划证据，不代表 NAS 上的耗时、锁竞争或磁盘吞吐。

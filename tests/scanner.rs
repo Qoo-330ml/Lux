@@ -409,7 +409,7 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 66);
+    assert_eq!(database.schema_version().await?, 68);
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master
          WHERE type = 'table' AND name IN ('filesystem_entries', 'media_items', 'media_sources', 'media_streams')
@@ -432,6 +432,7 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
              'idx_media_items_parent_removed',
              'idx_media_items_series_removed',
              'idx_media_items_library_added_visible',
+             'idx_media_items_library_type_visible',
              'idx_media_items_parent_available',
              'idx_media_items_series_available'
          )
@@ -443,6 +444,7 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
         indexes,
         [
             "idx_media_items_library_added_visible",
+            "idx_media_items_library_type_visible",
             "idx_media_items_parent_available",
             "idx_media_items_parent_removed",
             "idx_media_items_series_available",

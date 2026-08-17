@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
@@ -7,17 +7,27 @@ import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRa
 import { orderLibraries, readAccountSettings } from "../account/account-settings";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { LuxUser, MediaItem } from "../../lib/api/types";
+import type { LibrariesResponse, LuxUser, MediaItem } from "../../lib/api/types";
 import { HERO_CAROUSEL_INTERVAL_MS, heroSlides, heroTitleScale } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 
 export function HomePage({ user }: { user: LuxUser }) {
+  const queryClient = useQueryClient();
   const home = useQuery({
     queryKey: queryKeys.home,
     queryFn: () => api.home(),
     refetchInterval: queryRefreshIntervals.mediaSurface,
     refetchIntervalInBackground: false,
   });
+
+  useEffect(() => {
+    if (!home.data) return;
+    const current = queryClient.getQueryData<LibrariesResponse>(queryKeys.libraries);
+    queryClient.setQueryData<LibrariesResponse>(queryKeys.libraries, {
+      libraries: home.data.libraries ?? [],
+      showMetadataPending: current?.showMetadataPending ?? true,
+    });
+  }, [home.data, queryClient]);
 
   if (home.isPending) return <HomeSkeleton />;
   if (home.error) return <section className="lux-page-state"><h1>首页加载失败</h1><p>{home.error.message}</p></section>;
