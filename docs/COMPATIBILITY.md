@@ -42,6 +42,11 @@ WebCodecs `supported`。这只是浏览器能力声明，不是实际 4K 文件�
 44 ms。HeadlessChrome 的 `getVideoPlaybackQuality().droppedVideoFrames` 在该测试中与 presented-frame 序列不一致，
 因此以 presented-frame gap 作为丢帧判断，并保留该 API 差异作为测试注意事项。
 
+`79035ba7` 另以真实 `PlayerPage` 集成路径复测 4K Main：在新鲜 HeadlessChrome 151 中模拟原生 HEVC 不可用，
+浏览器实际选择客户端 fallback，首帧约 11,493 ms，页面显示 `speedX≈0.37` 的低于实时提示；播放和暂停分别
+上报 `PLAYING`/`PAUSED` 进度，浏览器控制台无播放相关错误。4K 选择器使用与 `@hevcjs/core` 一致的 H.264
+High@5.1 (`avc1.640033`) 探测，避免 4K 错误使用 High@4.0 (`avc1.640028`) 而被 WebCodecs 拒绝。
+
 因此当前这台 ARM64/HeadlessChrome 设备可以完成 4K HEVC 客户端 fallback，但 4K Main 和 Main10 均未通过实时
 转码性能门。播放器会显示“客户端解码速度低于实时”的降级提示，并建议使用原生客户端或降低清晰度；不能把
 本次结果外推到其他浏览器、硬件或目标 x86_64 NAS。
