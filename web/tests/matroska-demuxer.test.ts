@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseMatroska } from "../src/features/player/matroska-demuxer";
+import { MatroskaStreamDemuxer, parseMatroska } from "../src/features/player/matroska-demuxer";
 
 function vint(value: number) {
   if (value < 0x7f) return new Uint8Array([0x80 | value]);
@@ -84,5 +84,17 @@ describe("Matroska demuxer", () => {
     expect([...result.videoSamples[0].data]).toEqual([0, 0, 0, 1, 0x26]);
     expect(result.audioSamples.map((sample) => sample.timestampMs)).toEqual([1000]);
     expect([...result.audioSamples[0].data]).toEqual([0xaa, 0xbb]);
+
+    const streamedTracks: string[] = [];
+    const streamedSamples: number[] = [];
+    const stream = new MatroskaStreamDemuxer({
+      onTrack: (track) => streamedTracks.push(`${track.type}:${track.number}`),
+      onSample: (sample) => streamedSamples.push(sample.timestampMs),
+    });
+    for (let offset = 0; offset < source.byteLength; offset += 3) stream.write(source.slice(offset, offset + 3));
+    stream.end();
+
+    expect(streamedTracks).toEqual(["video:1", "audio:2"]);
+    expect(streamedSamples).toEqual([1000, 1000, 1040]);
   });
 });

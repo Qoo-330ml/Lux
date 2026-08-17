@@ -13,6 +13,7 @@
     "@tanstack/react-query": "^5.90.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "ebml": "2.2.4",
     "framer-motion": "^12.23.0",
     "lucide-react": "^0.468.0",
     "mp4box": "2.4.1",

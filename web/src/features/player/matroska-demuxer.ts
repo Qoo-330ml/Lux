@@ -1,3 +1,5 @@
+import { Decoder, type EbmlElement } from "ebml";
+
 const IDS = {
   ebml: 0x1a45dfa3,
   segment: 0x18538067,
@@ -52,6 +54,13 @@ export type MatroskaFile = {
   audioSamples: MatroskaSample[];
 };
 
+export type MatroskaStreamCallbacks = {
+  onTrack?: (track: MatroskaTrack) => void;
+  onSample?: (sample: MatroskaSample) => void;
+  onTimecodeScale?: (scale: number) => void;
+  onError?: (error: Error) => void;
+};
+
 type Element = { id: number; dataStart: number; dataEnd: number; end: number };
 
 export function parseMatroska(data: Uint8Array): MatroskaFile {
@@ -66,6 +75,93 @@ export function parseMatroska(data: Uint8Array): MatroskaFile {
   finalizeDurations(result.videoSamples, result.videoTrack?.defaultDurationMs ?? null);
   finalizeDurations(result.audioSamples, result.audioTrack?.defaultDurationMs ?? null);
   return result;
+}
+
+export class MatroskaStreamDemuxer {
+  private readonly decoder: Decoder;
+  private readonly callbacks: MatroskaStreamCallbacks;
+  private readonly tracks = new Map<number, MatroskaTrack>();
+  private path: string[] = [];
+  private currentTrack: Partial<MatroskaTrack> | null = null;
+  private clusterTimecode = 0;
+  private timecodeScale = 1_000_000;
+  private pendingBlocks: Array<{ data: Uint8Array; simple: boolean }> = [];
+
+  constructor(callbacks: MatroskaStreamCallbacks) {
+    this.callbacks = callbacks;
+    this.decoder = new Decoder();
+    this.decoder.on("data", (chunk) => this.consume(chunk[0], chunk[1]));
+    this.decoder.on("error", (error) => callbacks.onError?.(error));
+  }
+
+  write(chunk: Uint8Array) {
+    this.decoder.write(chunk);
+  }
+
+  end() {
+    this.decoder.end();
+  }
+
+  private consume(kind: "start" | "tag" | "end", element: EbmlElement) {
+    if (kind === "start") {
+      this.path.push(element.name);
+      if (element.name === "TrackEntry") this.currentTrack = { codecPrivate: new Uint8Array(), defaultDurationMs: null, width: null, height: null, sampleRate: null, channels: null };
+      return;
+    }
+    if (kind === "end") {
+      if (element.name === "TrackEntry" && this.currentTrack) this.finishTrack();
+      this.path.pop();
+      return;
+    }
+    const bytes = element.data;
+    if (!bytes) return;
+    if (element.name === "TimecodeScale") {
+      const scale = readUnsigned(bytes, 0, bytes.byteLength);
+      if (scale) {
+        this.timecodeScale = scale;
+        this.callbacks.onTimecodeScale?.(scale);
+      }
+    } else if (element.name === "Timecode" && this.path.includes("Cluster")) {
+      this.clusterTimecode = readUnsigned(bytes, 0, bytes.byteLength) ?? 0;
+    } else if ((element.name === "SimpleBlock" || element.name === "Block") && this.path.includes("Cluster")) {
+      this.consumeBlock(bytes, element.name === "SimpleBlock");
+    } else if (this.currentTrack && this.path.includes("TrackEntry")) {
+      readTrackFieldByName(element.name, bytes, this.currentTrack);
+    }
+  }
+
+  private finishTrack() {
+    if (!this.currentTrack?.number || !this.currentTrack.type || !this.currentTrack.codecId) {
+      this.currentTrack = null;
+      return;
+    }
+    const track = this.currentTrack as MatroskaTrack;
+    this.tracks.set(track.number, track);
+    this.callbacks.onTrack?.(track);
+    this.currentTrack = null;
+    const pending = this.pendingBlocks;
+    this.pendingBlocks = [];
+    pending.forEach((block) => this.consumeBlock(block.data, block.simple));
+  }
+
+  private consumeBlock(data: Uint8Array, simple: boolean) {
+    const block = parseSimpleBlockPayload(data);
+    if (!block) return;
+    const track = this.tracks.get(block.trackNumber);
+    if (!track) {
+      this.pendingBlocks.push({ data: data.slice(), simple });
+      return;
+    }
+    const timestampMs = (this.clusterTimecode + block.timecode) * this.timecodeScale / 1_000_000;
+    const defaultDuration = track.defaultDurationMs ?? (track.type === "audio" && track.sampleRate ? 1024_000 / track.sampleRate : 0);
+    block.frames.forEach((frame, index) => this.callbacks.onSample?.({
+      trackNumber: track.number,
+      timestampMs: timestampMs + index * defaultDuration,
+      durationMs: defaultDuration,
+      keyframe: simple && Boolean(block.flags & 0x80),
+      data: frame,
+    }));
+  }
 }
 
 function parseRange(
@@ -129,6 +225,20 @@ function readTrackField(data: Uint8Array, element: Element, track: Partial<Matro
   else if (element.id === IDS.channels) track.channels = readUnsigned(data, element.dataStart, element.dataEnd);
 }
 
+function readTrackFieldByName(name: string, data: Uint8Array, track: Partial<MatroskaTrack>) {
+  if (name === "TrackNumber") track.number = readUnsigned(data, 0, data.byteLength) ?? undefined;
+  else if (name === "TrackType") {
+    const value = readUnsigned(data, 0, data.byteLength);
+    track.type = value === 1 ? "video" : value === 2 ? "audio" : "other";
+  } else if (name === "CodecID") track.codecId = new TextDecoder().decode(data);
+  else if (name === "CodecPrivate") track.codecPrivate = data.slice();
+  else if (name === "DefaultDuration") track.defaultDurationMs = (readUnsigned(data, 0, data.byteLength) ?? 0) / 1_000_000;
+  else if (name === "PixelWidth") track.width = readUnsigned(data, 0, data.byteLength);
+  else if (name === "PixelHeight") track.height = readUnsigned(data, 0, data.byteLength);
+  else if (name === "SamplingFrequency") track.sampleRate = readFloat(data, 0, data.byteLength);
+  else if (name === "Channels") track.channels = readUnsigned(data, 0, data.byteLength);
+}
+
 function parseBlock(
   data: Uint8Array,
   start: number,
@@ -138,27 +248,37 @@ function parseBlock(
   scale: number,
   simple: boolean,
 ) {
-  const trackVint = readVint(data, start, end);
-  if (!trackVint || trackVint.value === 0 || trackVint.next + 3 > end) return;
-  const relativeTimecode = new DataView(data.buffer, data.byteOffset + trackVint.next, 2).getInt16(0);
-  const flags = data[data.byteOffset + trackVint.next + 2];
-  const payloadStart = trackVint.next + 3;
-  const frames = splitLacedPayload(data, payloadStart, end, flags);
-  const track = findTrack(result, trackVint.value);
+  const block = parseSimpleBlockPayload(data.slice(start, end));
+  if (!block) return;
+  const track = findTrack(result, block.trackNumber);
   if (!track) return;
-  const timestampMs = (clusterTimecode + relativeTimecode) * scale / 1_000_000;
+  const timestampMs = (clusterTimecode + block.timecode) * scale / 1_000_000;
   const defaultDuration = track.defaultDurationMs ?? (track.type === "audio" && track.sampleRate ? 1024_000 / track.sampleRate : 0);
-  frames.forEach((frame, index) => {
+  block.frames.forEach((frame, index) => {
     const sample: MatroskaSample = {
       trackNumber: track.number,
       timestampMs: timestampMs + index * defaultDuration,
       durationMs: defaultDuration,
-      keyframe: simple ? Boolean(flags & 0x80) : false,
+      keyframe: simple && Boolean(block.flags & 0x80),
       data: frame,
     };
     if (track.type === "video") result.videoSamples.push(sample);
     else if (track.type === "audio") result.audioSamples.push(sample);
   });
+}
+
+export function parseSimpleBlockPayload(data: Uint8Array) {
+  const trackVint = readVint(data, 0, data.byteLength);
+  if (!trackVint || trackVint.value === 0 || trackVint.next + 3 > data.byteLength) return null;
+  const view = new DataView(data.buffer, data.byteOffset + trackVint.next, 2);
+  const timecode = view.getInt16(0);
+  const flags = data[trackVint.next + 2];
+  return {
+    trackNumber: trackVint.value,
+    timecode,
+    flags,
+    frames: splitLacedPayload(data, trackVint.next + 3, data.byteLength, flags),
+  };
 }
 
 function findTrack(result: MatroskaFile, number: number) {
