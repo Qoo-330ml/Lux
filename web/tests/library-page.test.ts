@@ -365,7 +365,7 @@ describe("LibraryPage infinite scroll", () => {
       libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
     });
     const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
-      items: [{ id: "movie-1", title: "待确认电影", itemType: "MOVIE" }],
+      items: [{ id: "movie-1", title: "待确认电影", itemType: "MOVIE", metadataPending: true }],
       page: 1,
       pageSize: 24,
       total: 1,
