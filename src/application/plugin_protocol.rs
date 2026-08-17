@@ -584,6 +584,7 @@ pub struct StrmResolveRpcResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NotificationSendRpcRequest {
     pub event: Value,
+    pub target: Value,
     pub config: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
@@ -758,11 +759,16 @@ mod tests {
                 "eventType": "MEDIA_ADDED",
                 "data": {"libraryId": "library-1"}
             }),
+            target: json!({
+                "url": "https://hooks.example.test/lux",
+                "allowPrivateNetwork": false,
+            }),
             config: json!({"chatId": "chat-1"}),
             secret: Some("provider-secret".to_owned()),
         };
         let encoded = serde_json::to_value(&request).expect("request should serialize");
         assert_eq!(encoded["config"]["chatId"], "chat-1");
+        assert_eq!(encoded["target"]["allowPrivateNetwork"], false);
         assert_eq!(encoded["secret"], "provider-secret");
         assert!(encoded["event"].get("secret").is_none());
 

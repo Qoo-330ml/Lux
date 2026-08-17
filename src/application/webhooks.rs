@@ -564,6 +564,8 @@ impl WebhookService {
         } else {
             self.send_plugin_payload(
                 &destination.provider_plugin_id,
+                &destination.url,
+                destination.allow_private_network,
                 &destination.provider_config_json,
                 &String::from_utf8(payload)
                     .map_err(|error| WebhookError::Serialization(error.to_string()))?,
@@ -687,6 +689,8 @@ impl WebhookService {
     ) -> Result<u16, WebhookError> {
         self.send_plugin_payload(
             &delivery.provider_plugin_id,
+            &delivery.destination_url,
+            delivery.allow_private_network,
             &delivery.provider_config_json,
             &delivery.payload_json,
             secret,
@@ -697,6 +701,8 @@ impl WebhookService {
     async fn send_plugin_payload(
         &self,
         provider_plugin_id: &str,
+        destination_url: &str,
+        allow_private_network: bool,
         provider_config_json: &str,
         payload_json: &str,
         secret: Option<&String>,
@@ -709,6 +715,10 @@ impl WebhookService {
             .map_err(|error| WebhookError::Serialization(error.to_string()))?;
         let request = NotificationSendRpcRequest {
             event,
+            target: json!({
+                "url": destination_url,
+                "allowPrivateNetwork": allow_private_network,
+            }),
             config,
             secret: secret.cloned(),
         };

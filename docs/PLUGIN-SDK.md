@@ -337,13 +337,19 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
     "serverId": "server-1",
     "data": {"libraryId": "library-1", "addedCount": 1}
   },
+  "target": {
+    "url": "https://example.com/lux-hook",
+    "allowPrivateNetwork": false
+  },
   "config": {"chatId": "chat-1"},
   "secret": "provider-specific-secret"
 }
 ```
 
 `event.data` 只包含 Lux 事件白名单字段，不包含本地绝对路径、`.strm` 原始目标、令牌或不必要的用户
-隐私字段。`config` 只能保存非秘密目标设置；密码、Token、API Key 等必须放入受控的 `secret` 字段。
+隐私字段。`target` 是通知器投递所需的目标信息，`url` 为空时由通知器根据自身配置决定目标；
+`allowPrivateNetwork` 是 Lux 已批准的私网策略，通知器必须继续执行危险保留地址检查且不得自行放宽策略。
+`config` 只能保存非秘密目标设置；密码、Token、API Key 等必须放入受控的 `secret` 字段。
 插件必须返回 `DELIVERED`、`RETRYABLE` 或 `FAILED`，可选返回 provider 请求 ID、重试秒数和稳定错误码：
 
 ```json
