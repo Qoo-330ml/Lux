@@ -2,7 +2,7 @@
 
 ## 目标
 
-Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插件包。首版使用 `.zip` 包格式和独立进程运行时。插件不直接访问 Lux 数据库、媒体根目录或内部任务对象。除元数据插件外，SDK v1 也支持由 Lux 宿主调度的媒体探测插件和 IP 归属地插件；任务、媒体库选择、结果持久化和旁车写入仍由宿主负责。
+Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插件包。首版使用 `.zip` 包格式和独立进程运行时。插件不直接访问 Lux 数据库、媒体根目录或内部任务对象。除元数据插件外，SDK v1 也支持由 Lux 宿主调度的媒体探测、IP 归属地和通知插件；任务、媒体库选择、通知队列、结果持久化和旁车写入仍由宿主负责。
 
 ## 包格式
 
@@ -321,6 +321,38 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
 
 媒体探测调用只能由后台 STRM 探测任务触发，不得从播放、PlaybackInfo 或普通用户请求路径触发。Lux 宿主负责并发、超时、取消、重启恢复、任务状态、数据库写入和可选的
 `*-mediainfo.json` 原子写入。`permissions.network` 是能力声明，不替代宿主的出站 URL 安全策略。
+
+### 通知器调用约定
+
+通知器必须声明 `type: "notification"`、`category: "NOTIFICATION"` 和
+`capabilities: ["notification.send"]`。宿主通过 `notification.send` 发送：
+
+```json
+{
+  "event": {
+    "schemaVersion": 1,
+    "eventId": "event-1",
+    "eventType": "MEDIA_ADDED",
+    "occurredAt": 1700000000,
+    "serverId": "server-1",
+    "data": {"libraryId": "library-1", "addedCount": 1}
+  },
+  "config": {"chatId": "chat-1"},
+  "secret": "provider-specific-secret"
+}
+```
+
+`event.data` 只包含 Lux 事件白名单字段，不包含本地绝对路径、`.strm` 原始目标、令牌或不必要的用户
+隐私字段。`config` 只能保存非秘密目标设置；密码、Token、API Key 等必须放入受控的 `secret` 字段。
+插件必须返回 `DELIVERED`、`RETRYABLE` 或 `FAILED`，可选返回 provider 请求 ID、重试秒数和稳定错误码：
+
+```json
+{"status":"DELIVERED","providerRequestId":"message-1"}
+```
+
+宿主负责超时、重试、退避、投递记录和失败恢复。通知插件进程不会获得 `LUX_CONFIG_DIR`，不能通过文件系统
+读取其他插件或服务器 Secret。Webhook、Telegram、企业微信等平台的 payload 和认证逻辑属于各自插件，不应
+写入通知核心。
 
 ## 错误码
 

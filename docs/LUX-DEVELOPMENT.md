@@ -3925,12 +3925,13 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 
 依赖：LUX-020、LUX-022、LUX-024。
 
-#### LUX-183：Webhook 通知事件与持久化投递
+#### LUX-183：通知器插件、Webhook 事件与持久化投递
 
-范围：为 Lux 增加管理员配置的单一出站 Webhook 通知器。通知通过持久化事件和投递记录由有界后台 worker
-发送，不能阻塞扫描、播放或元数据请求。Lux 原生 `schemaVersion: 1` JSON 合同和 Emby 风格 payload 使用
-独立 adapter；不声称完整兼容 Emby Webhooks 插件的全部 payload/template 行为。Telegram、企业微信和 Email
-不属于当前任务。
+范围：为 Lux 增加统一通知事件、持久化 outbox 和可插拔通知器宿主。通知通过持久化事件和投递记录由有界后台
+worker 发送，不能阻塞扫描、播放或元数据请求。通知器使用独立进程插件协议；首个兼容 provider 为旧版内置
+Webhook，旧目标迁移后继续可用。Lux 原生 `schemaVersion: 1` JSON 合同和 Emby 风格 payload 使用独立
+adapter；不声称完整兼容 Emby Webhooks 插件的全部 payload/template 行为。Telegram、企业微信和 Email 的
+具体插件实现不属于当前任务。
 
 事件包括 `MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、
 `JOB_FAILED`、`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_PROGRESS`、`PLAYBACK_STOPPED`。事件不包含
@@ -3948,6 +3949,7 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 - [x] 媒体/任务服务接入基础事件；重复扫描不会重复发送同一媒体新增事件。
 - [x] 播放边沿和节流进度事件接入；乱序回调不会造成位置倒退或通知风暴。
 - [x] Lux/Emby payload adapter 按目标独立生成事件，旧目标升级后继续使用 Lux 合同。
+- [x] 通知插件 manifest/RPC 合同、provider 目标绑定和宿主统一结果分类已实现；通知插件不继承完整配置目录。
 - [x] API、存储、URL 安全、签名、重试、恢复、权限、CSRF、脱敏和本地接收器集成测试通过。
 
 验证：参见 `docs/LUX-183-PLAN.md`；完成后更新 `docs/COMPATIBILITY.md`，明确 Lux 原生 Webhook、Emby 风格

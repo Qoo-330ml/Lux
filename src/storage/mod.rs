@@ -736,8 +736,9 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO notification_destinations (
-                id, name, url, enabled, allow_private_network, event_types_json, payload_format
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                id, name, url, enabled, allow_private_network, event_types_json, payload_format,
+                provider_plugin_id, provider_config_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(destination.id)
         .bind(destination.name)
@@ -746,6 +747,8 @@ impl Database {
         .bind(database_flag(destination.allow_private_network))
         .bind(destination.event_types_json)
         .bind(destination.payload_format)
+        .bind(destination.provider_plugin_id)
+        .bind(destination.provider_config_json)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -761,7 +764,7 @@ impl Database {
     ) -> Result<Option<StoredNotificationDestination>, StorageError> {
         self.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
-                    created_at, updated_at
+                    provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations WHERE id = ?",
         )
         .bind(id)
@@ -781,7 +784,7 @@ impl Database {
     ) -> Result<Vec<StoredNotificationDestination>, StorageError> {
         self.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
-                    created_at, updated_at
+                    provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations
              ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
@@ -805,7 +808,7 @@ impl Database {
     ) -> Result<Vec<StoredNotificationDestination>, StorageError> {
         self.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
-                    created_at, updated_at
+                    provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations
              WHERE enabled = 1
              ORDER BY id LIMIT 1000",
@@ -836,6 +839,8 @@ impl Database {
                  allow_private_network = COALESCE(?, allow_private_network),
                  event_types_json = COALESCE(?, event_types_json),
                  payload_format = COALESCE(?, payload_format),
+                 provider_plugin_id = COALESCE(?, provider_plugin_id),
+                 provider_config_json = COALESCE(?, provider_config_json),
                  updated_at = unixepoch()
              WHERE id = ?",
         )
@@ -845,6 +850,8 @@ impl Database {
         .bind(update.allow_private_network.map(database_flag))
         .bind(update.event_types_json)
         .bind(update.payload_format)
+        .bind(update.provider_plugin_id)
+        .bind(update.provider_config_json)
         .bind(id)
         .execute(&self.pool)
         .await
@@ -941,7 +948,8 @@ impl Database {
                     d.next_attempt_at, d.claimed_until, d.last_http_status, d.last_error,
                     d.delivered_at, d.created_at, d.updated_at,
                     e.event_type, e.schema_version, e.occurred_at, e.payload_json,
-                    n.name, n.url, n.allow_private_network
+                    n.name, n.url, n.allow_private_network,
+                    n.provider_plugin_id, n.provider_config_json
              FROM notification_deliveries d
              JOIN notification_events e ON e.id = d.event_id
              JOIN notification_destinations n ON n.id = d.destination_id
@@ -972,7 +980,8 @@ impl Database {
                     d.next_attempt_at, d.claimed_until, d.last_http_status, d.last_error,
                     d.delivered_at, d.created_at, d.updated_at,
                     e.event_type, e.schema_version, e.occurred_at, e.payload_json,
-                    n.name, n.url, n.allow_private_network
+                    n.name, n.url, n.allow_private_network,
+                    n.provider_plugin_id, n.provider_config_json
              FROM notification_deliveries d
              JOIN notification_events e ON e.id = d.event_id
              JOIN notification_destinations n ON n.id = d.destination_id
@@ -11763,6 +11772,8 @@ pub(crate) struct StoredNotificationDestination {
     pub(crate) allow_private_network: bool,
     pub(crate) event_types_json: String,
     pub(crate) payload_format: String,
+    pub(crate) provider_plugin_id: String,
+    pub(crate) provider_config_json: String,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
@@ -11775,6 +11786,8 @@ pub(crate) struct NewNotificationDestination<'a> {
     pub(crate) allow_private_network: bool,
     pub(crate) event_types_json: &'a str,
     pub(crate) payload_format: &'a str,
+    pub(crate) provider_plugin_id: &'a str,
+    pub(crate) provider_config_json: &'a str,
 }
 
 pub(crate) struct UpdateNotificationDestination<'a> {
@@ -11784,6 +11797,8 @@ pub(crate) struct UpdateNotificationDestination<'a> {
     pub(crate) allow_private_network: Option<bool>,
     pub(crate) event_types_json: Option<&'a str>,
     pub(crate) payload_format: Option<&'a str>,
+    pub(crate) provider_plugin_id: Option<&'a str>,
+    pub(crate) provider_config_json: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -11804,6 +11819,8 @@ pub(crate) struct StoredNotificationDelivery {
     pub(crate) destination_name: String,
     pub(crate) destination_url: String,
     pub(crate) allow_private_network: bool,
+    pub(crate) provider_plugin_id: String,
+    pub(crate) provider_config_json: String,
 }
 
 pub(crate) struct NewNotificationEvent<'a> {
@@ -11855,6 +11872,8 @@ fn stored_notification_destination(row: sqlx::any::AnyRow) -> StoredNotification
         allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
         event_types_json: row.get("event_types_json"),
         payload_format: row.get("payload_format"),
+        provider_plugin_id: row.get("provider_plugin_id"),
+        provider_config_json: row.get("provider_config_json"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -11878,6 +11897,8 @@ fn stored_notification_delivery(row: sqlx::any::AnyRow) -> StoredNotificationDel
         destination_name: row.get("name"),
         destination_url: row.get("url"),
         allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
+        provider_plugin_id: row.get("provider_plugin_id"),
+        provider_config_json: row.get("provider_config_json"),
     }
 }
 

@@ -295,6 +295,8 @@ export type AdminWebhookDestination = {
   name: string;
   url: string;
   payloadFormat: "LUX" | "EMBY";
+  providerPluginId: string;
+  providerConfig: Record<string, unknown>;
   enabled: boolean;
   allowPrivateNetwork: boolean;
   eventTypes: string[];

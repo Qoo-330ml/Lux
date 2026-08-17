@@ -197,6 +197,32 @@ impl PluginSupervisor {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, PluginRuntimeError> {
+        self.call_with_config_access(plugin_id, method, params, true)
+            .await
+    }
+
+    /// Calls a plugin without exposing Lux's shared configuration directory.
+    ///
+    /// Notification providers receive credentials in their RPC request. They
+    /// must not inherit `LUX_CONFIG_DIR`, because that directory also contains
+    /// unrelated plugin and server secrets.
+    pub async fn call_without_config_access(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, PluginRuntimeError> {
+        self.call_with_config_access(plugin_id, method, params, false)
+            .await
+    }
+
+    async fn call_with_config_access(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: serde_json::Value,
+        allow_config_access: bool,
+    ) -> Result<serde_json::Value, PluginRuntimeError> {
         let plugin = self
             .catalog
             .read()
@@ -211,7 +237,9 @@ impl PluginSupervisor {
             } else {
                 let process = match spawn_process(
                     &plugin,
-                    self.config_dir.as_deref(),
+                    allow_config_access
+                        .then_some(self.config_dir.as_deref())
+                        .flatten(),
                     self.network_proxy_url.as_deref(),
                 ) {
                     Ok(process) => Arc::new(Mutex::new(process)),

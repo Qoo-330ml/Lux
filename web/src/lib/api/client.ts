@@ -440,6 +440,12 @@ export class LuxApiClient {
     );
   }
 
+  adminNotificationProviders() {
+    return this.request<{ plugins?: AdminPlugin[]; total?: number; page?: number; pageSize?: number }>(
+      "/api/v1/admin/notification-providers?page=1&pageSize=50",
+    );
+  }
+
   adminWebhookDestinations() {
     return this.request<{ destinations?: AdminWebhookDestination[]; page?: number; pageSize?: number }>(
       "/api/v1/admin/notification-destinations?page=1&pageSize=50",
@@ -454,6 +460,8 @@ export class LuxApiClient {
     eventTypes: string[];
     payloadFormat: "LUX" | "EMBY";
     secret?: string;
+    providerPluginId?: string;
+    providerConfig?: Record<string, unknown>;
   }) {
     return this.request<{ destination: AdminWebhookDestination; secret: string }>(
       "/api/v1/admin/notification-destinations",
@@ -468,6 +476,8 @@ export class LuxApiClient {
     allowPrivateNetwork?: boolean;
     eventTypes?: string[];
     payloadFormat?: "LUX" | "EMBY";
+    providerPluginId?: string;
+    providerConfig?: Record<string, unknown>;
   }) {
     return this.request<{ destination: AdminWebhookDestination }>(
       `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}`,

@@ -87,7 +87,7 @@ use crate::{
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
-        webhooks::{WebhookError, WebhookEventType, WebhookService},
+        webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
@@ -241,7 +241,9 @@ impl AppState {
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
         let chapter_detection = ChapterDetectionService::new(database.clone(), plugins.clone());
-        let webhooks = match WebhookService::new(database.clone(), config_dir.clone()) {
+        let webhooks = match WebhookService::new(database.clone(), config_dir.clone())
+            .map(|service| service.with_plugins(plugins.clone()))
+        {
             Ok(service) => Some(service),
             Err(error) => {
                 tracing::error!(%error, "failed to initialize webhook notifications");
@@ -616,6 +618,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_run_auto_library_cover),
         )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
+        .route(
+            "/api/v1/admin/notification-providers",
+            get(admin_list_notification_providers),
+        )
         .route(
             "/api/v1/admin/chapter-sources",
             get(admin_list_chapter_sources),
@@ -13441,6 +13447,8 @@ struct WebhookDestinationCreateRequest {
     event_types: Vec<String>,
     payload_format: Option<String>,
     secret: Option<String>,
+    provider_plugin_id: Option<String>,
+    provider_config: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -13452,6 +13460,8 @@ struct WebhookDestinationUpdateRequest {
     allow_private_network: Option<bool>,
     event_types: Option<Vec<String>>,
     payload_format: Option<String>,
+    provider_plugin_id: Option<String>,
+    provider_config: Option<Value>,
 }
 
 const fn default_enabled() -> bool {
@@ -13545,8 +13555,17 @@ async fn admin_create_webhook_destination(
         )
         .into_response();
     };
+    let provider_plugin_id = request
+        .provider_plugin_id
+        .as_deref()
+        .unwrap_or(BUILTIN_WEBHOOK_PROVIDER_ID);
+    let provider_config = request
+        .provider_config
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     match service
-        .create_destination_with_format(
+        .create_destination_with_provider(
             &request.name,
             &request.url,
             request.enabled,
@@ -13554,6 +13573,8 @@ async fn admin_create_webhook_destination(
             &request.event_types,
             request.secret.as_deref(),
             request.payload_format.as_deref().unwrap_or("LUX"),
+            provider_plugin_id,
+            &provider_config,
         )
         .await
     {
@@ -13585,7 +13606,7 @@ async fn admin_update_webhook_destination(
         .into_response();
     };
     match service
-        .update_destination_with_format(
+        .update_destination_with_provider(
             &destination_id,
             request.name.as_deref(),
             request.url.as_deref(),
@@ -13593,6 +13614,8 @@ async fn admin_update_webhook_destination(
             request.allow_private_network,
             request.event_types.as_deref(),
             request.payload_format.as_deref(),
+            request.provider_plugin_id.as_deref(),
+            request.provider_config.as_ref(),
         )
         .await
     {
@@ -13753,6 +13776,9 @@ fn webhook_error_response(headers: &HeaderMap, error: WebhookError) -> Response 
         | WebhookError::Io(_)
         | WebhookError::Serialization(_)
         | WebhookError::HttpResponse { .. }
+        | WebhookError::PluginRetryable { .. }
+        | WebhookError::PluginFailed(_)
+        | WebhookError::Plugin(_)
         | WebhookError::SecretUnavailable
         | WebhookError::RequestSetup(_) => {
             tracing::warn!("webhook operation failed");
@@ -15335,6 +15361,35 @@ async fn admin_list_plugins(
     State(state): State<AppState>,
 ) -> Response {
     admin_list_plugins_with_scope(headers, query, state, false).await
+}
+
+async fn admin_list_notification_providers(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match plugins.list_notification_plugins(offset, limit).await {
+        Ok(page) => Json(plugin_page_json(&page)).into_response(),
+        Err(error) => plugin_error(&headers, error),
+    }
 }
 
 async fn admin_list_chapter_sources(

@@ -89,6 +89,16 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `chapter_detector` 插件必须声明 `category: "MEDIA"`，并至少声明 `chapters.detect` 或 `chapters.lookup`。`org.lux.intro-outro-detector` 使用 `chapters.detect` 比较宿主提取的有界音频指纹；`org.lux.theintrodb-chapter-source` 使用 `chapters.lookup`，只把已保存的 TMDb/TVDb/IMDb ID、季号、集号和可选时长交给在线插件，由插件访问固定的 TheIntroDB API。两者都不接收媒体路径或任务对象，宿主负责并发、超时、取消、恢复、结果落库和 Emby 章节映射。
 - 未安装、未启用、无可用凭据、运行失败或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
+## 通知器插件（LUX-183）
+
+- `GET /api/v1/admin/notification-providers?page=1&pageSize=50`：分页返回已发现的
+  `type: "notification"` 插件及其安装、启用、可用状态和配置字段。
+- `GET/POST/PATCH/DELETE /api/v1/admin/notification-destinations`：继续兼容原有 Webhook 目标；创建或更新时可
+  传 `providerPluginId` 和非秘密 `providerConfig`。省略时使用 `builtin.webhook`。外部 provider 不需要 URL，
+  但 `secret` 仍只在创建/轮换响应中返回，不写入事件或普通列表。
+- 通知插件必须声明 `notification.send`，宿主通过独立进程 RPC 投递；插件结果 `DELIVERED`、`RETRYABLE`、
+  `FAILED` 由统一 outbox worker 处理超时、退避、恢复和失败记录。
+
 插件包不从任意未登记的远程 URL 自动下载；远程安装只使用当前插件商店目录声明的 Release 包地址。插件 API、媒体库 API 和日志不返回插件配置中的敏感值；TMDb API Key 和 Read Access Token 只存在受限配置或外置插件运行时中。
 
 ## 元数据候选管理（LUX-053）
