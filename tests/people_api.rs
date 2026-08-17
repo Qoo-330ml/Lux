@@ -3,7 +3,7 @@ use luxd::{
     application::{
         libraries::LibraryService,
         metadata_paths::library_item_directory,
-        people::{ActorCredit, PeopleService},
+        people::{ActorCredit, PeopleService, PersonMetadata},
         scanner::LibraryScanner,
         setup::SetupService,
     },
@@ -132,7 +132,13 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
                     character: None,
                     order: Some(1),
                     profile_url: None,
-                    person: None,
+                    person: Some(PersonMetadata {
+                        biography: Some("演员丁简介".to_owned()),
+                        birthday: None,
+                        deathday: None,
+                        known_for_department: None,
+                        place_of_birth: None,
+                    }),
                 },
             ],
         )
@@ -231,7 +237,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         .find(|actor| actor["Id"] == "102")
         .ok_or("missing actor 102")?;
     assert_eq!(actor_b["Name"], "演员乙");
-    assert!(actor_b["Role"].is_null());
+    assert!(actor_b.get("Role").is_none());
     let actor_c = actors
         .iter()
         .find(|actor| actor["Id"] == "nm103")

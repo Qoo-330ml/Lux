@@ -3729,38 +3729,45 @@ fn emby_person_json_with_fields(
         ("ImageTags".to_owned(), image_tags),
         ("BackdropImageTags".to_owned(), json!([])),
     ]);
-    if include("Role") {
-        object.insert("Role".to_owned(), json!(actor.character));
+    if include("Role")
+        && let Some(role) = actor.character
+    {
+        object.insert("Role".to_owned(), json!(role));
     }
-    if include("PrimaryImageTag") {
+    if include("PrimaryImageTag")
+        && let Some(image_tag) = image_tag
+    {
         object.insert("PrimaryImageTag".to_owned(), json!(image_tag));
     }
-    if include("Overview") {
-        object.insert("Overview".to_owned(), json!(actor.biography));
+    if include("Overview")
+        && let Some(overview) = actor.biography
+    {
+        object.insert("Overview".to_owned(), json!(overview));
     }
-    if include("BirthDate") {
-        object.insert("BirthDate".to_owned(), json!(actor.birthday));
+    if include("BirthDate")
+        && let Some(birthday) = actor.birthday
+    {
+        object.insert("BirthDate".to_owned(), json!(birthday));
     }
-    if include("DeathDate") {
-        object.insert("DeathDate".to_owned(), json!(actor.deathday));
+    if include("DeathDate")
+        && let Some(deathday) = actor.deathday
+    {
+        object.insert("DeathDate".to_owned(), json!(deathday));
     }
-    if include("KnownForDepartment") {
-        object.insert(
-            "KnownForDepartment".to_owned(),
-            json!(actor.known_for_department),
-        );
+    if include("KnownForDepartment")
+        && let Some(known_for_department) = actor.known_for_department
+    {
+        object.insert("KnownForDepartment".to_owned(), json!(known_for_department));
     }
-    if include("PlaceOfBirth") {
-        object.insert("PlaceOfBirth".to_owned(), json!(actor.place_of_birth));
+    if include("PlaceOfBirth")
+        && let Some(place_of_birth) = actor.place_of_birth
+    {
+        object.insert("PlaceOfBirth".to_owned(), json!(place_of_birth));
     }
-    if include("DateCreated") {
-        object.insert(
-            "DateCreated".to_owned(),
-            actor
-                .date_created
-                .and_then(emby_timestamp)
-                .map_or(Value::Null, Value::String),
-        );
+    if include("DateCreated")
+        && let Some(date_created) = actor.date_created.and_then(emby_timestamp)
+    {
+        object.insert("DateCreated".to_owned(), Value::String(date_created));
     }
     Value::Object(object)
 }
