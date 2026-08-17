@@ -3997,13 +3997,13 @@ DirectPlay；浏览器无法原生解码 HEVC、但具备 WebAssembly、Web Work
 
 验收：
 
-- [ ] NativeVideoEngine 保持现有播放、恢复位置、进度、暂停、停止和页面离开事件语义。
-- [ ] 播放器按真实能力选择原生路径或客户端 fallback，不因 `canPlayType` 的静态结果误选路径。
-- [ ] 客户端 fallback 使用 Worker，动态加载 WASM/Worker 资产，支持 MP4/fMP4 HEVC + AAC 的播放和 seek。
-- [ ] fallback 失败时显示可诊断原因，并推荐原生客户端；不创建服务器端转码任务。
-- [ ] 4K HEVC 在能力探测允许且实际客户端吞吐足够时可以走同一 fallback；性能不足时有明确降级状态。
-- [ ] `.strm` 外部 URL 只有在浏览器具备 CORS/Range 能力时才尝试客户端读取；不新增服务端代理。
-- [ ] 不改变 Emby PlaybackInfo、Rust 播放接口、数据库和第三方客户端行为。
+- [x] NativeVideoEngine 保持现有播放、恢复位置、进度、暂停、停止和页面离开事件语义。
+- [x] 播放器按真实能力选择原生路径或客户端 fallback，不因 `canPlayType` 的静态结果误选路径。
+- [x] 客户端 fallback 使用 Worker，动态加载 WASM/Worker 资产，支持 MP4/fMP4 HEVC + AAC 的播放和 seek。
+- [x] fallback 失败时显示可诊断原因，并推荐原生客户端；不创建服务器端转码任务。
+- [x] 4K HEVC 在能力探测允许且实际客户端吞吐足够时可以走同一 fallback；性能不足时有明确降级状态。
+- [x] `.strm` 外部 URL 只有在浏览器具备 CORS/Range 能力时才尝试客户端读取；不新增服务端代理。
+- [x] 不改变 Emby PlaybackInfo、Rust 播放接口、数据库和第三方客户端行为。
 
 验证：Web 单测、Web 构建、真实浏览器 MP4/H.265 fixture 播放、seek、进度和 fallback 错误回归；记录浏览器、
 平台、样本分辨率、媒体耗时、客户端转码速度和丢帧。未通过真实性能门时不得宣称该设备支持 4K 实时 fallback。
