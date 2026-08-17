@@ -504,7 +504,8 @@ impl MetadataCandidateService {
                     score: metadata_match_score(
                         current.series_title.as_deref().unwrap_or(series_query),
                         current.series_production_year,
-                        result.title.as_deref().or(result.original_title.as_deref()),
+                        result.title.as_deref(),
+                        result.original_title.as_deref(),
                         result.production_year,
                     ),
                 })
@@ -525,6 +526,7 @@ impl MetadataCandidateService {
                 &current.title,
                 current.production_year,
                 Some(&candidate.title),
+                candidate.original_title.as_deref(),
                 candidate.production_year,
             )
         });
@@ -673,34 +675,81 @@ fn metadata_match_score(
     current_title: &str,
     current_year: Option<i64>,
     candidate_title: Option<&str>,
+    candidate_original_title: Option<&str>,
     candidate_year: Option<i32>,
 ) -> f64 {
-    let title_score = candidate_title
-        .map(|candidate_title| {
-            let current_normalized =
-                crate::application::media_matching::normalize_title(current_title);
-            let candidate_normalized =
-                crate::application::media_matching::normalize_title(candidate_title);
-            if current_normalized == candidate_normalized {
-                80.0
-            } else if candidate_normalized.contains(&current_normalized)
-                || current_normalized.contains(&candidate_normalized)
-            {
-                50.0
-            } else {
-                0.0
-            }
+    let current_normalized = crate::application::media_matching::normalize_title(current_title);
+    let title_score = [candidate_title, candidate_original_title]
+        .into_iter()
+        .flatten()
+        .map(crate::application::media_matching::normalize_title)
+        .filter(|title| !title.is_empty())
+        .map(|candidate_normalized| {
+            title_similarity_score(&current_normalized, &candidate_normalized)
         })
+        .max_by(f64::total_cmp)
         .unwrap_or(0.0);
-    if title_score < 80.0
-        && current_year
-            .and_then(|value| i32::try_from(value).ok())
-            .is_some_and(|year| Some(year) == candidate_year)
-    {
-        title_score + 20.0
-    } else {
-        title_score
+    if title_score == 0.0 {
+        return 0.0;
     }
+
+    let year_score = match (
+        current_year.and_then(|value| i32::try_from(value).ok()),
+        candidate_year,
+    ) {
+        (Some(current), Some(candidate)) => match current.abs_diff(candidate) {
+            0 => 30.0,
+            1 => 20.0,
+            2..=3 => 5.0,
+            _ => -20.0,
+        },
+        _ => 0.0,
+    };
+    (title_score + year_score).max(0.0)
+}
+
+fn title_similarity_score(current: &str, candidate: &str) -> f64 {
+    if current == candidate {
+        return 65.0;
+    }
+    if candidate.contains(current) || current.contains(candidate) {
+        return 45.0;
+    }
+    match similarity_percent(current, candidate) {
+        90..=100 => 50.0,
+        80..=89 => 35.0,
+        _ => 0.0,
+    }
+}
+
+fn similarity_percent(left: &str, right: &str) -> u8 {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let max_length = left.len().max(right.len());
+    if max_length == 0 {
+        return 100;
+    }
+    let distance = levenshtein(&left, &right);
+    let similarity = 100_usize.saturating_sub(distance.saturating_mul(100) / max_length);
+    u8::try_from(similarity).unwrap_or(0)
+}
+
+fn levenshtein(left: &[char], right: &[char]) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.iter().enumerate() {
+        let mut current = vec![left_index + 1; right.len() + 1];
+        for (right_index, right_character) in right.iter().enumerate() {
+            current[right_index + 1] = if left_character == right_character {
+                previous[right_index]
+            } else {
+                1 + previous[right_index]
+                    .min(previous[right_index + 1])
+                    .min(current[right_index])
+            };
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1903,7 +1952,7 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 mod tests {
     use super::{
         TmdbCastMember, candidate_actors, default_image_selection_policy, generic_candidate_images,
-        tmdb_candidate_actors,
+        metadata_match_score, tmdb_candidate_actors,
     };
     use crate::application::scraper::{ScraperImage, ScraperItemType};
     use serde_json::json;
@@ -1984,5 +2033,61 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].id.is_empty());
         assert_eq!(result[0].name, "本地演员");
+    }
+
+    #[test]
+    fn metadata_match_score_requires_title_agreement_before_year_bonus() {
+        assert_eq!(
+            metadata_match_score(
+                "Example Movie",
+                Some(2020),
+                Some("Other Movie"),
+                None,
+                Some(2020),
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn metadata_match_score_keeps_missing_year_below_auto_match_threshold() {
+        assert_eq!(
+            metadata_match_score("Example Movie", None, Some("Example Movie"), None, None),
+            65.0
+        );
+    }
+
+    #[test]
+    fn metadata_match_score_rewards_same_or_nearby_years() {
+        assert_eq!(
+            metadata_match_score(
+                "Example Movie",
+                Some(2020),
+                Some("Example Movie"),
+                None,
+                Some(2020),
+            ),
+            95.0
+        );
+        assert_eq!(
+            metadata_match_score(
+                "Example Movie",
+                Some(2020),
+                Some("Example Movie"),
+                None,
+                Some(2021),
+            ),
+            85.0
+        );
+        assert_eq!(
+            metadata_match_score(
+                "Example Movie",
+                Some(2020),
+                Some("Example Movie"),
+                None,
+                Some(2015),
+            ),
+            45.0
+        );
     }
 }

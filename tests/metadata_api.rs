@@ -304,7 +304,7 @@ async fn admin_can_page_search_and_preview_pending_candidates()
         items.iter().any(|item| {
             item["providerId"] == "999"
                 && item["candidate"]["productionYear"] == 2020
-                && item["score"] == 80.0
+                && item["score"] == 95.0
         })
     }));
     let searched_candidate = reidentified_body["items"]
