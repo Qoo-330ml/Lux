@@ -1,5 +1,5 @@
-import type { PlaybackEngine, PlaybackPerformance, PlaybackSnapshot } from "./playback-engine";
-import { summarizePlaybackPerformance } from "./playback-engine";
+import { summarizePlaybackPerformance, type PlaybackEngine, type PlaybackPerformance, type PlaybackSnapshot } from "./playback-engine";
+import { hasClientMkvHevcRuntime } from "./playback-selection";
 import type { HevcRuntimeAssets } from "./hevc-playback-engine";
 
 type WorkerResponse =
@@ -85,7 +85,12 @@ export class ClientMkvEngine implements PlaybackEngine {
       rejectReady(error);
       rejectPlayback(error);
     };
-    worker.postMessage({ type: "init", wasmUrl: this.assets.wasmUrl, wasmBinaryUrl: this.assets.wasmBinaryUrl });
+    worker.postMessage({
+      type: "init",
+      wasmUrl: this.assets.wasmUrl,
+      wasmBinaryUrl: this.assets.wasmBinaryUrl,
+      mode: hasClientMkvHevcRuntime() ? "hevc-remux" : "sdr",
+    });
 
     try {
       await ready;

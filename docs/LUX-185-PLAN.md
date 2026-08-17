@@ -10,6 +10,7 @@
 - `@hevcjs/core` 固定使用 MIT 许可版本；包内 WASM 解码器和 Worker 资产由 Lux Web 同源发布。
 - `mp4box` 由 `@hevcjs/core` 运行时使用，许可为 BSD-3-Clause；随 Web 依赖记录，不复制或修改其源码。
 - 客户端 fallback 支持 MP4/fMP4 HEVC 视频和 AAC 音频，并支持 MKV 中的 HEVC 视频与 AAC-LC 音频；MKV 的 DTS/Opus、Dolby Vision、DRM、PGS/ASS 渲染仍不在范围内。
+- Safari 等支持 HEVC MSE 的浏览器优先走客户端 MKV → HEVC/AAC fMP4 封装路径；该路径只在浏览器端重封装样本，不解码、不降为 SDR，也不改变服务端的原始 Range 传输。
 - H.264 编码由浏览器 `VideoEncoder` 完成；不满足 `VideoEncoder.isConfigSupported` 时不启用 fallback。
 - WASM/转码工作在 Worker；UI 主线程只负责引擎状态、MSE 控制和播放进度。
 - 4K 是能力目标，不是所有设备的实时性能承诺；必须以实际 `speedX`、丢帧和音画同步验收。
@@ -38,9 +39,10 @@
 ## 当前实现记录
 
 本增量已完成播放引擎边界、客户端 HEVC fallback、流式 Matroska 解封装、MKV 的 HEVC/AAC-LC 输入、Worker/WASM 资产发布和 PlayerPage 选择接入。
-fallback 的视频输出使用 H.264 fMP4 MSE；MP4/fMP4 沿用现有的音频处理，MKV 则将 AAC-LC 与转码后的视频
-封装在同一个 A/V fMP4 流中，同时保持服务端不转码、不 Remux、不代理媒体内容。播放、暂停、seek 和资源销毁
-通过客户端事件同步。
+fallback 的视频输出使用 H.264 fMP4 MSE；MP4/fMP4 沿用现有的音频处理。MKV 在支持 HEVC MSE 的浏览器中将
+HEVC/AAC-LC 样本在 Worker 内封装为 fMP4，尽量保留 8/10-bit 视频；不支持 HEVC MSE 时才回退到 H.264 SDR
+客户端编码路径。两条路径都保持服务端不转码、不 Remux、不代理媒体内容。播放、暂停、seek 和资源销毁通过
+客户端事件同步。
 
 MKV 路径当前明确支持 `V_MPEGH/ISO/HEVC` 视频和 `A_AAC/MPEG4/LC` AAC-LC 音频，支持常见 SimpleBlock
 lacing 和 Annex-B/四字节长度前缀样本；其他音频编码会给出可诊断的 fallback 错误。浏览器 Worker 的真实初始化
@@ -49,6 +51,10 @@ lacing 和 Annex-B/四字节长度前缀样本；其他音频编码会给出可�
 
 MP4Box 生成的分段可能把负 composition offset 写成无符号 32 位值。客户端只在内存副本上把包含高位符号的
 `trun` 标记为 signed，避免 B 帧时间戳溢出污染 MSE duration。
+
+Safari HEVC MSE 路径使用原始 `hvcC` Box 写入 `hvc1` 样本描述，绕过 MP4Box 对 Matroska `CodecPrivate` 的
+浏览器端解析路径；Worker 烟测已验证 `ready`、初始化片段、媒体片段和完成事件。该路径仍需使用真实用户
+提供的 MKV 完成 Safari metadata、播放、seek、音画同步和 4K 性能验收。
 
 已完成真实 4K 样本测试：Chrome 151/macOS arm64 对 3840×2160 HEVC Main + AAC 和 3840×2160 HEVC Main10
 样本均完成 Worker/WASM 解码、H.264 编码、播放、seek 和 destroy；`43a7b8e6` 起 `setSource()` 在首个视频片段
