@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
+import { shouldUseClientHevc } from "../src/features/player/playback-selection";
 
 vi.mock("../src/features/player/playback-selection", () => ({
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
@@ -15,6 +16,7 @@ vi.mock("../src/features/player/playback-selection", () => ({
 vi.mock("../src/features/player/hevc-playback-engine", () => ({
   ClientHevcEngine: class MockClientHevcEngine {
     readonly kind = "client-hevc";
+    readonly error = new Error("MSE SourceBuffer append failed");
     readonly performance = {
       mediaDurationMs: 8_000,
       processingDurationMs: 16_000,
@@ -43,6 +45,7 @@ describe("PlayerPage client fallback status", () => {
   let root: Root | undefined;
 
   beforeEach(() => {
+    vi.mocked(shouldUseClientHevc).mockResolvedValue(true);
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-fallback",
       title: "4K fallback",
@@ -94,5 +97,33 @@ describe("PlayerPage client fallback status", () => {
     });
     expect(container?.textContent).toContain("客户端解码速度低于实时");
     expect(container?.textContent).toContain("使用原生客户端或降低清晰度");
+  });
+
+  it("shows the fallback engine reason when background playback fails", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-fallback"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    expect(video).not.toBeNull();
+    await act(async () => video?.dispatchEvent(new Event("error")));
+
+    expect(container?.textContent).toContain("MSE SourceBuffer append failed");
   });
 });

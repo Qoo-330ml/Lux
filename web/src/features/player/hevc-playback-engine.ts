@@ -116,6 +116,7 @@ class SourceBufferQueue {
 export class ClientHevcEngine implements PlaybackEngine {
   readonly kind = "client-hevc" as const;
   performance: PlaybackPerformance | null = null;
+  error: Error | null = null;
   private worker: TranscodeWorkerClient | null = null;
   private mediaSource: MediaSource | null = null;
   private objectUrl: string | null = null;
@@ -131,6 +132,7 @@ export class ClientHevcEngine implements PlaybackEngine {
   private durationSeconds: number | null = null;
   private transcodedMediaDurationMs = 0;
   private transcodedProcessingDurationMs = 0;
+  private streamTask: Promise<void> | null = null;
   private generation = 0;
 
   constructor(
@@ -152,51 +154,82 @@ export class ClientHevcEngine implements PlaybackEngine {
     const openPromise = waitForMediaSourceOpen(mediaSource);
     const worker = new TranscodeWorkerClient(this.assets);
     this.worker = worker;
-    await worker.waitReady();
-
-    const response = await fetch(source, { credentials: "same-origin", signal: this.abortController.signal });
-    if (!response.ok) throw new Error(`客户端媒体读取失败：HTTP ${response.status}`);
-    if (!response.body) throw new Error("客户端媒体读取失败：浏览器不支持流式读取");
-
-    const file = createFile();
-    const segmentChains = new Map<number, Promise<void>>();
-    const trackKinds = new Map<number, Mp4Track["type"]>();
-    let resolveInitialization: () => void = () => undefined;
-    let rejectInitialization: (error: unknown) => void = () => undefined;
-    const initialization = new Promise<void>((resolve, reject) => {
-      resolveInitialization = resolve;
-      rejectInitialization = reject;
-    });
-    let resolveTracksReady: () => void = () => undefined;
-    let rejectTracksReady: (error: unknown) => void = () => undefined;
-    const tracksReady = new Promise<void>((resolve, reject) => {
-      resolveTracksReady = resolve;
-      rejectTracksReady = reject;
-    });
-    file.onError = (error: unknown) => {
-      const failure = new Error(`MP4 解封装失败：${String(error)}`);
-      rejectInitialization(failure);
-      rejectTracksReady(failure);
-    };
-    file.onSegment = (id: number, _user: unknown, buffer: ArrayBuffer) => {
-      const previous = segmentChains.get(id) ?? Promise.resolve();
-      const next = previous.then(() => this.processSegment(id, buffer, trackKinds, initialization));
-      segmentChains.set(id, next);
-    };
-    file.onReady = (rawInfo) => {
-      const info = rawInfo as unknown as { tracks: Mp4Track[] };
-      for (const track of info.tracks) trackKinds.set(track.id, track.type);
-      void this.configureTracks(info.tracks, file, mediaSource, openPromise, worker)
-        .then(() => resolveInitialization())
-        .catch((error) => {
-          rejectInitialization(error);
-          rejectTracksReady(error);
-        });
-      resolveTracksReady();
-    };
-
     try {
-      const reader = response.body.getReader();
+      await worker.waitReady();
+      const response = await fetch(source, { credentials: "same-origin", mode: "cors", signal: this.abortController.signal });
+      if (!response.ok) throw new Error(`客户端媒体读取失败：HTTP ${response.status}`);
+      if (!response.body) throw new Error("客户端媒体读取失败：浏览器不支持流式读取");
+
+      const file = createFile();
+      const segmentChains = new Map<number, Promise<void>>();
+      const trackKinds = new Map<number, Mp4Track["type"]>();
+      let resolveInitialization: () => void = () => undefined;
+      let rejectInitialization: (error: unknown) => void = () => undefined;
+      const initialization = new Promise<void>((resolve, reject) => {
+        resolveInitialization = resolve;
+        rejectInitialization = reject;
+      });
+      let resolveTracksReady: () => void = () => undefined;
+      let rejectTracksReady: (error: unknown) => void = () => undefined;
+      const tracksReady = new Promise<void>((resolve, reject) => {
+        resolveTracksReady = resolve;
+        rejectTracksReady = reject;
+      });
+      let playbackReady = false;
+      let resolvePlaybackReady: () => void = () => undefined;
+      let rejectPlaybackReady: (error: unknown) => void = () => undefined;
+      const playbackReadyPromise = new Promise<void>((resolve, reject) => {
+        resolvePlaybackReady = () => {
+          playbackReady = true;
+          resolve();
+        };
+        rejectPlaybackReady = reject;
+      });
+      file.onError = (error: unknown) => {
+        const failure = new Error(`MP4 解封装失败：${String(error)}`);
+        rejectInitialization(failure);
+        rejectTracksReady(failure);
+        if (!playbackReady) rejectPlaybackReady(failure);
+      };
+      file.onSegment = (id: number, _user: unknown, buffer: ArrayBuffer) => {
+        const previous = segmentChains.get(id) ?? Promise.resolve();
+        const next = previous.then(() => this.processSegment(id, buffer, trackKinds, initialization, resolvePlaybackReady));
+        segmentChains.set(id, next);
+      };
+      file.onReady = (rawInfo) => {
+        const info = rawInfo as unknown as { tracks: Mp4Track[] };
+        for (const track of info.tracks) trackKinds.set(track.id, track.type);
+        void this.configureTracks(info.tracks, file, mediaSource, openPromise, worker)
+          .then(() => resolveInitialization())
+          .catch((error) => {
+            rejectInitialization(error);
+            rejectTracksReady(error);
+            if (!playbackReady) rejectPlaybackReady(error);
+          });
+        resolveTracksReady();
+      };
+
+      this.streamTask = this.consumeSource(response.body, file, segmentChains, tracksReady, initialization, mediaSource, generation, () => playbackReady, rejectPlaybackReady);
+      await playbackReadyPromise;
+    } catch (error) {
+      this.destroy();
+      throw error;
+    }
+  }
+
+  private async consumeSource(
+    body: ReadableStream<Uint8Array>,
+    file: ReturnType<typeof createFile>,
+    segmentChains: Map<number, Promise<void>>,
+    tracksReady: Promise<void>,
+    initialization: Promise<void>,
+    mediaSource: MediaSource,
+    generation: number,
+    isPlaybackReady: () => boolean,
+    rejectPlaybackReady: (error: unknown) => void,
+  ) {
+    try {
+      const reader = body.getReader();
       let offset = 0;
       while (true) {
         const chunk = await reader.read();
@@ -221,8 +254,15 @@ export class ClientHevcEngine implements PlaybackEngine {
         this.audioMediaSource.endOfStream();
       }
     } catch (error) {
-      this.destroy();
-      throw error;
+      if (generation !== this.generation) return;
+      this.error = error instanceof Error ? error : new Error(String(error));
+      if (!isPlaybackReady()) {
+        rejectPlaybackReady(error);
+      } else {
+        this.element.dispatchEvent(new Event("error"));
+      }
+    } finally {
+      if (generation === this.generation) this.streamTask = null;
     }
   }
 
@@ -291,6 +331,7 @@ export class ClientHevcEngine implements PlaybackEngine {
     buffer: ArrayBuffer,
     trackKinds: Map<number, Mp4Track["type"]>,
     initialization: Promise<void>,
+    resolvePlaybackReady: () => void,
   ) {
     await initialization;
     if (trackKinds.get(id) === "audio") {
@@ -305,7 +346,10 @@ export class ClientHevcEngine implements PlaybackEngine {
       this.transcodedProcessingDurationMs += stats.demuxMs + stats.decodeMs + stats.encodeMs;
       this.performance = summarizePlaybackPerformance(this.transcodedMediaDurationMs, this.transcodedProcessingDurationMs);
     }
-    if (transcoded) await this.videoQueue.append(transcoded);
+    if (transcoded) {
+      await this.videoQueue.append(transcoded);
+      resolvePlaybackReady();
+    }
   }
 
   play() {
@@ -332,6 +376,7 @@ export class ClientHevcEngine implements PlaybackEngine {
     this.generation += 1;
     this.abortController?.abort();
     this.abortController = null;
+    this.streamTask = null;
     this.worker?.destroy();
     this.worker = null;
     if (this.mediaSource?.readyState === "open") {
@@ -362,6 +407,7 @@ export class ClientHevcEngine implements PlaybackEngine {
     this.transcodedMediaDurationMs = 0;
     this.transcodedProcessingDurationMs = 0;
     this.performance = null;
+    this.error = null;
     this.element.pause();
     this.element.removeAttribute("src");
     this.element.load();

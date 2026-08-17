@@ -174,7 +174,11 @@ export function PlayerPage() {
             poster={poster ?? undefined}
             controls
             preload="metadata"
-            onError={() => { setFailedStreamUrl(streamUrl); setPlaybackError(null); }}
+            onError={() => {
+              setFailedStreamUrl(streamUrl);
+              const reason = engineRef.current?.error?.message;
+              setPlaybackError(reason ? `客户端播放失败：${reason} 请尝试其他版本或使用支持该格式的客户端。` : null);
+            }}
             onLoadedMetadata={handleLoadedMetadata}
             onPlay={() => { hasStartedRef.current = true; setPlaying(true); reportPlayback("PLAYING", true); }}
             onPause={handlePause}

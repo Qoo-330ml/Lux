@@ -28,6 +28,7 @@ export interface PlaybackEngine {
   readonly kind: PlaybackEngineKind;
   readonly element: HTMLVideoElement;
   readonly performance: PlaybackPerformance | null;
+  readonly error: Error | null;
   setSource(source: string, poster?: string | null): Promise<void>;
   play(): Promise<void>;
   pause(): void;
@@ -39,6 +40,7 @@ export interface PlaybackEngine {
 export class NativeVideoEngine implements PlaybackEngine {
   readonly kind = "native" as const;
   readonly performance = null;
+  readonly error = null;
 
   constructor(readonly element: HTMLVideoElement) {}
 
