@@ -12,6 +12,15 @@
 | Harbor | 1.4.6 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目列表通过 | 未测试 | 未测试 | 未测试 | 2026-08-09 本机 Harbor 连接本机 Lux 后，媒体库详情请求 `/Users/:userId/Items/:libraryId` 从 404 修复为 200，并进入电影库显示条目 |
 | Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
 
+## Lux Web 4K 媒体能力探针
+
+LUX-184 已加入独立探针页面 `/media-capability-probe.html`，用于记录真实媒体样本在原生 `video`、
+MediaCapabilities 和 WebCodecs 下的能力。当前尚未运行带 4K HEVC Main、HEVC Main10/HDR10 和 MKV 样本的
+真实矩阵，因此 Lux Web 暂不宣称 4K HEVC 兼容。
+
+记录探针结果时必须包含浏览器版本、平台/设备、Lux 提交、`uname -m`、样本校验值、metadata 结果、实际
+播放时长、VideoFrame 数量、丢帧和音画同步观察。不得写入完整媒体 URL、令牌、Cookie 或用户数据。
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。

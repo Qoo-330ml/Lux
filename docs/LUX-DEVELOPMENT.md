@@ -1285,7 +1285,12 @@ locked local value
 - 不支持时展示清晰错误和推荐使用第三方客户端。
 - 记录开始、定时进度、暂停和停止。
 - 页面关闭使用可靠的轻量上报机制。
-- 不实现 DRM、转码和自定义解码器。
+- 当前正式播放器仍不实现 DRM、服务端转码、Remux 或自定义解码器。
+- LUX-184 允许提供独立的浏览器媒体能力探针，用于实测原生 video、MediaCapabilities 和 WebCodecs；探针不接入
+  正式播放路径，不读取或保存用户媒体数据。
+- 客户端解码增强的目标包括具备相应硬件能力的 4K HEVC 8-bit、10-bit 和 HDR10；Dolby Vision 不属于当前承诺。
+- 若后续新增 WebCodecs 或 WASM 播放引擎，必须单独修改本节、补充 ADR，并通过实际浏览器性能阶段门；不得把
+  “浏览器报告支持”直接等同于 4K 实时播放能力。
 
 ### 14.7 下载权限的限制
 
@@ -1854,6 +1859,7 @@ services:
 | LUX-177 至 181 | migrations/、migrations-postgres/、src/library.rs、src/storage/、src/application/libraries.rs、src/application/plugins.rs、src/application/chapter_detector.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-182 | src/auth/、src/api/mod.rs、web/src/features/account/、web/src/lib/api/、tests/、docs/ |
 | LUX-183 至 186 | src/application/webhooks.rs、src/storage/、src/api/mod.rs、migrations/、migrations-postgres/、tests/、docs/ |
+| LUX-184 | web/public/media-capability-probe.html、web/public/media-capability-probe.js、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2974,6 +2980,7 @@ services:
 - 内容分级和标签 ACL。
 - 局域网自动发现。
 - 内嵌字幕按需无转换抽取。
+- Web 客户端媒体能力探针和客户端解码兼容性验证；首阶段只验证，不改变正式播放器。
 - Web 浏览器兼容转码，需要全新规格和 ADR。
 
 #### LUX-140：内置元数据插件与媒体库刮削器选择
@@ -3948,6 +3955,31 @@ payload 的实际支持范围，以及未实现的 Emby 插件行为。
 
 依赖：LUX-020、LUX-022、LUX-041、LUX-073、LUX-093。
 
+#### LUX-184：Web 4K 媒体能力探针
+
+范围：为 Lux Web 提供独立的浏览器媒体能力探针，验证实际本地测试文件在原生 `video`、MediaCapabilities
+和 WebCodecs 下的表现。探针只读取用户在页面中指定的媒体 URL，不上传、不持久化媒体内容，不接入正式播放器，
+不改变服务端 DirectPlay、Range 或 `.strm` 行为。
+
+目标测试范围包括 4K HEVC 8-bit、4K HEVC 10-bit HDR10、4K H.264 基准、MP4、MKV、24/30/60fps 和常见音频轨。
+Dolby Vision、DRM 和服务端转码不属于本任务。
+
+验收：
+
+- [ ] `/media-capability-probe.html` 能输入本地媒体 URL、MIME 类型、codec、分辨率、码率和帧率。
+- [ ] 页面分别报告 `HTMLVideoElement.canPlayType`、MediaCapabilities 和 WebCodecs 能力；结果不包含完整媒体
+      URL，避免把令牌写入结果或日志。
+- [ ] 页面可对实际媒体执行 metadata、短时播放、VideoFrame 计数、丢帧和当前播放位置测量。
+- [ ] 预设包含 4K HEVC Main、4K HEVC Main10 HDR10 和 4K H.264 基准；不伪造 Dolby Vision 支持。
+- [ ] 测试说明要求使用不含个人数据的本地样本，并记录浏览器版本、平台、Lux 提交、样本校验值和结果。
+- [ ] 本任务不修改正式 `PlayerPage`、服务端播放接口、数据库、Emby DTO 或 WASM/FFmpeg 依赖。
+
+验证：`node --test web/tests/media-capability-probe.test.mjs`、`pnpm --dir web test`、`pnpm --dir web build`，
+以及在实际浏览器中打开 `/media-capability-probe.html` 完成媒体矩阵测试。记录 `uname -m`；未提供真实 4K
+样本或未运行真实浏览器时，不得宣称 4K 播放兼容。
+
+依赖：LUX-113、LUX-114。
+
 ## 26. 风险与缓解
 
 | 风险 | 影响 | 缓解 |
@@ -3961,7 +3993,7 @@ payload 的实际支持范围，以及未实现的 Emby 插件行为。
 | TMDb 限流/不可用 | 中 | 本地优先、缓存、限流、退避、任务可重试 |
 | 错误自动匹配污染大库 | 高 | 高置信门、候选差距、待处理、重新匹配、字段来源与锁定 |
 | .strm URL 泄露令牌 | 中 | 明确产品行为、日志脱敏、只向有权限客户端返回 |
-| 浏览器编码支持不足 | 已接受 | 明确不支持提示，推荐第三方客户端，不在首版转码 |
+| 浏览器编码支持不足 | 高 | 先用 LUX-184 记录真实能力；4K 目标优先依赖原生/硬件 WebCodecs，不把 WASM 探测结果当作实时保证 |
 | 下载权限无法形成 DRM | 已接受 | 文档说明权限边界，不做虚假安全承诺 |
 | 临时 NAS 卸载导致条目删除 | 高 | 根路径 availability、完整 generation、删除宽限期 |
 | Web 与 Emby API 互相绑死 | 中 | Web 使用 Lux API，二者共享 application service |
