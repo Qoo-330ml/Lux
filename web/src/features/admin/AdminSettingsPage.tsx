@@ -39,7 +39,7 @@ export function AdminSettingsPage() {
     mutationFn: () => api.updateAdminSettings({
       resumeMinTicks: Number(minimumMinutes) * 600000000,
       mediaStrategy: {
-        ...settings.data.mediaStrategy,
+        ...settings.data!.mediaStrategy,
         showMetadataPending,
       },
     }),
