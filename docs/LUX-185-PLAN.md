@@ -34,3 +34,16 @@
 - 真实浏览器可证明至少一个 H.265 fallback 文件完成 metadata、播放、seek 和进度上报。
 - 原生播放路径无回归，第三方客户端无行为变化。
 - 兼容性文档记录浏览器、平台、媒体参数和客户端处理结果。
+
+## 当前实现记录
+
+本增量已完成播放引擎边界、客户端 HEVC fallback、Worker/WASM 资产发布和 PlayerPage 选择接入。
+fallback 的视频输出使用 H.264 MSE；AAC 音频使用独立的隐藏 audio 元素和独立 MediaSource，避免部分浏览器
+限制同一个 MediaSource 的 SourceBuffer 数量，同时保持服务端不转码、不 Remux、不代理媒体内容。播放、暂停、
+seek 和资源销毁通过客户端事件同步。
+
+MP4Box 生成的分段可能把负 composition offset 写成无符号 32 位值。客户端只在内存副本上把包含高位符号的
+`trun` 标记为 signed，避免 B 帧时间戳溢出污染 MSE duration。
+
+当前真实浏览器烟测使用 854×480、12 秒 HEVC Main + AAC 样本；已证明 Worker/WASM 解码、H.264 编码、视频和音频
+缓冲、播放、暂停、seek 和 destroy，但这不是 4K 性能验收。4K、Main10/HDR10 和更多浏览器矩阵仍需单独记录。

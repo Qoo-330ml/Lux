@@ -26,6 +26,9 @@ importers:
       lucide-react:
         specifier: ^0.468.0
         version: 0.468.0(react@19.2.8)
+      mp4box:
+        specifier: 2.4.1
+        version: 2.4.1
       react:
         specifier: ^19.0.0
         version: 19.2.8

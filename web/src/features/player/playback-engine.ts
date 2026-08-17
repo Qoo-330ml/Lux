@@ -1,4 +1,4 @@
-export type PlaybackEngineKind = "native";
+export type PlaybackEngineKind = "native" | "client-hevc";
 
 export type PlaybackSnapshot = {
   currentTime: number;
@@ -9,7 +9,7 @@ export type PlaybackSnapshot = {
 export interface PlaybackEngine {
   readonly kind: PlaybackEngineKind;
   readonly element: HTMLVideoElement;
-  setSource(source: string, poster?: string | null): void;
+  setSource(source: string, poster?: string | null): Promise<void>;
   play(): Promise<void>;
   pause(): void;
   seek(seconds: number): void;
@@ -22,7 +22,7 @@ export class NativeVideoEngine implements PlaybackEngine {
 
   constructor(readonly element: HTMLVideoElement) {}
 
-  setSource(source: string, poster?: string | null) {
+  async setSource(source: string, poster?: string | null) {
     this.element.poster = poster ?? "";
     this.element.src = source;
     this.element.load();

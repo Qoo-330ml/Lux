@@ -6,16 +6,24 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { PlaybackEventState } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
-import { NativeVideoEngine } from "./playback-engine";
+import { NativeVideoEngine, type PlaybackEngine } from "./playback-engine";
+import { shouldUseClientHevc } from "./playback-selection";
 
 const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
+const HEVC_RUNTIME_ASSETS = {
+  workerUrl: "/hevc/transcode-worker.js",
+  wasmUrl: "/hevc/hevc-decode.js",
+  wasmBinaryUrl: "/hevc/hevc-decode.wasm",
+};
 
 export function PlayerPage() {
   const { itemId = "" } = useParams();
   const [searchParams] = useSearchParams();
   const [playing, setPlaying] = useState(false);
   const [failedStreamUrl, setFailedStreamUrl] = useState<string | null>(null);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [fallbackLoading, setFallbackLoading] = useState(false);
   const requestedSourceId = searchParams.get("sourceId");
   const queryClient = useQueryClient();
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
@@ -32,7 +40,7 @@ export function PlayerPage() {
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const videoRef = useRef<HTMLVideoElement>(null);
   const lastVideoRef = useRef<HTMLVideoElement | null>(null);
-  const engineRef = useRef<NativeVideoEngine | null>(null);
+  const engineRef = useRef<PlaybackEngine | null>(null);
   const lastProgressReportRef = useRef(0);
   const hasStartedRef = useRef(false);
   const hasRestoredPositionRef = useRef(false);
@@ -72,6 +80,9 @@ export function PlayerPage() {
     lastProgressReportRef.current = 0;
     hasStartedRef.current = false;
     hasRestoredPositionRef.current = false;
+    setFailedStreamUrl(null);
+    setPlaybackError(null);
+    setFallbackLoading(false);
   }, [itemId, requestedSourceId]);
 
   useEffect(() => {
@@ -102,13 +113,38 @@ export function PlayerPage() {
   }, [restorePlaybackPosition]);
 
   useEffect(() => {
-    const engine = engineRef.current;
-    if (!engine || !streamUrl) return;
-    engine.setSource(streamUrl, poster);
-    return () => {
-      if (engineRef.current === engine) engine.destroy();
+    const initialEngine = engineRef.current;
+    if (!initialEngine || !streamUrl) return;
+    let activeEngine: PlaybackEngine = initialEngine;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        if (shouldUseClientHevc(source, initialEngine.element)) {
+          setFallbackLoading(true);
+          const { ClientHevcEngine } = await import("./hevc-playback-engine");
+          if (cancelled) return;
+          initialEngine.destroy();
+          activeEngine = new ClientHevcEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
+          engineRef.current = activeEngine;
+        }
+        await activeEngine.setSource(streamUrl, poster);
+      } catch (cause) {
+        if (!cancelled) {
+          setFailedStreamUrl(streamUrl);
+          const reason = cause instanceof Error ? cause.message : "未知错误";
+          setPlaybackError(`客户端解码失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`);
+        }
+      } finally {
+        if (!cancelled) setFallbackLoading(false);
+      }
     };
-  }, [poster, streamUrl]);
+    void load();
+    return () => {
+      cancelled = true;
+      activeEngine.destroy();
+      if (engineRef.current === activeEngine) engineRef.current = null;
+    };
+  }, [poster, source, streamUrl]);
 
   if (item.isPending) return <section className="lux-page-state"><p>正在准备播放器…</p></section>;
   if (item.error) return <section className="lux-page-state"><h1>播放器加载失败</h1><p>{item.error.message}</p></section>;
@@ -133,7 +169,7 @@ export function PlayerPage() {
             poster={poster ?? undefined}
             controls
             preload="metadata"
-            onError={() => setFailedStreamUrl(streamUrl)}
+            onError={() => { setFailedStreamUrl(streamUrl); setPlaybackError(null); }}
             onLoadedMetadata={handleLoadedMetadata}
             onPlay={() => { hasStartedRef.current = true; setPlaying(true); reportPlayback("PLAYING", true); }}
             onPause={handlePause}
@@ -142,7 +178,8 @@ export function PlayerPage() {
             aria-label={`播放 ${mediaTitle(media)}`}
           />
         ) : null}
-        {failedStreamUrl === streamUrl || !streamUrl ? <p className="lux-player-error" role="alert">浏览器无法播放这个媒体源。请尝试其他版本或使用支持该格式的客户端。</p> : null}
+        {fallbackLoading ? <p className="lux-player-status" role="status">正在准备客户端解码…</p> : null}
+        {failedStreamUrl === streamUrl || !streamUrl ? <p className="lux-player-error" role="alert">{playbackError ?? "浏览器无法播放这个媒体源。请尝试其他版本或使用支持该格式的客户端。"}</p> : null}
         <div className="lux-player-controls" aria-hidden="true"><button type="button"><Play size={17} fill="currentColor" /></button><div className="lux-player-progress"><span /></div><span>00:00</span><Volume2 size={17} /><button type="button"><Pause size={17} /></button></div>
         <span className="lux-player-status">{playing ? "正在播放" : "已暂停"}</span>
       </div>
