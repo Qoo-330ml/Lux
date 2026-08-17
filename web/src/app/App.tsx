@@ -67,13 +67,13 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
   return (
     <Suspense fallback={<LoadingScreen label="正在打开页面" />}>
       <Routes>
+        <Route path="watch/:itemId" element={<PlayerPage />} />
         <Route element={<LuxShell user={user} serverName={serverName} />}>
           <Route index element={<HomePage user={user} />} />
           <Route path="libraries" element={<LibrariesPage />} />
           <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
           <Route path="favorites" element={<FavoritesPage />} />
           <Route path="items/:itemId" element={<MediaDetailPage />} />
-          <Route path="watch/:itemId" element={<PlayerPage />} />
           <Route path="search" element={<SearchPage />} />
           <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />
           <Route path="account/:userId" element={<AccountRoute user={user} />} />
