@@ -3972,13 +3972,13 @@ Dolby Vision、DRM 和服务端转码不属于本任务。
 
 验收：
 
-- [ ] `/media-capability-probe.html` 能输入本地媒体 URL、MIME 类型、codec、分辨率、码率和帧率。
-- [ ] 页面分别报告 `HTMLVideoElement.canPlayType`、MediaCapabilities 和 WebCodecs 能力；结果不包含完整媒体
+- [x] `/media-capability-probe.html` 能输入本地媒体 URL、MIME 类型、codec、分辨率、码率和帧率。
+- [x] 页面分别报告 `HTMLVideoElement.canPlayType`、MediaCapabilities 和 WebCodecs 能力；结果不包含完整媒体
       URL，避免把令牌写入结果或日志。
-- [ ] 页面可对实际媒体执行 metadata、短时播放、VideoFrame 计数、丢帧和当前播放位置测量。
-- [ ] 预设包含 4K HEVC Main、4K HEVC Main10 HDR10 和 4K H.264 基准；不伪造 Dolby Vision 支持。
-- [ ] 测试说明要求使用不含个人数据的本地样本，并记录浏览器版本、平台、Lux 提交、样本校验值和结果。
-- [ ] 本任务不修改正式 `PlayerPage`、服务端播放接口、数据库、Emby DTO 或 WASM/FFmpeg 依赖。
+- [x] 页面可对实际媒体执行 metadata、短时播放、VideoFrame 计数、丢帧和当前播放位置测量。
+- [x] 预设包含 4K HEVC Main、HEVC Main10 HDR10 和 4K H.264 基准；不伪造 Dolby Vision 支持。
+- [x] 测试说明要求使用不含个人数据的本地样本，并记录浏览器版本、平台、Lux 提交、样本校验值和结果。
+- [x] 本任务不修改正式 `PlayerPage`、服务端播放接口、数据库、Emby DTO 或 WASM/FFmpeg 依赖。
 
 验证：`node --test web/tests/media-capability-probe.test.mjs`、`pnpm --dir web test`、`pnpm --dir web build`，
 以及在实际浏览器中打开 `/media-capability-probe.html` 完成媒体矩阵测试。记录 `uname -m`；未提供真实 4K
