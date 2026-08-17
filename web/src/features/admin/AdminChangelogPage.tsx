@@ -16,7 +16,7 @@ type ChangelogRelease = {
 export const changelogReleases: ChangelogRelease[] = [
   {
     version: "0.2.7",
-    date: "2026-08-17",
+    date: "2026-08-18",
     sections: [
       { kind: "added", items: [
         "增加 Web 端 Matroska/HEVC+AAC 客户端播放回退，支持浏览器端解复用、Worker/WASM 处理和 MSE 播放。",
@@ -29,11 +29,14 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 Matroska 流式处理和 HEVC+AAC 播放链路的兼容问题，提升非原生浏览器播放稳定性。",
         "修复浏览器 MKV remux 中 HEVC 配置保留和播放引擎选择问题。",
         "修复低置信度元数据应用后被错误标记为已确认的问题，并修复剧集播放未跳转到下一集的问题。",
+        "修复 Emby GET /Persons 顶层响应额外返回 StartIndex 导致的响应结构兼容问题。",
       ] },
       { kind: "changed", items: [
         "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
         "完善人物列表分页和字段投影行为，保持 Emby 客户端兼容请求的响应结构。",
         "完善播放器对音频编码选择、播放状态上报和下一集导航的处理。",
+        "首页媒体库入口和每个媒体库的最新资源改用进程内共享快照，扫描更新后自动失效并由后台刷新；用户权限、播放状态和推荐结果仍按请求实时查询。",
+        "增加 SQLite/PostgreSQL 首页目录查询索引，数据库 schema version 更新至 67。",
       ] },
     ],
   },
