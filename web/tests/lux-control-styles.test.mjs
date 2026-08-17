@@ -28,3 +28,7 @@ test("text field rules do not reshape checkbox controls", async () => {
   assert.match(css, /\.lux-admin-form input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\)/);
   assert.match(css, /\.lux-admin-library-page \.lux-library-dialog input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\)/);
 });
+
+test("checked checkbox keeps its rotated checkmark", () => {
+  assert.match(css, /:where\(input\[type="checkbox"\]\):checked::after\s*\{[^}]*transform:\s*translateY\(-1px\) rotate\(-45deg\) scale\(1\)/s);
+});

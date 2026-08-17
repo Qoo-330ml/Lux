@@ -100,7 +100,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   background: var(--lux-accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--lux-accent) 12%, transparent);
 }
-:where(input[type="checkbox"]):checked::after,
+:where(input[type="checkbox"]):checked::after {
+  opacity: 1;
+  transform: translateY(-1px) rotate(-45deg) scale(1);
+}
 :where(input[type="radio"]):checked::after {
   opacity: 1;
   transform: scale(1);
