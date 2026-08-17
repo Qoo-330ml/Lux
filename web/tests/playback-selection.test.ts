@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { hasClientHevcCandidate, hasClientMkvCandidate, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 
 describe("playback selection", () => {
   const source = {
@@ -53,6 +53,21 @@ describe("playback selection", () => {
     vi.spyOn(video, "canPlayType").mockReturnValue("");
 
     expect(await shouldUseClientHevc(source, video)).toBe(false);
+  });
+
+  it("selects the MKV path when Safari can MSE-play HEVC without VideoEncoder", async () => {
+    const mkv = { ...source, container: "mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC", details: { width: 3840, height: 1636, averageFrameRate: 60 } },
+      { index: 1, type: "AUDIO", codec: "AAC" },
+    ] };
+    vi.stubGlobal("MediaSource", { isTypeSupported: (mime: string) => mime.includes("hvc1") });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.stubGlobal("VideoEncoder", undefined);
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("");
+
+    expect(hasClientMkvHevcRuntime()).toBe(true);
+    expect(await shouldUseClientMkv(mkv, video)).toBe(true);
   });
 
   it("does not select fallback when H.264 VideoEncoder rejects the source configuration", async () => {

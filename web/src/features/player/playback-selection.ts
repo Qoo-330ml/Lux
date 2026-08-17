@@ -4,6 +4,7 @@ import { isHevcCodec } from "./media-codec";
 const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
 const CLIENT_MKV_CONTAINERS = new Set(["mkv"]);
 const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
+const HEVC_MSE_CODECS = ["hvc1.2.4.L153.B0", "hvc1.1.6.L120.B0"] as const;
 
 export function h264CodecForDimensions(width: number, height: number) {
   const pixels = Math.max(1, width) * Math.max(1, height);
@@ -32,8 +33,15 @@ export async function shouldUseClientHevc(source: MediaSource | undefined, video
 }
 
 export async function shouldUseClientMkv(source: MediaSource | undefined, video: HTMLVideoElement) {
-  if (!source || !hasClientMkvCandidate(source) || !hasClientHevcRuntime()) return false;
+  if (!source || !hasClientMkvCandidate(source)) return false;
+  if (hasClientMkvHevcRuntime()) return video.canPlayType('video/x-matroska; codecs="hvc1"') === "";
+  if (!hasClientHevcRuntime()) return false;
   return probeClientHevc(source, video, "video/x-matroska");
+}
+
+export function hasClientMkvHevcRuntime() {
+  if (typeof MediaSource === "undefined" || typeof MediaSource.isTypeSupported !== "function") return false;
+  return HEVC_MSE_CODECS.some((codec) => MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`));
 }
 
 async function probeClientHevc(source: MediaSource, video: HTMLVideoElement, mime: string) {
