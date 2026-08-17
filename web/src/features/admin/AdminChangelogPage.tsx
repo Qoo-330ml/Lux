@@ -15,6 +15,23 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.7",
+    date: "2026-08-17",
+    sections: [
+      { kind: "added", items: [
+        "增加 Web 端 Matroska/HEVC+AAC 客户端播放回退，支持浏览器端解复用、Worker/WASM 处理和 MSE 播放。",
+        "Emby GET /Persons 增强 Recursive、Fields、排序和 DateCreated 兼容字段，支持跨条目人物聚合。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 Matroska 流式处理和 HEVC+AAC 播放链路的兼容问题，提升非原生浏览器播放稳定性。",
+      ] },
+      { kind: "changed", items: [
+        "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
+        "完善人物列表分页和字段投影行为，保持 Emby 客户端兼容请求的响应结构。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.6",
     date: "2026-08-17",
     sections: [
