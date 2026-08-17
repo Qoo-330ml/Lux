@@ -2306,7 +2306,6 @@ async fn emby_persons(
             return Json(json!({
                 "Items": [],
                 "TotalRecordCount": 0,
-                "StartIndex": offset,
             }))
             .into_response();
         }
@@ -2339,7 +2338,6 @@ async fn emby_persons(
             })
             .collect::<Vec<_>>(),
         "TotalRecordCount": total,
-        "StartIndex": offset,
     }))
     .into_response()
 }

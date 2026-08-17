@@ -209,7 +209,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = response.json().await?;
     assert_eq!(body["TotalRecordCount"], 4);
-    assert_eq!(body["StartIndex"], 0);
+    assert!(body.get("StartIndex").is_none());
     let actors = body["Items"].as_array().ok_or("missing actor items")?;
     let actor_a = actors
         .iter()
@@ -256,6 +256,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(full_response.status(), reqwest::StatusCode::OK);
     let full_body: serde_json::Value = full_response.json().await?;
     assert_eq!(full_body["TotalRecordCount"], 4);
+    assert!(full_body.get("StartIndex").is_none());
     assert_eq!(full_body["Items"].as_array().map(Vec::len), Some(4));
     assert_eq!(full_body["Items"][0]["Id"], "104");
     assert!(full_body["Items"][0]["DateCreated"].is_string());
