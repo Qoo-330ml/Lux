@@ -6,9 +6,28 @@ export type PlaybackSnapshot = {
   ended: boolean;
 };
 
+export type PlaybackPerformance = {
+  mediaDurationMs: number;
+  processingDurationMs: number;
+  speedX: number;
+  realtime: boolean;
+};
+
+export function summarizePlaybackPerformance(mediaDurationMs: number, processingDurationMs: number): PlaybackPerformance | null {
+  if (!Number.isFinite(mediaDurationMs) || mediaDurationMs <= 0 || !Number.isFinite(processingDurationMs) || processingDurationMs <= 0) return null;
+  const speedX = mediaDurationMs / processingDurationMs;
+  return {
+    mediaDurationMs,
+    processingDurationMs,
+    speedX,
+    realtime: speedX >= 1,
+  };
+}
+
 export interface PlaybackEngine {
   readonly kind: PlaybackEngineKind;
   readonly element: HTMLVideoElement;
+  readonly performance: PlaybackPerformance | null;
   setSource(source: string, poster?: string | null): Promise<void>;
   play(): Promise<void>;
   pause(): void;
@@ -19,6 +38,7 @@ export interface PlaybackEngine {
 
 export class NativeVideoEngine implements PlaybackEngine {
   readonly kind = "native" as const;
+  readonly performance = null;
 
   constructor(readonly element: HTMLVideoElement) {}
 

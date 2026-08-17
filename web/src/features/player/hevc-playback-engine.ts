@@ -1,6 +1,6 @@
 import { TranscodeWorkerClient } from "@hevcjs/core";
 import { createFile } from "mp4box";
-import type { PlaybackEngine, PlaybackSnapshot } from "./playback-engine";
+import { summarizePlaybackPerformance, type PlaybackEngine, type PlaybackPerformance, type PlaybackSnapshot } from "./playback-engine";
 import { isHevcCodec } from "./media-codec";
 
 export type HevcRuntimeAssets = {
@@ -115,6 +115,7 @@ class SourceBufferQueue {
 
 export class ClientHevcEngine implements PlaybackEngine {
   readonly kind = "client-hevc" as const;
+  performance: PlaybackPerformance | null = null;
   private worker: TranscodeWorkerClient | null = null;
   private mediaSource: MediaSource | null = null;
   private objectUrl: string | null = null;
@@ -128,6 +129,8 @@ export class ClientHevcEngine implements PlaybackEngine {
   private audioPauseHandler: (() => void) | null = null;
   private audioSeekHandler: (() => void) | null = null;
   private durationSeconds: number | null = null;
+  private transcodedMediaDurationMs = 0;
+  private transcodedProcessingDurationMs = 0;
   private generation = 0;
 
   constructor(
@@ -296,6 +299,12 @@ export class ClientHevcEngine implements PlaybackEngine {
     }
     if (!this.worker || !this.videoQueue) throw new Error("客户端 fallback 尚未初始化");
     const transcoded = await this.worker.processMediaSegment(normalizeFragmentCompositionOffsets(buffer));
+    const stats = this.worker.lastPerfStats;
+    if (stats) {
+      this.transcodedMediaDurationMs += stats.segDurMs;
+      this.transcodedProcessingDurationMs += stats.demuxMs + stats.decodeMs + stats.encodeMs;
+      this.performance = summarizePlaybackPerformance(this.transcodedMediaDurationMs, this.transcodedProcessingDurationMs);
+    }
     if (transcoded) await this.videoQueue.append(transcoded);
   }
 
@@ -350,6 +359,9 @@ export class ClientHevcEngine implements PlaybackEngine {
     this.audioMediaSource = null;
     this.audioObjectUrl = null;
     this.durationSeconds = null;
+    this.transcodedMediaDurationMs = 0;
+    this.transcodedProcessingDurationMs = 0;
+    this.performance = null;
     this.element.pause();
     this.element.removeAttribute("src");
     this.element.load();

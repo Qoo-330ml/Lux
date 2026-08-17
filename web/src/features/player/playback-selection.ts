@@ -9,19 +9,41 @@ export function hasClientHevcCandidate(source: MediaSource | undefined) {
   return isHevcCodec(video?.codec);
 }
 
-export function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {
+export async function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {
   if (!hasClientHevcCandidate(source) || !hasClientHevcRuntime()) return false;
-  const codec = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec;
+  const videoStream = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
+  const codec = videoStream?.codec;
   const codecHint = codec && /^(hvc1|hev1)\./i.test(codec) ? codec : "hvc1.1.6.L120.B0";
-  return video.canPlayType(`video/mp4; codecs="${codecHint}"`) === "";
+  if (video.canPlayType(`video/mp4; codecs="${codecHint}"`) !== "") return false;
+  const browserGlobals = globalThis as typeof globalThis & {
+    VideoEncoder?: {
+      isConfigSupported: (config: Record<string, unknown>) => Promise<{ supported?: boolean }>;
+    };
+  };
+  const details = videoStream?.details ?? {};
+  const width = typeof details.width === "number" && Number.isFinite(details.width) && details.width > 0 ? Math.round(details.width) : 1920;
+  const height = typeof details.height === "number" && Number.isFinite(details.height) && details.height > 0 ? Math.round(details.height) : 1080;
+  const framerate = typeof details.averageFrameRate === "number" && Number.isFinite(details.averageFrameRate) && details.averageFrameRate > 0 ? details.averageFrameRate : 30;
+  try {
+    const support = await browserGlobals.VideoEncoder?.isConfigSupported({
+      codec: "avc1.640028",
+      width,
+      height,
+      bitrate: Math.max(1_000_000, source?.bitrate ?? 8_000_000),
+      framerate,
+    });
+    return support?.supported === true;
+  } catch {
+    return false;
+  }
 }
 
 export function hasClientHevcRuntime() {
-  const browserGlobals = globalThis as typeof globalThis & { VideoEncoder?: unknown };
+  const browserGlobals = globalThis as typeof globalThis & { VideoEncoder?: { isConfigSupported?: unknown } };
   return typeof WebAssembly !== "undefined"
     && typeof Worker !== "undefined"
     && typeof MediaSource !== "undefined"
-    && typeof browserGlobals.VideoEncoder === "function"
+    && typeof browserGlobals.VideoEncoder?.isConfigSupported === "function"
     && typeof MediaSource.isTypeSupported === "function"
     && MediaSource.isTypeSupported('video/mp4; codecs="avc1.640028"');
 }

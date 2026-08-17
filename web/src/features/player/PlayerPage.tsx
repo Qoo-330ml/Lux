@@ -24,6 +24,7 @@ export function PlayerPage() {
   const [failedStreamUrl, setFailedStreamUrl] = useState<string | null>(null);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [fallbackLoading, setFallbackLoading] = useState(false);
+  const [fallbackSpeedX, setFallbackSpeedX] = useState<number | null>(null);
   const requestedSourceId = searchParams.get("sourceId");
   const queryClient = useQueryClient();
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
@@ -83,6 +84,7 @@ export function PlayerPage() {
     setFailedStreamUrl(null);
     setPlaybackError(null);
     setFallbackLoading(false);
+    setFallbackSpeedX(null);
   }, [itemId, requestedSourceId]);
 
   useEffect(() => {
@@ -119,7 +121,7 @@ export function PlayerPage() {
     let cancelled = false;
     const load = async () => {
       try {
-        if (shouldUseClientHevc(source, initialEngine.element)) {
+        if (await shouldUseClientHevc(source, initialEngine.element)) {
           setFallbackLoading(true);
           const { ClientHevcEngine } = await import("./hevc-playback-engine");
           if (cancelled) return;
@@ -128,6 +130,9 @@ export function PlayerPage() {
           engineRef.current = activeEngine;
         }
         await activeEngine.setSource(streamUrl, poster);
+        if (!cancelled && activeEngine.performance && !activeEngine.performance.realtime) {
+          setFallbackSpeedX(activeEngine.performance.speedX);
+        }
       } catch (cause) {
         if (!cancelled) {
           setFailedStreamUrl(streamUrl);
@@ -179,6 +184,7 @@ export function PlayerPage() {
           />
         ) : null}
         {fallbackLoading ? <p className="lux-player-status" role="status">正在准备客户端解码…</p> : null}
+        {fallbackSpeedX !== null ? <p className="lux-player-status" role="status">客户端解码速度低于实时（约 {fallbackSpeedX.toFixed(2)}×），当前已缓存后播放；建议使用原生客户端或降低清晰度。</p> : null}
         {failedStreamUrl === streamUrl || !streamUrl ? <p className="lux-player-error" role="alert">{playbackError ?? "浏览器无法播放这个媒体源。请尝试其他版本或使用支持该格式的客户端。"}</p> : null}
         <div className="lux-player-controls" aria-hidden="true"><button type="button"><Play size={17} fill="currentColor" /></button><div className="lux-player-progress"><span /></div><span>00:00</span><Volume2 size={17} /><button type="button"><Pause size={17} /></button></div>
         <span className="lux-player-status">{playing ? "正在播放" : "已暂停"}</span>

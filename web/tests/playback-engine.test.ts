@@ -1,9 +1,20 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { NativeVideoEngine } from "../src/features/player/playback-engine";
+import { NativeVideoEngine, summarizePlaybackPerformance } from "../src/features/player/playback-engine";
 
 describe("NativeVideoEngine", () => {
+  it("summarizes client fallback throughput against media time", () => {
+    expect(summarizePlaybackPerformance(8_000, 16_000)).toEqual({
+      mediaDurationMs: 8_000,
+      processingDurationMs: 16_000,
+      speedX: 0.5,
+      realtime: false,
+    });
+    expect(summarizePlaybackPerformance(8_000, 4_000)?.realtime).toBe(true);
+    expect(summarizePlaybackPerformance(0, 4_000)).toBeNull();
+  });
+
   it("loads a source and exposes the native video snapshot", () => {
     const video = document.createElement("video");
     const load = vi.spyOn(video, "load").mockImplementation(() => undefined);

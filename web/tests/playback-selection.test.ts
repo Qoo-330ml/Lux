@@ -18,25 +18,35 @@ describe("playback selection", () => {
     expect(hasClientHevcCandidate({ ...source, streams: [{ index: 0, type: "VIDEO", codec: "dvh1.05.06" }] })).toBe(false);
   });
 
-  it("uses the fallback only when native HEVC is unavailable", () => {
+  it("uses the fallback only when native HEVC is unavailable", async () => {
     vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
     vi.stubGlobal("Worker", class Worker {});
-    vi.stubGlobal("VideoEncoder", class VideoEncoder {});
+    vi.stubGlobal("VideoEncoder", class VideoEncoder { static isConfigSupported() { return Promise.resolve({ supported: true }); } });
     const video = document.createElement("video");
     vi.spyOn(video, "canPlayType").mockReturnValue("");
-    expect(shouldUseClientHevc(source, video)).toBe(true);
+    expect(await shouldUseClientHevc(source, video)).toBe(true);
 
     vi.spyOn(video, "canPlayType").mockReturnValue("probably");
-    expect(shouldUseClientHevc(source, video)).toBe(false);
+    expect(await shouldUseClientHevc(source, video)).toBe(false);
   });
 
-  it("does not select fallback when the browser lacks a required runtime API", () => {
+  it("does not select fallback when the browser lacks a required runtime API", async () => {
     vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
     vi.stubGlobal("Worker", class Worker {});
     vi.stubGlobal("VideoEncoder", undefined);
     const video = document.createElement("video");
     vi.spyOn(video, "canPlayType").mockReturnValue("");
 
-    expect(shouldUseClientHevc(source, video)).toBe(false);
+    expect(await shouldUseClientHevc(source, video)).toBe(false);
+  });
+
+  it("does not select fallback when H.264 VideoEncoder rejects the source configuration", async () => {
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.stubGlobal("VideoEncoder", class VideoEncoder { static isConfigSupported() { return Promise.resolve({ supported: false }); } });
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("");
+
+    expect(await shouldUseClientHevc(source, video)).toBe(false);
   });
 });
