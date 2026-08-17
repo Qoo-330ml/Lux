@@ -46,6 +46,8 @@ MP4Box 生成的分段可能把负 composition offset 写成无符号 32 位值�
 `trun` 标记为 signed，避免 B 帧时间戳溢出污染 MSE duration。
 
 已完成真实 4K 样本测试：Chrome 151/macOS arm64 对 3840×2160 HEVC Main + AAC 和 3840×2160 HEVC Main10
-样本均完成 Worker/WASM 解码、H.264 编码、播放、seek 和 destroy；两者均记录为低于实时，`PlayerPage` 会显示
-明确的降级提示，不虚报 4K 实时能力。具体样本校验值、帧数、丢帧、漂移和 speedX 见 `docs/COMPATIBILITY.md`。
+样本均完成 Worker/WASM 解码、H.264 编码、播放、seek 和 destroy；`43a7b8e6` 起 `setSource()` 在首个视频片段
+可播后即返回，后续转码在后台完成。两者仍记录为低于实时，`PlayerPage` 会显示明确的降级提示，不虚报 4K
+实时能力。具体样本校验值、首段/完整耗时、帧回调、丢帧判断、漂移和 speedX 见 `docs/COMPATIBILITY.md` 与
+`docs/PERFORMANCE.md`。
 854×480 HEVC Main + AAC 烟测仍作为快速回归样本保留。

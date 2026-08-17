@@ -36,6 +36,12 @@ WebCodecs `supported`。这只是浏览器能力声明，不是实际 4K 文件�
 | 3840×2160 HEVC Main 8-bit + AAC、MP4、8 秒、9.4 MiB | `cbfad82624c6578ea9ce5f2a0f5e229d0230745d7cfa84eb9b5d457b57920ce1` | Worker/WASM 解码、H.264 编码、视频/音频缓冲、播放、暂停、seek、destroy 通过 | Worker 累计处理 21,558.7 ms，媒体时长 8,000 ms，`speedX=0.371`，低于实时；播放 2 秒窗口 50 帧/0 丢帧，漂移约 30 ms；seek 到 4 秒后漂移约 36 ms |
 | 3840×2160 HEVC Main10 10-bit HDR10、MP4、约 4.13 秒、21 MiB，无音频 | `88b238b05eca4de87548f5d2b022ddf1daa2e60d4f0218e65ae04db770d1d2da` | WASM 解码、H.264 编码、播放、seek、destroy 通过 | Worker 累计处理 18,929.3 ms，媒体时长 4,086 ms，`speedX=0.216`，低于实时；播放窗口 24 帧/0 丢帧；seek 通过。原始样本音轨为 DTS，测试文件主动去除音频，不代表 AAC 兼容 |
 
+`43a7b8e6` 的流式增量复测确认：`setSource()` 在完整转码完成前即可返回。HEVC Main 在 4,537 ms 返回首段并在
+17,665 ms 完成全片，HEVC Main10 在 9,606 ms 返回首段并在 18,577 ms 完成全片；两者首段均收到首帧，seek
+误差为 0 ms，`requestVideoFrameCallback` 的 `presentedFrames` 序列没有 gap，Main + AAC 的播放末段音画差约
+44 ms。HeadlessChrome 的 `getVideoPlaybackQuality().droppedVideoFrames` 在该测试中与 presented-frame 序列不一致，
+因此以 presented-frame gap 作为丢帧判断，并保留该 API 差异作为测试注意事项。
+
 因此当前这台 ARM64/HeadlessChrome 设备可以完成 4K HEVC 客户端 fallback，但 4K Main 和 Main10 均未通过实时
 转码性能门。播放器会显示“客户端解码速度低于实时”的降级提示，并建议使用原生客户端或降低清晰度；不能把
 本次结果外推到其他浏览器、硬件或目标 x86_64 NAS。
