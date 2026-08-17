@@ -229,6 +229,27 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         "https://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
     );
 
+    let duplicate_source_query_stream = no_redirect_client
+        .get(format!(
+            "http://{address}/emby/videos/{remote_item_id}/stream.mkv"
+        ))
+        .query(&[
+            ("MediaSourceId", remote_source_id.as_str()),
+            ("MediaSourceId", "00000000-0000-0000-0000-000000000000"),
+            ("api_key", token.as_str()),
+            ("api_key", "invalid-second-token"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(
+        duplicate_source_query_stream.status(),
+        reqwest::StatusCode::TEMPORARY_REDIRECT
+    );
+    assert_eq!(
+        duplicate_source_query_stream.headers()[reqwest::header::LOCATION],
+        "https://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
+    );
+
     let path_stream = no_redirect_client
         .get(format!(
             "http://{address}/Videos/{path_item_id}/original.strm"

@@ -10,7 +10,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, RawQuery, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
@@ -3761,9 +3761,10 @@ fn emby_person_image_tag(person_id: &str) -> String {
 async fn emby_playback_info(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -8989,20 +8990,38 @@ async fn emby_subtitle_without_source(
     .await
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Default)]
 struct EmbyStreamQuery {
-    #[serde(
-        rename = "api_key",
-        alias = "apiKey",
-        alias = "ApiKey",
-        alias = "X-Emby-Token",
-        alias = "x-emby-token",
-        alias = "X-MediaBrowser-Token",
-        alias = "x-media-browser-token"
-    )]
     api_key: Option<String>,
-    #[serde(alias = "mediaSourceId", alias = "MediaSourceId")]
     media_source_id: Option<String>,
+}
+
+fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery {
+    let mut query = EmbyStreamQuery::default();
+    let Some(raw_query) = raw_query.0 else {
+        return query;
+    };
+
+    for (name, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+        if query.api_key.is_none()
+            && (name.eq_ignore_ascii_case("api_key")
+                || name.eq_ignore_ascii_case("apiKey")
+                || name.eq_ignore_ascii_case("ApiKey")
+                || name.eq_ignore_ascii_case("X-Emby-Token")
+                || name.eq_ignore_ascii_case("X-MediaBrowser-Token")
+                || name.eq_ignore_ascii_case("x-media-browser-token"))
+        {
+            query.api_key = Some(value.into_owned());
+        } else if query.media_source_id.is_none()
+            && (name.eq_ignore_ascii_case("mediaSourceId")
+                || name.eq_ignore_ascii_case("MediaSourceId")
+                || name.eq_ignore_ascii_case("media_source_id"))
+        {
+            query.media_source_id = Some(value.into_owned());
+        }
+    }
+
+    query
 }
 
 fn emby_stream_query_from_path(
@@ -9012,21 +9031,12 @@ fn emby_stream_query_from_path(
     let Some((container, embedded_query)) = container.split_once('?') else {
         return (container.to_owned(), query);
     };
-    for pair in embedded_query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        if query.media_source_id.is_none() && key.eq_ignore_ascii_case("mediaSourceId") {
-            query.media_source_id = Some(value.to_owned());
-        }
-        if query.api_key.is_none()
-            && (key.eq_ignore_ascii_case("api_key")
-                || key.eq_ignore_ascii_case("apiKey")
-                || key.eq_ignore_ascii_case("X-Emby-Token")
-                || key.eq_ignore_ascii_case("X-MediaBrowser-Token"))
-        {
-            query.api_key = Some(value.to_owned());
-        }
+    let embedded = emby_stream_query_from_raw(RawQuery(Some(embedded_query.to_owned())));
+    if query.api_key.is_none() {
+        query.api_key = embedded.api_key;
+    }
+    if query.media_source_id.is_none() {
+        query.media_source_id = embedded.media_source_id;
     }
     (container.to_owned(), query)
 }
@@ -9035,9 +9045,10 @@ async fn emby_stream(
     headers: HeaderMap,
     method: Method,
     Path(item_id): Path<String>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -9058,9 +9069,10 @@ async fn emby_stream_with_container(
     headers: HeaderMap,
     method: Method,
     Path((item_id, container)): Path<(String, String)>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
@@ -9082,9 +9094,10 @@ async fn emby_stream_with_source(
     headers: HeaderMap,
     method: Method,
     Path((item_id, media_source_id)): Path<(String, String)>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -9105,9 +9118,10 @@ async fn emby_stream_with_source_and_container(
     headers: HeaderMap,
     method: Method,
     Path((item_id, media_source_id, container)): Path<(String, String, String)>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
@@ -9129,9 +9143,10 @@ async fn emby_download(
     headers: HeaderMap,
     method: Method,
     Path(item_id): Path<String>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
