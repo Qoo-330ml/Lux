@@ -17,7 +17,7 @@ use crate::application::metadata_paths::{
     people_directory, people_index_directory, people_index_path, people_index_path_for_provider,
     readable_component,
 };
-use crate::storage::{Database, NewPersonCredit, StoredPersonCredit};
+use crate::storage::{Database, NewPersonCredit, PersonListOptions, StoredPersonCredit};
 
 const LEGACY_PEOPLE_DIR: &str = "people";
 const LEGACY_ITEMS_DIR: &str = "items";
@@ -138,6 +138,7 @@ pub struct ActorView {
     pub provider: Option<String>,
     pub name: String,
     pub character: Option<String>,
+    pub date_created: Option<i64>,
     pub image_url: Option<String>,
     pub biography: Option<String>,
     pub birthday: Option<String>,
@@ -561,6 +562,7 @@ impl PeopleService {
                 provider,
                 name: actor.name,
                 character: actor.character,
+                date_created: None,
                 image_url,
                 biography: actor
                     .person
@@ -591,8 +593,7 @@ impl PeopleService {
         &self,
         library_id: &str,
         person_type: &str,
-        offset: i64,
-        limit: i64,
+        options: PersonListOptions,
     ) -> Result<(Vec<ActorView>, i64), PeopleError> {
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
@@ -600,7 +601,7 @@ impl PeopleService {
             ));
         };
         let (credits, total) = database
-            .list_person_credits_for_library(library_id, person_type, offset, limit)
+            .list_person_credits_for_library(library_id, person_type, options)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
         Ok((self.actor_views_from_credits(credits).await, total))
@@ -688,8 +689,7 @@ impl PeopleService {
         &self,
         library_ids: &[String],
         person_type: &str,
-        offset: i64,
-        limit: i64,
+        options: PersonListOptions,
     ) -> Result<(Vec<ActorView>, i64), PeopleError> {
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
@@ -697,7 +697,7 @@ impl PeopleService {
             ));
         };
         let (credits, total) = database
-            .list_person_credits_for_libraries(library_ids, person_type, offset, limit)
+            .list_person_credits_for_libraries(library_ids, person_type, options)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
         Ok((self.actor_views_from_credits(credits).await, total))
@@ -722,6 +722,7 @@ impl PeopleService {
                 provider,
                 name: credit.person_name,
                 character: (!credit.role.is_empty()).then_some(credit.role),
+                date_created: Some(credit.date_created),
                 image_url,
                 biography: credit.biography,
                 birthday: credit.birthday,

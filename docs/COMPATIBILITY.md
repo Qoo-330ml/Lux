@@ -12,6 +12,48 @@
 | Harbor | 1.4.6 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目列表通过 | 未测试 | 未测试 | 未测试 | 2026-08-09 本机 Harbor 连接本机 Lux 后，媒体库详情请求 `/Users/:userId/Items/:libraryId` 从 404 修复为 200，并进入电影库显示条目 |
 | Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
 
+## Lux Web 4K 媒体能力探针
+
+LUX-184 已加入独立探针页面 `/media-capability-probe.html`，用于记录真实媒体样本在原生 `video`、
+MediaCapabilities 和 WebCodecs 下的能力。探针能力声明和 LUX-185 客户端 fallback 性能记录分开维护；
+fallback 的 4K 实时能力不因探针返回 `supported` 而自动宣称。
+
+2026-08-17 的本机探针记录：Playwright HeadlessChrome 151、macOS `arm64` 对 4K HEVC Main、HEVC Main10/HDR10
+和 H.264 的 3840×2160 配置均报告原生 `probably`、MediaCapabilities `supported/smooth/powerEfficient` 和
+WebCodecs `supported`。这只是浏览器能力声明，不是实际 4K 文件播放证据。
+
+同次使用公开 Sintel 片段生成的临时 12 秒 HEVC MP4 做解码链路烟测，浏览器实际识别为 854×480，metadata、
+播放位置和 5 秒播放均正常；该文件不是 4K 样本，不能用于 4K 性能结论。
+
+## Lux Web LUX-185 客户端 fallback 实测
+
+2026-08-17，提交 `1233ec95`（包含性能状态提交 `fa39190a`），Playwright HeadlessChrome 151.0.0.0，macOS
+`arm64`（`uname -m=arm64`）。
+样本均为临时、本地、无个人数据文件，完整 URL 不写入记录：
+
+| 样本 | SHA-256 | 结果 | 性能与质量 |
+|---|---|---|---|
+| 3840×2160 HEVC Main 8-bit + AAC、MP4、8 秒、9.4 MiB | `cbfad82624c6578ea9ce5f2a0f5e229d0230745d7cfa84eb9b5d457b57920ce1` | Worker/WASM 解码、H.264 编码、视频/音频缓冲、播放、暂停、seek、destroy 通过 | Worker 累计处理 21,558.7 ms，媒体时长 8,000 ms，`speedX=0.371`，低于实时；播放 2 秒窗口 50 帧/0 丢帧，漂移约 30 ms；seek 到 4 秒后漂移约 36 ms |
+| 3840×2160 HEVC Main10 10-bit HDR10、MP4、约 4.13 秒、21 MiB，无音频 | `88b238b05eca4de87548f5d2b022ddf1daa2e60d4f0218e65ae04db770d1d2da` | WASM 解码、H.264 编码、播放、seek、destroy 通过 | Worker 累计处理 18,929.3 ms，媒体时长 4,086 ms，`speedX=0.216`，低于实时；播放窗口 24 帧/0 丢帧；seek 通过。原始样本音轨为 DTS，测试文件主动去除音频，不代表 AAC 兼容 |
+
+`43a7b8e6` 的流式增量复测确认：`setSource()` 在完整转码完成前即可返回。HEVC Main 在 4,537 ms 返回首段并在
+17,665 ms 完成全片，HEVC Main10 在 9,606 ms 返回首段并在 18,577 ms 完成全片；两者首段均收到首帧，seek
+误差为 0 ms，`requestVideoFrameCallback` 的 `presentedFrames` 序列没有 gap，Main + AAC 的播放末段音画差约
+44 ms。HeadlessChrome 的 `getVideoPlaybackQuality().droppedVideoFrames` 在该测试中与 presented-frame 序列不一致，
+因此以 presented-frame gap 作为丢帧判断，并保留该 API 差异作为测试注意事项。
+
+`79035ba7` 另以真实 `PlayerPage` 集成路径复测 4K Main：在新鲜 HeadlessChrome 151 中模拟原生 HEVC 不可用，
+浏览器实际选择客户端 fallback，首帧约 11,493 ms，页面显示 `speedX≈0.37` 的低于实时提示；播放和暂停分别
+上报 `PLAYING`/`PAUSED` 进度，浏览器控制台无播放相关错误。4K 选择器使用与 `@hevcjs/core` 一致的 H.264
+High@5.1 (`avc1.640033`) 探测，避免 4K 错误使用 High@4.0 (`avc1.640028`) 而被 WebCodecs 拒绝。
+
+因此当前这台 ARM64/HeadlessChrome 设备可以完成 4K HEVC 客户端 fallback，但 4K Main 和 Main10 均未通过实时
+转码性能门。播放器会显示“客户端解码速度低于实时”的降级提示，并建议使用原生客户端或降低清晰度；不能把
+本次结果外推到其他浏览器、硬件或目标 x86_64 NAS。
+
+记录探针结果时必须包含浏览器版本、平台/设备、Lux 提交、`uname -m`、样本校验值、metadata 结果、实际
+播放时长、VideoFrame 数量、丢帧和音画同步观察。不得写入完整媒体 URL、令牌、Cookie 或用户数据。
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。
@@ -42,7 +84,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - LUX-121 兼容补齐：Emby `Views` 返回媒体库类型、`ChildCount` 和标准 `ImageTags.Primary`；条目详情同时返回本地徽标的 `ImageTags.Logo`，并通过 `/Items/{itemId}/Images/Logo` 提供标准图片读取；媒体库封面支持 `/Items/{libraryId}/Images/Primary` 及带索引、HEAD、ETag 和 ACL。尚待 VidHub UI 重新实测确认。
 - 2026-08-17 混合媒体库兼容修复：普通 Emby 客户端继续在混合库 DTO 中收到 `CollectionType: "mixed"`；VidHub 的认证设备收到历史兼容的 `CollectionType: null`，同时保留电影/剧集条目列表和 `TypeOptions`。原因是 VidHub 可连接服务器但会丢弃带 `mixed` 集合类型的库；`tests/mixed_library_api.rs` 覆盖两种客户端的分流。
 - Emby `GET /Library/VirtualFolders` 现返回接近官方 `VirtualFolderInfo` 的完整结构：`Id`、`Guid`、`ItemId` 使用同一个稳定媒体库 ID，`LibraryOptions` 包含 `PathInfos`、按电影/剧集类型拆分的 `TypeOptions`、Lux 当前图片策略、NFO 本地元数据策略、字幕语言和播放恢复阈值。Lux 没有等价 Emby 刮削器时，metadata/image fetcher 数组保持为空；尚未以目标第三方客户端真实 UI 复测该管理端点。
-- Emby `GET /Persons?ParentId={libraryId}&Recursive=true&PersonTypes=Actor` 已补齐：返回去重后的演员 `Items`、`TotalRecordCount`、`StartIndex`，支持根路径和 `/emby` 前缀、Emby token/API Key、媒体库 ACL，并在服务启动后台回填已有 `people.json` 关系到人物索引。`tests/people_api.rs` 已覆盖共享 API Key、人物字段、分页结构、前缀和回填；尚未以目标第三方客户端真实 UI 复测。
+- Emby `GET /Persons` 已支持 `Recursive`、`Fields`、`SortBy=Name|DateCreated`、`SortOrder` 和任意正整数 `Limit`；返回去重后的演员 `Items`、`TotalRecordCount`、`StartIndex` 及 `DateCreated`，人物 DTO 使用 Emby 的 `Type: "Person"`，并补齐 `ServerId`、`ImageTags` 和 `BackdropImageTags`。支持根路径和 `/emby` 前缀、Emby token/API Key、媒体库 ACL，并在服务启动后台回填已有 `people.json` 关系到人物索引。`tests/people_api.rs` 已覆盖共享 API Key、跨条目聚合、字段投影、排序、超大 Limit、前缀和回填；尚未以目标第三方客户端真实 UI 复测。
 - Harbor 1.4.6 兼容修复：Emby 媒体库自身的 `/Users/{userId}/Items/{libraryId}` 详情现在返回 `CollectionFolder`，并复用媒体库启用状态和 ACL 校验；本机 Harbor 真实 UI 已验证可进入库并显示条目。
 - 2026-08-10 Emby 目录兼容修复：`Items/Latest` 默认按 `GroupItems=true` 返回电影/剧集根条目，剧集与季度 DTO 补充 `ChildCount`/`RecursiveItemCount`；`ParentId` 现在支持媒体库、剧集和季度，并覆盖剧集单集查询。`tests/series_api.rs` 已加入协议回归覆盖；网易爆米花真实设备复测仍待完成。
 - 2026-08-11 网易爆米花 2.15.3 DTO 兼容修复：已观察到客户端可登录并加载部分首页，但尚未进入播放会话。Emby 条目现补齐 `SortName`、`SeasonId`、`IndexNumber`、`PremiereDate` 和 `ProviderIds`，季/集层级的标准字段已有协议回归覆盖；完整首页、详情页和播放仍待重启服务后的真实设备复测，不据此宣称完全兼容。

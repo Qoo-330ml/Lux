@@ -165,11 +165,13 @@ Lux 的核心价值不是功能数量，而是：
 - 有明确 provider ID 时直接确认身份。
 - 没有 provider ID 时，可用规范化标题、年份、媒体类型和季集号通过媒体库所选刮削器搜索。
 - 匹配结果只保存当前媒体库所选刮削器对应的 provider ID；选择 TMDb 时保存 TMDb ID，选择其他刮削器时保存该刮削器返回的 ID。
-- 自动匹配必须达到高置信度阈值；候选接近或信息不足时进入“待处理”。
+- 自动匹配必须达到高置信度阈值；信息不足或最高分未达到阈值时进入“待处理”。
 - “待处理”条目保留原始文件名和可播放能力，不因缺少在线元数据从库中消失。
 - 低置信度匹配保留为“待确认”状态，但不提供独立的元数据纠错控制台页面。
 - 整库匹配任务完成后，任务结果显示自动确认、待确认、无候选和写回失败的数量；待确认数量链接到对应媒体库的“待确认”筛选。
 - 媒体库列表支持“待确认”筛选，条目卡片显示待确认标记；管理员从媒体详情页搜索候选、查看差异、选择正确条目并确认。
+- 管理员可在服务器设置中选择是否显示媒体库条目的“待确认”标记，默认显示；隐藏标记不改变待确认状态和筛选结果。
+- 媒体库页面支持进入多选模式；选中的条目全部为待确认时显示“批量确认”，按各条目最高分待确认候选确认并保留已刮削元数据；混合选择时不显示批量确认，并保留普通媒体操作菜单。
 - 媒体详情页在完成待确认匹配后提供“下一个待确认”入口，支持连续处理同一媒体库中的异常条目。
 - 元数据匹配错误时支持“重新匹配”。
 - 重新匹配可选择仅补缺字段或刷新在线字段；无论哪种模式都不覆盖已锁定字段。
@@ -177,13 +179,13 @@ Lux 的核心价值不是功能数量，而是：
   /config/metadata/library/<shard>/<item-id>/；媒体目录已有图片仍保留且优先。
 - 新建媒体库首次添加可用根路径并完成扫描后，若媒体库配置了刮削器，自动按高置信度选择最佳候选，写回元数据并按该媒体库的图像策略下载所需图片；用户无需逐条进入管理后台确认。
 - 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。
-- 管理员从媒体库入口手动执行“整库元数据匹配”时，使用与新库首次处理相同的自动选择、NFO 写回和图片下载流程；低置信度或候选接近的条目仍进入待处理队列。
+- 管理员从媒体库入口手动执行“整库元数据匹配”时，使用与新库首次处理相同的自动选择、NFO 写回和图片下载流程；低置信度条目仍进入待处理队列。
 - 回写使用临时文件、刷盘和原子重命名；失败时显示可重试状态，不谎报成功。
 
 建议的首版自动匹配门槛：
 
 - NFO 中存在合法 TMDb ID：确认。
-- 规范化标题完全一致、媒体类型一致、年份相差不超过 1 年，且最佳候选明显高于第二候选：可自动确认。
+- 规范化标题完全一致、媒体类型一致、年份相同或相差不超过 1 年，且最佳候选达到高置信度：可自动确认；多个候选按最高分选择，完全同分时任选。
 - 其他情况：待处理。
 
 具体分数只属于 Lux 内部实现，不作为 Emby 兼容 API 的公共契约。
@@ -259,7 +261,7 @@ Lux 的核心价值不是功能数量，而是：
 - 按最近添加排序。
 - 按发行日期排序。
 - 按评分排序。
-- 所有列表分页，禁止无界返回。
+- 所有列表分页并设置服务端上限；Emby `/Persons` 为兼容现有客户端的明确例外，接受任意正整数 `Limit`，由调用方自行承担请求超大结果集的资源成本。
 
 后续能力：
 
@@ -720,7 +722,7 @@ pub async fn get_item(
 
 - Emby 兼容 API 必须遵循 Emby 的路由、字段名、状态码和可观察行为，不强行套用 Lux 错误格式。
 - 输入和输出 DTO 分离。
-- 所有列表端点分页并设置上限。
+- 所有列表端点分页并设置上限；Emby `/Persons` 按兼容合同接受任意正整数 `Limit`，不额外施加服务端上限。
 - 添加字段优先，删除或改变类型必须写兼容性 ADR。
 
 ### 10.3 永远执行
@@ -1285,7 +1287,14 @@ locked local value
 - 不支持时展示清晰错误和推荐使用第三方客户端。
 - 记录开始、定时进度、暂停和停止。
 - 页面关闭使用可靠的轻量上报机制。
-- 不实现 DRM、转码和自定义解码器。
+- 当前正式播放器仍不实现 DRM、服务端转码、Remux 或自定义解码器。
+- LUX-184 允许提供独立的浏览器媒体能力探针，用于实测原生 video、MediaCapabilities 和 WebCodecs；探针不接入
+  正式播放路径，不读取或保存用户媒体数据。
+- LUX-185 可为 MP4/fMP4 的 HEVC 媒体增加浏览器端 WASM 解码、H.264 客户端编码和 MSE 播放 fallback；重型工作
+  必须在 Web Worker 中执行，服务端只继续提供原始媒体 Range 数据。
+- 客户端解码增强的目标包括具备相应硬件能力的 4K HEVC 8-bit、10-bit 和 HDR10；Dolby Vision 不属于当前承诺。
+- 若后续新增 WebCodecs 或 WASM 播放引擎，必须单独修改本节、补充 ADR，并通过实际浏览器性能阶段门；不得把
+  “浏览器报告支持”直接等同于 4K 实时播放能力。
 
 ### 14.7 下载权限的限制
 
@@ -1388,10 +1397,10 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - Years。
 - Fields。
 - EnableImages、ImageTypeLimit。
-- `/Persons` 使用 `ParentId` 指定媒体库，`PersonTypes=Actor` 返回去重后的演员，响应必须保持 `Items`、`TotalRecordCount`、`StartIndex` 的 Emby 分页结构；人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
+- `/Persons` 使用 `ParentId` 指定媒体库；`Recursive=true` 聚合媒体库所有后代媒体条目，`Recursive=false` 只聚合直接子条目，未传 `Recursive` 时按递归查询处理以兼容旧客户端；`PersonTypes=Actor` 返回去重后的演员。人物 DTO 使用 `Type=Person`，并提供 `ServerId`、`ImageTags`、`BackdropImageTags`。响应必须保持 `Items`、`TotalRecordCount`、`StartIndex` 的 Emby 分页结构；接受任意正整数 `Limit`，不额外施加服务端上限；`Fields`、`SortBy`、`SortOrder` 必须在数据库分页前生效；`DateCreated` 使用演员首次出现在该媒体库媒体条目中的最早 `added_at`。人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
 - TotalRecordCount 与 Items 的一致性。
 
-Limit 默认 50，服务端硬上限 500。客户端请求更大时按兼容性策略截断或拒绝，并记录测试。
+Limit 默认 50；Emby `/Persons` 接受任意正整数，不设置服务端硬上限，其他列表接口继续遵循各自的服务端上限。
 
 ### 15.5 核心 DTO
 
@@ -1854,6 +1863,8 @@ services:
 | LUX-177 至 181 | migrations/、migrations-postgres/、src/library.rs、src/storage/、src/application/libraries.rs、src/application/plugins.rs、src/application/chapter_detector.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-182 | src/auth/、src/api/mod.rs、web/src/features/account/、web/src/lib/api/、tests/、docs/ |
 | LUX-183 至 186 | src/application/webhooks.rs、src/storage/、src/api/mod.rs、migrations/、migrations-postgres/、tests/、docs/ |
+| LUX-184 | web/public/media-capability-probe.html、web/public/media-capability-probe.js、web/tests/、docs/ |
+| LUX-185 | web/src/features/player/、web/public/hevc/、web/tests/、web/package.json、web/pnpm-lock.yaml、web/vite.config.ts、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2368,7 +2379,7 @@ services:
 
 #### LUX-057：统一媒体文件名解析与 Movie/TV 匹配
 
-范围：参考 qmby 的 `ParseMediaName` 和刮削器候选策略，在 Lux 应用层提供统一的文件名/目录名解析与标题清洗。解析结果至少包含清洗后的标题、年份、季号、集号、版本和清晰度；支持 `SxxEyy`、`x` 格式、中文“第 N 季/第 M 集”和年份紧贴标题的常见命名。去除分辨率、编码、音频、字幕、来源、发布组等技术噪声，但保留可用于媒体源聚合的版本和清晰度字段。
+范围：参考 qmby 的 `ParseMediaName` 和刮削器候选策略，在 Lux 应用层提供统一的文件名/目录名解析与标题清洗。解析结果至少包含清洗后的标题、年份、季号、集号、版本和清晰度；支持 `SxxEyy`、`x` 格式、中文“第 N 季/第 M 集”和年份紧贴标题的常见命名。去除分辨率、编码、音频、字幕、来源、发布组等技术噪声，但保留可用于媒体源聚合的版本和清晰度字段。兼容 Emby 常见的 `[tmdbid=123]`、`[tmdbid-123]`、`[tmdb=123]`、`[tmdb-123]` 及对应 `{...}` 标签；标签从标题中剥离并保存为 provider ID，TMDb 刮削器可直接用该 ID 获取详情。
 
 元数据匹配和搜索必须使用媒体库所选刮削器，并按媒体类型分流；TMDb 刮削器的电影调用 `/search/movie`、剧集调用 `/search/tv`。带年份搜索无结果时允许回退无年份搜索，并对中文/英文标题候选逐项尝试。Lux 扫描、候选搜索、批量重新匹配和各刮削器插件使用同一解析语义；插件 RPC 公开字段保持兼容，不泄露凭据。
 
@@ -2377,6 +2388,7 @@ services:
 - [x] `暗夜与黎明2024` 清洗为标题“暗夜与黎明”、年份 2024；`暗夜与黎明 S01E01 H 265 AAC CHDWEB` 不把技术标签写入标题。
 - [x] 统一解析器覆盖电影、剧集、季度、单集的年份/季集号和常见技术标签，并保留版本/清晰度信息。
 - [x] MOVIE 候选和重新匹配请求只调用 `/search/movie`，SERIES 请求只调用 `/search/tv`；TV 搜索支持中文结果缺字段时的英文逐字段回退。
+- [x] 电影和剧集目录/文件名中的 Emby 风格 TMDb ID 标签可被识别、持久化并在选择 TMDb 刮削器时直接请求对应详情；手动改用冲突标题或年份时不复用旧 ID。
 - [x] `lux-plugin-tmdb` 的 `metadata.search` 对相同输入产生相同清洗标题和类型分流，协议响应字段不变。
 - [x] 解析和匹配错误只产生待处理/可重试结果，不在用户 HTTP 请求路径扫描文件或直接调用 TMDb。
 
@@ -2748,6 +2760,7 @@ services:
 - 不提供独立的元数据纠错控制台页面或导航入口。
 - 整库匹配任务结果显示待确认数量，并能跳转到对应媒体库的待确认筛选。
 - 媒体库列表支持服务端分页的待确认筛选，待确认条目保留可播放能力并显示状态标记。
+- 媒体库列表支持多选；全为待确认条目时可批量确认，混合选择时继续显示普通媒体操作菜单。
 - 从媒体详情页查看候选和 diff，选择仅补缺/刷新未锁定字段并处理写回成功/失败状态。
 - 完成一项待确认匹配后可以继续打开下一项待确认媒体。
 - poster/fanart 选择。
@@ -2975,6 +2988,7 @@ services:
 - 内容分级和标签 ACL。
 - 局域网自动发现。
 - 内嵌字幕按需无转换抽取。
+- Web 客户端媒体能力探针和客户端解码兼容性验证；首阶段只验证，不改变正式播放器。
 - Web 浏览器兼容转码，需要全新规格和 ADR。
 
 #### LUX-140：内置元数据插件与媒体库刮削器选择
@@ -3925,12 +3939,14 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 
 依赖：LUX-020、LUX-022、LUX-024。
 
-#### LUX-183：Webhook 通知事件与持久化投递
+#### LUX-183：通知器插件、Webhook 事件与持久化投递
 
-范围：为 Lux 增加管理员配置的单一出站 Webhook 通知器。通知通过持久化事件和投递记录由有界后台 worker
-发送，不能阻塞扫描、播放或元数据请求。Lux 原生 `schemaVersion: 1` JSON 合同和 Emby 风格 payload 使用
-独立 adapter；不声称完整兼容 Emby Webhooks 插件的全部 payload/template 行为。Telegram、企业微信和 Email
-不属于当前任务。
+范围：为 Lux 增加统一通知事件、持久化 outbox 和可插拔通知器宿主。通知通过持久化事件和投递记录由有界后台
+worker 发送，不能阻塞扫描、播放或元数据请求。通知器使用独立进程插件协议；首个外置 provider 为
+`org.lux.webhook`。旧版 `builtin.webhook` 目标保留兼容路径，新的通知配置应选择已安装的通知器插件。Lux 原生
+`schemaVersion: 1` JSON 合同和 Emby 风格 payload 使用独立
+adapter；不声称完整兼容 Emby Webhooks 插件的全部 payload/template 行为。Telegram、企业微信和 Email 的
+具体插件实现不属于当前任务。
 
 事件包括 `MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、
 `JOB_FAILED`、`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_PROGRESS`、`PLAYBACK_STOPPED`。事件不包含
@@ -3948,12 +3964,63 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 - [x] 媒体/任务服务接入基础事件；重复扫描不会重复发送同一媒体新增事件。
 - [x] 播放边沿和节流进度事件接入；乱序回调不会造成位置倒退或通知风暴。
 - [x] Lux/Emby payload adapter 按目标独立生成事件，旧目标升级后继续使用 Lux 合同。
+- [x] 通知插件 manifest/RPC 合同、provider 目标绑定和宿主统一结果分类已实现；通知插件不继承完整配置目录。
 - [x] API、存储、URL 安全、签名、重试、恢复、权限、CSRF、脱敏和本地接收器集成测试通过。
 
 验证：参见 `docs/LUX-183-PLAN.md`；完成后更新 `docs/COMPATIBILITY.md`，明确 Lux 原生 Webhook、Emby 风格
 payload 的实际支持范围，以及未实现的 Emby 插件行为。
 
 依赖：LUX-020、LUX-022、LUX-041、LUX-073、LUX-093。
+
+#### LUX-184：Web 4K 媒体能力探针
+
+范围：为 Lux Web 提供独立的浏览器媒体能力探针，验证实际本地测试文件在原生 `video`、MediaCapabilities
+和 WebCodecs 下的表现。探针只读取用户在页面中指定的媒体 URL，不上传、不持久化媒体内容，不接入正式播放器，
+不改变服务端 DirectPlay、Range 或 `.strm` 行为。
+
+目标测试范围包括 4K HEVC 8-bit、4K HEVC 10-bit HDR10、4K H.264 基准、MP4、MKV、24/30/60fps 和常见音频轨。
+Dolby Vision、DRM 和服务端转码不属于本任务。
+
+验收：
+
+- [x] `/media-capability-probe.html` 能输入本地媒体 URL、MIME 类型、codec、分辨率、码率和帧率。
+- [x] 页面分别报告 `HTMLVideoElement.canPlayType`、MediaCapabilities 和 WebCodecs 能力；结果不包含完整媒体
+      URL，避免把令牌写入结果或日志。
+- [x] 页面可对实际媒体执行 metadata、短时播放、VideoFrame 计数、丢帧和当前播放位置测量。
+- [x] 预设包含 4K HEVC Main、HEVC Main10 HDR10 和 4K H.264 基准；不伪造 Dolby Vision 支持。
+- [x] 测试说明要求使用不含个人数据的本地样本，并记录浏览器版本、平台、Lux 提交、样本校验值和结果。
+- [x] 本任务不修改正式 `PlayerPage`、服务端播放接口、数据库、Emby DTO 或 WASM/FFmpeg 依赖。
+
+验证：`node --test web/tests/media-capability-probe.test.mjs`、`pnpm --dir web test`、`pnpm --dir web build`，
+以及在实际浏览器中打开 `/media-capability-probe.html` 完成媒体矩阵测试。记录 `uname -m`；未提供真实 4K
+样本或未运行真实浏览器时，不得宣称 4K 播放兼容。
+
+依赖：LUX-113、LUX-114。
+
+#### LUX-185：Web 原生播放引擎与 HEVC 客户端兜底
+
+范围：将 Web 播放页从直接依赖 HTML `video` 元素改为可替换的播放引擎。浏览器原生支持时继续使用原生
+DirectPlay；浏览器无法原生解码 HEVC、但具备 WebAssembly、Web Worker、MSE 和 H.264 `VideoEncoder` 时，
+使用客户端 WASM HEVC 解码并编码为 H.264 fMP4 后通过 MSE 播放。所有媒体字节仍来自 Lux 原始 Range 端点，
+不触发服务端转码、Remux、代理或数据库任务。
+
+首个客户端 fallback 依赖 MIT 许可的 `@hevcjs/core`（其运行时依赖 MP4Box，BSD-3-Clause），固定版本并记录
+许可证；客户端 fallback 不处理 Dolby Vision、DRM 或无法由浏览器编码 H.264 的设备。
+
+验收：
+
+- [x] NativeVideoEngine 保持现有播放、恢复位置、进度、暂停、停止和页面离开事件语义。
+- [x] 播放器按真实能力选择原生路径或客户端 fallback，不因 `canPlayType` 的静态结果误选路径。
+- [x] 客户端 fallback 使用 Worker，动态加载 WASM/Worker 资产，支持 MP4/fMP4 HEVC + AAC 的播放和 seek。
+- [x] fallback 失败时显示可诊断原因，并推荐原生客户端；不创建服务器端转码任务。
+- [x] 4K HEVC 在能力探测允许且实际客户端吞吐足够时可以走同一 fallback；性能不足时有明确降级状态。
+- [x] `.strm` 外部 URL 只有在浏览器具备 CORS/Range 能力时才尝试客户端读取；不新增服务端代理。
+- [x] 不改变 Emby PlaybackInfo、Rust 播放接口、数据库和第三方客户端行为。
+
+验证：Web 单测、Web 构建、真实浏览器 MP4/H.265 fixture 播放、seek、进度和 fallback 错误回归；记录浏览器、
+平台、样本分辨率、媒体耗时、客户端转码速度和丢帧。未通过真实性能门时不得宣称该设备支持 4K 实时 fallback。
+
+依赖：LUX-184、LUX-113、LUX-073。
 
 ## 26. 风险与缓解
 
@@ -3968,7 +4035,7 @@ payload 的实际支持范围，以及未实现的 Emby 插件行为。
 | TMDb 限流/不可用 | 中 | 本地优先、缓存、限流、退避、任务可重试 |
 | 错误自动匹配污染大库 | 高 | 高置信门、候选差距、待处理、重新匹配、字段来源与锁定 |
 | .strm URL 泄露令牌 | 中 | 明确产品行为、日志脱敏、只向有权限客户端返回 |
-| 浏览器编码支持不足 | 已接受 | 明确不支持提示，推荐第三方客户端，不在首版转码 |
+| 浏览器编码支持不足 | 高 | 先用 LUX-184 记录真实能力；4K 目标优先依赖原生/硬件 WebCodecs，不把 WASM 探测结果当作实时保证 |
 | 下载权限无法形成 DRM | 已接受 | 文档说明权限边界，不做虚假安全承诺 |
 | 临时 NAS 卸载导致条目删除 | 高 | 根路径 availability、完整 generation、删除宽限期 |
 | Web 与 Emby API 互相绑死 | 中 | Web 使用 Lux API，二者共享 application service |

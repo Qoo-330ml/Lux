@@ -55,6 +55,11 @@ export type Library = {
   latest?: MediaItem[];
 };
 
+export type LibrariesResponse = {
+  libraries?: Library[];
+  showMetadataPending?: boolean;
+};
+
 export type ImageTags = Partial<Record<"poster" | "fanart" | "backdrop" | "thumb" | "logo", string>>;
 
 export type UserData = {
@@ -163,6 +168,7 @@ export type MediaItem = {
   seriesId?: string | null;
   indexNumber?: number | null;
   parentIndexNumber?: number | null;
+  metadataPending?: boolean;
 };
 
 export type MetadataFieldName = "title" | "originalTitle" | "overview" | "productionYear";
@@ -211,6 +217,12 @@ export type PageResponse<T> = {
   page?: number;
   pageSize?: number;
   total?: number;
+};
+
+export type AdminMetadataBatchConfirmation = {
+  confirmedCount: number;
+  failedCount: number;
+  failedItemIds: string[];
 };
 
 export type PlaybackState = {
@@ -295,6 +307,8 @@ export type AdminWebhookDestination = {
   name: string;
   url: string;
   payloadFormat: "LUX" | "EMBY";
+  providerPluginId: string;
+  providerConfig: Record<string, unknown>;
   enabled: boolean;
   allowPrivateNetwork: boolean;
   eventTypes: string[];
@@ -602,6 +616,7 @@ export type MediaStrategySettings = {
   region: string;
   scraperId?: string | null;
   metadataRefreshMode?: MetadataRefreshMode;
+  showMetadataPending?: boolean;
   applyScope: "NEW_CONTENT" | "SELECTED_CONTENT" | "ALL_CONTENT" | string;
   images: MediaImageStrategySettings;
   subtitles: MediaSubtitleStrategySettings;

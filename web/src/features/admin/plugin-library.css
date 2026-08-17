@@ -345,7 +345,7 @@
   font-size: .78rem;
 }
 
-.lux-admin-plugin-dialog-form input {
+.lux-admin-plugin-dialog-form input:not([type="checkbox"]):not([type="radio"]) {
   width: 100%;
   min-height: 44px;
   padding: 0 12px;
@@ -356,7 +356,7 @@
   background: rgba(255, 255, 255, .05);
 }
 
-.lux-admin-plugin-dialog-form input:disabled {
+.lux-admin-plugin-dialog-form input:not([type="checkbox"]):not([type="radio"]):disabled {
   cursor: not-allowed;
   opacity: .55;
 }
@@ -396,7 +396,7 @@
   font-weight: 650;
 }
 
-.lux-admin-plugin-dialog-form input:focus {
+.lux-admin-plugin-dialog-form input:not([type="checkbox"]):not([type="radio"]):focus {
   border-color: rgba(255, 255, 255, .46);
   box-shadow: 0 0 0 3px rgba(255, 255, 255, .06);
 }

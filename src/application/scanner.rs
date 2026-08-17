@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     path::{Component, Path, PathBuf},
     sync::{
@@ -774,6 +774,7 @@ impl LibraryScanner {
                 sort_title: &sort_title,
                 original_title: Some(&title),
                 production_year: None,
+                provider_ids_json: None,
                 identification_status: "PENDING",
                 identity_key: &identity_key,
             })
@@ -841,6 +842,7 @@ impl LibraryScanner {
                     item.sort_title,
                     item.original_title,
                     item.production_year,
+                    item.provider_ids_json,
                 )
                 .await?;
             return Ok((existing.id, false));
@@ -862,6 +864,7 @@ impl LibraryScanner {
                     item.sort_title,
                     item.original_title,
                     item.production_year,
+                    item.provider_ids_json,
                 )
                 .await?;
             return Ok((existing.id, false));
@@ -898,6 +901,7 @@ impl LibraryScanner {
         let series_sort_title = hierarchy.series_title.to_lowercase();
         let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
         let legacy_series_identity = legacy_series_identity(root, hierarchy);
+        let series_provider_ids_json = provider_ids_json(&hierarchy.provider_ids);
         let series_new_id = ItemId::new().to_string();
         let (series_id, series_created) = self
             .ensure_hierarchy_item(
@@ -914,6 +918,7 @@ impl LibraryScanner {
                     sort_title: &series_sort_title,
                     original_title: Some(&hierarchy.series_title),
                     production_year: hierarchy.production_year.map(i64::from),
+                    provider_ids_json: series_provider_ids_json.as_deref(),
                     identification_status: "PENDING",
                     identity_key: &series_identity,
                 },
@@ -946,6 +951,7 @@ impl LibraryScanner {
                     sort_title: &season_sort_title,
                     original_title: Some(&season_title),
                     production_year: None,
+                    provider_ids_json: None,
                     identification_status: "PENDING",
                     identity_key: &season_identity,
                 },
@@ -972,6 +978,7 @@ impl LibraryScanner {
                     sort_title: &episode_sort_title,
                     original_title: Some(&episode_title),
                     production_year: None,
+                    provider_ids_json: None,
                     identification_status: "PENDING",
                     identity_key: &episode_identity,
                 },
@@ -1140,6 +1147,8 @@ impl LibraryScanner {
         let Some(parsed_name) = parse_movie_filename(file_name) else {
             return Ok(None);
         };
+        let provider_ids = movie_provider_ids(path, &parsed_name.provider_ids);
+        let provider_ids_json = provider_ids_json(&provider_ids);
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
             Some(read_strm_target(path).await?)
@@ -1189,6 +1198,7 @@ impl LibraryScanner {
             sort_title: parsed_name.sort_title,
             original_title: parsed_name.title,
             production_year: parsed_name.production_year.map(i64::from),
+            provider_ids_json,
             source_kind: if is_strm {
                 "STRM_URL".to_owned()
             } else {
@@ -1238,6 +1248,8 @@ impl LibraryScanner {
         let Some(parsed_name) = parse_movie_filename(file_name) else {
             return Ok(ScanReport::default());
         };
+        let provider_ids = movie_provider_ids(path, &parsed_name.provider_ids);
+        let provider_ids_json = provider_ids_json(&provider_ids);
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
             Some(read_strm_target(path).await?)
@@ -1350,10 +1362,16 @@ impl LibraryScanner {
                     sort_title: &parsed_name.sort_title,
                     original_title: Some(&parsed_name.title),
                     production_year: parsed_name.production_year.map(i64::from),
+                    provider_ids_json: provider_ids_json.as_deref(),
                 })
                 .await?;
             (item_id, true)
         };
+        if let Some(provider_ids_json) = provider_ids_json.as_deref() {
+            self.database
+                .update_local_provider_ids_if_empty(&item_id, provider_ids_json)
+                .await?;
+        }
         self.database
             .repair_movie_parent_folder(library_id_text, &root.id, &relative_path, &item_id)
             .await?;
@@ -3689,6 +3707,7 @@ pub struct ParsedMovieFilename {
     pub production_year: Option<i32>,
     pub edition_name: Option<String>,
     pub quality_label: Option<String>,
+    pub provider_ids: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3701,6 +3720,7 @@ pub struct ParsedEpisodeFilename {
     pub absolute_number: Option<u32>,
     pub edition_name: Option<String>,
     pub quality_label: Option<String>,
+    pub provider_ids: BTreeMap<String, String>,
 }
 
 enum MixedClassification {
@@ -3773,7 +3793,33 @@ pub fn parse_movie_filename(filename: &str) -> Option<ParsedMovieFilename> {
         production_year: parsed.production_year,
         edition_name: parsed.edition_name,
         quality_label: parsed.quality_label,
+        provider_ids: parsed.provider_ids,
     })
+}
+
+fn movie_provider_ids(
+    path: &Path,
+    file_provider_ids: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut provider_ids = file_provider_ids.clone();
+    let Some(folder_name) = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return provider_ids;
+    };
+    if let Some(folder) = parse_media_name(folder_name, MediaKind::Movie) {
+        for (provider, provider_id) in folder.provider_ids {
+            provider_ids.entry(provider).or_insert(provider_id);
+        }
+    }
+    provider_ids
+}
+
+fn provider_ids_json(provider_ids: &BTreeMap<String, String>) -> Option<String> {
+    (!provider_ids.is_empty())
+        .then(|| serde_json::to_string(provider_ids).unwrap_or_else(|_| "{}".to_owned()))
 }
 
 pub fn parse_episode_filename(filename: &str) -> Option<ParsedEpisodeFilename> {
@@ -3794,6 +3840,7 @@ pub fn parse_episode_filename(filename: &str) -> Option<ParsedEpisodeFilename> {
         absolute_number: parsed.absolute_number,
         edition_name: parsed.edition_name,
         quality_label: parsed.quality_label,
+        provider_ids: parsed.provider_ids,
     })
 }
 
@@ -3806,6 +3853,7 @@ struct EpisodeHierarchy {
     series_path: String,
     series_title: String,
     production_year: Option<i32>,
+    provider_ids: BTreeMap<String, String>,
     season_number: u32,
 }
 
@@ -3844,13 +3892,19 @@ fn episode_hierarchy(relative_path: &str, parsed: &ParsedEpisodeFilename) -> Epi
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Series".to_owned());
     let production_year = parsed_series
+        .as_ref()
         .and_then(|value| value.production_year)
         .or(parsed.production_year);
+    let provider_ids = parsed_series
+        .map(|value| value.provider_ids.clone())
+        .filter(|provider_ids| !provider_ids.is_empty())
+        .unwrap_or_else(|| parsed.provider_ids.clone());
     let season_number = season_directory_number(directories).unwrap_or(parsed.season);
     EpisodeHierarchy {
         series_path,
         series_title,
         production_year,
+        provider_ids,
         season_number,
     }
 }

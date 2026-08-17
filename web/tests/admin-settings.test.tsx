@@ -36,6 +36,7 @@ const settings = {
       forcedOnly: false,
       hearingImpaired: false,
     },
+    showMetadataPending: true,
   },
   networkProxy: {
     configured: true,
@@ -98,6 +99,37 @@ describe("AdminSettingsPage network proxy", () => {
     });
 
     expect(update).toHaveBeenCalledWith({ networkProxyUrl: "http://192.168.1.2:7890/" });
+  });
+
+  it("shows the pending metadata badge setting and preserves the media strategy when saving", async () => {
+    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminSettingsPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const toggle = container.querySelector<HTMLInputElement>("input[aria-label='显示媒体库待确认标记']");
+    expect(toggle).toBeTruthy();
+    expect(toggle?.checked).toBe(true);
+    await act(async () => {
+      toggle?.click();
+      container.querySelector<HTMLButtonElement>("button.lux-settings-save")?.click();
+    });
+
+    expect(update).toHaveBeenCalledWith({
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: { ...settings.mediaStrategy, showMetadataPending: false },
+    });
   });
 
   it("shows the shared API key in server settings", async () => {

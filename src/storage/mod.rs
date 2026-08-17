@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -736,8 +736,9 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO notification_destinations (
-                id, name, url, enabled, allow_private_network, event_types_json, payload_format
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                id, name, url, enabled, allow_private_network, event_types_json, payload_format,
+                provider_plugin_id, provider_config_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(destination.id)
         .bind(destination.name)
@@ -746,6 +747,8 @@ impl Database {
         .bind(database_flag(destination.allow_private_network))
         .bind(destination.event_types_json)
         .bind(destination.payload_format)
+        .bind(destination.provider_plugin_id)
+        .bind(destination.provider_config_json)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -761,7 +764,7 @@ impl Database {
     ) -> Result<Option<StoredNotificationDestination>, StorageError> {
         self.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
-                    created_at, updated_at
+                    provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations WHERE id = ?",
         )
         .bind(id)
@@ -781,7 +784,7 @@ impl Database {
     ) -> Result<Vec<StoredNotificationDestination>, StorageError> {
         self.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
-                    created_at, updated_at
+                    provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations
              ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
@@ -805,7 +808,7 @@ impl Database {
     ) -> Result<Vec<StoredNotificationDestination>, StorageError> {
         self.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
-                    created_at, updated_at
+                    provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations
              WHERE enabled = 1
              ORDER BY id LIMIT 1000",
@@ -836,6 +839,8 @@ impl Database {
                  allow_private_network = COALESCE(?, allow_private_network),
                  event_types_json = COALESCE(?, event_types_json),
                  payload_format = COALESCE(?, payload_format),
+                 provider_plugin_id = COALESCE(?, provider_plugin_id),
+                 provider_config_json = COALESCE(?, provider_config_json),
                  updated_at = unixepoch()
              WHERE id = ?",
         )
@@ -845,6 +850,8 @@ impl Database {
         .bind(update.allow_private_network.map(database_flag))
         .bind(update.event_types_json)
         .bind(update.payload_format)
+        .bind(update.provider_plugin_id)
+        .bind(update.provider_config_json)
         .bind(id)
         .execute(&self.pool)
         .await
@@ -941,7 +948,8 @@ impl Database {
                     d.next_attempt_at, d.claimed_until, d.last_http_status, d.last_error,
                     d.delivered_at, d.created_at, d.updated_at,
                     e.event_type, e.schema_version, e.occurred_at, e.payload_json,
-                    n.name, n.url, n.allow_private_network
+                    n.name, n.url, n.allow_private_network,
+                    n.provider_plugin_id, n.provider_config_json
              FROM notification_deliveries d
              JOIN notification_events e ON e.id = d.event_id
              JOIN notification_destinations n ON n.id = d.destination_id
@@ -972,7 +980,8 @@ impl Database {
                     d.next_attempt_at, d.claimed_until, d.last_http_status, d.last_error,
                     d.delivered_at, d.created_at, d.updated_at,
                     e.event_type, e.schema_version, e.occurred_at, e.payload_json,
-                    n.name, n.url, n.allow_private_network
+                    n.name, n.url, n.allow_private_network,
+                    n.provider_plugin_id, n.provider_config_json
              FROM notification_deliveries d
              JOIN notification_events e ON e.id = d.event_id
              JOIN notification_destinations n ON n.id = d.destination_id
@@ -1186,10 +1195,9 @@ impl Database {
         &self,
         library_id: &str,
         person_type: &str,
-        offset: i64,
-        limit: i64,
+        options: PersonListOptions,
     ) -> Result<(Vec<StoredPersonCredit>, i64), StorageError> {
-        self.list_person_credits_for_libraries(&[library_id.to_owned()], person_type, offset, limit)
+        self.list_person_credits_for_libraries(&[library_id.to_owned()], person_type, options)
             .await
     }
 
@@ -1197,8 +1205,7 @@ impl Database {
         &self,
         library_ids: &[String],
         person_type: &str,
-        offset: i64,
-        limit: i64,
+        options: PersonListOptions,
     ) -> Result<(Vec<StoredPersonCredit>, i64), StorageError> {
         if library_ids.is_empty() {
             return Ok((Vec::new(), 0));
@@ -1206,6 +1213,12 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let person_sort_order = person_sort_order(options.sort_by, options.descending);
+        let recursive_clause = if options.recursive {
+            String::new()
+        } else {
+            format!(" AND (mi.parent_id IS NULL OR mi.parent_id IN ({placeholders}))")
+        };
         let count_query = format!(
             "SELECT COUNT(*) FROM (
                  SELECT pc.provider, pc.person_id
@@ -1213,6 +1226,7 @@ impl Database {
                  JOIN media_items mi ON mi.id = pc.item_id
                  WHERE mi.library_id IN ({placeholders})
                    AND mi.removed_at IS NULL
+                   {recursive_clause}
                    AND pc.person_type = ?
                  GROUP BY pc.provider, pc.person_id
              )"
@@ -1220,6 +1234,11 @@ impl Database {
         let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
+        }
+        if !options.recursive {
+            for library_id in library_ids {
+                count_statement = count_statement.bind(library_id);
+            }
         }
         let total: i64 = count_statement
             .bind(person_type)
@@ -1234,6 +1253,7 @@ impl Database {
                     pc.provider,
                     MIN(pc.person_name) AS person_name,
                     MIN(pc.role) AS role,
+                    MIN(mi.added_at) AS date_created,
                     MIN(pc.biography) AS biography,
                     MIN(pc.birthday) AS birthday,
                     MIN(pc.deathday) AS deathday,
@@ -1243,19 +1263,25 @@ impl Database {
              JOIN media_items mi ON mi.id = pc.item_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
+               {recursive_clause}
                AND pc.person_type = ?
              GROUP BY pc.provider, pc.person_id
-             ORDER BY MIN(pc.person_name), pc.provider, pc.person_id
+             ORDER BY {person_sort_order}
              LIMIT ? OFFSET ?"
         );
         let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
         }
+        if !options.recursive {
+            for library_id in library_ids {
+                list_statement = list_statement.bind(library_id);
+            }
+        }
         let rows = list_statement
             .bind(person_type)
-            .bind(limit)
-            .bind(offset)
+            .bind(options.limit)
+            .bind(options.offset)
             .fetch_all(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -5930,8 +5956,8 @@ impl Database {
                 self.query(
                     "INSERT INTO media_items (
                         id, library_id, item_type, parent_id, title, sort_title,
-                        original_title, production_year, identification_status
-                    ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+                        original_title, production_year, provider_ids_json, identification_status
+                    ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
                 )
                 .bind(&item_id)
                 .bind(library_id)
@@ -5940,6 +5966,7 @@ impl Database {
                 .bind(&file.sort_title)
                 .bind(&file.original_title)
                 .bind(file.production_year)
+                .bind(file.provider_ids_json.as_deref())
                 .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
@@ -5949,6 +5976,22 @@ impl Database {
                 (item_id, true)
             };
             created_items += usize::from(is_new_item);
+
+            if let Some(provider_ids_json) = file.provider_ids_json.as_deref() {
+                self.query(
+                    "UPDATE media_items
+                     SET provider_ids_json = ?
+                     WHERE id = ? AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
+                )
+                .bind(provider_ids_json)
+                .bind(&item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
 
             self.query(
                 "INSERT INTO media_sources (
@@ -6679,6 +6722,39 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_pending_metadata_item_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashSet<String>, StorageError> {
+        let mut pending = HashSet::new();
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT DISTINCT item_id FROM metadata_candidates
+                 WHERE status = 'PENDING' AND item_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            pending.extend(rows.into_iter().map(|row| row.get("item_id")));
+        }
+        Ok(pending)
+    }
+
     pub(crate) async fn insert_metadata_candidate(
         &self,
         candidate: NewMetadataCandidate<'_>,
@@ -6837,6 +6913,31 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_best_pending_metadata_candidate(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredMetadataCandidate>, StorageError> {
+        self.query(
+            "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                    mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                    mi.title AS item_title
+             FROM metadata_candidates mc
+             JOIN media_items mi ON mi.id = mc.item_id
+             WHERE mc.item_id = ? AND mc.status = 'PENDING'
+               AND mi.removed_at IS NULL
+             ORDER BY mc.score DESC, mc.created_at, mc.id
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_metadata_candidate))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn select_metadata_candidate(
         &self,
         update: SelectedMetadataUpdate<'_>,
@@ -6859,7 +6960,8 @@ impl Database {
                  original_language = COALESCE(?, original_language),
                  rating = COALESCE(?, rating),
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
-                 provider_ids_json = ?, identification_status = 'ONLINE_CONFIRMED',
+                 provider_ids_json = ?,
+                 identification_status = CASE WHEN ? THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
                  thumbnail_fallback_required = ?
              WHERE id = ? AND removed_at IS NULL",
@@ -6877,6 +6979,7 @@ impl Database {
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.provider_ids_json)
+        .bind(database_flag(update.keep_pending))
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
@@ -6891,9 +6994,11 @@ impl Database {
         let selected = self
             .query(
                 "UPDATE metadata_candidates
-             SET status = 'SELECTED', updated_at = unixepoch()
+             SET status = CASE WHEN ? THEN 'PENDING' ELSE 'SELECTED' END,
+                 updated_at = unixepoch()
              WHERE id = ? AND item_id = ? AND status = 'PENDING'",
             )
+            .bind(database_flag(update.keep_pending))
             .bind(update.candidate_id)
             .bind(update.item_id)
             .execute(&mut *transaction)
@@ -8524,8 +8629,8 @@ impl Database {
         self.query(
             "INSERT INTO media_items (
                 id, library_id, item_type, title, sort_title,
-                original_title, production_year, identification_status
-            ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+                original_title, production_year, provider_ids_json, identification_status
+            ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
         )
         .bind(item.id)
         .bind(item.library_id)
@@ -8533,6 +8638,28 @@ impl Database {
         .bind(item.sort_title)
         .bind(item.original_title)
         .bind(item.production_year)
+        .bind(item.provider_ids_json)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_local_provider_ids_if_empty(
+        &self,
+        item_id: &str,
+        provider_ids_json: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_items
+             SET provider_ids_json = ?
+             WHERE id = ? AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
+        )
+        .bind(provider_ids_json)
+        .bind(item_id)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -10629,8 +10756,8 @@ impl Database {
                 id, library_id, item_type, parent_id, series_id,
                 season_number, episode_number, absolute_number,
                 title, sort_title, original_title, production_year,
-                identification_status, identity_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                provider_ids_json, identification_status, identity_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(item.id)
         .bind(item.library_id)
@@ -10644,6 +10771,7 @@ impl Database {
         .bind(item.sort_title)
         .bind(item.original_title)
         .bind(item.production_year)
+        .bind(item.provider_ids_json)
         .bind(item.identification_status)
         .bind(item.identity_key)
         .execute(&self.pool)
@@ -10662,10 +10790,14 @@ impl Database {
         sort_title: &str,
         original_title: Option<&str>,
         production_year: Option<i64>,
+        provider_ids_json: Option<&str>,
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_items
-             SET title = ?, sort_title = ?, original_title = ?, production_year = ?
+             SET title = ?, sort_title = ?, original_title = ?, production_year = ?,
+                 provider_ids_json = CASE
+                     WHEN ? IS NOT NULL AND (provider_ids_json IS NULL OR provider_ids_json = '{}')
+                     THEN ? ELSE provider_ids_json END
              WHERE id = ?
                AND identification_status IN ('LOCAL_CONFIRMED', 'PENDING')
                AND metadata_provenance_json IS NULL
@@ -10675,6 +10807,8 @@ impl Database {
         .bind(sort_title)
         .bind(original_title)
         .bind(production_year)
+        .bind(provider_ids_json)
+        .bind(provider_ids_json)
         .bind(item_id)
         .execute(&self.pool)
         .await
@@ -11946,6 +12080,8 @@ pub(crate) struct StoredNotificationDestination {
     pub(crate) allow_private_network: bool,
     pub(crate) event_types_json: String,
     pub(crate) payload_format: String,
+    pub(crate) provider_plugin_id: String,
+    pub(crate) provider_config_json: String,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
@@ -11958,6 +12094,8 @@ pub(crate) struct NewNotificationDestination<'a> {
     pub(crate) allow_private_network: bool,
     pub(crate) event_types_json: &'a str,
     pub(crate) payload_format: &'a str,
+    pub(crate) provider_plugin_id: &'a str,
+    pub(crate) provider_config_json: &'a str,
 }
 
 pub(crate) struct UpdateNotificationDestination<'a> {
@@ -11967,6 +12105,8 @@ pub(crate) struct UpdateNotificationDestination<'a> {
     pub(crate) allow_private_network: Option<bool>,
     pub(crate) event_types_json: Option<&'a str>,
     pub(crate) payload_format: Option<&'a str>,
+    pub(crate) provider_plugin_id: Option<&'a str>,
+    pub(crate) provider_config_json: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -11987,6 +12127,8 @@ pub(crate) struct StoredNotificationDelivery {
     pub(crate) destination_name: String,
     pub(crate) destination_url: String,
     pub(crate) allow_private_network: bool,
+    pub(crate) provider_plugin_id: String,
+    pub(crate) provider_config_json: String,
 }
 
 pub(crate) struct NewNotificationEvent<'a> {
@@ -12038,6 +12180,8 @@ fn stored_notification_destination(row: sqlx::any::AnyRow) -> StoredNotification
         allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
         event_types_json: row.get("event_types_json"),
         payload_format: row.get("payload_format"),
+        provider_plugin_id: row.get("provider_plugin_id"),
+        provider_config_json: row.get("provider_config_json"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -12061,6 +12205,8 @@ fn stored_notification_delivery(row: sqlx::any::AnyRow) -> StoredNotificationDel
         destination_name: row.get("name"),
         destination_url: row.get("url"),
         allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
+        provider_plugin_id: row.get("provider_plugin_id"),
+        provider_config_json: row.get("provider_config_json"),
     }
 }
 
@@ -12297,6 +12443,7 @@ pub(crate) struct StoredPersonCredit {
     pub(crate) provider: String,
     pub(crate) person_name: String,
     pub(crate) role: String,
+    pub(crate) date_created: i64,
     pub(crate) biography: Option<String>,
     pub(crate) birthday: Option<String>,
     pub(crate) deathday: Option<String>,
@@ -12310,6 +12457,7 @@ fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
         provider: row.get("provider"),
         person_name: row.get("person_name"),
         role: row.get("role"),
+        date_created: row.get("date_created"),
         biography: row.get("biography"),
         birthday: row.get("birthday"),
         deathday: row.get("deathday"),
@@ -12880,6 +13028,33 @@ enum CatalogBind<'a> {
     Integer(i64),
 }
 
+#[derive(Clone, Copy)]
+pub enum PersonSort {
+    Name,
+    DateCreated,
+}
+
+#[derive(Clone, Copy)]
+pub struct PersonListOptions {
+    pub recursive: bool,
+    pub sort_by: PersonSort,
+    pub descending: bool,
+    pub offset: i64,
+    pub limit: i64,
+}
+
+fn person_sort_order(sort_by: PersonSort, descending: bool) -> String {
+    let direction = if descending { "DESC" } else { "ASC" };
+    match sort_by {
+        PersonSort::Name => format!(
+            "MIN(pc.person_name) {direction}, MIN(mi.added_at) DESC, pc.provider ASC, pc.person_id ASC"
+        ),
+        PersonSort::DateCreated => format!(
+            "MIN(mi.added_at) {direction}, MIN(pc.person_name) ASC, pc.provider ASC, pc.person_id ASC"
+        ),
+    }
+}
+
 pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) library_ids: &'a [String],
     pub(crate) user_id: &'a str,
@@ -13267,6 +13442,7 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
     pub(crate) thumbnail_fallback_required: bool,
+    pub(crate) keep_pending: bool,
 }
 
 pub(crate) struct LibrarySettingsUpdate<'a> {
@@ -13323,6 +13499,7 @@ pub(crate) struct NewMediaItem<'a> {
     pub(crate) sort_title: &'a str,
     pub(crate) original_title: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) provider_ids_json: Option<&'a str>,
 }
 
 pub(crate) struct NewHierarchyItem<'a> {
@@ -13338,6 +13515,7 @@ pub(crate) struct NewHierarchyItem<'a> {
     pub(crate) sort_title: &'a str,
     pub(crate) original_title: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) provider_ids_json: Option<&'a str>,
     pub(crate) identification_status: &'a str,
     pub(crate) identity_key: &'a str,
 }
@@ -13367,6 +13545,7 @@ pub(crate) struct NewMovieFile {
     pub(crate) sort_title: String,
     pub(crate) original_title: String,
     pub(crate) production_year: Option<i64>,
+    pub(crate) provider_ids_json: Option<String>,
     pub(crate) source_kind: String,
     pub(crate) strm_target_kind: Option<String>,
     pub(crate) edition_name: Option<String>,
@@ -13603,7 +13782,17 @@ mod tests {
             .await
             .expect("person credits");
         let (credits, total) = database
-            .list_person_credits_for_library(&library_id, "Actor", 0, 10)
+            .list_person_credits_for_library(
+                &library_id,
+                "Actor",
+                PersonListOptions {
+                    recursive: true,
+                    sort_by: PersonSort::Name,
+                    descending: false,
+                    offset: 0,
+                    limit: 10,
+                },
+            )
             .await
             .expect("list person credits");
         assert_eq!(total, 2);
@@ -13841,6 +14030,7 @@ mod tests {
                 sort_title: "movie".to_owned(),
                 original_title: "Movie".to_owned(),
                 production_year: Some(2024),
+                provider_ids_json: None,
                 source_kind: "LOCAL_FILE".to_owned(),
                 strm_target_kind: None,
                 edition_name: None,
@@ -13859,6 +14049,7 @@ mod tests {
                 sort_title: "movie".to_owned(),
                 original_title: "Movie".to_owned(),
                 production_year: Some(2024),
+                provider_ids_json: None,
                 source_kind: "LOCAL_FILE".to_owned(),
                 strm_target_kind: None,
                 edition_name: Some("Director's Cut".to_owned()),

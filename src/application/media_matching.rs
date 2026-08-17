@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaKind {
@@ -17,6 +17,7 @@ pub struct ParsedMediaName {
     pub absolute_number: Option<u32>,
     pub edition_name: Option<String>,
     pub quality_label: Option<String>,
+    pub provider_ids: BTreeMap<String, String>,
 }
 
 pub fn parse_media_name(input: &str, kind: MediaKind) -> Option<ParsedMediaName> {
@@ -24,7 +25,8 @@ pub fn parse_media_name(input: &str, kind: MediaKind) -> Option<ParsedMediaName>
     if stem.is_empty() {
         return None;
     }
-    let normalized = normalize_separators(stem);
+    let (stem_without_provider_ids, provider_ids) = strip_provider_id_tags(stem);
+    let normalized = normalize_separators(&stem_without_provider_ids);
     let words = normalized.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() {
         return None;
@@ -64,7 +66,66 @@ pub fn parse_media_name(input: &str, kind: MediaKind) -> Option<ParsedMediaName>
         absolute_number: None,
         edition_name,
         quality_label,
+        provider_ids,
     })
+}
+
+fn strip_provider_id_tags(value: &str) -> (String, BTreeMap<String, String>) {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut cleaned = String::with_capacity(value.len());
+    let mut provider_ids = BTreeMap::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let Some(close) = (characters[index] == '[' || characters[index] == '{')
+            .then(|| {
+                let expected = if characters[index] == '[' { ']' } else { '}' };
+                (index + 1..characters.len()).find(|position| characters[*position] == expected)
+            })
+            .flatten()
+        else {
+            cleaned.push(characters[index]);
+            index += 1;
+            continue;
+        };
+        let tag = characters[index + 1..close].iter().collect::<String>();
+        if let Some((provider, provider_id)) = parse_provider_id_tag(&tag) {
+            provider_ids.insert(provider, provider_id);
+            cleaned.push(' ');
+            index = close + 1;
+        } else {
+            cleaned.push(characters[index]);
+            index += 1;
+        }
+    }
+    (cleaned, provider_ids)
+}
+
+fn parse_provider_id_tag(value: &str) -> Option<(String, String)> {
+    let (raw_provider, raw_id) = value.split_once('=').or_else(|| value.split_once('-'))?;
+    let provider = match raw_provider.trim().to_ascii_lowercase().as_str() {
+        "tmdb" | "tmdbid" => "tmdb",
+        "tvdb" | "tvdbid" => "tvdb",
+        "imdb" | "imdbid" => "imdb",
+        _ => return None,
+    };
+    let provider_id = raw_id.trim();
+    if provider_id.is_empty()
+        || provider_id.len() > 128
+        || !provider_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some((canonical_provider_name(provider), provider_id.to_owned()))
+}
+
+fn canonical_provider_name(provider: &str) -> String {
+    let mut characters = provider.chars();
+    characters
+        .next()
+        .map(|first| first.to_ascii_uppercase().to_string() + characters.as_str())
+        .unwrap_or_default()
 }
 
 pub fn has_multi_part_marker(input: &str) -> bool {

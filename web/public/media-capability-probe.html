@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="/favicon.svg" />
+    <title>Lux Web 媒体能力探针</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0b0b0b; color: #f5f5f5; }
+      body { margin: 0; padding: 32px; max-width: 960px; margin-inline: auto; }
+      h1 { font-size: 1.8rem; margin: 0 0 8px; }
+      p { color: #b8b8b8; line-height: 1.6; }
+      form { display: grid; gap: 12px; margin: 24px 0; }
+      label { display: grid; gap: 6px; color: #d7d7d7; }
+      input, select, button { border: 1px solid #454545; border-radius: 8px; background: #171717; color: inherit; padding: 10px 12px; font: inherit; }
+      button { cursor: pointer; background: #f5f5f5; color: #0b0b0b; font-weight: 700; }
+      button:disabled { cursor: wait; opacity: .6; }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      video { width: 100%; max-height: 50vh; background: #000; margin-top: 12px; }
+      pre { overflow: auto; padding: 16px; border-radius: 8px; background: #151515; color: #d7ffd7; min-height: 160px; }
+      @media (max-width: 640px) { body { padding: 20px; } .grid { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Lux Web 媒体能力探针</h1>
+      <p>此页面只在当前浏览器中测试原生 video、MediaCapabilities 和 WebCodecs，不上传或保存媒体。请使用不含个人数据的本地测试文件；URL 中的令牌不会写入结果。</p>
+      <form id="probe-form">
+        <label>媒体 URL<input id="source" type="text" placeholder="例如 /api/v1/items/.../stream?sourceId=..." required /></label>
+        <label>测试预设<select id="preset"></select></label>
+        <label>MIME 类型<input id="mime" required /></label>
+        <label>WebCodecs codec<input id="codec" required /></label>
+        <div class="grid">
+          <label>宽度<input id="width" type="number" min="1" required /></label>
+          <label>高度<input id="height" type="number" min="1" required /></label>
+          <label>码率（bit/s）<input id="bitrate" type="number" min="1" required /></label>
+          <label>帧率<input id="framerate" type="number" min="1" step="0.001" required /></label>
+        </div>
+        <button id="run" type="submit">运行探针</button>
+      </form>
+      <video id="video" controls muted playsinline preload="metadata" aria-label="媒体能力探针预览"></video>
+      <h2>结果</h2>
+      <pre id="result">尚未运行。</pre>
+    </main>
+    <script type="module" src="/media-capability-probe.js"></script>
+  </body>
+</html>

@@ -11,8 +11,9 @@ use crate::{
     application::{
         admin_events::{AdminEventHub, AdminEventScope},
         candidates::{
-            MetadataCandidateError, MetadataCandidateService, MetadataSelectionError,
-            MetadataSelectionMode, MetadataSelectionService,
+            MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
+            MetadataCandidateView, MetadataSelectionError, MetadataSelectionMode,
+            MetadataSelectionService,
         },
         scraper::{ScraperError, ScraperResolver},
         tmdb_plugin::TmdbProvider,
@@ -24,6 +25,7 @@ use crate::{
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
+const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataRefreshMode {
@@ -594,26 +596,25 @@ impl MetadataReidentifyService {
         let Some(selection) = self.selection.as_ref() else {
             return Err(MetadataReidentifyError::SelectionUnavailable);
         };
-        let Some(candidate) = page
-            .items
-            .iter()
-            .filter(|candidate| candidate.status == "PENDING")
-            .max_by(|left, right| left.score.total_cmp(&right.score))
-        else {
+        let Some(candidate) = best_pending_candidate(&page) else {
             return Err(MetadataReidentifyError::LowConfidence);
         };
-        if candidate.score < 80.0 {
-            return Err(MetadataReidentifyError::LowConfidence);
-        }
+        let needs_review = candidate.score < AUTO_MATCH_MIN_SCORE;
         let selection_mode = match mode {
             MetadataRefreshMode::FillMissing => MetadataSelectionMode::FillMissing,
             MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
             MetadataRefreshMode::Reidentify => return Ok(0),
         };
-        selection
-            .select(item_id, &candidate.id, selection_mode)
-            .await
-            .map_err(MetadataReidentifyError::Selection)?;
+        if needs_review {
+            selection
+                .select_for_review(item_id, &candidate.id, selection_mode)
+                .await
+        } else {
+            selection
+                .select(item_id, &candidate.id, selection_mode)
+                .await
+        }
+        .map_err(MetadataReidentifyError::Selection)?;
         Ok(i64::try_from(page.items.len()).unwrap_or(i64::MAX))
     }
 
@@ -801,6 +802,18 @@ impl From<StorageError> for MetadataReidentifyError {
     }
 }
 
+#[cfg(test)]
+fn best_automatic_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
+    best_pending_candidate(page).filter(|candidate| candidate.score >= AUTO_MATCH_MIN_SCORE)
+}
+
+fn best_pending_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
+    page.items
+        .iter()
+        .filter(|candidate| candidate.status == "PENDING")
+        .max_by(|left, right| left.score.total_cmp(&right.score))
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -817,5 +830,73 @@ fn metadata_reidentify_item(item: StoredMetadataReidentifyItem) -> MetadataReide
         candidate_count: item.candidate_count,
         error: item.error,
         updated_at: item.updated_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::{
+        AUTO_MATCH_MIN_SCORE, MetadataCandidatePage, MetadataCandidateView,
+        best_automatic_candidate,
+    };
+
+    fn candidate(id: &str, score: f64) -> MetadataCandidateView {
+        MetadataCandidateView {
+            id: id.to_owned(),
+            item_id: "item".to_owned(),
+            item_title: "title".to_owned(),
+            provider: "tmdb".to_owned(),
+            provider_id: id.to_owned(),
+            candidate: Value::Null,
+            score,
+            status: "PENDING".to_owned(),
+            expires_at: None,
+            field_diffs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn automatic_matching_chooses_the_highest_qualifying_score() {
+        let page = MetadataCandidatePage {
+            items: vec![
+                candidate("lower", AUTO_MATCH_MIN_SCORE),
+                candidate("higher", 90.0),
+            ],
+            total: 2,
+            offset: 0,
+            limit: 50,
+        };
+
+        assert_eq!(
+            best_automatic_candidate(&page).map(|item| item.id.as_str()),
+            Some("higher")
+        );
+    }
+
+    #[test]
+    fn automatic_matching_allows_any_candidate_when_scores_tie() {
+        let page = MetadataCandidatePage {
+            items: vec![candidate("first", 90.0), candidate("second", 90.0)],
+            total: 2,
+            offset: 0,
+            limit: 50,
+        };
+
+        let selected = best_automatic_candidate(&page).expect("tied candidate is selectable");
+        assert_eq!(selected.score, 90.0);
+    }
+
+    #[test]
+    fn automatic_matching_rejects_scores_below_threshold() {
+        let page = MetadataCandidatePage {
+            items: vec![candidate("low", AUTO_MATCH_MIN_SCORE - 0.1)],
+            total: 1,
+            offset: 0,
+            limit: 50,
+        };
+
+        assert!(best_automatic_candidate(&page).is_none());
     }
 }

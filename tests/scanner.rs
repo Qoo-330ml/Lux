@@ -67,7 +67,7 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
         config_dir: temp_dir.path().join("config"),
     };
     let media_root = temp_dir.path().join("Movies");
-    let movie_dir = media_root.join("Example Movie (2020)");
+    let movie_dir = media_root.join("Example Movie (2020) [tmdbid=999]");
     tokio::fs::create_dir_all(&movie_dir).await?;
     tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
     tokio::fs::write(movie_dir.join("ignore.txt"), b"ignore").await?;
@@ -87,6 +87,12 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
     assert_eq!(first.created_items, 1);
     assert_eq!(first.created_sources, 1);
     assert_eq!(first.skipped_files, 0);
+    let provider_ids: String = sqlx::query_scalar(
+        "SELECT provider_ids_json FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(provider_ids, r#"{"Tmdb":"999"}"#);
 
     let second = scanner.scan_movie_library(library.id).await?;
     assert_eq!(second.discovered_files, 1);

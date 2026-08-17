@@ -22,6 +22,7 @@ export function AdminSettingsPage() {
   const queryClient = useQueryClient();
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
   const [minimumMinutes, setMinimumMinutes] = useState("2");
+  const [showMetadataPending, setShowMetadataPending] = useState(true);
   const [proxyUrl, setProxyUrl] = useState("");
   const [saved, setSaved] = useState(false);
   const [proxySaved, setProxySaved] = useState(false);
@@ -30,12 +31,17 @@ export function AdminSettingsPage() {
   useEffect(() => {
     if (!settings.data) return;
     setMinimumMinutes(String(Math.round(settings.data.resumeMinTicks / 600000000)));
+    setShowMetadataPending(settings.data.mediaStrategy.showMetadataPending ?? true);
     setProxyUrl(settings.data.networkProxy?.url ?? "");
   }, [settings.data]);
 
   const save = useMutation({
     mutationFn: () => api.updateAdminSettings({
       resumeMinTicks: Number(minimumMinutes) * 600000000,
+      mediaStrategy: {
+        ...settings.data!.mediaStrategy,
+        showMetadataPending,
+      },
     }),
     onSuccess: (data) => {
       setMinimumMinutes(String(Math.round(data.resumeMinTicks / 600000000)));
@@ -93,6 +99,19 @@ export function AdminSettingsPage() {
               <em>分钟</em>
             </div>
           </label>
+          <label className="lux-admin-toggle">
+            <input
+              type="checkbox"
+              aria-label="显示媒体库待确认标记"
+              checked={showMetadataPending}
+              onChange={(event) => {
+                setSaved(false);
+                setShowMetadataPending(event.target.checked);
+              }}
+            />
+            <span>显示媒体库待确认标记</span>
+          </label>
+          <small>关闭后只隐藏卡片上的标记，不会改变待确认状态或待确认筛选。</small>
           <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={save.isPending} onClick={() => save.mutate()}>
             <Save size={16} /> {save.isPending ? "保存中…" : "保存设置"}
           </button>

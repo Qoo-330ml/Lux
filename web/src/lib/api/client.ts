@@ -16,6 +16,7 @@ import type {
   NetworkProxyDiagnostics,
   AdminUser,
   AdminMetadataCandidate,
+  AdminMetadataBatchConfirmation,
   AdminMetadataReidentifyStart,
   AdminPlugin,
   AdminPluginStore,
@@ -26,6 +27,7 @@ import type {
   DatabaseSetupInput,
   HomeResponse,
   Library,
+  LibrariesResponse,
   LuxUser,
   MediaItem,
   ItemMetadata,
@@ -231,7 +233,7 @@ export class LuxApiClient {
   }
 
   libraries() {
-    return this.request<{ libraries?: Library[] }>("/api/v1/libraries");
+    return this.request<LibrariesResponse>("/api/v1/libraries");
   }
 
   libraryItems(
@@ -440,6 +442,12 @@ export class LuxApiClient {
     );
   }
 
+  adminNotificationProviders() {
+    return this.request<{ plugins?: AdminPlugin[]; total?: number; page?: number; pageSize?: number }>(
+      "/api/v1/admin/notification-providers?page=1&pageSize=50",
+    );
+  }
+
   adminWebhookDestinations() {
     return this.request<{ destinations?: AdminWebhookDestination[]; page?: number; pageSize?: number }>(
       "/api/v1/admin/notification-destinations?page=1&pageSize=50",
@@ -454,6 +462,8 @@ export class LuxApiClient {
     eventTypes: string[];
     payloadFormat: "LUX" | "EMBY";
     secret?: string;
+    providerPluginId?: string;
+    providerConfig?: Record<string, unknown>;
   }) {
     return this.request<{ destination: AdminWebhookDestination; secret: string }>(
       "/api/v1/admin/notification-destinations",
@@ -468,6 +478,8 @@ export class LuxApiClient {
     allowPrivateNetwork?: boolean;
     eventTypes?: string[];
     payloadFormat?: "LUX" | "EMBY";
+    providerPluginId?: string;
+    providerConfig?: Record<string, unknown>;
   }) {
     return this.request<{ destination: AdminWebhookDestination }>(
       `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}`,
@@ -771,6 +783,13 @@ export class LuxApiClient {
     return this.request<AdminSettings>("/api/v1/admin/settings", {
       method: "PATCH",
       body: JSON.stringify(input),
+    });
+  }
+
+  confirmAdminMetadata(itemIds: string[]) {
+    return this.request<AdminMetadataBatchConfirmation>("/api/v1/admin/metadata/confirm", {
+      method: "POST",
+      body: JSON.stringify({ itemIds }),
     });
   }
 

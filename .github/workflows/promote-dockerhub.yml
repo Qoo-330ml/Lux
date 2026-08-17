@@ -9,13 +9,25 @@ env:
 
 jobs:
   promote:
-    name: Promote test to latest
+    name: Promote test to latest and version
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
 
     steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Read Lux version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "luxd") | .version')"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -26,14 +38,18 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Promote test manifest to latest
+      - name: Promote test manifest to latest and version
         shell: bash
         run: |
           set -euo pipefail
           source_image="docker.io/${IMAGE_NAMESPACE}/${IMAGE_NAME}:test"
-          target_image="docker.io/${IMAGE_NAMESPACE}/${IMAGE_NAME}:latest"
+          latest_image="docker.io/${IMAGE_NAMESPACE}/${IMAGE_NAME}:latest"
+          version_image="docker.io/${IMAGE_NAMESPACE}/${IMAGE_NAME}:v${{ steps.version.outputs.version }}"
 
           docker buildx imagetools inspect "$source_image"
           docker buildx imagetools create \
-            --tag "$target_image" \
+            --tag "$latest_image" \
+            "$source_image"
+          docker buildx imagetools create \
+            --tag "$version_image" \
             "$source_image"

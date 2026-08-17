@@ -1,17 +1,25 @@
 .lux-notifications-page { display: grid; gap: 18px; }
 .lux-notifications-heading { margin-bottom: 0; }
 .lux-notifications-create { border-bottom: 1px solid var(--lux-line-soft); }
-.lux-notification-form, .lux-notification-edit-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.lux-notification-form > label, .lux-notification-edit-form > label { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
-.lux-notification-form input, .lux-notification-form select, .lux-notification-edit-form input, .lux-notification-edit-form select { min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
-.lux-notification-form input:focus, .lux-notification-form select:focus, .lux-notification-edit-form input:focus, .lux-notification-edit-form select:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.lux-notification-form, .lux-notification-edit-form { display: grid; gap: 16px; }
+.lux-notification-section { display: grid; gap: 10px; min-width: 0; padding: 0 0 16px; border: 0; border-bottom: 1px solid var(--lux-line-soft); }
+.lux-notification-section legend { margin-bottom: 2px; color: var(--lux-text); font-size: .86rem; font-weight: 600; }
+.lux-notification-form label, .lux-notification-edit-form label { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
+.lux-notification-form input:not([type="checkbox"]):not([type="radio"]), .lux-notification-form select, .lux-notification-edit-form input:not([type="checkbox"]):not([type="radio"]), .lux-notification-edit-form select { min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
+.lux-notification-form input:not([type="checkbox"]):not([type="radio"]):focus, .lux-notification-form select:focus, .lux-notification-edit-form input:not([type="checkbox"]):not([type="radio"]):focus, .lux-notification-edit-form select:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
 .lux-notification-form > button { justify-self: start; }
-.lux-notification-events { grid-column: 1 / -1; min-width: 0; padding: 0; border: 0; }
+.lux-notification-events { min-width: 0; padding: 0; border: 0; }
 .lux-notification-events legend { margin-bottom: 9px; color: var(--lux-muted); font-size: .74rem; }
 .lux-notification-event-grid { display: flex; flex-wrap: wrap; gap: 8px 18px; }
 .lux-notification-event-grid label { display: flex; align-items: center; gap: 7px; min-height: 32px; color: var(--lux-text); font-size: .82rem; }
 .lux-notification-event-grid input { width: 16px; min-height: 16px; accent-color: var(--lux-accent); }
 .lux-notification-events small { display: block; margin-top: 7px; color: var(--lux-subtle); font-size: .72rem; }
+.lux-notification-target-grid, .lux-notification-config-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.lux-notification-config-grid .lux-notification-config-toggle { align-self: end; }
+.lux-notification-provider-description, .lux-notification-config small, .lux-notification-section > small { margin: 0; color: var(--lux-subtle); font-size: .72rem; }
+.lux-notification-provider-empty { display: flex; align-items: center; gap: 10px; color: var(--lux-muted); font-size: .8rem; }
+.lux-notification-provider-empty p { margin: 0; }
+.lux-notification-provider-empty a { color: var(--lux-accent); }
 .lux-notification-destination-list, .lux-notification-delivery-list { display: grid; gap: 10px; }
 .lux-notification-destination { display: grid; gap: 14px; padding: 16px 0; border-top: 1px solid var(--lux-line-soft); }
 .lux-notification-destination-summary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 12px; }
@@ -33,6 +41,6 @@
 .lux-notification-secret { width: min(560px, 100%); padding: 22px; border: 1px solid var(--lux-line); border-radius: 14px; background: var(--lux-panel); box-shadow: 0 22px 80px rgba(0,0,0,.35); }
 .lux-notification-secret code { display: block; overflow-wrap: anywhere; padding: 14px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-text); background: rgba(255,255,255,.05); font-size: .82rem; }
 .lux-notification-secret-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-@media (max-width: 720px) { .lux-notification-form, .lux-notification-edit-form { grid-template-columns: 1fr; } .lux-notification-events { grid-column: auto; } .lux-notification-destination-summary { grid-template-columns: auto minmax(0, 1fr); } .lux-notification-destination-summary > .lux-user-badge { grid-column: 2; justify-self: start; } .lux-notification-delivery { grid-template-columns: minmax(0, 1fr) auto; } .lux-notification-delivery > .lux-icon-button { grid-column: 2; grid-row: 1; } }
-html[data-lux-theme="light"] .lux-notification-form input, html[data-lux-theme="light"] .lux-notification-edit-form input { color: var(--lux-text); background: rgba(28,28,34,.04); }
+@media (max-width: 720px) { .lux-notification-target-grid, .lux-notification-config-grid { grid-template-columns: 1fr; } .lux-notification-destination-summary { grid-template-columns: auto minmax(0, 1fr); } .lux-notification-destination-summary > .lux-user-badge { grid-column: 2; justify-self: start; } .lux-notification-delivery { grid-template-columns: minmax(0, 1fr) auto; } .lux-notification-delivery > .lux-icon-button { grid-column: 2; grid-row: 1; } }
+html[data-lux-theme="light"] .lux-notification-form input:not([type="checkbox"]):not([type="radio"]), html[data-lux-theme="light"] .lux-notification-edit-form input:not([type="checkbox"]):not([type="radio"]) { color: var(--lux-text); background: rgba(28,28,34,.04); }
 html[data-lux-theme="light"] .lux-notification-form select, html[data-lux-theme="light"] .lux-notification-edit-form select { color: var(--lux-text); background: rgba(28,28,34,.04); }

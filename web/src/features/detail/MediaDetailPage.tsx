@@ -120,9 +120,14 @@ export function MediaDetailPage() {
   const source = sources.find((entry) => entry.id === selectedSourceId)
     ?? sources.find((entry) => entry.isDefault)
     ?? sources[0];
+  const nextPlayableEpisode = !source && (isSeries || isSeason)
+    ? selectNextPlayableEpisode(episodes.data?.items ?? [])
+    : undefined;
   const watchHref = source
     ? `/watch/${media.id}?sourceId=${encodeURIComponent(source.id)}`
-    : `/watch/${media.id}`;
+    : nextPlayableEpisode
+      ? `/watch/${nextPlayableEpisode.id}`
+      : undefined;
   const pendingReviewItems = pendingItems.data?.items ?? [];
   const pendingIndex = pendingReviewItems.findIndex((entry) => entry.id === media.id);
   const nextPendingItem = pendingIndex >= 0
@@ -229,7 +234,17 @@ export function MediaDetailPage() {
             </div>
             <ExpandableOverview overview={media.overview || "暂无简介。"} />
             <div className="lux-hero-actions">
-              <Link className="lux-button lux-button-primary" to={watchHref}><Play size={17} fill="currentColor" /> 播放</Link>
+              {watchHref ? (
+                <Link className="lux-button lux-button-primary" to={watchHref}><Play size={17} fill="currentColor" /> 播放</Link>
+              ) : (
+                <button
+                  className="lux-button lux-button-primary"
+                  type="button"
+                  onClick={() => setActionNotice(episodes.isPending ? "正在查找可播放单集，请稍候。" : "没有可播放的单集。")}
+                >
+                  <Play size={17} fill="currentColor" /> 播放
+                </button>
+              )}
               <button className="lux-button lux-button-glass" type="button" data-action="toggle-favorite" aria-pressed={Boolean(playback.data?.isFavorite)} disabled={pendingPlaybackAction !== undefined} onClick={() => void updatePlaybackFlag("favorite")}>
                 <Heart size={17} fill={playback.data?.isFavorite ? "currentColor" : "none"} /> {playback.data?.isFavorite ? "已收藏" : "收藏"}
               </button>
@@ -294,6 +309,13 @@ export function MediaDetailPage() {
 function runtimeTicksFromMinutes(minutes?: number | null) {
   if (minutes == null || !Number.isFinite(minutes) || minutes < 0) return undefined;
   return minutes * 60 * 10_000_000;
+}
+
+function selectNextPlayableEpisode(episodes: MediaItem[]) {
+  const playableEpisodes = episodes.filter((episode) =>
+    episode.itemType === "EPISODE" && (episode.mediaSources?.length ?? 0) > 0,
+  );
+  return playableEpisodes.find((episode) => !episode.userData?.isPlayed) ?? playableEpisodes[0];
 }
 
 function ExpandableOverview({ overview }: { overview: string }) {

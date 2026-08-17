@@ -359,10 +359,20 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(low_confidence_job.status, "COMPLETED");
     assert_eq!(low_confidence_job.items[0].status, "COMPLETED");
-    assert_eq!(
-        low_confidence_job.items[0].error.as_deref(),
-        Some("LOW_CONFIDENCE")
-    );
+    assert_eq!(low_confidence_job.items[0].error, None);
+    let low_confidence_item: (String, String) =
+        sqlx::query_as("SELECT title, identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(low_confidence_item.0, "Batch Movie");
+    assert_eq!(low_confidence_item.1, "PENDING");
+    let low_confidence_candidate_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE item_id = ? LIMIT 1")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(low_confidence_candidate_status, "PENDING");
 
     sqlx::query("UPDATE media_items SET title = '', sort_title = '' WHERE id = ?")
         .bind(&item_id)

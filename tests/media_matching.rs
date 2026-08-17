@@ -63,3 +63,43 @@ fn removes_cd_part_marker_from_movie_title() {
 
     assert_eq!(parsed.title, "FC22378556无码");
 }
+
+#[test]
+fn parses_emby_tmdb_id_tags_without_polluting_movie_title() {
+    for (tag, expected_id) in [
+        ("[tmdbid=36557]", "36557"),
+        ("[tmdbid-36557]", "36557"),
+        ("[tmdb=36557]", "36557"),
+        ("[tmdb-36557]", "36557"),
+        ("{tmdbid=36557}", "36557"),
+        ("{tmdb-36557}", "36557"),
+        ("{tmdb=36557}", "36557"),
+        ("{tmdbid-36557}", "36557"),
+    ] {
+        let parsed = parse_media_name(&format!("Casino Royale (2006) {tag}.mkv"), MediaKind::Movie)
+            .expect("movie name");
+
+        assert_eq!(parsed.title, "Casino Royale");
+        assert_eq!(parsed.production_year, Some(2006));
+        assert_eq!(
+            parsed.provider_ids.get("Tmdb"),
+            Some(&expected_id.to_owned())
+        );
+    }
+}
+
+#[test]
+fn parses_emby_tmdb_id_tags_from_series_and_episode_names() {
+    let series = parse_media_name("The Vampire Diaries (2009) {tmdb-18148}", MediaKind::Series)
+        .expect("series name");
+    assert_eq!(series.title, "The Vampire Diaries");
+    assert_eq!(series.provider_ids.get("Tmdb"), Some(&"18148".to_owned()));
+
+    let episode = parse_media_name(
+        "The Vampire Diaries S01E01 [tmdbid=18148].mkv",
+        MediaKind::Episode,
+    )
+    .expect("episode name");
+    assert_eq!(episode.title, "The Vampire Diaries");
+    assert_eq!(episode.provider_ids.get("Tmdb"), Some(&"18148".to_owned()));
+}

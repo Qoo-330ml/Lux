@@ -21,11 +21,12 @@ use crate::{
             CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, ChapterDetectRpcRequest, ChapterDetectRpcResult,
             ChapterLookupRpcRequest, ChapterLookupRpcResult, IP_LOCATION_CAPABILITY,
             IpLocationRpcRequest, IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
-            MediaProbeRpcStreamType, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
-            PLUGIN_CATEGORY_SCRAPER, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_IP_LOCATION,
-            PLUGIN_TYPE_STRM_RESOLVER, PluginConfigField, PluginConfigOption,
-            STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD, StrmResolveRpcRequest,
-            StrmResolveRpcResult, StrmResolveStatus,
+            MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD,
+            NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
+            PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_CATEGORY_SCRAPER, PLUGIN_TYPE_CHAPTER_DETECTOR,
+            PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
+            PluginConfigField, PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
+            StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex},
@@ -249,6 +250,32 @@ impl PluginService {
         limit: i64,
     ) -> Result<PluginPage, PluginServiceError> {
         self.list_filtered(offset, limit, true).await
+    }
+
+    pub async fn list_notification_plugins(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<PluginPage, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let mut views = Vec::new();
+        for plugin in &catalog.plugins {
+            if !is_notification_plugin(plugin) {
+                continue;
+            }
+            let (installed, enabled) = self.plugin_state(&plugin.manifest.id).await?;
+            views.push(self.dynamic_view(plugin, installed, enabled).await?);
+        }
+        views.sort_by(|left, right| left.id.cmp(&right.id));
+        let total = i64::try_from(views.len()).unwrap_or(i64::MAX);
+        let start = offset.max(0).min(total) as usize;
+        let end = offset.max(0).saturating_add(limit.max(0)).min(total) as usize;
+        Ok(PluginPage {
+            plugins: views[start..end].to_vec(),
+            total,
+            offset,
+            limit,
+        })
     }
 
     async fn list_filtered(
@@ -499,6 +526,56 @@ impl PluginService {
             .call(&plugin_id, method, params)
             .await
             .map_err(PluginServiceError::Runtime)
+    }
+
+    pub async fn call_notification(
+        &self,
+        plugin_id: &str,
+        params: Value,
+    ) -> Result<NotificationSendRpcResult, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_notification_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        let (installed, enabled) = self.plugin_state(&plugin_id).await?;
+        if !installed || !enabled {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        let value = self
+            .supervisor
+            .call_without_config_access(&plugin_id, NOTIFICATION_SEND_METHOD, params)
+            .await
+            .map_err(PluginServiceError::Runtime)?;
+        if serde_json::to_vec(&value)
+            .ok()
+            .is_none_or(|bytes| bytes.len() > 256 * 1024)
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)
+    }
+
+    pub async fn validate_notification_provider(
+        &self,
+        plugin_id: &str,
+    ) -> Result<(), PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_notification_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        let (installed, enabled) = self.plugin_state(&plugin_id).await?;
+        if !installed || !enabled {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        Ok(())
     }
 
     pub async fn lookup_ip_location(
@@ -2181,6 +2258,16 @@ fn is_chapter_lookup_plugin(plugin: &DiscoveredPlugin) -> bool {
             .capabilities
             .iter()
             .any(|capability| capability == CHAPTER_LOOKUP_CAPABILITY)
+}
+
+fn is_notification_plugin(plugin: &DiscoveredPlugin) -> bool {
+    plugin.manifest.plugin_type == PLUGIN_TYPE_NOTIFICATION
+        && plugin.manifest.category == PLUGIN_CATEGORY_NOTIFICATION
+        && plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == NOTIFICATION_SEND_CAPABILITY)
 }
 
 fn validate_chapter_detect_request(

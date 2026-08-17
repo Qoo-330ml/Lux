@@ -15,8 +15,31 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.7",
+    date: "2026-08-17",
+    sections: [
+      { kind: "added", items: [
+        "增加 Web 端 Matroska/HEVC+AAC 客户端播放回退，支持浏览器端解复用、Worker/WASM 处理和 MSE 播放。",
+        "增加 Matroska HEVC 的 AC-3/E-AC-3 音频回退，并完善浏览器端 MSE 播放链路。",
+        "增加播放器完整控制栏，支持进度拖动、音量、倍速、全屏、画中画和键盘快捷键。",
+        "Emby GET /Persons 增强 Recursive、Fields、排序和 DateCreated 兼容字段，支持跨条目人物聚合。",
+        "增加媒体库待确认内容的批量确认操作和可配置的待确认标记。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 Matroska 流式处理和 HEVC+AAC 播放链路的兼容问题，提升非原生浏览器播放稳定性。",
+        "修复浏览器 MKV remux 中 HEVC 配置保留和播放引擎选择问题。",
+        "修复低置信度元数据应用后被错误标记为已确认的问题，并修复剧集播放未跳转到下一集的问题。",
+      ] },
+      { kind: "changed", items: [
+        "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
+        "完善人物列表分页和字段投影行为，保持 Emby 客户端兼容请求的响应结构。",
+        "完善播放器对音频编码选择、播放状态上报和下一集导航的处理。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.6",
-    date: "2026-08-16",
+    date: "2026-08-17",
     sections: [
       { kind: "added", items: [
         "增加 Emby GET /Library/VirtualFolders 接口，返回管理员可见的媒体库虚拟文件夹、根路径、集合类型和刷新状态。",
@@ -24,6 +47,9 @@ export const changelogReleases: ChangelogRelease[] = [
         "增加持久化出站 Webhook 通知，支持媒体、扫描、元数据和后台任务事件。",
         "Webhook 增加播放边沿/节流进度事件，并支持 Lux 原生与有限 Emby 风格 payload 选择。",
         "增加管理员通知页面，支持 Webhook 目标管理、Secret 轮换、测试发送和失败投递重试。",
+        "通知 outbox 支持绑定独立 notification provider 插件；宿主统一处理事件、重试和恢复，旧 Webhook 目标保持兼容。",
+        "增加独立 Web 媒体能力探针，支持检测原生 video、MediaCapabilities 和 WebCodecs 能力。",
+        "增加客户端 HEVC 播放回退，支持 MP4/fMP4、Worker/WASM 解码、MSE 输出和首段可播后的流式处理。",
         "增加 Emby GET /Persons 人物列表接口，支持分页、媒体库权限和共享 API Key。",
       ] },
       { kind: "fixed", items: [
@@ -31,12 +57,16 @@ export const changelogReleases: ChangelogRelease[] = [
         "加强 Webhook 管理权限、CSRF、SSRF 和事件 payload 字段白名单校验，避免敏感数据外泄。",
         "修复人物索引回填和人物列表查询中 provider identity 丢失的问题。",
         "修复混合媒体库首次扫描时未创建电影父级文件夹的问题。",
+        "修复 Emby 播放请求重复查询参数的解析问题，并改善 HEVC .strm 回退的跨域与 4K 编码能力探测。",
       ] },
       { kind: "changed", items: [
         "完善虚拟文件夹的 LibraryOptions、PathInfos 和 TypeOptions 字段，映射媒体库策略、字幕语言和播放恢复设置，提升 Emby 客户端兼容性。",
         "完善虚拟文件夹媒体库身份字段，确保 Id、Guid 和 ItemId 使用同一个稳定的媒体库 ID。",
         "使用持久化人物出演索引支持人物查询，并在服务启动时回填既有人物关系。",
         "调整反向代理转发头处理，支持无代理地址白名单时识别 X-Forwarded-For 和 X-Forwarded-Proto，远程访问继续由账号认证和媒体库 ACL 控制。",
+        "元数据匹配支持复用文件名/目录中的 provider ID，并收紧标题与年份相似度评分，减少错误自动匹配。",
+        "客户端 HEVC 回退会报告处理速度；4K 样本未达到实时性能时显示降级提示，不虚报实时兼容性。",
+        "Docker 镜像流水线按 Lux 版本生成稳定标签，并将测试构建与发布 promotion 分离。",
       ] },
     ],
   },

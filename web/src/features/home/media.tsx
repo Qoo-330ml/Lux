@@ -96,7 +96,7 @@ export function EpisodeCount({ item }: { item: MediaItem }) {
   return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
 }
 
-export function MediaCard({ item, landscape = false, compactRating = false, metadataAttention = false, detailSearch }: { item: MediaItem; landscape?: boolean; compactRating?: boolean; metadataAttention?: boolean; detailSearch?: string }) {
+export function MediaCard({ item, landscape = false, compactRating = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; compactRating?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; onSelectionChange?: (selected: boolean) => void }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
@@ -142,8 +142,21 @@ export function MediaCard({ item, landscape = false, compactRating = false, meta
 
   return (
     <>
-      <article className={landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card"}>
+      <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")}>
         <div className="lux-media-art-shell">
+          {selectionMode ? (
+            <label className="lux-media-selection-control">
+              <input
+                className="lux-media-selection-checkbox"
+                type="checkbox"
+                aria-label={`选择 ${mediaTitle(item)}`}
+                checked={selected}
+                onChange={(event) => onSelectionChange?.(event.target.checked)}
+                onClick={(event) => event.stopPropagation()}
+              />
+              <span aria-hidden="true" />
+            </label>
+          ) : null}
           <Link className="lux-media-card-link" to={detailHref} aria-label={`查看 ${mediaTitle(item)} 详情`}>
             <div className="lux-media-art">
               {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}

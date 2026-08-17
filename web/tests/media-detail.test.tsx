@@ -82,6 +82,142 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-episode-list")).toBeNull();
   });
 
+  it("starts the first unplayed playable episode from a series detail", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "series-1",
+      title: "示例剧集",
+      itemType: "SERIES",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
+      items: options?.itemType === "SEASON"
+        ? [{ id: "season-1", title: "第一季", itemType: "SEASON" }]
+        : [
+          { id: "episode-1", title: "第一集", itemType: "EPISODE", mediaSources: [{ id: "source-1" }], userData: { isPlayed: true } },
+          { id: "episode-2", title: "第二集", itemType: "EPISODE", mediaSources: [{ id: "source-2" }] },
+        ],
+      total: 2,
+      page: 1,
+      pageSize: 60,
+    }));
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/series-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector<HTMLAnchorElement>(".lux-detail-copy a.lux-button-primary")?.getAttribute("href"))
+      .toBe("/watch/episode-2");
+  });
+
+  it("starts the first unplayed playable episode from a season detail", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "season-1",
+      title: "第一季",
+      itemType: "SEASON",
+      parentId: "series-1",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({
+      items: [
+        { id: "episode-1", title: "第一集", itemType: "EPISODE", mediaSources: [{ id: "source-1" }], userData: { isPlayed: true } },
+        { id: "episode-2", title: "第二集", itemType: "EPISODE", mediaSources: [{ id: "source-2" }] },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 60,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/season-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector<HTMLAnchorElement>(".lux-detail-copy a.lux-button-primary")?.getAttribute("href"))
+      .toBe("/watch/episode-2");
+  });
+
+  it("falls back to the first playable episode when every episode is played", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "season-1",
+      title: "第一季",
+      itemType: "SEASON",
+      parentId: "series-1",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({
+      items: [
+        { id: "episode-1", title: "第一集", itemType: "EPISODE", mediaSources: [{ id: "source-1" }], userData: { isPlayed: true } },
+        { id: "episode-2", title: "第二集", itemType: "EPISODE", mediaSources: [{ id: "source-2" }], userData: { isPlayed: true } },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 60,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/season-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector<HTMLAnchorElement>(".lux-detail-copy a.lux-button-primary")?.getAttribute("href"))
+      .toBe("/watch/episode-1");
+  });
+
   it("shows the available series metadata in the detail hero", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "series-1",

@@ -267,6 +267,89 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
 }
 
 #[tokio::test]
+async fn batch_confirmation_selects_the_highest_scored_pending_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let low_candidate_id = Uuid::now_v7().to_string();
+    let high_candidate_id = Uuid::now_v7().to_string();
+    for (candidate_id, provider_id, score, title) in [
+        (&low_candidate_id, "601", 72.0_f64, "低分候选"),
+        (&high_candidate_id, "602", 88.0_f64, "高分候选"),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_candidates
+             (id, item_id, provider, provider_id, candidate_json, score, status)
+             VALUES (?, ?, 'TMDB', ?, ?, ?, 'PENDING')",
+        )
+        .bind(candidate_id)
+        .bind(&fixture.item_id)
+        .bind(provider_id)
+        .bind(json!({ "title": title, "productionYear": 2020 }).to_string())
+        .bind(score)
+        .execute(fixture.database.pool())
+        .await?;
+    }
+    let service = ImageWriteService::new(fixture.database.clone())?;
+    let selection = MetadataSelectionService::new(fixture.database.clone(), service);
+
+    let report = selection.confirm_best_pending(&fixture.item_id).await?;
+
+    assert_eq!(report.candidate_id, high_candidate_id);
+    assert_eq!(report.status, "ONLINE_CONFIRMED");
+    let high_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+            .bind(&high_candidate_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(high_status, "SELECTED");
+    let low_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+            .bind(&low_candidate_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(low_status, "REJECTED");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_batch_confirm_pending_metadata_items() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = prepare_fixture(false).await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({ "title": "待确认候选", "productionYear": 2020 }),
+    )
+    .await?;
+    let (base_url, lux_server) = start_lux(&fixture).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = login(&client, &base_url).await?;
+
+    let response = client
+        .post(format!("{base_url}/api/v1/admin/metadata/confirm"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "itemIds": [fixture.item_id] }))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["confirmedCount"], 1);
+    assert_eq!(body["failedCount"], 0);
+    assert_eq!(body["failedItemIds"], json!([]));
+    let status: String = sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+        .bind(candidate_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    assert_eq!(status, "SELECTED");
+
+    lux_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_selection_persists_cast_in_config_and_detail_api()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
@@ -788,22 +871,27 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         .bind(&library_id)
         .execute(fixture.database.pool())
         .await?;
+    sqlx::query("UPDATE media_items SET provider_ids_json = ? WHERE id = ?")
+        .bind(r#"{"Tmdb":"999"}"#)
+        .bind(&fixture.item_id)
+        .execute(fixture.database.pool())
+        .await?;
 
-    let tmdb_app = Router::new().fallback(any(|| async {
-        Json(json!({
-            "page": 1,
-            "total_pages": 1,
-            "total_results": 1,
-            "results": [{
-                "id": 999,
-                "title": "Example Movie",
-                "original_title": "Example Movie",
-                "overview": "Automatically matched overview.",
-                "release_date": "2020-04-01",
-                "original_language": "en"
-            }]
-        }))
-    }));
+    let tmdb_app = Router::new()
+        .route(
+            "/3/movie/999",
+            get(|| async {
+                Json(json!({
+                    "id": 999,
+                    "title": "Example Movie",
+                    "original_title": "Example Movie",
+                    "overview": "Automatically matched overview.",
+                    "release_date": "2020-04-01",
+                    "original_language": "en"
+                }))
+            }),
+        )
+        .fallback(any(|| async { (StatusCode::NOT_FOUND, Json(json!({}))) }));
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
@@ -855,6 +943,13 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     assert_eq!(status, "ONLINE_CONFIRMED");
     let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<plot>Automatically matched overview.</plot>"));
+    let score: f64 = sqlx::query_scalar(
+        "SELECT score FROM metadata_candidates WHERE item_id = ? AND status = 'SELECTED' LIMIT 1",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(score, 100.0);
     let mode: String = sqlx::query_scalar(
         "SELECT mode FROM metadata_reidentify_jobs ORDER BY created_at DESC LIMIT 1",
     )

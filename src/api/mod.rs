@@ -10,7 +10,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, RawQuery, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
@@ -88,7 +88,7 @@ use crate::{
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
-        webhooks::{WebhookError, WebhookEventType, WebhookService},
+        webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
@@ -108,8 +108,8 @@ use crate::{
     },
     security::LoginRateLimiter,
     storage::{
-        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError,
-        StoredPlaybackSession,
+        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, PersonListOptions,
+        PersonSort, StorageError, StoredPlaybackSession,
     },
 };
 use tokio::{
@@ -246,7 +246,9 @@ impl AppState {
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
         let chapter_detection = ChapterDetectionService::new(database.clone(), plugins.clone());
-        let webhooks = match WebhookService::new(database.clone(), config_dir.clone()) {
+        let webhooks = match WebhookService::new(database.clone(), config_dir.clone())
+            .map(|service| service.with_plugins(plugins.clone()))
+        {
             Ok(service) => Some(service),
             Err(error) => {
                 tracing::error!(%error, "failed to initialize webhook notifications");
@@ -624,6 +626,10 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
         .route(
+            "/api/v1/admin/notification-providers",
+            get(admin_list_notification_providers),
+        )
+        .route(
             "/api/v1/admin/chapter-sources",
             get(admin_list_chapter_sources),
         )
@@ -674,6 +680,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/metadata/reidentify",
             get(admin_list_metadata_reidentify).post(admin_start_metadata_reidentify),
+        )
+        .route(
+            "/api/v1/admin/metadata/confirm",
+            post(admin_confirm_metadata),
         )
         .route(
             "/api/v1/admin/metadata/reidentify/{job_id}",
@@ -1718,6 +1728,12 @@ struct EmbyPersonsQuery {
     start_index: Option<i64>,
     #[serde(rename = "Limit", alias = "limit", default)]
     limit: Option<i64>,
+    #[serde(rename = "Recursive", alias = "recursive", default)]
+    recursive: Option<bool>,
+    #[serde(rename = "SortBy", alias = "sortBy", default)]
+    sort_by: Option<String>,
+    #[serde(rename = "SortOrder", alias = "sortOrder", default)]
+    sort_order: Option<String>,
 }
 
 async fn require_emby_token(
@@ -2273,6 +2289,24 @@ async fn emby_persons(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
+    // Keep the historical Lux behavior for clients that omit Recursive. An
+    // explicit false still requests only direct children.
+    let recursive = query.recursive.unwrap_or(true);
+    let sort_by = match emby_person_sort(query.sort_by.as_deref()) {
+        Ok(sort_by) => sort_by,
+        Err(status) => return status.into_response(),
+    };
+    let descending = match emby_person_sort_order(query.sort_order.as_deref()) {
+        Ok(descending) => descending,
+        Err(status) => return status.into_response(),
+    };
+    let options = PersonListOptions {
+        recursive,
+        sort_by,
+        descending,
+        offset,
+        limit,
+    };
     let person_type = match emby_person_type_filter(query.person_types.as_deref()) {
         Some(person_type) => person_type,
         None => {
@@ -2290,12 +2324,12 @@ async fn emby_persons(
     let result = match query.parent_id.as_deref() {
         Some(parent_id) => {
             people
-                .list_library_actors(parent_id, person_type, offset, limit)
+                .list_library_actors(parent_id, person_type, options)
                 .await
         }
         None => {
             people
-                .list_libraries_actors(&library_ids, person_type, offset, limit)
+                .list_libraries_actors(&library_ids, person_type, options)
                 .await
         }
     };
@@ -2305,7 +2339,12 @@ async fn emby_persons(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(json!({
-        "Items": actors.into_iter().map(emby_person_json).collect::<Vec<_>>(),
+        "Items": actors
+            .into_iter()
+            .map(|actor| {
+                emby_person_json_with_fields(actor, &state.server_id, query.auth.fields.as_deref())
+            })
+            .collect::<Vec<_>>(),
         "TotalRecordCount": total,
         "StartIndex": offset,
     }))
@@ -3107,7 +3146,10 @@ async fn emby_catalog_items_for_user_with_preferred_source(
                 None => Vec::new(),
             };
             if let Value::Object(object) = &mut value {
-                let mut people = actors.into_iter().map(emby_person_json).collect::<Vec<_>>();
+                let mut people = actors
+                    .into_iter()
+                    .map(|actor| emby_person_json(actor, &state.server_id))
+                    .collect::<Vec<_>>();
                 if let Some(nfo) = nfo.as_ref() {
                     people.extend(emby_nfo_crew_json(nfo));
                 }
@@ -3591,7 +3633,10 @@ async fn emby_item_response(
                 None => Vec::new(),
             };
             if let Value::Object(object) = &mut item_json {
-                let mut people = actors.into_iter().map(emby_person_json).collect::<Vec<_>>();
+                let mut people = actors
+                    .into_iter()
+                    .map(|actor| emby_person_json(actor, &state.server_id))
+                    .collect::<Vec<_>>();
                 if let Some(nfo) = nfo.as_ref() {
                     people.extend(emby_nfo_crew_json(nfo));
                 }
@@ -3665,23 +3710,73 @@ async fn emby_person_image_response(
     .await
 }
 
-fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
+fn emby_person_json(actor: crate::application::people::ActorView, server_id: &str) -> Value {
+    emby_person_json_with_fields(actor, server_id, None)
+}
+
+fn emby_person_json_with_fields(
+    actor: crate::application::people::ActorView,
+    server_id: &str,
+    fields: Option<&str>,
+) -> Value {
     let image_tag = actor
         .image_url
         .as_ref()
         .map(|_| emby_person_image_tag(&actor.id));
-    json!({
-        "Name": actor.name,
-        "Id": actor.id,
-        "Role": actor.character,
-        "Type": "Actor",
-        "PrimaryImageTag": image_tag,
-        "Overview": actor.biography,
-        "BirthDate": actor.birthday,
-        "DeathDate": actor.deathday,
-        "KnownForDepartment": actor.known_for_department,
-        "PlaceOfBirth": actor.place_of_birth,
-    })
+    let include = |field| fields.is_none_or(|fields| emby_fields_include(Some(fields), field));
+    let image_tags = image_tag
+        .clone()
+        .map(|tag| json!({"Primary": tag}))
+        .unwrap_or_else(|| json!({}));
+    let mut object = serde_json::Map::from_iter([
+        ("Name".to_owned(), json!(actor.name)),
+        ("ServerId".to_owned(), json!(server_id)),
+        ("Id".to_owned(), json!(actor.id)),
+        ("Type".to_owned(), json!("Person")),
+        ("ImageTags".to_owned(), image_tags),
+        ("BackdropImageTags".to_owned(), json!([])),
+    ]);
+    if include("Role")
+        && let Some(role) = actor.character
+    {
+        object.insert("Role".to_owned(), json!(role));
+    }
+    if include("PrimaryImageTag")
+        && let Some(image_tag) = image_tag
+    {
+        object.insert("PrimaryImageTag".to_owned(), json!(image_tag));
+    }
+    if include("Overview")
+        && let Some(overview) = actor.biography
+    {
+        object.insert("Overview".to_owned(), json!(overview));
+    }
+    if include("BirthDate")
+        && let Some(birthday) = actor.birthday
+    {
+        object.insert("BirthDate".to_owned(), json!(birthday));
+    }
+    if include("DeathDate")
+        && let Some(deathday) = actor.deathday
+    {
+        object.insert("DeathDate".to_owned(), json!(deathday));
+    }
+    if include("KnownForDepartment")
+        && let Some(known_for_department) = actor.known_for_department
+    {
+        object.insert("KnownForDepartment".to_owned(), json!(known_for_department));
+    }
+    if include("PlaceOfBirth")
+        && let Some(place_of_birth) = actor.place_of_birth
+    {
+        object.insert("PlaceOfBirth".to_owned(), json!(place_of_birth));
+    }
+    if include("DateCreated")
+        && let Some(date_created) = actor.date_created.and_then(emby_timestamp)
+    {
+        object.insert("DateCreated".to_owned(), Value::String(date_created));
+    }
+    Value::Object(object)
 }
 
 fn emby_stable_named_id(kind: &str, name: &str) -> String {
@@ -3768,9 +3863,10 @@ fn emby_person_image_tag(person_id: &str) -> String {
 async fn emby_playback_info(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -4734,10 +4830,40 @@ fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
 fn emby_person_page_params(query: &EmbyPersonsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
-    if offset < 0 || !(1..=100).contains(&limit) {
+    if offset < 0 || limit < 1 {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
+}
+
+fn emby_person_sort(value: Option<&str>) -> Result<PersonSort, StatusCode> {
+    match value
+        .unwrap_or("Name")
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Name")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "name" => Ok(PersonSort::Name),
+        "datecreated" => Ok(PersonSort::DateCreated),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+fn emby_person_sort_order(value: Option<&str>) -> Result<bool, StatusCode> {
+    match value
+        .unwrap_or("Ascending")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ascending" => Ok(false),
+        "descending" => Ok(true),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 fn emby_person_type_filter(person_types: Option<&str>) -> Option<&'static str> {
@@ -7729,6 +7855,13 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let show_metadata_pending = match read_media_strategy_settings(database).await {
+        Ok(settings) => settings.show_metadata_pending,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     match libraries.list_libraries().await {
         Ok(views) => {
@@ -7750,7 +7883,11 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
                     }));
                 }
             }
-            Json(json!({ "libraries": visible })).into_response()
+            Json(json!({
+                "libraries": visible,
+                "showMetadataPending": show_metadata_pending,
+            }))
+            .into_response()
         }
         Err(error) => library_error(&headers, error),
     }
@@ -8958,20 +9095,38 @@ async fn emby_subtitle_without_source(
     .await
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Default)]
 struct EmbyStreamQuery {
-    #[serde(
-        rename = "api_key",
-        alias = "apiKey",
-        alias = "ApiKey",
-        alias = "X-Emby-Token",
-        alias = "x-emby-token",
-        alias = "X-MediaBrowser-Token",
-        alias = "x-media-browser-token"
-    )]
     api_key: Option<String>,
-    #[serde(alias = "mediaSourceId", alias = "MediaSourceId")]
     media_source_id: Option<String>,
+}
+
+fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery {
+    let mut query = EmbyStreamQuery::default();
+    let Some(raw_query) = raw_query.0 else {
+        return query;
+    };
+
+    for (name, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+        if query.api_key.is_none()
+            && (name.eq_ignore_ascii_case("api_key")
+                || name.eq_ignore_ascii_case("apiKey")
+                || name.eq_ignore_ascii_case("ApiKey")
+                || name.eq_ignore_ascii_case("X-Emby-Token")
+                || name.eq_ignore_ascii_case("X-MediaBrowser-Token")
+                || name.eq_ignore_ascii_case("x-media-browser-token"))
+        {
+            query.api_key = Some(value.into_owned());
+        } else if query.media_source_id.is_none()
+            && (name.eq_ignore_ascii_case("mediaSourceId")
+                || name.eq_ignore_ascii_case("MediaSourceId")
+                || name.eq_ignore_ascii_case("media_source_id"))
+        {
+            query.media_source_id = Some(value.into_owned());
+        }
+    }
+
+    query
 }
 
 fn emby_stream_query_from_path(
@@ -8981,21 +9136,12 @@ fn emby_stream_query_from_path(
     let Some((container, embedded_query)) = container.split_once('?') else {
         return (container.to_owned(), query);
     };
-    for pair in embedded_query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        if query.media_source_id.is_none() && key.eq_ignore_ascii_case("mediaSourceId") {
-            query.media_source_id = Some(value.to_owned());
-        }
-        if query.api_key.is_none()
-            && (key.eq_ignore_ascii_case("api_key")
-                || key.eq_ignore_ascii_case("apiKey")
-                || key.eq_ignore_ascii_case("X-Emby-Token")
-                || key.eq_ignore_ascii_case("X-MediaBrowser-Token"))
-        {
-            query.api_key = Some(value.to_owned());
-        }
+    let embedded = emby_stream_query_from_raw(RawQuery(Some(embedded_query.to_owned())));
+    if query.api_key.is_none() {
+        query.api_key = embedded.api_key;
+    }
+    if query.media_source_id.is_none() {
+        query.media_source_id = embedded.media_source_id;
     }
     (container.to_owned(), query)
 }
@@ -9004,9 +9150,10 @@ async fn emby_stream(
     headers: HeaderMap,
     method: Method,
     Path(item_id): Path<String>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -9027,9 +9174,10 @@ async fn emby_stream_with_container(
     headers: HeaderMap,
     method: Method,
     Path((item_id, container)): Path<(String, String)>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
@@ -9051,9 +9199,10 @@ async fn emby_stream_with_source(
     headers: HeaderMap,
     method: Method,
     Path((item_id, media_source_id)): Path<(String, String)>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -9074,9 +9223,10 @@ async fn emby_stream_with_source_and_container(
     headers: HeaderMap,
     method: Method,
     Path((item_id, media_source_id, container)): Path<(String, String, String)>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
@@ -9098,9 +9248,10 @@ async fn emby_download(
     headers: HeaderMap,
     method: Method,
     Path(item_id): Path<String>,
-    Query(query): Query<EmbyStreamQuery>,
+    raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let query = emby_stream_query_from_raw(raw_query);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -9808,13 +9959,18 @@ async fn lux_catalog_item_values_by_id(
         }
     }
     let states = database.list_user_item_states(user_id, &item_ids).await?;
+    let pending_item_ids = database.list_pending_metadata_item_ids(&item_ids).await?;
     Ok(items
         .iter()
         .map(|item| {
-            (
-                item.id.clone(),
-                lux_catalog_item_json_with_user_state(item, states.get(&item.id)),
-            )
+            let mut value = lux_catalog_item_json_with_user_state(item, states.get(&item.id));
+            if let Value::Object(object) = &mut value {
+                object.insert(
+                    "metadataPending".to_owned(),
+                    Value::Bool(pending_item_ids.contains(&item.id)),
+                );
+            }
+            (item.id.clone(), value)
         })
         .collect())
 }
@@ -10129,6 +10285,12 @@ struct UpdateExternalSubtitleRequest {
 #[serde(rename_all = "camelCase")]
 struct MetadataReidentifyRequest {
     #[serde(default)]
+    item_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetadataBatchConfirmationRequest {
     item_ids: Vec<String>,
 }
 
@@ -10451,6 +10613,8 @@ struct MediaStrategySettings {
     scraper_id: Option<String>,
     #[serde(default = "default_metadata_refresh_mode")]
     metadata_refresh_mode: String,
+    #[serde(default = "default_show_metadata_pending")]
+    show_metadata_pending: bool,
     apply_scope: String,
     images: MediaImageStrategySettings,
     subtitles: MediaSubtitleStrategySettings,
@@ -10489,6 +10653,7 @@ impl Default for MediaStrategySettings {
             region: "CN".to_owned(),
             scraper_id: None,
             metadata_refresh_mode: default_metadata_refresh_mode(),
+            show_metadata_pending: true,
             apply_scope: "NEW_CONTENT".to_owned(),
             images: MediaImageStrategySettings {
                 poster: true,
@@ -10513,6 +10678,10 @@ impl Default for MediaStrategySettings {
 
 fn default_metadata_refresh_mode() -> String {
     "FILL_MISSING".to_owned()
+}
+
+fn default_show_metadata_pending() -> bool {
+    true
 }
 
 async fn read_media_strategy_settings(database: &Database) -> Result<MediaStrategySettings, ()> {
@@ -13395,6 +13564,8 @@ struct WebhookDestinationCreateRequest {
     event_types: Vec<String>,
     payload_format: Option<String>,
     secret: Option<String>,
+    provider_plugin_id: Option<String>,
+    provider_config: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -13406,6 +13577,8 @@ struct WebhookDestinationUpdateRequest {
     allow_private_network: Option<bool>,
     event_types: Option<Vec<String>>,
     payload_format: Option<String>,
+    provider_plugin_id: Option<String>,
+    provider_config: Option<Value>,
 }
 
 const fn default_enabled() -> bool {
@@ -13499,8 +13672,17 @@ async fn admin_create_webhook_destination(
         )
         .into_response();
     };
+    let provider_plugin_id = request
+        .provider_plugin_id
+        .as_deref()
+        .unwrap_or(BUILTIN_WEBHOOK_PROVIDER_ID);
+    let provider_config = request
+        .provider_config
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     match service
-        .create_destination_with_format(
+        .create_destination_with_provider(
             &request.name,
             &request.url,
             request.enabled,
@@ -13508,6 +13690,8 @@ async fn admin_create_webhook_destination(
             &request.event_types,
             request.secret.as_deref(),
             request.payload_format.as_deref().unwrap_or("LUX"),
+            provider_plugin_id,
+            &provider_config,
         )
         .await
     {
@@ -13539,7 +13723,7 @@ async fn admin_update_webhook_destination(
         .into_response();
     };
     match service
-        .update_destination_with_format(
+        .update_destination_with_provider(
             &destination_id,
             request.name.as_deref(),
             request.url.as_deref(),
@@ -13547,6 +13731,8 @@ async fn admin_update_webhook_destination(
             request.allow_private_network,
             request.event_types.as_deref(),
             request.payload_format.as_deref(),
+            request.provider_plugin_id.as_deref(),
+            request.provider_config.as_ref(),
         )
         .await
     {
@@ -13707,6 +13893,9 @@ fn webhook_error_response(headers: &HeaderMap, error: WebhookError) -> Response 
         | WebhookError::Io(_)
         | WebhookError::Serialization(_)
         | WebhookError::HttpResponse { .. }
+        | WebhookError::PluginRetryable { .. }
+        | WebhookError::PluginFailed(_)
+        | WebhookError::Plugin(_)
         | WebhookError::SecretUnavailable
         | WebhookError::RequestSetup(_) => {
             tracing::warn!("webhook operation failed");
@@ -14452,6 +14641,86 @@ async fn admin_start_metadata_reidentify(
         Json(json!({ "job": metadata_reidentify_job_json(&job) })),
     )
         .into_response()
+}
+
+async fn admin_confirm_metadata(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<MetadataBatchConfirmationRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if request.item_ids.is_empty() || request.item_ids.len() > 100 {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "批量确认条目数量必须在 1 到 100 之间",
+        )
+        .into_response();
+    }
+    let requested_item_count = request.item_ids.len();
+    let item_ids: Vec<String> = request
+        .item_ids
+        .into_iter()
+        .filter(|item_id| item_id.parse::<crate::domain::ids::ItemId>().is_ok())
+        .collect();
+    if item_ids.len() != item_ids.iter().collect::<HashSet<_>>().len() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "批量确认条目不能重复",
+        )
+        .into_response();
+    }
+    if item_ids.len() != requested_item_count {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(selection) = state.metadata_selection.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据写回服务尚未就绪",
+        )
+        .into_response();
+    };
+    let mut confirmed_count = 0_usize;
+    let mut failed_item_ids = Vec::new();
+    for item_id in &item_ids {
+        match selection.confirm_best_pending(item_id).await {
+            Ok(_) => confirmed_count += 1,
+            Err(_) => failed_item_ids.push(item_id.clone()),
+        }
+    }
+    record_audit_event(
+        &state,
+        &headers,
+        "METADATA_BATCH_CONFIRMED",
+        Some("metadata_items"),
+        None,
+        &json!({
+            "requestedCount": item_ids.len(),
+            "confirmedCount": confirmed_count,
+            "failedCount": failed_item_ids.len(),
+        })
+        .to_string(),
+    )
+    .await;
+    Json(json!({
+        "confirmedCount": confirmed_count,
+        "failedCount": failed_item_ids.len(),
+        "failedItemIds": failed_item_ids,
+    }))
+    .into_response()
 }
 
 async fn admin_get_metadata_reidentify(
@@ -15289,6 +15558,35 @@ async fn admin_list_plugins(
     State(state): State<AppState>,
 ) -> Response {
     admin_list_plugins_with_scope(headers, query, state, false).await
+}
+
+async fn admin_list_notification_providers(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match plugins.list_notification_plugins(offset, limit).await {
+        Ok(page) => Json(plugin_page_json(&page)).into_response(),
+        Err(error) => plugin_error(&headers, error),
+    }
 }
 
 async fn admin_list_chapter_sources(

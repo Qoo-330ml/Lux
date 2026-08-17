@@ -1,4 +1,4 @@
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
@@ -75,17 +75,35 @@ function getStorage(): Storage | null {
 
 export function LibraryPage({ serverName }: { serverName?: string | null } = {}) {
   const { libraryId = "" } = useParams();
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const metadataStatus = searchParams.get("metadataStatus")?.toUpperCase() === "PENDING" ? "PENDING" as const : undefined;
   const [sortState, setSortState] = useState(() => ({
     libraryId,
     preference: readLibrarySortPreference(libraryId),
   }));
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const sortPreference = sortState.libraryId === libraryId ? sortState.preference : readLibrarySortPreference(libraryId);
   const { sortBy, sortOrder } = sortPreference;
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
+  const showMetadataPending = libraries.data?.showMetadataPending ?? true;
   const itemTypes = libraryItemTypeFilter(library?.kind);
+  const confirmMetadata = useMutation({
+    mutationFn: () => api.confirmAdminMetadata([...selectedIds]),
+    onSuccess: () => {
+      setSelectedIds(new Set());
+      setSelectionMode(false);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder, metadataStatus ?? "all") });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
+    },
+  });
+
+  useEffect(() => {
+    setSelectedIds(new Set());
+    setSelectionMode(false);
+  }, [libraryId, metadataStatus, sortBy, sortOrder]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -149,6 +167,10 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     { value: "ALL", label: "全部内容" },
     { value: "PENDING", label: "待确认" },
   ] as const;
+  const selectedItems = loadedItems.filter((item) => selectedIds.has(item.id));
+  const allSelectedPending = selectedIds.size > 0
+    && selectedItems.length === selectedIds.size
+    && selectedItems.every((item) => item.metadataPending === true);
 
   function changeSortBy(value: string) {
     const nextSortBy = value as LibrarySortBy;
@@ -175,13 +197,30 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   return (
     <section className="lux-page lux-page-narrow">
       <div className="lux-page-heading"><h1>{library?.name || "媒体库"}</h1><p>{metadataStatus ? `${total} 项待确认内容` : `${total} 项内容`}</p></div>
+      <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
+        <button
+          className="lux-button lux-button-secondary"
+          type="button"
+          aria-label={selectionMode ? "退出媒体库多选" : "开启媒体库多选"}
+          aria-pressed={selectionMode}
+          onClick={() => {
+            setSelectionMode((value) => !value);
+            setSelectedIds(new Set());
+          }}
+        >
+          {selectionMode ? "退出多选" : "多选"}
+        </button>
+        {selectionMode && selectedIds.size > 0 ? <span>{`已选 ${selectedIds.size} 项`}</span> : null}
+        {allSelectedPending ? <button className="lux-button lux-button-primary" type="button" data-action="batch-confirm-metadata" disabled={confirmMetadata.isPending} onClick={() => confirmMetadata.mutate()}>{confirmMetadata.isPending ? "确认中…" : "批量确认"}</button> : null}
+        {confirmMetadata.error ? <span className="lux-error-copy" role="alert">{confirmMetadata.error.message}</span> : null}
+      </div>
       <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
         <div className="lux-library-sort-control"><span>元数据</span><LuxSelect value={metadataStatus ?? "ALL"} options={metadataOptions} onChange={changeMetadataStatus} aria-label="元数据状态" /></div>
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div>
       <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} metadataAttention={metadataStatus === "PENDING"} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} />)}
+        {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} metadataAttention={showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
       </div>
       {!loadedItems.length ? <div className="lux-empty-card"><span>这个媒体库还没有内容。</span><Link to="/libraries">返回媒体库</Link></div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />

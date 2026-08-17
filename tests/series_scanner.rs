@@ -406,6 +406,21 @@ async fn series_scan_allows_same_title_and_year_in_different_directories()
         .await?,
         2
     );
+    let series_provider_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT provider_ids_json FROM media_items
+         WHERE library_id = ? AND item_type = 'SERIES' AND removed_at IS NULL
+         ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        series_provider_ids,
+        vec![
+            r#"{"Tmdb":"118968"}"#.to_owned(),
+            r#"{"Tmdb":"118968"}"#.to_owned(),
+        ]
+    );
     Ok(())
 }
 

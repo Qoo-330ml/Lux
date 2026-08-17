@@ -16,10 +16,16 @@ use sha2::{Digest, Sha256};
 use tokio::{fs, net::lookup_host, sync::Mutex, time::sleep};
 use url::{Host, Url};
 
+use crate::application::{
+    plugin_protocol::{NotificationSendRpcRequest, NotificationSendStatus},
+    plugins::PluginService,
+};
 use crate::storage::{
     Database, NewNotificationDestination, NewNotificationEvent, StorageError,
     StoredNotificationDelivery, StoredNotificationDestination, UpdateNotificationDestination,
 };
+
+pub const BUILTIN_WEBHOOK_PROVIDER_ID: &str = "builtin.webhook";
 
 pub const WEBHOOK_SECRET_FILE: &str = "lux_webhook_secrets.json";
 const MAX_NAME_LENGTH: usize = 128;
@@ -31,7 +37,7 @@ const DELIVERY_LEASE_SECONDS: i64 = 60;
 const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebhookDestinationView {
     pub id: String,
@@ -41,6 +47,8 @@ pub struct WebhookDestinationView {
     pub allow_private_network: bool,
     pub event_types: Vec<String>,
     pub payload_format: String,
+    pub provider_plugin_id: String,
+    pub provider_config: Value,
     pub secret_configured: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -74,9 +82,15 @@ pub enum WebhookError {
         status: StatusCode,
         retry_after_seconds: Option<i64>,
     },
+    PluginRetryable {
+        message: String,
+        retry_after_seconds: Option<i64>,
+    },
+    PluginFailed(String),
     NotFound,
     SecretUnavailable,
     RequestSetup(String),
+    Plugin(String),
 }
 
 impl fmt::Display for WebhookError {
@@ -89,9 +103,19 @@ impl fmt::Display for WebhookError {
             Self::HttpResponse { status, .. } => {
                 write!(formatter, "webhook endpoint returned HTTP {status}")
             }
+            Self::PluginRetryable { message, .. } => {
+                write!(
+                    formatter,
+                    "notification provider is temporarily unavailable: {message}"
+                )
+            }
+            Self::PluginFailed(message) => {
+                write!(formatter, "notification provider rejected event: {message}")
+            }
             Self::NotFound => formatter.write_str("webhook destination not found"),
             Self::SecretUnavailable => formatter.write_str("webhook secret is unavailable"),
             Self::RequestSetup(error) => write!(formatter, "webhook request setup failed: {error}"),
+            Self::Plugin(error) => write!(formatter, "notification provider failed: {error}"),
         }
     }
 }
@@ -116,6 +140,7 @@ pub struct WebhookService {
     config_dir: PathBuf,
     secret_lock: Arc<Mutex<()>>,
     server_id: String,
+    plugins: Option<PluginService>,
 }
 
 impl WebhookService {
@@ -126,7 +151,13 @@ impl WebhookService {
             config_dir,
             secret_lock: Arc::new(Mutex::new(())),
             server_id,
+            plugins: None,
         })
+    }
+
+    pub fn with_plugins(mut self, plugins: PluginService) -> Self {
+        self.plugins = Some(plugins);
+        self
     }
 
     pub async fn create_destination(
@@ -161,10 +192,44 @@ impl WebhookService {
         secret: Option<&str>,
         payload_format: &str,
     ) -> Result<(WebhookDestinationView, String), WebhookError> {
+        self.create_destination_with_provider(
+            name,
+            url,
+            enabled,
+            allow_private_network,
+            event_types,
+            secret,
+            payload_format,
+            BUILTIN_WEBHOOK_PROVIDER_ID,
+            &Value::Object(Map::new()),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_destination_with_provider(
+        &self,
+        name: &str,
+        url: &str,
+        enabled: bool,
+        allow_private_network: bool,
+        event_types: &[String],
+        secret: Option<&str>,
+        payload_format: &str,
+        provider_plugin_id: &str,
+        provider_config: &Value,
+    ) -> Result<(WebhookDestinationView, String), WebhookError> {
         let name = validate_name(name)?;
-        let url = validate_destination(url, allow_private_network)?;
+        let provider_plugin_id = validate_provider_id(provider_plugin_id)?;
+        validate_provider(self, provider_plugin_id, provider_config).await?;
+        let url = if provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+            validate_destination(url, allow_private_network).map(Some)?
+        } else {
+            validate_optional_provider_url(url, allow_private_network)?
+        };
         let event_types = normalize_event_types(event_types)?;
         let payload_format = normalize_payload_format(payload_format)?;
+        let provider_config_json = provider_config_json(provider_config)?;
         let secret = normalize_or_generate_secret(secret)?;
         let id = uuid::Uuid::now_v7().to_string();
         self.set_secret(&id, Some(&secret)).await?;
@@ -175,11 +240,13 @@ impl WebhookService {
             .create_notification_destination(NewNotificationDestination {
                 id: &id,
                 name,
-                url: url.as_str(),
+                url: url.as_ref().map(Url::as_str).unwrap_or_default(),
                 enabled,
                 allow_private_network,
                 event_types_json: &event_types_json,
                 payload_format: payload_format.as_str(),
+                provider_plugin_id,
+                provider_config_json: &provider_config_json,
             })
             .await
         {
@@ -269,6 +336,33 @@ impl WebhookService {
         event_types: Option<&[String]>,
         payload_format: Option<&str>,
     ) -> Result<WebhookDestinationView, WebhookError> {
+        self.update_destination_with_provider(
+            id,
+            name,
+            url,
+            enabled,
+            allow_private_network,
+            event_types,
+            payload_format,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_destination_with_provider(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        url: Option<&str>,
+        enabled: Option<bool>,
+        allow_private_network: Option<bool>,
+        event_types: Option<&[String]>,
+        payload_format: Option<&str>,
+        provider_plugin_id: Option<&str>,
+        provider_config: Option<&Value>,
+    ) -> Result<WebhookDestinationView, WebhookError> {
         let current = self
             .database
             .find_notification_destination(id)
@@ -277,9 +371,28 @@ impl WebhookService {
         let next_allow_private_network =
             allow_private_network.unwrap_or(current.allow_private_network);
         let validated_name = name.map(validate_name).transpose()?;
+        let next_provider_id = provider_plugin_id.unwrap_or(&current.provider_plugin_id);
+        let next_provider_id = validate_provider_id(next_provider_id)?;
+        let current_provider_config = if provider_config.is_none() {
+            serde_json::from_str(&current.provider_config_json)
+                .map_err(|error| WebhookError::Serialization(error.to_string()))?
+        } else {
+            Value::Null
+        };
+        let next_provider_config = provider_config.unwrap_or(&current_provider_config);
+        validate_provider(self, next_provider_id, next_provider_config).await?;
         let validated_url = url
-            .map(|value| validate_destination(value, next_allow_private_network))
+            .map(|value| {
+                if next_provider_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+                    validate_destination(value, next_allow_private_network).map(Some)
+                } else {
+                    validate_optional_provider_url(value, next_allow_private_network)
+                }
+            })
             .transpose()?;
+        if next_provider_id == BUILTIN_WEBHOOK_PROVIDER_ID && validated_url.is_none() {
+            validate_destination(&current.url, next_allow_private_network)?;
+        }
         let normalized_event_types = event_types.map(normalize_event_types).transpose()?;
         let event_types_json = normalized_event_types
             .as_ref()
@@ -287,16 +400,22 @@ impl WebhookService {
             .transpose()
             .map_err(|error| WebhookError::Serialization(error.to_string()))?;
         let normalized_payload_format = payload_format.map(normalize_payload_format).transpose()?;
+        let provider_config_json = provider_config.map(provider_config_json).transpose()?;
         self.database
             .update_notification_destination(
                 id,
                 UpdateNotificationDestination {
                     name: validated_name,
-                    url: validated_url.as_ref().map(Url::as_str),
+                    url: validated_url
+                        .as_ref()
+                        .and_then(Option::as_ref)
+                        .map(Url::as_str),
                     enabled,
                     allow_private_network,
                     event_types_json: event_types_json.as_deref(),
                     payload_format: normalized_payload_format.map(WebhookPayloadFormat::as_str),
+                    provider_plugin_id,
+                    provider_config_json: provider_config_json.as_deref(),
                 },
             )
             .await?;
@@ -346,10 +465,14 @@ impl WebhookService {
             if !selected {
                 continue;
             }
-            let payload_format = WebhookPayloadFormat::from_wire_name(&destination.payload_format)
-                .ok_or_else(|| {
-                    WebhookError::Invalid("unknown webhook payload format".to_owned())
-                })?;
+            let payload_format = if destination.provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+                WebhookPayloadFormat::from_wire_name(&destination.payload_format).ok_or_else(
+                    || WebhookError::Invalid("unknown webhook payload format".to_owned()),
+                )?
+            } else {
+                // External providers receive the provider-neutral Lux event.
+                WebhookPayloadFormat::Lux
+            };
             destination_groups
                 .entry(payload_format)
                 .or_default()
@@ -412,27 +535,44 @@ impl WebhookService {
             .remove(id)
             .ok_or(WebhookError::SecretUnavailable)?;
         let event_id = uuid::Uuid::now_v7().to_string();
+        let payload_format = if destination.provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+            WebhookPayloadFormat::from_wire_name(&destination.payload_format)
+                .ok_or_else(|| WebhookError::Invalid("unknown webhook payload format".to_owned()))?
+        } else {
+            WebhookPayloadFormat::Lux
+        };
         let payload = build_event_payload_for_format(
             &self.server_id,
             &event_id,
             WebhookEventType::JobFailed,
             unix_now(),
-            WebhookPayloadFormat::from_wire_name(&destination.payload_format).ok_or_else(|| {
-                WebhookError::Invalid("unknown webhook payload format".to_owned())
-            })?,
+            payload_format,
             json!({"test": true}),
         )?;
         let payload = serde_json::to_vec(&payload)
             .map_err(|error| WebhookError::Serialization(error.to_string()))?;
-        self.send_http(
-            &destination.url,
-            destination.allow_private_network,
-            &secret,
-            &event_id,
-            WebhookEventType::JobFailed.as_str(),
-            &payload,
-        )
-        .await
+        if destination.provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+            self.send_http(
+                &destination.url,
+                destination.allow_private_network,
+                &secret,
+                &event_id,
+                WebhookEventType::JobFailed.as_str(),
+                &payload,
+            )
+            .await
+        } else {
+            self.send_plugin_payload(
+                &destination.provider_plugin_id,
+                &destination.url,
+                destination.allow_private_network,
+                &destination.provider_config_json,
+                &String::from_utf8(payload)
+                    .map_err(|error| WebhookError::Serialization(error.to_string()))?,
+                Some(&secret),
+            )
+            .await
+        }
     }
 
     pub fn spawn_worker(&self) {
@@ -477,19 +617,23 @@ impl WebhookService {
             .await?
             .remove(&delivery.destination_id)
             .ok_or(WebhookError::SecretUnavailable);
-        let result = match secret {
-            Ok(secret) => {
-                self.send_http(
-                    &delivery.destination_url,
-                    delivery.allow_private_network,
-                    &secret,
-                    &delivery.event_id,
-                    &delivery.event_type,
-                    delivery.payload_json.as_bytes(),
-                )
-                .await
+        let result = if delivery.provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+            match secret {
+                Ok(secret) => {
+                    self.send_http(
+                        &delivery.destination_url,
+                        delivery.allow_private_network,
+                        &secret,
+                        &delivery.event_id,
+                        &delivery.event_type,
+                        delivery.payload_json.as_bytes(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
+        } else {
+            self.send_plugin(&delivery, secret.as_ref().ok()).await
         };
         match result {
             Ok(status) => {
@@ -508,6 +652,12 @@ impl WebhookService {
                         Some(i64::from(status.as_u16())),
                         *retry_after_seconds,
                     ),
+                    WebhookError::PluginRetryable {
+                        retry_after_seconds,
+                        ..
+                    } => (true, None, *retry_after_seconds),
+                    WebhookError::PluginFailed(_) => (false, None, None),
+                    WebhookError::Plugin(_) => (true, None, None),
                     _ => (false, None, None),
                 };
                 let status = if delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS || !retryable {
@@ -530,6 +680,70 @@ impl WebhookService {
             }
         }
         Ok(())
+    }
+
+    async fn send_plugin(
+        &self,
+        delivery: &StoredNotificationDelivery,
+        secret: Option<&String>,
+    ) -> Result<u16, WebhookError> {
+        self.send_plugin_payload(
+            &delivery.provider_plugin_id,
+            &delivery.destination_url,
+            delivery.allow_private_network,
+            &delivery.provider_config_json,
+            &delivery.payload_json,
+            secret,
+        )
+        .await
+    }
+
+    async fn send_plugin_payload(
+        &self,
+        provider_plugin_id: &str,
+        destination_url: &str,
+        allow_private_network: bool,
+        provider_config_json: &str,
+        payload_json: &str,
+        secret: Option<&String>,
+    ) -> Result<u16, WebhookError> {
+        let plugins = self.plugins.as_ref().ok_or_else(|| {
+            WebhookError::Plugin("notification plugin service is unavailable".to_owned())
+        })?;
+        let event = plugin_event_from_payload(payload_json)?;
+        let config: Value = serde_json::from_str(provider_config_json)
+            .map_err(|error| WebhookError::Serialization(error.to_string()))?;
+        let request = NotificationSendRpcRequest {
+            event,
+            target: json!({
+                "url": destination_url,
+                "allowPrivateNetwork": allow_private_network,
+            }),
+            config,
+            secret: secret.cloned(),
+        };
+        let params = serde_json::to_value(request)
+            .map_err(|error| WebhookError::Serialization(error.to_string()))?;
+        let result = plugins
+            .call_notification(provider_plugin_id, params)
+            .await
+            .map_err(|error| WebhookError::Plugin(error.to_string()))?;
+        match result.status {
+            NotificationSendStatus::Delivered => Ok(200),
+            NotificationSendStatus::Retryable => Err(WebhookError::PluginRetryable {
+                message: result
+                    .error_code
+                    .unwrap_or_else(|| "provider requested retry".to_owned()),
+                retry_after_seconds: result
+                    .retry_after_seconds
+                    .map(|value| value.clamp(0, MAX_RETRY_DELAY_SECONDS)),
+            }),
+            NotificationSendStatus::Failed => Err(WebhookError::PluginFailed(
+                result
+                    .error_code
+                    .unwrap_or_else(|| "provider rejected event".to_owned()),
+            )),
+        }
     }
 
     async fn send_http(
@@ -981,6 +1195,39 @@ fn build_event_payload_for_format(
     Ok(payload)
 }
 
+fn plugin_event_from_payload(payload_json: &str) -> Result<Value, WebhookError> {
+    let Value::Object(mut payload) = serde_json::from_str(payload_json)
+        .map_err(|error| WebhookError::Serialization(error.to_string()))?
+    else {
+        return Err(WebhookError::Serialization(
+            "notification payload must be an object".to_owned(),
+        ));
+    };
+    let schema_version = payload.remove("schemaVersion").ok_or_else(|| {
+        WebhookError::Serialization("notification schemaVersion is missing".to_owned())
+    })?;
+    let event_id = payload
+        .remove("eventId")
+        .ok_or_else(|| WebhookError::Serialization("notification eventId is missing".to_owned()))?;
+    let event_type = payload.remove("eventType").ok_or_else(|| {
+        WebhookError::Serialization("notification eventType is missing".to_owned())
+    })?;
+    let occurred_at = payload.remove("occurredAt").ok_or_else(|| {
+        WebhookError::Serialization("notification occurredAt is missing".to_owned())
+    })?;
+    let server_id = payload.remove("serverId").ok_or_else(|| {
+        WebhookError::Serialization("notification serverId is missing".to_owned())
+    })?;
+    Ok(json!({
+        "schemaVersion": schema_version,
+        "eventId": event_id,
+        "eventType": event_type,
+        "occurredAt": occurred_at,
+        "serverId": server_id,
+        "data": Value::Object(payload),
+    }))
+}
+
 fn emby_event_name(event_type: WebhookEventType) -> &'static str {
     match event_type {
         WebhookEventType::MediaAdded => "library.new",
@@ -1079,6 +1326,8 @@ fn destination_view(
     destination: StoredNotificationDestination,
     secret_configured: bool,
 ) -> Result<WebhookDestinationView, WebhookError> {
+    let provider_config = serde_json::from_str(&destination.provider_config_json)
+        .map_err(|error| WebhookError::Serialization(error.to_string()))?;
     Ok(WebhookDestinationView {
         id: destination.id,
         name: destination.name,
@@ -1089,10 +1338,97 @@ fn destination_view(
         payload_format: normalize_payload_format(&destination.payload_format)?
             .as_str()
             .to_owned(),
+        provider_plugin_id: destination.provider_plugin_id,
+        provider_config,
         secret_configured,
         created_at: destination.created_at,
         updated_at: destination.updated_at,
     })
+}
+
+fn validate_provider_id(value: &str) -> Result<&str, WebhookError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(WebhookError::Invalid(
+            "notification provider ID is invalid".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+fn provider_config_json(value: &Value) -> Result<String, WebhookError> {
+    let Some(object) = value.as_object() else {
+        return Err(WebhookError::Invalid(
+            "notification provider config must be an object".to_owned(),
+        ));
+    };
+    if object.keys().any(|key| {
+        let key = key.to_ascii_lowercase();
+        ["secret", "token", "password", "apikey", "api_key"]
+            .iter()
+            .any(|sensitive| key.contains(sensitive))
+    }) || value_contains_secret_key(value)
+    {
+        return Err(WebhookError::Invalid(
+            "provider secrets must be sent through the secret field".to_owned(),
+        ));
+    }
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| WebhookError::Serialization(error.to_string()))?;
+    if encoded.len() > 64 * 1024 {
+        return Err(WebhookError::Invalid(
+            "notification provider config is too large".to_owned(),
+        ));
+    }
+    Ok(encoded)
+}
+
+fn value_contains_secret_key(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            (["secret", "token", "password", "apikey", "api_key"])
+                .iter()
+                .any(|sensitive| key.contains(sensitive))
+                || value_contains_secret_key(value)
+        }),
+        Value::Array(values) => values.iter().any(value_contains_secret_key),
+        _ => false,
+    }
+}
+
+fn validate_optional_provider_url(
+    value: &str,
+    allow_private_network: bool,
+) -> Result<Option<Url>, WebhookError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    validate_destination(value, allow_private_network).map(Some)
+}
+
+async fn validate_provider(
+    service: &WebhookService,
+    provider_plugin_id: &str,
+    config: &Value,
+) -> Result<(), WebhookError> {
+    provider_config_json(config)?;
+    if provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+        return Ok(());
+    }
+    let plugins = service.plugins.as_ref().ok_or_else(|| {
+        WebhookError::Plugin("notification plugin service is unavailable".to_owned())
+    })?;
+    plugins
+        .validate_notification_provider(provider_plugin_id)
+        .await
+        .map_err(|error| WebhookError::Plugin(error.to_string()))
 }
 
 fn delivery_view(delivery: StoredNotificationDelivery) -> WebhookDeliveryView {
@@ -1211,7 +1547,8 @@ fn public_error_message(error: &WebhookError) -> String {
 mod tests {
     use super::{
         WebhookEventType, WebhookPayloadFormat, build_event_payload,
-        build_event_payload_for_format, is_retryable_http_status, parse_retry_after, retry_delay,
+        build_event_payload_for_format, is_retryable_http_status, parse_retry_after,
+        plugin_event_from_payload, provider_config_json, retry_delay,
     };
     use reqwest::StatusCode;
     use serde_json::json;
@@ -1347,5 +1684,32 @@ mod tests {
         assert_eq!(payload["PositionTicks"], 42);
         assert!(payload.get("path").is_none());
         assert!(payload.get("userId").is_none());
+    }
+
+    #[test]
+    fn external_provider_receives_an_envelope_with_data_separated() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-1",
+            WebhookEventType::MediaAdded,
+            1_700_000_000,
+            json!({"libraryId": "library-1", "addedCount": 2}),
+        )
+        .expect("payload should be accepted");
+        let envelope = plugin_event_from_payload(
+            &serde_json::to_string(&payload).expect("payload should serialize"),
+        )
+        .expect("plugin envelope should be accepted");
+        assert_eq!(envelope["eventType"], "MEDIA_ADDED");
+        assert_eq!(envelope["data"]["libraryId"], "library-1");
+        assert_eq!(envelope["data"]["addedCount"], 2);
+        assert!(envelope["data"].get("eventId").is_none());
+    }
+
+    #[test]
+    fn provider_config_rejects_secret_like_keys() {
+        assert!(provider_config_json(&json!({"chatId": "chat-1"})).is_ok());
+        assert!(provider_config_json(&json!({"botToken": "secret"})).is_err());
+        assert!(provider_config_json(&json!(["not-an-object"])).is_err());
     }
 }

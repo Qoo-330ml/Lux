@@ -10,18 +10,22 @@ pub const PLUGIN_API_VERSION: u32 = 1;
 pub const PLUGIN_CATEGORY_SCRAPER: &str = "SCRAPER";
 pub const PLUGIN_CATEGORY_MEDIA: &str = "MEDIA";
 pub const PLUGIN_CATEGORY_NETWORK: &str = "NETWORK";
+pub const PLUGIN_CATEGORY_NOTIFICATION: &str = "NOTIFICATION";
 pub const PLUGIN_TYPE_MEDIA_PROBE: &str = "media_probe";
 pub const PLUGIN_TYPE_IP_LOCATION: &str = "ip_location";
 pub const PLUGIN_TYPE_STRM_RESOLVER: &str = "strm_resolver";
 pub const PLUGIN_TYPE_CHAPTER_DETECTOR: &str = "chapter_detector";
+pub const PLUGIN_TYPE_NOTIFICATION: &str = "notification";
 pub const MEDIA_PROBE_CAPABILITY: &str = "media.probe";
 pub const IP_LOCATION_CAPABILITY: &str = "ip.location";
 pub const STRM_RESOLVE_CAPABILITY: &str = "strm.resolve";
 pub const CHAPTER_DETECT_CAPABILITY: &str = "chapters.detect";
 pub const CHAPTER_LOOKUP_CAPABILITY: &str = "chapters.lookup";
+pub const NOTIFICATION_SEND_CAPABILITY: &str = "notification.send";
 pub const STRM_RESOLVE_METHOD: &str = "strm.resolve";
 pub const CHAPTER_DETECT_METHOD: &str = "chapters.detect";
 pub const CHAPTER_LOOKUP_METHOD: &str = "chapters.lookup";
+pub const NOTIFICATION_SEND_METHOD: &str = "notification.send";
 pub const CHAPTER_FINGERPRINT_SAMPLE_RATE: u32 = 11_025;
 pub const CHAPTER_FINGERPRINT_POINT_DURATION_TICKS: i64 = 1_238_095;
 pub const CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES: &str = "media-libraries";
@@ -143,6 +147,22 @@ impl PluginManifest {
                     return Err(PluginManifestError::Invalid(
                         "chapter detector plugins must declare chapters.detect or chapters.lookup"
                             .to_owned(),
+                    ));
+                }
+            }
+            PLUGIN_TYPE_NOTIFICATION => {
+                if self.category != PLUGIN_CATEGORY_NOTIFICATION {
+                    return Err(PluginManifestError::Invalid(
+                        "notification plugins must use the NOTIFICATION category".to_owned(),
+                    ));
+                }
+                if !self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == NOTIFICATION_SEND_CAPABILITY)
+                {
+                    return Err(PluginManifestError::Invalid(
+                        "notification plugins must declare notification.send".to_owned(),
                     ));
                 }
             }
@@ -555,6 +575,41 @@ pub struct StrmResolveRpcResult {
     pub url: Option<String>,
 }
 
+/// The provider-neutral request sent to an installed notification plugin.
+///
+/// `event` is already filtered by Lux's notification event allowlist. `config`
+/// contains only non-secret target settings; the optional `secret` is supplied
+/// through the RPC request and is never persisted in the event or database.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NotificationSendRpcRequest {
+    pub event: Value,
+    pub target: Value,
+    pub config: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NotificationSendStatus {
+    Delivered,
+    Retryable,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NotificationSendRpcResult {
+    pub status: NotificationSendStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaProbeRpcStream {
@@ -652,4 +707,81 @@ fn validate_relative_path(field: &str, path: &Path) -> Result<(), PluginManifest
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NotificationSendRpcRequest, NotificationSendRpcResult, NotificationSendStatus,
+        PluginManifest,
+    };
+    use serde_json::json;
+
+    fn notification_manifest(category: &str, capabilities: &[&str]) -> PluginManifest {
+        serde_json::from_value(json!({
+            "formatVersion": 1,
+            "id": "org.example.notify",
+            "name": "Example notifier",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "bin/notify"},
+            "type": "notification",
+            "category": category,
+            "capabilities": capabilities,
+        }))
+        .expect("notification manifest should deserialize")
+    }
+
+    #[test]
+    fn notification_manifest_requires_notification_category_and_capability() {
+        assert!(
+            notification_manifest("NOTIFICATION", &["notification.send"])
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            notification_manifest("NETWORK", &["notification.send"])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            notification_manifest("NOTIFICATION", &[])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn notification_rpc_round_trip_keeps_secret_out_of_event() {
+        let request = NotificationSendRpcRequest {
+            event: json!({
+                "eventId": "event-1",
+                "eventType": "MEDIA_ADDED",
+                "data": {"libraryId": "library-1"}
+            }),
+            target: json!({
+                "url": "https://hooks.example.test/lux",
+                "allowPrivateNetwork": false,
+            }),
+            config: json!({"chatId": "chat-1"}),
+            secret: Some("provider-secret".to_owned()),
+        };
+        let encoded = serde_json::to_value(&request).expect("request should serialize");
+        assert_eq!(encoded["config"]["chatId"], "chat-1");
+        assert_eq!(encoded["target"]["allowPrivateNetwork"], false);
+        assert_eq!(encoded["secret"], "provider-secret");
+        assert!(encoded["event"].get("secret").is_none());
+
+        let result = NotificationSendRpcResult {
+            status: NotificationSendStatus::Retryable,
+            provider_request_id: None,
+            retry_after_seconds: Some(30),
+            error_code: Some("RATE_LIMITED".to_owned()),
+        };
+        let decoded: NotificationSendRpcResult =
+            serde_json::from_value(serde_json::to_value(result).expect("result should serialize"))
+                .expect("result should deserialize");
+        assert_eq!(decoded.status, NotificationSendStatus::Retryable);
+        assert_eq!(decoded.retry_after_seconds, Some(30));
+    }
 }

@@ -89,6 +89,16 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `chapter_detector` 插件必须声明 `category: "MEDIA"`，并至少声明 `chapters.detect` 或 `chapters.lookup`。`org.lux.intro-outro-detector` 使用 `chapters.detect` 比较宿主提取的有界音频指纹；`org.lux.theintrodb-chapter-source` 使用 `chapters.lookup`，只把已保存的 TMDb/TVDb/IMDb ID、季号、集号和可选时长交给在线插件，由插件访问固定的 TheIntroDB API。两者都不接收媒体路径或任务对象，宿主负责并发、超时、取消、恢复、结果落库和 Emby 章节映射。
 - 未安装、未启用、无可用凭据、运行失败或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
+## 通知器插件（LUX-183）
+
+- `GET /api/v1/admin/notification-providers?page=1&pageSize=50`：分页返回已发现的
+  `type: "notification"` 插件及其安装、启用、可用状态和配置字段。
+- `GET/POST/PATCH/DELETE /api/v1/admin/notification-destinations`：继续兼容原有 Webhook 目标；创建或更新时可
+  传 `providerPluginId` 和非秘密 `providerConfig`。省略时使用 `builtin.webhook`。外部 provider 不需要 URL，
+  但 `secret` 仍只在创建/轮换响应中返回，不写入事件或普通列表。
+- 通知插件必须声明 `notification.send`，宿主通过独立进程 RPC 投递；插件结果 `DELIVERED`、`RETRYABLE`、
+  `FAILED` 由统一 outbox worker 处理超时、退避、恢复和失败记录。
+
 插件包不从任意未登记的远程 URL 自动下载；远程安装只使用当前插件商店目录声明的 Release 包地址。插件 API、媒体库 API 和日志不返回插件配置中的敏感值；TMDb API Key 和 Read Access Token 只存在受限配置或外置插件运行时中。
 
 ## 元数据候选管理（LUX-053）
@@ -164,7 +174,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 - `GET /Items/Counts`：返回当前用户可见媒体条目的 Emby 统计字段；支持 `UserId` 指定目标用户和 `IsFavorite=true|false` 按目标用户收藏状态过滤。Lux 当前支持电影、剧集、单集和合集计数，其余 Emby 类型返回 0；`ItemCount` 为过滤后所有可见目录条目（包含季度等层级条目）的总数。
 - `GET /Library/VirtualFolders`：管理员获取 Emby 兼容的媒体库列表；返回完整的 `VirtualFolderInfo` 主要字段，包括 `Name`、`Locations`、`CollectionType`、`LibraryOptions`、`Id`、`Guid`、`ItemId`、`PrimaryImageItemId` 和刷新状态。`Id`、`Guid`、`ItemId` 使用同一个稳定的媒体库 ID，`LibraryOptions` 包含 `PathInfos`、`TypeOptions`、NFO/字幕/图片策略以及播放恢复阈值，并从 Lux 的全局或媒体库策略映射。支持根路径及 `/emby` 前缀，并接受共享 API Key。
-- `GET /Persons?ParentId={libraryId}&Recursive=true&PersonTypes=Actor&StartIndex=0&Limit=50`：返回指定媒体库中去重后的演员列表，使用 Emby 风格的 `Items`、`TotalRecordCount` 和 `StartIndex`，演员项包含 `Name`、稳定 `Id`、`Role`、`Type=Actor`、人物简介/生日等字段和可用的 `PrimaryImageTag`。支持根路径及 `/emby` 前缀，接受 Emby token 或共享 API Key；`ParentId` 必须是当前用户可访问的媒体库 ID，列表查询使用持久化人物关系索引，不在请求中扫描媒体目录。
+- `GET /Persons?ParentId={libraryId}&Recursive=true&PersonTypes=Actor&StartIndex=0&Limit=50`：返回指定媒体库中去重后的演员列表，使用 Emby 风格的 `Items`、`TotalRecordCount` 和 `StartIndex`。支持 `Fields`、`SortBy=Name|DateCreated`、`SortOrder=Ascending|Descending`，`Limit` 接受任意正整数且不设置服务端硬上限；演员项使用 `Type=Person`，并包含 `ServerId`、`ImageTags`、`BackdropImageTags`、`Name`、稳定 `Id`、`Role`、`DateCreated`、人物简介/生日等字段和可用的 `PrimaryImageTag`。`Recursive=true` 聚合媒体库所有后代条目，`Recursive=false` 只聚合直接子条目；未传 `Recursive` 时为兼容旧客户端按递归查询处理。支持根路径及 `/emby` 前缀，接受 Emby token 或共享 API Key；`ParentId` 必须是当前用户可访问的媒体库 ID，列表查询使用持久化人物关系索引，不在请求中扫描媒体目录。
 - `GET /Users/{userId}/Views`：返回电影媒体库视图。
 - `GET /Users/{userId}/Items/Root`、`GET /Items/Root?userId={userId}`：返回用户虚拟根目录；将该根 ID 作为 `ParentId` 并请求 `IncludeItemTypes=CollectionFolder` 时返回当前用户可见的媒体库文件夹。
 - `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`Recursive`、`StartIndex`、`Limit`、`IncludeItemTypes` 和 `ExcludeItemTypes`，`ParentId` 可指向虚拟根、媒体库、物理媒体目录、剧集或季度；电影扫描会为物理媒体目录建立稳定的 `FOLDER` 条目，普通电影列表和统计不会把这些内部目录项当成电影。网易爆米花首页使用的无 `ParentId`、无 `Recursive=true`、无 `IncludeItemTypes` 但带 `ExcludeItemTypes` 请求返回当前用户可见的媒体库 `CollectionFolder`，再按媒体库 ID 请求 `Items/Latest`；递归查询按排除类型过滤；默认从 0 开始、每页 50 条，单页上限 100。
