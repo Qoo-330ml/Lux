@@ -63,6 +63,9 @@ export default defineConfig({
       "/health": process.env.LUX_API_ORIGIN ?? "http://127.0.0.1:8097",
     },
   },
+  worker: {
+    format: "es",
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

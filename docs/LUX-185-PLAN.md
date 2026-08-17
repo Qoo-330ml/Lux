@@ -9,8 +9,8 @@
 
 - `@hevcjs/core` 固定使用 MIT 许可版本；包内 WASM 解码器和 Worker 资产由 Lux Web 同源发布。
 - `mp4box` 由 `@hevcjs/core` 运行时使用，许可为 BSD-3-Clause；随 Web 依赖记录，不复制或修改其源码。
-- 客户端 fallback 支持 MP4/fMP4 HEVC 视频和 AAC 音频，并支持 MKV 中的 HEVC 视频与 AAC-LC/AC-3 音频；MKV 的 DTS/Opus、Dolby Vision、DRM、PGS/ASS 渲染仍不在范围内。
-- Safari 等支持 HEVC MSE 的浏览器优先走客户端 MKV → HEVC/AAC/AC-3 fMP4 封装路径；该路径只在浏览器端重封装样本，不解码、不降为 SDR，也不改变服务端的原始 Range 传输。
+- 客户端 fallback 支持 MP4/fMP4 HEVC 视频和 AAC 音频，并支持 MKV 中的 HEVC 视频与 AAC-LC/AC-3/E-AC-3 音频；MKV 的 DTS/Opus、Dolby Vision、DRM、PGS/ASS 渲染仍不在范围内。
+- Safari 等支持 HEVC MSE 且同时支持对应音频 codec 的浏览器优先走客户端 MKV → HEVC/AAC/AC-3/E-AC-3 fMP4 封装路径；该路径只在浏览器端重封装样本，不解码、不降为 SDR，也不改变服务端的原始 Range 传输。
 - H.264 编码由浏览器 `VideoEncoder` 完成；不满足 `VideoEncoder.isConfigSupported` 时不启用 fallback。
 - WASM/转码工作在 Worker；UI 主线程只负责引擎状态、MSE 控制和播放进度。
 - 4K 是能力目标，不是所有设备的实时性能承诺；必须以实际 `speedX`、丢帧和音画同步验收。
@@ -19,7 +19,7 @@
 
 1. 定义 `PlaybackEngine` 契约并抽取 `NativeVideoEngine`，确保现有 Web 播放回归通过。
 2. 安装依赖、发布 Worker/WASM 资产，并实现客户端 MP4/fMP4 fallback 的输入与 MSE 输出。
-3. 增加流式 Matroska/EBML 解封装，将 MKV 的 HEVC/AAC-LC/AC-3 样本接入同一客户端 fallback，并在 `PlayerPage` 按媒体流和浏览器能力选择引擎。
+3. 增加流式 Matroska/EBML 解封装，将 MKV 的 HEVC/AAC-LC/AC-3/E-AC-3 样本接入同一客户端 fallback，并在 `PlayerPage` 按媒体流和浏览器能力选择引擎。
 4. 统一进度/错误/生命周期事件，用真实浏览器测试原生 H.264、原生 HEVC、MP4 fallback、MKV fallback、seek、停止和失败降级。
 
 ## 安全与资源约束
@@ -38,15 +38,17 @@
 
 ## 当前实现记录
 
-本增量已完成播放引擎边界、客户端 HEVC fallback、流式 Matroska 解封装、MKV 的 HEVC/AAC-LC/AC-3 输入、Worker/WASM 资产发布和 PlayerPage 选择接入。
-fallback 的视频输出使用 H.264 fMP4 MSE；MP4/fMP4 沿用现有的音频处理。MKV 在支持 HEVC MSE 的浏览器中将
-HEVC/AAC-LC/AC-3 样本在 Worker 内封装为 fMP4，尽量保留 8/10-bit 视频；不支持 HEVC MSE 或 AC-3 MSE 时才回退到 H.264 SDR
+本增量已完成播放引擎边界、客户端 HEVC fallback、流式 Matroska 解封装、MKV 的 HEVC/AAC-LC/AC-3/E-AC-3 输入、Worker/WASM 资产发布和 PlayerPage 选择接入。
+fallback 的视频输出使用 H.264 fMP4 MSE；MP4/fMP4 沿用现有的音频处理。MKV 在支持 HEVC MSE 且支持所选音频 codec 的浏览器中将
+HEVC/AAC-LC/AC-3/E-AC-3 样本在 Worker 内封装为 fMP4，尽量保留 8/10-bit 视频；不支持 HEVC MSE 或对应音频 MSE 时才回退到 H.264 SDR
 客户端编码路径。两条路径都保持服务端不转码、不 Remux、不代理媒体内容。播放、暂停、seek 和资源销毁通过
 客户端事件同步。
 
-MKV 路径当前明确支持 `V_MPEGH/ISO/HEVC` 视频、`A_AAC/MPEG4/LC` AAC-LC 和 `A_AC3` AC-3 音频，支持常见
+MKV 路径当前明确支持 `V_MPEGH/ISO/HEVC` 视频、`A_AAC/MPEG4/LC` AAC-LC、`A_AC3` AC-3 和 `A_EAC3` E-AC-3 音频，支持常见
 SimpleBlock lacing 和 Annex-B/四字节长度前缀样本；其他音频编码会给出可诊断的 fallback 错误。AC-3 的
-`dac3` 配置从首个音频帧解析，浏览器必须支持组合 HEVC+AC-3 MSE。浏览器 Worker 的真实初始化
+`dac3` 和 E-AC-3 的 `dec3` 配置从首个音频帧解析，浏览器必须支持组合 HEVC+对应音频 MSE。存在多条音频轨时，Worker
+按 AAC-LC、AC-3、E-AC-3 的顺序选择第一条可封装轨；DTS 不伪装成 Web 可播格式，若存在可用备用轨会跳过，DTS-only 资源提示使用兼容客户端。
+浏览器 Worker 的真实初始化
 回归已通过；本机当前没有可提交的真实 MKV 样本，因此 MKV 的完整播放、seek 和音画同步真实性能门仍待使用
 用户提供的脱敏样本或专门准备的临时样本完成，不能据此宣称所有 MKV 或 4K MKV 均可实时播放。
 

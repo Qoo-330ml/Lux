@@ -288,7 +288,8 @@ function findTrack(result: MatroskaFile, number: number) {
 function defaultSampleDurationMs(track: MatroskaTrack) {
   if (track.defaultDurationMs !== null) return track.defaultDurationMs;
   if (track.type !== "audio" || !track.sampleRate) return 0;
-  return track.codecId.toUpperCase() === "A_AC3" ? 1536_000 / track.sampleRate : 1024_000 / track.sampleRate;
+  const codec = track.codecId.toUpperCase();
+  return codec === "A_AC3" || codec === "A_EAC3" ? 1536_000 / track.sampleRate : 1024_000 / track.sampleRate;
 }
 
 function splitLacedPayload(data: Uint8Array, start: number, end: number, flags: number) {

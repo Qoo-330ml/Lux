@@ -33,6 +33,45 @@ describe("playback selection", () => {
     expect(await shouldUseClientMkv(mkv, video)).toBe(true);
   });
 
+  it("accepts an MKV when a supported AAC track follows DTS and E-AC-3 tracks", () => {
+    const mkv = { ...source, container: "mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC" },
+      { index: 1, type: "AUDIO", codec: "DTS" },
+      { index: 2, type: "AUDIO", codec: "EAC3" },
+      { index: 3, type: "AUDIO", codec: "AAC" },
+    ] };
+    expect(hasClientMkvCandidate(mkv)).toBe(true);
+  });
+
+  it("selects E-AC-3 only when HEVC and E-AC-3 share an MSE", async () => {
+    const mkv = { ...source, container: "mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC" },
+      { index: 1, type: "AUDIO", codec: "EAC3" },
+    ] };
+    expect(hasClientMkvCandidate(mkv)).toBe(true);
+    vi.stubGlobal("MediaSource", { isTypeSupported: (mime: string) => !mime.includes("ec-3") });
+    vi.stubGlobal("VideoEncoder", undefined);
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("");
+    expect(await shouldUseClientMkv(mkv, video)).toBe(false);
+
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+    expect(await shouldUseClientMkv(mkv, video)).toBe(true);
+  });
+
+  it("does not select the AAC-only SDR path for an E-AC-3-only MKV", async () => {
+    const mkv = { ...source, container: "mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC" },
+      { index: 1, type: "AUDIO", codec: "EAC3" },
+    ] };
+    vi.stubGlobal("MediaSource", { isTypeSupported: (mime: string) => mime.includes("avc1") });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.stubGlobal("VideoEncoder", class VideoEncoder { static isConfigSupported() { return Promise.resolve({ supported: true }); } });
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("");
+    expect(await shouldUseClientMkv(mkv, video)).toBe(false);
+  });
+
   it("uses the fallback only when native HEVC is unavailable", async () => {
     vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
     vi.stubGlobal("Worker", class Worker {});

@@ -2,7 +2,8 @@ import type { MatroskaTrack } from "./matroska-demuxer";
 
 export type MatroskaAudioConfig =
   | { codec: "mp4a.40.2"; asc: Uint8Array; sampleRate: number; channels: number }
-  | { codec: "ac-3"; dac3: Uint8Array; sampleRate: number; channels: number };
+  | { codec: "ac-3"; dac3: Uint8Array; sampleRate: number; channels: number }
+  | { codec: "ec-3"; dec3: Uint8Array; sampleRate: number; channels: number; frameDurationMs: number };
 
 export function isSupportedMatroskaVideo(track: Pick<MatroskaTrack, "codecId" | "codecPrivate">) {
   return track.codecId.toUpperCase() === "V_MPEGH/ISO/HEVC" && track.codecPrivate.byteLength > 0;
@@ -12,7 +13,8 @@ export function isSupportedMatroskaAudio(track: Pick<MatroskaTrack, "codecId" | 
   const codec = track.codecId.toUpperCase();
   const audioObjectType = (track.codecPrivate[0] ?? 0) >> 3;
   return (codec.startsWith("A_AAC") && audioObjectType === 2 && track.codecPrivate.byteLength >= 2)
-    || (codec === "A_AC3" && (track.codecPrivate.byteLength === 0 || parseAc3Config(track.codecPrivate) !== null));
+    || (codec === "A_AC3" && (track.codecPrivate.byteLength === 0 || parseAc3Config(track.codecPrivate) !== null))
+    || (codec === "A_EAC3" && (track.codecPrivate.byteLength === 0 || parseEac3Config(track.codecPrivate) !== null));
 }
 
 export function matroskaAudioConfig(track: Pick<MatroskaTrack, "codecId" | "codecPrivate" | "sampleRate" | "channels">): MatroskaAudioConfig | null {
@@ -22,7 +24,9 @@ export function matroskaAudioConfig(track: Pick<MatroskaTrack, "codecId" | "code
     return { codec: "mp4a.40.2", asc: track.codecPrivate.slice(), sampleRate: track.sampleRate, channels: track.channels };
   }
   const dac3 = codec === "A_AC3" ? parseAc3Config(track.codecPrivate) : null;
-  return dac3 ? { codec: "ac-3", dac3, sampleRate: track.sampleRate, channels: track.channels } : null;
+  if (dac3) return { codec: "ac-3", dac3, sampleRate: track.sampleRate, channels: track.channels };
+  const eac3 = codec === "A_EAC3" ? parseEac3Config(track.codecPrivate) : null;
+  return eac3 ? { codec: "ec-3", dec3: eac3.dec3, sampleRate: track.sampleRate, channels: track.channels, frameDurationMs: eac3.frameDurationMs } : null;
 }
 
 export function encodedVideoDurationTicks(durationUs: number | undefined, fallbackDurationMs: number) {
@@ -72,6 +76,53 @@ function parseAc3Config(data: Uint8Array) {
   dac3[1] = ((bsmod & 3) << 6) | (acmod << 3) | (lfeon << 2) | ((frameSizeCode >> 1) & 3);
   dac3[2] = ((frameSizeCode >> 2) & 7) << 5;
   return dac3;
+}
+
+function parseEac3Config(data: Uint8Array) {
+  if (data.byteLength < 6 || data[0] !== 0x0b || data[1] !== 0x77) return null;
+  let bitOffset = 16;
+  const strmtyp = readBits(data, bitOffset, 2);
+  bitOffset += 2;
+  const substreamId = readBits(data, bitOffset, 3);
+  bitOffset += 3;
+  const frameSize = readBits(data, bitOffset, 11);
+  bitOffset += 11;
+  const fscod = readBits(data, bitOffset, 2);
+  bitOffset += 2;
+  if (strmtyp === null || substreamId === null || frameSize === null || fscod === null) return null;
+  let numBlocksCode: number | null;
+  let sampleRateCode: number | null = fscod;
+  if (fscod === 3) {
+    sampleRateCode = readBits(data, bitOffset, 2);
+    bitOffset += 2;
+    numBlocksCode = readBits(data, bitOffset, 2);
+    bitOffset += 2;
+  } else {
+    numBlocksCode = readBits(data, bitOffset, 2);
+    bitOffset += 2;
+  }
+  const acmod = readBits(data, bitOffset, 3);
+  bitOffset += 3;
+  const lfeon = readBits(data, bitOffset, 1);
+  bitOffset += 1;
+  const bsid = readBits(data, bitOffset, 5);
+  if (sampleRateCode === null || numBlocksCode === null || acmod === null || lfeon === null || bsid === null) return null;
+  if (strmtyp !== 0 || substreamId !== 0 || sampleRateCode > 2 || numBlocksCode > 3 || bsid < 11 || bsid > 16) return null;
+  const blocks = [1, 2, 3, 6][numBlocksCode];
+  const sampleRate = [48_000, 44_100, 32_000][sampleRateCode];
+  if (!blocks || !sampleRate) return null;
+  // EC3SpecificBox: data_rate/num_ind_sub followed by one four-byte
+  // independent substream descriptor. E-AC-3's syncframe has no bsmod field,
+  // so it is 0; the final byte is the required reserved bit plus padding.
+  const dec3 = new Uint8Array([
+    0,
+    0,
+    (sampleRateCode << 6) | (bsid << 1),
+    (acmod << 1) | lfeon,
+    0,
+    0,
+  ]);
+  return { dec3, frameDurationMs: blocks * 256_000 / sampleRate };
 }
 
 function readBits(data: Uint8Array, offset: number, length: number) {

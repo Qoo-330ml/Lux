@@ -29,6 +29,28 @@ describe("MKV transcode input", () => {
     });
   });
 
+  it("recognizes E-AC-3 syncframes and exposes an MP4 dec3 configuration", () => {
+    const eac3Frame = new Uint8Array(8);
+    eac3Frame.set([0x0b, 0x77]);
+    writeBits(eac3Frame, 16, 0, 2); // strmtyp
+    writeBits(eac3Frame, 18, 0, 3); // substreamid
+    writeBits(eac3Frame, 21, 0, 11); // frmsiz
+    writeBits(eac3Frame, 32, 0, 2); // fscod
+    writeBits(eac3Frame, 34, 3, 2); // numblkscod: 6 blocks
+    writeBits(eac3Frame, 36, 7, 3); // acmod: 3/2
+    writeBits(eac3Frame, 39, 1, 1); // lfeon: 5.1
+    writeBits(eac3Frame, 40, 16, 5); // bsid: E-AC-3
+
+    expect(isSupportedMatroskaAudio({ codecId: "A_EAC3", codecPrivate: eac3Frame })).toBe(true);
+    expect(matroskaAudioConfig({ codecId: "A_EAC3", codecPrivate: eac3Frame, sampleRate: 48_000, channels: 6 })).toEqual({
+      codec: "ec-3",
+      dec3: new Uint8Array([0, 0, 0x20, 0x0f, 0, 0]),
+      sampleRate: 48_000,
+      channels: 6,
+      frameDurationMs: 32,
+    });
+  });
+
   it("keeps Annex-B samples and converts four-byte length-prefixed NAL units", () => {
     const annexB = new Uint8Array([0, 0, 0, 1, 0x26, 0, 0, 1, 0x02]);
     expect([...toAnnexB(annexB)]).toEqual([...annexB]);
@@ -76,3 +98,10 @@ describe("MKV transcode input", () => {
     expect(hvcC?.data).toEqual(codecPrivate);
   });
 });
+
+function writeBits(data: Uint8Array, offset: number, value: number, length: number) {
+  for (let index = 0; index < length; index += 1) {
+    const bit = (value >> (length - index - 1)) & 1;
+    data[(offset + index) >> 3] |= bit << (7 - ((offset + index) & 7));
+  }
+}

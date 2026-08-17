@@ -5,7 +5,7 @@ const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
 const CLIENT_MKV_CONTAINERS = new Set(["mkv"]);
 const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
 const HEVC_MSE_CODECS = ["hvc1.2.4.L153.B0", "hvc1.1.6.L120.B0"] as const;
-const AC3_CODECS = new Set(["ac3", "ac-3"]);
+const PASSTHROUGH_AUDIO_CODECS = new Set(["ac3", "ac-3", "eac3", "ec-3"]);
 
 export function h264CodecForDimensions(width: number, height: number) {
   const pixels = Math.max(1, width) * Math.max(1, height);
@@ -24,8 +24,8 @@ export function hasClientMkvCandidate(source: MediaSource | undefined) {
   if (!source || (source.sourceKind === "STRM_URL" && !source.externalUrl) || !CLIENT_MKV_CONTAINERS.has((source.container ?? "").toLowerCase())) return false;
   const video = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
   if (!isHevcCodec(video?.codec)) return false;
-  const audio = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "AUDIO");
-  return !audio?.codec || /^aac$|^mp4a\./i.test(audio.codec) || AC3_CODECS.has(audio.codec.toLowerCase());
+  const audio = source.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
+  return audio.length === 0 || audio.some((stream) => /^aac$|^mp4a\./i.test(stream.codec ?? "") || PASSTHROUGH_AUDIO_CODECS.has((stream.codec ?? "").toLowerCase()));
 }
 
 export async function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {
@@ -40,13 +40,26 @@ export async function shouldUseClientMkv(source: MediaSource | undefined, video:
     return video.canPlayType('video/x-matroska; codecs="hvc1"') === "";
   }
   if (!hasClientHevcRuntime()) return false;
+  if (!hasClientMkvH264Audio(source)) return false;
   return probeClientHevc(source, video, "video/x-matroska");
 }
 
 function hasClientMkvAudioRuntime(source: MediaSource) {
-  const audio = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "AUDIO");
-  if (!audio?.codec || !AC3_CODECS.has(audio.codec.toLowerCase())) return true;
-  return HEVC_MSE_CODECS.some((videoCodec) => MediaSource.isTypeSupported(`video/mp4; codecs="${videoCodec},ac-3"`));
+  const audio = source.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
+  const codec = audio.some((stream) => /^aac$|^mp4a\./i.test(stream.codec ?? ""))
+    ? "aac"
+    : audio.some((stream) => ["ac3", "ac-3"].includes((stream.codec ?? "").toLowerCase()))
+      ? "ac-3"
+      : audio.some((stream) => ["eac3", "ec-3"].includes((stream.codec ?? "").toLowerCase()))
+        ? "ec-3"
+        : null;
+  if (!codec || codec === "aac") return true;
+  return HEVC_MSE_CODECS.some((videoCodec) => MediaSource.isTypeSupported(`video/mp4; codecs="${videoCodec},${codec}"`));
+}
+
+function hasClientMkvH264Audio(source: MediaSource) {
+  const audio = source.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
+  return audio.length === 0 || audio.some((stream) => /^aac$|^mp4a\./i.test(stream.codec ?? ""));
 }
 
 export function hasClientMkvHevcRuntime() {

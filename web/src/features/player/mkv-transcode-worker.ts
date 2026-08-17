@@ -1,7 +1,7 @@
 import { FMP4Muxer, H264Encoder, HEVCDecoder, type HEVCFrame, type MuxerSample } from "@hevcjs/core";
 import { Box, createFile, DataStream, ISOFile } from "mp4box";
 import processPolyfill from "process";
-import { MatroskaStreamDemuxer, type MatroskaSample, type MatroskaTrack } from "./matroska-demuxer";
+import type { MatroskaSample, MatroskaStreamDemuxer, MatroskaTrack } from "./matroska-demuxer";
 import { addHevcTrack, concatBuffers, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, toLengthPrefixed } from "./mkv-remux";
 import { encodedVideoDurationTicks, isSupportedMatroskaVideo, matroskaAudioConfig, toAnnexB } from "./mkv-transcode";
 
@@ -77,17 +77,19 @@ async function initialize(message: Extract<WorkerMessage, { type: "init" }>) {
     decoder = await HEVCDecoder.create({ wasmUrl: message.wasmUrl, wasmBinaryUrl: message.wasmBinaryUrl });
     muxer = new FMP4Muxer();
   }
+  const { MatroskaStreamDemuxer } = await import("./matroska-demuxer");
   demuxer = new MatroskaStreamDemuxer({
     onTrack: (track) => {
       if (track.type === "video" && !videoTrack) {
         if (!isSupportedMatroskaVideo(track)) throw new Error(`MKV 视频编码不支持：${track.codecId}`);
         videoTrack = track;
-      } else if (track.type === "audio" && !audioTrack) {
-        audioTrack = track;
-        audioConfig = matroskaAudioConfig(track);
-        const codec = track.codecId.toUpperCase();
-        if (!audioConfig && codec !== "A_AC3") throw new Error("MKV 音频只支持 AAC-LC 或 AC-3");
-        if (!remuxMode && codec === "A_AC3") throw new Error("当前客户端路径不支持 AC-3 音频");
+      } else if (track.type === "audio") {
+        const priority = audioTrackPriority(track);
+        const config = matroskaAudioConfig(track);
+        if (priority >= 0 && (!audioTrack || !audioConfig || priority > audioTrackPriority(audioTrack))) {
+          audioTrack = track;
+          audioConfig = config;
+        }
       }
     },
     onSample: (sample) => {
@@ -115,6 +117,7 @@ async function consumeSample(sample: MatroskaSample) {
   if (!track) return;
   if (track.type === "audio") {
     if (!audioConfig || !audioTrack?.sampleRate) return;
+    if (audioConfig.codec !== "mp4a.40.2") throw new Error("当前客户端路径不支持 AC-3/E-AC-3 音频");
     pendingAudio.push({
       timestampMs: sample.timestampMs,
       data: sample.data,
@@ -202,7 +205,7 @@ async function consumeRemuxSample(sample: MatroskaSample) {
   if (fatalError) return;
   const track = sample.trackNumber === videoTrack?.number ? videoTrack : sample.trackNumber === audioTrack?.number ? audioTrack : null;
   if (!track) return;
-  if (audioTrack?.codecId.toUpperCase() === "A_AC3" && !audioConfig) {
+  if ((audioTrack?.codecId.toUpperCase() === "A_AC3" || audioTrack?.codecId.toUpperCase() === "A_EAC3") && !audioConfig) {
     if (track.type !== "audio") {
       pendingRemuxSamples.push(sample);
       return;
@@ -218,7 +221,11 @@ async function consumeRemuxSample(sample: MatroskaSample) {
   const durationMs = sample.durationMs > 0
     ? sample.durationMs
     : track.type === "audio" && track.sampleRate
-      ? 1024_000 / track.sampleRate
+      ? audioConfig?.codec === "ec-3"
+        ? audioConfig.frameDurationMs
+        : audioConfig?.codec === "ac-3"
+          ? 1536_000 / track.sampleRate
+          : 1024_000 / track.sampleRate
       : videoTrack?.defaultDurationMs ?? 1000 / 30;
   const isVideo = track.type === "video";
   const trackId = isVideo ? remuxVideoTrackId : remuxAudioTrackId;
@@ -244,7 +251,7 @@ function ensureRemuxFile() {
   if (!videoTrack?.width || !videoTrack.height || videoTrack.codecPrivate.byteLength < 23) {
     throw new Error("MKV HEVC 缺少有效的视频配置");
   }
-  if (audioTrack && !audioConfig) throw new Error("MKV 音频只支持 AAC-LC 或 AC-3");
+  if (audioTrack && !audioConfig) throw new Error("MKV 音频只支持 AAC-LC、AC-3 或 E-AC-3");
   remuxOriginMs ??= 0;
   const file = createFile();
   const videoTrackId = addHevcTrack(file, videoTrack.codecPrivate, videoTrack.width, videoTrack.height);
@@ -254,7 +261,7 @@ function ensureRemuxFile() {
     const channels = audioTrack.channels;
     if (!sampleRate || !channels) throw new Error("MKV AAC 音频缺少采样率或声道数");
     audioTrackId = file.addTrack({
-      type: audioConfig.codec === "ac-3" ? "ac-3" : "mp4a",
+      type: audioConfig.codec === "ac-3" ? "ac-3" : audioConfig.codec === "ec-3" ? "ec-3" : "mp4a",
       timescale: sampleRate,
       channel_count: channels,
       samplerate: sampleRate,
@@ -266,8 +273,12 @@ function ensureRemuxFile() {
     const entry = track?.mdia.minf.stbl.stsd.entries[0];
     if (!entry) throw new Error("MKV fMP4 remux 缺少音频样本描述");
     const description = new Box();
-    description.type = audioConfig.codec === "ac-3" ? "dac3" : "esds";
-    description.data = audioConfig.codec === "ac-3" ? audioConfig.dac3.slice() : makeAacEsdsData(audioConfig.asc);
+    description.type = audioConfig.codec === "ac-3" ? "dac3" : audioConfig.codec === "ec-3" ? "dec3" : "esds";
+    description.data = audioConfig.codec === "ac-3"
+      ? audioConfig.dac3.slice()
+      : audioConfig.codec === "ec-3"
+        ? audioConfig.dec3.slice()
+        : makeAacEsdsData(audioConfig.asc);
     entry.addBox(description);
   }
   removeCreatedMovieExtends(file);
@@ -317,6 +328,14 @@ function removeCreatedMovieExtends(file: RemuxFile) {
 function copyDataStream(stream: DataStream | undefined) {
   if (!stream) throw new Error("MKV fMP4 remux 生成空媒体片段");
   return new Uint8Array(stream.buffer, stream.byteOffset, stream.byteLength).slice().buffer;
+}
+
+function audioTrackPriority(track: MatroskaTrack) {
+  const codec = track.codecId.toUpperCase();
+  if (codec.startsWith("A_AAC")) return 3;
+  if (codec === "A_AC3") return 2;
+  if (codec === "A_EAC3") return 1;
+  return -1;
 }
 
 async function flush() {
