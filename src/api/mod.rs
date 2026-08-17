@@ -675,6 +675,10 @@ pub fn app_with_state(state: AppState) -> Router {
             get(admin_list_metadata_reidentify).post(admin_start_metadata_reidentify),
         )
         .route(
+            "/api/v1/admin/metadata/confirm",
+            post(admin_confirm_metadata),
+        )
+        .route(
             "/api/v1/admin/metadata/reidentify/{job_id}",
             get(admin_get_metadata_reidentify).post(admin_retry_metadata_reidentify),
         )
@@ -10292,6 +10296,12 @@ struct MetadataReidentifyRequest {
     item_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetadataBatchConfirmationRequest {
+    item_ids: Vec<String>,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct MetadataReidentifyListQuery {
@@ -14639,6 +14649,86 @@ async fn admin_start_metadata_reidentify(
         Json(json!({ "job": metadata_reidentify_job_json(&job) })),
     )
         .into_response()
+}
+
+async fn admin_confirm_metadata(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<MetadataBatchConfirmationRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if request.item_ids.is_empty() || request.item_ids.len() > 100 {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "批量确认条目数量必须在 1 到 100 之间",
+        )
+        .into_response();
+    }
+    let requested_item_count = request.item_ids.len();
+    let item_ids: Vec<String> = request
+        .item_ids
+        .into_iter()
+        .filter(|item_id| item_id.parse::<crate::domain::ids::ItemId>().is_ok())
+        .collect();
+    if item_ids.len() != item_ids.iter().collect::<HashSet<_>>().len() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "批量确认条目不能重复",
+        )
+        .into_response();
+    }
+    if item_ids.len() != requested_item_count {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(selection) = state.metadata_selection.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "元数据写回服务尚未就绪",
+        )
+        .into_response();
+    };
+    let mut confirmed_count = 0_usize;
+    let mut failed_item_ids = Vec::new();
+    for item_id in &item_ids {
+        match selection.confirm_best_pending(item_id).await {
+            Ok(_) => confirmed_count += 1,
+            Err(_) => failed_item_ids.push(item_id.clone()),
+        }
+    }
+    record_audit_event(
+        &state,
+        &headers,
+        "METADATA_BATCH_CONFIRMED",
+        Some("metadata_items"),
+        None,
+        &json!({
+            "requestedCount": item_ids.len(),
+            "confirmedCount": confirmed_count,
+            "failedCount": failed_item_ids.len(),
+        })
+        .to_string(),
+    )
+    .await;
+    Json(json!({
+        "confirmedCount": confirmed_count,
+        "failedCount": failed_item_ids.len(),
+        "failedItemIds": failed_item_ids,
+    }))
+    .into_response()
 }
 
 async fn admin_get_metadata_reidentify(

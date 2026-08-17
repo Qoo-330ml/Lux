@@ -1108,6 +1108,19 @@ impl MetadataSelectionService {
             .await
     }
 
+    pub async fn confirm_best_pending(
+        &self,
+        item_id: &str,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        let candidate = self
+            .database
+            .find_best_pending_metadata_candidate(item_id)
+            .await?
+            .ok_or(MetadataSelectionError::CandidateNotFound)?;
+        self.select(item_id, &candidate.id, MetadataSelectionMode::FillMissing)
+            .await
+    }
+
     async fn select_internal(
         &self,
         item_id: &str,

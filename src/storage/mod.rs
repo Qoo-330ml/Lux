@@ -6852,6 +6852,31 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_best_pending_metadata_candidate(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredMetadataCandidate>, StorageError> {
+        self.query(
+            "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                    mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                    mi.title AS item_title
+             FROM metadata_candidates mc
+             JOIN media_items mi ON mi.id = mc.item_id
+             WHERE mc.item_id = ? AND mc.status = 'PENDING'
+               AND mi.removed_at IS NULL
+             ORDER BY mc.score DESC, mc.created_at, mc.id
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_metadata_candidate))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn select_metadata_candidate(
         &self,
         update: SelectedMetadataUpdate<'_>,
