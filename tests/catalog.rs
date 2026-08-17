@@ -459,7 +459,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let emby_people_page_body: Value = emby_people_page.json().await?;
     assert_eq!(
         emby_people_page_body["Items"][0]["People"][0]["Type"],
-        "Actor"
+        "Person"
     );
     assert_eq!(
         emby_people_page_body["Items"][0]["People"][1]["Type"],
@@ -763,7 +763,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert!(user_scoped_detail_body.get("SeasonId").is_none());
     assert_eq!(user_scoped_detail_body["People"][0]["Id"], "9");
     assert_eq!(user_scoped_detail_body["People"][0]["Role"], "角色甲");
-    assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Actor");
+    assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Person");
     assert_eq!(user_scoped_detail_body["People"][1]["Id"], "88");
     assert_eq!(user_scoped_detail_body["People"][1]["Name"], "导演甲");
     assert_eq!(user_scoped_detail_body["People"][1]["Type"], "Director");

@@ -218,7 +218,14 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         actor_a["Role"].as_str(),
         Some("角色甲") | Some("角色乙")
     ));
-    assert_eq!(actor_a["Type"], "Actor");
+    assert_eq!(actor_a["Type"], "Person");
+    assert!(
+        actor_a["ServerId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(actor_a["ImageTags"].is_object());
+    assert_eq!(actor_a["BackdropImageTags"], json!([]));
     let actor_b = actors
         .iter()
         .find(|actor| actor["Id"] == "102")

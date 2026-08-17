@@ -1397,7 +1397,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - Years。
 - Fields。
 - EnableImages、ImageTypeLimit。
-- `/Persons` 使用 `ParentId` 指定媒体库；`Recursive=true` 聚合媒体库所有后代媒体条目，`Recursive=false` 只聚合直接子条目，未传 `Recursive` 时按递归查询处理以兼容旧客户端；`PersonTypes=Actor` 返回去重后的演员。响应必须保持 `Items`、`TotalRecordCount`、`StartIndex` 的 Emby 分页结构；接受任意正整数 `Limit`，不额外施加服务端上限；`Fields`、`SortBy`、`SortOrder` 必须在数据库分页前生效；`DateCreated` 使用演员首次出现在该媒体库媒体条目中的最早 `added_at`。人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
+- `/Persons` 使用 `ParentId` 指定媒体库；`Recursive=true` 聚合媒体库所有后代媒体条目，`Recursive=false` 只聚合直接子条目，未传 `Recursive` 时按递归查询处理以兼容旧客户端；`PersonTypes=Actor` 返回去重后的演员。人物 DTO 使用 `Type=Person`，并提供 `ServerId`、`ImageTags`、`BackdropImageTags`。响应必须保持 `Items`、`TotalRecordCount`、`StartIndex` 的 Emby 分页结构；接受任意正整数 `Limit`，不额外施加服务端上限；`Fields`、`SortBy`、`SortOrder` 必须在数据库分页前生效；`DateCreated` 使用演员首次出现在该媒体库媒体条目中的最早 `added_at`。人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
 - TotalRecordCount 与 Items 的一致性。
 
 Limit 默认 50；Emby `/Persons` 接受任意正整数，不设置服务端硬上限，其他列表接口继续遵循各自的服务端上限。
