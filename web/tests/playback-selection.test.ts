@@ -14,7 +14,7 @@ describe("playback selection", () => {
   it("recognizes local MP4 HEVC sources as client-fallback candidates", () => {
     expect(hasClientHevcCandidate(source)).toBe(true);
     expect(hasClientHevcCandidate({ ...source, container: "mkv" })).toBe(false);
-    expect(hasClientHevcCandidate({ ...source, sourceKind: "STRM_URL" })).toBe(false);
+    expect(hasClientHevcCandidate({ ...source, sourceKind: "STRM_URL", externalUrl: "https://media.example.test/video.mp4" })).toBe(true);
     expect(hasClientHevcCandidate({ ...source, streams: [{ index: 0, type: "VIDEO", codec: "dvh1.05.06" }] })).toBe(false);
   });
 

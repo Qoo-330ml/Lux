@@ -4,7 +4,7 @@ import { isHevcCodec } from "./media-codec";
 const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
 
 export function hasClientHevcCandidate(source: MediaSource | undefined) {
-  if (!source || source.sourceKind === "STRM_URL" || !CLIENT_HEVC_CONTAINERS.has((source.container ?? "").toLowerCase())) return false;
+  if (!source || (source.sourceKind === "STRM_URL" && !source.externalUrl) || !CLIENT_HEVC_CONTAINERS.has((source.container ?? "").toLowerCase())) return false;
   const video = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
   return isHevcCodec(video?.codec);
 }
