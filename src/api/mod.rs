@@ -5873,6 +5873,17 @@ fn is_http_strm_target(value: &str) -> bool {
     matches!(classify_strm_target(value).kind, StrmTargetKind::Url)
 }
 
+fn normalize_strm_http_location(value: &str) -> Option<HeaderValue> {
+    if value.is_ascii() {
+        return HeaderValue::from_str(value).ok();
+    }
+    if !is_http_strm_target(value) {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    HeaderValue::from_str(url.as_str()).ok()
+}
+
 fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
     let mut value = json!({
         "Index": stream.index,
@@ -9245,7 +9256,7 @@ async fn serve_media_file(
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
         };
-        let Ok(location) = HeaderValue::from_str(&location) else {
+        let Some(location) = normalize_strm_http_location(&location) else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
         return match Response::builder()
@@ -16780,8 +16791,9 @@ mod tests {
         is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
         is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
         is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        normalize_filmly_null_languages, playback_client_label, playback_identifier_prefix,
-        record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
+        normalize_filmly_null_languages, normalize_strm_http_location, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -16796,6 +16808,21 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri};
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn strm_http_location_percent_encodes_non_ascii_url_components() {
+        let raw = "https://media.example.test/path/剧集?title=第1集&token=secret";
+        assert!(super::is_http_strm_target(raw));
+        let location = normalize_strm_http_location(raw)
+            .and_then(|value| value.to_str().ok().map(str::to_owned));
+
+        assert_eq!(
+            location.as_deref(),
+            Some(
+                "https://media.example.test/path/%E5%89%A7%E9%9B%86?title=%E7%AC%AC1%E9%9B%86&token=secret"
+            )
+        );
+    }
 
     #[test]
     fn emby_collection_type_uses_mixed_for_mixed_libraries() {

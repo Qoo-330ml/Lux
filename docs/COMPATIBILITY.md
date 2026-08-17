@@ -34,6 +34,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - Emby `GET /Items/Counts` 现已支持根路径和 `/emby` 前缀，执行 Emby token/API key 鉴权、用户媒体库 ACL，并支持 `UserId` 与 `IsFavorite` 过滤；`tests/emby_counts.rs` 覆盖协议响应。尚未以 Filmly 或 CapyPlayer 真实 UI 复测，不据此宣称客户端兼容。
 - 2026-08-11 服务器名称兼容修复：第三方客户端添加服务器时可从 `GET /System/Info/Public` 的 `ServerName` 读取名称；认证后的 `GET /System/Info`、`Users/Public`、`AuthenticateByName` 返回的 `User.ServerName` 也统一读取管理员设置的 `serverName`。官方 Emby 文档将 `ServerName` 定义为服务器名称字段；本次加入 `tests/emby_system.rs` 协议回归，尚未在当前环境重新进行 VidHub UI 点选复测。
 - SenPlayer 列表兼容修复：当请求的 `Fields` 未包含 `MediaSources` 或 `MediaStreams` 时，Emby 列表响应不再携带这些字段；详情和 `PlaybackInfo` 仍返回完整媒体源。自动化回归已覆盖，真实客户端需要清理缓存或重新进入库后复测。
+- 2026-08-17 SenPlayer `.strm` 直放地址编码修复：HTTP(S) 目标包含 Unicode 路径或查询参数时，Emby 视频端点现在先将 URL 规范化为合法的百分号编码 `Location`，再返回原有 307 直连；数据库仍保留原始目标，不代理媒体字节。新增 API 单测和 `.strm` 集成回归，真实 SenPlayer UI 需重新部署后复测。
 - Emby `GET /Items` 对标准 ItemId 仍按逗号分隔的 `Ids` 严格过滤；不存在的 ItemId 或 UUID 返回空 `Items` 和 `TotalRecordCount: 0`。针对 Redia 的兼容兜底见下一条。
 - Redia 兼容兜底：`GET /Items?Ids=<MediaSourceId>` 在没有同名 ItemId 时会解析到该媒体源所属条目；未知 ID 仍返回空结果，不会回退到媒体库第一条。`/Videos/{ItemId}/original.strm`（含 `/emby` 和大小写路径变体）复用 Emby 播放逻辑并对 STRM 返回 307 直连；其他未注册 `/Videos/...` 路径返回 404，不再落入 Web 前端 fallback 返回 HTML。标准客户端仍应使用 ItemId 和 `/Items/{ItemId}/PlaybackInfo`。
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
