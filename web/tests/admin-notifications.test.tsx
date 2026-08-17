@@ -21,6 +21,8 @@ describe("AdminNotificationsPage", () => {
         name: "本地接收器",
         url: "http://127.0.0.1:8787/hooks",
         payloadFormat: "LUX",
+        providerPluginId: "org.lux.webhook",
+        providerConfig: { payloadFormat: "LUX" },
         enabled: true,
         allowPrivateNetwork: true,
         eventTypes: ["MEDIA_ADDED"],
@@ -28,6 +30,37 @@ describe("AdminNotificationsPage", () => {
         createdAt: 1_700_000_000,
         updatedAt: 1_700_000_100,
       }],
+      page: 1,
+      pageSize: 50,
+    });
+    vi.spyOn(api, "adminNotificationProviders").mockResolvedValue({
+      plugins: [{
+        id: "org.lux.webhook",
+        name: "Webhook 通知器",
+        description: "发送 Lux 事件",
+        category: "NOTIFICATION",
+        version: "0.1.0",
+        runtime: "process",
+        capabilities: ["notification.send"],
+        status: "READY",
+        running: true,
+        installed: true,
+        enabled: true,
+        configured: true,
+        available: true,
+        configurable: true,
+        configFields: [{
+          key: "payloadFormat",
+          label: "Payload 格式",
+          type: "select",
+          required: true,
+          sensitive: false,
+          defaultValue: "LUX",
+          options: [{ value: "LUX", label: "Lux 原生" }, { value: "EMBY", label: "Emby 风格" }],
+        }],
+        configSource: "PLUGIN_DEFAULT",
+      }],
+      total: 1,
       page: 1,
       pageSize: 50,
     });
@@ -56,6 +89,8 @@ describe("AdminNotificationsPage", () => {
         name: "新目标",
         url: "https://example.com/hooks",
         payloadFormat: "EMBY",
+        providerPluginId: "org.lux.webhook",
+        providerConfig: { payloadFormat: "EMBY" },
         enabled: true,
         allowPrivateNetwork: false,
         eventTypes: [],
@@ -74,6 +109,8 @@ describe("AdminNotificationsPage", () => {
         name: "本地接收器",
         url: "http://127.0.0.1:8787/hooks",
         payloadFormat: "LUX",
+        providerPluginId: "org.lux.webhook",
+        providerConfig: { payloadFormat: "LUX" },
         enabled: false,
         allowPrivateNetwork: true,
         eventTypes: ["MEDIA_ADDED"],
@@ -107,10 +144,12 @@ describe("AdminNotificationsPage", () => {
 
     expect(container.textContent).toContain("通知");
     expect(container.textContent).toContain("本地接收器");
-    expect(container.textContent).toContain("投递失败");
+    expect(container.textContent).toContain("发送失败");
     expect(container.querySelector('input[name="event-MEDIA_ADDED"]')).toBeTruthy();
-    expect(container.querySelector('select[name="notification-payload-format"]')).toBeTruthy();
-    expect(container.textContent).toContain("Emby 风格");
+    expect(container.querySelector('select[name="notification-provider"]')).toBeTruthy();
+    expect(container.querySelector('select[name="notification-config-payloadFormat"]')).toBeTruthy();
+    expect(container.textContent).toContain("通知内容");
+    expect(container.textContent).toContain("通知器配置");
     expect(container.querySelector('button[aria-label="重试投递 delivery-1"]')).toBeTruthy();
   });
 });

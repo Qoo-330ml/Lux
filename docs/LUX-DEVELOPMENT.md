@@ -3935,8 +3935,9 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 #### LUX-183：通知器插件、Webhook 事件与持久化投递
 
 范围：为 Lux 增加统一通知事件、持久化 outbox 和可插拔通知器宿主。通知通过持久化事件和投递记录由有界后台
-worker 发送，不能阻塞扫描、播放或元数据请求。通知器使用独立进程插件协议；首个兼容 provider 为旧版内置
-Webhook，旧目标迁移后继续可用。Lux 原生 `schemaVersion: 1` JSON 合同和 Emby 风格 payload 使用独立
+worker 发送，不能阻塞扫描、播放或元数据请求。通知器使用独立进程插件协议；首个外置 provider 为
+`org.lux.webhook`。旧版 `builtin.webhook` 目标保留兼容路径，新的通知配置应选择已安装的通知器插件。Lux 原生
+`schemaVersion: 1` JSON 合同和 Emby 风格 payload 使用独立
 adapter；不声称完整兼容 Emby Webhooks 插件的全部 payload/template 行为。Telegram、企业微信和 Email 的
 具体插件实现不属于当前任务。
 

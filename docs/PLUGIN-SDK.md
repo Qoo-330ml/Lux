@@ -341,7 +341,7 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
     "url": "https://example.com/lux-hook",
     "allowPrivateNetwork": false
   },
-  "config": {"chatId": "chat-1"},
+  "config": {"payloadFormat": "LUX"},
   "secret": "provider-specific-secret"
 }
 ```
