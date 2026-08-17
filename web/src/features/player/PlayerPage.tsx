@@ -6,6 +6,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { PlaybackEventState } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
+import { NativeVideoEngine } from "./playback-engine";
 
 const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
@@ -19,14 +20,32 @@ export function PlayerPage() {
   const queryClient = useQueryClient();
   const item = useQuery({ queryKey: queryKeys.item(itemId), queryFn: () => api.item(itemId), enabled: Boolean(itemId) });
   const playback = useQuery({ queryKey: queryKeys.playback(itemId), queryFn: () => api.playback(itemId), enabled: Boolean(itemId) });
+  const media = item.data;
+  const source = media?.mediaSources?.find((entry) => entry.id === requestedSourceId)
+    ?? media?.mediaSources?.find((entry) => entry.isDefault)
+    ?? media?.mediaSources?.[0];
+  const streamUrl = source?.sourceKind === "STRM_URL"
+    ? source.externalUrl ?? ""
+    : source && media
+      ? `/api/v1/items/${encodeURIComponent(media.id)}/stream?sourceId=${encodeURIComponent(source.id)}`
+      : "";
+  const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const videoRef = useRef<HTMLVideoElement>(null);
   const lastVideoRef = useRef<HTMLVideoElement | null>(null);
+  const engineRef = useRef<NativeVideoEngine | null>(null);
   const lastProgressReportRef = useRef(0);
   const hasStartedRef = useRef(false);
   const hasRestoredPositionRef = useRef(false);
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
+    if (!video) {
+      engineRef.current?.destroy();
+      engineRef.current = null;
+      videoRef.current = null;
+      return;
+    }
     videoRef.current = video;
-    if (video) lastVideoRef.current = video;
+    lastVideoRef.current = video;
+    engineRef.current = new NativeVideoEngine(video);
   }, []);
 
   const reportPlayback = useCallback((state: PlaybackEventState, force = false, keepalive = false, videoOverride?: HTMLVideoElement | null) => {
@@ -82,19 +101,19 @@ export function PlayerPage() {
     restorePlaybackPosition();
   }, [restorePlaybackPosition]);
 
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine || !streamUrl) return;
+    engine.setSource(streamUrl, poster);
+    return () => {
+      if (engineRef.current === engine) engine.destroy();
+    };
+  }, [poster, streamUrl]);
+
   if (item.isPending) return <section className="lux-page-state"><p>正在准备播放器…</p></section>;
   if (item.error) return <section className="lux-page-state"><h1>播放器加载失败</h1><p>{item.error.message}</p></section>;
+  if (!media) return <section className="lux-page-state"><h1>播放器加载失败</h1><p>媒体条目为空。</p></section>;
 
-  const media = item.data;
-  const source = media.mediaSources?.find((entry) => entry.id === requestedSourceId)
-    ?? media.mediaSources?.find((entry) => entry.isDefault)
-    ?? media.mediaSources?.[0];
-  const streamUrl = source?.sourceKind === "STRM_URL"
-    ? source.externalUrl ?? ""
-    : source
-      ? `/api/v1/items/${encodeURIComponent(media.id)}/stream?sourceId=${encodeURIComponent(source.id)}`
-      : "";
-  const poster = imageUrl(media, "fanart") ?? imageUrl(media);
   const handleLoadedMetadata = () => {
     restorePlaybackPosition();
   };
@@ -111,8 +130,7 @@ export function PlayerPage() {
           <video
             ref={setVideoRef}
             className="lux-video"
-            src={streamUrl}
-            poster={poster}
+            poster={poster ?? undefined}
             controls
             preload="metadata"
             onError={() => setFailedStreamUrl(streamUrl)}

@@ -17,6 +17,8 @@ describe("PlayerPage playback synchronization", () => {
 
   beforeEach(() => {
     vi.spyOn(api, "progress").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
   });
 
   afterEach(() => {
