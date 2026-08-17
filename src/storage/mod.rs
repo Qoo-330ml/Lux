@@ -7336,23 +7336,10 @@ impl Database {
         if library_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat_n("?", library_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query = format!(
-            "WITH ranked AS (
-                 SELECT mi.id, mi.library_id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY mi.library_id
-                            ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC
-                        ) AS library_rank
-                 FROM media_items mi
-                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND mi.item_type IN ('MOVIE', 'SERIES')
-                   AND mi.library_id IN ({placeholders})
-             )
-             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+        let mut rows = Vec::new();
+        for library_id in library_ids {
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
@@ -7373,7 +7360,16 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM ranked
+             FROM (
+                 SELECT mi.id, mi.library_id
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.library_id = ?
+                   AND mi.item_type IN ('MOVIE', 'SERIES')
+                   AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                 ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC
+                 LIMIT ?
+             ) ranked
              JOIN media_items mi ON mi.id = ranked.id
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
@@ -7382,13 +7378,18 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE ranked.library_rank <= ?
-             ORDER BY ranked.library_id, ranked.library_rank, ms.id, mt.stream_index"
-        );
-        let mut binds = Vec::with_capacity(library_ids.len() + 1);
-        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
-        binds.push(CatalogBind::Integer(limit));
-        self.fetch_catalog_rows(&query, &binds).await
+             ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC,
+                      ms.id, mt.stream_index"
+            );
+            let library_rows = self
+                .fetch_catalog_rows(
+                    &query,
+                    &[CatalogBind::Text(library_id), CatalogBind::Integer(limit)],
+                )
+                .await?;
+            rows.extend(library_rows);
+        }
+        Ok(rows)
     }
 
     pub(crate) async fn list_recommended_catalog_rows(

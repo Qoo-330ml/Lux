@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{
         Arc,
@@ -75,12 +75,25 @@ struct CachedSnapshot {
     snapshot: Arc<HomeSnapshot>,
 }
 
+struct HomeSharedSnapshot {
+    latest_groups: Vec<(String, Vec<CatalogItem>)>,
+    views: Vec<LibraryView>,
+}
+
+struct CachedSharedSnapshot {
+    generation: u64,
+    refreshed_at: Instant,
+    snapshot: Arc<HomeSharedSnapshot>,
+}
+
 struct HomeServiceInner {
     catalog: CatalogService,
     libraries: LibraryService,
     access: MediaAccessService,
     generation: AtomicU64,
     entries: Mutex<HashMap<HomeCacheKey, Arc<HomeCacheEntry>>>,
+    shared: Mutex<Option<CachedSharedSnapshot>>,
+    shared_compute_lock: Mutex<()>,
     refresh_tx: mpsc::Sender<()>,
     invalidation_notify: Notify,
 }
@@ -103,6 +116,8 @@ impl HomeService {
             access,
             generation: AtomicU64::new(0),
             entries: Mutex::new(HashMap::new()),
+            shared: Mutex::new(None),
+            shared_compute_lock: Mutex::new(()),
             refresh_tx,
             invalidation_notify: Notify::new(),
         });
@@ -117,7 +132,9 @@ impl HomeService {
                 Self { inner }.refresh_cached_entries().await;
             }
         });
-        Self { inner }
+        let service = Self { inner };
+        service.schedule_refresh();
+        service
     }
 
     pub(crate) async fn snapshot(
@@ -193,7 +210,64 @@ impl HomeService {
         let _ = self.inner.refresh_tx.try_send(());
     }
 
+    async fn prewarm(&self) -> Result<(), HomeError> {
+        self.refresh_shared_cache().await
+    }
+
+    async fn shared_snapshot(&self) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
+        loop {
+            let generation = self.inner.generation.load(Ordering::Acquire);
+            {
+                let cached = self.inner.shared.lock().await;
+                if let Some(cached) = cached.as_ref()
+                    && cached.generation == generation
+                {
+                    if cached.refreshed_at.elapsed() >= HOME_CACHE_TTL {
+                        self.schedule_refresh();
+                    }
+                    return Ok(cached.snapshot.clone());
+                }
+            }
+
+            self.refresh_shared_cache().await?;
+            let cached = self.inner.shared.lock().await;
+            if let Some(cached) = cached.as_ref()
+                && cached.generation == generation
+            {
+                return Ok(cached.snapshot.clone());
+            }
+        }
+    }
+
+    async fn refresh_shared_cache(&self) -> Result<(), HomeError> {
+        let _compute_guard = self.inner.shared_compute_lock.lock().await;
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        {
+            let cached = self.inner.shared.lock().await;
+            if cached.as_ref().is_some_and(|cached| {
+                cached.generation == generation && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
+            }) {
+                return Ok(());
+            }
+        }
+
+        let snapshot = Arc::new(self.build_shared_snapshot().await?);
+        if self.inner.generation.load(Ordering::Acquire) == generation {
+            *self.inner.shared.lock().await = Some(CachedSharedSnapshot {
+                generation,
+                refreshed_at: Instant::now(),
+                snapshot,
+            });
+        } else {
+            self.schedule_refresh();
+        }
+        Ok(())
+    }
+
     async fn refresh_cached_entries(&self) {
+        if let Err(error) = self.prewarm().await {
+            tracing::warn!(%error, "failed to prewarm shared home cache");
+        }
         let entries = self
             .inner
             .entries
@@ -238,20 +312,14 @@ impl HomeService {
     }
 
     async fn build_snapshot(&self, principal: AccessPrincipal) -> Result<HomeSnapshot, HomeError> {
-        let accessible_library_ids = self
-            .inner
-            .access
-            .accessible_library_ids(principal)
-            .await
-            .map_err(CatalogError::from)?;
+        let (shared_result, accessible_library_ids_result) = tokio::join!(
+            self.shared_snapshot(),
+            self.inner.access.accessible_library_ids(principal),
+        );
+        let shared = shared_result?;
+        let accessible_library_ids = accessible_library_ids_result.map_err(CatalogError::from)?;
         let user_id = principal.user_id.to_string();
-        let (
-            continue_watching_result,
-            recently_added_result,
-            recommended_result,
-            latest_groups_result,
-            views_result,
-        ) = tokio::join!(
+        let (continue_watching_result, recently_added_result, recommended_result) = tokio::join!(
             self.inner.catalog.list_continue_watching_for_library_ids(
                 &accessible_library_ids,
                 &user_id,
@@ -266,29 +334,63 @@ impl HomeService {
                 &user_id,
                 12,
             ),
-            self.inner
-                .catalog
-                .list_recently_added_by_library_ids(&accessible_library_ids, 12),
-            self.inner.libraries.list_libraries(),
         );
-        let accessible_library_ids = accessible_library_ids
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-        let views = views_result?
-            .into_iter()
+        let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
+        let views = shared
+            .views
+            .iter()
             .filter(|view| {
                 view.library.is_enabled
                     && accessible_library_ids.contains(&view.library.id.to_string())
             })
+            .cloned()
+            .collect();
+        let latest_groups = shared
+            .latest_groups
+            .iter()
+            .filter(|(library_id, _)| accessible_library_ids.contains(library_id))
+            .cloned()
             .collect();
 
         Ok(HomeSnapshot {
             continue_watching: continue_watching_result?,
             recently_added: recently_added_result?,
             recommended: recommended_result?,
-            latest_groups: latest_groups_result?,
+            latest_groups,
             views,
         })
+    }
+
+    async fn build_shared_snapshot(&self) -> Result<HomeSharedSnapshot, HomeError> {
+        let views = self.inner.libraries.list_libraries().await?;
+        let enabled_library_ids = views
+            .iter()
+            .filter(|view| view.library.is_enabled)
+            .map(|view| view.library.id.to_string())
+            .collect::<Vec<_>>();
+        let latest_groups = self
+            .inner
+            .catalog
+            .list_recently_added_by_library_ids(&enabled_library_ids, 12)
+            .await?;
+        Ok(HomeSharedSnapshot {
+            latest_groups,
+            views: views
+                .into_iter()
+                .filter(|view| view.library.is_enabled)
+                .collect(),
+        })
+    }
+
+    #[cfg(test)]
+    async fn shared_cache_ready(&self) -> bool {
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        self.inner
+            .shared
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|cached| cached.generation == generation)
     }
 }
 
@@ -330,5 +432,26 @@ mod tests {
         tokio::time::sleep(HOME_REFRESH_DEBOUNCE + std::time::Duration::from_millis(50)).await;
         let third = home.snapshot(principal).await.expect("refreshed snapshot");
         assert!(!std::ptr::eq(first.as_ref(), third.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn invalidation_prewarms_shared_home_without_a_user_entry() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access.clone()),
+            LibraryService::new(database),
+            access,
+        );
+
+        home.invalidate();
+        tokio::time::sleep(HOME_REFRESH_DEBOUNCE + std::time::Duration::from_millis(50)).await;
+
+        assert!(home.shared_cache_ready().await);
     }
 }
