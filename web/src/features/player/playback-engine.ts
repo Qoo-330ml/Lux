@@ -13,6 +13,8 @@ export type PlaybackPerformance = {
   realtime: boolean;
 };
 
+export const PLAYBACK_PERFORMANCE_EVENT = "lux:playback-performance";
+
 export function summarizePlaybackPerformance(mediaDurationMs: number, processingDurationMs: number): PlaybackPerformance | null {
   if (!Number.isFinite(mediaDurationMs) || mediaDurationMs <= 0 || !Number.isFinite(processingDurationMs) || processingDurationMs <= 0) return null;
   const speedX = mediaDurationMs / processingDurationMs;

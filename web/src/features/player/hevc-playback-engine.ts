@@ -1,6 +1,6 @@
 import { TranscodeWorkerClient } from "@hevcjs/core";
 import { createFile } from "mp4box";
-import { summarizePlaybackPerformance, type PlaybackEngine, type PlaybackPerformance, type PlaybackSnapshot } from "./playback-engine";
+import { PLAYBACK_PERFORMANCE_EVENT, summarizePlaybackPerformance, type PlaybackEngine, type PlaybackPerformance, type PlaybackSnapshot } from "./playback-engine";
 import { isHevcCodec } from "./media-codec";
 
 export type HevcRuntimeAssets = {
@@ -345,6 +345,7 @@ export class ClientHevcEngine implements PlaybackEngine {
       this.transcodedMediaDurationMs += stats.segDurMs;
       this.transcodedProcessingDurationMs += stats.demuxMs + stats.decodeMs + stats.encodeMs;
       this.performance = summarizePlaybackPerformance(this.transcodedMediaDurationMs, this.transcodedProcessingDurationMs);
+      this.element.dispatchEvent(new CustomEvent(PLAYBACK_PERFORMANCE_EVENT, { detail: this.performance }));
     }
     if (transcoded) {
       await this.videoQueue.append(transcoded);

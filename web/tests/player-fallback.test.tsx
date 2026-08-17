@@ -126,4 +126,35 @@ describe("PlayerPage client fallback status", () => {
 
     expect(container?.textContent).toContain("MSE SourceBuffer append failed");
   });
+
+  it("updates the degraded status when fallback throughput arrives after first playback is ready", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-fallback"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    expect(video).not.toBeNull();
+    await act(async () => video?.dispatchEvent(new CustomEvent("lux:playback-performance", {
+      detail: { mediaDurationMs: 2_000, processingDurationMs: 8_000, speedX: 0.25, realtime: false },
+    })));
+
+    expect(container?.textContent).toContain("客户端解码速度低于实时");
+    expect(container?.textContent).toContain("0.25×");
+  });
 });

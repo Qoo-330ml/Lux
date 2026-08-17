@@ -2,6 +2,14 @@ import type { MediaSource } from "../../lib/api/types";
 import { isHevcCodec } from "./media-codec";
 
 const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
+const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
+
+export function h264CodecForDimensions(width: number, height: number) {
+  const pixels = Math.max(1, width) * Math.max(1, height);
+  if (pixels > 2_073_600) return "avc1.640033";
+  if (pixels > 921_600) return "avc1.64002a";
+  return "avc1.640028";
+}
 
 export function hasClientHevcCandidate(source: MediaSource | undefined) {
   if (!source || (source.sourceKind === "STRM_URL" && !source.externalUrl) || !CLIENT_HEVC_CONTAINERS.has((source.container ?? "").toLowerCase())) return false;
@@ -26,7 +34,7 @@ export async function shouldUseClientHevc(source: MediaSource | undefined, video
   const framerate = typeof details.averageFrameRate === "number" && Number.isFinite(details.averageFrameRate) && details.averageFrameRate > 0 ? details.averageFrameRate : 30;
   try {
     const support = await browserGlobals.VideoEncoder?.isConfigSupported({
-      codec: "avc1.640028",
+      codec: h264CodecForDimensions(width, height),
       width,
       height,
       bitrate: Math.max(1_000_000, source?.bitrate ?? 8_000_000),
@@ -45,5 +53,5 @@ export function hasClientHevcRuntime() {
     && typeof MediaSource !== "undefined"
     && typeof browserGlobals.VideoEncoder?.isConfigSupported === "function"
     && typeof MediaSource.isTypeSupported === "function"
-    && MediaSource.isTypeSupported('video/mp4; codecs="avc1.640028"');
+    && H264_CODECS.some((codec) => MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`));
 }

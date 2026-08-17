@@ -6,7 +6,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { PlaybackEventState } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
-import { NativeVideoEngine, type PlaybackEngine } from "./playback-engine";
+import { NativeVideoEngine, PLAYBACK_PERFORMANCE_EVENT, type PlaybackEngine, type PlaybackPerformance } from "./playback-engine";
 import { shouldUseClientHevc } from "./playback-selection";
 
 const TICKS_PER_SECOND = 10_000_000;
@@ -118,7 +118,12 @@ export function PlayerPage() {
     const initialEngine = engineRef.current;
     if (!initialEngine || !streamUrl) return;
     let activeEngine: PlaybackEngine = initialEngine;
+    let performanceElement: HTMLVideoElement | null = null;
     let cancelled = false;
+    const handlePerformance = (event: Event) => {
+      const performance = (event as CustomEvent<PlaybackPerformance | null>).detail;
+      setFallbackSpeedX(performance && !performance.realtime ? performance.speedX : null);
+    };
     const load = async () => {
       try {
         if (await shouldUseClientHevc(source, initialEngine.element)) {
@@ -128,11 +133,11 @@ export function PlayerPage() {
           initialEngine.destroy();
           activeEngine = new ClientHevcEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
           engineRef.current = activeEngine;
+          performanceElement = activeEngine.element;
+          performanceElement.addEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
         }
         await activeEngine.setSource(streamUrl, poster);
-        if (!cancelled && activeEngine.performance && !activeEngine.performance.realtime) {
-          setFallbackSpeedX(activeEngine.performance.speedX);
-        }
+        if (!cancelled && activeEngine.performance) handlePerformance(new CustomEvent(PLAYBACK_PERFORMANCE_EVENT, { detail: activeEngine.performance }));
       } catch (cause) {
         if (!cancelled) {
           setFailedStreamUrl(streamUrl);
@@ -146,6 +151,7 @@ export function PlayerPage() {
     void load();
     return () => {
       cancelled = true;
+      performanceElement?.removeEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
       activeEngine.destroy();
       if (engineRef.current === activeEngine) engineRef.current = null;
     };

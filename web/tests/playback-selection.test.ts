@@ -49,4 +49,25 @@ describe("playback selection", () => {
 
     expect(await shouldUseClientHevc(source, video)).toBe(false);
   });
+
+  it("probes a 4K-capable H.264 level for 4K HEVC sources", async () => {
+    let config: Record<string, unknown> | undefined;
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.stubGlobal("VideoEncoder", class VideoEncoder {
+      static isConfigSupported(nextConfig: Record<string, unknown>) {
+        config = nextConfig;
+        return Promise.resolve({ supported: true });
+      }
+    });
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("");
+
+    expect(await shouldUseClientHevc({
+      ...source,
+      bitrate: 8_000_000,
+      streams: [{ index: 0, type: "VIDEO", codec: "HEVC", details: { width: 3840, height: 2160, averageFrameRate: 30 } }],
+    }, video)).toBe(true);
+    expect(config?.codec).toBe("avc1.640033");
+  });
 });
