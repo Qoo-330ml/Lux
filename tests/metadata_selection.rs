@@ -788,22 +788,27 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         .bind(&library_id)
         .execute(fixture.database.pool())
         .await?;
+    sqlx::query("UPDATE media_items SET provider_ids_json = ? WHERE id = ?")
+        .bind(r#"{"Tmdb":"999"}"#)
+        .bind(&fixture.item_id)
+        .execute(fixture.database.pool())
+        .await?;
 
-    let tmdb_app = Router::new().fallback(any(|| async {
-        Json(json!({
-            "page": 1,
-            "total_pages": 1,
-            "total_results": 1,
-            "results": [{
-                "id": 999,
-                "title": "Example Movie",
-                "original_title": "Example Movie",
-                "overview": "Automatically matched overview.",
-                "release_date": "2020-04-01",
-                "original_language": "en"
-            }]
-        }))
-    }));
+    let tmdb_app = Router::new()
+        .route(
+            "/3/movie/999",
+            get(|| async {
+                Json(json!({
+                    "id": 999,
+                    "title": "Example Movie",
+                    "original_title": "Example Movie",
+                    "overview": "Automatically matched overview.",
+                    "release_date": "2020-04-01",
+                    "original_language": "en"
+                }))
+            }),
+        )
+        .fallback(any(|| async { (StatusCode::NOT_FOUND, Json(json!({}))) }));
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
@@ -855,6 +860,13 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     assert_eq!(status, "ONLINE_CONFIRMED");
     let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<plot>Automatically matched overview.</plot>"));
+    let score: f64 = sqlx::query_scalar(
+        "SELECT score FROM metadata_candidates WHERE item_id = ? AND status = 'SELECTED' LIMIT 1",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(score, 100.0);
     let mode: String = sqlx::query_scalar(
         "SELECT mode FROM metadata_reidentify_jobs ORDER BY created_at DESC LIMIT 1",
     )

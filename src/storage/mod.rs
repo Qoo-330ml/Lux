@@ -5878,8 +5878,8 @@ impl Database {
                 self.query(
                     "INSERT INTO media_items (
                         id, library_id, item_type, parent_id, title, sort_title,
-                        original_title, production_year, identification_status
-                    ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+                        original_title, production_year, provider_ids_json, identification_status
+                    ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
                 )
                 .bind(&item_id)
                 .bind(library_id)
@@ -5888,6 +5888,7 @@ impl Database {
                 .bind(&file.sort_title)
                 .bind(&file.original_title)
                 .bind(file.production_year)
+                .bind(file.provider_ids_json.as_deref())
                 .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
@@ -5897,6 +5898,22 @@ impl Database {
                 (item_id, true)
             };
             created_items += usize::from(is_new_item);
+
+            if let Some(provider_ids_json) = file.provider_ids_json.as_deref() {
+                self.query(
+                    "UPDATE media_items
+                     SET provider_ids_json = ?
+                     WHERE id = ? AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
+                )
+                .bind(provider_ids_json)
+                .bind(&item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
 
             self.query(
                 "INSERT INTO media_sources (
@@ -8359,8 +8376,8 @@ impl Database {
         self.query(
             "INSERT INTO media_items (
                 id, library_id, item_type, title, sort_title,
-                original_title, production_year, identification_status
-            ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+                original_title, production_year, provider_ids_json, identification_status
+            ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
         )
         .bind(item.id)
         .bind(item.library_id)
@@ -8368,6 +8385,28 @@ impl Database {
         .bind(item.sort_title)
         .bind(item.original_title)
         .bind(item.production_year)
+        .bind(item.provider_ids_json)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_local_provider_ids_if_empty(
+        &self,
+        item_id: &str,
+        provider_ids_json: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_items
+             SET provider_ids_json = ?
+             WHERE id = ? AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
+        )
+        .bind(provider_ids_json)
+        .bind(item_id)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -10464,8 +10503,8 @@ impl Database {
                 id, library_id, item_type, parent_id, series_id,
                 season_number, episode_number, absolute_number,
                 title, sort_title, original_title, production_year,
-                identification_status, identity_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                provider_ids_json, identification_status, identity_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(item.id)
         .bind(item.library_id)
@@ -10479,6 +10518,7 @@ impl Database {
         .bind(item.sort_title)
         .bind(item.original_title)
         .bind(item.production_year)
+        .bind(item.provider_ids_json)
         .bind(item.identification_status)
         .bind(item.identity_key)
         .execute(&self.pool)
@@ -10497,10 +10537,14 @@ impl Database {
         sort_title: &str,
         original_title: Option<&str>,
         production_year: Option<i64>,
+        provider_ids_json: Option<&str>,
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_items
-             SET title = ?, sort_title = ?, original_title = ?, production_year = ?
+             SET title = ?, sort_title = ?, original_title = ?, production_year = ?,
+                 provider_ids_json = CASE
+                     WHEN ? IS NOT NULL AND (provider_ids_json IS NULL OR provider_ids_json = '{}')
+                     THEN ? ELSE provider_ids_json END
              WHERE id = ?
                AND identification_status IN ('LOCAL_CONFIRMED', 'PENDING')
                AND metadata_provenance_json IS NULL
@@ -10510,6 +10554,8 @@ impl Database {
         .bind(sort_title)
         .bind(original_title)
         .bind(production_year)
+        .bind(provider_ids_json)
+        .bind(provider_ids_json)
         .bind(item_id)
         .execute(&self.pool)
         .await
@@ -13161,6 +13207,7 @@ pub(crate) struct NewMediaItem<'a> {
     pub(crate) sort_title: &'a str,
     pub(crate) original_title: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) provider_ids_json: Option<&'a str>,
 }
 
 pub(crate) struct NewHierarchyItem<'a> {
@@ -13176,6 +13223,7 @@ pub(crate) struct NewHierarchyItem<'a> {
     pub(crate) sort_title: &'a str,
     pub(crate) original_title: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) provider_ids_json: Option<&'a str>,
     pub(crate) identification_status: &'a str,
     pub(crate) identity_key: &'a str,
 }
@@ -13205,6 +13253,7 @@ pub(crate) struct NewMovieFile {
     pub(crate) sort_title: String,
     pub(crate) original_title: String,
     pub(crate) production_year: Option<i64>,
+    pub(crate) provider_ids_json: Option<String>,
     pub(crate) source_kind: String,
     pub(crate) strm_target_kind: Option<String>,
     pub(crate) edition_name: Option<String>,
@@ -13679,6 +13728,7 @@ mod tests {
                 sort_title: "movie".to_owned(),
                 original_title: "Movie".to_owned(),
                 production_year: Some(2024),
+                provider_ids_json: None,
                 source_kind: "LOCAL_FILE".to_owned(),
                 strm_target_kind: None,
                 edition_name: None,
@@ -13697,6 +13747,7 @@ mod tests {
                 sort_title: "movie".to_owned(),
                 original_title: "Movie".to_owned(),
                 production_year: Some(2024),
+                provider_ids_json: None,
                 source_kind: "LOCAL_FILE".to_owned(),
                 strm_target_kind: None,
                 edition_name: Some("Director's Cut".to_owned()),

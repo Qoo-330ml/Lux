@@ -16,6 +16,7 @@ use crate::{
         people::{ActorCredit, PeopleError},
         scraper::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
+            ScraperSearchResponse, ScraperSearchResult,
         },
         tmdb::TmdbError,
         tmdb_plugin::TmdbProvider,
@@ -140,9 +141,40 @@ impl MetadataCandidateService {
             MediaKind::Series => crate::application::scraper::ScraperItemType::Series,
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
-        let response = search_generic(tmdb, item_type, query, year)
-            .await
-            .map_err(MetadataCandidateError::Scraper)?;
+        let direct_provider_id = tmdb_provider_id(&current).filter(|_| {
+            let same_title = crate::application::media_matching::normalize_title(query)
+                == crate::application::media_matching::normalize_title(&current.title);
+            let same_year =
+                year.is_none_or(|year| current.production_year == Some(i64::from(year)));
+            same_title && same_year
+        });
+        let response = if let Some(provider_id) = direct_provider_id.as_deref() {
+            let details = tmdb
+                .get_generic(ScraperGetRequest::new(item_type, provider_id, "zh-CN"))
+                .await
+                .map_err(MetadataCandidateError::Scraper)?;
+            let mut provider_ids = details.provider_ids.clone();
+            provider_ids
+                .entry("Tmdb".to_owned())
+                .or_insert_with(|| provider_id.to_owned());
+            ScraperSearchResponse {
+                items: vec![ScraperSearchResult {
+                    item_type: details.item_type.clone(),
+                    title: details.title.clone(),
+                    original_title: details.original_title.clone(),
+                    overview: details.overview.clone(),
+                    production_year: details.production_year,
+                    premiere_date: details.premiere_date.clone(),
+                    original_language: details.original_language.clone(),
+                    provider_ids,
+                    ..ScraperSearchResult::default()
+                }],
+            }
+        } else {
+            search_generic(tmdb, item_type, query, year)
+                .await
+                .map_err(MetadataCandidateError::Scraper)?
+        };
         let expires_at = candidate_expiry();
         for result in response.items.into_iter().take(20) {
             let Some((provider, provider_id)) = tmdb.selected_provider_entry(&result) else {
@@ -299,7 +331,7 @@ impl MetadataCandidateService {
                     provider_id,
                     images: generic_candidate_images(&images.images, item_type),
                     actors,
-                    score: None,
+                    score: direct_provider_id.as_ref().map(|_| 100.0),
                 },
                 expires_at,
             )
@@ -669,6 +701,30 @@ fn selected_metadata_provider_id(metadata: &ScraperMetadata, provider: &str) -> 
                 .flatten()
         })
         .map(str::to_owned)
+}
+
+fn tmdb_provider_id(current: &StoredMediaMetadata) -> Option<String> {
+    let scraper_id = current.scraper_id.as_deref()?.to_ascii_lowercase();
+    if !scraper_id.contains("tmdb") {
+        return None;
+    }
+    let raw = current.provider_ids_json.as_deref()?;
+    let Value::Object(provider_ids) = serde_json::from_str(raw).ok()? else {
+        return None;
+    };
+    provider_ids.into_iter().find_map(|(provider, value)| {
+        provider
+            .eq_ignore_ascii_case("tmdb")
+            .then(|| value.as_str().map(str::to_owned))
+            .flatten()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 128
+                    && value
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+            })
+    })
 }
 
 fn metadata_match_score(
