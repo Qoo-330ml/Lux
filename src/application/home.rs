@@ -16,8 +16,12 @@ use crate::application::{
     libraries::{LibraryService, LibraryServiceError, LibraryView},
 };
 
-const HOME_CACHE_TTL: Duration = Duration::from_secs(5);
-const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
+// Home queries can take several seconds on a large library. Keep a complete
+// snapshot usable while a newer one is being prepared, and wait until a burst
+// of scanner invalidations has gone quiet before refreshing it.
+const HOME_USER_CACHE_TTL: Duration = Duration::from_secs(15);
+const HOME_SHARED_CACHE_TTL: Duration = Duration::from_secs(60);
+const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HomeSnapshot {
@@ -124,8 +128,14 @@ impl HomeService {
         let worker_inner = Arc::downgrade(&inner);
         tokio::spawn(async move {
             while refresh_rx.recv().await.is_some() {
-                tokio::time::sleep(HOME_REFRESH_DEBOUNCE).await;
-                while refresh_rx.try_recv().is_ok() {}
+                // Reset the debounce window whenever another invalidation
+                // arrives. A large scan can emit many small updates; doing a
+                // full home calculation between those updates only competes
+                // with the scan for the same database and I/O resources.
+                while let Ok(Some(())) =
+                    tokio::time::timeout(HOME_REFRESH_DEBOUNCE, refresh_rx.recv()).await
+                {
+                }
                 let Some(inner) = worker_inner.upgrade() else {
                     break;
                 };
@@ -149,12 +159,15 @@ impl HomeService {
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
             let cached = entry.value.lock().await;
-            if let Some(cached) = cached.as_ref()
-                && cached.generation == generation
-            {
-                if cached.refreshed_at.elapsed() >= HOME_CACHE_TTL {
+            if let Some(cached) = cached.as_ref() {
+                if cached.generation != generation
+                    || cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL
+                {
                     self.schedule_refresh();
                 }
+                // A complete old snapshot is preferable to making the user
+                // wait for a database-wide recalculation. The refresh worker
+                // will converge on the latest generation in the background.
                 return Ok(cached.snapshot.clone());
             }
         }
@@ -163,24 +176,26 @@ impl HomeService {
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
             let cached = entry.value.lock().await;
-            if let Some(cached) = cached.as_ref()
-                && cached.generation == generation
-                && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
-            {
+            if let Some(cached) = cached.as_ref() {
+                if cached.generation != generation
+                    || cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL
+                {
+                    self.schedule_refresh();
+                }
                 return Ok(cached.snapshot.clone());
             }
         }
 
         let snapshot = Arc::new(self.build_snapshot(principal).await?);
-        if self.inner.generation.load(Ordering::Acquire) == generation {
-            *entry.value.lock().await = Some(CachedSnapshot {
-                generation,
-                refreshed_at: Instant::now(),
-                snapshot: snapshot.clone(),
-            });
-        } else {
-            // The foreground request is allowed to finish. A queued background
-            // refresh will calculate a snapshot for the newer generation.
+        let generation_changed = self.inner.generation.load(Ordering::Acquire) != generation;
+        *entry.value.lock().await = Some(CachedSnapshot {
+            generation,
+            refreshed_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        if generation_changed {
+            // Keep this complete snapshot available while a queued background
+            // refresh calculates one for the newer generation.
             self.schedule_refresh();
         }
         Ok(snapshot)
@@ -220,7 +235,7 @@ impl HomeService {
             let cached = self.inner.shared.lock().await;
             if let Some(cached) = cached.as_ref() {
                 if cached.generation == generation {
-                    if cached.refreshed_at.elapsed() >= HOME_CACHE_TTL {
+                    if cached.refreshed_at.elapsed() >= HOME_SHARED_CACHE_TTL {
                         self.schedule_refresh();
                     }
                     return Ok(cached.snapshot.clone());
@@ -247,20 +262,20 @@ impl HomeService {
             let cached = self.inner.shared.lock().await;
             if let Some(cached) = cached.as_ref()
                 && cached.generation == generation
-                && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
+                && cached.refreshed_at.elapsed() < HOME_SHARED_CACHE_TTL
             {
                 return Ok(cached.snapshot.clone());
             }
         }
 
         let snapshot = Arc::new(self.build_shared_snapshot().await?);
-        if self.inner.generation.load(Ordering::Acquire) == generation {
-            *self.inner.shared.lock().await = Some(CachedSharedSnapshot {
-                generation,
-                refreshed_at: Instant::now(),
-                snapshot: snapshot.clone(),
-            });
-        } else {
+        let generation_changed = self.inner.generation.load(Ordering::Acquire) != generation;
+        *self.inner.shared.lock().await = Some(CachedSharedSnapshot {
+            generation,
+            refreshed_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        if generation_changed {
             self.schedule_refresh();
         }
         Ok(snapshot)
@@ -287,7 +302,7 @@ impl HomeService {
                 let cached = entry.value.lock().await;
                 if cached.as_ref().is_some_and(|cached| {
                     cached.generation == generation
-                        && cached.refreshed_at.elapsed() < HOME_CACHE_TTL
+                        && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
                 }) {
                     continue;
                 }
@@ -408,7 +423,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn empty_home_snapshot_is_cached_and_invalidated() {
+    async fn empty_home_snapshot_is_served_while_invalidation_refreshes() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
         let config = Config {
             http_addr: "127.0.0.1:8097".parse().expect("test address"),
@@ -431,9 +446,12 @@ mod tests {
         assert!(std::ptr::eq(first.as_ref(), second.as_ref()));
 
         home.invalidate();
-        tokio::time::sleep(HOME_REFRESH_DEBOUNCE + std::time::Duration::from_millis(50)).await;
-        let third = home.snapshot(principal).await.expect("refreshed snapshot");
-        assert!(!std::ptr::eq(first.as_ref(), third.as_ref()));
+        let stale = home.snapshot(principal).await.expect("stale snapshot");
+        assert!(std::ptr::eq(first.as_ref(), stale.as_ref()));
+
+        tokio::time::sleep(HOME_REFRESH_DEBOUNCE + std::time::Duration::from_millis(100)).await;
+        let refreshed = home.snapshot(principal).await.expect("refreshed snapshot");
+        assert!(!std::ptr::eq(first.as_ref(), refreshed.as_ref()));
     }
 
     #[tokio::test]

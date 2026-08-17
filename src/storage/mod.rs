@@ -7294,14 +7294,6 @@ impl Database {
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
         }
-        let total = count_statement
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-
         let list_query = format!(
             "WITH visible_catalog AS (
                  SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
@@ -7352,15 +7344,27 @@ impl Database {
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
         }
-        let rows = list_statement
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let count_future = async {
+            count_statement
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })
+        };
+        let list_future = async {
+            list_statement
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })
+        };
+        let (total, rows) = tokio::try_join!(count_future, list_future)?;
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
 
