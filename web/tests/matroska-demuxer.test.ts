@@ -97,4 +97,24 @@ describe("Matroska demuxer", () => {
     expect(streamedTracks).toEqual(["video:1", "audio:2"]);
     expect(streamedSamples).toEqual([1000, 1000, 1040]);
   });
+
+  it("uses the 1536-sample AC-3 frame duration when TrackEntry has no default duration", () => {
+    const ac3Track = element([0xae], concat(
+      element([0xd7], uint(1)),
+      element([0x83], uint(2)),
+      element([0x86], text("A_AC3")),
+      element([0xe1], concat(element([0xb5], float(48_000)), element([0x9f], uint(2)))),
+    ));
+    const ac3Frame = new Uint8Array([0x0b, 0x77, 0, 0, 0x04, 0x40, 0x40]);
+    const source = concat(
+      element([0x1a, 0x45, 0xdf, 0xa3], new Uint8Array()),
+      element([0x18, 0x53, 0x80, 0x67], concat(
+        element([0x15, 0x49, 0xa9, 0x66], element([0x2a, 0xd7, 0xb1], uint(1_000_000, 4))),
+        element([0x16, 0x54, 0xae, 0x6b], ac3Track),
+        element([0x1f, 0x43, 0xb6, 0x75], concat(element([0xe7], uint(0)), simpleBlock(1, 0, true, ac3Frame), simpleBlock(1, 32, false, ac3Frame))),
+      )),
+    );
+
+    expect(parseMatroska(source).audioSamples.map((sample) => sample.durationMs)).toEqual([32, 32]);
+  });
 });

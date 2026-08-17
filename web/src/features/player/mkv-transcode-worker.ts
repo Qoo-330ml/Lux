@@ -3,7 +3,7 @@ import { Box, createFile, DataStream, ISOFile } from "mp4box";
 import processPolyfill from "process";
 import { MatroskaStreamDemuxer, type MatroskaSample, type MatroskaTrack } from "./matroska-demuxer";
 import { addHevcTrack, concatBuffers, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, toLengthPrefixed } from "./mkv-remux";
-import { encodedVideoDurationTicks, isSupportedMatroskaAudio, isSupportedMatroskaVideo, matroskaAudioConfig, toAnnexB } from "./mkv-transcode";
+import { encodedVideoDurationTicks, isSupportedMatroskaVideo, matroskaAudioConfig, toAnnexB } from "./mkv-transcode";
 
 type WorkerMessage =
   | { type: "init"; wasmUrl: string; wasmBinaryUrl: string; mode?: "sdr" | "hevc-remux" }
@@ -49,6 +49,7 @@ let remuxBatchStartMs: number | null = null;
 let remuxBatchEndMs = 0;
 let remuxOriginMs: number | null = null;
 let remuxSequenceNumber = 0;
+let pendingRemuxSamples: MatroskaSample[] = [];
 
 const workerScope = globalThis as typeof globalThis & {
   onmessage: ((event: MessageEvent<WorkerMessage>) => void) | null;
@@ -84,7 +85,9 @@ async function initialize(message: Extract<WorkerMessage, { type: "init" }>) {
       } else if (track.type === "audio" && !audioTrack) {
         audioTrack = track;
         audioConfig = matroskaAudioConfig(track);
-        if (track.codecId.toUpperCase().startsWith("A_AAC") && !audioConfig) throw new Error("MKV 音频只支持 AAC-LC");
+        const codec = track.codecId.toUpperCase();
+        if (!audioConfig && codec !== "A_AC3") throw new Error("MKV 音频只支持 AAC-LC 或 AC-3");
+        if (!remuxMode && codec === "A_AC3") throw new Error("当前客户端路径不支持 AC-3 音频");
       }
     },
     onSample: (sample) => {
@@ -163,10 +166,11 @@ function workerScopeHasInit() {
 function emitInit(frame: HEVCFrame) {
   if (!encoder?.codecDescription || !muxer) return;
   const video = { width: frame.width, height: frame.height, timescale: 90_000, avcC: encoder.codecDescription };
-  const initSegment = audioConfig && audioTrack?.sampleRate && audioTrack.channels
-    ? muxer.generateInitAV(video, { timescale: audioTrack.sampleRate, channelCount: audioTrack.channels, sampleRate: audioTrack.sampleRate, sampleSize: 16, asc: audioConfig.asc })
+  const aacConfig = audioConfig?.codec === "mp4a.40.2" ? audioConfig : null;
+  const initSegment = aacConfig && audioTrack?.sampleRate && audioTrack.channels
+    ? muxer.generateInitAV(video, { timescale: audioTrack.sampleRate, channelCount: audioTrack.channels, sampleRate: audioTrack.sampleRate, sampleSize: 16, asc: aacConfig.asc })
     : muxer.generateInit(video);
-  const codec = audioConfig ? `${encoder.codec},mp4a.40.2` : encoder.codec;
+  const codec = aacConfig ? `${encoder.codec},mp4a.40.2` : encoder.codec;
   (workerScope as typeof workerScope & { __mkvInitSent?: boolean }).__mkvInitSent = true;
   const transfer = copyTransferBuffer(initSegment);
   workerScope.postMessage({ type: "init", initSegment: transfer, codec }, [transfer]);
@@ -198,6 +202,17 @@ async function consumeRemuxSample(sample: MatroskaSample) {
   if (fatalError) return;
   const track = sample.trackNumber === videoTrack?.number ? videoTrack : sample.trackNumber === audioTrack?.number ? audioTrack : null;
   if (!track) return;
+  if (audioTrack?.codecId.toUpperCase() === "A_AC3" && !audioConfig) {
+    if (track.type !== "audio") {
+      pendingRemuxSamples.push(sample);
+      return;
+    }
+    audioConfig = matroskaAudioConfig({ ...audioTrack, codecPrivate: sample.data });
+    if (!audioConfig) throw new Error("MKV AC-3 首个音频样本无效");
+    const pending = pendingRemuxSamples;
+    pendingRemuxSamples = [];
+    for (const pendingSample of pending) await consumeRemuxSample(pendingSample);
+  }
   const file = ensureRemuxFile();
   const timestampMs = Math.max(0, sample.timestampMs - (remuxOriginMs ?? sample.timestampMs));
   const durationMs = sample.durationMs > 0
@@ -229,7 +244,7 @@ function ensureRemuxFile() {
   if (!videoTrack?.width || !videoTrack.height || videoTrack.codecPrivate.byteLength < 23) {
     throw new Error("MKV HEVC 缺少有效的视频配置");
   }
-  if (audioTrack && !audioConfig) throw new Error("MKV 音频只支持 AAC-LC");
+  if (audioTrack && !audioConfig) throw new Error("MKV 音频只支持 AAC-LC 或 AC-3");
   remuxOriginMs ??= 0;
   const file = createFile();
   const videoTrackId = addHevcTrack(file, videoTrack.codecPrivate, videoTrack.width, videoTrack.height);
@@ -239,7 +254,7 @@ function ensureRemuxFile() {
     const channels = audioTrack.channels;
     if (!sampleRate || !channels) throw new Error("MKV AAC 音频缺少采样率或声道数");
     audioTrackId = file.addTrack({
-      type: "mp4a",
+      type: audioConfig.codec === "ac-3" ? "ac-3" : "mp4a",
       timescale: sampleRate,
       channel_count: channels,
       samplerate: sampleRate,
@@ -250,10 +265,10 @@ function ensureRemuxFile() {
     const track = file.moov.traks.find((entry) => entry.tkhd.track_id === audioTrackId);
     const entry = track?.mdia.minf.stbl.stsd.entries[0];
     if (!entry) throw new Error("MKV fMP4 remux 缺少音频样本描述");
-    const esds = new Box();
-    esds.type = "esds";
-    esds.data = makeAacEsdsData(audioConfig.asc);
-    entry.addBox(esds);
+    const description = new Box();
+    description.type = audioConfig.codec === "ac-3" ? "dac3" : "esds";
+    description.data = audioConfig.codec === "ac-3" ? audioConfig.dac3.slice() : makeAacEsdsData(audioConfig.asc);
+    entry.addBox(description);
   }
   removeCreatedMovieExtends(file);
   file.nextMoofNumber = remuxSequenceNumber;
@@ -263,7 +278,7 @@ function ensureRemuxFile() {
   if (!workerScopeHasInit()) {
     const initSegment = ISOFile.writeInitializationSegment(file.ftyp, file.moov, 0, audioTrackId ? new Set([audioTrackId]) : undefined);
     const transfer = copyTransferBuffer(new Uint8Array(initSegment));
-    const codec = audioTrackId ? `${hevcCodecString(videoTrack.codecPrivate)},mp4a.40.2` : hevcCodecString(videoTrack.codecPrivate);
+    const codec = audioTrackId ? `${hevcCodecString(videoTrack.codecPrivate)},${audioConfig?.codec ?? "mp4a.40.2"}` : hevcCodecString(videoTrack.codecPrivate);
     (workerScope as typeof workerScope & { __mkvInitSent?: boolean }).__mkvInitSent = true;
     workerScope.postMessage({ type: "init", initSegment: transfer, codec }, [transfer]);
   }
@@ -349,6 +364,7 @@ function destroy() {
   remuxBatchEndMs = 0;
   remuxOriginMs = null;
   remuxSequenceNumber = 0;
+  pendingRemuxSamples = [];
   sampleChain = Promise.resolve();
   (workerScope as typeof workerScope & { __mkvInitSent?: boolean }).__mkvInitSent = false;
 }

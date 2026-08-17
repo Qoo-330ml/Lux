@@ -153,7 +153,7 @@ export class MatroskaStreamDemuxer {
       return;
     }
     const timestampMs = (this.clusterTimecode + block.timecode) * this.timecodeScale / 1_000_000;
-    const defaultDuration = track.defaultDurationMs ?? (track.type === "audio" && track.sampleRate ? 1024_000 / track.sampleRate : 0);
+    const defaultDuration = defaultSampleDurationMs(track);
     block.frames.forEach((frame, index) => this.callbacks.onSample?.({
       trackNumber: track.number,
       timestampMs: timestampMs + index * defaultDuration,
@@ -253,7 +253,7 @@ function parseBlock(
   const track = findTrack(result, block.trackNumber);
   if (!track) return;
   const timestampMs = (clusterTimecode + block.timecode) * scale / 1_000_000;
-  const defaultDuration = track.defaultDurationMs ?? (track.type === "audio" && track.sampleRate ? 1024_000 / track.sampleRate : 0);
+  const defaultDuration = defaultSampleDurationMs(track);
   block.frames.forEach((frame, index) => {
     const sample: MatroskaSample = {
       trackNumber: track.number,
@@ -283,6 +283,12 @@ export function parseSimpleBlockPayload(data: Uint8Array) {
 
 function findTrack(result: MatroskaFile, number: number) {
   return [result.videoTrack, result.audioTrack].find((track) => track?.number === number) ?? null;
+}
+
+function defaultSampleDurationMs(track: MatroskaTrack) {
+  if (track.defaultDurationMs !== null) return track.defaultDurationMs;
+  if (track.type !== "audio" || !track.sampleRate) return 0;
+  return track.codecId.toUpperCase() === "A_AC3" ? 1536_000 / track.sampleRate : 1024_000 / track.sampleRate;
 }
 
 function splitLacedPayload(data: Uint8Array, start: number, end: number, flags: number) {

@@ -5,6 +5,7 @@ const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
 const CLIENT_MKV_CONTAINERS = new Set(["mkv"]);
 const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
 const HEVC_MSE_CODECS = ["hvc1.2.4.L153.B0", "hvc1.1.6.L120.B0"] as const;
+const AC3_CODECS = new Set(["ac3", "ac-3"]);
 
 export function h264CodecForDimensions(width: number, height: number) {
   const pixels = Math.max(1, width) * Math.max(1, height);
@@ -24,7 +25,7 @@ export function hasClientMkvCandidate(source: MediaSource | undefined) {
   const video = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
   if (!isHevcCodec(video?.codec)) return false;
   const audio = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "AUDIO");
-  return !audio?.codec || /^aac$|^mp4a\./i.test(audio.codec);
+  return !audio?.codec || /^aac$|^mp4a\./i.test(audio.codec) || AC3_CODECS.has(audio.codec.toLowerCase());
 }
 
 export async function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {
@@ -34,9 +35,18 @@ export async function shouldUseClientHevc(source: MediaSource | undefined, video
 
 export async function shouldUseClientMkv(source: MediaSource | undefined, video: HTMLVideoElement) {
   if (!source || !hasClientMkvCandidate(source)) return false;
-  if (hasClientMkvHevcRuntime()) return video.canPlayType('video/x-matroska; codecs="hvc1"') === "";
+  if (hasClientMkvHevcRuntime()) {
+    if (!hasClientMkvAudioRuntime(source)) return false;
+    return video.canPlayType('video/x-matroska; codecs="hvc1"') === "";
+  }
   if (!hasClientHevcRuntime()) return false;
   return probeClientHevc(source, video, "video/x-matroska");
+}
+
+function hasClientMkvAudioRuntime(source: MediaSource) {
+  const audio = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "AUDIO");
+  if (!audio?.codec || !AC3_CODECS.has(audio.codec.toLowerCase())) return true;
+  return HEVC_MSE_CODECS.some((videoCodec) => MediaSource.isTypeSupported(`video/mp4; codecs="${videoCodec},ac-3"`));
 }
 
 export function hasClientMkvHevcRuntime() {

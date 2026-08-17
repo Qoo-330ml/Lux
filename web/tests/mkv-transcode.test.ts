@@ -17,6 +17,18 @@ describe("MKV transcode input", () => {
     });
   });
 
+  it("recognizes AC-3 syncframes and exposes an MP4 dac3 configuration", () => {
+    const ac3Frame = new Uint8Array([0x0b, 0x77, 0, 0, 0x04, 0x40, 0x40]);
+    expect(isSupportedMatroskaAudio({ codecId: "A_AC3", codecPrivate: ac3Frame })).toBe(true);
+    expect(isSupportedMatroskaAudio({ codecId: "A_AC3", codecPrivate: new Uint8Array() })).toBe(true);
+    expect(matroskaAudioConfig({ codecId: "A_AC3", codecPrivate: ac3Frame, sampleRate: 48_000, channels: 2 })).toEqual({
+      codec: "ac-3",
+      dac3: new Uint8Array([0x10, 0x12, 0x20]),
+      sampleRate: 48_000,
+      channels: 2,
+    });
+  });
+
   it("keeps Annex-B samples and converts four-byte length-prefixed NAL units", () => {
     const annexB = new Uint8Array([0, 0, 0, 1, 0x26, 0, 0, 1, 0x02]);
     expect([...toAnnexB(annexB)]).toEqual([...annexB]);

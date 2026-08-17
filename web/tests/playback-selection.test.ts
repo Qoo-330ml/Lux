@@ -70,6 +70,22 @@ describe("playback selection", () => {
     expect(await shouldUseClientMkv(mkv, video)).toBe(true);
   });
 
+  it("selects MKV AC-3 only when HEVC and AC-3 share an MSE", async () => {
+    const mkv = { ...source, container: "mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC" },
+      { index: 1, type: "AUDIO", codec: "AC3" },
+    ] };
+    expect(hasClientMkvCandidate(mkv)).toBe(true);
+    vi.stubGlobal("MediaSource", { isTypeSupported: (mime: string) => !mime.includes("ac-3") });
+    vi.stubGlobal("VideoEncoder", undefined);
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("");
+    expect(await shouldUseClientMkv(mkv, video)).toBe(false);
+
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+    expect(await shouldUseClientMkv(mkv, video)).toBe(true);
+  });
+
   it("does not select fallback when H.264 VideoEncoder rejects the source configuration", async () => {
     vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
     vi.stubGlobal("Worker", class Worker {});
