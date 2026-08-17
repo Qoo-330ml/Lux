@@ -596,18 +596,25 @@ impl MetadataReidentifyService {
         let Some(selection) = self.selection.as_ref() else {
             return Err(MetadataReidentifyError::SelectionUnavailable);
         };
-        let Some(candidate) = best_automatic_candidate(&page) else {
+        let Some(candidate) = best_pending_candidate(&page) else {
             return Err(MetadataReidentifyError::LowConfidence);
         };
+        let needs_review = candidate.score < AUTO_MATCH_MIN_SCORE;
         let selection_mode = match mode {
             MetadataRefreshMode::FillMissing => MetadataSelectionMode::FillMissing,
             MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
             MetadataRefreshMode::Reidentify => return Ok(0),
         };
-        selection
-            .select(item_id, &candidate.id, selection_mode)
-            .await
-            .map_err(MetadataReidentifyError::Selection)?;
+        if needs_review {
+            selection
+                .select_for_review(item_id, &candidate.id, selection_mode)
+                .await
+        } else {
+            selection
+                .select(item_id, &candidate.id, selection_mode)
+                .await
+        }
+        .map_err(MetadataReidentifyError::Selection)?;
         Ok(i64::try_from(page.items.len()).unwrap_or(i64::MAX))
     }
 
@@ -795,12 +802,16 @@ impl From<StorageError> for MetadataReidentifyError {
     }
 }
 
+#[cfg(test)]
 fn best_automatic_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
+    best_pending_candidate(page).filter(|candidate| candidate.score >= AUTO_MATCH_MIN_SCORE)
+}
+
+fn best_pending_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
     page.items
         .iter()
         .filter(|candidate| candidate.status == "PENDING")
         .max_by(|left, right| left.score.total_cmp(&right.score))
-        .filter(|candidate| candidate.score >= AUTO_MATCH_MIN_SCORE)
 }
 
 fn unix_now() -> i64 {

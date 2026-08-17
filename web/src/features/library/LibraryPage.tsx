@@ -85,6 +85,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const { sortBy, sortOrder } = sortPreference;
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
+  const showMetadataPending = libraries.data?.showMetadataPending ?? true;
   const itemTypes = libraryItemTypeFilter(library?.kind);
 
   useEffect(() => {
@@ -181,7 +182,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div>
       <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} metadataAttention={metadataStatus === "PENDING"} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} />)}
+        {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} metadataAttention={showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} />)}
       </div>
       {!loadedItems.length ? <div className="lux-empty-card"><span>这个媒体库还没有内容。</span><Link to="/libraries">返回媒体库</Link></div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />

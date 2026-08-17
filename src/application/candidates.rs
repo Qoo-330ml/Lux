@@ -1094,6 +1094,27 @@ impl MetadataSelectionService {
         candidate_id: &str,
         mode: MetadataSelectionMode,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        self.select_internal(item_id, candidate_id, mode, false)
+            .await
+    }
+
+    pub async fn select_for_review(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        mode: MetadataSelectionMode,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        self.select_internal(item_id, candidate_id, mode, true)
+            .await
+    }
+
+    async fn select_internal(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        mode: MetadataSelectionMode,
+        keep_pending: bool,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         let current = self
             .database
             .find_media_item_metadata(item_id)
@@ -1203,6 +1224,7 @@ impl MetadataSelectionService {
                 provenance_json: &state.provenance_json(),
                 locked_fields_json: &state.locked_fields_json(),
                 thumbnail_fallback_required: !has_thumbnail,
+                keep_pending,
             })
             .await?;
         if !selected {
@@ -1214,7 +1236,11 @@ impl MetadataSelectionService {
             item_id: item_id.to_owned(),
             candidate_id: candidate_id.to_owned(),
             mode,
-            status: "ONLINE_CONFIRMED",
+            status: if keep_pending {
+                "PENDING"
+            } else {
+                "ONLINE_CONFIRMED"
+            },
             image_types,
             actor_count,
         })

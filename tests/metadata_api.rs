@@ -252,6 +252,18 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
     let viewer_cookie = login(&client, &base_url, "viewer", "viewer password").await?;
 
+    let library_items = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=10",
+            library.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(library_items.status(), reqwest::StatusCode::OK);
+    let library_items_body: Value = library_items.json().await?;
+    assert_eq!(library_items_body["items"][0]["metadataPending"], true);
+
     let pending = client
         .get(format!(
             "{base_url}/api/v1/admin/metadata/pending?page=1&pageSize=1"

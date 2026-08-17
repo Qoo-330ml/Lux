@@ -55,6 +55,11 @@ export type Library = {
   latest?: MediaItem[];
 };
 
+export type LibrariesResponse = {
+  libraries?: Library[];
+  showMetadataPending?: boolean;
+};
+
 export type ImageTags = Partial<Record<"poster" | "fanart" | "backdrop" | "thumb" | "logo", string>>;
 
 export type UserData = {
@@ -163,6 +168,8 @@ export type MediaItem = {
   seriesId?: string | null;
   indexNumber?: number | null;
   parentIndexNumber?: number | null;
+  metadataPending?: boolean;
+  metadataPending?: boolean;
 };
 
 export type MetadataFieldName = "title" | "originalTitle" | "overview" | "productionYear";
@@ -604,7 +611,9 @@ export type MediaStrategySettings = {
   region: string;
   scraperId?: string | null;
   metadataRefreshMode?: MetadataRefreshMode;
+  showMetadataPending?: boolean;
   applyScope: "NEW_CONTENT" | "SELECTED_CONTENT" | "ALL_CONTENT" | string;
+  showMetadataPending: boolean;
   images: MediaImageStrategySettings;
   subtitles: MediaSubtitleStrategySettings;
 };

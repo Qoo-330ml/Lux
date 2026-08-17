@@ -26,6 +26,7 @@ import type {
   DatabaseSetupInput,
   HomeResponse,
   Library,
+  LibrariesResponse,
   LuxUser,
   MediaItem,
   ItemMetadata,
@@ -231,7 +232,7 @@ export class LuxApiClient {
   }
 
   libraries() {
-    return this.request<{ libraries?: Library[] }>("/api/v1/libraries");
+    return this.request<LibrariesResponse>("/api/v1/libraries");
   }
 
   libraryItems(

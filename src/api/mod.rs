@@ -7859,6 +7859,13 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let show_metadata_pending = match read_media_strategy_settings(database).await {
+        Ok(settings) => settings.show_metadata_pending,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     match libraries.list_libraries().await {
         Ok(views) => {
@@ -7880,7 +7887,11 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
                     }));
                 }
             }
-            Json(json!({ "libraries": visible })).into_response()
+            Json(json!({
+                "libraries": visible,
+                "showMetadataPending": show_metadata_pending,
+            }))
+            .into_response()
         }
         Err(error) => library_error(&headers, error),
     }
@@ -9952,13 +9963,18 @@ async fn lux_catalog_item_values_by_id(
         }
     }
     let states = database.list_user_item_states(user_id, &item_ids).await?;
+    let pending_item_ids = database.list_pending_metadata_item_ids(&item_ids).await?;
     Ok(items
         .iter()
         .map(|item| {
-            (
-                item.id.clone(),
-                lux_catalog_item_json_with_user_state(item, states.get(&item.id)),
-            )
+            let mut value = lux_catalog_item_json_with_user_state(item, states.get(&item.id));
+            if let Value::Object(object) = &mut value {
+                object.insert(
+                    "metadataPending".to_owned(),
+                    Value::Bool(pending_item_ids.contains(&item.id)),
+                );
+            }
+            (item.id.clone(), value)
         })
         .collect())
 }
@@ -10595,6 +10611,8 @@ struct MediaStrategySettings {
     scraper_id: Option<String>,
     #[serde(default = "default_metadata_refresh_mode")]
     metadata_refresh_mode: String,
+    #[serde(default = "default_show_metadata_pending")]
+    show_metadata_pending: bool,
     apply_scope: String,
     images: MediaImageStrategySettings,
     subtitles: MediaSubtitleStrategySettings,
@@ -10633,6 +10651,7 @@ impl Default for MediaStrategySettings {
             region: "CN".to_owned(),
             scraper_id: None,
             metadata_refresh_mode: default_metadata_refresh_mode(),
+            show_metadata_pending: true,
             apply_scope: "NEW_CONTENT".to_owned(),
             images: MediaImageStrategySettings {
                 poster: true,
@@ -10657,6 +10676,10 @@ impl Default for MediaStrategySettings {
 
 fn default_metadata_refresh_mode() -> String {
     "FILL_MISSING".to_owned()
+}
+
+fn default_show_metadata_pending() -> bool {
+    true
 }
 
 async fn read_media_strategy_settings(database: &Database) -> Result<MediaStrategySettings, ()> {

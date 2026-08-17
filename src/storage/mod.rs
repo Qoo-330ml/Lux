@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -6661,6 +6661,39 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_pending_metadata_item_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashSet<String>, StorageError> {
+        let mut pending = HashSet::new();
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT DISTINCT item_id FROM metadata_candidates
+                 WHERE status = 'PENDING' AND item_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            pending.extend(rows.into_iter().map(|row| row.get("item_id")));
+        }
+        Ok(pending)
+    }
+
     pub(crate) async fn insert_metadata_candidate(
         &self,
         candidate: NewMetadataCandidate<'_>,
@@ -6841,7 +6874,8 @@ impl Database {
                  original_language = COALESCE(?, original_language),
                  rating = COALESCE(?, rating),
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
-                 provider_ids_json = ?, identification_status = 'ONLINE_CONFIRMED',
+                 provider_ids_json = ?,
+                 identification_status = CASE WHEN ? THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
                  thumbnail_fallback_required = ?
              WHERE id = ? AND removed_at IS NULL",
@@ -6859,6 +6893,7 @@ impl Database {
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.provider_ids_json)
+        .bind(database_flag(update.keep_pending))
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
@@ -6873,9 +6908,11 @@ impl Database {
         let selected = self
             .query(
                 "UPDATE metadata_candidates
-             SET status = 'SELECTED', updated_at = unixepoch()
+             SET status = CASE WHEN ? THEN 'PENDING' ELSE 'SELECTED' END,
+                 updated_at = unixepoch()
              WHERE id = ? AND item_id = ? AND status = 'PENDING'",
             )
+            .bind(database_flag(update.keep_pending))
             .bind(update.candidate_id)
             .bind(update.item_id)
             .execute(&mut *transaction)
@@ -13197,6 +13234,7 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
     pub(crate) thumbnail_fallback_required: bool,
+    pub(crate) keep_pending: bool,
 }
 
 pub(crate) struct LibrarySettingsUpdate<'a> {
