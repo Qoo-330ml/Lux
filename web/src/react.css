@@ -63,6 +63,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   width: 18px;
   height: 18px;
   min-height: 18px;
+  padding: 0;
   margin: 0;
   flex: 0 0 auto;
   border: 1px solid var(--lux-line);
@@ -269,10 +270,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-metadata-field { display: grid; gap: 7px; }
 .lux-metadata-field > label, .lux-image-editor-toolbar label > span { color: var(--lux-muted); font-size: .76rem; }
 .lux-metadata-field-control { display: flex; align-items: flex-start; gap: 8px; }
-.lux-metadata-field input, .lux-metadata-field textarea { width: 100%; min-height: 42px; padding: 10px var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; resize: vertical; color: #fff; background: rgba(255,255,255,.05); transition: border-color .2s ease, box-shadow .2s ease, opacity .2s ease; }
+.lux-metadata-field input:not([type="checkbox"]):not([type="radio"]), .lux-metadata-field textarea { width: 100%; min-height: 42px; padding: 10px var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; resize: vertical; color: #fff; background: rgba(255,255,255,.05); transition: border-color .2s ease, box-shadow .2s ease, opacity .2s ease; }
 .lux-metadata-field textarea { min-height: 120px; line-height: 1.55; }
-.lux-metadata-field input:focus, .lux-metadata-field textarea:focus { border-color: rgba(210,71,191,.58); box-shadow: 0 0 0 3px rgba(210,71,191,.12); }
-.lux-metadata-field input:disabled, .lux-metadata-field textarea:disabled { opacity: .62; }
+.lux-metadata-field input:not([type="checkbox"]):not([type="radio"]):focus, .lux-metadata-field textarea:focus { border-color: rgba(210,71,191,.58); box-shadow: 0 0 0 3px rgba(210,71,191,.12); }
+.lux-metadata-field input:not([type="checkbox"]):not([type="radio"]):disabled, .lux-metadata-field textarea:disabled { opacity: .62; }
 .lux-metadata-field small { color: var(--lux-subtle); font-size: .7rem; }
 .lux-metadata-lock { display: grid; place-items: center; flex: 0 0 auto; width: 42px; height: 42px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-subtle); background: rgba(255,255,255,.04); }
 .lux-metadata-field.is-locked .lux-metadata-lock { border-color: rgba(210,71,191,.42); color: var(--lux-accent); background: rgba(210,71,191,.1); }
@@ -508,8 +509,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-auth-card > p { margin: 0; color: var(--lux-muted); line-height: 1.6; }
 .lux-auth-form { display: grid; gap: 17px; margin-top: 28px; }
 .lux-auth-form label { display: grid; gap: 8px; color: var(--lux-muted); font-size: .78rem; }
-.lux-auth-form input { width: 100%; min-height: 46px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 9px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
-.lux-auth-form input:focus { border-color: rgba(255,255,255,.5); box-shadow: 0 0 0 3px rgba(255,255,255,.08); }
+.lux-auth-form input:not([type="checkbox"]):not([type="radio"]) { width: 100%; min-height: 46px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 9px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
+.lux-auth-form input:not([type="checkbox"]):not([type="radio"]):focus { border-color: rgba(255,255,255,.5); box-shadow: 0 0 0 3px rgba(255,255,255,.08); }
 .lux-auth-form details { border-top: 1px solid var(--lux-line-soft); padding-top: 14px; color: var(--lux-muted); font-size: .78rem; }
 .lux-auth-form summary { cursor: pointer; }
 .lux-setup-optional { display: grid; gap: 15px; padding-top: 15px; }
@@ -629,8 +630,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-server-status i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 4px rgba(155,220,179,.1); }
 .lux-admin-server-form { display: flex; align-items: end; gap: 9px; }
 .lux-admin-server-form label { display: grid; flex: 1; gap: 7px; color: var(--lux-muted); font-size: .72rem; }
-.lux-admin-server-form input { width: 100%; min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 9px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
-.lux-admin-server-form input:focus { border-color: rgba(210,71,191,.66); box-shadow: 0 0 0 3px rgba(210,71,191,.12); }
+.lux-admin-server-form input:not([type="checkbox"]):not([type="radio"]) { width: 100%; min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 9px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
+.lux-admin-server-form input:not([type="checkbox"]):not([type="radio"]):focus { border-color: rgba(210,71,191,.66); box-shadow: 0 0 0 3px rgba(210,71,191,.12); }
 .lux-admin-server-form .lux-button { min-height: 42px; white-space: nowrap; }
 .lux-dashboard-inline-error { margin: 12px 0 -4px; }
 .lux-admin-dashboard-monitor-section { margin-top: 46px; }
@@ -725,8 +726,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-create-panel { margin-bottom: 18px; }
 .lux-admin-create-form { display: grid; grid-template-columns: minmax(180px, 1.3fr) minmax(130px, .75fr) auto auto; align-items: end; gap: 13px; }
 .lux-admin-form label, .lux-admin-schedule-field { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
-.lux-admin-form input, .lux-admin-form select, .lux-admin-schedule-field input, .lux-admin-root-form input { min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
-.lux-admin-form input:focus, .lux-admin-form select:focus, .lux-admin-schedule-field input:focus, .lux-admin-root-form input:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.lux-admin-form input:not([type="checkbox"]):not([type="radio"]), .lux-admin-form select, .lux-admin-schedule-field input:not([type="checkbox"]):not([type="radio"]), .lux-admin-root-form input:not([type="checkbox"]):not([type="radio"]) { min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
+.lux-admin-form input:not([type="checkbox"]):not([type="radio"]):focus, .lux-admin-form select:focus, .lux-admin-schedule-field input:not([type="checkbox"]):not([type="radio"]):focus, .lux-admin-root-form input:not([type="checkbox"]):not([type="radio"]):focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
 .lux-admin-form select { appearance: auto; }
 .lux-admin-toggle { display: flex !important; grid-template-columns: none; align-items: center; gap: 9px !important; min-height: 42px; white-space: nowrap; }
 .lux-admin-toggle input { width: 16px; min-height: 16px; accent-color: var(--lux-accent); }
@@ -1224,8 +1225,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-strategy-card-heading > svg { color: var(--lux-muted); }
 .lux-library-strategy-form-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .lux-library-strategy-form-grid label, .lux-library-strategy-scope, .lux-library-strategy-language-input { display: grid; gap: 7px; color: var(--lux-muted); font-size: .73rem; }
-.lux-library-strategy-form-grid input, .lux-library-strategy-form-grid select, .lux-library-strategy-card input, .lux-library-strategy-card select { width: 100%; min-height: 39px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
-.lux-library-strategy-form-grid input:focus, .lux-library-strategy-form-grid select:focus, .lux-library-strategy-card input:focus, .lux-library-strategy-card select:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.08); }
+.lux-library-strategy-form-grid input:not([type="checkbox"]):not([type="radio"]), .lux-library-strategy-form-grid select, .lux-library-strategy-card input:not([type="checkbox"]):not([type="radio"]), .lux-library-strategy-card select { width: 100%; min-height: 39px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
+.lux-library-strategy-form-grid input:not([type="checkbox"]):not([type="radio"]):focus, .lux-library-strategy-form-grid select:focus, .lux-library-strategy-card input:not([type="checkbox"]):not([type="radio"]):focus, .lux-library-strategy-card select:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.08); }
 .lux-library-strategy-form-grid small, .lux-library-strategy-scope small, .lux-library-strategy-language-input small { color: var(--lux-subtle); font-size: .68rem; line-height: 1.45; }
 .lux-library-strategy-help { margin: 12px 0 0; color: var(--lux-subtle); font-size: .7rem; line-height: 1.5; }
 .lux-library-strategy-toggle-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
@@ -1323,8 +1324,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-settings-form { display: grid; gap: 14px; }
 .lux-library-settings-form h3 { margin-bottom: 0; }
 .lux-library-settings-form label, .lux-library-dialog-form label { display: grid; gap: 7px; color: var(--lux-muted); font-size: .75rem; }
-.lux-admin-library-page .lux-library-dialog input, .lux-admin-library-page .lux-library-dialog select { min-height: 40px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
-.lux-admin-library-page .lux-library-dialog input:focus, .lux-admin-library-page .lux-library-dialog select:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.08); }
+.lux-admin-library-page .lux-library-dialog input:not([type="checkbox"]):not([type="radio"]), .lux-admin-library-page .lux-library-dialog select { min-height: 40px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
+.lux-admin-library-page .lux-library-dialog input:not([type="checkbox"]):not([type="radio"]):focus, .lux-admin-library-page .lux-library-dialog select:focus { border-color: rgba(255,255,255,.46); box-shadow: 0 0 0 3px rgba(255,255,255,.08); }
 .lux-library-settings-form .lux-admin-toggle { display: flex; color: var(--lux-muted); }
 .lux-library-settings-form .lux-admin-toggle input { min-height: 16px; accent-color: var(--lux-accent); }
 .lux-library-settings-form .lux-admin-scraper-field, .lux-library-settings-form .lux-admin-schedule-field { color: var(--lux-muted); }
@@ -1470,9 +1471,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-setting-field { display: grid; gap: 7px; min-width: 0; color: var(--lux-text); font-size: .76rem; }
 .lux-setting-field span { font-weight: 550; }
 .lux-setting-field small { color: var(--lux-subtle); font-size: .68rem; line-height: 1.45; }
-.lux-setting-field input, .lux-setting-field select { width: 100%; min-height: 41px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-settings-line); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
-.lux-setting-field input:focus, .lux-setting-field select:focus { border-color: rgba(255,255,255,.45); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
-.lux-setting-field input[readonly] { color: var(--lux-subtle); cursor: not-allowed; }
+.lux-setting-field input:not([type="checkbox"]):not([type="radio"]), .lux-setting-field select { width: 100%; min-height: 41px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-settings-line); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); }
+.lux-setting-field input:not([type="checkbox"]):not([type="radio"]):focus, .lux-setting-field select:focus { border-color: rgba(255,255,255,.45); box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.lux-setting-field input:not([type="checkbox"]):not([type="radio"])[readonly] { color: var(--lux-subtle); cursor: not-allowed; }
 .lux-account-profile-editor { display: flex; align-items: center; gap: 15px; padding: 17px 0; }
 .lux-account-api-key-panel { display: grid; gap: 13px; padding: 17px 0; }
 .lux-account-api-key-panel .lux-setting-block-heading strong { display: inline-flex; align-items: center; gap: 7px; }

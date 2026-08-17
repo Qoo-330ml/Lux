@@ -16,9 +16,9 @@ test("shared control padding is used by form controls across pages", () => {
     ".lux-select-trigger",
     ".lux-select-option",
     ".lux-media-action",
-    ".lux-auth-form input",
-    ".lux-admin-form input, .lux-admin-form select, .lux-admin-schedule-field input, .lux-admin-root-form input",
-    ".lux-admin-server-form input",
+    ".lux-auth-form input:not([type=\"checkbox\"]):not([type=\"radio\"])",
+    ".lux-admin-form input:not([type=\"checkbox\"]):not([type=\"radio\"]), .lux-admin-form select, .lux-admin-schedule-field input:not([type=\"checkbox\"]):not([type=\"radio\"]), .lux-admin-root-form input:not([type=\"checkbox\"]):not([type=\"radio\"])",
+    ".lux-admin-server-form input:not([type=\"checkbox\"]):not([type=\"radio\"])",
     ".lux-admin-scraper-field select",
     ".lux-admin-password-row input",
     ".lux-admin-input-with-suffix input",
@@ -26,10 +26,10 @@ test("shared control padding is used by form controls across pages", () => {
     ".lux-admin-filter-select .lux-select-trigger",
     ".lux-registered-task-editor input:not([type=\"checkbox\"])",
     ".lux-operations-log-toolbar input",
-    ".lux-library-strategy-form-grid input, .lux-library-strategy-form-grid select, .lux-library-strategy-card input, .lux-library-strategy-card select",
+    ".lux-library-strategy-form-grid input:not([type=\"checkbox\"]):not([type=\"radio\"]), .lux-library-strategy-form-grid select, .lux-library-strategy-card input:not([type=\"checkbox\"]):not([type=\"radio\"]), .lux-library-strategy-card select",
     ".lux-library-override-fields input, .lux-library-override-fields select",
-    ".lux-admin-library-page .lux-library-dialog input, .lux-admin-library-page .lux-library-dialog select",
-    ".lux-setting-field input, .lux-setting-field select",
+    ".lux-admin-library-page .lux-library-dialog input:not([type=\"checkbox\"]):not([type=\"radio\"]), .lux-admin-library-page .lux-library-dialog select",
+    ".lux-setting-field input:not([type=\"checkbox\"]):not([type=\"radio\"]), .lux-setting-field select",
     ".lux-account-settings-nav a",
     ".lux-upload-button",
   ]) {
@@ -86,7 +86,7 @@ test("same-page cards, buttons, and dialogs share their padding tokens", () => {
 
 test("dense editor and strategy controls keep their page-level horizontal padding", () => {
   assert.match(
-    rule(".lux-metadata-field input, .lux-metadata-field textarea"),
+    rule(".lux-metadata-field input:not([type=\"checkbox\"]):not([type=\"radio\"]), .lux-metadata-field textarea"),
     /padding:\s*10px var\(--lux-control-padding-x\)/,
   );
   assert.match(
