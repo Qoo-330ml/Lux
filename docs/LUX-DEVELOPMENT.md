@@ -1288,6 +1288,8 @@ locked local value
 - 当前正式播放器仍不实现 DRM、服务端转码、Remux 或自定义解码器。
 - LUX-184 允许提供独立的浏览器媒体能力探针，用于实测原生 video、MediaCapabilities 和 WebCodecs；探针不接入
   正式播放路径，不读取或保存用户媒体数据。
+- LUX-185 可为 MP4/fMP4 的 HEVC 媒体增加浏览器端 WASM 解码、H.264 客户端编码和 MSE 播放 fallback；重型工作
+  必须在 Web Worker 中执行，服务端只继续提供原始媒体 Range 数据。
 - 客户端解码增强的目标包括具备相应硬件能力的 4K HEVC 8-bit、10-bit 和 HDR10；Dolby Vision 不属于当前承诺。
 - 若后续新增 WebCodecs 或 WASM 播放引擎，必须单独修改本节、补充 ADR，并通过实际浏览器性能阶段门；不得把
   “浏览器报告支持”直接等同于 4K 实时播放能力。
@@ -1860,6 +1862,7 @@ services:
 | LUX-182 | src/auth/、src/api/mod.rs、web/src/features/account/、web/src/lib/api/、tests/、docs/ |
 | LUX-183 至 186 | src/application/webhooks.rs、src/storage/、src/api/mod.rs、migrations/、migrations-postgres/、tests/、docs/ |
 | LUX-184 | web/public/media-capability-probe.html、web/public/media-capability-probe.js、web/tests/、docs/ |
+| LUX-185 | web/src/features/player/、web/public/hevc/、web/tests/、web/package.json、web/pnpm-lock.yaml、web/vite.config.ts、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3981,6 +3984,31 @@ Dolby Vision、DRM 和服务端转码不属于本任务。
 样本或未运行真实浏览器时，不得宣称 4K 播放兼容。
 
 依赖：LUX-113、LUX-114。
+
+#### LUX-185：Web 原生播放引擎与 HEVC 客户端兜底
+
+范围：将 Web 播放页从直接依赖 HTML `video` 元素改为可替换的播放引擎。浏览器原生支持时继续使用原生
+DirectPlay；浏览器无法原生解码 HEVC、但具备 WebAssembly、Web Worker、MSE 和 H.264 `VideoEncoder` 时，
+使用客户端 WASM HEVC 解码并编码为 H.264 fMP4 后通过 MSE 播放。所有媒体字节仍来自 Lux 原始 Range 端点，
+不触发服务端转码、Remux、代理或数据库任务。
+
+首个客户端 fallback 依赖 MIT 许可的 `@hevcjs/core`（其运行时依赖 MP4Box，BSD-3-Clause），固定版本并记录
+许可证；客户端 fallback 不处理 Dolby Vision、DRM 或无法由浏览器编码 H.264 的设备。
+
+验收：
+
+- [ ] NativeVideoEngine 保持现有播放、恢复位置、进度、暂停、停止和页面离开事件语义。
+- [ ] 播放器按真实能力选择原生路径或客户端 fallback，不因 `canPlayType` 的静态结果误选路径。
+- [ ] 客户端 fallback 使用 Worker，动态加载 WASM/Worker 资产，支持 MP4/fMP4 HEVC + AAC 的播放和 seek。
+- [ ] fallback 失败时显示可诊断原因，并推荐原生客户端；不创建服务器端转码任务。
+- [ ] 4K HEVC 在能力探测允许且实际客户端吞吐足够时可以走同一 fallback；性能不足时有明确降级状态。
+- [ ] `.strm` 外部 URL 只有在浏览器具备 CORS/Range 能力时才尝试客户端读取；不新增服务端代理。
+- [ ] 不改变 Emby PlaybackInfo、Rust 播放接口、数据库和第三方客户端行为。
+
+验证：Web 单测、Web 构建、真实浏览器 MP4/H.265 fixture 播放、seek、进度和 fallback 错误回归；记录浏览器、
+平台、样本分辨率、媒体耗时、客户端转码速度和丢帧。未通过真实性能门时不得宣称该设备支持 4K 实时 fallback。
+
+依赖：LUX-184、LUX-113、LUX-073。
 
 ## 26. 风险与缓解
 
