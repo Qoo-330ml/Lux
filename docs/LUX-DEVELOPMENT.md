@@ -286,7 +286,7 @@ Lux 的核心价值不是功能数量，而是：
 - 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 Lux 发出的网络请求，包括 `.strm` 下载的上游请求，但不代理播放时由客户端直连的 `.strm` 地址和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
 - 远程访问权限由用户策略控制。
-- 只有受信代理来源的 X-Forwarded-For、X-Forwarded-Proto 等请求头可以影响远近端判断。
+- Lux 会优先使用 X-Forwarded-For、X-Forwarded-Proto 等反代请求头；远程访问权限不再依据来源 IP 判断。
 - 反向代理场景必须使用 HTTPS；用户名和密码登录协议本身不能替代 TLS。
 
 ### 3.14 管理与可观测性
@@ -1344,6 +1344,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - GET /Shows/{Id}/Seasons
 - GET /Shows/{Id}/Episodes
 - GET /Shows/NextUp
+- GET /Persons?ParentId={LibraryId}&Recursive=true&PersonTypes=Actor
 - GET /Search/Hints
 - GET/HEAD /Items/{Id}/Images/{Type}
 - GET/HEAD /Items/{Id}/Images/{Type}/{Index}
@@ -1387,6 +1388,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - Years。
 - Fields。
 - EnableImages、ImageTypeLimit。
+- `/Persons` 使用 `ParentId` 指定媒体库，`PersonTypes=Actor` 返回去重后的演员，响应必须保持 `Items`、`TotalRecordCount`、`StartIndex` 的 Emby 分页结构；人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
 - TotalRecordCount 与 Items 的一致性。
 
 Limit 默认 50，服务端硬上限 500。客户端请求更大时按兼容性策略截断或拒绝，并记录测试。
@@ -1503,7 +1505,8 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 电影详情：海报、背景、简介、年份、时长、版本、字幕信息、播放、收藏。
 - 电影和剧集详情显示本地 NFO 或所选刮削器提供的主要演员；演员姓名和角色不要求存在 provider ID，
   无头像时显示姓名首字母占位。已确认的人物身份和头像使用规范人物资源，可由 TMDb、IMDb、豆瓣等
-  多个 provider 身份共同引用；未确认身份的演员只保存出演关系，不创建人物目录或发起人物图片请求。
+  多个 provider 身份共同引用；已确认人物的可用简介、出生/去世日期、出生地和职业领域也保存到人物资料，
+  未确认身份的演员只保存出演关系，不创建人物目录或发起人物图片请求。
 - 剧集详情：季度、单集、下一集、进度。
 - 合集详情。
 - Web 播放页。
@@ -1850,6 +1853,7 @@ services:
 | LUX-172 | migrations/、migrations-postgres/、src/application/nfo.rs、src/application/metadata.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/types.ts、tests/、docs/ |
 | LUX-177 至 181 | migrations/、migrations-postgres/、src/library.rs、src/storage/、src/application/libraries.rs、src/application/plugins.rs、src/application/chapter_detector.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-182 | src/auth/、src/api/mod.rs、web/src/features/account/、web/src/lib/api/、tests/、docs/ |
+| LUX-183 至 186 | src/application/webhooks.rs、src/storage/、src/api/mod.rs、migrations/、migrations-postgres/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2605,15 +2609,14 @@ services:
 
 依赖：LUX-090。
 
-#### LUX-092：可信代理和远近端判断
+#### LUX-092：转发客户端 IP 和远程访问行为
 
 验收：
 
-- 默认不信任转发头。
-- 只接受配置代理 CIDR 的转发头。
-- can_remote_access 在所有认证入口和媒体请求生效。
+- 无需配置代理 CIDR，始终优先使用有效的转发头。
+- 远程访问只依赖账号认证和媒体库 ACL，不再依据来源 IP 或 can_remote_access 阻止请求。
 
-验证：伪造头、可信代理、Tailscale 地址测试。
+验证：转发头解析、无转发头回退和反代 HTTPS Cookie 测试。
 
 依赖：LUX-090。
 
@@ -2925,7 +2928,7 @@ services:
 
 验收：
 
-- HTTPS、trusted proxy、Range、超时和流缓冲配置说明完整。
+- HTTPS、转发客户端 IP、Range、超时和流缓冲配置说明完整。
 - 明确不公开初始化中的实例。
 
 验证：至少一种真实反向代理手工验证。
@@ -3921,6 +3924,36 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 验证：API Key 服务单测、SQLite 集成测试、Lux/Emby 路由鉴权测试、管理员管理接口测试、日志脱敏测试、Web 账户页测试，以及完整 Rust/Web 检查。
 
 依赖：LUX-020、LUX-022、LUX-024。
+
+#### LUX-183：Webhook 通知事件与持久化投递
+
+范围：为 Lux 增加管理员配置的单一出站 Webhook 通知器。通知通过持久化事件和投递记录由有界后台 worker
+发送，不能阻塞扫描、播放或元数据请求。Lux 原生 `schemaVersion: 1` JSON 合同和 Emby 风格 payload 使用
+独立 adapter；不声称完整兼容 Emby Webhooks 插件的全部 payload/template 行为。Telegram、企业微信和 Email
+不属于当前任务。
+
+事件包括 `MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、
+`JOB_FAILED`、`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_PROGRESS`、`PLAYBACK_STOPPED`。事件不包含
+本地绝对路径、`.strm` 原始目标、令牌、完整外部 URL 或不必要的用户隐私字段。
+
+验收：
+
+- [x] 从空 SQLite 和 PostgreSQL 数据库运行 migration，建立通知目标、事件和投递状态表。
+- [x] 管理员可以创建、查看、修改、删除、启停 Webhook 目标并执行测试发送；secret 只在创建/轮换时返回，
+      普通列表和日志不返回明文。
+- [x] Webhook 请求使用 `eventId`、时间戳和 HMAC-SHA256 签名；事件写入和匹配投递记录可恢复且按目标幂等。
+- [x] 投递具备超时、固定并发、有限指数退避、`Retry-After`、429/5xx 重试、失败记录和服务重启恢复。
+- [x] URL 校验阻止凭据、查询参数、重定向以及默认的 loopback、链路本地、私有和 metadata 地址；管理员显式
+      允许私有网络时仍拒绝危险保留地址。
+- [x] 媒体/任务服务接入基础事件；重复扫描不会重复发送同一媒体新增事件。
+- [x] 播放边沿和节流进度事件接入；乱序回调不会造成位置倒退或通知风暴。
+- [x] Lux/Emby payload adapter 按目标独立生成事件，旧目标升级后继续使用 Lux 合同。
+- [x] API、存储、URL 安全、签名、重试、恢复、权限、CSRF、脱敏和本地接收器集成测试通过。
+
+验证：参见 `docs/LUX-183-PLAN.md`；完成后更新 `docs/COMPATIBILITY.md`，明确 Lux 原生 Webhook、Emby 风格
+payload 的实际支持范围，以及未实现的 Emby 插件行为。
+
+依赖：LUX-020、LUX-022、LUX-041、LUX-073、LUX-093。
 
 ## 26. 风险与缓解
 

@@ -17,6 +17,7 @@ use crate::application::metadata_paths::{
     people_directory, people_index_directory, people_index_path, people_index_path_for_provider,
     readable_component,
 };
+use crate::storage::{Database, NewPersonCredit, StoredPersonCredit};
 
 const LEGACY_PEOPLE_DIR: &str = "people";
 const LEGACY_ITEMS_DIR: &str = "items";
@@ -32,6 +33,7 @@ const MAX_ACTORS: usize = 12;
 const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
 const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
+const PERSON_INDEX_REBUILD_BATCH_SIZE: i64 = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +51,23 @@ pub struct ActorCredit {
     pub order: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<PersonMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub biography: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deathday: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_for_department: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_of_birth: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,6 +97,8 @@ struct StoredActor {
     image_file: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_assets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    person: Option<PersonMetadata>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -114,9 +135,15 @@ struct StoredPersonIndex {
 #[serde(rename_all = "camelCase")]
 pub struct ActorView {
     pub id: String,
+    pub provider: Option<String>,
     pub name: String,
     pub character: Option<String>,
     pub image_url: Option<String>,
+    pub biography: Option<String>,
+    pub birthday: Option<String>,
+    pub deathday: Option<String>,
+    pub known_for_department: Option<String>,
+    pub place_of_birth: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +157,7 @@ pub struct PersonImage {
 pub struct PeopleService {
     config_dir: PathBuf,
     client: Client,
+    database: Option<Database>,
 }
 
 impl PeopleService {
@@ -141,6 +169,11 @@ impl PeopleService {
         Self::with_proxy(config_dir, proxy_url)
     }
 
+    pub fn with_database(mut self, database: Database) -> Self {
+        self.database = Some(database);
+        self
+    }
+
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
         let client = match crate::network::client_builder_from_env_or(proxy_url.as_deref()) {
             Ok(builder) => match builder.build() {
@@ -149,7 +182,11 @@ impl PeopleService {
             },
             Err(_) => Client::new(),
         };
-        Self { config_dir, client }
+        Self {
+            config_dir,
+            client,
+            database: None,
+        }
     }
 
     pub async fn persist_item_actors(
@@ -243,6 +280,7 @@ impl PeopleService {
                 order: actor.order,
                 image_file: assets.image_file,
                 pending_assets: assets.pending_assets,
+                person: actor.person.clone(),
             });
         }
 
@@ -257,6 +295,17 @@ impl PeopleService {
         let bytes = serde_json::to_vec_pretty(&relation)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
         write_atomically(&relation_path, &bytes).await?;
+        if let Some(database) = &self.database {
+            let credits = relation
+                .actors
+                .iter()
+                .map(person_credit_from_stored_actor)
+                .collect::<Vec<_>>();
+            database
+                .replace_person_credits(item_id, &credits)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        }
         Ok(ActorPersistReport {
             stored_count: relation.actors.len(),
             pending_assets,
@@ -329,7 +378,7 @@ impl PeopleService {
         }
         if let Err(error) = write_atomically(
             &nfo_path,
-            &person_nfo_bytes(&actor.name, provider, provider_id),
+            &person_nfo_bytes(&actor.name, provider, provider_id, actor.person.as_ref()),
         )
         .await
         {
@@ -491,39 +540,197 @@ impl PeopleService {
             .take(MAX_ACTORS)
             .filter(|actor| !actor.name.trim().is_empty())
         {
-            let id = actor
-                .id
-                .filter(|id| is_valid_person_id(id))
-                .unwrap_or_else(|| local_actor_id(&actor.name, actor.character.as_deref()));
-            let provider = actor.provider;
-            let image_url = if provider.is_empty() {
-                None
-            } else {
-                match self.profile_image_for_provider(Some(&provider), &id).await {
-                    Ok(Some(_)) => {
-                        if provider.eq_ignore_ascii_case("tmdb") {
-                            Some(format!("/api/v1/people/{id}/image"))
-                        } else if validate_component(&provider).is_ok() {
-                            Some(format!("/api/v1/people/{provider}/{id}/image"))
-                        } else {
-                            None
-                        }
-                    }
+            let id = actor_id_from_stored_actor(&actor);
+            let provider = actor_provider_from_stored_actor(&actor);
+            let image_url = match provider.as_deref() {
+                Some(provider_name) => match self
+                    .profile_image_for_provider(Some(provider_name), &id)
+                    .await
+                {
+                    Ok(Some(_)) => actor_image_url(provider_name, &id),
                     Ok(None) => None,
                     Err(error) => {
                         tracing::warn!(person_id = %id, %error, "actor profile image lookup failed; using placeholder");
                         None
                     }
-                }
+                },
+                None => None,
             };
             views.push(ActorView {
                 id,
+                provider,
                 name: actor.name,
                 character: actor.character,
                 image_url,
+                biography: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.biography.clone()),
+                birthday: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.birthday.clone()),
+                deathday: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.deathday.clone()),
+                known_for_department: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.known_for_department.clone()),
+                place_of_birth: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.place_of_birth.clone()),
             });
         }
         Ok(views)
+    }
+
+    pub async fn list_library_actors(
+        &self,
+        library_id: &str,
+        person_type: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<ActorView>, i64), PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        let (credits, total) = database
+            .list_person_credits_for_library(library_id, person_type, offset, limit)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        Ok((self.actor_views_from_credits(credits).await, total))
+    }
+
+    pub async fn rebuild_person_credit_index(&self) -> Result<usize, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        let library_ids = database
+            .list_enabled_library_ids()
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let mut rebuilt_items = 0;
+        for library_id in library_ids {
+            let mut offset = 0;
+            loop {
+                let item_ids = database
+                    .list_media_item_ids_for_library(
+                        &library_id,
+                        offset,
+                        PERSON_INDEX_REBUILD_BATCH_SIZE,
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                if item_ids.is_empty() {
+                    break;
+                }
+                for item_id in &item_ids {
+                    match self.rebuild_item_person_credit_index(item_id).await {
+                        Ok(()) => rebuilt_items += 1,
+                        Err(PeopleError::Serialization(message)) => {
+                            tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                offset += item_ids.len() as i64;
+                if item_ids.len() < PERSON_INDEX_REBUILD_BATCH_SIZE as usize {
+                    break;
+                }
+            }
+        }
+        Ok(rebuilt_items)
+    }
+
+    async fn rebuild_item_person_credit_index(&self, item_id: &str) -> Result<(), PeopleError> {
+        let new_path = library_item_directory(&self.config_dir, item_id)
+            .map_err(PeopleError::from)?
+            .join("people.json");
+        let legacy_path = self
+            .legacy_people_dir()
+            .join(LEGACY_ITEMS_DIR)
+            .join(format!("{item_id}.json"));
+        let relation = match read_relation(&new_path).await? {
+            Some(relation) => Some(relation),
+            None => read_relation(&legacy_path).await?,
+        };
+        let credits = relation
+            .as_ref()
+            .map(|relation| {
+                relation
+                    .actors
+                    .iter()
+                    .take(MAX_ACTORS)
+                    .filter(|actor| !actor.name.trim().is_empty())
+                    .map(person_credit_from_stored_actor)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .replace_person_credits(item_id, &credits)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub async fn list_libraries_actors(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<ActorView>, i64), PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        let (credits, total) = database
+            .list_person_credits_for_libraries(library_ids, person_type, offset, limit)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        Ok((self.actor_views_from_credits(credits).await, total))
+    }
+
+    async fn actor_views_from_credits(&self, credits: Vec<StoredPersonCredit>) -> Vec<ActorView> {
+        let mut views = Vec::with_capacity(credits.len());
+        for credit in credits {
+            let provider = (!credit.provider.is_empty()).then(|| credit.provider.clone());
+            let image_url = match provider.as_deref() {
+                Some(provider) => match self
+                    .profile_image_for_provider(Some(provider), &credit.person_id)
+                    .await
+                {
+                    Ok(Some(_)) => actor_image_url(provider, &credit.person_id),
+                    Ok(None) | Err(_) => None,
+                },
+                None => None,
+            };
+            views.push(ActorView {
+                id: credit.person_id,
+                provider,
+                name: credit.person_name,
+                character: (!credit.role.is_empty()).then_some(credit.role),
+                image_url,
+                biography: credit.biography,
+                birthday: credit.birthday,
+                deathday: credit.deathday,
+                known_for_department: credit.known_for_department,
+                place_of_birth: credit.place_of_birth,
+            });
+        }
+        views
     }
 
     pub async fn profile_image(&self, person_id: &str) -> Result<Option<PersonImage>, PeopleError> {
@@ -942,19 +1149,115 @@ async fn image_from_path(path: &Path) -> Result<Option<PersonImage>, PeopleError
     }))
 }
 
-fn person_nfo_bytes(name: &str, provider: &str, provider_id: &str) -> Vec<u8> {
+fn person_nfo_bytes(
+    name: &str,
+    provider: &str,
+    provider_id: &str,
+    metadata: Option<&PersonMetadata>,
+) -> Vec<u8> {
+    let metadata = metadata.map(person_metadata_xml).unwrap_or_default();
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-         <person><name>{}</name><uniqueid type=\"{}\">{}</uniqueid></person>\n",
+         <person><name>{}</name>{}<uniqueid type=\"{}\">{}</uniqueid></person>\n",
         escape(name),
+        metadata,
         escape(provider),
         escape(provider_id),
     )
     .into_bytes()
 }
 
+fn person_metadata_xml(metadata: &PersonMetadata) -> String {
+    let mut xml = String::new();
+    for (tag, value) in [
+        ("biography", metadata.biography.as_deref()),
+        ("birthday", metadata.birthday.as_deref()),
+        ("deathday", metadata.deathday.as_deref()),
+        ("knownfor", metadata.known_for_department.as_deref()),
+        ("placeofbirth", metadata.place_of_birth.as_deref()),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            xml.push_str(&format!("<{tag}>{}</{tag}>", escape(value)));
+        }
+    }
+    xml
+}
+
 fn default_provider() -> String {
     "tmdb".to_owned()
+}
+
+fn actor_id_from_stored_actor(actor: &StoredActor) -> String {
+    actor
+        .id
+        .as_deref()
+        .filter(|id| is_valid_person_id(id))
+        .map(str::to_owned)
+        .or_else(|| {
+            actor
+                .identities
+                .iter()
+                .find(|identity| {
+                    is_valid_person_id(&identity.provider) && is_valid_person_id(&identity.id)
+                })
+                .map(|identity| identity.id.clone())
+        })
+        .unwrap_or_else(|| local_actor_id(&actor.name, actor.character.as_deref()))
+}
+
+fn actor_provider_from_stored_actor(actor: &StoredActor) -> Option<String> {
+    if actor.id.as_deref().is_some_and(is_valid_person_id)
+        && !actor.provider.is_empty()
+        && validate_component(&actor.provider).is_ok()
+    {
+        return Some(actor.provider.clone());
+    }
+    actor
+        .identities
+        .iter()
+        .find(|identity| is_valid_person_id(&identity.provider) && is_valid_person_id(&identity.id))
+        .map(|identity| identity.provider.clone())
+}
+
+fn person_credit_from_stored_actor(actor: &StoredActor) -> NewPersonCredit {
+    NewPersonCredit {
+        person_id: actor_id_from_stored_actor(actor),
+        person_type: "Actor".to_owned(),
+        person_name: actor.name.clone(),
+        provider: actor_provider_from_stored_actor(actor).unwrap_or_default(),
+        role: actor.character.clone().unwrap_or_default(),
+        sort_order: i64::from(actor.order.unwrap_or(i32::MAX)),
+        biography: actor
+            .person
+            .as_ref()
+            .and_then(|person| person.biography.clone()),
+        birthday: actor
+            .person
+            .as_ref()
+            .and_then(|person| person.birthday.clone()),
+        deathday: actor
+            .person
+            .as_ref()
+            .and_then(|person| person.deathday.clone()),
+        known_for_department: actor
+            .person
+            .as_ref()
+            .and_then(|person| person.known_for_department.clone()),
+        place_of_birth: actor
+            .person
+            .as_ref()
+            .and_then(|person| person.place_of_birth.clone()),
+    }
+}
+
+fn actor_image_url(provider: &str, person_id: &str) -> Option<String> {
+    if provider.eq_ignore_ascii_case("tmdb") {
+        Some(format!("/api/v1/people/{person_id}/image"))
+    } else if validate_component(provider).is_ok() {
+        Some(format!("/api/v1/people/{provider}/{person_id}/image"))
+    } else {
+        None
+    }
 }
 
 fn validate_component(value: &str) -> Result<(), PeopleError> {
@@ -1196,6 +1499,7 @@ pub enum PeopleError {
     UpstreamStatus(u16),
     Download(String),
     Serialization(String),
+    Storage(String),
     Symlink(PathBuf),
     Io {
         path: PathBuf,
@@ -1215,6 +1519,7 @@ impl fmt::Display for PeopleError {
                 write!(formatter, "people image upstream returned {status}")
             }
             Self::Serialization(message) => write!(formatter, "people data is invalid: {message}"),
+            Self::Storage(message) => write!(formatter, "people index storage failed: {message}"),
             Self::Symlink(path) => {
                 write!(formatter, "people path is a symlink: {}", path.display())
             }
@@ -1236,6 +1541,7 @@ impl std::error::Error for PeopleError {
             | Self::UpstreamStatus(_)
             | Self::Download(_)
             | Self::Serialization(_)
+            | Self::Storage(_)
             | Self::Symlink(_) => None,
         }
     }
@@ -1294,6 +1600,7 @@ mod tests {
                     character: Some("角色甲".to_owned()),
                     order: Some(0),
                     profile_url: None,
+                    person: None,
                 }],
             )
             .await?;
@@ -1315,6 +1622,44 @@ mod tests {
             service.profile_image("9").await?.map(|image| image.path),
             Some(person_dir.join("folder.png"))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_writes_available_person_biography_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let person_dir = people_directory(config.path(), "演员甲", "tmdb", "9")?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+
+        PeopleService::new(config.path().to_owned())
+            .persist_item_actors(
+                "item-biography",
+                "tmdb",
+                &[ActorCredit {
+                    id: "9".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员甲".to_owned(),
+                    character: Some("角色甲".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                    person: Some(super::PersonMetadata {
+                        biography: Some("演员甲的生平介绍".to_owned()),
+                        birthday: Some("1970-01-01".to_owned()),
+                        deathday: None,
+                        known_for_department: Some("Acting".to_owned()),
+                        place_of_birth: Some("测试城市".to_owned()),
+                    }),
+                }],
+            )
+            .await?;
+
+        let nfo = tokio::fs::read_to_string(person_dir.join("person.nfo")).await?;
+        assert!(nfo.contains("<biography>演员甲的生平介绍</biography>"));
+        assert!(nfo.contains("<birthday>1970-01-01</birthday>"));
+        assert!(nfo.contains("<knownfor>Acting</knownfor>"));
+        assert!(nfo.contains("<placeofbirth>测试城市</placeofbirth>"));
         Ok(())
     }
 
@@ -1346,6 +1691,7 @@ mod tests {
                         character: None,
                         order: Some(0),
                         profile_url: None,
+                        person: None,
                     }],
                 )
                 .await?;
@@ -1406,6 +1752,7 @@ mod tests {
                     character: None,
                     order: None,
                     profile_url: None,
+                    person: None,
                 }],
             )
             .await
@@ -1431,6 +1778,7 @@ mod tests {
                     character: Some("本地角色".to_owned()),
                     order: Some(0),
                     profile_url: None,
+                    person: None,
                 }],
             )
             .await?;
@@ -1495,6 +1843,7 @@ mod tests {
                     character: None,
                     order: Some(0),
                     profile_url: None,
+                    person: None,
                 }],
             )
             .await?;
@@ -1527,6 +1876,7 @@ mod tests {
             character: None,
             order: Some(0),
             profile_url: None,
+            person: None,
         }];
 
         service
@@ -1570,6 +1920,7 @@ mod tests {
                     character: Some("角色甲".to_owned()),
                     order: Some(0),
                     profile_url: None,
+                    person: None,
                 }],
                 &[1, 2, 3],
             )

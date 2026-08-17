@@ -19,6 +19,7 @@ use luxd::{
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
         tmdb_plugin::TmdbProvider,
+        webhooks::WebhookService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -685,11 +686,23 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
+    let webhooks = WebhookService::new(database.clone(), config.config_dir.clone())?;
+    webhooks
+        .create_destination(
+            "Metadata test receiver",
+            "https://example.com/lux-hook",
+            true,
+            false,
+            &["METADATA_UPDATED".to_owned(), "JOB_FAILED".to_owned()],
+            Some("webhook-test-secret-1234"),
+        )
+        .await?;
     let metadata = MetadataReidentifyService::with_selection(
         database.clone(),
         TmdbProvider::from(tmdb),
         Some(selection),
-    );
+    )
+    .with_webhooks(webhooks);
     let job = metadata
         .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
         .await?;
@@ -713,6 +726,12 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
         .await?;
     metadata.run(&full_refresh_job.id).await;
     assert!(tracker.requests.load(Ordering::SeqCst) > requests_after_incomplete);
+    let metadata_updated: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_events WHERE event_type = 'METADATA_UPDATED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(metadata_updated >= 1);
 
     tmdb_server.abort();
     Ok(())
@@ -809,5 +828,46 @@ async fn metadata_job_skips_explicit_parent_folder_without_failing()
     let finished = metadata.get_job(&job.id).await?;
     assert_eq!(finished.status, "COMPLETED");
     assert_eq!(finished.processed_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_metadata_job_enqueues_job_failed_webhook() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let webhooks = WebhookService::new(database.clone(), _temp_dir.path().join("config"))?;
+    webhooks
+        .create_destination(
+            "Failed job receiver",
+            "https://example.com/lux-hook",
+            true,
+            false,
+            &["JOB_FAILED".to_owned()],
+            Some("webhook-test-secret-1234"),
+        )
+        .await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?)
+        .with_webhooks(webhooks);
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    metadata.run(&job.id).await;
+
+    let finished = metadata.get_job(&job.id).await?;
+    assert_eq!(finished.status, "FAILED");
+    let failed_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_events
+         WHERE event_type = 'JOB_FAILED' AND dedupe_key = ?",
+    )
+    .bind(format!("job-failed:{}", job.id))
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(failed_events, 1);
     Ok(())
 }

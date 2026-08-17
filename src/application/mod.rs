@@ -45,3 +45,4 @@ pub mod tmdb;
 pub mod tmdb_plugin;
 pub mod user_avatars;
 pub mod watch;
+pub mod webhooks;

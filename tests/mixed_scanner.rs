@@ -51,6 +51,7 @@ async fn mixed_scan_classifies_movies_series_and_unresolved_without_cross_contam
         counts,
         vec![
             ("EPISODE".to_owned(), 1),
+            ("FOLDER".to_owned(), 2),
             ("MOVIE".to_owned(), 1),
             ("SEASON".to_owned(), 1),
             ("SERIES".to_owned(), 1),

@@ -28,7 +28,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     tokio::fs::create_dir_all(&root).await?;
     tokio::fs::write(
         root.join("Remote.Movie.2024.strm"),
-        "\u{feff}\n  \n https://media.example.test/video?id=7&token=secret \nignored\n",
+        "\u{feff}\n  \n https://media.example.test/video/剧集?id=7&title=第1集&token=secret \nignored\n",
     )
     .await?;
     tokio::fs::write(root.join("Empty.Movie.2025.strm"), b"\n \n").await?;
@@ -66,7 +66,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     assert_eq!(remote.3.as_deref(), Some("URL"));
     assert_eq!(
         remote.2.as_deref(),
-        Some("https://media.example.test/video?id=7&token=secret")
+        Some("https://media.example.test/video/剧集?id=7&title=第1集&token=secret")
     );
     let path = stored
         .iter()
@@ -226,7 +226,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     );
     assert_eq!(
         senplayer_stream.headers()[reqwest::header::LOCATION],
-        "https://media.example.test/video?id=7&token=secret"
+        "https://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
     );
 
     let path_stream = no_redirect_client
@@ -257,7 +257,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     );
     assert_eq!(
         unmatched_video_path.headers()[reqwest::header::LOCATION],
-        "https://media.example.test/video?id=7&token=secret"
+        "https://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
     );
 
     let missing_source_video_path = no_redirect_client
@@ -295,7 +295,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     );
     assert_eq!(
         source_id_body["Items"][0]["MediaSources"][0]["Path"],
-        "https://media.example.test/video?id=7&token=secret"
+        "https://media.example.test/video/剧集?id=7&title=第1集&token=secret"
     );
     tokio::fs::write(
         root.join("Path.Movie.2026.strm"),

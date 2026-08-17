@@ -26,6 +26,8 @@ export const queryKeys = {
   adminPlugins: ["admin", "plugins"] as const,
   adminPluginStore: ["admin", "plugin-store"] as const,
   adminInstalledPlugins: ["admin", "plugins", "installed"] as const,
+  adminWebhookDestinations: ["admin", "webhook-destinations"] as const,
+  adminWebhookDeliveries: ["admin", "webhook-deliveries"] as const,
   adminUsers: ["admin", "users"] as const,
   adminJobs: (status?: string) => ["admin", "jobs", status ?? "all"] as const,
   adminScheduledTasks: (page = 1) => ["admin", "scheduled-tasks", page] as const,

@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -63,7 +63,7 @@ use crate::{
             ImageWriteService, normalize_image_type, read_image_dimensions,
         },
         ip_location::{IpLocation, IpLocationService},
-        libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
+        libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch, LibraryView},
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
         metadata::MetadataField,
         network_diagnostics::{NetworkDiagnostics, NetworkProbeResult, test_network},
@@ -88,6 +88,7 @@ use crate::{
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
+        webhooks::{WebhookError, WebhookEventType, WebhookService},
     },
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
@@ -148,6 +149,7 @@ pub struct AppState {
     strm_probe: Option<StrmProbeService>,
     chapter_detection: Option<ChapterDetectionService>,
     scheduled_tasks: Option<ScheduledTaskService>,
+    webhooks: Option<WebhookService>,
     danmaku: Option<DanmakuService>,
     plugins: Option<PluginService>,
     scraper_resolver: Option<ScraperResolver>,
@@ -244,7 +246,19 @@ impl AppState {
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
         let chapter_detection = ChapterDetectionService::new(database.clone(), plugins.clone());
-        let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone());
+        let webhooks = match WebhookService::new(database.clone(), config_dir.clone()) {
+            Ok(service) => Some(service),
+            Err(error) => {
+                tracing::error!(%error, "failed to initialize webhook notifications");
+                None
+            }
+        };
+        let metadata_reidentify = metadata_reidentify.map(|service| match webhooks.clone() {
+            Some(webhooks) => service.with_webhooks(webhooks),
+            None => service,
+        });
+        let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone())
+            .with_database(database.clone());
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
         let probe = Some(MediaProbeService::new(
             database.clone(),
@@ -260,10 +274,14 @@ impl AppState {
                 Some(covers) => service.with_library_covers(covers),
                 None => service,
             };
-            service
+            let service = service
                 .with_strm_probe(strm_probe.clone())
                 .with_people(people.clone())
-                .with_nfo_store(local_nfo.clone())
+                .with_nfo_store(local_nfo.clone());
+            match webhooks.clone() {
+                Some(webhooks) => service.with_webhooks(webhooks),
+                None => service,
+            }
         };
         let scheduled_tasks = ScheduledTaskService::new(
             database.clone(),
@@ -309,13 +327,17 @@ impl AppState {
             downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
                 .ok(),
             metadata_reidentify,
-            deletion: Some(MediaDeleteService::new(database.clone())),
+            deletion: Some(match webhooks.clone() {
+                Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
+                None => MediaDeleteService::new(database.clone()),
+            }),
             probe,
             thumbnails,
             scan_jobs: Some(scan_jobs),
             strm_probe: Some(strm_probe),
             chapter_detection: Some(chapter_detection),
             scheduled_tasks: Some(scheduled_tasks),
+            webhooks,
             danmaku: Some(
                 DanmakuService::new(
                     database.clone(),
@@ -334,7 +356,7 @@ impl AppState {
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
             resources,
-            remote_access: RemoteAccessPolicy::from_env(),
+            remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
         }
     }
@@ -399,6 +421,22 @@ impl AppState {
                 worker.run(&job_id).await;
             });
         }
+    }
+
+    pub async fn rebuild_people_index(&self) {
+        let Some(service) = self.people.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match service.rebuild_person_credit_index().await {
+                Ok(rebuilt_items) => {
+                    tracing::info!(rebuilt_items, "person credit index rebuild completed");
+                }
+                Err(error) => {
+                    tracing::error!(%error, "person credit index rebuild failed");
+                }
+            }
+        });
     }
 
     pub async fn resume_scan_jobs(&self) {
@@ -498,6 +536,12 @@ impl AppState {
         }
     }
 
+    pub fn start_webhook_worker(&self) {
+        if let Some(webhooks) = self.webhooks.as_ref() {
+            webhooks.spawn_worker();
+        }
+    }
+
     pub async fn resume_danmaku_match_jobs(&self) {
         let Some(service) = self.danmaku.clone() else {
             return;
@@ -514,11 +558,6 @@ impl AppState {
                 }
             });
         }
-    }
-
-    pub fn with_remote_access_policy(mut self, policy: RemoteAccessPolicy) -> Self {
-        self.remote_access = policy;
-        self
     }
 
     pub fn require_database_selection(mut self) -> Self {
@@ -788,6 +827,32 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/settings/network-proxy/test",
             post(admin_test_network_proxy),
+        )
+        .route(
+            "/api/v1/admin/notification-destinations",
+            get(admin_list_webhook_destinations).post(admin_create_webhook_destination),
+        )
+        .route(
+            "/api/v1/admin/notification-destinations/{destination_id}",
+            get(admin_get_webhook_destination)
+                .patch(admin_update_webhook_destination)
+                .delete(admin_delete_webhook_destination),
+        )
+        .route(
+            "/api/v1/admin/notification-destinations/{destination_id}/test",
+            post(admin_test_webhook_destination),
+        )
+        .route(
+            "/api/v1/admin/notification-destinations/{destination_id}/rotate-secret",
+            post(admin_rotate_webhook_secret),
+        )
+        .route(
+            "/api/v1/admin/notification-deliveries",
+            get(admin_list_webhook_deliveries),
+        )
+        .route(
+            "/api/v1/admin/notification-deliveries/{delivery_id}/retry",
+            post(admin_retry_webhook_delivery),
         )
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
@@ -1244,6 +1309,15 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option<String> {
+    policy
+        .reported_client_ip(
+            header_str(headers, "x-lux-peer-ip"),
+            header_str(headers, "x-forwarded-for"),
+        )
+        .map(|address| address.to_string())
+}
+
 fn login_attempt_key(headers: &HeaderMap, username: &str) -> String {
     format!(
         "{}:{}",
@@ -1259,6 +1333,8 @@ fn emby_routes() -> Router<AppState> {
         .route("/System/Ping", get(emby_ping).post(emby_ping))
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
+        .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
+        .route("/Persons", get(emby_persons))
         .route("/Users/{user_id}", get(emby_user))
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Root", get(emby_user_root))
@@ -1626,6 +1702,22 @@ struct EmbyTokenQuery {
     tag: Option<String>,
     #[serde(rename = "Fields", default)]
     fields: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct EmbyPersonsQuery {
+    #[serde(flatten)]
+    auth: EmbyTokenQuery,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    user_id: Option<String>,
+    #[serde(rename = "ParentId", alias = "parentId", default)]
+    parent_id: Option<String>,
+    #[serde(rename = "PersonTypes", alias = "personTypes", default)]
+    person_types: Option<String>,
+    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    start_index: Option<i64>,
+    #[serde(rename = "Limit", alias = "limit", default)]
+    limit: Option<i64>,
 }
 
 async fn require_emby_token(
@@ -2036,6 +2128,41 @@ fn emby_compat_media_source_id<'a>(ids: Option<&'a str>, page: &CatalogPage) -> 
         })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmbyClientCompatibility {
+    Generic,
+    VidHub,
+}
+
+fn emby_client_compatibility_from_name(client: Option<&str>) -> EmbyClientCompatibility {
+    match client.map(str::trim) {
+        Some(client) if client.eq_ignore_ascii_case("vidhub") => EmbyClientCompatibility::VidHub,
+        _ => EmbyClientCompatibility::Generic,
+    }
+}
+
+async fn emby_client_compatibility(
+    headers: &HeaderMap,
+    api_key: Option<&str>,
+    state: &AppState,
+) -> EmbyClientCompatibility {
+    let header_device = emby_device_info_from_headers(headers);
+    if !header_device.client.is_empty() {
+        return emby_client_compatibility_from_name(Some(&header_device.client));
+    }
+    let Some(token) = emby_token_from_headers(headers).or_else(|| api_key.map(str::to_owned))
+    else {
+        return EmbyClientCompatibility::Generic;
+    };
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return EmbyClientCompatibility::Generic;
+    };
+    match auth.device_info(&token).await {
+        Ok(Some(device)) => emby_client_compatibility_from_name(Some(&device.client)),
+        Ok(None) | Err(_) => EmbyClientCompatibility::Generic,
+    }
+}
+
 async fn emby_user_views(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -2050,7 +2177,8 @@ async fn emby_user_views(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    match emby_visible_library_items(&state, principal).await {
+    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
+    match emby_visible_library_items(&state, principal, compatibility).await {
         Ok(items) => {
             let total = items.len();
             Json(json!({
@@ -2062,6 +2190,126 @@ async fn emby_user_views(
         }
         Err(status) => status.into_response(),
     }
+}
+
+async fn emby_library_virtual_folders(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let media_strategy = match read_media_strategy_settings(database).await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let (resume_played_percent, resume_min_ticks) = match database.resume_settings().await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
+    match libraries.list_libraries().await {
+        Ok(views) => Json(
+            views
+                .iter()
+                .filter(|view| view.library.is_enabled)
+                .map(|view| {
+                    emby_virtual_folder_json(
+                        view,
+                        &media_strategy,
+                        resume_played_percent,
+                        resume_min_ticks,
+                        compatibility,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn emby_persons(
+    headers: HeaderMap,
+    Query(query): Query<EmbyPersonsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Some(user_id) = query.user_id.as_deref()
+        && let Err(status) = ensure_emby_user_scope(&user, user_id)
+    {
+        return status.into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let library_ids = match query.parent_id.as_deref() {
+        Some(parent_id) if accessible_library_ids.iter().any(|id| id == parent_id) => {
+            vec![parent_id.to_owned()]
+        }
+        Some(_) => return StatusCode::NOT_FOUND.into_response(),
+        None => accessible_library_ids,
+    };
+    let (offset, limit) = match emby_person_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let person_type = match emby_person_type_filter(query.person_types.as_deref()) {
+        Some(person_type) => person_type,
+        None => {
+            return Json(json!({
+                "Items": [],
+                "TotalRecordCount": 0,
+                "StartIndex": offset,
+            }))
+            .into_response();
+        }
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = match query.parent_id.as_deref() {
+        Some(parent_id) => {
+            people
+                .list_library_actors(parent_id, person_type, offset, limit)
+                .await
+        }
+        None => {
+            people
+                .list_libraries_actors(&library_ids, person_type, offset, limit)
+                .await
+        }
+    };
+    let (actors, total) = match result {
+        Ok(result) => result,
+        Err(PeopleError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(json!({
+        "Items": actors.into_iter().map(emby_person_json).collect::<Vec<_>>(),
+        "TotalRecordCount": total,
+        "StartIndex": offset,
+    }))
+    .into_response()
 }
 
 async fn emby_user_root(
@@ -2077,7 +2325,13 @@ async fn emby_user_root(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
-    emby_user_root_response(&state, AccessPrincipal::new(user.id, user.is_admin)).await
+    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
+    emby_user_root_response(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        compatibility,
+    )
+    .await
 }
 
 async fn emby_items_root(
@@ -2093,11 +2347,21 @@ async fn emby_items_root(
     if let Err(status) = ensure_emby_user_scope(&user, &requested_user_id) {
         return status.into_response();
     }
-    emby_user_root_response(&state, AccessPrincipal::new(user.id, user.is_admin)).await
+    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
+    emby_user_root_response(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        compatibility,
+    )
+    .await
 }
 
-async fn emby_user_root_response(state: &AppState, principal: AccessPrincipal) -> Response {
-    let items = match emby_visible_library_items(state, principal).await {
+async fn emby_user_root_response(
+    state: &AppState,
+    principal: AccessPrincipal,
+    compatibility: EmbyClientCompatibility,
+) -> Response {
+    let items = match emby_visible_library_items(state, principal, compatibility).await {
         Ok(items) => items,
         Err(status) => return status.into_response(),
     };
@@ -2126,6 +2390,7 @@ async fn emby_user_root_response(state: &AppState, principal: AccessPrincipal) -
 async fn emby_visible_library_items(
     state: &AppState,
     principal: AccessPrincipal,
+    compatibility: EmbyClientCompatibility,
 ) -> Result<Vec<Value>, StatusCode> {
     let Some(access) = state.access.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -2153,6 +2418,7 @@ async fn emby_visible_library_items(
             &view.library,
             &state.server_id,
             child_count,
+            compatibility,
         ));
     }
     Ok(items)
@@ -2962,7 +3228,7 @@ async fn emby_items_counts(
 }
 
 async fn emby_list_items(
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     state: &AppState,
     principal: AccessPrincipal,
     can_download: bool,
@@ -2970,7 +3236,9 @@ async fn emby_list_items(
 ) -> Response {
     let root_id = principal.user_id.to_string();
     if emby_query_targets_user_root_views(query, &root_id) {
-        return match emby_visible_library_items(state, principal).await {
+        let compatibility =
+            emby_client_compatibility(headers, query.api_key.as_deref(), state).await;
+        return match emby_visible_library_items(state, principal, compatibility).await {
             Ok(items) => Json(json!({
                 "Items": items,
                 "TotalRecordCount": items.len(),
@@ -3191,12 +3459,14 @@ async fn emby_item(
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let fields = emby_detail_fields(query.fields.as_deref());
+    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
     emby_item_response(
         &state,
         principal,
         &item_id,
         user.can_download,
         fields.as_deref(),
+        compatibility,
     )
     .await
 }
@@ -3216,12 +3486,14 @@ async fn emby_user_item(
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let fields = emby_detail_fields(query.fields.as_deref());
+    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
     emby_item_response(
         &state,
         principal,
         &item_id,
         user.can_download,
         fields.as_deref(),
+        compatibility,
     )
     .await
 }
@@ -3232,9 +3504,10 @@ async fn emby_item_response(
     item_id: &str,
     can_download: bool,
     fields: Option<&str>,
+    compatibility: EmbyClientCompatibility,
 ) -> Response {
     if item_id == principal.user_id.to_string() {
-        return emby_user_root_response(state, principal).await;
+        return emby_user_root_response(state, principal, compatibility).await;
     }
     if let Ok(library_id) = item_id.parse::<crate::domain::ids::LibraryId>()
         && let Some(libraries) = state.libraries.as_ref()
@@ -3261,6 +3534,7 @@ async fn emby_item_response(
                     &library,
                     &state.server_id,
                     child_count,
+                    compatibility,
                 ))
                 .into_response();
             }
@@ -3402,6 +3676,11 @@ fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
         "Role": actor.character,
         "Type": "Actor",
         "PrimaryImageTag": image_tag,
+        "Overview": actor.biography,
+        "BirthDate": actor.birthday,
+        "DeathDate": actor.deathday,
+        "KnownForDepartment": actor.known_for_department,
+        "PlaceOfBirth": actor.place_of_birth,
     })
 }
 
@@ -3803,6 +4082,17 @@ async fn handle_emby_playback_event(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
+    let occurred_at = current_unix_timestamp();
+    let webhook_event = webhook_event_type_for_playback(
+        activity_event,
+        should_publish_playback_progress(
+            previous_session.as_ref(),
+            state_name,
+            request.position_ticks,
+            occurred_at,
+        ),
+    );
+    let remote_ip = request_client_ip(&headers, &state.remote_access);
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -3814,7 +4104,7 @@ async fn handle_emby_playback_event(
             device_name,
             client_version,
             device_type,
-            remote_ip: header_str(&headers, "x-lux-peer-ip"),
+            remote_ip: remote_ip.as_deref(),
             state: state_name,
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -3845,6 +4135,25 @@ async fn handle_emby_playback_event(
                         "deviceType": device_type,
                         "state": state_name,
                     }),
+                )
+                .await;
+            }
+            if let Some(event_type) = webhook_event {
+                publish_playback_webhook(
+                    &state,
+                    event_type,
+                    occurred_at,
+                    &request.item_id,
+                    media_source_id,
+                    &play_session_id,
+                    state_name,
+                    request.position_ticks,
+                    request.duration_ticks,
+                    request.is_paused || state_name == "PAUSED",
+                    client,
+                    device_name,
+                    device_type,
+                    client_version,
                 )
                 .await;
             }
@@ -3887,6 +4196,98 @@ fn playback_client_label(value: Option<&str>) -> &'static str {
         Some(_) => "other",
         None => "unknown",
     }
+}
+
+const PLAYBACK_WEBHOOK_PROGRESS_INTERVAL_SECONDS: i64 = 30;
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+fn should_publish_playback_progress(
+    previous: Option<&StoredPlaybackSession>,
+    state_name: &str,
+    position_ticks: i64,
+    occurred_at: i64,
+) -> bool {
+    matches!(state_name, "PLAYING" | "PAUSED")
+        && previous.is_some_and(|session| {
+            occurred_at.saturating_sub(session.last_event_at)
+                >= PLAYBACK_WEBHOOK_PROGRESS_INTERVAL_SECONDS
+                && position_ticks > session.position_ticks
+        })
+}
+
+fn webhook_event_type_for_playback(
+    activity_event: Option<&str>,
+    progress_due: bool,
+) -> Option<WebhookEventType> {
+    match activity_event {
+        Some("PLAYBACK_STARTED") => Some(WebhookEventType::PlaybackStarted),
+        Some("PLAYBACK_PAUSED") => Some(WebhookEventType::PlaybackPaused),
+        Some("PLAYBACK_STOPPED") => Some(WebhookEventType::PlaybackStopped),
+        _ if progress_due => Some(WebhookEventType::PlaybackProgress),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_playback_webhook(
+    state: &AppState,
+    event_type: WebhookEventType,
+    occurred_at: i64,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    play_session_id: &str,
+    state_name: &str,
+    position_ticks: i64,
+    duration_ticks: Option<i64>,
+    is_paused: bool,
+    client: Option<&str>,
+    device_name: Option<&str>,
+    device_type: Option<&str>,
+    client_version: Option<&str>,
+) {
+    let Some(webhooks) = state.webhooks.as_ref() else {
+        return;
+    };
+    let dedupe_key = format!(
+        "playback:{play_session_id}:{}:{occurred_at}",
+        event_type.as_str()
+    );
+    let data = json!({
+        "itemId": item_id,
+        "mediaSourceId": media_source_id,
+        "playSessionId": play_session_id,
+        "state": state_name,
+        "positionTicks": position_ticks,
+        "durationTicks": duration_ticks,
+        "isPaused": is_paused,
+        "client": bounded_playback_text(client),
+        "deviceName": bounded_playback_text(device_name),
+        "deviceType": bounded_playback_text(device_type),
+        "clientVersion": bounded_playback_text(client_version),
+    });
+    if let Err(error) = webhooks
+        .publish(event_type, &dedupe_key, occurred_at, data)
+        .await
+    {
+        tracing::warn!(
+            event = "playback_webhook_enqueue_failed",
+            webhook_event_type = event_type.as_str(),
+            error = %error,
+            "failed to enqueue playback webhook"
+        );
+    }
+}
+
+fn bounded_playback_text(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (value.chars().count() <= 128).then(|| value.to_owned())
 }
 
 async fn emby_sessions(
@@ -4054,6 +4455,17 @@ async fn lux_post_progress(
     };
     let activity_event =
         playback_activity_event_type(previous_session.as_ref(), playback_state.as_str());
+    let occurred_at = current_unix_timestamp();
+    let webhook_event = webhook_event_type_for_playback(
+        activity_event,
+        should_publish_playback_progress(
+            previous_session.as_ref(),
+            playback_state.as_str(),
+            request.position_ticks,
+            occurred_at,
+        ),
+    );
+    let remote_ip = request_client_ip(&headers, &state.remote_access);
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -4065,7 +4477,7 @@ async fn lux_post_progress(
             device_name: Some("Web"),
             client_version: None,
             device_type: Some("Web"),
-            remote_ip: header_str(&headers, "x-lux-peer-ip"),
+            remote_ip: remote_ip.as_deref(),
             state: playback_state.as_str(),
             position_ticks: request.position_ticks,
             duration_ticks: request.duration_ticks,
@@ -4098,6 +4510,25 @@ async fn lux_post_progress(
                         "deviceName": "Web",
                         "state": playback_state.as_str(),
                     }),
+                )
+                .await;
+            }
+            if let Some(event_type) = webhook_event {
+                publish_playback_webhook(
+                    &state,
+                    event_type,
+                    occurred_at,
+                    &item_id,
+                    None,
+                    &play_session_id,
+                    playback_state.as_str(),
+                    request.position_ticks,
+                    request.duration_ticks,
+                    matches!(playback_state, LuxPlaybackState::Paused),
+                    Some("Lux"),
+                    Some("Web"),
+                    Some("Web"),
+                    None,
                 )
                 .await;
             }
@@ -4298,6 +4729,26 @@ fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
+}
+
+fn emby_person_page_params(query: &EmbyPersonsQuery) -> Result<(i64, i64), StatusCode> {
+    let offset = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50);
+    if offset < 0 || !(1..=100).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((offset, limit))
+}
+
+fn emby_person_type_filter(person_types: Option<&str>) -> Option<&'static str> {
+    let mut requested = person_types
+        .unwrap_or("Actor")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    requested
+        .find(|value| value.eq_ignore_ascii_case("Actor"))
+        .map(|_| "Actor")
 }
 
 fn ensure_emby_user_scope(user: &UserRecord, requested_id: &str) -> Result<(), StatusCode> {
@@ -5343,6 +5794,18 @@ fn emby_media_source_json_with_resolver_and_chapters(
     };
     let is_remote_playback = is_remote || is_resolver_target;
     let is_playable = source.source_kind == "LOCAL_FILE" || is_remote_playback;
+    let default_audio_stream_index = source
+        .streams
+        .iter()
+        .find(|stream| stream.stream_type == "AUDIO" && stream.is_default)
+        .or_else(|| {
+            source
+                .streams
+                .iter()
+                .find(|stream| stream.stream_type == "AUDIO")
+        })
+        .map(|stream| stream.index)
+        .unwrap_or(-1);
     let mut value = json!({
         "Id": source.id,
         "ItemId": item_id,
@@ -5364,17 +5827,11 @@ fn emby_media_source_json_with_resolver_and_chapters(
         "SupportsProbing": !source.probe_status.eq_ignore_ascii_case("FAILED"),
         "SupportsTranscoding": false,
         "DirectStreamUrl": direct_stream_url,
-        "DefaultAudioStreamIndex": source
-            .streams
-            .iter()
-            .find(|stream| stream.stream_type == "AUDIO" && stream.is_default)
-            .or_else(|| {
-                source
-                    .streams
-                    .iter()
-                    .find(|stream| stream.stream_type == "AUDIO")
-            })
-            .map(|stream| stream.index),
+        // Android clients deserialize this compatibility field as a number,
+        // even while a source is waiting for media probing and has no audio
+        // stream yet. Keep the wire type numeric without selecting a video
+        // stream as audio.
+        "DefaultAudioStreamIndex": default_audio_stream_index,
         "Formats": [],
         "HasMixedProtocols": false,
         "IsInfiniteStream": false,
@@ -5421,6 +5878,17 @@ fn emby_chapter_json(chapter: &crate::application::catalog::CatalogChapter) -> V
 
 fn is_http_strm_target(value: &str) -> bool {
     matches!(classify_strm_target(value).kind, StrmTargetKind::Url)
+}
+
+fn normalize_strm_http_location(value: &str) -> Option<HeaderValue> {
+    if value.is_ascii() {
+        return HeaderValue::from_str(value).ok();
+    }
+    if !is_http_strm_target(value) {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    HeaderValue::from_str(url.as_str()).ok()
 }
 
 fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
@@ -5533,7 +6001,12 @@ fn emby_boolean_value(value: &Value) -> Option<Value> {
     }
 }
 
-fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count: i64) -> Value {
+fn emby_library_view_json(
+    library: &LibraryRecord,
+    server_id: &str,
+    child_count: i64,
+    compatibility: EmbyClientCompatibility,
+) -> Value {
     json!({
         "Name": library.name,
         "SortName": library.name,
@@ -5542,7 +6015,7 @@ fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count:
         "Type": "CollectionFolder",
         "IsFolder": true,
         "MediaType": "Video",
-        "CollectionType": emby_collection_type(library.kind),
+        "CollectionType": emby_collection_type(library.kind, compatibility),
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
         "PrimaryImageItemId": library.cover_image_tag.as_ref().map(|_| library.id.to_string()),
@@ -5562,11 +6035,205 @@ fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count:
     })
 }
 
-fn emby_collection_type(kind: LibraryKind) -> Option<&'static str> {
+fn emby_virtual_folder_json(
+    view: &LibraryView,
+    global_media_strategy: &MediaStrategySettings,
+    resume_played_percent: i64,
+    resume_min_ticks: i64,
+    compatibility: EmbyClientCompatibility,
+) -> Value {
+    let media_strategy = view
+        .library
+        .media_strategy_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<MediaStrategySettings>(value).ok())
+        .unwrap_or_else(|| global_media_strategy.clone());
+    let collection_type = emby_collection_type(view.library.kind, compatibility);
+    json!({
+        "Name": view.library.name,
+        "Locations": view
+            .roots
+            .iter()
+            .map(|root| root.display_path.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+        "CollectionType": collection_type,
+        "LibraryOptions": emby_virtual_folder_options_json(
+            view,
+            &media_strategy,
+            resume_played_percent,
+            resume_min_ticks,
+            compatibility,
+        ),
+        "Id": view.library.id,
+        "Guid": view.library.id,
+        "ItemId": view.library.id,
+        "PrimaryImageItemId": view
+            .library
+            .cover_image_tag
+            .as_ref()
+            .map(|_| view.library.id),
+        "RefreshProgress": null,
+        "RefreshStatus": "Idle",
+    })
+}
+
+fn emby_virtual_folder_options_json(
+    view: &LibraryView,
+    media_strategy: &MediaStrategySettings,
+    resume_played_percent: i64,
+    resume_min_ticks: i64,
+    compatibility: EmbyClientCompatibility,
+) -> Value {
+    let collection_type = emby_collection_type(view.library.kind, compatibility);
+    let type_options = match view.library.kind {
+        LibraryKind::Movie => vec![emby_library_type_options_json("Movie", media_strategy)],
+        LibraryKind::Series => vec![emby_library_type_options_json("Series", media_strategy)],
+        LibraryKind::Mixed => vec![
+            emby_library_type_options_json("Movie", media_strategy),
+            emby_library_type_options_json("Series", media_strategy),
+        ],
+    };
+    json!({
+        "EnableArchiveMediaFiles": false,
+        "EnablePhotos": false,
+        "EnableRealtimeMonitor": true,
+        "EnableChapterImageExtraction": false,
+        "ExtractChapterImagesDuringLibraryScan": false,
+        "DownloadImagesInAdvance": false,
+        "PathInfos": view.roots.iter().map(|root| json!({
+            "Path": root.display_path.to_string_lossy().to_string(),
+            "NetworkPath": "",
+        })).collect::<Vec<_>>(),
+        "SaveLocalMetadata": true,
+        "SaveLocalThumbnailSets": false,
+        "ImportMissingEpisodes": false,
+        "EnableAutomaticSeriesGrouping": false,
+        "EnableEmbeddedTitles": false,
+        "EnableAudioResume": false,
+        "AutomaticRefreshIntervalDays": 0,
+        "PreferredMetadataLanguage": media_strategy.metadata_language,
+        "ContentType": collection_type,
+        "MetadataCountryCode": media_strategy.region,
+        "SeasonZeroDisplayName": "Specials",
+        "MetadataSavers": ["Nfo"],
+        "DisabledLocalMetadataReaders": [],
+        "LocalMetadataReaderOrder": ["Nfo"],
+        "DisabledSubtitleFetchers": [],
+        "SubtitleFetcherOrder": [],
+        "SkipSubtitlesIfEmbeddedSubtitlesPresent": true,
+        "SkipSubtitlesIfAudioTrackMatches": false,
+        "SubtitleDownloadLanguages": media_strategy
+            .subtitles
+            .languages
+            .iter()
+            .map(|language| emby_subtitle_language_code(language))
+            .collect::<Vec<_>>(),
+        "RequirePerfectSubtitleMatch": false,
+        "SaveSubtitlesWithMedia": false,
+        "ForcedSubtitlesOnly": media_strategy.subtitles.forced_only,
+        "TypeOptions": type_options,
+        "CollapseSingleItemFolders": false,
+        "MinResumePct": 0,
+        "MaxResumePct": resume_played_percent,
+        "MinResumeDurationSeconds": resume_min_ticks
+            .max(0)
+            .saturating_add(9_999_999)
+            / 10_000_000,
+        "ThumbnailImagesIntervalSeconds": 0,
+    })
+}
+
+fn emby_library_type_options_json(
+    item_type: &str,
+    media_strategy: &MediaStrategySettings,
+) -> Value {
+    let mut image_options = Vec::new();
+    if media_strategy.images.poster {
+        image_options.push(json!({
+            "Type": "Primary",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.artwork {
+        image_options.push(json!({
+            "Type": "Art",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.banner {
+        image_options.push(json!({
+            "Type": "Banner",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.logo {
+        image_options.push(json!({
+            "Type": "Logo",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.thumbnail {
+        image_options.push(json!({
+            "Type": "Thumb",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.disc {
+        image_options.push(json!({
+            "Type": "Disc",
+            "Limit": 1,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+    if media_strategy.images.max_backdrop_count > 0 {
+        image_options.push(json!({
+            "Type": "Backdrop",
+            "Limit": media_strategy.images.max_backdrop_count,
+            "MinWidth": media_strategy.images.min_download_width,
+        }));
+    }
+
+    json!({
+        "Type": item_type,
+        "MetadataFetchers": [],
+        "MetadataFetcherOrder": [],
+        "ImageFetchers": [],
+        "ImageFetcherOrder": [],
+        "ImageOptions": image_options,
+    })
+}
+
+fn emby_subtitle_language_code(language: &str) -> String {
+    match language.split('-').next().unwrap_or(language) {
+        "zh" => "chi".to_owned(),
+        "en" => "eng".to_owned(),
+        "ja" => "jpn".to_owned(),
+        "ko" => "kor".to_owned(),
+        "fr" => "fra".to_owned(),
+        "de" => "deu".to_owned(),
+        "es" => "spa".to_owned(),
+        "it" => "ita".to_owned(),
+        "ru" => "rus".to_owned(),
+        _ => language.to_owned(),
+    }
+}
+
+fn emby_collection_type(
+    kind: LibraryKind,
+    compatibility: EmbyClientCompatibility,
+) -> Option<&'static str> {
     match kind {
         LibraryKind::Movie => Some("movies"),
         LibraryKind::Series => Some("tvshows"),
-        LibraryKind::Mixed => Some("mixed"),
+        LibraryKind::Mixed => match compatibility {
+            EmbyClientCompatibility::Generic => Some("mixed"),
+            EmbyClientCompatibility::VidHub => None,
+        },
     }
 }
 
@@ -8558,7 +9225,7 @@ async fn serve_media_file(
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
         };
-        let Ok(location) = HeaderValue::from_str(&location) else {
+        let Some(location) = normalize_strm_http_location(&location) else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
         return match Response::builder()
@@ -12715,6 +13382,345 @@ async fn probe_directory_writable(path: &FsPath) -> bool {
     result.is_ok()
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WebhookDestinationCreateRequest {
+    name: String,
+    url: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    allow_private_network: bool,
+    #[serde(default)]
+    event_types: Vec<String>,
+    payload_format: Option<String>,
+    secret: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WebhookDestinationUpdateRequest {
+    name: Option<String>,
+    url: Option<String>,
+    enabled: Option<bool>,
+    allow_private_network: Option<bool>,
+    event_types: Option<Vec<String>>,
+    payload_format: Option<String>,
+}
+
+const fn default_enabled() -> bool {
+    true
+}
+
+async fn admin_list_webhook_destinations(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.list_destinations(offset, limit).await {
+        Ok(destinations) => Json(json!({
+            "destinations": destinations,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_get_webhook_destination(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.get_destination(&destination_id).await {
+        Ok(Some(destination)) => Json(json!({ "destination": destination })).into_response(),
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "Webhook 目标不存在",
+        )
+        .into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_create_webhook_destination(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<WebhookDestinationCreateRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service
+        .create_destination_with_format(
+            &request.name,
+            &request.url,
+            request.enabled,
+            request.allow_private_network,
+            &request.event_types,
+            request.secret.as_deref(),
+            request.payload_format.as_deref().unwrap_or("LUX"),
+        )
+        .await
+    {
+        Ok((destination, secret)) => (
+            StatusCode::CREATED,
+            Json(json!({ "destination": destination, "secret": secret })),
+        )
+            .into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_update_webhook_destination(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<WebhookDestinationUpdateRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service
+        .update_destination_with_format(
+            &destination_id,
+            request.name.as_deref(),
+            request.url.as_deref(),
+            request.enabled,
+            request.allow_private_network,
+            request.event_types.as_deref(),
+            request.payload_format.as_deref(),
+        )
+        .await
+    {
+        Ok(destination) => Json(json!({ "destination": destination })).into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_delete_webhook_destination(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.delete_destination(&destination_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_test_webhook_destination(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.test_destination(&destination_id).await {
+        Ok(status) => Json(json!({ "status": status })).into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_rotate_webhook_secret(
+    headers: HeaderMap,
+    Path(destination_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.rotate_secret(&destination_id).await {
+        Ok(secret) => Json(json!({ "secret": secret })).into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_list_webhook_deliveries(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.list_deliveries(offset, limit).await {
+        Ok(deliveries) => Json(json!({
+            "deliveries": deliveries,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+async fn admin_retry_webhook_delivery(
+    headers: HeaderMap,
+    Path(delivery_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.webhooks.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "Webhook 通知服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.retry_delivery(&delivery_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => webhook_error_response(&headers, error),
+    }
+}
+
+fn webhook_error_response(headers: &HeaderMap, error: WebhookError) -> Response {
+    match error {
+        WebhookError::Invalid(message) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response(),
+        WebhookError::NotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "Webhook 目标或投递记录不存在",
+        )
+        .into_response(),
+        WebhookError::Storage(_)
+        | WebhookError::Io(_)
+        | WebhookError::Serialization(_)
+        | WebhookError::HttpResponse { .. }
+        | WebhookError::SecretUnavailable
+        | WebhookError::RequestSetup(_) => {
+            tracing::warn!("webhook operation failed");
+            api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "Webhook 通知服务暂时不可用",
+            )
+            .into_response()
+        }
+    }
+}
+
 async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -15746,14 +16752,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CatalogSort, FilmlyImageCompatMode, MediaStrategySettings, MetadataCandidateFailureKind,
-        build_cookie, catalog_filter_from_emby, emby_collection_type, emby_media_source_json,
-        emby_media_source_json_with_resolver, emby_media_stream_item_id, emby_media_stream_json,
-        emby_playback_info_item_id, filmly_image_compat_mode_from_env_value,
-        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
-        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
-        is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
-        metadata_candidate_failure_kind, normalize_filmly_null_languages, playback_client_label,
+        CatalogSort, EmbyClientCompatibility, FilmlyImageCompatMode, MediaStrategySettings,
+        MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby, emby_collection_type,
+        emby_media_source_json, emby_media_source_json_with_resolver, emby_media_stream_item_id,
+        emby_media_stream_json, emby_playback_info_item_id,
+        filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
+        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
+        is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
+        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
+        normalize_filmly_null_languages, normalize_strm_http_location, playback_client_label,
         playback_identifier_prefix, record_activity_event, safe_trace_path,
         secure_cookie_for_request, validate_media_strategy,
     };
@@ -15772,8 +16779,34 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn strm_http_location_percent_encodes_non_ascii_url_components() {
+        let raw = "https://media.example.test/path/剧集?title=第1集&token=secret";
+        assert!(super::is_http_strm_target(raw));
+        let location = normalize_strm_http_location(raw)
+            .and_then(|value| value.to_str().ok().map(str::to_owned));
+
+        assert_eq!(
+            location.as_deref(),
+            Some(
+                "https://media.example.test/path/%E5%89%A7%E9%9B%86?title=%E7%AC%AC1%E9%9B%86&token=secret"
+            )
+        );
+    }
+
+    #[test]
     fn emby_collection_type_uses_mixed_for_mixed_libraries() {
-        assert_eq!(emby_collection_type(LibraryKind::Mixed), Some("mixed"));
+        assert_eq!(
+            emby_collection_type(LibraryKind::Mixed, EmbyClientCompatibility::Generic),
+            Some("mixed")
+        );
+    }
+
+    #[test]
+    fn emby_collection_type_uses_legacy_null_for_vidhub_mixed_libraries() {
+        assert_eq!(
+            emby_collection_type(LibraryKind::Mixed, EmbyClientCompatibility::VidHub),
+            None
+        );
     }
 
     #[test]
@@ -15907,10 +16940,7 @@ mod tests {
     fn direct_http_cookie_is_not_marked_secure() {
         let headers = HeaderMap::new();
 
-        assert!(!secure_cookie_for_request(
-            &headers,
-            &RemoteAccessPolicy::default()
-        ));
+        assert!(!secure_cookie_for_request(&headers, &RemoteAccessPolicy));
         let cookie = build_cookie("lux_session", "token", true, None, false)
             .expect("cookie value should be valid");
         assert!(
@@ -15924,10 +16954,8 @@ mod tests {
     #[test]
     fn trusted_https_forwarding_marks_cookie_secure() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.2"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        let policy = RemoteAccessPolicy::from_cidrs(["10.0.0.0/8"])
-            .expect("trusted proxy CIDR should be valid");
+        let policy = RemoteAccessPolicy;
 
         assert!(secure_cookie_for_request(&headers, &policy));
         let cookie = build_cookie("lux_session", "token", true, None, true)
@@ -15941,15 +16969,12 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_forwarded_https_does_not_mark_cookie_secure() {
+    fn forwarded_https_marks_cookie_secure_without_proxy_allowlist() {
         let mut headers = HeaderMap::new();
         headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.2"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
 
-        assert!(!secure_cookie_for_request(
-            &headers,
-            &RemoteAccessPolicy::default()
-        ));
+        assert!(secure_cookie_for_request(&headers, &RemoteAccessPolicy));
     }
 
     #[test]
@@ -16123,6 +17148,7 @@ mod tests {
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(body["SupportsDirectStream"], true);
         assert!(body["DirectStreamUrl"].is_null());
+        assert_eq!(body["DefaultAudioStreamIndex"], -1);
         assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);
         assert_eq!(body["MediaStreams"][0]["Height"], 1080);

@@ -78,7 +78,6 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 
 ```dotenv
 LUX_PROXY_URL=http://192.168.1.2:7890
-LUX_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 LUX_TMDB_READ_ACCESS_TOKEN=***
 ```
 
@@ -86,7 +85,7 @@ LUX_TMDB_READ_ACCESS_TOKEN=***
 
 IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
 
-`LUX_TRUSTED_PROXY_CIDRS` 只能填写实际代理节点或网关的地址范围，不能使用 `0.0.0.0/0`。Lux 只信任来自这些地址的 `X-Forwarded-For`。
+反向代理应向 Lux 传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`；Lux 会优先使用这些头部中的客户端 IP 和协议。
 
 ## Nginx 反向代理
 
@@ -118,7 +117,7 @@ server {
 }
 ```
 
-代理应保留 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges` 和 `ETag`。不能把媒体流改成缓存整文件的代理模式。`LUX_TRUSTED_PROXY_CIDRS` 应设置为 Nginx 到 Lux 之间实际可见的 peer 地址。
+代理应保留 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges` 和 `ETag`。不能把媒体流改成缓存整文件的代理模式。
 
 ## Tailscale
 
@@ -134,14 +133,14 @@ http://127.0.0.1:8097
 2. 初始化完成后登录、退出和 CSRF 请求正常。
 3. MP4 `GET` 返回 `206`，Range、`Content-Range` 和 `Content-Length` 保留。
 4. WebSocket/长播放请求不被短超时切断（当前 Lux 首版播放为 HTTP 流，不提供转码）。
-5. 代理 peer 地址与 `LUX_TRUSTED_PROXY_CIDRS` 一致，伪造的 forwarded header 不被非可信来源接受。
+5. 反代转发的客户端 IP 和 HTTPS 协议头被 Lux 正确识别。
 
 ## 升级与回滚边界
 
 发布镜像使用不可变版本标签和 digest，不使用 `latest` 作为唯一发布标识：
 
 ```bash
-docker build --build-arg LUX_VERSION=0.2.5 -t lux:0.2.5 .
+docker build --build-arg LUX_VERSION=0.2.6 -t lux:0.2.6 .
 docker compose up -d
 ```
 
@@ -175,13 +174,13 @@ LUX_IMAGE=lux:arm64-local ./scripts/mount-loss-smoke.sh
 
 该脚本通过临时目录权限撤销模拟不可访问状态，证明扫描会隔离不可用 root、保留已有条目并在恢复后重新发现 root；它不替代真实 NAS 卸载、网络中断或持久卷恢复演练。
 
-本机还可以用临时自签名证书和 Nginx 反代演练 HTTPS、trusted proxy 和 Range 响应头：
+本机还可以用临时自签名证书和 Nginx 反代演练 HTTPS 和 Range 响应头：
 
 ```bash
 LUX_IMAGE=lux:arm64-local ./scripts/proxy-smoke.sh
 ```
 
-该脚本验证可信代理转发公网地址时的远程访问控制，以及 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges` 和 `ETag` 的保留；自签名证书和本机 Docker 网络不替代真实 Tailscale/HTTPS 实机验证。
+该脚本验证转发公网地址和 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges`、`ETag` 的保留；自签名证书和本机 Docker 网络不替代真实 Tailscale/HTTPS 实机验证。
 
 扫描完成后可以用 ARM64 容器端到端验证媒体探测和 Emby 播放信息：
 

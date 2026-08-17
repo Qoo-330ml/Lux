@@ -211,6 +211,84 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     assert_eq!(views_body["TotalRecordCount"], 1);
     assert_eq!(views_body["Items"][0]["Id"], library.id.to_string());
 
+    for path in ["/Library/VirtualFolders", "/emby/Library/VirtualFolders"] {
+        let virtual_folders = client
+            .get(format!("http://{address}{path}?api_key={key}"))
+            .send()
+            .await?;
+        assert_eq!(virtual_folders.status(), reqwest::StatusCode::OK);
+        let virtual_folders_body = virtual_folders.json::<serde_json::Value>().await?;
+        assert_eq!(virtual_folders_body[0]["Name"], "Movies");
+        assert_eq!(virtual_folders_body[0]["Id"], library.id.to_string());
+        assert_eq!(virtual_folders_body[0]["Guid"], library.id.to_string());
+        assert_eq!(virtual_folders_body[0]["ItemId"], library.id.to_string());
+        assert_eq!(virtual_folders_body[0]["CollectionType"], "movies");
+        assert_eq!(
+            virtual_folders_body[0]["Locations"][0],
+            media_root.to_string_lossy().to_string()
+        );
+        let options = &virtual_folders_body[0]["LibraryOptions"];
+        for field in [
+            "EnableArchiveMediaFiles",
+            "EnablePhotos",
+            "EnableRealtimeMonitor",
+            "EnableChapterImageExtraction",
+            "ExtractChapterImagesDuringLibraryScan",
+            "DownloadImagesInAdvance",
+            "PathInfos",
+            "SaveLocalMetadata",
+            "SaveLocalThumbnailSets",
+            "ImportMissingEpisodes",
+            "EnableAutomaticSeriesGrouping",
+            "EnableEmbeddedTitles",
+            "EnableAudioResume",
+            "AutomaticRefreshIntervalDays",
+            "PreferredMetadataLanguage",
+            "ContentType",
+            "MetadataCountryCode",
+            "SeasonZeroDisplayName",
+            "MetadataSavers",
+            "DisabledLocalMetadataReaders",
+            "LocalMetadataReaderOrder",
+            "DisabledSubtitleFetchers",
+            "SubtitleFetcherOrder",
+            "SkipSubtitlesIfEmbeddedSubtitlesPresent",
+            "SkipSubtitlesIfAudioTrackMatches",
+            "SubtitleDownloadLanguages",
+            "RequirePerfectSubtitleMatch",
+            "SaveSubtitlesWithMedia",
+            "ForcedSubtitlesOnly",
+            "TypeOptions",
+            "CollapseSingleItemFolders",
+            "MinResumePct",
+            "MaxResumePct",
+            "MinResumeDurationSeconds",
+            "ThumbnailImagesIntervalSeconds",
+        ] {
+            assert!(!options[field].is_null(), "missing LibraryOptions.{field}");
+        }
+        assert_eq!(options["PreferredMetadataLanguage"], "zh-CN");
+        assert_eq!(options["MetadataCountryCode"], "CN");
+        assert_eq!(options["ContentType"], "movies");
+        assert_eq!(options["EnableRealtimeMonitor"], true);
+        assert_eq!(options["MaxResumePct"], 90);
+        assert_eq!(options["MinResumeDurationSeconds"], 120);
+        assert_eq!(options["SubtitleDownloadLanguages"][0], "chi");
+        assert_eq!(
+            options["PathInfos"][0]["Path"],
+            media_root.to_string_lossy().to_string()
+        );
+        assert_eq!(options["PathInfos"][0]["NetworkPath"], "");
+        assert_eq!(options["TypeOptions"][0]["Type"], "Movie");
+        assert!(options["TypeOptions"][0]["MetadataFetchers"].is_array());
+        assert!(options["TypeOptions"][0]["ImageFetchers"].is_array());
+        assert!(options["TypeOptions"][0]["ImageOptions"].is_array());
+        assert_eq!(
+            options["TypeOptions"][0]["ImageOptions"][0]["Type"],
+            "Primary"
+        );
+    }
+
     let root = client
         .get(format!(
             "http://{address}/Users/{}/Items/Root?api_key={key}",
@@ -340,6 +418,30 @@ async fn only_web_admins_can_manage_the_shared_key() -> Result<(), Box<dyn std::
         .send()
         .await?;
     assert_eq!(viewer_read.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let viewer_emby_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .header(
+            "Authorization",
+            r#"Emby Client="LuxTest", Device="Mac", DeviceId="viewer-device", Version="1""#,
+        )
+        .json(&json!({ "Username": "viewer", "Pw": "viewer password" }))
+        .send()
+        .await?;
+    assert_eq!(viewer_emby_login.status(), reqwest::StatusCode::OK);
+    let viewer_emby_token = viewer_emby_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer Emby access token")?
+        .to_owned();
+    let viewer_virtual_folders = client
+        .get(format!("http://{address}/Library/VirtualFolders"))
+        .header("X-Emby-Token", viewer_emby_token)
+        .send()
+        .await?;
+    assert_eq!(
+        viewer_virtual_folders.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
 
     let revoked = client
         .delete(format!("http://{address}/api/v1/admin/api-key"))

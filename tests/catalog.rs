@@ -154,6 +154,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
                 character: Some("角色甲".to_owned()),
                 order: Some(0),
                 profile_url: None,
+                person: None,
             }],
         )
         .await?;

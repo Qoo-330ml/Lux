@@ -22,7 +22,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 ## Web 会话
 
 - `POST /api/v1/auth/login`：校验用户名和密码，成功后设置 `lux_session` 与 `lux_csrf` cookie。
-- 远程请求还需命中 `LUX_TRUSTED_PROXY_CIDRS` 规则（若经反代）并满足用户 `can_remote_access`。
+- 远程请求只需通过用户认证和媒体库 ACL；Lux 不再依据来源 IP 或 `can_remote_access` 阻止反代后的请求。
 - 登录失败按来源和用户名限流；失败响应不区分用户不存在、密码错误或暂时封锁。
 - `GET /api/v1/auth/me`：读取当前 Web session，返回用户和权限。
 - `POST /api/v1/auth/logout`：需要有效 `lux_session` 和 `X-CSRF-Token`，成功返回 204 并撤销 session。
@@ -163,6 +163,8 @@ Lux 电影查询要求有效 Web session：
 Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 - `GET /Items/Counts`：返回当前用户可见媒体条目的 Emby 统计字段；支持 `UserId` 指定目标用户和 `IsFavorite=true|false` 按目标用户收藏状态过滤。Lux 当前支持电影、剧集、单集和合集计数，其余 Emby 类型返回 0；`ItemCount` 为过滤后所有可见目录条目（包含季度等层级条目）的总数。
+- `GET /Library/VirtualFolders`：管理员获取 Emby 兼容的媒体库列表；返回完整的 `VirtualFolderInfo` 主要字段，包括 `Name`、`Locations`、`CollectionType`、`LibraryOptions`、`Id`、`Guid`、`ItemId`、`PrimaryImageItemId` 和刷新状态。`Id`、`Guid`、`ItemId` 使用同一个稳定的媒体库 ID，`LibraryOptions` 包含 `PathInfos`、`TypeOptions`、NFO/字幕/图片策略以及播放恢复阈值，并从 Lux 的全局或媒体库策略映射。支持根路径及 `/emby` 前缀，并接受共享 API Key。
+- `GET /Persons?ParentId={libraryId}&Recursive=true&PersonTypes=Actor&StartIndex=0&Limit=50`：返回指定媒体库中去重后的演员列表，使用 Emby 风格的 `Items`、`TotalRecordCount` 和 `StartIndex`，演员项包含 `Name`、稳定 `Id`、`Role`、`Type=Actor`、人物简介/生日等字段和可用的 `PrimaryImageTag`。支持根路径及 `/emby` 前缀，接受 Emby token 或共享 API Key；`ParentId` 必须是当前用户可访问的媒体库 ID，列表查询使用持久化人物关系索引，不在请求中扫描媒体目录。
 - `GET /Users/{userId}/Views`：返回电影媒体库视图。
 - `GET /Users/{userId}/Items/Root`、`GET /Items/Root?userId={userId}`：返回用户虚拟根目录；将该根 ID 作为 `ParentId` 并请求 `IncludeItemTypes=CollectionFolder` 时返回当前用户可见的媒体库文件夹。
 - `GET /Users/{userId}/Items`、`GET /Items`：支持 `ParentId`、`Recursive`、`StartIndex`、`Limit`、`IncludeItemTypes` 和 `ExcludeItemTypes`，`ParentId` 可指向虚拟根、媒体库、物理媒体目录、剧集或季度；电影扫描会为物理媒体目录建立稳定的 `FOLDER` 条目，普通电影列表和统计不会把这些内部目录项当成电影。网易爆米花首页使用的无 `ParentId`、无 `Recursive=true`、无 `IncludeItemTypes` 但带 `ExcludeItemTypes` 请求返回当前用户可见的媒体库 `CollectionFolder`，再按媒体库 ID 请求 `Items/Latest`；递归查询按排除类型过滤；默认从 0 开始、每页 50 条，单页上限 100。

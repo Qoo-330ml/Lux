@@ -20,6 +20,7 @@ const AdminLayout = lazy(() => import("../features/admin/AdminLayout").then(({ A
 const AdminDashboardPage = lazy(() => import("../features/admin/AdminDashboardPage").then(({ AdminDashboardPage }) => ({ default: AdminDashboardPage })));
 const AdminLibrariesPage = lazy(() => import("../features/admin/AdminLibrariesPage").then(({ AdminLibrariesPage }) => ({ default: AdminLibrariesPage })));
 const AdminPluginsPage = lazy(() => import("../features/admin/AdminPluginsPage").then(({ AdminPluginsPage }) => ({ default: AdminPluginsPage })));
+const AdminNotificationsPage = lazy(() => import("../features/admin/AdminNotificationsPage").then(({ AdminNotificationsPage }) => ({ default: AdminNotificationsPage })));
 const AdminUsersPage = lazy(() => import("../features/admin/AdminUsersPage").then(({ AdminUsersPage }) => ({ default: AdminUsersPage })));
 const AdminOperationsPage = lazy(() => import("../features/admin/AdminOperationsPage").then(({ AdminOperationsPage }) => ({ default: AdminOperationsPage })));
 const AdminSettingsPage = lazy(() => import("../features/admin/AdminSettingsPage").then(({ AdminSettingsPage }) => ({ default: AdminSettingsPage })));
@@ -80,6 +81,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
             <Route index element={<AdminDashboardPage />} />
             <Route path="libraries" element={<AdminLibrariesPage />} />
             <Route path="plugins" element={<AdminPluginsPage />} />
+            <Route path="notifications" element={<AdminNotificationsPage />} />
             <Route path="users" element={<AdminUsersPage />} />
             <Route path="jobs" element={<AdminOperationsPage />} />
             <Route path="settings" element={<AdminSettingsPage />} />

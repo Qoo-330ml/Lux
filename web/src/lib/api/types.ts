@@ -97,6 +97,11 @@ export type MediaActor = {
   name: string;
   character?: string | null;
   imageUrl?: string | null;
+  biography?: string | null;
+  birthday?: string | null;
+  deathday?: string | null;
+  knownForDepartment?: string | null;
+  placeOfBirth?: string | null;
 };
 
 export type MediaNfoCredit = {
@@ -283,6 +288,35 @@ export type ChapterSource = {
 export type AdminPluginStore = {
   url: string;
   defaultUrl: string;
+};
+
+export type AdminWebhookDestination = {
+  id: string;
+  name: string;
+  url: string;
+  payloadFormat: "LUX" | "EMBY";
+  enabled: boolean;
+  allowPrivateNetwork: boolean;
+  eventTypes: string[];
+  secretConfigured: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type AdminWebhookDelivery = {
+  id: string;
+  eventId: string;
+  destinationId: string;
+  destinationName: string;
+  eventType: string;
+  status: string;
+  attemptCount: number;
+  nextAttemptAt: number;
+  lastHttpStatus?: number | null;
+  lastError?: string | null;
+  deliveredAt?: number | null;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type AdminPluginConfigField = {

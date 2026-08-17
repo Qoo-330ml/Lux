@@ -21,7 +21,11 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup.complete("Admin", "Admin", "correct password").await?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -89,6 +93,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .post(&event_url)
         .header("X-Emby-Token", &token)
         .header("x-lux-peer-ip", "203.0.113.9")
+        .header("x-forwarded-for", "203.0.113.9")
         .json(&event)
         .send()
         .await?;
@@ -148,7 +153,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(sessions_body[0]["DeviceName"], "Mac");
     assert_eq!(sessions_body[0]["DeviceType"], "Mac");
     assert_eq!(sessions_body[0]["ApplicationVersion"], "1");
-    assert_eq!(sessions_body[0]["RemoteEndPoint"], "127.0.0.1");
+    assert_eq!(sessions_body[0]["RemoteEndPoint"], "203.0.113.9");
 
     sqlx::query(
         "UPDATE playback_sessions

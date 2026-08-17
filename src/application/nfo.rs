@@ -433,6 +433,7 @@ fn push_parsed_actor(actors: &mut Vec<ActorCredit>, actor: ParsedMovieActor) {
         character: actor.role,
         order: actor.order,
         profile_url: None,
+        person: None,
     });
 }
 

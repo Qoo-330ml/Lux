@@ -85,7 +85,18 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
             "providerIds": {"Tmdb": "7", "Imdb": "tt0000007"},
             "directors": [{"providerId": "11", "name": "导演甲"}],
             "writers": [{"providerId": "12", "name": "编剧甲"}],
-            "actors": [{"id": "9", "name": "演员甲", "character": "角色甲", "order": 0}],
+            "actors": [{
+                "id": "9",
+                "name": "演员甲",
+                "character": "角色甲",
+                "order": 0,
+                "person": {
+                    "biography": "演员甲的生平介绍",
+                    "birthday": "1970-01-01",
+                    "knownForDepartment": "Acting",
+                    "placeOfBirth": "测试城市"
+                }
+            }],
             "trailers": ["https://www.youtube.com/watch?v=abc123"],
             "images": {
                 "POSTER": [format!("{image_url}/poster")],
@@ -272,7 +283,13 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
                 "name": "演员甲",
                 "character": "角色甲",
                 "order": 0,
-                "profileUrl": "https://image.tmdb.org/t/p/w185/profile.jpg"
+                "profileUrl": "https://image.tmdb.org/t/p/w185/profile.jpg",
+                "person": {
+                    "biography": "演员甲的生平介绍",
+                    "birthday": "1970-01-01",
+                    "knownForDepartment": "Acting",
+                    "placeOfBirth": "测试城市"
+                }
             }]
         }),
     )
@@ -316,6 +333,10 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let detail_body: Value = detail.json().await?;
     assert_eq!(detail_body["actors"][0]["name"], "演员甲");
     assert_eq!(detail_body["actors"][0]["character"], "角色甲");
+    assert_eq!(detail_body["actors"][0]["biography"], "演员甲的生平介绍");
+    assert_eq!(detail_body["actors"][0]["birthday"], "1970-01-01");
+    assert_eq!(detail_body["actors"][0]["knownForDepartment"], "Acting");
+    assert_eq!(detail_body["actors"][0]["placeOfBirth"], "测试城市");
     assert_eq!(
         detail_body["actors"][0]["imageUrl"],
         "/api/v1/people/9/image"
