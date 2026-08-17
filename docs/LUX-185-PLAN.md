@@ -45,5 +45,7 @@ seek 和资源销毁通过客户端事件同步。
 MP4Box 生成的分段可能把负 composition offset 写成无符号 32 位值。客户端只在内存副本上把包含高位符号的
 `trun` 标记为 signed，避免 B 帧时间戳溢出污染 MSE duration。
 
-当前真实浏览器烟测使用 854×480、12 秒 HEVC Main + AAC 样本；已证明 Worker/WASM 解码、H.264 编码、视频和音频
-缓冲、播放、暂停、seek 和 destroy，但这不是 4K 性能验收。4K、Main10/HDR10 和更多浏览器矩阵仍需单独记录。
+已完成真实 4K 样本测试：Chrome 151/macOS arm64 对 3840×2160 HEVC Main + AAC 和 3840×2160 HEVC Main10
+样本均完成 Worker/WASM 解码、H.264 编码、播放、seek 和 destroy；两者均记录为低于实时，`PlayerPage` 会显示
+明确的降级提示，不虚报 4K 实时能力。具体样本校验值、帧数、丢帧、漂移和 speedX 见 `docs/COMPATIBILITY.md`。
+854×480 HEVC Main + AAC 烟测仍作为快速回归样本保留。

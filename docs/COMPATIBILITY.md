@@ -15,16 +15,30 @@
 ## Lux Web 4K 媒体能力探针
 
 LUX-184 已加入独立探针页面 `/media-capability-probe.html`，用于记录真实媒体样本在原生 `video`、
-MediaCapabilities 和 WebCodecs 下的能力。当前尚未运行带 4K HEVC Main、HEVC Main10/HDR10 和 MKV 样本的
-真实矩阵，因此 Lux Web 暂不宣称 4K HEVC 兼容。
+MediaCapabilities 和 WebCodecs 下的能力。探针能力声明和 LUX-185 客户端 fallback 性能记录分开维护；
+fallback 的 4K 实时能力不因探针返回 `supported` 而自动宣称。
 
 2026-08-17 的本机探针记录：Playwright HeadlessChrome 151、macOS `arm64` 对 4K HEVC Main、HEVC Main10/HDR10
 和 H.264 的 3840×2160 配置均报告原生 `probably`、MediaCapabilities `supported/smooth/powerEfficient` 和
 WebCodecs `supported`。这只是浏览器能力声明，不是实际 4K 文件播放证据。
 
 同次使用公开 Sintel 片段生成的临时 12 秒 HEVC MP4 做解码链路烟测，浏览器实际识别为 854×480，metadata、
-播放位置和 5 秒播放均正常；该文件不是 4K 样本，不能用于 4K 性能结论。真实 4K、高码率、HDR10 和 MKV
-样本仍待补充。
+播放位置和 5 秒播放均正常；该文件不是 4K 样本，不能用于 4K 性能结论。
+
+## Lux Web LUX-185 客户端 fallback 实测
+
+2026-08-17，提交 `1233ec95`（包含性能状态提交 `fa39190a`），Playwright HeadlessChrome 151.0.0.0，macOS
+`arm64`（`uname -m=arm64`）。
+样本均为临时、本地、无个人数据文件，完整 URL 不写入记录：
+
+| 样本 | SHA-256 | 结果 | 性能与质量 |
+|---|---|---|---|
+| 3840×2160 HEVC Main 8-bit + AAC、MP4、8 秒、9.4 MiB | `cbfad82624c6578ea9ce5f2a0f5e229d0230745d7cfa84eb9b5d457b57920ce1` | Worker/WASM 解码、H.264 编码、视频/音频缓冲、播放、暂停、seek、destroy 通过 | Worker 累计处理 21,558.7 ms，媒体时长 8,000 ms，`speedX=0.371`，低于实时；播放 2 秒窗口 50 帧/0 丢帧，漂移约 30 ms；seek 到 4 秒后漂移约 36 ms |
+| 3840×2160 HEVC Main10 10-bit HDR10、MP4、约 4.13 秒、21 MiB，无音频 | `88b238b05eca4de87548f5d2b022ddf1daa2e60d4f0218e65ae04db770d1d2da` | WASM 解码、H.264 编码、播放、seek、destroy 通过 | Worker 累计处理 18,929.3 ms，媒体时长 4,086 ms，`speedX=0.216`，低于实时；播放窗口 24 帧/0 丢帧；seek 通过。原始样本音轨为 DTS，测试文件主动去除音频，不代表 AAC 兼容 |
+
+因此当前这台 ARM64/HeadlessChrome 设备可以完成 4K HEVC 客户端 fallback，但 4K Main 和 Main10 均未通过实时
+转码性能门。播放器会显示“客户端解码速度低于实时”的降级提示，并建议使用原生客户端或降低清晰度；不能把
+本次结果外推到其他浏览器、硬件或目标 x86_64 NAS。
 
 记录探针结果时必须包含浏览器版本、平台/设备、Lux 提交、`uname -m`、样本校验值、metadata 结果、实际
 播放时长、VideoFrame 数量、丢帧和音画同步观察。不得写入完整媒体 URL、令牌、Cookie 或用户数据。
