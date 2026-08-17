@@ -155,6 +155,23 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("confirms selected pending metadata items in one admin request", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ confirmedCount: 2, failedCount: 0, failedItemIds: [] }), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().confirmAdminMetadata(["movie-1", "movie-2"])).resolves.toEqual({
+      confirmedCount: 2,
+      failedCount: 0,
+      failedItemIds: [],
+    });
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/admin/metadata/confirm");
+    expect(options?.method).toBe("POST");
+    expect(JSON.parse(String(options?.body))).toEqual({ itemIds: ["movie-1", "movie-2"] });
+  });
+
   it("requests the children for a series or a selected season", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),

@@ -220,6 +220,12 @@ export type PageResponse<T> = {
   total?: number;
 };
 
+export type AdminMetadataBatchConfirmation = {
+  confirmedCount: number;
+  failedCount: number;
+  failedItemIds: string[];
+};
+
 export type PlaybackState = {
   isFavorite?: boolean;
   isPlayed?: boolean;

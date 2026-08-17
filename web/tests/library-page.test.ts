@@ -402,4 +402,102 @@ describe("LibraryPage infinite scroll", () => {
     expect(container.textContent).toContain("待确认");
     expect(container.querySelector(".lux-metadata-attention-badge")?.textContent).toContain("待确认");
   });
+
+  it("shows batch confirmation only when every selected item is pending", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [
+        { id: "pending-1", title: "待确认电影", itemType: "MOVIE", metadataPending: true },
+        { id: "pending-2", title: "另一部待确认电影", itemType: "MOVIE", metadataPending: true },
+      ],
+      page: 1,
+      pageSize: 24,
+      total: 2,
+    });
+    const confirm = vi.spyOn(api, "confirmAdminMetadata").mockResolvedValue({ confirmedCount: 2, failedCount: 0, failedItemIds: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(2));
+    });
+
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("button[aria-label='开启媒体库多选']")?.click();
+    });
+    const checkboxes = container?.querySelectorAll<HTMLInputElement>(".lux-media-selection-checkbox");
+    await act(async () => checkboxes?.forEach((checkbox) => checkbox.click()));
+    expect(container?.textContent).toContain("批量确认");
+
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("button[data-action='batch-confirm-metadata']")?.click();
+    });
+    expect(confirm).toHaveBeenCalledWith(["pending-1", "pending-2"]);
+  });
+
+  it("keeps the regular media menu when selected items are mixed", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [
+        { id: "pending-1", title: "待确认电影", itemType: "MOVIE", metadataPending: true },
+        { id: "confirmed-1", title: "已确认电影", itemType: "MOVIE", metadataPending: false },
+      ],
+      page: 1,
+      pageSize: 24,
+      total: 2,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(2));
+    });
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("button[aria-label='开启媒体库多选']")?.click();
+      container?.querySelectorAll<HTMLInputElement>(".lux-media-selection-checkbox").forEach((checkbox) => checkbox.click());
+    });
+
+    expect(container?.querySelector("button[data-action='batch-confirm-metadata']")).toBeNull();
+    expect(container?.querySelector("button[aria-label='打开 待确认电影 操作菜单']")).toBeTruthy();
+    expect(container?.querySelector("button[aria-label='打开 已确认电影 操作菜单']")).toBeTruthy();
+  });
 });

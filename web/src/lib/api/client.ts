@@ -16,6 +16,7 @@ import type {
   NetworkProxyDiagnostics,
   AdminUser,
   AdminMetadataCandidate,
+  AdminMetadataBatchConfirmation,
   AdminMetadataReidentifyStart,
   AdminPlugin,
   AdminPluginStore,
@@ -782,6 +783,13 @@ export class LuxApiClient {
     return this.request<AdminSettings>("/api/v1/admin/settings", {
       method: "PATCH",
       body: JSON.stringify(input),
+    });
+  }
+
+  confirmAdminMetadata(itemIds: string[]) {
+    return this.request<AdminMetadataBatchConfirmation>("/api/v1/admin/metadata/confirm", {
+      method: "POST",
+      body: JSON.stringify({ itemIds }),
     });
   }
 
