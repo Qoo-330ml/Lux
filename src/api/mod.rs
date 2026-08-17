@@ -107,8 +107,8 @@ use crate::{
     },
     security::LoginRateLimiter,
     storage::{
-        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, StorageError,
-        StoredPlaybackSession,
+        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, PersonListOptions,
+        PersonSort, StorageError, StoredPlaybackSession,
     },
 };
 use tokio::{
@@ -1717,6 +1717,12 @@ struct EmbyPersonsQuery {
     start_index: Option<i64>,
     #[serde(rename = "Limit", alias = "limit", default)]
     limit: Option<i64>,
+    #[serde(rename = "Recursive", alias = "recursive", default)]
+    recursive: Option<bool>,
+    #[serde(rename = "SortBy", alias = "sortBy", default)]
+    sort_by: Option<String>,
+    #[serde(rename = "SortOrder", alias = "sortOrder", default)]
+    sort_order: Option<String>,
 }
 
 async fn require_emby_token(
@@ -2272,6 +2278,24 @@ async fn emby_persons(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
+    // Keep the historical Lux behavior for clients that omit Recursive. An
+    // explicit false still requests only direct children.
+    let recursive = query.recursive.unwrap_or(true);
+    let sort_by = match emby_person_sort(query.sort_by.as_deref()) {
+        Ok(sort_by) => sort_by,
+        Err(status) => return status.into_response(),
+    };
+    let descending = match emby_person_sort_order(query.sort_order.as_deref()) {
+        Ok(descending) => descending,
+        Err(status) => return status.into_response(),
+    };
+    let options = PersonListOptions {
+        recursive,
+        sort_by,
+        descending,
+        offset,
+        limit,
+    };
     let person_type = match emby_person_type_filter(query.person_types.as_deref()) {
         Some(person_type) => person_type,
         None => {
@@ -2289,12 +2313,12 @@ async fn emby_persons(
     let result = match query.parent_id.as_deref() {
         Some(parent_id) => {
             people
-                .list_library_actors(parent_id, person_type, offset, limit)
+                .list_library_actors(parent_id, person_type, options)
                 .await
         }
         None => {
             people
-                .list_libraries_actors(&library_ids, person_type, offset, limit)
+                .list_libraries_actors(&library_ids, person_type, options)
                 .await
         }
     };
@@ -2304,7 +2328,10 @@ async fn emby_persons(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(json!({
-        "Items": actors.into_iter().map(emby_person_json).collect::<Vec<_>>(),
+        "Items": actors
+            .into_iter()
+            .map(|actor| emby_person_json_with_fields(actor, query.auth.fields.as_deref()))
+            .collect::<Vec<_>>(),
         "TotalRecordCount": total,
         "StartIndex": offset,
     }))
@@ -3665,22 +3692,57 @@ async fn emby_person_image_response(
 }
 
 fn emby_person_json(actor: crate::application::people::ActorView) -> Value {
+    emby_person_json_with_fields(actor, None)
+}
+
+fn emby_person_json_with_fields(
+    actor: crate::application::people::ActorView,
+    fields: Option<&str>,
+) -> Value {
     let image_tag = actor
         .image_url
         .as_ref()
         .map(|_| emby_person_image_tag(&actor.id));
-    json!({
-        "Name": actor.name,
-        "Id": actor.id,
-        "Role": actor.character,
-        "Type": "Actor",
-        "PrimaryImageTag": image_tag,
-        "Overview": actor.biography,
-        "BirthDate": actor.birthday,
-        "DeathDate": actor.deathday,
-        "KnownForDepartment": actor.known_for_department,
-        "PlaceOfBirth": actor.place_of_birth,
-    })
+    let include = |field| fields.is_none_or(|fields| emby_fields_include(Some(fields), field));
+    let mut object = serde_json::Map::from_iter([
+        ("Name".to_owned(), json!(actor.name)),
+        ("Id".to_owned(), json!(actor.id)),
+        ("Type".to_owned(), json!("Actor")),
+    ]);
+    if include("Role") {
+        object.insert("Role".to_owned(), json!(actor.character));
+    }
+    if include("PrimaryImageTag") {
+        object.insert("PrimaryImageTag".to_owned(), json!(image_tag));
+    }
+    if include("Overview") {
+        object.insert("Overview".to_owned(), json!(actor.biography));
+    }
+    if include("BirthDate") {
+        object.insert("BirthDate".to_owned(), json!(actor.birthday));
+    }
+    if include("DeathDate") {
+        object.insert("DeathDate".to_owned(), json!(actor.deathday));
+    }
+    if include("KnownForDepartment") {
+        object.insert(
+            "KnownForDepartment".to_owned(),
+            json!(actor.known_for_department),
+        );
+    }
+    if include("PlaceOfBirth") {
+        object.insert("PlaceOfBirth".to_owned(), json!(actor.place_of_birth));
+    }
+    if include("DateCreated") {
+        object.insert(
+            "DateCreated".to_owned(),
+            actor
+                .date_created
+                .and_then(emby_timestamp)
+                .map_or(Value::Null, Value::String),
+        );
+    }
+    Value::Object(object)
 }
 
 fn emby_stable_named_id(kind: &str, name: &str) -> String {
@@ -4734,10 +4796,40 @@ fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
 fn emby_person_page_params(query: &EmbyPersonsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
-    if offset < 0 || !(1..=100).contains(&limit) {
+    if offset < 0 || limit < 1 {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
+}
+
+fn emby_person_sort(value: Option<&str>) -> Result<PersonSort, StatusCode> {
+    match value
+        .unwrap_or("Name")
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Name")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "name" => Ok(PersonSort::Name),
+        "datecreated" => Ok(PersonSort::DateCreated),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+fn emby_person_sort_order(value: Option<&str>) -> Result<bool, StatusCode> {
+    match value
+        .unwrap_or("Ascending")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ascending" => Ok(false),
+        "descending" => Ok(true),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 fn emby_person_type_filter(person_types: Option<&str>) -> Option<&'static str> {

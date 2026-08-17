@@ -1195,10 +1195,9 @@ impl Database {
         &self,
         library_id: &str,
         person_type: &str,
-        offset: i64,
-        limit: i64,
+        options: PersonListOptions,
     ) -> Result<(Vec<StoredPersonCredit>, i64), StorageError> {
-        self.list_person_credits_for_libraries(&[library_id.to_owned()], person_type, offset, limit)
+        self.list_person_credits_for_libraries(&[library_id.to_owned()], person_type, options)
             .await
     }
 
@@ -1206,8 +1205,7 @@ impl Database {
         &self,
         library_ids: &[String],
         person_type: &str,
-        offset: i64,
-        limit: i64,
+        options: PersonListOptions,
     ) -> Result<(Vec<StoredPersonCredit>, i64), StorageError> {
         if library_ids.is_empty() {
             return Ok((Vec::new(), 0));
@@ -1215,6 +1213,12 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let person_sort_order = person_sort_order(options.sort_by, options.descending);
+        let recursive_clause = if options.recursive {
+            String::new()
+        } else {
+            format!(" AND (mi.parent_id IS NULL OR mi.parent_id IN ({placeholders}))")
+        };
         let count_query = format!(
             "SELECT COUNT(*) FROM (
                  SELECT pc.provider, pc.person_id
@@ -1222,6 +1226,7 @@ impl Database {
                  JOIN media_items mi ON mi.id = pc.item_id
                  WHERE mi.library_id IN ({placeholders})
                    AND mi.removed_at IS NULL
+                   {recursive_clause}
                    AND pc.person_type = ?
                  GROUP BY pc.provider, pc.person_id
              )"
@@ -1229,6 +1234,11 @@ impl Database {
         let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
+        }
+        if !options.recursive {
+            for library_id in library_ids {
+                count_statement = count_statement.bind(library_id);
+            }
         }
         let total: i64 = count_statement
             .bind(person_type)
@@ -1243,6 +1253,7 @@ impl Database {
                     pc.provider,
                     MIN(pc.person_name) AS person_name,
                     MIN(pc.role) AS role,
+                    MIN(mi.added_at) AS date_created,
                     MIN(pc.biography) AS biography,
                     MIN(pc.birthday) AS birthday,
                     MIN(pc.deathday) AS deathday,
@@ -1252,19 +1263,25 @@ impl Database {
              JOIN media_items mi ON mi.id = pc.item_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
+               {recursive_clause}
                AND pc.person_type = ?
              GROUP BY pc.provider, pc.person_id
-             ORDER BY MIN(pc.person_name), pc.provider, pc.person_id
+             ORDER BY {person_sort_order}
              LIMIT ? OFFSET ?"
         );
         let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
         }
+        if !options.recursive {
+            for library_id in library_ids {
+                list_statement = list_statement.bind(library_id);
+            }
+        }
         let rows = list_statement
             .bind(person_type)
-            .bind(limit)
-            .bind(offset)
+            .bind(options.limit)
+            .bind(options.offset)
             .fetch_all(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -12181,6 +12198,7 @@ pub(crate) struct StoredPersonCredit {
     pub(crate) provider: String,
     pub(crate) person_name: String,
     pub(crate) role: String,
+    pub(crate) date_created: i64,
     pub(crate) biography: Option<String>,
     pub(crate) birthday: Option<String>,
     pub(crate) deathday: Option<String>,
@@ -12194,6 +12212,7 @@ fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
         provider: row.get("provider"),
         person_name: row.get("person_name"),
         role: row.get("role"),
+        date_created: row.get("date_created"),
         biography: row.get("biography"),
         birthday: row.get("birthday"),
         deathday: row.get("deathday"),
@@ -12762,6 +12781,33 @@ fn resume_runtime_ticks_sql() -> &'static str {
 enum CatalogBind<'a> {
     Text(&'a str),
     Integer(i64),
+}
+
+#[derive(Clone, Copy)]
+pub enum PersonSort {
+    Name,
+    DateCreated,
+}
+
+#[derive(Clone, Copy)]
+pub struct PersonListOptions {
+    pub recursive: bool,
+    pub sort_by: PersonSort,
+    pub descending: bool,
+    pub offset: i64,
+    pub limit: i64,
+}
+
+fn person_sort_order(sort_by: PersonSort, descending: bool) -> String {
+    let direction = if descending { "DESC" } else { "ASC" };
+    match sort_by {
+        PersonSort::Name => format!(
+            "MIN(pc.person_name) {direction}, MIN(mi.added_at) DESC, pc.provider ASC, pc.person_id ASC"
+        ),
+        PersonSort::DateCreated => format!(
+            "MIN(mi.added_at) {direction}, MIN(pc.person_name) ASC, pc.provider ASC, pc.person_id ASC"
+        ),
+    }
 }
 
 pub(crate) struct CatalogFilterQuery<'a> {
@@ -13490,7 +13536,17 @@ mod tests {
             .await
             .expect("person credits");
         let (credits, total) = database
-            .list_person_credits_for_library(&library_id, "Actor", 0, 10)
+            .list_person_credits_for_library(
+                &library_id,
+                "Actor",
+                PersonListOptions {
+                    recursive: true,
+                    sort_by: PersonSort::Name,
+                    descending: false,
+                    offset: 0,
+                    limit: 10,
+                },
+            )
             .await
             .expect("list person credits");
         assert_eq!(total, 2);

@@ -25,7 +25,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup
+    let admin = setup
         .complete("Admin", "Administrator", "correct password")
         .await?;
     let libraries = LibraryService::new(database.clone());
@@ -68,6 +68,16 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     .bind(&item_id)
     .fetch_one(database.pool())
     .await?;
+    sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
+        .bind(100_i64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
+        .bind(200_i64)
+        .bind(&second_item_id)
+        .execute(database.pool())
+        .await?;
 
     PeopleService::new(config.config_dir.clone())
         .with_database(database.clone())
@@ -222,6 +232,40 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(actor_c["Name"], "演员丙");
     assert!(actors.iter().any(|actor| actor["Id"] == "104"));
 
+    let full_query = format!(
+        "ParentId={}&Recursive=true&PersonTypes=Actor&StartIndex=0&Limit=999999&Fields=DateCreated,Overview&SortBy=DateCreated&SortOrder=Descending&userid={}&api_key={key}",
+        library.id, admin.id
+    );
+    let full_response = client
+        .get(format!("http://{address}/emby/Persons?{full_query}&&"))
+        .send()
+        .await?;
+    assert_eq!(full_response.status(), reqwest::StatusCode::OK);
+    let full_body: serde_json::Value = full_response.json().await?;
+    assert_eq!(full_body["TotalRecordCount"], 4);
+    assert_eq!(full_body["Items"].as_array().map(Vec::len), Some(4));
+    assert_eq!(full_body["Items"][0]["Id"], "104");
+    assert!(full_body["Items"][0]["DateCreated"].is_string());
+    assert!(full_body["Items"][0].get("Overview").is_some());
+    assert!(full_body["Items"][0].get("Role").is_none());
+
+    let ascending = client
+        .get(format!(
+            "http://{address}/Persons?ParentId={}&Recursive=true&PersonTypes=Actor&Limit=999999&SortBy=DateCreated&SortOrder=Ascending&api_key={key}",
+            library.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(ascending.status(), reqwest::StatusCode::OK);
+    let ascending_body: serde_json::Value = ascending.json().await?;
+    let ascending_items = ascending_body["Items"]
+        .as_array()
+        .ok_or("missing ascending items")?;
+    assert_eq!(
+        ascending_items.last().ok_or("empty ascending items")?["Id"],
+        "104"
+    );
+
     let prefixed = client
         .get(format!("http://{address}/emby/Persons?{query}"))
         .send()
@@ -230,6 +274,19 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(
         prefixed.json::<serde_json::Value>().await?["TotalRecordCount"],
         4
+    );
+
+    let non_recursive = client
+        .get(format!(
+            "http://{address}/Persons?ParentId={}&Recursive=false&PersonTypes=Actor&Limit=999999&api_key={key}",
+            library.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(non_recursive.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        non_recursive.json::<serde_json::Value>().await?["TotalRecordCount"],
+        0
     );
 
     let directors = client

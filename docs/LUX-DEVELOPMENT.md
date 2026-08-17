@@ -259,7 +259,7 @@ Lux 的核心价值不是功能数量，而是：
 - 按最近添加排序。
 - 按发行日期排序。
 - 按评分排序。
-- 所有列表分页，禁止无界返回。
+- 所有列表分页并设置服务端上限；Emby `/Persons` 为兼容现有客户端的明确例外，接受任意正整数 `Limit`，由调用方自行承担请求超大结果集的资源成本。
 
 后续能力：
 
@@ -720,7 +720,7 @@ pub async fn get_item(
 
 - Emby 兼容 API 必须遵循 Emby 的路由、字段名、状态码和可观察行为，不强行套用 Lux 错误格式。
 - 输入和输出 DTO 分离。
-- 所有列表端点分页并设置上限。
+- 所有列表端点分页并设置上限；Emby `/Persons` 按兼容合同接受任意正整数 `Limit`，不额外施加服务端上限。
 - 添加字段优先，删除或改变类型必须写兼容性 ADR。
 
 ### 10.3 永远执行
@@ -1395,10 +1395,10 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - Years。
 - Fields。
 - EnableImages、ImageTypeLimit。
-- `/Persons` 使用 `ParentId` 指定媒体库，`PersonTypes=Actor` 返回去重后的演员，响应必须保持 `Items`、`TotalRecordCount`、`StartIndex` 的 Emby 分页结构；人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
+- `/Persons` 使用 `ParentId` 指定媒体库；`Recursive=true` 聚合媒体库所有后代媒体条目，`Recursive=false` 只聚合直接子条目，未传 `Recursive` 时按递归查询处理以兼容旧客户端；`PersonTypes=Actor` 返回去重后的演员。响应必须保持 `Items`、`TotalRecordCount`、`StartIndex` 的 Emby 分页结构；接受任意正整数 `Limit`，不额外施加服务端上限；`Fields`、`SortBy`、`SortOrder` 必须在数据库分页前生效；`DateCreated` 使用演员首次出现在该媒体库媒体条目中的最早 `added_at`。人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
 - TotalRecordCount 与 Items 的一致性。
 
-Limit 默认 50，服务端硬上限 500。客户端请求更大时按兼容性策略截断或拒绝，并记录测试。
+Limit 默认 50；Emby `/Persons` 接受任意正整数，不设置服务端硬上限，其他列表接口继续遵循各自的服务端上限。
 
 ### 15.5 核心 DTO
 
