@@ -136,7 +136,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     .bind(r#"{"Channels":"2","SampleRate":"48000"}"#)
     .execute(database.pool())
     .await?;
-    let people = PeopleService::new(config.config_dir.clone());
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
     let person_image = config
         .config_dir
         .join("metadata/people/演/演员甲-tmdb-9/folder.png");
@@ -871,6 +871,31 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         person_item_image_head.headers()["content-type"],
         "image/png"
     );
+
+    let person_item_detail_url = format!("{base_url}/emby/Items/9?api_key={admin_token}");
+    let person_item_detail_response = client.get(&person_item_detail_url).send().await?;
+    assert_eq!(
+        person_item_detail_response.status(),
+        reqwest::StatusCode::OK
+    );
+    let person_item_detail_body: serde_json::Value = person_item_detail_response.json().await?;
+    assert_eq!(person_item_detail_body["Id"], "9");
+    assert_eq!(person_item_detail_body["Name"], "演员甲");
+    assert_eq!(person_item_detail_body["Type"], "Person");
+    assert!(person_item_detail_body["ImageTags"]["Primary"].is_string());
+    assert_eq!(person_item_detail_body["BackdropImageTags"], json!([]));
+
+    let person_item_detail_head = client.head(&person_item_detail_url).send().await?;
+    assert_eq!(person_item_detail_head.status(), reqwest::StatusCode::OK);
+
+    let person_item_untagged_image = client
+        .get(format!(
+            "{base_url}/emby/Items/9/Images/Primary?api_key={admin_token}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(person_item_untagged_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(person_item_untagged_image.bytes().await?.as_ref(), PNG_1X1);
 
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))

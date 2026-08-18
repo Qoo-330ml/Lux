@@ -1370,7 +1370,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Items/Counts", get(emby_items_counts))
         .route("/Items/Root", get(emby_items_root))
         .route("/Search/Hints", get(emby_search_hints))
-        .route("/Items/{item_id}", get(emby_item))
+        .route("/Items/{item_id}", get(emby_item).head(emby_item))
         .route("/Items/{item_id}/Children", get(emby_collection_children))
         .route("/api/danmu/{item_id}", get(emby_danmaku_info))
         .route("/api/danmu/{item_id}/raw", get(emby_danmaku_raw))
@@ -3696,7 +3696,31 @@ async fn emby_item_response(
             }
             Json(item_json).into_response()
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => {
+            let Some(access) = state.access.as_ref() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let library_ids = match access.accessible_library_ids(principal).await {
+                Ok(library_ids) => library_ids,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let Some(people) = state.people.as_ref() else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            match people.find_person(&library_ids, "Actor", item_id).await {
+                Ok(Some(person)) => Json(emby_person_json_with_fields(
+                    person,
+                    &state.server_id,
+                    fields,
+                ))
+                .into_response(),
+                Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+                Err(PeopleError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
             unreachable!("inaccessible item is returned as not found")
@@ -8907,16 +8931,17 @@ async fn emby_image(
     {
         return response;
     }
-    if let Some(response) = serve_emby_person_item_image(
-        &state,
-        &headers,
-        &method,
-        &item_id,
-        &image_type,
-        0,
-        query.tag.as_deref(),
-    )
-    .await
+    if (user.is_some() || query.tag.is_some())
+        && let Some(response) = serve_emby_person_item_image(
+            &state,
+            &headers,
+            &method,
+            &item_id,
+            &image_type,
+            0,
+            query.tag.as_deref(),
+        )
+        .await
     {
         return response;
     }
@@ -9026,16 +9051,17 @@ async fn emby_image_at_index(
     {
         return response;
     }
-    if let Some(response) = serve_emby_person_item_image(
-        &state,
-        &headers,
-        &method,
-        &item_id,
-        &image_type,
-        image_index,
-        query.tag.as_deref(),
-    )
-    .await
+    if (user.is_some() || query.tag.is_some())
+        && let Some(response) = serve_emby_person_item_image(
+            &state,
+            &headers,
+            &method,
+            &item_id,
+            &image_type,
+            image_index,
+            query.tag.as_deref(),
+        )
+        .await
     {
         return response;
     }
@@ -9094,8 +9120,9 @@ async fn serve_emby_person_item_image(
         return None;
     }
     let expected_tag = emby_person_image_tag(item_id);
-    if tag.filter(|tag| !tag.is_empty()) != Some(expected_tag.as_str()) {
-        return None;
+    match tag.filter(|tag| !tag.is_empty()) {
+        Some(tag) if tag != expected_tag => return None,
+        _ => {}
     }
     let people = state.people.as_ref()?;
     let image = match people.profile_image_for_emby_name_or_id(item_id).await {
