@@ -2838,6 +2838,7 @@ impl ScanJobService {
                     .await?
                     .ok_or(ScanJobError::JobNotFound)?;
                 let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
+                drop(_scan_permit);
                 if incremental {
                     self.run_metadata_after_incremental_scan(job_id).await?;
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
