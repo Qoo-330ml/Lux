@@ -27,6 +27,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "增加人物详情 API 和 Web 人物详情页，支持通过人物 ID 或精确姓名查询；演职员卡片可点击查看人物资料。",
         "增加管理台元数据任务失败详情，支持查看失败条目和具体错误信息。",
         "支持 MDC 通过 Emby POST /Items/{personId} 更新人物简介、生日、职业领域和出生地等元数据，并同步人物关系。",
+        "支持 MDC 通过 Emby POST /Items/{personId}/Images/Primary 上传演员头像，并在人物图片接口中读取。",
       ] },
       { kind: "fixed", items: [
         "修复 Matroska 流式处理和 HEVC+AAC 播放链路的兼容问题，提升非原生浏览器播放稳定性。",
@@ -39,6 +40,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 MDC 请求 Emby GET/HEAD /Items/{personId} 无法返回人物 DTO，以及无 tag 人物主图请求无法获取图片的问题。",
         "修复媒体根路径暂时不可用时已托管的媒体图片无法读取的问题。",
         "修复媒体详情和媒体卡片的扫描操作误扫描整个媒体库的问题。",
+        "修复本地图片路径不变但文件内容替换后索引未刷新的问题。",
       ] },
       { kind: "changed", items: [
         "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
