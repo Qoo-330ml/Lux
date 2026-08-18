@@ -15,6 +15,14 @@ use luxd::{
 use serde_json::json;
 use tokio::net::TcpListener;
 
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
 #[tokio::test]
 async fn emby_persons_lists_library_actors_with_shared_admin_key()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -380,6 +388,29 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(person_update_body["BirthDate"], "1990-01-02");
     assert_eq!(person_update_body["KnownForDepartment"], "Acting");
     assert_eq!(person_update_body["PlaceOfBirth"], "北京");
+
+    let person_image_upload = client
+        .post(format!(
+            "http://{address}/emby/Items/104/Images/Primary?api_key={key}"
+        ))
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(
+        person_image_upload.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+
+    let person_image = client
+        .get(format!(
+            "http://{address}/emby/Items/104/Images/Primary?api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(person_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(person_image.headers()["content-type"], "image/png");
+    assert_eq!(person_image.bytes().await?.as_ref(), PNG_1X1);
 
     let updated_person_detail = client
         .get(format!(

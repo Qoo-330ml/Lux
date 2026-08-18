@@ -554,20 +554,7 @@ impl PeopleService {
         {
             let id = actor_id_from_stored_actor(&actor);
             let provider = actor_provider_from_stored_actor(&actor);
-            let image_url = match provider.as_deref() {
-                Some(provider_name) => match self
-                    .profile_image_for_provider(Some(provider_name), &id)
-                    .await
-                {
-                    Ok(Some(_)) => actor_image_url(provider_name, &id),
-                    Ok(None) => None,
-                    Err(error) => {
-                        tracing::warn!(person_id = %id, %error, "actor profile image lookup failed; using placeholder");
-                        None
-                    }
-                },
-                None => None,
-            };
+            let image_url = self.person_image_url(provider.as_deref(), &id).await;
             views.push(ActorView {
                 id,
                 provider,
@@ -830,16 +817,9 @@ impl PeopleService {
         let mut views = Vec::with_capacity(credits.len());
         for credit in credits {
             let provider = (!credit.provider.is_empty()).then(|| credit.provider.clone());
-            let image_url = match provider.as_deref() {
-                Some(provider) => match self
-                    .profile_image_for_provider(Some(provider), &credit.person_id)
-                    .await
-                {
-                    Ok(Some(_)) => actor_image_url(provider, &credit.person_id),
-                    Ok(None) | Err(_) => None,
-                },
-                None => None,
-            };
+            let image_url = self
+                .person_image_url(provider.as_deref(), &credit.person_id)
+                .await;
             views.push(ActorView {
                 id: credit.person_id,
                 provider,
@@ -857,8 +837,58 @@ impl PeopleService {
         views
     }
 
+    async fn person_image_url(&self, provider: Option<&str>, person_id: &str) -> Option<String> {
+        let image = match provider {
+            Some(provider) => {
+                self.profile_image_for_provider(Some(provider), person_id)
+                    .await
+            }
+            None => self.profile_image(person_id).await,
+        };
+        if !matches!(image, Ok(Some(_))) {
+            return None;
+        }
+        provider
+            .and_then(|provider| actor_image_url(provider, person_id))
+            .or_else(|| Some(format!("/api/v1/people/{person_id}/image")))
+    }
+
     pub async fn profile_image(&self, person_id: &str) -> Result<Option<PersonImage>, PeopleError> {
         self.profile_image_for_provider(None, person_id).await
+    }
+
+    pub async fn update_person_image(
+        &self,
+        person_id: &str,
+        content_type: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<(), PeopleError> {
+        validate_component(person_id)?;
+        if bytes.is_empty() || bytes.len() > MAX_PROFILE_BYTES {
+            return Err(PeopleError::InvalidImage(
+                "profile image payload is invalid".to_owned(),
+            ));
+        }
+        let (extension, expected_type) =
+            profile_image_format(content_type, bytes).ok_or_else(|| {
+                PeopleError::InvalidImage("unsupported profile image type".to_owned())
+            })?;
+        if !valid_image(expected_type, bytes) {
+            return Err(PeopleError::InvalidImage(
+                "profile image payload is invalid".to_owned(),
+            ));
+        }
+        let image_path = self.store_shared_profile_asset(bytes, extension).await?;
+        let index_path =
+            people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
+        create_private_dir(&people_index_directory(&self.config_dir)).await?;
+        let index = StoredPersonIndex {
+            image_path,
+            person_key: None,
+        };
+        let index_bytes = serde_json::to_vec_pretty(&index)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        write_atomically(&index_path, &index_bytes).await
     }
 
     pub async fn profile_image_for_emby_name_or_id(
@@ -1683,6 +1713,28 @@ impl std::error::Error for PeopleError {
 impl From<MetadataPathError> for PeopleError {
     fn from(error: MetadataPathError) -> Self {
         Self::MetadataPath(error.to_string())
+    }
+}
+
+fn profile_image_format(
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> Option<(&'static str, &'static str)> {
+    let content_type = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    match content_type.as_deref() {
+        Some("image/jpeg") | Some("image/jpg") if valid_image("image/jpeg", bytes) => {
+            Some(("jpg", "image/jpeg"))
+        }
+        Some("image/png") if valid_image("image/png", bytes) => Some(("png", "image/png")),
+        Some("image/webp") if valid_image("image/webp", bytes) => Some(("webp", "image/webp")),
+        Some(_) => None,
+        None if valid_image("image/jpeg", bytes) => Some(("jpg", "image/jpeg")),
+        None if valid_image("image/png", bytes) => Some(("png", "image/png")),
+        None if valid_image("image/webp", bytes) => Some(("webp", "image/webp")),
+        None => None,
     }
 }
 
