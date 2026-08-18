@@ -316,6 +316,52 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         json!([])
     );
 
+    let person_detail = client
+        .get(format!(
+            "http://{address}/emby/Persons/104?Fields=Overview,Role,DateCreated&api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(person_detail.status(), reqwest::StatusCode::OK);
+    let person_detail_body: serde_json::Value = person_detail.json().await?;
+    assert_eq!(person_detail_body["Id"], "104");
+    assert_eq!(person_detail_body["Type"], "Person");
+    assert_eq!(person_detail_body["Overview"], "演员丁简介");
+    assert!(person_detail_body["DateCreated"].is_string());
+    assert!(person_detail_body["ImageTags"].is_object());
+    assert_eq!(person_detail_body["BackdropImageTags"], json!([]));
+    assert!(person_detail_body.get("BirthDate").is_none());
+
+    let root_person_detail = client
+        .get(format!("http://{address}/Persons/104?api_key={key}"))
+        .send()
+        .await?;
+    assert_eq!(root_person_detail.status(), reqwest::StatusCode::OK);
+
+    let lux_person_detail = client
+        .get(format!("http://{address}/api/v1/people/104"))
+        .header("X-Lux-Api-Key", &key)
+        .send()
+        .await?;
+    assert_eq!(lux_person_detail.status(), reqwest::StatusCode::OK);
+    let lux_person_detail_body: serde_json::Value = lux_person_detail.json().await?;
+    assert_eq!(lux_person_detail_body["id"], "104");
+    assert_eq!(lux_person_detail_body["name"], "演员丁");
+    assert_eq!(lux_person_detail_body["biography"], "演员丁简介");
+
+    let missing_person = client
+        .get(format!("http://{address}/Persons/missing?api_key={key}"))
+        .send()
+        .await?;
+    assert_eq!(missing_person.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let missing_lux_person = client
+        .get(format!("http://{address}/api/v1/people/missing"))
+        .header("X-Lux-Api-Key", &key)
+        .send()
+        .await?;
+    assert_eq!(missing_lux_person.status(), reqwest::StatusCode::NOT_FOUND);
+
     server.abort();
     Ok(())
 }

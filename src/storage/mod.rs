@@ -1294,6 +1294,59 @@ impl Database {
         Ok((rows, total))
     }
 
+    pub(crate) async fn find_person_credits_for_libraries(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        person_id: &str,
+    ) -> Result<Vec<StoredPersonCredit>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT pc.person_id,
+                    pc.provider,
+                    MIN(pc.person_name) AS person_name,
+                    MIN(pc.role) AS role,
+                    MIN(mi.added_at) AS date_created,
+                    MIN(pc.biography) AS biography,
+                    MIN(pc.birthday) AS birthday,
+                    MIN(pc.deathday) AS deathday,
+                    MIN(pc.known_for_department) AS known_for_department,
+                    MIN(pc.place_of_birth) AS place_of_birth
+             FROM person_credits pc
+             JOIN media_items mi ON mi.id = pc.item_id
+             WHERE mi.library_id IN ({placeholders})
+               AND mi.removed_at IS NULL
+               AND pc.person_type = ?
+               AND pc.person_id = ?
+             GROUP BY pc.provider, pc.person_id
+             ORDER BY CASE WHEN pc.provider = '' THEN 1 ELSE 0 END,
+                      pc.provider ASC,
+                      pc.person_id ASC"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        let rows = statement
+            .bind(person_type)
+            .bind(person_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(stored_person_credit)
+            .collect();
+        Ok(rows)
+    }
+
     pub(crate) async fn list_media_item_ids_for_library(
         &self,
         library_id: &str,

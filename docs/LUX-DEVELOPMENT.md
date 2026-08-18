@@ -1400,6 +1400,15 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - `/Persons` 使用 `ParentId` 指定媒体库；`Recursive=true` 聚合媒体库所有后代媒体条目，`Recursive=false` 只聚合直接子条目，未传 `Recursive` 时按递归查询处理以兼容旧客户端；`PersonTypes=Actor` 返回去重后的演员。人物 DTO 使用 `Type=Person`，并提供 `ServerId`、`ImageTags`、`BackdropImageTags`。响应必须保持 Emby 的 `Items`、`TotalRecordCount` 结构且不额外返回 `StartIndex`；接受任意正整数 `Limit`，不额外施加服务端上限；`Fields`、`SortBy`、`SortOrder` 必须在数据库分页前生效；`DateCreated` 使用演员首次出现在该媒体库媒体条目中的最早 `added_at`。人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
 - TotalRecordCount 与 Items 的一致性。
 
+人物详情兼容合同：
+
+- `GET /Persons/{PersonId}` 与 `/emby/Persons/{PersonId}` 返回单个人物 DTO，使用与 `/Persons` 相同的
+  `Name`、`ServerId`、`Id`、`Type`、`ImageTags`、`BackdropImageTags` 结构，并按 `Fields` 投影
+  `Overview`、`Role`、`BirthDate`、`DeathDate`、`KnownForDepartment`、`PlaceOfBirth`、`DateCreated`。
+- 人物详情只从持久化人物关系索引读取，不在请求中扫描 metadata 目录、解析 NFO 或调用 TMDb；人物没有
+  图片时仍返回 JSON，图片标签为空，调用方可以使用占位图。
+- 人物查询遵守当前 Emby 用户的媒体库 ACL；没有任何可访问媒体库中的出演关系时返回 `404`。
+
 Limit 默认 50；Emby `/Persons` 接受任意正整数，不设置服务端硬上限，其他列表接口继续遵循各自的服务端上限。
 
 ### 15.5 核心 DTO
@@ -1449,6 +1458,7 @@ Web 使用 HttpOnly、Secure（HTTPS 下）、SameSite Cookie。改变状态的 
 - GET /api/v1/libraries
 - GET /api/v1/libraries/{id}/items（支持 `metadataStatus=PENDING` 待确认筛选）
 - GET /api/v1/items/{id}
+- GET /api/v1/people/{personId}
 - GET /api/v1/search
 - GET /api/v1/items/{id}/playback
 - POST /api/v1/items/{id}/progress

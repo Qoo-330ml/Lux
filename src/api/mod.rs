@@ -883,6 +883,7 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_list_library_items),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route("/api/v1/people/{person_id}", get(lux_get_person))
         .route(
             "/api/v1/people/{person_id}/image",
             get(lux_get_person_image),
@@ -1345,6 +1346,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
         .route("/Persons", get(emby_persons))
+        .route("/Persons/{person_id}", get(emby_person))
         .route("/Users/{user_id}", get(emby_user))
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Root", get(emby_user_root))
@@ -1734,6 +1736,14 @@ struct EmbyPersonsQuery {
     sort_by: Option<String>,
     #[serde(rename = "SortOrder", alias = "sortOrder", default)]
     sort_order: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct EmbyPersonQuery {
+    #[serde(flatten)]
+    auth: EmbyTokenQuery,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    user_id: Option<String>,
 }
 
 async fn require_emby_token(
@@ -2347,6 +2357,47 @@ async fn emby_persons(
         "TotalRecordCount": total,
     }))
     .into_response()
+}
+
+async fn emby_person(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    Query(query): Query<EmbyPersonQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Some(user_id) = query.user_id.as_deref()
+        && let Err(status) = ensure_emby_user_scope(&user, user_id)
+    {
+        return status.into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match people.find_person(&library_ids, "Actor", &person_id).await {
+        Ok(Some(person)) => Json(emby_person_json_with_fields(
+            person,
+            &state.server_id,
+            query.auth.fields.as_deref(),
+        ))
+        .into_response(),
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(PeopleError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn emby_user_root(
@@ -10119,6 +10170,48 @@ async fn lux_get_person_image(
     State(state): State<AppState>,
 ) -> Response {
     lux_get_person_image_inner(headers, None, person_id, state).await
+}
+
+async fn lux_get_person(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match people.find_person(&library_ids, "Actor", &person_id).await {
+        Ok(Some(person)) => Json(person).into_response(),
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "人物不存在",
+        )
+        .into_response(),
+        Err(PeopleError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn lux_get_person_image_for_provider(

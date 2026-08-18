@@ -703,6 +703,31 @@ impl PeopleService {
         Ok((self.actor_views_from_credits(credits).await, total))
     }
 
+    pub async fn find_person(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        person_id: &str,
+    ) -> Result<Option<ActorView>, PeopleError> {
+        if !is_valid_person_id(person_id) {
+            return Err(PeopleError::InvalidComponent(person_id.to_owned()));
+        }
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        let credits = database
+            .find_person_credits_for_libraries(library_ids, person_type, person_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        Ok(self
+            .actor_views_from_credits(credits)
+            .await
+            .into_iter()
+            .next())
+    }
+
     async fn actor_views_from_credits(&self, credits: Vec<StoredPersonCredit>) -> Vec<ActorView> {
         let mut views = Vec::with_capacity(credits.len());
         for credit in credits {
