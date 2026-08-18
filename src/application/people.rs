@@ -4,6 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::escape::escape;
 use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -869,16 +870,25 @@ impl PeopleService {
                 "profile image payload is invalid".to_owned(),
             ));
         }
-        let (extension, expected_type) =
-            profile_image_format(content_type, bytes).ok_or_else(|| {
+        let image_bytes = if profile_image_format(content_type, bytes).is_some() {
+            bytes.to_owned()
+        } else {
+            BASE64.decode(bytes).map_err(|_| {
+                PeopleError::InvalidImage("unsupported profile image type".to_owned())
+            })?
+        };
+        let (extension, expected_type) = profile_image_format(content_type, &image_bytes)
+            .ok_or_else(|| {
                 PeopleError::InvalidImage("unsupported profile image type".to_owned())
             })?;
-        if !valid_image(expected_type, bytes) {
+        if image_bytes.len() > MAX_PROFILE_BYTES || !valid_image(expected_type, &image_bytes) {
             return Err(PeopleError::InvalidImage(
                 "profile image payload is invalid".to_owned(),
             ));
         }
-        let image_path = self.store_shared_profile_asset(bytes, extension).await?;
+        let image_path = self
+            .store_shared_profile_asset(&image_bytes, extension)
+            .await?;
         let index_path =
             people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
         create_private_dir(&people_index_directory(&self.config_dir)).await?;

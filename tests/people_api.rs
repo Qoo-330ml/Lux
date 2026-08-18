@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
@@ -411,6 +412,19 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(person_image.status(), reqwest::StatusCode::OK);
     assert_eq!(person_image.headers()["content-type"], "image/png");
     assert_eq!(person_image.bytes().await?.as_ref(), PNG_1X1);
+
+    let encoded_person_image_upload = client
+        .post(format!(
+            "http://{address}/emby/Items/104/Images/Primary?api_key={key}"
+        ))
+        .header("Content-Type", "image/png")
+        .body(BASE64.encode(PNG_1X1))
+        .send()
+        .await?;
+    assert_eq!(
+        encoded_person_image_upload.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
 
     let updated_person_detail = client
         .get(format!(
