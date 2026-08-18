@@ -961,10 +961,21 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-job-heading strong, .lux-admin-log-row strong { overflow: hidden; color: #fff; font-size: .8rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-job-main > small, .lux-admin-log-row small { display: block; margin-top: 5px; overflow: hidden; color: var(--lux-subtle); font-size: .7rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-job-main > .lux-admin-job-meta { display: flex; align-items: baseline; gap: 0 6px; overflow: visible; text-overflow: clip; white-space: normal; }
-.lux-admin-job-context, .lux-admin-job-error { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-job-context { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-job-context { flex: 1 1 auto; }
 .lux-admin-job-count { flex: 0 0 auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.lux-admin-job-error { flex: 1 1 100%; }
+.lux-admin-job-error { display: grid; gap: 3px; margin-top: 9px; padding: 9px 10px; border-left: 2px solid rgba(220,89,115,.7); border-radius: 0 7px 7px 0; color: #f3aab8; font-size: .72rem; line-height: 1.45; background: rgba(220,89,115,.08); overflow-wrap: anywhere; }
+.lux-admin-job-error strong { color: inherit; font-size: .67rem; }
+.lux-admin-job-details { margin-top: 8px; padding: 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); font-size: .7rem; background: rgba(0,0,0,.12); }
+.lux-admin-job-details > strong { color: var(--lux-text); }
+.lux-admin-job-details p { margin: 0; }
+.lux-admin-job-details ul { display: grid; gap: 7px; margin: 8px 0 0; padding: 0; list-style: none; }
+.lux-admin-job-details li { display: grid; grid-template-columns: minmax(110px, .7fr) minmax(0, 1fr); gap: 10px; }
+.lux-admin-job-details code { overflow: hidden; color: var(--lux-subtle); text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-job-details-toggle { display: inline-flex; align-items: center; gap: 4px; min-height: 30px; padding: 0 8px; border: 1px solid var(--lux-line-soft); border-radius: 7px; color: var(--lux-muted); font: inherit; font-size: .68rem; background: transparent; cursor: pointer; }
+.lux-admin-job-details-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+html[data-lux-theme="light"] .lux-admin-job-error { color: #9f3047; background: rgba(190,47,76,.07); }
+html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,.035); }
 .lux-admin-job-finished-at { display: block; margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
 .lux-admin-job-attention { display: inline-flex; margin-top: 8px; color: #f3c788; font-size: .7rem; text-decoration: none; }
 .lux-admin-job-attention:hover { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
@@ -1274,6 +1285,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-password-row { align-items: stretch; flex-direction: column; }
   .lux-admin-job-row, .lux-admin-log-row { grid-template-columns: 30px minmax(0, 1fr); }
   .lux-admin-job-actions, .lux-admin-log-row time { grid-column: 2; }
+  .lux-admin-job-actions { flex-wrap: wrap; }
+  .lux-admin-job-details li { grid-template-columns: 1fr; gap: 3px; }
   .lux-admin-pagination { align-items: stretch; flex-direction: column; }
   .lux-admin-pagination > div { display: grid; grid-template-columns: 1fr 1fr; }
   .lux-operations-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }

@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
     AlertTriangle,
     CalendarDays,
+    ChevronDown,
     CheckCircle2,
     ClipboardList,
     Download,
@@ -452,6 +453,7 @@ function Pagination({ page, pageSize, total, onPageChange }: { page: number; pag
 }
 
 function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: OperationsJob; libraryNames: ReadonlyMap<string, string>; onCancel: () => void; onRetry: () => void; busy: boolean }) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const progress = job.totalCount && job.totalCount > 0 ? Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100)) : null;
   const active = isActiveJob(job.status);
   const cancelling = active && Boolean(job.cancelRequested);
@@ -461,7 +463,34 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
   const libraryLabel = job.libraryId ? libraryNames.get(job.libraryId) ?? job.libraryId : "";
   const pendingCount = job.kind === "metadata" ? job.pendingCount ?? 0 : 0;
   const pendingHref = job.libraryId ? `/libraries/${encodeURIComponent(job.libraryId)}?metadataStatus=pending` : undefined;
-  return <article className="lux-admin-job-row"><div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div><div className="lux-admin-job-main"><div className="lux-admin-job-heading"><strong>{formatJobType(job.jobType)}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{formatJobStatus(job.status)}</span></div><small className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : discovering ? "正在发现目录" : job.kind === "metadata" ? "元数据任务" : "扫描任务"}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}</span>{error ? <span className="lux-admin-job-error">{error}</span> : null}</small><time className="lux-admin-job-finished-at">完成时间：{job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>{active && (progress !== null || discovering) ? <div className={`lux-job-progress${discovering && progress === null ? " is-indeterminate" : ""}`}><span style={progress === null ? undefined : { width: `${progress}%` }} /></div> : null}{pendingCount > 0 ? pendingHref ? <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link> : <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span> : null}</div><div className="lux-admin-job-actions">{active ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></button> : null}{retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}</div></article>;
+  const details = useQuery({
+    queryKey: ["admin", "metadata-job", job.id, "details"],
+    queryFn: () => api.adminMetadataReidentifyJob(job.id),
+    enabled: detailsOpen && job.kind === "metadata",
+  });
+  const failedItems = details.data?.job.items?.filter((item) => item.status === "FAILED") ?? [];
+  const jobLabel = formatJobType(job.jobType);
+  return <article className="lux-admin-job-row">
+    <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
+    <div className="lux-admin-job-main">
+      <div className="lux-admin-job-heading"><strong>{jobLabel}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{formatJobStatus(job.status)}</span></div>
+      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : discovering ? "正在发现目录" : job.kind === "metadata" ? "元数据任务" : "扫描任务"}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}</span></div>
+      {error ? <div className="lux-admin-job-error" role="alert"><strong>失败原因</strong><span>{error}</span></div> : null}
+      {detailsOpen && job.kind === "metadata" ? <div className="lux-admin-job-details">
+        {details.isPending ? <p role="status">正在读取失败详情…</p> : null}
+        {details.error ? <p role="alert">详情读取失败，请稍后重试。</p> : null}
+        {details.data ? <><strong>失败条目 {failedItems.length} 个</strong>{failedItems.length ? <ul>{failedItems.map((item) => <li key={item.itemId}><code>{item.itemId}</code><span>{formatJobError(item.error) || "未记录具体原因"}</span></li>)}</ul> : <p>任务未记录逐条失败信息。</p>}</> : null}
+      </div> : null}
+      <time className="lux-admin-job-finished-at">完成时间：{job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>
+      {active && (progress !== null || discovering) ? <div className={`lux-job-progress${discovering && progress === null ? " is-indeterminate" : ""}`}><span style={progress === null ? undefined : { width: `${progress}%` }} /></div> : null}
+      {pendingCount > 0 ? pendingHref ? <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link> : <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span> : null}
+    </div>
+    <div className="lux-admin-job-actions">
+      {error && job.kind === "metadata" ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}${jobLabel}失败详情`} onClick={() => setDetailsOpen((open) => !open)}>详情<ChevronDown size={14} /></button> : null}
+      {active ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></button> : null}
+      {retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}
+    </div>
+  </article>;
 }
 
 function metadataStatusFilter(status: string) {
@@ -514,7 +543,9 @@ function formatJobStatus(status: string) {
 }
 
 function formatJobError(error?: string | null) {
-  return error ? ERROR_LABELS[error] || "任务处理失败" : "";
+  if (!error) return "";
+  const knownLabel = Object.prototype.hasOwnProperty.call(ERROR_LABELS, error) ? ERROR_LABELS[error] : undefined;
+  return knownLabel || (/^[A-Z][A-Z0-9_]{1,127}$/.test(error) ? `任务处理失败（${error}）` : "任务处理失败（未提供可识别的错误码）");
 }
 
 function formatAuditEvent(eventType: string) {

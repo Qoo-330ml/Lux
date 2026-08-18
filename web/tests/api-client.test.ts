@@ -363,6 +363,36 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("loads metadata job item details from the existing job detail endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        job: {
+          id: "metadata-job-1",
+          status: "FAILED",
+          mode: "FILL_MISSING",
+          processedCount: 1,
+          totalCount: 1,
+          createdAt: 1_700_000_000,
+          items: [{
+            jobId: "metadata-job-1",
+            itemId: "movie-1",
+            status: "FAILED",
+            candidateCount: 0,
+            error: "TMDB_UNAVAILABLE",
+            updatedAt: 1_700_000_001,
+          }],
+        },
+      }), { status: 200 }),
+    );
+
+    const result = await new LuxApiClient().adminMetadataReidentifyJob("metadata/job 1");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/metadata/reidentify/metadata%2Fjob%201",
+    );
+    expect(result.job.items?.[0]?.error).toBe("TMDB_UNAVAILABLE");
+  });
+
   it("lists and updates scheduled task configurations with CSRF protection", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
