@@ -348,7 +348,7 @@ async fn reconciliation_persists_discovered_file_count_before_discovery_finishes
 }
 
 #[tokio::test]
-async fn cancelling_a_pending_scan_emits_an_immediate_cancellation_request()
+async fn cancelling_a_pending_scan_finishes_immediately_and_cleans_work()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -370,6 +370,11 @@ async fn cancelling_a_pending_scan_emits_an_immediate_cancellation_request()
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.cancel(&job.id).await?;
 
+    let status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(status, "CANCELLED");
     let cancel_requested: i64 =
         sqlx::query_scalar("SELECT cancel_requested FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
@@ -383,7 +388,7 @@ async fn cancelling_a_pending_scan_emits_an_immediate_cancellation_request()
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(event_code, "CANCEL_REQUESTED");
+    assert_eq!(event_code, "JOB_CANCELLED");
     Ok(())
 }
 
@@ -445,6 +450,72 @@ async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dy
         error,
         ScanJobError::AlreadyActive(id) if id == incremental_scan.id
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_scan_retry_reuses_job_progress_and_pending_entries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    for (title, year) in [("Alpha", 2020), ("Beta", 2021), ("Gamma", 2022)] {
+        tokio::fs::write(root.join(format!("{title}.Movie.{year}.mkv")), b"fixture").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_batch(&job.id, 100).await?;
+    jobs.run_batch(&job.id, 1).await?;
+
+    let before_failure: (i64, i64) = sqlx::query_as(
+        "SELECT processed_count,
+                (SELECT COUNT(*) FROM reconciliation_scan_entries WHERE job_id = scan_jobs.id)
+         FROM scan_jobs WHERE id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(before_failure, (1, 2));
+    sqlx::query(
+        "UPDATE scan_jobs
+         SET status = 'FAILED', error = 'simulated failure', finished_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.status, "PENDING");
+    assert_eq!(retried.processed_count, 1);
+    let pending_after_retry: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_scan_entries WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(pending_after_retry, 2);
+
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let completed: (String, i64, i64) =
+        sqlx::query_as("SELECT status, processed_count, total_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(completed, ("COMPLETED".to_owned(), 3, 3));
     Ok(())
 }
 

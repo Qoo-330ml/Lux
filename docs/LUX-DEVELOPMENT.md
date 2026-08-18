@@ -1400,6 +1400,16 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - `/Persons` 使用 `ParentId` 指定媒体库；`Recursive=true` 聚合媒体库所有后代媒体条目，`Recursive=false` 只聚合直接子条目，未传 `Recursive` 时按递归查询处理以兼容旧客户端；`PersonTypes=Actor` 返回去重后的演员。人物 DTO 使用 `Type=Person`，并提供 `ServerId`、`ImageTags`、`BackdropImageTags`。响应必须保持 Emby 的 `Items`、`TotalRecordCount` 结构且不额外返回 `StartIndex`；接受任意正整数 `Limit`，不额外施加服务端上限；`Fields`、`SortBy`、`SortOrder` 必须在数据库分页前生效；`DateCreated` 使用演员首次出现在该媒体库媒体条目中的最早 `added_at`。人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
 - TotalRecordCount 与 Items 的一致性。
 
+人物详情兼容合同：
+
+- `GET /Persons/{PersonIdOrName}` 与 `/emby/Persons/{PersonIdOrName}` 返回单个人物 DTO；路径参数优先按
+  人物 ID 匹配，未匹配时按精确人物姓名匹配。两条路径使用与 `/Persons` 相同的 `Name`、`ServerId`、`Id`、
+  `Type`、`ImageTags`、`BackdropImageTags` 结构，并按 `Fields` 投影 `Overview`、`Role`、`BirthDate`、
+  `DeathDate`、`KnownForDepartment`、`PlaceOfBirth`、`DateCreated`。
+- 人物详情只从持久化人物关系索引读取，不在请求中扫描 metadata 目录、解析 NFO 或调用 TMDb；人物没有
+  图片时仍返回 JSON，图片标签为空，调用方可以使用占位图。
+- 人物查询遵守当前 Emby 用户的媒体库 ACL；没有任何可访问媒体库中的出演关系时返回 `404`。
+
 Limit 默认 50；Emby `/Persons` 接受任意正整数，不设置服务端硬上限，其他列表接口继续遵循各自的服务端上限。
 
 ### 15.5 核心 DTO
@@ -1449,6 +1459,7 @@ Web 使用 HttpOnly、Secure（HTTPS 下）、SameSite Cookie。改变状态的 
 - GET /api/v1/libraries
 - GET /api/v1/libraries/{id}/items（支持 `metadataStatus=PENDING` 待确认筛选）
 - GET /api/v1/items/{id}
+- GET /api/v1/people/{personId}
 - GET /api/v1/search
 - GET /api/v1/items/{id}/playback
 - POST /api/v1/items/{id}/progress
@@ -2785,6 +2796,9 @@ services:
 
 验证：Playwright 多用户测试。
 
+首页媒体库数据应写入 React Query 的 `libraries` 缓存；媒体库入口在 hover 或 keyboard focus
+时预取默认排序的第一页，媒体库首屏等待期间显示稳定骨架屏，避免导航后的空白等待。
+
 依赖：阶段 10。
 
 #### LUX-111：媒体库列表与筛选
@@ -2797,6 +2811,9 @@ services:
 - 首页和媒体库中的剧集海报在右上角显示集数；剧集显示全部单集数，季度显示该季度单集数。
 
 验证：大列表 Playwright。
+
+媒体库首屏预取必须复用正式页面的 query key、分页边界和 ACL 语义，不得预取无权媒体库或
+绕过服务端分页上限。
 
 依赖：LUX-110。
 
@@ -3384,19 +3401,24 @@ ip138，不再把它作为回退。Hiofd 插件显示名称为“IP归属地查�
 只持久化任务和根目录工作项并立即返回；后台 worker 先通过持久化目录队列完成一次有界目录
 发现，把媒体文件保存为任务工作项，再按既有批次大小处理。目录展开与当前目录完成必须在同一
 短事务中提交；服务重启后只允许重复尚未提交的当前目录或尚未提交的文件批次，已经提交的目录
-不再遍历。任务取消、失败或完成时清理临时工作项，不让工作队列无限增长。
+不再遍历。任务取消或完成时清理临时工作项；可恢复失败任务保留有界 checkpoint，避免工作队列
+无限增长。
 
-扫描 worker 使用进程内共享的容量为 1 的互斥锁。一个媒体库的全量扫描或实时增量扫描执行
-期间，其他媒体库的扫描任务保持排队；锁覆盖整个扫描 worker 的生命周期，而不是只覆盖单个
-批次。该机制是扫描互斥，不引入跨库 worker pool，也不改变任务的持久化、恢复和取消模型。
+扫描 worker 使用进程内共享的容量为 1 的互斥锁。一个媒体库的文件系统发现、调和工作项处理
+和索引写入期间，其他媒体库的文件扫描任务保持排队；文件系统阶段完成并提交后释放该锁。
+ffprobe、本地 NFO/图片、缩略图、自动封面和在线元数据调度属于后处理阶段，不持有扫描互斥锁，
+由各自的有界资源配额控制。该机制仍不引入跨库 worker pool，也不改变任务的持久化、恢复和
+取消模型。
 
 验收：
 
 - [x] 创建全量任务不访问媒体文件系统；后台发现阶段对未中断任务中的每个目录只读取一次。
 - [x] 发现的文件路径持久化后按批处理；处理批次不重新遍历媒体库，重启后从剩余目录或文件工作项继续。
 - [x] 只有所有可用根路径完成发现后才执行 generation missing 判定；不可用或扫描中失效的根路径不批量标记缺失。
-- [x] 任务进度在发现完成后具有稳定 `totalCount`，取消、失败和完成会清理临时工作项，现有增量扫描行为不变。
+- [x] 任务进度在发现完成后具有稳定 `totalCount`；取消和完成会清理临时工作项，失败任务保留可恢复 checkpoint，现有增量扫描行为不变。
+- [ ] 文件系统阶段完成后释放扫描互斥锁，其他媒体库可以开始文件扫描；后处理继续受独立资源配额限制。
 - [x] 自动化测试覆盖单次发现快照、分批恢复、发现期间取消、根路径不可用和工作项清理。
+- [ ] 自动化测试覆盖失败 checkpoint 重试和后处理阶段不持有扫描互斥锁。
 
 验证：
 

@@ -35,6 +35,7 @@ import type {
   ImageSearchResult,
   MetadataFieldName,
   PageResponse,
+  PersonDetail,
   PlaybackState,
   PlaybackEventState,
   SetupStatus,
@@ -259,6 +260,10 @@ export class LuxApiClient {
 
   item(itemId: string) {
     return this.request<MediaItem>(`/api/v1/items/${encodeURIComponent(itemId)}`);
+  }
+
+  person(personId: string) {
+    return this.request<PersonDetail>(`/api/v1/people/${encodeURIComponent(personId)}`);
   }
 
   itemMetadata(itemId: string) {
@@ -717,6 +722,12 @@ export class LuxApiClient {
     if (status) params.set("status", status);
     return this.request<{ jobs?: AdminMetadataReidentifyJob[] }>(
       `/api/v1/admin/metadata/reidentify?${params}`,
+    );
+  }
+
+  adminMetadataReidentifyJob(jobId: string) {
+    return this.request<{ job: AdminMetadataReidentifyJob }>(
+      `/api/v1/admin/metadata/reidentify/${encodeURIComponent(jobId)}`,
     );
   }
 

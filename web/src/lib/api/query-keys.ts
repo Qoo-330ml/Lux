@@ -15,6 +15,7 @@ export const queryKeys = {
     metadataStatus = "all",
   ) => ["library", libraryId, page, itemTypes ?? "root", sortBy, sortOrder, metadataStatus] as const,
   item: (itemId: string) => ["item", itemId] as const,
+  person: (personId: string) => ["person", personId] as const,
   itemImages: (itemId: string) => ["item-images", itemId] as const,
   children: (itemId: string, itemType?: string, seasonId?: string) =>
     ["children", itemId, itemType ?? "default", seasonId ?? "all"] as const,

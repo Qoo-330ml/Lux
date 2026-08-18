@@ -1,6 +1,7 @@
 import type { MediaActor } from "../../lib/api/types";
 import { UserRound } from "lucide-react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
+import { Link } from "react-router-dom";
 
 export function MediaCast({ actors }: { actors: MediaActor[] }) {
   if (actors.length === 0) return null;
@@ -15,15 +16,17 @@ export function MediaCast({ actors }: { actors: MediaActor[] }) {
         <ul className="lux-media-cast-list" role="list">
           {actors.map((actor) => (
             <li className="lux-media-cast-card" key={actor.id}>
-              <div className="lux-media-cast-avatar">
-                {actor.imageUrl ? (
-                  <img src={actor.imageUrl} alt={`${actor.name} 头像`} loading="lazy" />
-                ) : (
-                  <UserRound className="lux-media-cast-placeholder-icon" size={34} strokeWidth={1.8} aria-hidden="true" />
-                )}
-              </div>
-              <strong title={actor.name}>{actor.name}</strong>
-              {actor.character ? <span title={actor.character}>饰 {actor.character}</span> : null}
+              <Link className="lux-media-cast-link" to={`/people/${encodeURIComponent(actor.id)}`} aria-label={`查看${actor.name}的人物详情`}>
+                <div className="lux-media-cast-avatar">
+                  {actor.imageUrl ? (
+                    <img src={actor.imageUrl} alt={`${actor.name} 头像`} loading="lazy" />
+                  ) : (
+                    <UserRound className="lux-media-cast-placeholder-icon" size={34} strokeWidth={1.8} aria-hidden="true" />
+                  )}
+                </div>
+                <strong title={actor.name}>{actor.name}</strong>
+                {actor.character ? <span title={actor.character}>饰 {actor.character}</span> : null}
+              </Link>
             </li>
           ))}
         </ul>

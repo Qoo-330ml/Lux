@@ -99,6 +99,7 @@ export type MediaSource = {
 
 export type MediaActor = {
   id: string;
+  provider?: string | null;
   name: string;
   character?: string | null;
   imageUrl?: string | null;
@@ -108,6 +109,8 @@ export type MediaActor = {
   knownForDepartment?: string | null;
   placeOfBirth?: string | null;
 };
+
+export type PersonDetail = MediaActor;
 
 export type MediaNfoCredit = {
   providerId?: string | null;
@@ -530,6 +533,16 @@ export type AdminMetadataReidentifyJob = {
   updatedAt?: string | number;
   startedAt?: string | number | null;
   finishedAt?: string | number | null;
+  items?: AdminMetadataReidentifyJobItem[];
+};
+
+export type AdminMetadataReidentifyJobItem = {
+  jobId: string;
+  itemId: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  candidateCount: number;
+  error?: string | null;
+  updatedAt: string | number;
 };
 
 export type AdminMetadataReidentifyStart = {

@@ -400,12 +400,37 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-cast-rail { margin-top: 22px; }
 .lux-media-cast-list { display: flex; gap: 24px; width: max-content; min-width: 100%; margin: 0; padding: 0 2px 12px; list-style: none; }
 .lux-media-cast-card { flex: 0 0 96px; min-width: 0; text-align: center; }
+.lux-media-cast-link { display: block; color: inherit; text-decoration: none; border-radius: 12px; }
+.lux-media-cast-link:focus-visible { outline: 2px solid var(--lux-accent); outline-offset: 5px; }
 .lux-media-cast-avatar { display: grid; place-items: center; width: 84px; height: 84px; margin: 0 auto 11px; overflow: hidden; border: 1px solid rgba(255,255,255,.2); border-radius: 50%; background: #202026; box-shadow: 0 8px 20px rgba(0,0,0,.22); }
 .lux-media-cast-avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .lux-media-cast-placeholder-icon { color: #f4e9d9; }
-.lux-media-cast-card strong, .lux-media-cast-card > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lux-media-cast-card strong { color: rgba(255,255,255,.86); font-size: .8rem; font-weight: 600; }
-.lux-media-cast-card > span { margin-top: 5px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-media-cast-link strong, .lux-media-cast-link > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-media-cast-link strong { color: rgba(255,255,255,.86); font-size: .8rem; font-weight: 600; }
+.lux-media-cast-link > span { margin-top: 5px; color: var(--lux-subtle); font-size: .68rem; }
+
+.lux-person-detail-page { max-width: 1040px; margin: 0 auto; padding: 8px 0 72px; }
+.lux-person-back { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; color: var(--lux-subtle); background: transparent; text-decoration: none; font: inherit; font-size: .82rem; cursor: pointer; }
+.lux-person-back:hover { color: var(--lux-text); }
+.lux-person-detail-grid { display: grid; grid-template-columns: minmax(210px, 280px) minmax(0, 1fr); gap: clamp(28px, 6vw, 72px); align-items: start; margin-top: 34px; }
+.lux-person-detail-photo-frame { width: min(100%, 280px); aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 18px; background: var(--lux-panel); box-shadow: 0 20px 50px rgba(0,0,0,.24); }
+.lux-person-detail-photo { display: block; width: 100%; height: 100%; object-fit: cover; }
+.lux-person-detail-placeholder { display: grid; place-items: center; width: 100%; height: 100%; color: var(--lux-subtle); background: linear-gradient(145deg, rgba(255,255,255,.08), rgba(255,255,255,.02)); }
+.lux-person-detail-copy h1 { margin: 6px 0 0; color: var(--lux-text); font-size: clamp(2rem, 5vw, 3.6rem); line-height: 1.08; }
+.lux-person-detail-role { margin: 14px 0 0; color: var(--lux-subtle); font-size: 1rem; }
+.lux-person-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 28px; margin: 32px 0 0; }
+.lux-person-facts > div { min-width: 0; }
+.lux-person-facts dt { display: flex; align-items: center; gap: 6px; color: var(--lux-subtle); font-size: .72rem; }
+.lux-person-facts dd { margin: 5px 0 0; color: var(--lux-text); font-size: .9rem; overflow-wrap: anywhere; }
+.lux-person-overview { margin-top: 34px; }
+.lux-person-overview h2 { margin: 0; color: var(--lux-text); font-size: 1rem; }
+.lux-person-overview p { max-width: 70ch; margin: 12px 0 0; color: var(--lux-subtle); line-height: 1.8; white-space: pre-wrap; }
+@media (max-width: 700px) {
+  .lux-person-detail-page { padding-top: 0; }
+  .lux-person-detail-grid { grid-template-columns: 1fr; gap: 28px; }
+  .lux-person-detail-photo-frame { width: min(58vw, 220px); margin: 0 auto; }
+  .lux-person-detail-copy h1 { font-size: 2.2rem; }
+}
 .lux-source-selector { max-width: none; margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--lux-line-soft); }
 .lux-source-select { max-width: 320px; margin-top: 14px; }
 .lux-source-select .lux-select-trigger { min-height: 58px; padding: 8px var(--lux-control-padding-x); border-radius: 10px; }
@@ -617,6 +642,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-skeleton-block { min-height: min(92vh, 920px); }
 .lux-skeleton-line { width: 180px; height: 20px; border-radius: 6px; }
 .lux-skeleton-row { height: 250px; margin-top: 22px; border-radius: 12px; }
+.lux-library-page-loading { min-height: 70vh; }
+.lux-library-page-skeleton-title { display: block; width: min(240px, 55vw); height: 34px; }
+.lux-library-page-skeleton-control { display: block; width: 130px; height: 38px; }
+.lux-library-page-skeleton-card { display: block; min-height: 290px; border-radius: 10px; background: linear-gradient(100deg, #101014 25%, #1a1a20 50%, #101014 75%); background-size: 200% 100%; animation: lux-shimmer 1.8s ease-in-out infinite; }
 @keyframes lux-shimmer { to { background-position: -200% 0; } }
 
 .lux-admin-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); width: 92%; min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 90px; background: var(--lux-bg); }
@@ -931,6 +960,22 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-job-heading { display: flex; align-items: center; gap: 9px; }
 .lux-admin-job-heading strong, .lux-admin-log-row strong { overflow: hidden; color: #fff; font-size: .8rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-job-main > small, .lux-admin-log-row small { display: block; margin-top: 5px; overflow: hidden; color: var(--lux-subtle); font-size: .7rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-job-main > .lux-admin-job-meta { display: flex; align-items: baseline; gap: 0 6px; overflow: visible; text-overflow: clip; white-space: normal; }
+.lux-admin-job-context { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-job-context { flex: 1 1 auto; }
+.lux-admin-job-count { flex: 0 0 auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.lux-admin-job-error { display: grid; gap: 3px; margin-top: 9px; padding: 9px 10px; border-left: 2px solid rgba(220,89,115,.7); border-radius: 0 7px 7px 0; color: #f3aab8; font-size: .72rem; line-height: 1.45; background: rgba(220,89,115,.08); overflow-wrap: anywhere; }
+.lux-admin-job-error strong { color: inherit; font-size: .67rem; }
+.lux-admin-job-details { margin-top: 8px; padding: 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); font-size: .7rem; background: rgba(0,0,0,.12); }
+.lux-admin-job-details > strong { color: var(--lux-text); }
+.lux-admin-job-details p { margin: 0; }
+.lux-admin-job-details ul { display: grid; gap: 7px; margin: 8px 0 0; padding: 0; list-style: none; }
+.lux-admin-job-details li { display: grid; grid-template-columns: minmax(110px, .7fr) minmax(0, 1fr); gap: 10px; }
+.lux-admin-job-details code { overflow: hidden; color: var(--lux-subtle); text-overflow: ellipsis; white-space: nowrap; }
+.lux-admin-job-details-toggle { display: inline-flex; align-items: center; gap: 4px; min-height: 30px; padding: 0 8px; border: 1px solid var(--lux-line-soft); border-radius: 7px; color: var(--lux-muted); font: inherit; font-size: .68rem; background: transparent; cursor: pointer; }
+.lux-admin-job-details-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+html[data-lux-theme="light"] .lux-admin-job-error { color: #9f3047; background: rgba(190,47,76,.07); }
+html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,.035); }
 .lux-admin-job-finished-at { display: block; margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
 .lux-admin-job-attention { display: inline-flex; margin-top: 8px; color: #f3c788; font-size: .7rem; text-decoration: none; }
 .lux-admin-job-attention:hover { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
@@ -1087,9 +1132,16 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-header { padding: 18px 20px; }
   .lux-desktop-nav { display: none; }
   .lux-menu-button { display: inline-grid; }
-  .lux-mobile-nav { position: fixed; z-index: 25; top: var(--lux-header-height); right: 20px; display: grid; min-width: 180px; gap: 4px; padding: 10px; border: 1px solid var(--lux-line); border-radius: 13px; background: rgba(19,19,23,.92); box-shadow: 0 18px 44px rgba(0,0,0,.4); backdrop-filter: blur(18px); }
-  .lux-mobile-nav .lux-nav-link { padding: 10px 12px; }
-  .lux-mobile-nav .lux-nav-link.is-active::after { display: none; }
+  .lux-mobile-nav { position: fixed; z-index: 25; top: var(--lux-header-height); right: 16px; display: grid; min-width: 214px; gap: 4px; padding: 8px; border: 1px solid var(--lux-line); border-radius: 16px; background: rgba(19,19,23,.94); box-shadow: 0 18px 44px rgba(0,0,0,.4); backdrop-filter: blur(18px); }
+  .lux-mobile-nav .lux-mobile-nav-link { display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 0 13px; border: 1px solid transparent; border-radius: 10px; color: var(--lux-muted); font-size: .84rem; font-weight: 550; transition: color .18s ease, background .18s ease, border-color .18s ease; }
+  .lux-mobile-nav .lux-mobile-nav-icon { display: inline-grid; place-items: center; flex: 0 0 20px; width: 20px; height: 20px; color: var(--lux-subtle); }
+  .lux-mobile-nav .lux-mobile-nav-icon svg { display: block; width: 18px; height: 18px; stroke-width: 2; }
+  .lux-mobile-nav .lux-mobile-nav-label { min-width: 0; }
+  .lux-mobile-nav .lux-mobile-nav-link:hover { color: #fff; background: rgba(255,255,255,.07); }
+  .lux-mobile-nav .lux-mobile-nav-link:hover .lux-mobile-nav-icon { color: currentColor; }
+  .lux-mobile-nav .lux-mobile-nav-link.is-active { border-color: rgba(255,255,255,.12); color: #fff; background: rgba(255,255,255,.1); }
+  .lux-mobile-nav .lux-mobile-nav-link.is-active::after { content: none; }
+  .lux-mobile-nav .lux-mobile-nav-link.is-active .lux-mobile-nav-icon { color: #fff; }
   .lux-mobile-admin { display: flex; align-items: center; gap: 7px; padding: 10px 12px; border-top: 1px solid var(--lux-line-soft); color: var(--lux-subtle); font-size: .72rem; }
   .lux-hero { min-height: 680px; }
   .lux-hero-copy { margin-bottom: 74px; }
@@ -1233,6 +1285,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-admin-password-row { align-items: stretch; flex-direction: column; }
   .lux-admin-job-row, .lux-admin-log-row { grid-template-columns: 30px minmax(0, 1fr); }
   .lux-admin-job-actions, .lux-admin-log-row time { grid-column: 2; }
+  .lux-admin-job-actions { flex-wrap: wrap; }
+  .lux-admin-job-details li { grid-template-columns: 1fr; gap: 3px; }
   .lux-admin-pagination { align-items: stretch; flex-direction: column; }
   .lux-admin-pagination > div { display: grid; grid-template-columns: 1fr 1fr; }
   .lux-operations-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1665,9 +1719,14 @@ html[data-lux-theme="light"] .lux-app.is-home-route .lux-nav-link.is-active { co
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-icon-button,
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-user-button { border-color: var(--lux-line); background: rgba(255,255,255,.66); }
 html[data-lux-theme="light"] .lux-mobile-nav { border-color: var(--lux-line); background: rgba(255,255,255,.96); box-shadow: 0 18px 44px rgba(30,30,38,.16); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link { color: var(--lux-muted); }
 html[data-lux-theme="light"] .lux-mobile-nav .lux-nav-link { color: var(--lux-muted); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link:hover { color: var(--lux-text); background: rgba(28,28,34,.06); }
 html[data-lux-theme="light"] .lux-mobile-nav .lux-nav-link:hover { color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link.is-active { border-color: var(--lux-line-soft); color: var(--lux-text); background: rgba(28,28,34,.08); }
 html[data-lux-theme="light"] .lux-mobile-nav .lux-nav-link.is-active { color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link svg { color: var(--lux-subtle); }
+html[data-lux-theme="light"] .lux-mobile-nav .lux-mobile-nav-link.is-active svg { color: var(--lux-text); }
 
 /* Detail pages use the same pale reading layer as the light home hero. */
 html[data-lux-theme="light"] .lux-detail-page { color: var(--lux-text); background: var(--lux-bg); }

@@ -1899,7 +1899,11 @@ impl ScanJobService {
                     )
                     .await;
                 }
-                Err(error) => return self.fail_reconciliation_job(job, error).await,
+                Err(error) => {
+                    return self
+                        .fail_reconciliation_job(job, error, &[], job.processed_count)
+                        .await;
+                }
             }
         }
 
@@ -2166,7 +2170,11 @@ impl ScanJobService {
             };
             let report = match result {
                 Ok(report) => report,
-                Err(error) => return self.fail_reconciliation_job(job, error).await,
+                Err(error) => {
+                    return self
+                        .fail_reconciliation_job(job, error, &completed_entries, next_count)
+                        .await;
+                }
             };
             created_items = created_items.saturating_add(report.created_items);
             next_count = next_count.saturating_add(1);
@@ -2308,7 +2316,13 @@ impl ScanJobService {
                     )
                     .await
                 {
-                    return self.fail_reconciliation_job(job, error).await;
+                    let completed = completed_entries
+                        .iter()
+                        .map(|(_, entry)| entry.clone())
+                        .collect::<Vec<_>>();
+                    return self
+                        .fail_reconciliation_job(job, error, &completed, next_count)
+                        .await;
                 }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
@@ -2340,7 +2354,15 @@ impl ScanJobService {
                 let prepared = join_movie_preparation(&mut preparation_tasks).await;
                 let (index, root_id, entry, file) = match prepared {
                     Ok(result) => result,
-                    Err(error) => return self.fail_reconciliation_job(job, error).await,
+                    Err(error) => {
+                        let completed = completed_entries
+                            .iter()
+                            .map(|(_, entry)| entry.clone())
+                            .collect::<Vec<_>>();
+                        return self
+                            .fail_reconciliation_job(job, error, &completed, next_count)
+                            .await;
+                    }
                 };
                 active_tasks = active_tasks.saturating_sub(1);
                 if cancellation.load(Ordering::Acquire) {
@@ -2365,7 +2387,15 @@ impl ScanJobService {
             let prepared = join_movie_preparation(&mut preparation_tasks).await;
             let (index, root_id, entry, file) = match prepared {
                 Ok(result) => result,
-                Err(error) => return self.fail_reconciliation_job(job, error).await,
+                Err(error) => {
+                    let completed = completed_entries
+                        .iter()
+                        .map(|(_, entry)| entry.clone())
+                        .collect::<Vec<_>>();
+                    return self
+                        .fail_reconciliation_job(job, error, &completed, next_count)
+                        .await;
+                }
             };
             active_tasks = active_tasks.saturating_sub(1);
             if cancellation.load(Ordering::Acquire) {
@@ -2390,7 +2420,15 @@ impl ScanJobService {
                 .await
             {
                 Ok(inserted) => inserted,
-                Err(error) => return self.fail_reconciliation_job(job, error.into()).await,
+                Err(error) => {
+                    let completed = completed_entries
+                        .iter()
+                        .map(|(_, entry)| entry.clone())
+                        .collect::<Vec<_>>();
+                    return self
+                        .fail_reconciliation_job(job, error.into(), &completed, next_count)
+                        .await;
+                }
             };
             created_items = created_items.saturating_add(inserted);
         }
@@ -2455,11 +2493,15 @@ impl ScanJobService {
         &self,
         job: &StoredScanJob,
         error: ScannerError,
+        completed_entries: &[StoredReconciliationScanEntry],
+        next_count: i64,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let error_code = error.code();
-        self.database
-            .clear_reconciliation_scan_entries(&job.id)
-            .await?;
+        if !completed_entries.is_empty() {
+            self.database
+                .complete_reconciliation_files(&job.id, completed_entries, next_count)
+                .await?;
+        }
         self.database
             .finish_scan_job(&job.id, "FAILED", Some(&error.to_string()))
             .await?;
@@ -2796,6 +2838,7 @@ impl ScanJobService {
                     .await?
                     .ok_or(ScanJobError::JobNotFound)?;
                 let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
+                drop(_scan_permit);
                 if incremental {
                     self.run_metadata_after_incremental_scan(job_id).await?;
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
@@ -3393,6 +3436,11 @@ impl ScanJobService {
         }
         let cancellation = self.cancellation_flag(job_id);
         cancellation.store(true, Ordering::Release);
+        if job.status == "PENDING" {
+            self.database.request_scan_job_cancel(job_id).await?;
+            self.cancel_running_job(job_id).await?;
+            return Ok(());
+        }
         self.database.request_scan_job_cancel(job_id).await?;
         self.record_event(job_id, "INFO", "CANCEL_REQUESTED", "已请求取消任务", "{}")
             .await;
@@ -3409,8 +3457,32 @@ impl ScanJobService {
         let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
             return Err(ScanJobError::LibraryNotFound);
         };
-        self.create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
-            .await
+        if job.status == "CANCELLED" {
+            return self
+                .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
+                .await;
+        }
+        if let Some(active) = self
+            .database
+            .find_active_scan_job(&job.library_id, &job.job_type)
+            .await?
+        {
+            return Err(ScanJobError::AlreadyActive(active.id));
+        }
+        if job.job_type == "RECONCILE_LIBRARY"
+            && !self
+                .database
+                .has_reconciliation_scan_entries(&job.id)
+                .await?
+        {
+            return self
+                .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
+                .await;
+        }
+        if !self.database.retry_scan_job(&job.id).await? {
+            return Err(ScanJobError::AlreadyActive(job.id));
+        }
+        self.get_job(&job.id).await
     }
 
     async fn get_job(&self, id: &str) -> Result<ScanJob, ScanJobError> {

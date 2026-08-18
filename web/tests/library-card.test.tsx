@@ -47,6 +47,29 @@ describe("LibraryCard", () => {
     expect(container.querySelector(".lux-library-icon")).toBeNull();
   });
 
+  it("prefetches the library page on pointer hover and keyboard focus", async () => {
+    const onPrefetch = vi.fn();
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LibraryCard library={{ id: "library-1", name: "电影", kind: "MOVIE" }} onPrefetch={onPrefetch} />
+        </MemoryRouter>,
+      );
+    });
+
+    const link = container.querySelector<HTMLAnchorElement>(".lux-library-card-link");
+    await act(async () => {
+      link?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      link?.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    });
+
+    expect(onPrefetch).toHaveBeenCalledTimes(2);
+  });
+
   it("opens a custom context menu for whole-library operations", async () => {
     const reidentify = vi.spyOn(api, "startLibraryMetadataReidentify").mockResolvedValue({
       totalCount: 125,

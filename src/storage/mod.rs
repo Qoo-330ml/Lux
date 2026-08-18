@@ -1294,6 +1294,112 @@ impl Database {
         Ok((rows, total))
     }
 
+    pub(crate) async fn find_person_credits_for_libraries(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        person_id: &str,
+    ) -> Result<Vec<StoredPersonCredit>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT pc.person_id,
+                    pc.provider,
+                    MIN(pc.person_name) AS person_name,
+                    MIN(pc.role) AS role,
+                    MIN(mi.added_at) AS date_created,
+                    MIN(pc.biography) AS biography,
+                    MIN(pc.birthday) AS birthday,
+                    MIN(pc.deathday) AS deathday,
+                    MIN(pc.known_for_department) AS known_for_department,
+                    MIN(pc.place_of_birth) AS place_of_birth
+             FROM person_credits pc
+             JOIN media_items mi ON mi.id = pc.item_id
+             WHERE mi.library_id IN ({placeholders})
+               AND mi.removed_at IS NULL
+               AND pc.person_type = ?
+               AND pc.person_id = ?
+             GROUP BY pc.provider, pc.person_id
+             ORDER BY CASE WHEN pc.provider = '' THEN 1 ELSE 0 END,
+                      pc.provider ASC,
+                      pc.person_id ASC"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        let rows = statement
+            .bind(person_type)
+            .bind(person_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(stored_person_credit)
+            .collect();
+        Ok(rows)
+    }
+
+    pub(crate) async fn find_person_credits_for_libraries_by_name(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        person_name: &str,
+    ) -> Result<Vec<StoredPersonCredit>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT pc.person_id,
+                    pc.provider,
+                    MIN(pc.person_name) AS person_name,
+                    MIN(pc.role) AS role,
+                    MIN(mi.added_at) AS date_created,
+                    MIN(pc.biography) AS biography,
+                    MIN(pc.birthday) AS birthday,
+                    MIN(pc.deathday) AS deathday,
+                    MIN(pc.known_for_department) AS known_for_department,
+                    MIN(pc.place_of_birth) AS place_of_birth
+             FROM person_credits pc
+             JOIN media_items mi ON mi.id = pc.item_id
+             WHERE mi.library_id IN ({placeholders})
+               AND mi.removed_at IS NULL
+               AND pc.person_type = ?
+               AND pc.person_name = ?
+             GROUP BY pc.provider, pc.person_id
+             ORDER BY CASE WHEN pc.provider = '' THEN 1 ELSE 0 END,
+                      pc.provider ASC,
+                      pc.person_id ASC"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        let rows = statement
+            .bind(person_type)
+            .bind(person_name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(stored_person_credit)
+            .collect();
+        Ok(rows)
+    }
+
     pub(crate) async fn list_media_item_ids_for_library(
         &self,
         library_id: &str,
@@ -3768,6 +3874,25 @@ impl Database {
         })
     }
 
+    pub(crate) async fn has_reconciliation_scan_entries(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM reconciliation_scan_entries WHERE job_id = ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn claim_strm_probe_job(&self, id: &str) -> Result<bool, StorageError> {
         self.query(
             "UPDATE strm_probe_jobs
@@ -4684,6 +4809,31 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_active_scan_job(
+        &self,
+        library_id: &str,
+        job_type: &str,
+    ) -> Result<Option<StoredScanJob>, StorageError> {
+        self.query(
+            "SELECT id, library_id, job_type, status, generation, cursor,
+                    processed_count, total_count, cancel_requested, error,
+                    finished_at,
+                    discovery_completed, auto_metadata_match
+             FROM scan_jobs
+             WHERE library_id = ? AND job_type = ? AND status IN ('PENDING', 'RUNNING')
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(library_id)
+        .bind(job_type)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_scan_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn claim_scan_job(&self, id: &str) -> Result<bool, StorageError> {
         self.query(
             "UPDATE scan_jobs
@@ -4905,6 +5055,23 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn retry_scan_job(&self, id: &str) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE scan_jobs
+             SET status = 'PENDING', cancel_requested = 0, error = NULL,
+                 started_at = NULL, finished_at = NULL, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('FAILED', 'CANCELLED')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -7292,47 +7459,123 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let count_query = format!(
-            "SELECT COUNT(*) FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL
-               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}
-               AND mi.library_id IN ({placeholders})"
+            "SELECT CAST(COALESCE(SUM(item_count), 0) AS BIGINT)
+             FROM (
+                 SELECT COUNT(*) AS item_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type <> 'FOLDER'
+                   AND mi.has_available_source = 1
+                   AND mi.library_id IN ({placeholders})
+                 UNION ALL
+                 SELECT COUNT(*) AS item_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')
+                   AND mi.has_available_source = 0
+                   AND mi.library_id IN ({placeholders})
+                   AND (
+                       EXISTS (
+                           SELECT 1
+                           FROM media_items visible_child
+                           WHERE visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                             AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM collection_items visible_collection_item
+                           JOIN collections visible_collection
+                             ON visible_collection.id = visible_collection_item.collection_id
+                           JOIN media_items visible_child
+                             ON visible_child.id = visible_collection_item.item_id
+                           WHERE visible_collection.item_id = mi.id
+                             AND visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                       )
+                   )
+             ) visible_catalog"
         );
         let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
         }
-        let total = count_statement
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-
+        for library_id in library_ids {
+            count_statement = count_statement.bind(library_id);
+        }
         let list_query = format!(
-            "SELECT mi.id
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL
-               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}
-               AND mi.library_id IN ({placeholders})
-             ORDER BY mi.added_at DESC, mi.sort_title, mi.id
+            "WITH visible_catalog AS (
+                 SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type <> 'FOLDER'
+                   AND mi.has_available_source = 1
+                   AND mi.library_id IN ({placeholders})
+                 UNION ALL
+                 SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')
+                   AND mi.has_available_source = 0
+                   AND mi.library_id IN ({placeholders})
+                   AND (
+                       EXISTS (
+                           SELECT 1
+                           FROM media_items visible_child
+                           WHERE visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                             AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM collection_items visible_collection_item
+                           JOIN collections visible_collection
+                             ON visible_collection.id = visible_collection_item.collection_id
+                           JOIN media_items visible_child
+                             ON visible_child.id = visible_collection_item.item_id
+                           WHERE visible_collection.item_id = mi.id
+                             AND visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                       )
+                   )
+             )
+             SELECT id
+             FROM visible_catalog
+             ORDER BY added_at DESC, sort_title, id
              LIMIT ? OFFSET ?"
         );
         let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
         }
-        let rows = list_statement
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        for library_id in library_ids {
+            list_statement = list_statement.bind(library_id);
+        }
+        let count_future = async {
+            count_statement
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })
+        };
+        let list_future = async {
+            list_statement
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })
+        };
+        let (total, rows) = tokio::try_join!(count_future, list_future)?;
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
 
@@ -7344,23 +7587,10 @@ impl Database {
         if library_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat_n("?", library_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query = format!(
-            "WITH ranked AS (
-                 SELECT mi.id, mi.library_id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY mi.library_id
-                            ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC
-                        ) AS library_rank
-                 FROM media_items mi
-                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND mi.item_type IN ('MOVIE', 'SERIES')
-                   AND mi.library_id IN ({placeholders})
-             )
-             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+        let mut rows = Vec::new();
+        for library_id in library_ids {
+            let query =
+                "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
@@ -7381,7 +7611,49 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM ranked
+             FROM (
+                 WITH visible_catalog AS (
+                     SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                     FROM media_items mi
+                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                     WHERE mi.library_id = ?
+                       AND mi.item_type IN ('MOVIE', 'SERIES')
+                       AND mi.removed_at IS NULL
+                       AND mi.has_available_source = 1
+                     UNION ALL
+                     SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                     FROM media_items mi
+                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                     WHERE mi.library_id = ?
+                       AND mi.item_type = 'SERIES'
+                       AND mi.removed_at IS NULL
+                       AND mi.has_available_source = 0
+                       AND (
+                           EXISTS (
+                               SELECT 1
+                               FROM media_items visible_child
+                               WHERE visible_child.removed_at IS NULL
+                                 AND visible_child.has_available_source = 1
+                                 AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                           )
+                           OR EXISTS (
+                               SELECT 1
+                               FROM collection_items visible_collection_item
+                               JOIN collections visible_collection
+                                 ON visible_collection.id = visible_collection_item.collection_id
+                               JOIN media_items visible_child
+                                 ON visible_child.id = visible_collection_item.item_id
+                               WHERE visible_collection.item_id = mi.id
+                                 AND visible_child.removed_at IS NULL
+                                 AND visible_child.has_available_source = 1
+                           )
+                       )
+                 )
+                 SELECT id, library_id
+                 FROM visible_catalog
+                 ORDER BY added_at DESC, sort_title ASC, id ASC
+                 LIMIT ?
+             ) ranked
              JOIN media_items mi ON mi.id = ranked.id
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
@@ -7390,13 +7662,21 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE ranked.library_rank <= ?
-             ORDER BY ranked.library_id, ranked.library_rank, ms.id, mt.stream_index"
-        );
-        let mut binds = Vec::with_capacity(library_ids.len() + 1);
-        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
-        binds.push(CatalogBind::Integer(limit));
-        self.fetch_catalog_rows(&query, &binds).await
+             ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC,
+                      ms.id, mt.stream_index";
+            let library_rows = self
+                .fetch_catalog_rows(
+                    query,
+                    &[
+                        CatalogBind::Text(library_id),
+                        CatalogBind::Text(library_id),
+                        CatalogBind::Integer(limit),
+                    ],
+                )
+                .await?;
+            rows.extend(library_rows);
+        }
+        Ok(rows)
     }
 
     pub(crate) async fn list_recommended_catalog_rows(
@@ -7650,7 +7930,6 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-
         let list_sql = format!(
             "SELECT mi.id
              FROM media_items mi
@@ -7948,14 +8227,6 @@ impl Database {
                 CatalogBind::Integer(value) => count_statement.bind(*value),
             };
         }
-        let total = count_statement
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-
         let item_order = match (filter.sort_by, filter.descending) {
             (CatalogSort::DateCreated, true) => "mi.added_at DESC, LOWER(mi.title) ASC, mi.id ASC",
             (CatalogSort::DateCreated, false) => "mi.added_at ASC, LOWER(mi.title) ASC, mi.id ASC",
@@ -8018,10 +8289,20 @@ impl Database {
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              ORDER BY {item_order}, ms.id, mt.stream_index"
         );
-        let mut list_binds = filter_binds;
+        let mut list_binds = filter_binds.clone();
         list_binds.push(CatalogBind::Integer(filter.limit));
         list_binds.push(CatalogBind::Integer(filter.offset));
-        let rows = self.fetch_catalog_rows(&query, &list_binds).await?;
+        let total_future = async {
+            count_statement
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })
+        };
+        let rows_future = self.fetch_catalog_rows(&query, &list_binds);
+        let (total, rows) = tokio::try_join!(total_future, rows_future)?;
         Ok((rows, total))
     }
 
@@ -11618,6 +11899,9 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
              ON media_items(parent_id, removed_at)",
             "CREATE INDEX idx_media_items_series_removed
              ON media_items(series_id, removed_at)",
+            "CREATE INDEX idx_media_items_library_type_visible
+             ON media_items(library_id, item_type, id)
+             WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
                 VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),

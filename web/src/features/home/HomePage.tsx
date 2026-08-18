@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
@@ -12,12 +12,21 @@ import { HERO_CAROUSEL_INTERVAL_MS, heroSlides, heroTitleScale } from "./carouse
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 
 export function HomePage({ user }: { user: LuxUser }) {
+  const queryClient = useQueryClient();
   const home = useQuery({
     queryKey: queryKeys.home,
     queryFn: () => api.home(),
     refetchInterval: queryRefreshIntervals.mediaSurface,
     refetchIntervalInBackground: false,
   });
+
+  useEffect(() => {
+    if (home.data) {
+      queryClient.setQueryData(queryKeys.libraries, {
+        libraries: home.data.libraries ?? [],
+      });
+    }
+  }, [home.data, queryClient]);
 
   if (home.isPending) return <HomeSkeleton />;
   if (home.error) return <section className="lux-page-state"><h1>首页加载失败</h1><p>{home.error.message}</p></section>;
