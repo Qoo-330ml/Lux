@@ -173,6 +173,54 @@ async fn completed_flat_movie_scan_indexes_media_prefixed_images_per_item()
 }
 
 #[tokio::test]
+async fn rescan_updates_an_existing_local_image_path() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Updated Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Updated.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(movie_dir.join("poster.jpg"), b"old-poster").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first_job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&first_job.id, 100, None).await?;
+    let first_image: (String, Option<String>) = sqlx::query_as(
+        "SELECT local_path, content_tag FROM item_images WHERE image_type = 'POSTER'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    tokio::fs::remove_file(movie_dir.join("poster.jpg")).await?;
+    tokio::fs::write(movie_dir.join("poster.webp"), b"new-poster").await?;
+    let second_job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&second_job.id, 100, None).await?;
+
+    let second_image: (String, Option<String>) = sqlx::query_as(
+        "SELECT local_path, content_tag FROM item_images WHERE image_type = 'POSTER'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(second_image.0.ends_with("poster.webp"));
+    assert!(first_image.1.is_some());
+    assert!(second_image.1.is_some());
+    assert_ne!(first_image.1, second_image.1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_mixed_scan_indexes_local_movie_and_series_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

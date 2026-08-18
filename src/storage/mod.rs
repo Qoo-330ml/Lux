@@ -11245,24 +11245,38 @@ impl Database {
         item_id: &str,
         image_type: &str,
         local_path: &std::path::Path,
-        file_size: i64,
-        width: Option<i32>,
-        height: Option<i32>,
+        metadata: ItemImageMetadata<'_>,
     ) -> Result<bool, StorageError> {
         let id = Uuid::now_v7().to_string();
         self.query(
             "INSERT INTO item_images (
-                id, item_id, image_type, image_index, local_path, width, height, file_size, source
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, 'LOCAL')
-            ON CONFLICT(item_id, image_type, image_index) DO NOTHING",
+                id, item_id, image_type, image_index, local_path, width, height,
+                file_size, content_tag, source
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
+                id = excluded.id,
+                local_path = excluded.local_path,
+                width = excluded.width,
+                height = excluded.height,
+                file_size = excluded.file_size,
+                content_tag = excluded.content_tag,
+                source = excluded.source,
+                updated_at = unixepoch()
+            WHERE item_images.local_path <> excluded.local_path
+               OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
+               OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
+               OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
+               OR item_images.source <> excluded.source",
         )
         .bind(id)
         .bind(item_id)
         .bind(image_type)
         .bind(local_path.to_string_lossy().as_ref())
-        .bind(width)
-        .bind(height)
-        .bind(file_size)
+        .bind(metadata.width)
+        .bind(metadata.height)
+        .bind(metadata.file_size)
+        .bind(metadata.content_tag)
+        .bind(metadata.source)
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)

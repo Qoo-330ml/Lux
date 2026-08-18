@@ -1,10 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    io::Read,
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use crate::{
@@ -19,7 +21,7 @@ use crate::{
     },
     domain::ids::LibraryId,
     storage::{
-        Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath,
+        Database, ItemImageMetadata, MediaMetadataUpdate, StorageError, StoredMediaSourcePath,
         StoredSeriesMetadataSource,
     },
 };
@@ -693,6 +695,18 @@ impl MetadataEnricher {
                     continue;
                 }
             };
+            let content_tag = match image_content_tag(&image.path).await {
+                Ok(content_tag) => content_tag,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        path = %image.path.display(),
+                        %error,
+                        "local movie image fingerprint could not be read; skipping image"
+                    );
+                    continue;
+                }
+            };
             let dimensions = read_image_dimensions(&image.path).await;
             match self
                 .database
@@ -700,9 +714,13 @@ impl MetadataEnricher {
                     item_id,
                     image.image_type.as_str(),
                     &image.path,
-                    file_size,
-                    dimensions.map(|(width, _)| width),
-                    dimensions.map(|(_, height)| height),
+                    ItemImageMetadata {
+                        file_size,
+                        width: dimensions.map(|(width, _)| width),
+                        height: dimensions.map(|(_, height)| height),
+                        content_tag: &content_tag,
+                        source: "LOCAL",
+                    },
                 )
                 .await
             {
@@ -1102,6 +1120,13 @@ impl MetadataEnricher {
                     path: image.path.clone(),
                     size: file_size,
                 })?;
+            let content_tag =
+                image_content_tag(&image.path)
+                    .await
+                    .map_err(|source| MetadataError::Io {
+                        path: image.path.clone(),
+                        source,
+                    })?;
             let dimensions = read_image_dimensions(&image.path).await;
             if self
                 .database
@@ -1109,9 +1134,13 @@ impl MetadataEnricher {
                     item_id,
                     image.image_type.as_str(),
                     &image.path,
-                    file_size,
-                    dimensions.map(|(width, _)| width),
-                    dimensions.map(|(_, height)| height),
+                    ItemImageMetadata {
+                        file_size,
+                        width: dimensions.map(|(width, _)| width),
+                        height: dimensions.map(|(_, height)| height),
+                        content_tag: &content_tag,
+                        source: "LOCAL",
+                    },
                 )
                 .await?
             {
@@ -1142,6 +1171,25 @@ impl MetadataReport {
         self.nfo_skipped += other.nfo_skipped;
         self.images_found += other.images_found;
     }
+}
+
+async fn image_content_tag(path: &Path) -> Result<String, std::io::Error> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("image fingerprint worker failed: {error}")))?
 }
 
 pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
