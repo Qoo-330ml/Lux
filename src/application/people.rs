@@ -792,6 +792,7 @@ impl PeopleService {
                     known_for_department: update.known_for_department.clone(),
                     place_of_birth: update.place_of_birth.clone(),
                 });
+                self.write_person_nfo_for_actor(actor).await?;
                 item_updated = true;
             }
             if !item_updated {
@@ -812,6 +813,38 @@ impl PeopleService {
             updated = true;
         }
         Ok(updated)
+    }
+
+    async fn write_person_nfo_for_actor(&self, actor: &StoredActor) -> Result<(), PeopleError> {
+        let person_id = actor_id_from_stored_actor(actor);
+        let provider = if actor.provider.trim().is_empty() {
+            actor
+                .identities
+                .iter()
+                .find(|identity| identity.id == person_id)
+                .map(|identity| identity.provider.as_str())
+                .unwrap_or_default()
+        } else {
+            actor.provider.trim()
+        };
+        if !is_valid_person_id(&person_id) || !is_valid_person_id(provider) {
+            return Err(PeopleError::InvalidComponent(person_id));
+        }
+        let legacy_dir = people_directory(&self.config_dir, &actor.name, provider, &person_id)
+            .map_err(PeopleError::from)?;
+        let person_dir = if safe_metadata(&legacy_dir).await.ok().flatten().is_some() {
+            legacy_dir
+        } else if let Some(person_key) = actor.person_key.as_deref() {
+            canonical_person_directory(&self.config_dir, person_key).map_err(PeopleError::from)?
+        } else {
+            legacy_dir
+        };
+        create_private_dir(&person_dir).await?;
+        write_atomically(
+            &person_dir.join(PERSON_NFO),
+            &person_nfo_bytes(&actor.name, provider, &person_id, actor.person.as_ref()),
+        )
+        .await
     }
 
     async fn actor_views_from_credits(&self, credits: Vec<StoredPersonCredit>) -> Vec<ActorView> {

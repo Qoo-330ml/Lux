@@ -3,7 +3,7 @@ use luxd::{
     api::{AppState, app_with_state},
     application::{
         libraries::LibraryService,
-        metadata_paths::library_item_directory,
+        metadata_paths::{canonical_person_directory, library_item_directory},
         people::{ActorCredit, PeopleService, PersonMetadata},
         scanner::LibraryScanner,
         setup::SetupService,
@@ -391,6 +391,25 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(person_update_body["BirthDate"], "1990-01-02");
     assert_eq!(person_update_body["KnownForDepartment"], "Acting");
     assert_eq!(person_update_body["PlaceOfBirth"], "北京");
+
+    let updated_relation_path =
+        library_item_directory(&temp_dir.path().join("config"), &second_item_id)?
+            .join("people.json");
+    let updated_relation: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(updated_relation_path).await?)?;
+    let person_key = updated_relation["actors"]
+        .as_array()
+        .and_then(|actors| actors.iter().find(|actor| actor["id"] == "104"))
+        .and_then(|actor| actor["personKey"].as_str())
+        .ok_or("missing updated person key")?;
+    let person_nfo =
+        canonical_person_directory(&temp_dir.path().join("config"), person_key)?.join("person.nfo");
+    let person_nfo_body = tokio::fs::read_to_string(person_nfo).await?;
+    assert!(person_nfo_body.contains("<name>演员丁</name>"));
+    assert!(person_nfo_body.contains("<biography>MDC 更新后的演员简介</biography>"));
+    assert!(person_nfo_body.contains("<birthday>1990-01-02</birthday>"));
+    assert!(person_nfo_body.contains("<knownfor>Acting</knownfor>"));
+    assert!(person_nfo_body.contains("<placeofbirth>北京</placeofbirth>"));
 
     let person_image_upload = client
         .post(format!(
