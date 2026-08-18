@@ -73,6 +73,25 @@ function getStorage(): Storage | null {
   }
 }
 
+function LibraryPageLoadingState({ libraryName }: { libraryName?: string }) {
+  return (
+    <section className="lux-page lux-page-narrow lux-library-page-loading" aria-busy="true">
+      <div className="lux-page-heading">
+        <span className="lux-skeleton-line lux-library-page-skeleton-title" aria-hidden="true" />
+        {libraryName ? <p>{libraryName} · 正在加载首屏内容…</p> : <p>正在加载媒体库…</p>}
+      </div>
+      <div className="lux-library-sort-toolbar" aria-hidden="true">
+        <span className="lux-skeleton-line lux-library-page-skeleton-control" />
+        <span className="lux-skeleton-line lux-library-page-skeleton-control" />
+        <span className="lux-skeleton-line lux-library-page-skeleton-control" />
+      </div>
+      <div className="lux-poster-grid" aria-hidden="true">
+        {Array.from({ length: 12 }, (_, index) => <span className="lux-library-page-skeleton-card" key={index} />)}
+      </div>
+    </section>
+  );
+}
+
 export function LibraryPage({ serverName }: { serverName?: string | null } = {}) {
   const { libraryId = "" } = useParams();
   const queryClient = useQueryClient();
@@ -144,10 +163,10 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     return () => observer.disconnect();
   }, [pages.fetchNextPage, pages.hasNextPage, pages.isFetchingNextPage]);
 
-  if (libraries.isPending) return <section className="lux-page-state"><p>正在整理媒体库…</p></section>;
+  if (libraries.isPending) return <LibraryPageLoadingState />;
   if (pages.error && !pages.data) return <section className="lux-page-state"><h1>媒体库加载失败</h1><p>{pages.error.message}</p></section>;
   if (!library) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
-  if (pages.isPending) return <section className="lux-page-state"><p>正在整理媒体库…</p></section>;
+  if (pages.isPending) return <LibraryPageLoadingState libraryName={library.name} />;
 
   const loadedItems = pages.data?.pages.flatMap((page) => page.items ?? []) ?? [];
   const total = pages.data?.pages[0]?.total ?? 0;
