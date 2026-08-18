@@ -3768,6 +3768,25 @@ impl Database {
         })
     }
 
+    pub(crate) async fn has_reconciliation_scan_entries(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM reconciliation_scan_entries WHERE job_id = ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn claim_strm_probe_job(&self, id: &str) -> Result<bool, StorageError> {
         self.query(
             "UPDATE strm_probe_jobs
@@ -4684,6 +4703,31 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_active_scan_job(
+        &self,
+        library_id: &str,
+        job_type: &str,
+    ) -> Result<Option<StoredScanJob>, StorageError> {
+        self.query(
+            "SELECT id, library_id, job_type, status, generation, cursor,
+                    processed_count, total_count, cancel_requested, error,
+                    finished_at,
+                    discovery_completed, auto_metadata_match
+             FROM scan_jobs
+             WHERE library_id = ? AND job_type = ? AND status IN ('PENDING', 'RUNNING')
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(library_id)
+        .bind(job_type)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_scan_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn claim_scan_job(&self, id: &str) -> Result<bool, StorageError> {
         self.query(
             "UPDATE scan_jobs
@@ -4905,6 +4949,23 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn retry_scan_job(&self, id: &str) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE scan_jobs
+             SET status = 'PENDING', cancel_requested = 0, error = NULL,
+                 started_at = NULL, finished_at = NULL, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('FAILED', 'CANCELLED')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
