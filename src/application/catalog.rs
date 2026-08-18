@@ -93,11 +93,11 @@ impl CatalogService {
         if !self.access.can_view_library(principal, library_id).await? {
             return Err(CatalogError::AccessDenied);
         }
-        let total = self.database.count_catalog_items(Some(library_id)).await?;
-        let rows = self
-            .database
-            .list_catalog_rows(Some(library_id), offset, limit)
-            .await?;
+        let (total, rows) = tokio::try_join!(
+            self.database.count_catalog_items(Some(library_id)),
+            self.database
+                .list_catalog_rows(Some(library_id), offset, limit),
+        )?;
         let mut items = assemble_items(rows);
         self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
@@ -150,8 +150,8 @@ impl CatalogService {
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
         let mut items = assemble_items(rows);
-        self.populate_item_details(&mut items).await?;
-        self.populate_episode_counts(&mut items).await?;
+        self.populate_item_details_and_episode_counts(&mut items)
+            .await?;
         Ok(CatalogPage {
             items,
             total,
@@ -192,8 +192,8 @@ impl CatalogService {
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
         let mut items = assemble_items(rows);
-        self.populate_item_details(&mut items).await?;
-        self.populate_episode_counts(&mut items).await?;
+        self.populate_item_details_and_episode_counts(&mut items)
+            .await?;
         Ok(CatalogPage {
             items,
             total,
@@ -223,9 +223,11 @@ impl CatalogService {
             .await?;
         let mut items = assemble_items(rows);
         if matches!(item_type, "SEASON" | "EPISODE") {
-            self.populate_item_details(&mut items).await?;
+            self.populate_item_details_and_episode_counts(&mut items)
+                .await?;
+        } else {
+            self.populate_episode_counts(&mut items).await?;
         }
-        self.populate_episode_counts(&mut items).await?;
         Ok(CatalogPage {
             items,
             total,
@@ -537,6 +539,31 @@ impl CatalogService {
         let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
         for item in &mut *items {
             if let Some(detail) = details.get(&item.id) {
+                item.season_count = Some(detail.season_count);
+                item.series_name = detail.series_name.clone();
+            }
+            item.episode_count = episode_counts.get(&item.id).copied();
+        }
+        Ok(())
+    }
+
+    async fn populate_item_details_and_episode_counts(
+        &self,
+        items: &mut [CatalogItem],
+    ) -> Result<(), CatalogError> {
+        let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let episode_item_ids = items
+            .iter()
+            .filter(|item| item.item_type == "SERIES" || item.item_type == "SEASON")
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let (details, episode_counts) = tokio::try_join!(
+            self.database.list_catalog_details_by_ids(&item_ids),
+            self.database.list_episode_counts(&episode_item_ids),
+        )?;
+        for item in &mut *items {
+            if let Some(detail) = details.get(&item.id) {
+                apply_catalog_detail(item, detail);
                 item.season_count = Some(detail.season_count);
                 item.series_name = detail.series_name.clone();
             }
