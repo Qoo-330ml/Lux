@@ -327,7 +327,7 @@ describe("LuxApiClient", () => {
 
     const client = new LuxApiClient();
     await expect(client.startItemMetadataRefresh("item-1")).resolves.toEqual({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } });
-    await expect(client.startItemLibraryScan("item-1")).resolves.toEqual({ job: { id: "scan-job-1" } });
+    await expect(client.startItemFolderScan("item-1")).resolves.toEqual({ job: { id: "scan-job-1" } });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 

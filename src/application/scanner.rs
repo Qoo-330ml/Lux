@@ -1643,45 +1643,9 @@ impl ScanJobService {
         if valid_changes.is_empty() {
             return Err(ScanJobError::NoChanges);
         }
-        let job = if let Some(active) = self
-            .database
-            .find_active_scan_job_for_library(&library_id_text)
-            .await?
-        {
-            if active.job_type != "INCREMENTAL_SCAN" {
-                return Err(ScanJobError::AlreadyActive(active.id));
-            }
-            active
-        } else {
-            let id = Uuid::now_v7().to_string();
-            let generation = Uuid::now_v7().to_string();
-            if let Err(error) = self
-                .database
-                .create_scan_job(
-                    &id,
-                    &library_id_text,
-                    "INCREMENTAL_SCAN",
-                    &generation,
-                    0,
-                    false,
-                )
-                .await
-            {
-                if error.is_unique_violation()
-                    && let Some(active) = self
-                        .database
-                        .find_active_scan_job_for_library(&library_id_text)
-                        .await?
-                {
-                    return Err(ScanJobError::AlreadyActive(active.id));
-                }
-                return Err(error.into());
-            }
-            self.database
-                .find_scan_job(&id)
-                .await?
-                .ok_or(ScanJobError::JobNotFound)?
-        };
+        let job = self
+            .get_or_create_incremental_scan_job(&library_id_text, true)
+            .await?;
         self.cancellation_flag(&job.id);
         for (root_id, relative_path, kind) in valid_changes {
             self.database
@@ -1702,6 +1666,88 @@ impl ScanJobService {
         )
         .await;
         self.get_job(&job.id).await
+    }
+
+    pub async fn create_item_folder_scan_job(
+        &self,
+        item_id: &str,
+    ) -> Result<ScanJob, ScanJobError> {
+        let Some(source) = self.database.find_item_scan_source_path(item_id).await? else {
+            return Err(ScanJobError::ItemNotFound);
+        };
+        let Some(library) = self.database.find_library(&source.library_id).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if !library.is_enabled {
+            return Err(ScanJobError::LibraryNotFound);
+        }
+        let folder = media_source_folder(&source.relative_path)?;
+        let job = self
+            .get_or_create_incremental_scan_job(&source.library_id, false)
+            .await?;
+        self.cancellation_flag(&job.id);
+        self.database
+            .enqueue_incremental_scan_path(&job.id, &source.library_root_id, &folder, "MODIFY")
+            .await?;
+        self.record_event(
+            &job.id,
+            "INFO",
+            "PATHS_QUEUED",
+            "已加入媒体所在文件夹扫描路径",
+            "{}",
+        )
+        .await;
+        self.get_job(&job.id).await
+    }
+
+    async fn get_or_create_incremental_scan_job(
+        &self,
+        library_id: &str,
+        auto_metadata_match: bool,
+    ) -> Result<StoredScanJob, ScanJobError> {
+        if let Some(active) = self
+            .database
+            .find_active_scan_job_for_library(library_id)
+            .await?
+        {
+            if active.job_type != "INCREMENTAL_SCAN" {
+                return Err(ScanJobError::AlreadyActive(active.id));
+            }
+            if auto_metadata_match && !active.auto_metadata_match {
+                self.database
+                    .enable_scan_job_auto_metadata_match(&active.id)
+                    .await?;
+            }
+            return Ok(active);
+        }
+        let id = Uuid::now_v7().to_string();
+        let generation = Uuid::now_v7().to_string();
+        if let Err(error) = self
+            .database
+            .create_scan_job(
+                &id,
+                library_id,
+                "INCREMENTAL_SCAN",
+                &generation,
+                0,
+                auto_metadata_match,
+            )
+            .await
+        {
+            if error.is_unique_violation()
+                && let Some(active) = self
+                    .database
+                    .find_active_scan_job_for_library(library_id)
+                    .await?
+            {
+                return Err(ScanJobError::AlreadyActive(active.id));
+            }
+            return Err(error.into());
+        }
+        self.database
+            .find_scan_job(&id)
+            .await?
+            .ok_or(ScanJobError::JobNotFound)
     }
 
     pub async fn create_movie_scan_job(
@@ -2843,17 +2889,19 @@ impl ScanJobService {
                     self.run_metadata_after_incremental_scan(job_id).await?;
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
                         .await?;
-                    if let Some(metadata) = metadata {
-                        self.schedule_online_metadata_after_incremental_scan(job_id, metadata)
+                    if completed_job.auto_metadata_match {
+                        if let Some(metadata) = metadata {
+                            self.schedule_online_metadata_after_incremental_scan(job_id, metadata)
+                                .await;
+                        }
+                        if let Some(strm_probe) = self.strm_probe.clone() {
+                            self.schedule_strm_probe_after_incremental_scan(
+                                job_id,
+                                &completed_job.library_id,
+                                strm_probe,
+                            )
                             .await;
-                    }
-                    if let Some(strm_probe) = self.strm_probe.clone() {
-                        self.schedule_strm_probe_after_incremental_scan(
-                            job_id,
-                            &completed_job.library_id,
-                            strm_probe,
-                        )
-                        .await;
+                        }
                     }
                     self.run_auto_library_cover_after_scan(job_id).await?;
                     if let Some(home) = &self.home {
@@ -3585,6 +3633,7 @@ pub struct ScanBatchReport {
 #[derive(Debug)]
 pub enum ScanJobError {
     LibraryNotFound,
+    ItemNotFound,
     JobNotFound,
     NoChanges,
     AlreadyActive(String),
@@ -3598,6 +3647,7 @@ impl std::fmt::Display for ScanJobError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LibraryNotFound => formatter.write_str("library not found"),
+            Self::ItemNotFound => formatter.write_str("media item not found"),
             Self::JobNotFound => formatter.write_str("scan job not found"),
             Self::NoChanges => formatter.write_str("incremental scan has no valid changes"),
             Self::AlreadyActive(id) => write!(formatter, "scan job already active: {id}"),
@@ -3625,6 +3675,32 @@ fn normalize_incremental_path(value: &str) -> Result<String, ScanJobError> {
         )));
     }
     Ok(value.to_owned())
+}
+
+fn media_source_folder(value: &str) -> Result<String, ScanJobError> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ScanJobError::Scanner(ScannerError::InvalidRelativePath(
+            value.to_owned(),
+        )));
+    }
+    let folder = path
+        .parent()
+        .and_then(|parent| parent.to_str())
+        .unwrap_or("");
+    if folder.is_empty() {
+        Ok(".".to_owned())
+    } else {
+        Ok(folder.to_owned())
+    }
 }
 
 fn change_kind_name(kind: ChangeKind) -> &'static str {
@@ -4196,5 +4272,19 @@ impl std::error::Error for ScannerError {
 impl From<StorageError> for ScannerError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::media_source_folder;
+
+    #[test]
+    fn media_source_folder_uses_the_source_parent_directory() {
+        assert_eq!(
+            media_source_folder("Movies/Dune/Dune.2021.mkv").unwrap(),
+            "Movies/Dune"
+        );
+        assert_eq!(media_source_folder("Dune.2021.mkv").unwrap(), ".");
     }
 }

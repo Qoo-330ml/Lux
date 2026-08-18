@@ -130,8 +130,8 @@ export function MediaCard({ item, landscape = false, compactRating = false, meta
     setActionError(undefined);
     setActionNotice(undefined);
     try {
-      await api.startItemLibraryScan(item.id);
-      setActionNotice("扫描任务已提交");
+      await api.startItemFolderScan(item.id);
+      setActionNotice("所在文件夹扫描任务已提交");
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "媒体库扫描任务提交失败，请重试。");
     }
@@ -166,7 +166,7 @@ export function MediaCard({ item, landscape = false, compactRating = false, meta
               {progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
             </div>
           </Link>
-          <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+          <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
         </div>
         <Link className="lux-media-card-link" to={detailHref}>
           <div className="lux-media-copy">

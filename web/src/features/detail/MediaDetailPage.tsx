@@ -160,8 +160,8 @@ export function MediaDetailPage() {
     setActionError(undefined);
     setActionNotice(undefined);
     try {
-      await api.startItemLibraryScan(media.id);
-      setActionNotice("媒体库扫描任务已提交，可在管理任务中查看进度。");
+      await api.startItemFolderScan(media.id);
+      setActionNotice("所在文件夹扫描任务已提交，可在管理任务中查看进度。");
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "媒体库扫描任务提交失败，请重试。");
     }
@@ -260,7 +260,7 @@ export function MediaDetailPage() {
               >
                 <Check size={20} strokeWidth={2.4} />
               </button>
-              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanLibrary={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
               {pendingReview && nextPendingItem ? <Link className="lux-button lux-button-glass lux-detail-next-pending" data-action="next-pending" to={`/items/${nextPendingItem.id}?metadataStatus=pending`}>下一个待确认</Link> : null}
               {source ? <span className="lux-detail-source"><Radio size={16} /> {source.container || "DIRECT PLAY"}</span> : null}
             </div>

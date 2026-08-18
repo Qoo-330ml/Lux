@@ -11514,12 +11514,12 @@ async fn admin_start_item_scan(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_id = match database.find_item_library_id(&item_id).await {
-        Ok(Some(library_id)) => library_id,
-        Ok(None) => {
+    let job = match scan_jobs.create_item_folder_scan_job(&item_id).await {
+        Ok(job) => job,
+        Err(ScanJobError::ItemNotFound) => {
             return api_error(
                 &headers,
                 StatusCode::NOT_FOUND,
@@ -11528,9 +11528,57 @@ async fn admin_start_item_scan(
             )
             .into_response();
         }
+        Err(ScanJobError::LibraryNotFound) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体条目不存在",
+            )
+            .into_response();
+        }
+        Err(ScanJobError::AlreadyActive(_)) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库已有扫描任务运行",
+            )
+            .into_response();
+        }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    admin_start_scan(headers, Path(library_id), State(state)).await
+    let worker = scan_jobs.clone();
+    let job_id = job.id.clone();
+    let probe = state.probe.clone();
+    let metadata = state.metadata_reidentify.clone();
+    let thumbnails = state.thumbnails.clone();
+    tokio::spawn(async move {
+        let _ = worker
+            .run_to_completion_with_metadata_and_thumbnails(
+                &job_id,
+                BACKGROUND_SCAN_BATCH_SIZE,
+                probe,
+                metadata,
+                thumbnails,
+            )
+            .await;
+    });
+    let target_id = job.id.clone();
+    record_audit_event(
+        &state,
+        &headers,
+        "SCAN_STARTED",
+        Some("scan_job"),
+        Some(&target_id),
+        "{}",
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": scan_job_json(&job) })),
+    )
+        .into_response()
 }
 
 async fn admin_start_item_metadata_refresh(

@@ -454,6 +454,75 @@ async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn item_scan_only_reconciles_the_source_folder() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let alpha = root.join("Alpha");
+    let beta = root.join("Beta");
+    tokio::fs::create_dir_all(&alpha).await?;
+    tokio::fs::create_dir_all(&beta).await?;
+    tokio::fs::write(alpha.join("Alpha.Movie.2020.mkv"), b"fixture").await?;
+    tokio::fs::write(beta.join("Beta.Movie.2021.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let alpha_item_id: String = sqlx::query_scalar(
+        "SELECT ms.item_id
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Alpha/Alpha.Movie.2020.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    tokio::fs::write(alpha.join("Alpha.New.Movie.2022.mkv"), b"fixture").await?;
+    tokio::fs::write(beta.join("Beta.New.Movie.2023.mkv"), b"fixture").await?;
+
+    let item_scan = jobs.create_item_folder_scan_job(&alpha_item_id).await?;
+    assert_eq!(item_scan.job_type, "INCREMENTAL_SCAN");
+    let queued_path: String =
+        sqlx::query_scalar("SELECT relative_path FROM scan_job_paths WHERE job_id = ?")
+            .bind(&item_scan.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(queued_path, "Alpha");
+    let auto_metadata_match: i64 =
+        sqlx::query_scalar("SELECT auto_metadata_match FROM scan_jobs WHERE id = ?")
+            .bind(&item_scan.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(auto_metadata_match, 0);
+
+    jobs.run_to_completion(&item_scan.id, 100, None).await?;
+    let alpha_new_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries WHERE relative_path = 'Alpha/Alpha.New.Movie.2022.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let beta_new_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries WHERE relative_path = 'Beta/Beta.New.Movie.2023.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(alpha_new_entries, 1);
+    assert_eq!(beta_new_entries, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_scan_retry_reuses_job_progress_and_pending_entries()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

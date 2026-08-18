@@ -25,7 +25,7 @@ describe("MediaActionMenu", () => {
     const onLockMetadata = vi.fn();
     const onUnlockMetadata = vi.fn();
     const onRefreshMetadata = vi.fn();
-    const onScanLibrary = vi.fn();
+    const onScanFolder = vi.fn();
     const onDelete = vi.fn();
     container = document.createElement("div");
     document.body.append(container);
@@ -51,7 +51,7 @@ describe("MediaActionMenu", () => {
             onLockMetadata={onLockMetadata}
             onUnlockMetadata={onUnlockMetadata}
             onRefreshMetadata={onRefreshMetadata}
-            onScanLibrary={onScanLibrary}
+            onScanFolder={onScanFolder}
             onDelete={onDelete}
           />
         </MemoryRouter>,
@@ -64,7 +64,7 @@ describe("MediaActionMenu", () => {
 
     const actions = [...document.body.querySelectorAll<HTMLElement>("[role=menuitem]")]
       .map((element) => element.textContent?.replace(/\s+/g, " ").trim());
-    expect(actions).toEqual(["下载", "下载到…", "编辑元数据", "编辑图像", "编辑字幕", "删除", "元数据匹配", "刷新元数据", "扫描媒体库文件", "锁定元数据", "解锁元数据"]);
+    expect(actions).toEqual(["下载", "下载到…", "编辑元数据", "编辑图像", "编辑字幕", "删除", "元数据匹配", "刷新元数据", "扫描所在文件夹", "锁定元数据", "解锁元数据"]);
     expect(document.body.querySelector<HTMLAnchorElement>("[data-action=download]")?.getAttribute("href"))
       .toBe("/api/v1/items/item-1/download?sourceId=source-4k");
 
@@ -96,8 +96,8 @@ describe("MediaActionMenu", () => {
     expect(onRefreshMetadata).toHaveBeenCalledOnce();
 
     await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
-    await act(async () => document.body.querySelector<HTMLElement>("[data-action=scan-library]")?.click());
-    expect(onScanLibrary).toHaveBeenCalledOnce();
+    await act(async () => document.body.querySelector<HTMLElement>("[data-action=scan-folder]")?.click());
+    expect(onScanFolder).toHaveBeenCalledOnce();
 
     await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
     await act(async () => document.body.querySelector<HTMLElement>("[data-action=delete]")?.click());

@@ -307,7 +307,7 @@ export class LuxApiClient {
     );
   }
 
-  startItemLibraryScan(itemId: string) {
+  startItemFolderScan(itemId: string) {
     return this.request<{ job: AdminJob }>(
       `/api/v1/admin/items/${encodeURIComponent(itemId)}/scan`,
       { method: "POST" },

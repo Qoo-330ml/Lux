@@ -13,7 +13,7 @@ type MediaActionMenuProps = {
   onLockMetadata?: () => void;
   onUnlockMetadata?: () => void;
   onRefreshMetadata?: () => void;
-  onScanLibrary?: () => void;
+  onScanFolder?: () => void;
   className?: string;
   sourceId?: string;
 };
@@ -49,7 +49,7 @@ export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
   return `/api/v1/items/${encodeURIComponent(item.id)}/download${query}`;
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanLibrary, className = "", sourceId }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanFolder, className = "", sourceId }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState({ left: 16, top: 16 });
   const rootRef = useRef<HTMLDivElement>(null);
@@ -221,19 +221,19 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
               <span>刷新元数据</span>
             </button>
           ) : null}
-          {onScanLibrary ? (
+          {onScanFolder ? (
             <button
               className="lux-media-action"
-              data-action="scan-library"
+              data-action="scan-folder"
               type="button"
               role="menuitem"
               onClick={() => {
                 setOpen(false);
-                onScanLibrary();
+                onScanFolder();
               }}
             >
               <ScanLine size={17} aria-hidden="true" />
-              <span>扫描媒体库文件</span>
+              <span>扫描所在文件夹</span>
             </button>
           ) : null}
           {onLockMetadata ? (

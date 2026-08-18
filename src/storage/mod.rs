@@ -1112,6 +1112,48 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_item_scan_source_path(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredItemScanPath>, StorageError> {
+        self.query(
+            "SELECT source_item.library_id, fe.library_root_id, fe.relative_path
+             FROM media_items source_item
+             JOIN media_sources ms ON ms.item_id = source_item.id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE source_item.removed_at IS NULL
+               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
+               AND (
+                    source_item.id = ?
+                    OR (
+                        source_item.item_type = 'EPISODE'
+                        AND (source_item.series_id = ? OR source_item.parent_id = ?)
+                    )
+               )
+             ORDER BY CASE WHEN source_item.id = ? THEN 0 ELSE 1 END,
+                      ms.is_default DESC, ms.id
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .bind(item_id)
+        .bind(item_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredItemScanPath {
+                library_id: row.get("library_id"),
+                library_root_id: row.get("library_root_id"),
+                relative_path: row.get("relative_path"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_item_scraper_id(
         &self,
         item_id: &str,
@@ -3222,6 +3264,25 @@ impl Database {
         })
     }
 
+    pub(crate) async fn enable_scan_job_auto_metadata_match(
+        &self,
+        job_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scan_jobs
+             SET auto_metadata_match = 1, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn enqueue_incremental_scan_path(
         &self,
         job_id: &str,
@@ -3322,8 +3383,10 @@ impl Database {
             "SELECT DISTINCT ms.item_id
              FROM scan_job_paths sjp
              JOIN filesystem_entries fe
-               ON fe.library_root_id = sjp.library_root_id
+             ON fe.library_root_id = sjp.library_root_id
               AND (
+                    sjp.relative_path = '.'
+                    OR
                     fe.relative_path = sjp.relative_path
                     OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
                        = sjp.relative_path || '/'
@@ -8909,6 +8972,8 @@ impl Database {
                      AND sjp.processed_at IS NOT NULL
                      AND sjp.library_root_id = fe.library_root_id
                      AND (
+                           sjp.relative_path = '.'
+                           OR
                            fe.relative_path = sjp.relative_path
                            OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
                               = sjp.relative_path || '/'
@@ -9470,6 +9535,8 @@ impl Database {
                      AND sjp.processed_at IS NOT NULL
                      AND sjp.library_root_id = fe.library_root_id
                      AND (
+                           sjp.relative_path = '.'
+                           OR
                            fe.relative_path = sjp.relative_path
                            OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
                               = sjp.relative_path || '/'
@@ -9640,6 +9707,8 @@ impl Database {
                        WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
                          AND sjp.library_root_id = fe.library_root_id
                          AND (
+                               sjp.relative_path = '.'
+                               OR
                                fe.relative_path = sjp.relative_path
                                OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
                                   = sjp.relative_path || '/'
@@ -9680,6 +9749,8 @@ impl Database {
                        WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
                          AND sjp.library_root_id = fe.library_root_id
                          AND (
+                               sjp.relative_path = '.'
+                               OR
                                fe.relative_path = sjp.relative_path
                                OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
                                   = sjp.relative_path || '/'
@@ -9730,6 +9801,8 @@ impl Database {
                    WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
                      AND sjp.library_root_id = fe.library_root_id
                      AND (
+                           sjp.relative_path = '.'
+                           OR
                            fe.relative_path = sjp.relative_path
                            OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
                               = sjp.relative_path || '/'
@@ -10155,6 +10228,8 @@ impl Database {
                      AND sjp.processed_at IS NOT NULL
                      AND sjp.library_root_id = fe.library_root_id
                      AND (
+                           sjp.relative_path = '.'
+                           OR
                            fe.relative_path = sjp.relative_path
                            OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
                               = sjp.relative_path || '/'
@@ -13197,6 +13272,13 @@ pub(crate) struct StoredMediaSourcePath {
     pub(crate) item_id: String,
     pub(crate) probe_status: String,
     pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredItemScanPath {
+    pub(crate) library_id: String,
+    pub(crate) library_root_id: String,
     pub(crate) relative_path: String,
 }
 
