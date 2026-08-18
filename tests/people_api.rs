@@ -24,6 +24,8 @@ const PNG_1X1: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
+const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+
 #[tokio::test]
 async fn emby_persons_lists_library_actors_with_shared_admin_key()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -424,6 +426,30 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(
         encoded_person_image_upload.status(),
         reqwest::StatusCode::NO_CONTENT
+    );
+
+    let mismatched_content_type_upload = client
+        .post(format!(
+            "http://{address}/emby/Items/104/Images/Primary?api_key={key}"
+        ))
+        .header("Content-Type", "image/png")
+        .body(BASE64.encode(JPEG_SIGNATURE))
+        .send()
+        .await?;
+    assert_eq!(
+        mismatched_content_type_upload.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+
+    let mismatched_content_type_image = client
+        .get(format!(
+            "http://{address}/emby/Items/104/Images/Primary?api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(
+        mismatched_content_type_image.headers()["content-type"],
+        "image/jpeg"
     );
 
     let updated_person_detail = client

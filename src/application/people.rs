@@ -1734,17 +1734,23 @@ fn profile_image_format(
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .map(str::to_ascii_lowercase);
+    let detected = detected_profile_image_format(bytes);
     match content_type.as_deref() {
-        Some("image/jpeg") | Some("image/jpg") if valid_image("image/jpeg", bytes) => {
-            Some(("jpg", "image/jpeg"))
-        }
-        Some("image/png") if valid_image("image/png", bytes) => Some(("png", "image/png")),
-        Some("image/webp") if valid_image("image/webp", bytes) => Some(("webp", "image/webp")),
+        Some("image/jpeg") | Some("image/jpg") | Some("image/png") | Some("image/webp") => detected,
         Some(_) => None,
-        None if valid_image("image/jpeg", bytes) => Some(("jpg", "image/jpeg")),
-        None if valid_image("image/png", bytes) => Some(("png", "image/png")),
-        None if valid_image("image/webp", bytes) => Some(("webp", "image/webp")),
-        None => None,
+        None => detected,
+    }
+}
+
+fn detected_profile_image_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if valid_image("image/jpeg", bytes) {
+        Some(("jpg", "image/jpeg"))
+    } else if valid_image("image/png", bytes) {
+        Some(("png", "image/png"))
+    } else if valid_image("image/webp", bytes) {
+        Some(("webp", "image/webp"))
+    } else {
+        None
     }
 }
 
