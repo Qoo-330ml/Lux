@@ -400,12 +400,37 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-cast-rail { margin-top: 22px; }
 .lux-media-cast-list { display: flex; gap: 24px; width: max-content; min-width: 100%; margin: 0; padding: 0 2px 12px; list-style: none; }
 .lux-media-cast-card { flex: 0 0 96px; min-width: 0; text-align: center; }
+.lux-media-cast-link { display: block; color: inherit; text-decoration: none; border-radius: 12px; }
+.lux-media-cast-link:focus-visible { outline: 2px solid var(--lux-accent); outline-offset: 5px; }
 .lux-media-cast-avatar { display: grid; place-items: center; width: 84px; height: 84px; margin: 0 auto 11px; overflow: hidden; border: 1px solid rgba(255,255,255,.2); border-radius: 50%; background: #202026; box-shadow: 0 8px 20px rgba(0,0,0,.22); }
 .lux-media-cast-avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .lux-media-cast-placeholder-icon { color: #f4e9d9; }
-.lux-media-cast-card strong, .lux-media-cast-card > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lux-media-cast-card strong { color: rgba(255,255,255,.86); font-size: .8rem; font-weight: 600; }
-.lux-media-cast-card > span { margin-top: 5px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-media-cast-link strong, .lux-media-cast-link > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-media-cast-link strong { color: rgba(255,255,255,.86); font-size: .8rem; font-weight: 600; }
+.lux-media-cast-link > span { margin-top: 5px; color: var(--lux-subtle); font-size: .68rem; }
+
+.lux-person-detail-page { max-width: 1040px; margin: 0 auto; padding: 8px 0 72px; }
+.lux-person-back { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; color: var(--lux-subtle); background: transparent; text-decoration: none; font: inherit; font-size: .82rem; cursor: pointer; }
+.lux-person-back:hover { color: var(--lux-text); }
+.lux-person-detail-grid { display: grid; grid-template-columns: minmax(210px, 280px) minmax(0, 1fr); gap: clamp(28px, 6vw, 72px); align-items: start; margin-top: 34px; }
+.lux-person-detail-photo-frame { width: min(100%, 280px); aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 18px; background: var(--lux-panel); box-shadow: 0 20px 50px rgba(0,0,0,.24); }
+.lux-person-detail-photo { display: block; width: 100%; height: 100%; object-fit: cover; }
+.lux-person-detail-placeholder { display: grid; place-items: center; width: 100%; height: 100%; color: var(--lux-subtle); background: linear-gradient(145deg, rgba(255,255,255,.08), rgba(255,255,255,.02)); }
+.lux-person-detail-copy h1 { margin: 6px 0 0; color: var(--lux-text); font-size: clamp(2rem, 5vw, 3.6rem); line-height: 1.08; }
+.lux-person-detail-role { margin: 14px 0 0; color: var(--lux-subtle); font-size: 1rem; }
+.lux-person-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 28px; margin: 32px 0 0; }
+.lux-person-facts > div { min-width: 0; }
+.lux-person-facts dt { display: flex; align-items: center; gap: 6px; color: var(--lux-subtle); font-size: .72rem; }
+.lux-person-facts dd { margin: 5px 0 0; color: var(--lux-text); font-size: .9rem; overflow-wrap: anywhere; }
+.lux-person-overview { margin-top: 34px; }
+.lux-person-overview h2 { margin: 0; color: var(--lux-text); font-size: 1rem; }
+.lux-person-overview p { max-width: 70ch; margin: 12px 0 0; color: var(--lux-subtle); line-height: 1.8; white-space: pre-wrap; }
+@media (max-width: 700px) {
+  .lux-person-detail-page { padding-top: 0; }
+  .lux-person-detail-grid { grid-template-columns: 1fr; gap: 28px; }
+  .lux-person-detail-photo-frame { width: min(58vw, 220px); margin: 0 auto; }
+  .lux-person-detail-copy h1 { font-size: 2.2rem; }
+}
 .lux-source-selector { max-width: none; margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--lux-line-soft); }
 .lux-source-select { max-width: 320px; margin-top: 14px; }
 .lux-source-select .lux-select-trigger { min-height: 58px; padding: 8px var(--lux-control-padding-x); border-radius: 10px; }

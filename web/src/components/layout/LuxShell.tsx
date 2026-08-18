@@ -34,7 +34,9 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(() => api.avatarUrl());
   const [avatarImageFailed, setAvatarImageFailed] = useState(false);
-  const isDetail = location.pathname.startsWith("/libraries/");
+  const isDetail = location.pathname.startsWith("/libraries/")
+    || location.pathname.startsWith("/items/")
+    || location.pathname.startsWith("/people/");
   const isHome = location.pathname === "/";
 
   useEffect(() => {

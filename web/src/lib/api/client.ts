@@ -35,6 +35,7 @@ import type {
   ImageSearchResult,
   MetadataFieldName,
   PageResponse,
+  PersonDetail,
   PlaybackState,
   PlaybackEventState,
   SetupStatus,
@@ -259,6 +260,10 @@ export class LuxApiClient {
 
   item(itemId: string) {
     return this.request<MediaItem>(`/api/v1/items/${encodeURIComponent(itemId)}`);
+  }
+
+  person(personId: string) {
+    return this.request<PersonDetail>(`/api/v1/people/${encodeURIComponent(personId)}`);
   }
 
   itemMetadata(itemId: string) {
