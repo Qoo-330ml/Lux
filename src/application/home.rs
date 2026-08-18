@@ -384,9 +384,12 @@ mod tests {
     use super::HomeService;
     use crate::{
         application::{
-            access::MediaAccessService, catalog::CatalogService, libraries::LibraryService,
+            access::{AccessPrincipal, MediaAccessService},
+            catalog::CatalogService,
+            libraries::LibraryService,
         },
         config::Config,
+        domain::ids::UserId,
         storage::Database,
     };
 
@@ -414,5 +417,39 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2) + Duration::from_millis(100)).await;
         let refreshed = home.shared_snapshot().await.expect("refreshed snapshot");
         assert!(!std::ptr::eq(first.as_ref(), refreshed.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn user_home_snapshot_cache_is_reused_but_isolated_by_principal() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access.clone()),
+            LibraryService::new(database),
+            access,
+        );
+        let first_user = AccessPrincipal::new(UserId::new(), false);
+        let second_user = AccessPrincipal::new(UserId::new(), false);
+
+        let first = home
+            .snapshot(first_user, Vec::new())
+            .await
+            .expect("first user snapshot");
+        let reused = home
+            .snapshot(first_user, Vec::new())
+            .await
+            .expect("reused user snapshot");
+        let isolated = home
+            .snapshot(second_user, Vec::new())
+            .await
+            .expect("second user snapshot");
+
+        assert!(std::ptr::eq(first.as_ref(), reused.as_ref()));
+        assert!(!std::ptr::eq(first.as_ref(), isolated.as_ref()));
     }
 }
