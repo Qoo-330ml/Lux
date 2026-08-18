@@ -1261,11 +1261,10 @@ impl ImageService {
             let Ok(canonical_path) = fs::canonicalize(&path).await else {
                 continue;
             };
-            let Ok(canonical_root) = fs::canonicalize(&candidate.root_path).await else {
-                continue;
-            };
-            let in_media_root =
-                canonical_path.starts_with(&canonical_root) && canonical_path != canonical_root;
+            let canonical_root = fs::canonicalize(&candidate.root_path).await.ok();
+            let in_media_root = canonical_root
+                .as_ref()
+                .is_some_and(|root| canonical_path.starts_with(root) && canonical_path != *root);
             let in_metadata_root = metadata_root
                 .as_ref()
                 .is_some_and(|root| canonical_path.starts_with(root) && canonical_path != *root);

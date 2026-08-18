@@ -356,6 +356,90 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     Ok(())
 }
 
+#[tokio::test]
+async fn serves_managed_image_when_media_root_is_temporarily_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Managed Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Managed.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(movie_dir.join("poster.jpg"), b"local-poster").await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'managed movie'")
+            .fetch_one(database.pool())
+            .await?;
+    MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    let image_id: String = sqlx::query_scalar(
+        "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+
+    let metadata_item_dir = library_item_directory(&config.config_dir, &item_id)?;
+    tokio::fs::create_dir_all(&metadata_item_dir).await?;
+    let managed_poster = metadata_item_dir.join("poster.jpg");
+    tokio::fs::write(&managed_poster, b"managed-poster").await?;
+    sqlx::query("UPDATE item_images SET local_path = ? WHERE id = ?")
+        .bind(managed_poster.to_str().ok_or("non-utf8 path")?)
+        .bind(&image_id)
+        .execute(database.pool())
+        .await?;
+    tokio::fs::remove_dir_all(&media_root).await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config, database, setup, web_auth, emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(login.headers(), "lux_session"),
+        cookie_value(login.headers(), "lux_csrf")
+    );
+
+    let response = client
+        .get(format!("{base_url}/api/v1/items/{item_id}/images/poster"))
+        .header(COOKIE, cookies)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes().await?.as_ref(), b"managed-poster");
+
+    server.abort();
+    Ok(())
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)
