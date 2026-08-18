@@ -1,4 +1,6 @@
 use std::{
+    collections::{HashMap, HashSet},
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -6,18 +8,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
-use super::{
-    catalog::{CatalogError, CatalogItem, CatalogService},
+use crate::application::{
+    access::{AccessPrincipal, MediaAccessService},
+    catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
     libraries::{LibraryService, LibraryServiceError, LibraryView},
 };
 
+const HOME_USER_CACHE_TTL: Duration = Duration::from_secs(15);
 const HOME_SHARED_CACHE_TTL: Duration = Duration::from_secs(60);
 const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
+const MAX_HOME_CACHE_ENTRIES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct HomeSharedSnapshot {
+pub(crate) struct HomeSnapshot {
+    pub(crate) continue_watching: CatalogPage,
+    pub(crate) recently_added: CatalogPage,
+    pub(crate) recommended: Vec<CatalogItem>,
     pub(crate) latest_groups: Vec<(String, Vec<CatalogItem>)>,
     pub(crate) views: Vec<LibraryView>,
 }
@@ -28,7 +36,7 @@ pub(crate) enum HomeError {
     Libraries(LibraryServiceError),
 }
 
-impl std::fmt::Display for HomeError {
+impl fmt::Display for HomeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Catalog(error) => error.fmt(formatter),
@@ -51,6 +59,30 @@ impl From<LibraryServiceError> for HomeError {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HomeCacheKey {
+    user_id: String,
+    is_admin: bool,
+    library_ids: Vec<String>,
+}
+
+struct HomeCacheEntry {
+    principal: AccessPrincipal,
+    value: Mutex<Option<CachedSnapshot>>,
+    compute_lock: Mutex<()>,
+}
+
+struct CachedSnapshot {
+    generation: u64,
+    refreshed_at: Instant,
+    snapshot: Arc<HomeSnapshot>,
+}
+
+struct HomeSharedSnapshot {
+    latest_groups: Vec<(String, Vec<CatalogItem>)>,
+    views: Vec<LibraryView>,
+}
+
 struct CachedSharedSnapshot {
     generation: u64,
     refreshed_at: Instant,
@@ -60,10 +92,13 @@ struct CachedSharedSnapshot {
 struct HomeServiceInner {
     catalog: CatalogService,
     libraries: LibraryService,
+    access: MediaAccessService,
     generation: AtomicU64,
+    entries: Mutex<HashMap<HomeCacheKey, Arc<HomeCacheEntry>>>,
     shared: Mutex<Option<CachedSharedSnapshot>>,
-    compute_lock: Mutex<()>,
+    shared_compute_lock: Mutex<()>,
     refresh_tx: mpsc::Sender<()>,
+    invalidation_notify: Notify,
 }
 
 #[derive(Clone)]
@@ -72,15 +107,22 @@ pub(crate) struct HomeService {
 }
 
 impl HomeService {
-    pub(crate) fn new(catalog: CatalogService, libraries: LibraryService) -> Self {
+    pub(crate) fn new(
+        catalog: CatalogService,
+        libraries: LibraryService,
+        access: MediaAccessService,
+    ) -> Self {
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let inner = Arc::new(HomeServiceInner {
             catalog,
             libraries,
+            access,
             generation: AtomicU64::new(0),
             shared: Mutex::new(None),
-            compute_lock: Mutex::new(()),
+            entries: Mutex::new(HashMap::new()),
+            shared_compute_lock: Mutex::new(()),
             refresh_tx,
+            invalidation_notify: Notify::new(),
         });
         let worker_inner = Arc::downgrade(&inner);
         tokio::spawn(async move {
@@ -92,9 +134,7 @@ impl HomeService {
                 let Some(inner) = worker_inner.upgrade() else {
                     break;
                 };
-                if let Err(error) = (Self { inner }).refresh_shared_snapshot().await {
-                    tracing::warn!(%error, "failed to refresh shared home snapshot");
-                }
+                (Self { inner }).refresh_cached_entries().await;
             }
         });
         let service = Self { inner };
@@ -102,26 +142,59 @@ impl HomeService {
         service
     }
 
-    pub(crate) async fn shared_snapshot(&self) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
+    pub(crate) async fn snapshot(
+        &self,
+        principal: AccessPrincipal,
+        mut library_ids: Vec<String>,
+    ) -> Result<Arc<HomeSnapshot>, HomeError> {
+        library_ids.sort_unstable();
+        library_ids.dedup();
+        let key = HomeCacheKey {
+            user_id: principal.user_id.to_string(),
+            is_admin: principal.is_admin,
+            library_ids,
+        };
+        let entry = self.entry(key, principal).await;
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
-            let cached = self.inner.shared.lock().await;
+            let cached = entry.value.lock().await;
             if let Some(cached) = cached.as_ref() {
-                if cached.generation == generation
-                    && cached.refreshed_at.elapsed() < HOME_SHARED_CACHE_TTL
+                if cached.generation != generation
+                    || cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL
                 {
-                    return Ok(cached.snapshot.clone());
+                    self.schedule_refresh();
                 }
-                self.schedule_refresh();
                 return Ok(cached.snapshot.clone());
             }
         }
 
-        self.refresh_shared_snapshot().await
+        let _compute_guard = entry.compute_lock.lock().await;
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        {
+            let cached = entry.value.lock().await;
+            if let Some(cached) = cached.as_ref() {
+                if cached.generation != generation
+                    || cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL
+                {
+                    self.schedule_refresh();
+                }
+                return Ok(cached.snapshot.clone());
+            }
+        }
+
+        let snapshot = Arc::new(self.build_snapshot(principal).await?);
+        *entry.value.lock().await = Some(CachedSnapshot {
+            generation,
+            refreshed_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
     }
 
     pub(crate) fn invalidate(&self) {
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.catalog.invalidate_library_pages();
+        self.inner.invalidation_notify.notify_waiters();
         self.schedule_refresh();
     }
 
@@ -129,8 +202,25 @@ impl HomeService {
         let _ = self.inner.refresh_tx.try_send(());
     }
 
+    async fn entry(&self, key: HomeCacheKey, principal: AccessPrincipal) -> Arc<HomeCacheEntry> {
+        let mut entries = self.inner.entries.lock().await;
+        if !entries.contains_key(&key) && entries.len() >= MAX_HOME_CACHE_ENTRIES {
+            entries.clear();
+        }
+        entries
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(HomeCacheEntry {
+                    principal,
+                    value: Mutex::new(None),
+                    compute_lock: Mutex::new(()),
+                })
+            })
+            .clone()
+    }
+
     async fn refresh_shared_snapshot(&self) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
-        let _compute_guard = self.inner.compute_lock.lock().await;
+        let _compute_guard = self.inner.shared_compute_lock.lock().await;
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
             let cached = self.inner.shared.lock().await;
@@ -171,6 +261,120 @@ impl HomeService {
         }
         Ok(snapshot)
     }
+
+    async fn refresh_cached_entries(&self) {
+        if let Err(error) = self.refresh_shared_snapshot().await {
+            tracing::warn!(%error, "failed to refresh shared home snapshot");
+        }
+        let entries = self
+            .inner
+            .entries
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let Ok(_compute_guard) = entry.compute_lock.try_lock() else {
+                continue;
+            };
+            let generation = self.inner.generation.load(Ordering::Acquire);
+            let cached = entry.value.lock().await;
+            if cached.as_ref().is_some_and(|cached| {
+                cached.generation == generation
+                    && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
+            }) {
+                continue;
+            }
+            drop(cached);
+            let notified = self.inner.invalidation_notify.notified();
+            let result = tokio::select! {
+                result = self.build_snapshot(entry.principal) => Some(result),
+                _ = notified => None,
+            };
+            match result {
+                Some(Ok(snapshot))
+                    if self.inner.generation.load(Ordering::Acquire) == generation =>
+                {
+                    *entry.value.lock().await = Some(CachedSnapshot {
+                        generation,
+                        refreshed_at: Instant::now(),
+                        snapshot: Arc::new(snapshot),
+                    });
+                }
+                Some(Ok(_)) | None => self.schedule_refresh(),
+                Some(Err(error)) => tracing::debug!(%error, "home cache refresh failed"),
+            }
+        }
+    }
+
+    async fn build_snapshot(&self, principal: AccessPrincipal) -> Result<HomeSnapshot, HomeError> {
+        let shared = self.shared_snapshot().await?;
+        let accessible_library_ids = self
+            .inner
+            .access
+            .accessible_library_ids(principal)
+            .await
+            .map_err(CatalogError::from)?;
+        let user_id = principal.user_id.to_string();
+        let (continue_watching, recently_added, recommended) = tokio::try_join!(
+            self.inner.catalog.list_continue_watching_for_library_ids(
+                &accessible_library_ids,
+                &user_id,
+                0,
+                10,
+            ),
+            self.inner
+                .catalog
+                .list_recently_added_for_library_ids(&accessible_library_ids, 0, 12,),
+            self.inner.catalog.list_recommended_for_library_ids(
+                &accessible_library_ids,
+                &user_id,
+                12,
+            ),
+        )?;
+        let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
+        let views = shared
+            .views
+            .iter()
+            .filter(|view| {
+                view.library.is_enabled
+                    && accessible_library_ids.contains(&view.library.id.to_string())
+            })
+            .cloned()
+            .collect();
+        let latest_groups = shared
+            .latest_groups
+            .iter()
+            .filter(|(library_id, _)| accessible_library_ids.contains(library_id))
+            .cloned()
+            .collect();
+        Ok(HomeSnapshot {
+            continue_watching,
+            recently_added,
+            recommended,
+            latest_groups,
+            views,
+        })
+    }
+
+    async fn shared_snapshot(&self) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        {
+            let cached = self.inner.shared.lock().await;
+            if let Some(cached) = cached.as_ref() {
+                if cached.generation == generation {
+                    if cached.refreshed_at.elapsed() >= HOME_SHARED_CACHE_TTL {
+                        self.schedule_refresh();
+                    }
+                    return Ok(cached.snapshot.clone());
+                }
+                self.schedule_refresh();
+                return Ok(cached.snapshot.clone());
+            }
+        }
+        self.refresh_shared_snapshot().await
+    }
 }
 
 #[cfg(test)]
@@ -196,8 +400,9 @@ mod tests {
         let database = Database::connect(&config).await.expect("database");
         let access = MediaAccessService::new(database.clone());
         let home = HomeService::new(
-            CatalogService::new(database.clone(), access),
+            CatalogService::new(database.clone(), access.clone()),
             LibraryService::new(database),
+            access,
         );
 
         let first = home.shared_snapshot().await.expect("first snapshot");

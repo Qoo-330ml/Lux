@@ -199,7 +199,7 @@ impl AppState {
         let access = MediaAccessService::new(database.clone());
         let libraries = LibraryService::new(database.clone());
         let catalog = CatalogService::new(database.clone(), access.clone());
-        let home = HomeService::new(catalog.clone(), libraries.clone());
+        let home = HomeService::new(catalog.clone(), libraries.clone(), access.clone());
         let image_writes = ImageWriteService::new_with_proxy_and_config_dir(
             database.clone(),
             config.config_dir.clone(),
@@ -7679,9 +7679,6 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let Some(home) = state.home.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -7697,32 +7694,17 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let (shared_result, continue_watching_result, recently_added_result, recommended_result) = tokio::join!(
-        home.shared_snapshot(),
-        catalog.list_continue_watching_for_library_ids(&accessible_library_ids, &user_id, 0, 10),
-        catalog.list_recently_added_for_library_ids(&accessible_library_ids, 0, 12),
-        catalog.list_recommended_for_library_ids(&accessible_library_ids, &user_id, 12),
-    );
-    let shared = match shared_result {
+    let snapshot = match home
+        .snapshot(principal, accessible_library_ids.clone())
+        .await
+    {
         Ok(value) => value,
         Err(HomeError::Catalog(_) | HomeError::Libraries(_)) => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let continue_watching = match continue_watching_result {
-        Ok(value) => value,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let recently_added = match recently_added_result {
-        Ok(value) => value,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let recommended = match recommended_result {
-        Ok(value) => value,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
-    let latest_groups = shared
+    let latest_groups = snapshot
         .latest_groups
         .iter()
         .filter(|(library_id, _)| accessible_library_ids.contains(library_id))
@@ -7732,11 +7714,12 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         .iter()
         .flat_map(|(_, items)| items.iter().cloned())
         .collect::<Vec<_>>();
-    let all_items = continue_watching
+    let all_items = snapshot
+        .continue_watching
         .items
         .iter()
-        .chain(recently_added.items.iter())
-        .chain(recommended.iter())
+        .chain(snapshot.recently_added.items.iter())
+        .chain(snapshot.recommended.iter())
         .chain(latest_items.iter())
         .cloned()
         .collect::<Vec<_>>();
@@ -7745,9 +7728,10 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let continue_watching_items =
-        lux_catalog_items_from_values(&continue_watching.items, &user_values);
-    let recently_added_items = lux_catalog_items_from_values(&recently_added.items, &user_values);
-    let recommended_items = lux_catalog_items_from_values(&recommended, &user_values);
+        lux_catalog_items_from_values(&snapshot.continue_watching.items, &user_values);
+    let recently_added_items =
+        lux_catalog_items_from_values(&snapshot.recently_added.items, &user_values);
+    let recommended_items = lux_catalog_items_from_values(&snapshot.recommended, &user_values);
     let latest_values = lux_catalog_items_from_values(&latest_items, &user_values);
     let mut latest_by_library = BTreeMap::<String, Vec<Value>>::new();
     for (item, value) in latest_items.iter().zip(latest_values) {
@@ -7757,7 +7741,7 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
             .push(value);
     }
     let mut visible = Vec::new();
-    for view in &shared.views {
+    for view in &snapshot.views {
         let library_id = view.library.id.to_string();
         if !accessible_library_ids.contains(&library_id) {
             continue;
@@ -7775,9 +7759,9 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
     }
     Json(json!({
         "continueWatching": continue_watching_items,
-        "continueWatchingTotal": continue_watching.total,
+        "continueWatchingTotal": snapshot.continue_watching.total,
         "recentlyAdded": recently_added_items,
-        "recentlyAddedTotal": recently_added.total,
+        "recentlyAddedTotal": snapshot.recently_added.total,
         "recommended": recommended_items,
         "libraries": visible,
     }))
@@ -11123,6 +11107,9 @@ async fn admin_set_library_access(
         .await
     {
         Ok(()) => {
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
             record_audit_event(
                 &state,
                 &headers,
@@ -11644,6 +11631,9 @@ async fn admin_delete_item(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    if let Some(home) = state.home.as_ref() {
+        home.invalidate();
+    }
     record_audit_event(
         &state,
         &headers,
@@ -16104,6 +16094,9 @@ async fn admin_create_library(
         .await
     {
         Ok(library) => {
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
             if let Some(plugins) = state.plugins.as_ref()
                 && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
             {
@@ -16248,6 +16241,9 @@ async fn admin_update_library(
     }
     match libraries.update_settings(library_id, settings).await {
         Ok(view) => {
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
             if let Some(plugins) = state.plugins.as_ref()
                 && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
             {
@@ -16442,6 +16438,9 @@ async fn admin_delete_library_root(
     };
     match libraries.delete_root(library_id, root_id).await {
         Ok(()) => {
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
             let target_id = root_id.to_string();
             record_audit_event(
                 &state,
@@ -16480,6 +16479,9 @@ async fn admin_delete_library(
     };
     match libraries.delete_library(library_id).await {
         Ok(()) => {
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
             let target_id = library_id.to_string();
             record_audit_event(
                 &state,
@@ -16525,6 +16527,9 @@ async fn admin_add_library_root(
     };
     match libraries.add_root(library_id, &request.path).await {
         Ok(result) => {
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
             let target_id = library_id.to_string();
             record_audit_event(
                 &state,

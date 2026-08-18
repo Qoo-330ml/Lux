@@ -1,7 +1,14 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
+
+use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
@@ -14,7 +21,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct CatalogFilter {
     pub item_types: Vec<String>,
     pub excluded_item_types: Vec<String>,
@@ -28,7 +35,7 @@ pub struct CatalogFilter {
     pub descending: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum CatalogSort {
     #[default]
     Name,
@@ -41,6 +48,193 @@ pub enum CatalogSort {
 pub struct CatalogService {
     database: Database,
     access: MediaAccessService,
+    library_page_cache: Arc<LibraryPageCache>,
+}
+
+const LIBRARY_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
+const LIBRARY_PAGE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
+const MAX_LIBRARY_PAGE_CACHE_ENTRIES: usize = 256;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LibraryPageCacheKey {
+    user_id: String,
+    is_admin: bool,
+    library_id: String,
+    filter: CatalogFilter,
+    offset: i64,
+    limit: i64,
+}
+
+#[derive(Clone)]
+struct LibraryPageRequest {
+    principal: AccessPrincipal,
+    library_id: String,
+    filter: CatalogFilter,
+    offset: i64,
+    limit: i64,
+}
+
+struct CachedLibraryPage {
+    generation: u64,
+    refreshed_at: Instant,
+    page: Arc<CatalogPage>,
+}
+
+struct LibraryPageCacheEntry {
+    request: LibraryPageRequest,
+    value: Mutex<Option<CachedLibraryPage>>,
+    compute_lock: Mutex<()>,
+}
+
+struct LibraryPageCache {
+    generation: AtomicU64,
+    entries: Mutex<HashMap<LibraryPageCacheKey, Arc<LibraryPageCacheEntry>>>,
+    refresh_tx: mpsc::Sender<()>,
+}
+
+impl LibraryPageCache {
+    fn new(database: Database, access: MediaAccessService) -> Arc<Self> {
+        let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
+        let cache = Arc::new(Self {
+            generation: AtomicU64::new(0),
+            entries: Mutex::new(HashMap::new()),
+            refresh_tx,
+        });
+        let worker_cache = Arc::downgrade(&cache);
+        tokio::spawn(async move {
+            while refresh_rx.recv().await.is_some() {
+                while let Ok(Some(())) =
+                    tokio::time::timeout(LIBRARY_PAGE_REFRESH_DEBOUNCE, refresh_rx.recv()).await
+                {
+                }
+                let Some(cache) = worker_cache.upgrade() else {
+                    break;
+                };
+                let service = CatalogService {
+                    database: database.clone(),
+                    access: access.clone(),
+                    library_page_cache: cache.clone(),
+                };
+                cache.refresh_entries(&service).await;
+            }
+        });
+        cache
+    }
+
+    async fn entry(
+        &self,
+        key: LibraryPageCacheKey,
+        request: LibraryPageRequest,
+    ) -> Arc<LibraryPageCacheEntry> {
+        let mut entries = self.entries.lock().await;
+        if !entries.contains_key(&key) && entries.len() >= MAX_LIBRARY_PAGE_CACHE_ENTRIES {
+            entries.clear();
+        }
+        entries
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LibraryPageCacheEntry {
+                    request,
+                    value: Mutex::new(None),
+                    compute_lock: Mutex::new(()),
+                })
+            })
+            .clone()
+    }
+
+    fn schedule_refresh(&self) {
+        let _ = self.refresh_tx.try_send(());
+    }
+
+    fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.schedule_refresh();
+    }
+
+    async fn get_or_load(
+        &self,
+        service: &CatalogService,
+        request: LibraryPageRequest,
+    ) -> Result<CatalogPage, CatalogError> {
+        let key = LibraryPageCacheKey {
+            user_id: request.principal.user_id.to_string(),
+            is_admin: request.principal.is_admin,
+            library_id: request.library_id.clone(),
+            filter: request.filter.clone(),
+            offset: request.offset,
+            limit: request.limit,
+        };
+        let entry = self.entry(key, request).await;
+        let generation = self.generation.load(Ordering::Acquire);
+        {
+            let cached = entry.value.lock().await;
+            if let Some(cached) = cached.as_ref() {
+                if cached.generation != generation
+                    || cached.refreshed_at.elapsed() >= LIBRARY_PAGE_CACHE_TTL
+                {
+                    self.schedule_refresh();
+                }
+                return Ok((*cached.page).clone());
+            }
+        }
+
+        let _compute_guard = entry.compute_lock.lock().await;
+        let generation = self.generation.load(Ordering::Acquire);
+        {
+            let cached = entry.value.lock().await;
+            if let Some(cached) = cached.as_ref() {
+                if cached.generation != generation
+                    || cached.refreshed_at.elapsed() >= LIBRARY_PAGE_CACHE_TTL
+                {
+                    self.schedule_refresh();
+                }
+                return Ok((*cached.page).clone());
+            }
+        }
+
+        let page = service.load_library_page(&entry.request).await?;
+        *entry.value.lock().await = Some(CachedLibraryPage {
+            generation,
+            refreshed_at: Instant::now(),
+            page: Arc::new(page.clone()),
+        });
+        Ok(page)
+    }
+
+    async fn refresh_entries(&self, service: &CatalogService) {
+        let entries = self
+            .entries
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let Ok(_compute_guard) = entry.compute_lock.try_lock() else {
+                continue;
+            };
+            let generation = self.generation.load(Ordering::Acquire);
+            let cached = entry.value.lock().await;
+            if cached.as_ref().is_some_and(|cached| {
+                cached.generation == generation
+                    && cached.refreshed_at.elapsed() < LIBRARY_PAGE_CACHE_TTL
+            }) {
+                continue;
+            }
+            drop(cached);
+            match service.load_library_page(&entry.request).await {
+                Ok(page) if self.generation.load(Ordering::Acquire) == generation => {
+                    *entry.value.lock().await = Some(CachedLibraryPage {
+                        generation,
+                        refreshed_at: Instant::now(),
+                        page: Arc::new(page),
+                    });
+                }
+                Ok(_) => self.schedule_refresh(),
+                Err(error) => tracing::debug!(%error, "library page cache refresh failed"),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -54,7 +248,16 @@ pub struct CatalogItemCounts {
 
 impl CatalogService {
     pub fn new(database: Database, access: MediaAccessService) -> Self {
-        Self { database, access }
+        let library_page_cache = LibraryPageCache::new(database.clone(), access.clone());
+        Self {
+            database,
+            access,
+            library_page_cache,
+        }
+    }
+
+    pub(crate) fn invalidate_library_pages(&self) {
+        self.library_page_cache.invalidate();
     }
 
     pub async fn count_item_types(
@@ -125,8 +328,23 @@ impl CatalogService {
         if !self.access.can_view_library(principal, library_id).await? {
             return Err(CatalogError::AccessDenied);
         }
-        let library_ids = vec![library_id.to_owned()];
-        let user_id = principal.user_id.to_string();
+        let request = LibraryPageRequest {
+            principal,
+            library_id: library_id.to_owned(),
+            filter: filter.clone(),
+            offset,
+            limit,
+        };
+        return self.library_page_cache.get_or_load(self, request).await;
+    }
+
+    async fn load_library_page(
+        &self,
+        request: &LibraryPageRequest,
+    ) -> Result<CatalogPage, CatalogError> {
+        let library_ids = vec![request.library_id.clone()];
+        let user_id = request.principal.user_id.to_string();
+        let filter = &request.filter;
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
@@ -145,8 +363,8 @@ impl CatalogService {
                 CatalogSort::Rating => StorageCatalogSort::Rating,
             },
             descending: filter.descending,
-            offset,
-            limit,
+            offset: request.offset,
+            limit: request.limit,
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
         let mut items = assemble_items(rows);
@@ -155,8 +373,8 @@ impl CatalogService {
         Ok(CatalogPage {
             items,
             total,
-            offset,
-            limit,
+            offset: request.offset,
+            limit: request.limit,
         })
     }
 
