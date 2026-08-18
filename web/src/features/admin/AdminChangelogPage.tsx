@@ -46,6 +46,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 MDC 演员头像的 Content-Type 声明不准确时无法按实际图片格式识别的问题。",
         "修复 MDC 更新人物资料后人物 NFO 未同步写入的问题。",
         "修复共享人物头像未物化为人物目录中的 Emby folder.<ext> 文件、导致目录读取不兼容的问题。",
+        "修复没有 provider ID 的本地人物身份无法写入人物 person.nfo 的问题。",
       ] },
       { kind: "changed", items: [
         "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
