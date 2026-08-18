@@ -28,6 +28,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "增加管理台元数据任务失败详情，支持查看失败条目和具体错误信息。",
         "支持 MDC 通过 Emby POST /Items/{personId} 更新人物简介、生日、职业领域和出生地等元数据，并同步人物关系。",
         "支持 MDC 通过 Emby POST /Items/{personId}/Images/Primary 上传演员头像，并在人物图片接口中读取。",
+        "MDC 人物资料更新同步写入人物 person.nfo，保留简介、生日、职业领域和出生地等信息。",
       ] },
       { kind: "fixed", items: [
         "修复 Matroska 流式处理和 HEVC+AAC 播放链路的兼容问题，提升非原生浏览器播放稳定性。",
@@ -43,6 +44,8 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复本地图片路径不变但文件内容替换后索引未刷新的问题。",
         "修复 MDC 发送 Base64 格式演员头像时无法上传的问题。",
         "修复 MDC 演员头像的 Content-Type 声明不准确时无法按实际图片格式识别的问题。",
+        "修复 MDC 更新人物资料后人物 NFO 未同步写入的问题。",
+        "修复共享人物头像未物化为人物目录中的 Emby folder.<ext> 文件、导致目录读取不兼容的问题。",
       ] },
       { kind: "changed", items: [
         "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
@@ -53,6 +56,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "优化扫描生命周期：文件系统阶段完成后释放扫描互斥锁，失败任务保留有界 checkpoint，历史身份修复改为后台执行。",
         "媒体详情和媒体卡片的扫描操作改为只扫描媒体源所在文件夹，媒体库管理页继续负责整库扫描。",
         "增加 SQLite/PostgreSQL 首页与人物名称查询索引，数据库 schema version 更新至 69。",
+        "规范人物资源目录使用 people/person/<shard>/<person-key>/ 和 Emby 风格的 folder.<ext> 图片；图片字节继续通过共享内容哈希资源去重，旧目录保持兼容读取。",
       ] },
     ],
   },
