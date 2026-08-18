@@ -35,6 +35,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复失败扫描重试时无法复用已发现 checkpoint、待处理项或进度的问题。",
         "修复移动端导航切换时任务进度上下文丢失的问题。",
         "修复 Emby 人物详情仅按 ID 查找、无法按人物姓名匹配的问题。",
+        "修复 MDC 请求 Emby GET/HEAD /Items/{personId} 无法返回人物 DTO，以及无 tag 人物主图请求无法获取图片的问题。",
       ] },
       { kind: "changed", items: [
         "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
