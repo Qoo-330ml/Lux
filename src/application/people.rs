@@ -707,20 +707,36 @@ impl PeopleService {
         &self,
         library_ids: &[String],
         person_type: &str,
-        person_id: &str,
+        person_id_or_name: &str,
     ) -> Result<Option<ActorView>, PeopleError> {
-        if !is_valid_person_id(person_id) {
-            return Err(PeopleError::InvalidComponent(person_id.to_owned()));
+        if !is_valid_person_lookup(person_id_or_name) {
+            return Err(PeopleError::InvalidComponent(person_id_or_name.to_owned()));
         }
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
                 "people database index is unavailable".to_owned(),
             ));
         };
-        let credits = database
-            .find_person_credits_for_libraries(library_ids, person_type, person_id)
-            .await
-            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let credits = if is_valid_person_id(person_id_or_name) {
+            database
+                .find_person_credits_for_libraries(library_ids, person_type, person_id_or_name)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let credits = if credits.is_empty() {
+            database
+                .find_person_credits_for_libraries_by_name(
+                    library_ids,
+                    person_type,
+                    person_id_or_name,
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+        } else {
+            credits
+        };
         Ok(self
             .actor_views_from_credits(credits)
             .await
@@ -1303,6 +1319,15 @@ fn is_valid_person_id(value: &str) -> bool {
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn is_valid_person_lookup(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+        && !matches!(value, "." | "..")
 }
 
 fn actor_identities(actor: &ActorCredit, fallback_provider: &str) -> Vec<PersonIdentity> {

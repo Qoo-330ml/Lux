@@ -332,6 +332,26 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(person_detail_body["BackdropImageTags"], json!([]));
     assert!(person_detail_body.get("BirthDate").is_none());
 
+    let person_name_detail = client
+        .get(format!(
+            "http://{address}/emby/Persons/演员丁?Fields=Overview,Role,DateCreated&api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(person_name_detail.status(), reqwest::StatusCode::OK);
+    let person_name_detail_body: serde_json::Value = person_name_detail.json().await?;
+    assert_eq!(person_name_detail_body, person_detail_body);
+
+    let root_person_name_detail = client
+        .get(format!(
+            "http://{address}/Persons/演员丁?Fields=Overview,Role,DateCreated&api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(root_person_name_detail.status(), reqwest::StatusCode::OK);
+    let root_person_name_detail_body: serde_json::Value = root_person_name_detail.json().await?;
+    assert_eq!(root_person_name_detail_body, person_detail_body);
+
     let root_person_detail = client
         .get(format!("http://{address}/Persons/104?api_key={key}"))
         .send()

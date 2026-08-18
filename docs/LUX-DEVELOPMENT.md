@@ -1402,9 +1402,10 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 
 人物详情兼容合同：
 
-- `GET /Persons/{PersonId}` 与 `/emby/Persons/{PersonId}` 返回单个人物 DTO，使用与 `/Persons` 相同的
-  `Name`、`ServerId`、`Id`、`Type`、`ImageTags`、`BackdropImageTags` 结构，并按 `Fields` 投影
-  `Overview`、`Role`、`BirthDate`、`DeathDate`、`KnownForDepartment`、`PlaceOfBirth`、`DateCreated`。
+- `GET /Persons/{PersonIdOrName}` 与 `/emby/Persons/{PersonIdOrName}` 返回单个人物 DTO；路径参数优先按
+  人物 ID 匹配，未匹配时按精确人物姓名匹配。两条路径使用与 `/Persons` 相同的 `Name`、`ServerId`、`Id`、
+  `Type`、`ImageTags`、`BackdropImageTags` 结构，并按 `Fields` 投影 `Overview`、`Role`、`BirthDate`、
+  `DeathDate`、`KnownForDepartment`、`PlaceOfBirth`、`DateCreated`。
 - 人物详情只从持久化人物关系索引读取，不在请求中扫描 metadata 目录、解析 NFO 或调用 TMDb；人物没有
   图片时仍返回 JSON，图片标签为空，调用方可以使用占位图。
 - 人物查询遵守当前 Emby 用户的媒体库 ACL；没有任何可访问媒体库中的出演关系时返回 `404`。

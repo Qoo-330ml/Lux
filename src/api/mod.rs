@@ -2361,7 +2361,7 @@ async fn emby_persons(
 
 async fn emby_person(
     headers: HeaderMap,
-    Path(person_id): Path<String>,
+    Path(person_id_or_name): Path<String>,
     Query(query): Query<EmbyPersonQuery>,
     State(state): State<AppState>,
 ) -> Response {
@@ -2387,7 +2387,10 @@ async fn emby_person(
     let Some(people) = state.people.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match people.find_person(&library_ids, "Actor", &person_id).await {
+    match people
+        .find_person(&library_ids, "Actor", &person_id_or_name)
+        .await
+    {
         Ok(Some(person)) => Json(emby_person_json_with_fields(
             person,
             &state.server_id,
