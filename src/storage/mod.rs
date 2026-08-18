@@ -7353,27 +7353,99 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let count_query = format!(
-            "SELECT COUNT(*) FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL
-               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}
-               AND mi.library_id IN ({placeholders})"
+            "SELECT CAST(COALESCE(SUM(item_count), 0) AS BIGINT)
+             FROM (
+                 SELECT COUNT(*) AS item_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type <> 'FOLDER'
+                   AND mi.has_available_source = 1
+                   AND mi.library_id IN ({placeholders})
+                 UNION ALL
+                 SELECT COUNT(*) AS item_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')
+                   AND mi.has_available_source = 0
+                   AND mi.library_id IN ({placeholders})
+                   AND (
+                       EXISTS (
+                           SELECT 1
+                           FROM media_items visible_child
+                           WHERE visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                             AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM collection_items visible_collection_item
+                           JOIN collections visible_collection
+                             ON visible_collection.id = visible_collection_item.collection_id
+                           JOIN media_items visible_child
+                             ON visible_child.id = visible_collection_item.item_id
+                           WHERE visible_collection.item_id = mi.id
+                             AND visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                       )
+                   )
+             ) visible_catalog"
         );
         let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
         }
+        for library_id in library_ids {
+            count_statement = count_statement.bind(library_id);
+        }
         let list_query = format!(
-            "SELECT mi.id
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL
-               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}
-               AND mi.library_id IN ({placeholders})
-             ORDER BY mi.added_at DESC, mi.sort_title, mi.id
+            "WITH visible_catalog AS (
+                 SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type <> 'FOLDER'
+                   AND mi.has_available_source = 1
+                   AND mi.library_id IN ({placeholders})
+                 UNION ALL
+                 SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL
+                   AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')
+                   AND mi.has_available_source = 0
+                   AND mi.library_id IN ({placeholders})
+                   AND (
+                       EXISTS (
+                           SELECT 1
+                           FROM media_items visible_child
+                           WHERE visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                             AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM collection_items visible_collection_item
+                           JOIN collections visible_collection
+                             ON visible_collection.id = visible_collection_item.collection_id
+                           JOIN media_items visible_child
+                             ON visible_child.id = visible_collection_item.item_id
+                           WHERE visible_collection.item_id = mi.id
+                             AND visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                       )
+                   )
+             )
+             SELECT id
+             FROM visible_catalog
+             ORDER BY added_at DESC, sort_title, id
              LIMIT ? OFFSET ?"
         );
         let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
+        for library_id in library_ids {
+            list_statement = list_statement.bind(library_id);
+        }
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
         }
@@ -7409,23 +7481,10 @@ impl Database {
         if library_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat_n("?", library_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query = format!(
-            "WITH ranked AS (
-                 SELECT mi.id, mi.library_id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY mi.library_id
-                            ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC
-                        ) AS library_rank
-                 FROM media_items mi
-                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND mi.item_type IN ('MOVIE', 'SERIES')
-                   AND mi.library_id IN ({placeholders})
-             )
-             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+        let mut rows = Vec::new();
+        for library_id in library_ids {
+            let query =
+                "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
@@ -7446,7 +7505,49 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM ranked
+             FROM (
+                 WITH visible_catalog AS (
+                     SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                     FROM media_items mi
+                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                     WHERE mi.library_id = ?
+                       AND mi.item_type IN ('MOVIE', 'SERIES')
+                       AND mi.removed_at IS NULL
+                       AND mi.has_available_source = 1
+                     UNION ALL
+                     SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                     FROM media_items mi
+                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                     WHERE mi.library_id = ?
+                       AND mi.item_type = 'SERIES'
+                       AND mi.removed_at IS NULL
+                       AND mi.has_available_source = 0
+                       AND (
+                           EXISTS (
+                               SELECT 1
+                               FROM media_items visible_child
+                               WHERE visible_child.removed_at IS NULL
+                                 AND visible_child.has_available_source = 1
+                                 AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                           )
+                           OR EXISTS (
+                               SELECT 1
+                               FROM collection_items visible_collection_item
+                               JOIN collections visible_collection
+                                 ON visible_collection.id = visible_collection_item.collection_id
+                               JOIN media_items visible_child
+                                 ON visible_child.id = visible_collection_item.item_id
+                               WHERE visible_collection.item_id = mi.id
+                                 AND visible_child.removed_at IS NULL
+                                 AND visible_child.has_available_source = 1
+                           )
+                       )
+                 )
+                 SELECT id, library_id
+                 FROM visible_catalog
+                 ORDER BY added_at DESC, sort_title ASC, id ASC
+                 LIMIT ?
+             ) ranked
              JOIN media_items mi ON mi.id = ranked.id
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
@@ -7455,13 +7556,21 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE ranked.library_rank <= ?
-             ORDER BY ranked.library_id, ranked.library_rank, ms.id, mt.stream_index"
-        );
-        let mut binds = Vec::with_capacity(library_ids.len() + 1);
-        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
-        binds.push(CatalogBind::Integer(limit));
-        self.fetch_catalog_rows(&query, &binds).await
+             ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC,
+                      ms.id, mt.stream_index";
+            let library_rows = self
+                .fetch_catalog_rows(
+                    query,
+                    &[
+                        CatalogBind::Text(library_id),
+                        CatalogBind::Text(library_id),
+                        CatalogBind::Integer(limit),
+                    ],
+                )
+                .await?;
+            rows.extend(library_rows);
+        }
+        Ok(rows)
     }
 
     pub(crate) async fn list_recommended_catalog_rows(
@@ -11684,6 +11793,9 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
              ON media_items(parent_id, removed_at)",
             "CREATE INDEX idx_media_items_series_removed
              ON media_items(series_id, removed_at)",
+            "CREATE INDEX idx_media_items_library_type_visible
+             ON media_items(library_id, item_type, id)
+             WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
                 VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
