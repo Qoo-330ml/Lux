@@ -13,7 +13,8 @@ Emby 的 `/config/metadata` 目录提供了可借鉴的按对象分组和分片�
 
 - Lux 管理的元数据资源统一位于 `/config/metadata`。
 - `library/<shard>/<item-id>/` 存放 Lux 管理的媒体条目图片、章节缩略图和后续资源。
-- `people/<bucket>/<display-name>-<provider>-<provider-id>/` 存放人物头像和 `person.nfo`。
+- 规范人物使用 `people/person/<shard>/<person-key>/` 存放人物头像和 `person.nfo`；旧版
+  `people/<bucket>/<display-name>-<provider>-<provider-id>/` 目录只作为兼容读取位置。
 - `collections`、`genres`、`studios`、`tags` 使用
   `<kind>/<bucket>/<display-name>-<provider>-<object-id>/` 的对象目录模式，按后续任务逐步启用；
   当前只确定路径合同，不代表这些对象已经进入数据库或 API。

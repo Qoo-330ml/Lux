@@ -894,10 +894,15 @@ impl PeopleService {
     pub async fn update_person_image(
         &self,
         person_id: &str,
+        person_name: &str,
+        provider: Option<&str>,
         content_type: Option<&str>,
         bytes: &[u8],
     ) -> Result<(), PeopleError> {
         validate_component(person_id)?;
+        if !is_valid_person_lookup(person_name) {
+            return Err(PeopleError::InvalidComponent(person_name.to_owned()));
+        }
         if bytes.is_empty() || bytes.len() > MAX_PROFILE_BYTES {
             return Err(PeopleError::InvalidImage(
                 "profile image payload is invalid".to_owned(),
@@ -919,19 +924,109 @@ impl PeopleService {
                 "profile image payload is invalid".to_owned(),
             ));
         }
-        let image_path = self
+
+        let provider = provider.unwrap_or("tmdb").trim().to_ascii_lowercase();
+        validate_component(&provider)?;
+        let person_dir = self
+            .person_directory_for_update(person_name, &provider, person_id)
+            .await?;
+        create_private_dir(&person_dir).await?;
+        let shared_relative = self
             .store_shared_profile_asset(&image_bytes, extension)
             .await?;
-        let index_path =
-            people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
+        let image_path = self
+            .materialize_profile_asset(
+                &metadata_root(&self.config_dir).join(shared_relative),
+                &person_dir,
+            )
+            .await?;
+        let relative_image_path = person_dir
+            .join(&image_path)
+            .strip_prefix(metadata_root(&self.config_dir))
+            .map_err(|_| {
+                PeopleError::Serialization("person image path is outside metadata".to_owned())
+            })?
+            .to_string_lossy()
+            .into_owned();
         create_private_dir(&people_index_directory(&self.config_dir)).await?;
         let index = StoredPersonIndex {
-            image_path,
-            person_key: None,
+            image_path: relative_image_path,
+            person_key: person_key_for_identities(&[PersonIdentity {
+                provider: provider.clone(),
+                id: person_id.to_owned(),
+            }]),
         };
         let index_bytes = serde_json::to_vec_pretty(&index)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
-        write_atomically(&index_path, &index_bytes).await
+        let provider_index_path =
+            people_index_path_for_provider(&self.config_dir, &provider, person_id)
+                .map_err(PeopleError::from)?;
+        write_atomically(&provider_index_path, &index_bytes).await?;
+        if provider.eq_ignore_ascii_case("tmdb") {
+            let index_path =
+                people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
+            write_atomically(&index_path, &index_bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn person_directory_for_update(
+        &self,
+        person_name: &str,
+        provider: &str,
+        person_id: &str,
+    ) -> Result<PathBuf, PeopleError> {
+        let legacy_dir = people_directory(&self.config_dir, person_name, provider, person_id)
+            .map_err(PeopleError::from)?;
+        if safe_metadata(&legacy_dir).await?.is_some() {
+            return Ok(legacy_dir);
+        }
+
+        let mut index_paths = vec![
+            people_index_path_for_provider(&self.config_dir, provider, person_id)
+                .map_err(PeopleError::from)?,
+        ];
+        if provider.eq_ignore_ascii_case("tmdb") {
+            index_paths
+                .push(people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?);
+        }
+        for index_path in index_paths {
+            let Some(bytes) = read_people_file(&index_path).await? else {
+                continue;
+            };
+            let index = serde_json::from_slice::<StoredPersonIndex>(&bytes)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            if let Some(person_key) = index.person_key.as_deref() {
+                return canonical_person_directory(&self.config_dir, person_key)
+                    .map_err(PeopleError::from);
+            }
+            let relative = Path::new(&index.image_path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+                || relative.starts_with(Path::new("people/assets"))
+            {
+                continue;
+            }
+            let metadata_dir = metadata_root(&self.config_dir);
+            let image_path = metadata_dir.join(relative);
+            if image_path.starts_with(&metadata_dir)
+                && let Some(parent) = image_path.parent()
+                && safe_metadata(parent)
+                    .await?
+                    .is_some_and(|metadata| metadata.is_dir())
+            {
+                return Ok(parent.to_owned());
+            }
+        }
+
+        let person_key = person_key_for_identities(&[PersonIdentity {
+            provider: provider.to_owned(),
+            id: person_id.to_owned(),
+        }])
+        .ok_or_else(|| PeopleError::InvalidComponent(person_id.to_owned()))?;
+        canonical_person_directory(&self.config_dir, &person_key).map_err(PeopleError::from)
     }
 
     pub async fn profile_image_for_emby_name_or_id(
@@ -1033,17 +1128,11 @@ impl PeopleService {
         validate_component(person_id)?;
         if let Some(provider) = provider {
             validate_component(provider)?;
-            let index_path = people_index_path_for_provider(&self.config_dir, provider, person_id)
-                .map_err(PeopleError::from)?;
-            if let Some(image) = self.read_indexed_person_image(&index_path).await? {
+            if let Some(image) = self
+                .indexed_profile_image_for_provider(provider, person_id)
+                .await?
+            {
                 return Ok(Some(image));
-            }
-            if provider.eq_ignore_ascii_case("tmdb") {
-                let legacy_index_path =
-                    people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
-                if let Some(image) = self.read_indexed_person_image(&legacy_index_path).await? {
-                    return Ok(Some(image));
-                }
             }
             if !provider.eq_ignore_ascii_case("tmdb") {
                 return Ok(None);
@@ -1066,6 +1155,26 @@ impl PeopleService {
         for extension in PROFILE_EXTENSIONS {
             let path = profiles_dir.join(format!("{person_id}.{extension}"));
             if let Some(image) = image_from_path(&path).await? {
+                return Ok(Some(image));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn indexed_profile_image_for_provider(
+        &self,
+        provider: &str,
+        person_id: &str,
+    ) -> Result<Option<PersonImage>, PeopleError> {
+        let index_path = people_index_path_for_provider(&self.config_dir, provider, person_id)
+            .map_err(PeopleError::from)?;
+        if let Some(image) = self.read_indexed_person_image(&index_path).await? {
+            return Ok(Some(image));
+        }
+        if provider.eq_ignore_ascii_case("tmdb") {
+            let legacy_index_path =
+                people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
+            if let Some(image) = self.read_indexed_person_image(&legacy_index_path).await? {
                 return Ok(Some(image));
             }
         }
@@ -1112,6 +1221,16 @@ impl PeopleService {
         image_url: Option<&str>,
         person_dir: &Path,
     ) -> Result<Option<String>, PeopleError> {
+        if let Some(image) = self
+            .indexed_profile_image_for_provider(provider, person_id)
+            .await?
+        {
+            return self
+                .materialize_profile_asset(&image.path, person_dir)
+                .await
+                .map(Some);
+        }
+
         for extension in PROFILE_EXTENSIONS {
             let path = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
             if safe_metadata(&path)
@@ -1137,19 +1256,8 @@ impl PeopleService {
 
         // The provider ID is the identity key. If another title already
         // indexed a local image for this person, reuse it instead of
-        // downloading the same profile again. The relation keeps
-        // `imageFile` empty in this case; `profile_image` resolves the
-        // canonical index independently of the title-specific directory.
-        if let Ok(Some(image)) = self
-            .profile_image_for_provider(Some(provider), person_id)
-            .await
-        {
-            if let Ok(relative) = image.path.strip_prefix(metadata_root(&self.config_dir)) {
-                return Ok(Some(relative.to_string_lossy().into_owned()));
-            }
-            return Ok(None);
-        }
-
+        // downloading the same profile again. The shared bytes are
+        // materialized as `folder.<ext>` in this person directory.
         let Some(image_url) = image_url else {
             return Ok(None);
         };
@@ -1209,9 +1317,11 @@ impl PeopleService {
                 "profile image payload is invalid".to_owned(),
             ));
         }
-        Ok(Some(
-            self.store_shared_profile_asset(&bytes, extension).await?,
-        ))
+        let relative = self.store_shared_profile_asset(&bytes, extension).await?;
+        let shared_path = metadata_root(&self.config_dir).join(relative);
+        self.materialize_profile_asset(&shared_path, person_dir)
+            .await
+            .map(Some)
     }
 
     async fn store_shared_profile_asset(
@@ -1239,6 +1349,63 @@ impl PeopleService {
             write_atomically(&path, bytes).await?;
         }
         Ok(relative)
+    }
+
+    async fn materialize_profile_asset(
+        &self,
+        shared_path: &Path,
+        person_dir: &Path,
+    ) -> Result<String, PeopleError> {
+        let Some(metadata) = safe_metadata(shared_path).await? else {
+            return Err(PeopleError::Io {
+                path: shared_path.to_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "shared profile asset does not exist",
+                ),
+            });
+        };
+        if !metadata.is_file() {
+            return Err(PeopleError::Io {
+                path: shared_path.to_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "shared profile asset is not a file",
+                ),
+            });
+        }
+        let extension = shared_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| PROFILE_EXTENSIONS.contains(value))
+            .ok_or_else(|| {
+                PeopleError::InvalidImage("shared profile asset extension is invalid".to_owned())
+            })?;
+        let file_name = format!("{PERSON_IMAGE}.{extension}");
+        let target = person_dir.join(&file_name);
+        let temporary = person_dir.join(format!(".{file_name}.{}.tmp", Uuid::now_v7()));
+        let result = async {
+            // Keep one physical copy in the content-addressed pool while exposing
+            // the Emby-compatible folder.<ext> entry inside each person directory.
+            fs::hard_link(shared_path, &temporary)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: temporary.clone(),
+                    source,
+                })?;
+            fs::rename(&temporary, &target)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: target.clone(),
+                    source,
+                })?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary).await;
+        }
+        result.map(|()| file_name)
     }
 }
 
@@ -1795,6 +1962,14 @@ mod tests {
         people_index_path_for_provider,
     };
 
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
     #[tokio::test]
     async fn profile_image_rejects_symlinked_files() -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::symlink;
@@ -2047,6 +2222,133 @@ mod tests {
         assert_eq!(first, second);
         let shared_path = config.path().join("metadata").join(&first);
         assert_eq!(tokio::fs::read(shared_path).await?, b"same-image");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_profile_asset_is_materialized_in_person_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let shared_relative = service
+            .store_shared_profile_asset(b"same-image", "png")
+            .await?;
+        let person_key = super::person_key_for_identities(&[PersonIdentity {
+            provider: "tmdb".to_owned(),
+            id: "9".to_owned(),
+        }])
+        .ok_or("missing person key")?;
+        let index_path = people_index_path_for_provider(config.path(), "tmdb", "9")?;
+        tokio::fs::create_dir_all(index_path.parent().ok_or("missing index parent")?).await?;
+        tokio::fs::write(
+            &index_path,
+            serde_json::to_vec(&serde_json::json!({
+                "imagePath": shared_relative,
+                "personKey": person_key,
+            }))?,
+        )
+        .await?;
+
+        service
+            .persist_item_actors(
+                "item-shared-profile",
+                "tmdb",
+                &[ActorCredit {
+                    id: "9".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员甲".to_owned(),
+                    character: None,
+                    order: Some(0),
+                    profile_url: None,
+                    person: None,
+                }],
+            )
+            .await?;
+
+        let relation_path =
+            library_item_directory(config.path(), "item-shared-profile")?.join("people.json");
+        let relation: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(relation_path).await?)?;
+        assert_eq!(relation["actors"][0]["imageFile"], "folder.png");
+
+        let person_dir = canonical_person_directory(config.path(), &person_key)?;
+        let person_image = person_dir.join("folder.png");
+        assert_eq!(tokio::fs::read(&person_image).await?, b"same-image");
+        let shared_path = config.path().join("metadata").join(&shared_relative);
+        assert_eq!(
+            tokio::fs::metadata(&person_image).await?.ino(),
+            tokio::fs::metadata(shared_path).await?.ino()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploaded_profile_asset_is_materialized_in_person_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        service
+            .update_person_image("9", "演员甲", Some("tmdb"), Some("image/png"), PNG_1X1)
+            .await?;
+
+        let person_key = super::person_key_for_identities(&[PersonIdentity {
+            provider: "tmdb".to_owned(),
+            id: "9".to_owned(),
+        }])
+        .ok_or("missing person key")?;
+        let person_dir = canonical_person_directory(config.path(), &person_key)?;
+        let person_image = person_dir.join("folder.png");
+        assert_eq!(tokio::fs::read(&person_image).await?, PNG_1X1);
+        let index_path = people_index_path_for_provider(config.path(), "tmdb", "9")?;
+        let index: serde_json::Value = serde_json::from_slice(&tokio::fs::read(index_path).await?)?;
+        assert!(
+            index["imagePath"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/folder.png"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploaded_profile_index_wins_over_an_older_folder_variant()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let legacy_dir = people_directory(config.path(), "演员甲", "tmdb", "9")?;
+        tokio::fs::create_dir_all(&legacy_dir).await?;
+        tokio::fs::write(legacy_dir.join("folder.jpg"), b"old-image").await?;
+        let service = PeopleService::new(config.path().to_owned());
+        service
+            .update_person_image("9", "演员甲", Some("tmdb"), Some("image/png"), PNG_1X1)
+            .await?;
+        service
+            .persist_item_actors(
+                "item-uploaded-profile",
+                "tmdb",
+                &[ActorCredit {
+                    id: "9".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员甲".to_owned(),
+                    character: None,
+                    order: Some(0),
+                    profile_url: None,
+                    person: None,
+                }],
+            )
+            .await?;
+
+        let relation_path =
+            library_item_directory(config.path(), "item-uploaded-profile")?.join("people.json");
+        let relation: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(relation_path).await?)?;
+        assert_eq!(relation["actors"][0]["imageFile"], "folder.png");
+        assert_eq!(
+            tokio::fs::read(legacy_dir.join("folder.png")).await?,
+            PNG_1X1
+        );
         Ok(())
     }
 

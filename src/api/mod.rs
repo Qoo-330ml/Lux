@@ -9260,18 +9260,24 @@ async fn emby_update_person_image(
     let Some(people) = state.people.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match people.find_person(&library_ids, "Actor", &item_id).await {
-        Ok(Some(_)) => {}
+    let person = match people.find_person(&library_ids, "Actor", &item_id).await {
+        Ok(Some(person)) => person,
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    };
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     match people
-        .update_person_image(&item_id, content_type, &body)
+        .update_person_image(
+            &item_id,
+            &person.name,
+            person.provider.as_deref(),
+            content_type,
+            &body,
+        )
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
