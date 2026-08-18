@@ -42,6 +42,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复媒体详情和媒体卡片的扫描操作误扫描整个媒体库的问题。",
         "修复本地图片路径不变但文件内容替换后索引未刷新的问题。",
         "修复 MDC 发送 Base64 格式演员头像时无法上传的问题。",
+        "修复 MDC 演员头像的 Content-Type 声明不准确时无法按实际图片格式识别的问题。",
       ] },
       { kind: "changed", items: [
         "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
