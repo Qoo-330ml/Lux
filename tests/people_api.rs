@@ -358,6 +358,43 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         .await?;
     assert_eq!(root_person_detail.status(), reqwest::StatusCode::OK);
 
+    let person_update = client
+        .post(format!("http://{address}/emby/Items/104?api_key={key}"))
+        .json(&json!({
+            "Name": "演员丁",
+            "ServerId": "ignored-by-lux",
+            "Id": "104",
+            "Type": "Person",
+            "Overview": "MDC 更新后的演员简介",
+            "BirthDate": "1990-01-02",
+            "KnownForDepartment": "Acting",
+            "PlaceOfBirth": "北京"
+        }))
+        .send()
+        .await?;
+    assert_eq!(person_update.status(), reqwest::StatusCode::OK);
+    let person_update_body: serde_json::Value = person_update.json().await?;
+    assert_eq!(person_update_body["Id"], "104");
+    assert_eq!(person_update_body["Type"], "Person");
+    assert_eq!(person_update_body["Overview"], "MDC 更新后的演员简介");
+    assert_eq!(person_update_body["BirthDate"], "1990-01-02");
+    assert_eq!(person_update_body["KnownForDepartment"], "Acting");
+    assert_eq!(person_update_body["PlaceOfBirth"], "北京");
+
+    let updated_person_detail = client
+        .get(format!(
+            "http://{address}/emby/Persons/104?Fields=Overview,BirthDate&api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(updated_person_detail.status(), reqwest::StatusCode::OK);
+    let updated_person_detail_body: serde_json::Value = updated_person_detail.json().await?;
+    assert_eq!(
+        updated_person_detail_body["Overview"],
+        "MDC 更新后的演员简介"
+    );
+    assert_eq!(updated_person_detail_body["BirthDate"], "1990-01-02");
+
     let lux_person_detail = client
         .get(format!("http://{address}/api/v1/people/104"))
         .header("X-Lux-Api-Key", &key)
@@ -367,7 +404,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     let lux_person_detail_body: serde_json::Value = lux_person_detail.json().await?;
     assert_eq!(lux_person_detail_body["id"], "104");
     assert_eq!(lux_person_detail_body["name"], "演员丁");
-    assert_eq!(lux_person_detail_body["biography"], "演员丁简介");
+    assert_eq!(lux_person_detail_body["biography"], "MDC 更新后的演员简介");
 
     let missing_person = client
         .get(format!("http://{address}/Persons/missing?api_key={key}"))

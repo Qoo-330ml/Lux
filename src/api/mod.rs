@@ -71,7 +71,7 @@ use crate::{
             LocalNfoDetails, LocalNfoMetadataStore, MetadataWriteRequest, MetadataWriteService,
             NfoWriteError,
         },
-        people::{PeopleError, PeopleService},
+        people::{PeopleError, PeopleService, PersonMetadataUpdate},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
@@ -1370,7 +1370,10 @@ fn emby_routes() -> Router<AppState> {
         .route("/Items/Counts", get(emby_items_counts))
         .route("/Items/Root", get(emby_items_root))
         .route("/Search/Hints", get(emby_search_hints))
-        .route("/Items/{item_id}", get(emby_item).head(emby_item))
+        .route(
+            "/Items/{item_id}",
+            get(emby_item).head(emby_item).post(emby_update_item),
+        )
         .route("/Items/{item_id}/Children", get(emby_collection_children))
         .route("/api/danmu/{item_id}", get(emby_danmaku_info))
         .route("/api/danmu/{item_id}/raw", get(emby_danmaku_raw))
@@ -3551,6 +3554,91 @@ async fn emby_item(
         Ok(user) => user,
         Err(status) => return status.into_response(),
     };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let fields = emby_detail_fields(query.fields.as_deref());
+    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
+    emby_item_response(
+        &state,
+        principal,
+        &item_id,
+        user.can_download,
+        fields.as_deref(),
+        compatibility,
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct EmbyPersonUpdateRequest {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Type")]
+    item_type: Option<String>,
+    #[serde(rename = "Overview")]
+    overview: Option<String>,
+    #[serde(rename = "BirthDate")]
+    birth_date: Option<String>,
+    #[serde(rename = "DeathDate")]
+    death_date: Option<String>,
+    #[serde(rename = "KnownForDepartment")]
+    known_for_department: Option<String>,
+    #[serde(rename = "PlaceOfBirth")]
+    place_of_birth: Option<String>,
+}
+
+async fn emby_update_item(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<EmbyPersonUpdateRequest>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if request.id != item_id {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if request
+        .item_type
+        .as_deref()
+        .is_some_and(|item_type| !item_type.eq_ignore_ascii_case("Person"))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let update = PersonMetadataUpdate {
+        name: request.name.trim().to_owned(),
+        biography: request.overview,
+        birthday: request.birth_date,
+        deathday: request.death_date,
+        known_for_department: request.known_for_department,
+        place_of_birth: request.place_of_birth,
+    };
+    match people
+        .update_person_metadata(&library_ids, &item_id, update)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(PeopleError::InvalidComponent(_)) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let fields = emby_detail_fields(query.fields.as_deref());
     let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;

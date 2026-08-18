@@ -1233,6 +1233,44 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) async fn list_person_credit_item_ids(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        person_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT DISTINCT pc.item_id
+             FROM person_credits pc
+             JOIN media_items mi ON mi.id = pc.item_id
+             WHERE mi.library_id IN ({placeholders})
+               AND mi.removed_at IS NULL
+               AND pc.person_type = ?
+               AND pc.person_id = ?
+             ORDER BY pc.item_id"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        let rows = statement
+            .bind(person_type)
+            .bind(person_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows.into_iter().map(|row| row.get("item_id")).collect())
+    }
+
     pub(crate) async fn list_person_credits_for_library(
         &self,
         library_id: &str,

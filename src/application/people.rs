@@ -70,6 +70,17 @@ pub struct PersonMetadata {
     pub place_of_birth: Option<String>,
 }
 
+/// Metadata supplied by an Emby-compatible person update request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PersonMetadataUpdate {
+    pub name: String,
+    pub biography: Option<String>,
+    pub birthday: Option<String>,
+    pub deathday: Option<String>,
+    pub known_for_department: Option<String>,
+    pub place_of_birth: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonIdentity {
@@ -742,6 +753,77 @@ impl PeopleService {
             .await
             .into_iter()
             .next())
+    }
+
+    pub async fn update_person_metadata(
+        &self,
+        library_ids: &[String],
+        person_id: &str,
+        update: PersonMetadataUpdate,
+    ) -> Result<bool, PeopleError> {
+        if !is_valid_person_id(person_id) {
+            return Err(PeopleError::InvalidComponent(person_id.to_owned()));
+        }
+        if !is_valid_person_lookup(&update.name) {
+            return Err(PeopleError::InvalidComponent(update.name));
+        }
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people index storage is unavailable".to_owned(),
+            ));
+        };
+        let item_ids = database
+            .list_person_credit_item_ids(library_ids, "Actor", person_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let mut updated = false;
+        for item_id in item_ids {
+            let new_path = library_item_directory(&self.config_dir, &item_id)
+                .map_err(PeopleError::from)?
+                .join("people.json");
+            let legacy_path = self
+                .legacy_people_dir()
+                .join(LEGACY_ITEMS_DIR)
+                .join(format!("{item_id}.json"));
+            let (relation_path, Some(mut relation)) = (match read_relation(&new_path).await? {
+                Some(relation) => (new_path, Some(relation)),
+                None => (legacy_path.clone(), read_relation(&legacy_path).await?),
+            }) else {
+                continue;
+            };
+            let mut item_updated = false;
+            for actor in &mut relation.actors {
+                if actor_id_from_stored_actor(actor) != person_id {
+                    continue;
+                }
+                actor.name = update.name.clone();
+                actor.person = Some(PersonMetadata {
+                    biography: update.biography.clone(),
+                    birthday: update.birthday.clone(),
+                    deathday: update.deathday.clone(),
+                    known_for_department: update.known_for_department.clone(),
+                    place_of_birth: update.place_of_birth.clone(),
+                });
+                item_updated = true;
+            }
+            if !item_updated {
+                continue;
+            }
+            let bytes = serde_json::to_vec_pretty(&relation)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            write_atomically(&relation_path, &bytes).await?;
+            let credits = relation
+                .actors
+                .iter()
+                .map(person_credit_from_stored_actor)
+                .collect::<Vec<_>>();
+            database
+                .replace_person_credits(&item_id, &credits)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            updated = true;
+        }
+        Ok(updated)
     }
 
     async fn actor_views_from_credits(&self, credits: Vec<StoredPersonCredit>) -> Vec<ActorView> {
