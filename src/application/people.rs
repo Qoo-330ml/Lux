@@ -823,7 +823,7 @@ impl PeopleService {
                 .iter()
                 .find(|identity| identity.id == person_id)
                 .map(|identity| identity.provider.as_str())
-                .unwrap_or_default()
+                .unwrap_or("local")
         } else {
             actor.provider.trim()
         };
@@ -2069,6 +2069,40 @@ mod tests {
         assert!(nfo.contains("<birthday>1970-01-01</birthday>"));
         assert!(nfo.contains("<knownfor>Acting</knownfor>"));
         assert!(nfo.contains("<placeofbirth>测试城市</placeofbirth>"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_person_metadata_nfo_uses_local_identity_type()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let actor = super::StoredActor {
+            id: Some("local-test".to_owned()),
+            name: "本地演员".to_owned(),
+            provider: String::new(),
+            person_key: None,
+            identities: Vec::new(),
+            character: None,
+            order: Some(0),
+            image_file: None,
+            pending_assets: Vec::new(),
+            person: Some(super::PersonMetadata {
+                biography: Some("本地演员简介".to_owned()),
+                birthday: None,
+                deathday: None,
+                known_for_department: None,
+                place_of_birth: None,
+            }),
+        };
+
+        service.write_person_nfo_for_actor(&actor).await?;
+
+        let nfo_path = people_directory(config.path(), "本地演员", "local", "local-test")?
+            .join(super::PERSON_NFO);
+        let nfo = tokio::fs::read_to_string(nfo_path).await?;
+        assert!(nfo.contains("<uniqueid type=\"local\">local-test</uniqueid>"));
+        assert!(nfo.contains("<biography>本地演员简介</biography>"));
         Ok(())
     }
 
