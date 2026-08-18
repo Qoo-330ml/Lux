@@ -725,6 +725,12 @@ export class LuxApiClient {
     );
   }
 
+  adminMetadataReidentifyJob(jobId: string) {
+    return this.request<{ job: AdminMetadataReidentifyJob }>(
+      `/api/v1/admin/metadata/reidentify/${encodeURIComponent(jobId)}`,
+    );
+  }
+
   retryMetadataReidentify(jobId: string) {
     return this.request<{ job: AdminMetadataReidentifyJob }>(
       `/api/v1/admin/metadata/reidentify/${encodeURIComponent(jobId)}`,

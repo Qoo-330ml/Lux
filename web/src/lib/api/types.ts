@@ -533,6 +533,16 @@ export type AdminMetadataReidentifyJob = {
   updatedAt?: string | number;
   startedAt?: string | number | null;
   finishedAt?: string | number | null;
+  items?: AdminMetadataReidentifyJobItem[];
+};
+
+export type AdminMetadataReidentifyJobItem = {
+  jobId: string;
+  itemId: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  candidateCount: number;
+  error?: string | null;
+  updatedAt: string | number;
 };
 
 export type AdminMetadataReidentifyStart = {
