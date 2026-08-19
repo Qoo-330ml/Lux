@@ -149,6 +149,13 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
                         deathday: None,
                         known_for_department: None,
                         place_of_birth: None,
+                        provider_ids: std::collections::BTreeMap::new(),
+                        genres: Vec::new(),
+                        tags: Vec::new(),
+                        production_locations: Vec::new(),
+                        premiere_date: None,
+                        production_year: None,
+                        taglines: Vec::new(),
                     }),
                 },
             ],
@@ -378,8 +385,18 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
             "Type": "Person",
             "Overview": "MDC 更新后的演员简介",
             "BirthDate": "1990-01-02",
+            "Genres": ["Drama"],
+            "Tags": ["MDC"],
+            "ProviderIds": {
+                "Tmdb": "123456",
+                "Imdb": "nm1234567"
+            },
+            "ProductionLocations": ["日本"],
+            "PremiereDate": "2000-01-02",
+            "ProductionYear": 2000,
             "KnownForDepartment": "Acting",
-            "PlaceOfBirth": "北京"
+            "PlaceOfBirth": "北京",
+            "Taglines": ["MDC 标语"]
         }))
         .send()
         .await?;
@@ -411,6 +428,14 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert!(person_nfo_body.contains("<birthday>1990-01-02</birthday>"));
     assert!(person_nfo_body.contains("<knownfor>Acting</knownfor>"));
     assert!(person_nfo_body.contains("<placeofbirth>北京</placeofbirth>"));
+    assert!(person_nfo_body.contains("<uniqueid type=\"tmdb\">123456</uniqueid>"));
+    assert!(person_nfo_body.contains("<uniqueid type=\"imdb\">nm1234567</uniqueid>"));
+    assert!(person_nfo_body.contains("<genre>Drama</genre>"));
+    assert!(person_nfo_body.contains("<tag>MDC</tag>"));
+    assert!(person_nfo_body.contains("<country>日本</country>"));
+    assert!(person_nfo_body.contains("<premiered>2000-01-02</premiered>"));
+    assert!(person_nfo_body.contains("<year>2000</year>"));
+    assert!(person_nfo_body.contains("<tagline>MDC 标语</tagline>"));
 
     let person_image_upload = client
         .post(format!(

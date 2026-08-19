@@ -3588,6 +3588,20 @@ struct EmbyPersonUpdateRequest {
     known_for_department: Option<String>,
     #[serde(rename = "PlaceOfBirth")]
     place_of_birth: Option<String>,
+    #[serde(rename = "ProviderIds", default)]
+    provider_ids: BTreeMap<String, String>,
+    #[serde(rename = "Genres", default)]
+    genres: Vec<String>,
+    #[serde(rename = "Tags", default)]
+    tags: Vec<String>,
+    #[serde(rename = "ProductionLocations", default)]
+    production_locations: Vec<String>,
+    #[serde(rename = "PremiereDate")]
+    premiere_date: Option<String>,
+    #[serde(rename = "ProductionYear")]
+    production_year: Option<i32>,
+    #[serde(rename = "Taglines", default)]
+    taglines: Vec<String>,
 }
 
 async fn emby_update_item(
@@ -3631,6 +3645,13 @@ async fn emby_update_item(
         deathday: request.death_date,
         known_for_department: request.known_for_department,
         place_of_birth: request.place_of_birth,
+        provider_ids: request.provider_ids,
+        genres: request.genres,
+        tags: request.tags,
+        production_locations: request.production_locations,
+        premiere_date: request.premiere_date,
+        production_year: request.production_year,
+        taglines: request.taglines,
     };
     match people
         .update_person_metadata(&library_ids, &item_id, update)

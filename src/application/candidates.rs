@@ -948,6 +948,13 @@ async fn enrich_actor_metadata(scraper: &TmdbProvider, actors: &mut [ActorCredit
             deathday: metadata.deathday,
             known_for_department: metadata.known_for_department,
             place_of_birth: metadata.place_of_birth,
+            provider_ids: std::collections::BTreeMap::new(),
+            genres: Vec::new(),
+            tags: Vec::new(),
+            production_locations: Vec::new(),
+            premiere_date: None,
+            production_year: None,
+            taglines: Vec::new(),
         };
         if person.biography.is_some()
             || person.birthday.is_some()

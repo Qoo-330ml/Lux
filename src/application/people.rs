@@ -75,6 +75,20 @@ pub struct PersonMetadata {
     pub known_for_department: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place_of_birth: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_ids: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub production_locations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premiere_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production_year: Option<i32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taglines: Vec<String>,
 }
 
 /// Metadata supplied by an Emby-compatible person update request.
@@ -86,6 +100,13 @@ pub struct PersonMetadataUpdate {
     pub deathday: Option<String>,
     pub known_for_department: Option<String>,
     pub place_of_birth: Option<String>,
+    pub provider_ids: BTreeMap<String, String>,
+    pub genres: Vec<String>,
+    pub tags: Vec<String>,
+    pub production_locations: Vec<String>,
+    pub premiere_date: Option<String>,
+    pub production_year: Option<i32>,
+    pub taglines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -805,6 +826,13 @@ impl PeopleService {
                     deathday: update.deathday.clone(),
                     known_for_department: update.known_for_department.clone(),
                     place_of_birth: update.place_of_birth.clone(),
+                    provider_ids: update.provider_ids.clone(),
+                    genres: update.genres.clone(),
+                    tags: update.tags.clone(),
+                    production_locations: update.production_locations.clone(),
+                    premiere_date: update.premiere_date.clone(),
+                    production_year: update.production_year,
+                    taglines: update.taglines.clone(),
                 });
                 self.write_person_nfo_for_actor(actor).await?;
                 item_updated = true;
@@ -1520,7 +1548,9 @@ fn person_nfo_bytes(
     provider_id: &str,
     metadata: Option<&PersonMetadata>,
 ) -> Vec<u8> {
-    let metadata = metadata.map(person_metadata_xml).unwrap_or_default();
+    let metadata = metadata
+        .map(|metadata| person_metadata_xml(metadata, provider, provider_id))
+        .unwrap_or_default();
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
          <person><name>{}</name>{}<uniqueid type=\"{}\">{}</uniqueid></person>\n",
@@ -1535,6 +1565,7 @@ fn person_nfo_bytes(
 #[derive(Default)]
 struct ParsedPersonNfo {
     fields: BTreeMap<String, String>,
+    repeated_fields: BTreeMap<String, BTreeSet<String>>,
     uniqueids: BTreeSet<(String, String)>,
 }
 
@@ -1572,19 +1603,49 @@ fn merge_person_nfo_bytes(
     ] {
         append_missing_person_nfo_field(&mut additions, &parsed, tag, value);
     }
+    let mut known_uniqueids = parsed.uniqueids.clone();
+    for (provider, provider_id) in metadata
+        .into_iter()
+        .flat_map(|metadata| metadata.provider_ids.iter())
+    {
+        append_missing_person_nfo_uniqueid(
+            &mut additions,
+            &mut known_uniqueids,
+            provider,
+            provider_id,
+        );
+    }
     let provider = provider.trim().to_ascii_lowercase();
     let provider_id = provider_id.trim();
-    if !provider.is_empty()
-        && !provider_id.is_empty()
-        && !parsed
-            .uniqueids
-            .contains(&(provider.clone(), provider_id.to_owned()))
-    {
-        additions.push_str(&format!(
-            "<uniqueid type=\"{}\">{}</uniqueid>",
-            escape(&provider),
-            escape(provider_id)
-        ));
+    append_missing_person_nfo_uniqueid(
+        &mut additions,
+        &mut known_uniqueids,
+        &provider,
+        provider_id,
+    );
+    if let Some(metadata) = metadata {
+        append_missing_person_nfo_values(&mut additions, &parsed, "genre", &metadata.genres);
+        append_missing_person_nfo_values(&mut additions, &parsed, "tag", &metadata.tags);
+        append_missing_person_nfo_values(
+            &mut additions,
+            &parsed,
+            "country",
+            &metadata.production_locations,
+        );
+        append_missing_person_nfo_values(&mut additions, &parsed, "tagline", &metadata.taglines);
+        append_missing_person_nfo_field(
+            &mut additions,
+            &parsed,
+            "premiered",
+            metadata.premiere_date.as_deref(),
+        );
+        let production_year = metadata.production_year.map(|year| year.to_string());
+        append_missing_person_nfo_field(
+            &mut additions,
+            &parsed,
+            "year",
+            production_year.as_deref(),
+        );
     }
     if additions.is_empty() {
         return Some(existing.to_owned());
@@ -1593,6 +1654,27 @@ fn merge_person_nfo_bytes(
     let closing = existing.rfind("</person>")?;
     existing.insert_str(closing, &additions);
     Some(existing.into_bytes())
+}
+
+fn append_missing_person_nfo_uniqueid(
+    additions: &mut String,
+    known_uniqueids: &mut BTreeSet<(String, String)>,
+    provider: &str,
+    provider_id: &str,
+) {
+    let provider = provider.trim().to_ascii_lowercase();
+    let provider_id = provider_id.trim();
+    if provider.is_empty()
+        || provider_id.is_empty()
+        || !known_uniqueids.insert((provider.clone(), provider_id.to_owned()))
+    {
+        return;
+    }
+    additions.push_str(&format!(
+        "<uniqueid type=\"{}\">{}</uniqueid>",
+        escape(&provider),
+        escape(provider_id)
+    ));
 }
 
 fn append_missing_person_nfo_field(
@@ -1609,6 +1691,27 @@ fn append_missing_person_nfo_field(
         .get(tag)
         .is_some_and(|value| !value.trim().is_empty());
     if !already_present {
+        additions.push_str(&format!("<{tag}>{}</{tag}>", escape(value)));
+    }
+}
+
+fn append_missing_person_nfo_values(
+    additions: &mut String,
+    parsed: &ParsedPersonNfo,
+    tag: &str,
+    values: &[String],
+) {
+    let existing = parsed.repeated_fields.get(tag);
+    let mut appended = BTreeSet::new();
+    for value in values
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if existing.is_some_and(|values| values.contains(value)) || !appended.insert(value) {
+            continue;
+        }
         additions.push_str(&format!("<{tag}>{}</{tag}>", escape(value)));
     }
 }
@@ -1638,8 +1741,16 @@ fn parse_person_nfo(bytes: &[u8]) -> Option<ParsedPersonNfo> {
                     active = Some((tag, provider, String::new()));
                 } else if matches!(
                     tag.as_str(),
-                    "name" | "biography" | "birthday" | "deathday" | "knownfor" | "placeofbirth"
-                ) {
+                    "name"
+                        | "biography"
+                        | "birthday"
+                        | "deathday"
+                        | "knownfor"
+                        | "placeofbirth"
+                        | "premiered"
+                        | "year"
+                ) || matches!(tag.as_str(), "genre" | "tag" | "country" | "tagline")
+                {
                     active = Some((tag, None, String::new()));
                 }
             }
@@ -1661,6 +1772,8 @@ fn parse_person_nfo(bytes: &[u8]) -> Option<ParsedPersonNfo> {
                                 result.uniqueids.insert((provider, value));
                             }
                         }
+                    } else if matches!(tag.as_str(), "genre" | "tag" | "country" | "tagline") {
+                        result.repeated_fields.entry(tag).or_default().insert(value);
                     } else {
                         result.fields.entry(tag).or_insert(value);
                     }
@@ -1672,7 +1785,11 @@ fn parse_person_nfo(bytes: &[u8]) -> Option<ParsedPersonNfo> {
     }
 }
 
-fn person_metadata_xml(metadata: &PersonMetadata) -> String {
+fn person_metadata_xml(
+    metadata: &PersonMetadata,
+    primary_provider: &str,
+    primary_id: &str,
+) -> String {
     let mut xml = String::new();
     for (tag, value) in [
         ("biography", metadata.biography.as_deref()),
@@ -1685,7 +1802,67 @@ fn person_metadata_xml(metadata: &PersonMetadata) -> String {
             xml.push_str(&format!("<{tag}>{}</{tag}>", escape(value)));
         }
     }
+    let mut uniqueids = BTreeSet::new();
+    let primary_provider = primary_provider.trim().to_ascii_lowercase();
+    let primary_id = primary_id.trim();
+    if !primary_provider.is_empty() && !primary_id.is_empty() {
+        uniqueids.insert((primary_provider, primary_id.to_owned()));
+    }
+    for (provider, provider_id) in &metadata.provider_ids {
+        append_uniqueid_xml(&mut xml, &mut uniqueids, provider, provider_id);
+    }
+    for (tag, values) in [
+        ("genre", &metadata.genres),
+        ("tag", &metadata.tags),
+        ("country", &metadata.production_locations),
+        ("tagline", &metadata.taglines),
+    ] {
+        let mut seen = BTreeSet::new();
+        for value in values
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !seen.insert(value) {
+                continue;
+            }
+            xml.push_str(&format!("<{tag}>{}</{tag}>", escape(value)));
+        }
+    }
+    if let Some(value) = metadata
+        .premiere_date
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        xml.push_str(&format!("<premiered>{}</premiered>", escape(value)));
+    }
+    if let Some(value) = metadata.production_year {
+        xml.push_str(&format!("<year>{value}</year>"));
+    }
     xml
+}
+
+fn append_uniqueid_xml(
+    xml: &mut String,
+    known_uniqueids: &mut BTreeSet<(String, String)>,
+    provider: &str,
+    provider_id: &str,
+) {
+    let provider = provider.trim().to_ascii_lowercase();
+    let provider_id = provider_id.trim();
+    if provider.is_empty()
+        || provider_id.is_empty()
+        || !known_uniqueids.insert((provider.clone(), provider_id.to_owned()))
+    {
+        return;
+    }
+    xml.push_str(&format!(
+        "<uniqueid type=\"{}\">{}</uniqueid>",
+        escape(&provider),
+        escape(provider_id)
+    ));
 }
 
 fn default_provider() -> String {
@@ -2097,6 +2274,8 @@ fn detected_profile_image_format(bytes: &[u8]) -> Option<(&'static str, &'static
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{ActorCredit, PeopleError, PeopleService, PersonIdentity};
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, people_directory,
@@ -2200,6 +2379,13 @@ mod tests {
                         deathday: None,
                         known_for_department: Some("Acting".to_owned()),
                         place_of_birth: Some("测试城市".to_owned()),
+                        provider_ids: BTreeMap::new(),
+                        genres: Vec::new(),
+                        tags: Vec::new(),
+                        production_locations: Vec::new(),
+                        premiere_date: None,
+                        production_year: None,
+                        taglines: Vec::new(),
                     }),
                 }],
             )
@@ -2234,6 +2420,13 @@ mod tests {
                 deathday: None,
                 known_for_department: None,
                 place_of_birth: None,
+                provider_ids: BTreeMap::new(),
+                genres: Vec::new(),
+                tags: Vec::new(),
+                production_locations: Vec::new(),
+                premiere_date: None,
+                production_year: None,
+                taglines: Vec::new(),
             }),
         };
 
@@ -2503,6 +2696,13 @@ mod tests {
                         deathday: None,
                         known_for_department: None,
                         place_of_birth: None,
+                        provider_ids: BTreeMap::new(),
+                        genres: Vec::new(),
+                        tags: Vec::new(),
+                        production_locations: Vec::new(),
+                        premiere_date: None,
+                        production_year: None,
+                        taglines: Vec::new(),
                     }),
                 }],
             )
@@ -2525,6 +2725,13 @@ mod tests {
                         deathday: None,
                         known_for_department: None,
                         place_of_birth: None,
+                        provider_ids: BTreeMap::new(),
+                        genres: Vec::new(),
+                        tags: Vec::new(),
+                        production_locations: Vec::new(),
+                        premiere_date: None,
+                        production_year: None,
+                        taglines: Vec::new(),
                     }),
                 }],
             )
@@ -2547,6 +2754,53 @@ mod tests {
         assert!(!nfo.contains("Douban biography"));
         assert!(nfo.contains("<birthday>1970-01-01</birthday>"));
         Ok(())
+    }
+
+    #[test]
+    fn person_nfo_appends_mdc_fields_without_duplicates_and_escapes_values() {
+        let existing = "<?xml version=\"1.0\"?><person><name>旧姓名</name><genre>已有类型</genre><uniqueid type=\"tmdb\">9</uniqueid><custom>保留</custom></person>".as_bytes();
+        let mut provider_ids = BTreeMap::new();
+        provider_ids.insert("Tmdb".to_owned(), "9".to_owned());
+        provider_ids.insert("Imdb".to_owned(), "nm<&>".to_owned());
+        let metadata = super::PersonMetadata {
+            biography: None,
+            birthday: None,
+            deathday: None,
+            known_for_department: None,
+            place_of_birth: None,
+            provider_ids,
+            genres: vec![
+                "已有类型".to_owned(),
+                "新 & 类型".to_owned(),
+                "新 & 类型".to_owned(),
+            ],
+            tags: vec!["MDC".to_owned(), "MDC".to_owned()],
+            production_locations: vec!["日本".to_owned()],
+            premiere_date: Some("2000-01-02".to_owned()),
+            production_year: Some(2000),
+            taglines: vec!["A <tagline>".to_owned()],
+        };
+
+        let nfo = String::from_utf8(
+            super::merge_person_nfo_bytes(existing, "新姓名", "tmdb", "9", Some(&metadata))
+                .expect("valid person nfo"),
+        )
+        .expect("utf-8 nfo");
+
+        assert!(nfo.contains("<name>旧姓名</name>"));
+        assert!(nfo.contains("<custom>保留</custom>"));
+        assert_eq!(
+            nfo.matches("<uniqueid type=\"tmdb\">9</uniqueid>").count(),
+            1
+        );
+        assert!(nfo.contains("<uniqueid type=\"imdb\">nm&lt;&amp;&gt;</uniqueid>"));
+        assert_eq!(nfo.matches("<genre>已有类型</genre>").count(), 1);
+        assert!(nfo.contains("<genre>新 &amp; 类型</genre>"));
+        assert_eq!(nfo.matches("<tag>MDC</tag>").count(), 1);
+        assert!(nfo.contains("<country>日本</country>"));
+        assert!(nfo.contains("<premiered>2000-01-02</premiered>"));
+        assert!(nfo.contains("<year>2000</year>"));
+        assert!(nfo.contains("<tagline>A &lt;tagline&gt;</tagline>"));
     }
 
     #[tokio::test]
