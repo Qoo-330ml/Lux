@@ -1877,6 +1877,7 @@ services:
 | LUX-183 至 186 | src/application/webhooks.rs、src/storage/、src/api/mod.rs、migrations/、migrations-postgres/、tests/、docs/ |
 | LUX-184 | web/public/media-capability-probe.html、web/public/media-capability-probe.js、web/tests/、docs/ |
 | LUX-185 | web/src/features/player/、web/public/hevc/、web/tests/、web/package.json、web/pnpm-lock.yaml、web/vite.config.ts、docs/ |
+| LUX-186 | src/application/plugins.rs、src/api/lux/mod.rs、src/api/mod.rs、tests/plugins.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4061,11 +4062,11 @@ API：
 
 验收：
 
-- [ ] 已安装插件页面可以手动检查更新，并显示当前版本、最新版本和是否可更新。
-- [ ] 可更新插件显示“更新插件”；更新成功后插件仍保持原配置和启用状态，页面显示已是最新。
-- [ ] 更新下载失败、包校验失败、平台不支持或无更新时旧包仍可用，且不删除插件配置。
-- [ ] 更新过程中插件进程被停止，更新后通过正常 RPC 调用按需启动新版本；STRM 插件计划任务保持同步。
-- [ ] 非管理员不能检查或更新；更新接口不记录完整外部 URL、token 或包内容。
+- [x] 已安装插件页面可以手动检查更新，并显示当前版本、最新版本和是否可更新。
+- [x] 可更新插件显示“更新插件”；更新成功后插件仍保持原配置和启用状态，页面显示已是最新。
+- [x] 更新下载失败、包校验失败、平台不支持或无更新时旧包仍可用，且不删除插件配置。
+- [x] 更新过程中插件进程被停止，更新后通过正常 RPC 调用按需启动新版本；STRM 插件计划任务保持同步。
+- [x] 非管理员不能检查或更新；更新接口不记录完整外部 URL、token 或包内容。
 
 验证：
 
