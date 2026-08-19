@@ -255,7 +255,7 @@ impl MetadataReidentifyService {
         }
         let job_id = Uuid::now_v7().to_string();
         self.database
-            .create_metadata_reidentify_library_job(&job_id, &item_ids, mode.as_str())
+            .create_metadata_reidentify_library_job(&job_id, library_id, &item_ids, mode.as_str())
             .await?;
         self.admin_events.publish(AdminEventScope::Jobs);
         self.get_job(&job_id).await

@@ -817,11 +817,17 @@ async fn library_metadata_job_processes_items_concurrently()
 async fn library_metadata_job_excludes_parent_folders() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, database, library_id, _folder_id) =
         setup_movie_library_with_parent_folder().await?;
-    let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
 
     let job = metadata.create_library_job(&library_id).await?;
 
     assert_eq!(job.total_count, 1);
+    let stored_library_id: Option<String> =
+        sqlx::query_scalar("SELECT library_id FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored_library_id.as_deref(), Some(library_id.as_str()));
     Ok(())
 }
 

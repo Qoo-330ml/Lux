@@ -4291,8 +4291,8 @@ impl Database {
                 source,
             })?;
         self.query(
-            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode)
-             VALUES (?, 'QUEUED', ?, ?)",
+            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode, library_id)
+             VALUES (?, 'QUEUED', ?, ?, NULL)",
         )
         .bind(job_id)
         .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
@@ -4317,6 +4317,28 @@ impl Database {
                 source,
             })?;
         }
+        self.query(
+            "UPDATE metadata_reidentify_jobs
+             SET library_id = (
+                 SELECT CASE
+                     WHEN MIN(media_items.library_id) = MAX(media_items.library_id)
+                         THEN MIN(media_items.library_id)
+                     ELSE NULL
+                 END
+                 FROM metadata_reidentify_job_items
+                 JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
+                 WHERE metadata_reidentify_job_items.job_id = ?
+             )
+             WHERE id = ?",
+        )
+        .bind(job_id)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         transaction
             .commit()
             .await
@@ -4329,16 +4351,18 @@ impl Database {
     pub(crate) async fn create_metadata_reidentify_library_job(
         &self,
         job_id: &str,
+        library_id: &str,
         item_ids: &[String],
         mode: &str,
     ) -> Result<(), StorageError> {
         self.query(
-            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode)
-             VALUES (?, 'CANCELLED', ?, ?)",
+            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode, library_id)
+             VALUES (?, 'CANCELLED', ?, ?, ?)",
         )
         .bind(job_id)
         .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
         .bind(mode)
+        .bind(library_id)
         .execute(&self.pool)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -4401,13 +4425,7 @@ impl Database {
             "SELECT id, status, processed_count, total_count, error,
                     created_at, updated_at, started_at, finished_at, mode,
                     cancel_requested,
-                    (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
-                            THEN MIN(media_items.library_id)
-                            ELSE NULL END
-                     FROM metadata_reidentify_job_items
-                     JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
-                     WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                    ) AS library_id,
+                    library_id,
                     (SELECT COUNT(DISTINCT pending_candidates.item_id)
                      FROM metadata_candidates pending_candidates
                      JOIN metadata_reidentify_job_items pending_job_items
@@ -4435,25 +4453,34 @@ impl Database {
     ) -> Result<Vec<StoredMetadataReidentifyJob>, StorageError> {
         let rows = if let Some(status) = status {
             self.query(
-                "SELECT id, status, processed_count, total_count, error,
-                        created_at, updated_at, started_at, finished_at, mode,
-                        cancel_requested,
-                        (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
-                                THEN MIN(media_items.library_id)
-                                ELSE NULL END
-                         FROM metadata_reidentify_job_items
-                         JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
-                         WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                        ) AS library_id,
-                        (SELECT COUNT(DISTINCT pending_candidates.item_id)
-                         FROM metadata_candidates pending_candidates
-                         JOIN metadata_reidentify_job_items pending_job_items
-                           ON pending_job_items.item_id = pending_candidates.item_id
-                          AND pending_job_items.job_id = metadata_reidentify_jobs.id
-                         WHERE pending_candidates.status = 'PENDING'
-                        ) AS pending_count
-                 FROM metadata_reidentify_jobs WHERE status = ?
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                "WITH selected_jobs AS (
+                     SELECT id, status, processed_count, total_count, error,
+                            created_at, updated_at, started_at, finished_at, mode,
+                            cancel_requested, library_id
+                     FROM metadata_reidentify_jobs
+                     WHERE status = ?
+                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+                 ), pending_items AS (
+                     SELECT DISTINCT item_id
+                     FROM metadata_candidates
+                     WHERE status = 'PENDING'
+                 ), pending_counts AS (
+                     SELECT job_items.job_id, COUNT(pending_items.item_id) AS pending_count
+                     FROM metadata_reidentify_job_items job_items
+                     JOIN selected_jobs ON selected_jobs.id = job_items.job_id
+                     JOIN pending_items ON pending_items.item_id = job_items.item_id
+                     GROUP BY job_items.job_id
+                 )
+                 SELECT selected_jobs.id, selected_jobs.status,
+                        selected_jobs.processed_count, selected_jobs.total_count,
+                        selected_jobs.error, selected_jobs.created_at,
+                        selected_jobs.updated_at, selected_jobs.started_at,
+                        selected_jobs.finished_at, selected_jobs.mode,
+                        selected_jobs.cancel_requested, selected_jobs.library_id,
+                        COALESCE(pending_counts.pending_count, 0) AS pending_count
+                 FROM selected_jobs
+                 LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id
+                 ORDER BY selected_jobs.created_at DESC, selected_jobs.id DESC",
             )
             .bind(status)
             .bind(limit)
@@ -4462,25 +4489,33 @@ impl Database {
             .await
         } else {
             self.query(
-                "SELECT id, status, processed_count, total_count, error,
-                        created_at, updated_at, started_at, finished_at, mode,
-                        cancel_requested,
-                        (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
-                                THEN MIN(media_items.library_id)
-                                ELSE NULL END
-                         FROM metadata_reidentify_job_items
-                         JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
-                         WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                        ) AS library_id,
-                        (SELECT COUNT(DISTINCT pending_candidates.item_id)
-                         FROM metadata_candidates pending_candidates
-                         JOIN metadata_reidentify_job_items pending_job_items
-                           ON pending_job_items.item_id = pending_candidates.item_id
-                          AND pending_job_items.job_id = metadata_reidentify_jobs.id
-                         WHERE pending_candidates.status = 'PENDING'
-                        ) AS pending_count
-                 FROM metadata_reidentify_jobs
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                "WITH selected_jobs AS (
+                     SELECT id, status, processed_count, total_count, error,
+                            created_at, updated_at, started_at, finished_at, mode,
+                            cancel_requested, library_id
+                     FROM metadata_reidentify_jobs
+                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+                 ), pending_items AS (
+                     SELECT DISTINCT item_id
+                     FROM metadata_candidates
+                     WHERE status = 'PENDING'
+                 ), pending_counts AS (
+                     SELECT job_items.job_id, COUNT(pending_items.item_id) AS pending_count
+                     FROM metadata_reidentify_job_items job_items
+                     JOIN selected_jobs ON selected_jobs.id = job_items.job_id
+                     JOIN pending_items ON pending_items.item_id = job_items.item_id
+                     GROUP BY job_items.job_id
+                 )
+                 SELECT selected_jobs.id, selected_jobs.status,
+                        selected_jobs.processed_count, selected_jobs.total_count,
+                        selected_jobs.error, selected_jobs.created_at,
+                        selected_jobs.updated_at, selected_jobs.started_at,
+                        selected_jobs.finished_at, selected_jobs.mode,
+                        selected_jobs.cancel_requested, selected_jobs.library_id,
+                        COALESCE(pending_counts.pending_count, 0) AS pending_count
+                 FROM selected_jobs
+                 LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id
+                 ORDER BY selected_jobs.created_at DESC, selected_jobs.id DESC",
             )
             .bind(limit)
             .bind(offset)
