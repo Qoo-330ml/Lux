@@ -436,6 +436,20 @@ async fn tmdb_client_routes_requests_through_configured_network_proxy()
     Ok(())
 }
 
+#[tokio::test]
+async fn tmdb_client_coalesces_and_reuses_cached_requests() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (base_url, state, server) = start_stub(vec![StatusCode::OK; 2], None, false, false).await;
+    let client = TmdbClient::new(client_config(base_url, Duration::from_secs(1), 0))?;
+    let first = client.search_movies("stub", Some(2020), "en-US").await?;
+    let second = client.search_movies("stub", Some(2020), "en-US").await?;
+    assert_eq!(first.results[0].id, second.results[0].id);
+    assert_eq!(state.attempts.load(Ordering::Relaxed), 1);
+
+    server.abort();
+    Ok(())
+}
+
 #[test]
 fn tmdb_client_requires_a_token_and_valid_http_base_url() {
     assert!(matches!(
