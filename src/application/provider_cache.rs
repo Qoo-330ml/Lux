@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    pin::Pin,
+    sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, Notify, OnceCell};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, futures::OwnedNotified};
 
 const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4096;
@@ -16,7 +17,7 @@ const MAX_CACHE_ENTRIES: usize = 4096;
 pub(crate) struct ProviderResponseCache {
     state: Arc<Mutex<CacheState>>,
     load_once: Arc<OnceCell<()>>,
-    persist_lock: Arc<Mutex<()>>,
+    persist_lock: Arc<AsyncMutex<()>>,
     path: Option<PathBuf>,
 }
 
@@ -35,8 +36,49 @@ struct CacheEntry {
 pub(crate) enum CacheLookup {
     Hit(Value),
     Negative,
-    Wait(Arc<Notify>),
-    Owner,
+    Wait(Pin<Box<OwnedNotified>>),
+    Owner(CacheOwner),
+}
+
+pub(crate) struct CacheOwner {
+    state: Arc<Mutex<CacheState>>,
+    key: String,
+    notify: Arc<Notify>,
+    released: bool,
+}
+
+impl CacheOwner {
+    pub(crate) fn finish(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let notify = {
+            let mut state = lock_state(&self.state);
+            let owned = state
+                .inflight
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.notify));
+            if owned {
+                state.inflight.remove(&self.key)
+            } else {
+                None
+            }
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for CacheOwner {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl ProviderResponseCache {
@@ -47,7 +89,7 @@ impl ProviderResponseCache {
                 inflight: HashMap::new(),
             })),
             load_once: Arc::new(OnceCell::new()),
-            persist_lock: Arc::new(Mutex::new(())),
+            persist_lock: Arc::new(AsyncMutex::new(())),
             path,
         }
     }
@@ -55,7 +97,7 @@ impl ProviderResponseCache {
     pub(crate) async fn begin(&self, key: &str) -> CacheLookup {
         self.ensure_loaded().await;
         let now = unix_now();
-        let mut state = self.state.lock().await;
+        let mut state = lock_state(&self.state);
         if let Some(entry) = state.entries.get(key) {
             if entry.expires_at > now {
                 return if entry.negative {
@@ -67,12 +109,18 @@ impl ProviderResponseCache {
         }
         state.entries.retain(|_, entry| entry.expires_at > now);
         if let Some(notify) = state.inflight.get(key) {
-            return CacheLookup::Wait(notify.clone());
+            let mut waiter = Box::pin(notify.clone().notified_owned());
+            waiter.as_mut().enable();
+            return CacheLookup::Wait(waiter);
         }
-        state
-            .inflight
-            .insert(key.to_owned(), Arc::new(Notify::new()));
-        CacheLookup::Owner
+        let notify = Arc::new(Notify::new());
+        state.inflight.insert(key.to_owned(), notify.clone());
+        CacheLookup::Owner(CacheOwner {
+            state: self.state.clone(),
+            key: key.to_owned(),
+            notify,
+            released: false,
+        })
     }
 
     pub(crate) async fn store(&self, key: &str, value: &Value, ttl_seconds: i64) {
@@ -83,7 +131,7 @@ impl ProviderResponseCache {
             return;
         };
         {
-            let mut state = self.state.lock().await;
+            let mut state = lock_state(&self.state);
             if state.entries.len() >= MAX_CACHE_ENTRIES {
                 evict_oldest(&mut state.entries);
             }
@@ -104,7 +152,7 @@ impl ProviderResponseCache {
             return;
         };
         {
-            let mut state = self.state.lock().await;
+            let mut state = lock_state(&self.state);
             if state.entries.len() >= MAX_CACHE_ENTRIES {
                 evict_oldest(&mut state.entries);
             }
@@ -120,16 +168,9 @@ impl ProviderResponseCache {
         self.persist().await;
     }
 
-    pub(crate) async fn finish(&self, key: &str) {
-        let notify = self.state.lock().await.inflight.remove(key);
-        if let Some(notify) = notify {
-            notify.notify_waiters();
-        }
-    }
-
     pub(crate) async fn clear(&self) {
         self.ensure_loaded().await;
-        self.state.lock().await.entries.clear();
+        lock_state(&self.state).entries.clear();
         self.persist().await;
     }
 
@@ -149,7 +190,7 @@ impl ProviderResponseCache {
                     return;
                 };
                 let now = unix_now();
-                let mut state = self.state.lock().await;
+                let mut state = lock_state(&self.state);
                 state.entries = entries
                     .into_iter()
                     .filter(|(_, entry)| entry.expires_at > now)
@@ -165,7 +206,7 @@ impl ProviderResponseCache {
         };
         let _guard = self.persist_lock.lock().await;
         let entries = {
-            let state = self.state.lock().await;
+            let state = lock_state(&self.state);
             state.entries.clone()
         };
         let Ok(bytes) = serde_json::to_vec(&entries) else {
@@ -183,6 +224,16 @@ impl ProviderResponseCache {
         }
         if tokio::fs::rename(&temporary, path).await.is_err() {
             let _ = tokio::fs::remove_file(&temporary).await;
+        }
+    }
+}
+
+fn lock_state(state: &Mutex<CacheState>) -> MutexGuard<'_, CacheState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!("provider response cache lock was poisoned");
+            poisoned.into_inner()
         }
     }
 }
@@ -255,14 +306,18 @@ mod tests {
     #[tokio::test]
     async fn cache_reuses_values_and_negative_results() {
         let cache = ProviderResponseCache::new(None);
-        assert!(matches!(cache.begin("value").await, CacheLookup::Owner));
+        let CacheLookup::Owner(owner) = cache.begin("value").await else {
+            panic!("first request should own value lookup");
+        };
         cache.store("value", &json!({"id": 7}), 60).await;
-        cache.finish("value").await;
+        owner.finish();
         assert!(matches!(cache.begin("value").await, CacheLookup::Hit(value) if value["id"] == 7));
 
-        assert!(matches!(cache.begin("missing").await, CacheLookup::Owner));
+        let CacheLookup::Owner(owner) = cache.begin("missing").await else {
+            panic!("first request should own missing lookup");
+        };
         cache.store_negative("missing", 60).await;
-        cache.finish("missing").await;
+        owner.finish();
         assert!(matches!(
             cache.begin("missing").await,
             CacheLookup::Negative
@@ -272,12 +327,14 @@ mod tests {
     #[tokio::test]
     async fn concurrent_lookup_waits_for_the_single_owner() {
         let cache = Arc::new(ProviderResponseCache::new(None));
-        assert!(matches!(cache.begin("same").await, CacheLookup::Owner));
+        let CacheLookup::Owner(owner) = cache.begin("same").await else {
+            panic!("first request should own concurrent lookup");
+        };
         let waiting_cache = cache.clone();
         let waiting = tokio::spawn(async move {
             match waiting_cache.begin("same").await {
-                CacheLookup::Wait(notify) => {
-                    notify.notified().await;
+                CacheLookup::Wait(waiter) => {
+                    waiter.await;
                     matches!(waiting_cache.begin("same").await, CacheLookup::Hit(value) if value["ok"] == true)
                 }
                 _ => false,
@@ -285,7 +342,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         cache.store("same", &json!({"ok": true}), 60).await;
-        cache.finish("same").await;
+        owner.finish();
         let result = timeout(Duration::from_secs(1), waiting)
             .await
             .expect("singleflight waiter timed out")
@@ -294,13 +351,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_owner_releases_waiters_for_a_new_request() {
+        let cache = Arc::new(ProviderResponseCache::new(None));
+        let owner_cache = cache.clone();
+        let (owner_claimed, owner_claimed_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            let CacheLookup::Owner(_lease) = owner_cache.begin("cancelled").await else {
+                return;
+            };
+            let _ = owner_claimed.send(());
+            std::future::pending::<()>().await;
+        });
+        owner_claimed_rx
+            .await
+            .expect("owner task stopped before claiming the request");
+
+        let waiting_cache = cache.clone();
+        let (waiter_registered, waiter_registered_rx) = tokio::sync::oneshot::channel();
+        let waiting = tokio::spawn(async move {
+            let CacheLookup::Wait(waiter) = waiting_cache.begin("cancelled").await else {
+                return false;
+            };
+            let _ = waiter_registered.send(());
+            waiter.await;
+            match waiting_cache.begin("cancelled").await {
+                CacheLookup::Owner(_lease) => true,
+                CacheLookup::Hit(_) | CacheLookup::Negative | CacheLookup::Wait(_) => false,
+            }
+        });
+        waiter_registered_rx
+            .await
+            .expect("waiter task stopped before observing the owner");
+        owner.abort();
+
+        let continued = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("new request remained blocked after owner cancellation")
+            .expect("waiter task panicked");
+        assert!(continued, "cancelled owner must not populate the cache");
+    }
+
+    #[tokio::test]
     async fn cache_survives_recreation_when_backed_by_a_file() {
         let directory = tempfile::tempdir().expect("temporary cache directory");
         let path = directory.path().join("provider-cache.json");
         let cache = ProviderResponseCache::new(Some(path.clone()));
-        assert!(matches!(cache.begin("persisted").await, CacheLookup::Owner));
+        let CacheLookup::Owner(owner) = cache.begin("persisted").await else {
+            panic!("first request should own persisted lookup");
+        };
         cache.store("persisted", &json!({"id": 9}), 60).await;
-        cache.finish("persisted").await;
+        owner.finish();
 
         let restored = ProviderResponseCache::new(Some(path));
         assert!(

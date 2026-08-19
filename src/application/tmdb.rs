@@ -693,18 +693,20 @@ impl TmdbClient {
     ) -> Result<serde_json::Value, TmdbError> {
         let cache_params = serde_json::json!(params);
         let cache_key = cache_key("tmdb", endpoint, &cache_params);
-        if let Some(cache_key) = cache_key.as_deref() {
+        let cache_owner = if let Some(cache_key) = cache_key.as_deref() {
             loop {
                 match self.response_cache.begin(cache_key).await {
                     CacheLookup::Negative => return Err(TmdbError::NotFound),
                     CacheLookup::Hit(value) => return Ok(value),
-                    CacheLookup::Wait(notify) => {
-                        notify.notified().await;
+                    CacheLookup::Wait(waiter) => {
+                        waiter.await;
                     }
-                    CacheLookup::Owner => break,
+                    CacheLookup::Owner(owner) => break Some(owner),
                 }
             }
-        }
+        } else {
+            None
+        };
         let result = self.request_value_uncached(endpoint, params).await;
         if let Some(cache_key) = cache_key.as_deref() {
             match &result {
@@ -718,7 +720,9 @@ impl TmdbClient {
                 }
                 Err(_) => {}
             }
-            self.response_cache.finish(cache_key).await;
+            if let Some(owner) = cache_owner {
+                owner.finish();
+            }
         }
         result
     }

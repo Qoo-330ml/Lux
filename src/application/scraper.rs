@@ -592,7 +592,7 @@ impl ScraperPluginClient {
                 .await
                 .map_err(ScraperError::Plugin);
         };
-        loop {
+        let cache_owner = loop {
             match self.response_cache.begin(&cache_key).await {
                 CacheLookup::Hit(value) => return Ok(value),
                 CacheLookup::Negative => {
@@ -600,10 +600,10 @@ impl ScraperPluginClient {
                         "cached scraper result was not found".to_owned(),
                     ));
                 }
-                CacheLookup::Wait(notify) => notify.notified().await,
-                CacheLookup::Owner => break,
+                CacheLookup::Wait(waiter) => waiter.await,
+                CacheLookup::Owner(owner) => break owner,
             }
-        }
+        };
         let result = self
             .plugins
             .call_scraper(&self.plugin_id, method, params)
@@ -618,7 +618,7 @@ impl ScraperPluginClient {
                 .store_negative(&cache_key, 10 * 60)
                 .await;
         }
-        self.response_cache.finish(&cache_key).await;
+        cache_owner.finish();
         result
     }
 }
