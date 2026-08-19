@@ -999,6 +999,7 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         .route(
             "/3/person/10",
             get(|| async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
                 Json(json!({
                     "id": 10,
                     "name": "后台演员",
@@ -1076,23 +1077,6 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
 
     let people_file =
         library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
-    for _ in 0..40 {
-        if people_file.exists() {
-            let people: Value = serde_json::from_slice(&tokio::fs::read(&people_file).await?)?;
-            if let Some(person_key) = people["actors"][0]["personKey"].as_str() {
-                let person_nfo =
-                    canonical_person_directory(&fixture.config.config_dir, person_key)?
-                        .join("person.nfo");
-                if tokio::fs::read_to_string(person_nfo)
-                    .await
-                    .is_ok_and(|value| value.contains("后台补全的人物简介"))
-                {
-                    break;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
     let people: Value = serde_json::from_slice(&tokio::fs::read(&people_file).await?)?;
     let person_key = people["actors"][0]["personKey"]
         .as_str()

@@ -609,7 +609,7 @@ impl MetadataReidentifyService {
             MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
             MetadataRefreshMode::Reidentify => return Ok(0),
         };
-        let selection_report = if needs_review {
+        if needs_review {
             selection
                 .select_for_review(item_id, &candidate.id, selection_mode)
                 .await
@@ -619,33 +619,29 @@ impl MetadataReidentifyService {
                 .await
         }
         .map_err(MetadataReidentifyError::Selection)?;
-        let selection = selection.clone();
-        let item_id = item_id.to_owned();
-        let candidate_id = candidate.id.clone();
-        let provider = provider.clone();
-        tokio::spawn(async move {
-            match selection
-                .enrich_selected_actors(&item_id, &candidate_id, &provider)
-                .await
-            {
-                Ok(actor_count) if actor_count > 0 => {
-                    tracing::debug!(
-                        item_id = %item_id,
-                        candidate_id = %candidate_id,
-                        actor_count,
-                        "background actor metadata enrichment completed"
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    item_id = %item_id,
-                    candidate_id = %candidate_id,
-                    %error,
-                    "background actor metadata enrichment failed"
-                ),
+        // Actor assets remain part of this persisted item worker: cancellation
+        // stops new claims and drains claimed items, job completion waits for
+        // this attempt, and a process exit cannot orphan a detached task.
+        match selection
+            .enrich_selected_actors(item_id, &candidate.id, provider)
+            .await
+        {
+            Ok(actor_count) if actor_count > 0 => {
+                tracing::debug!(
+                    item_id,
+                    candidate_id = %candidate.id,
+                    actor_count,
+                    "actor metadata enrichment completed"
+                );
             }
-        });
-        let _ = selection_report;
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                item_id,
+                candidate_id = %candidate.id,
+                %error,
+                "actor metadata enrichment failed"
+            ),
+        }
         Ok(i64::try_from(page.items.len()).unwrap_or(i64::MAX))
     }
 
