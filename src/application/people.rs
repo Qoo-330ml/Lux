@@ -1,11 +1,17 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fmt::Write as _,
+    io::Cursor,
     path::{Component, Path, PathBuf},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use quick_xml::escape::escape;
+use quick_xml::{
+    escape::{escape, unescape},
+    events::Event,
+    reader::Reader,
+};
 use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -389,12 +395,20 @@ impl PeopleService {
                 "actor people index directory was not prepared"
             );
         }
-        if let Err(error) = write_atomically(
-            &nfo_path,
-            &person_nfo_bytes(&actor.name, provider, provider_id, actor.person.as_ref()),
-        )
-        .await
-        {
+        let nfo_result = async {
+            let bytes = self
+                .person_nfo_bytes_with_existing(
+                    &nfo_path,
+                    &actor.name,
+                    provider,
+                    provider_id,
+                    actor.person.as_ref(),
+                )
+                .await?;
+            write_atomically(&nfo_path, &bytes).await
+        }
+        .await;
+        if let Err(error) = nfo_result {
             tracing::warn!(person_id = %provider_id, %error, "actor person NFO was not cached");
             pending_assets.push(PENDING_PERSON_NFO.to_owned());
         }
@@ -840,11 +854,34 @@ impl PeopleService {
             legacy_dir
         };
         create_private_dir(&person_dir).await?;
-        write_atomically(
-            &person_dir.join(PERSON_NFO),
-            &person_nfo_bytes(&actor.name, provider, &person_id, actor.person.as_ref()),
+        let nfo_path = person_dir.join(PERSON_NFO);
+        let bytes = self
+            .person_nfo_bytes_with_existing(
+                &nfo_path,
+                &actor.name,
+                provider,
+                &person_id,
+                actor.person.as_ref(),
+            )
+            .await?;
+        write_atomically(&nfo_path, &bytes).await
+    }
+
+    async fn person_nfo_bytes_with_existing(
+        &self,
+        path: &Path,
+        name: &str,
+        provider: &str,
+        provider_id: &str,
+        metadata: Option<&PersonMetadata>,
+    ) -> Result<Vec<u8>, PeopleError> {
+        let Some(existing) = read_people_file(path).await? else {
+            return Ok(person_nfo_bytes(name, provider, provider_id, metadata));
+        };
+        Ok(
+            merge_person_nfo_bytes(&existing, name, provider, provider_id, metadata)
+                .unwrap_or(existing),
         )
-        .await
     }
 
     async fn actor_views_from_credits(&self, credits: Vec<StoredPersonCredit>) -> Vec<ActorView> {
@@ -931,15 +968,8 @@ impl PeopleService {
             .person_directory_for_update(person_name, &provider, person_id)
             .await?;
         create_private_dir(&person_dir).await?;
-        let shared_relative = self
-            .store_shared_profile_asset(&image_bytes, extension)
-            .await?;
-        let image_path = self
-            .materialize_profile_asset(
-                &metadata_root(&self.config_dir).join(shared_relative),
-                &person_dir,
-            )
-            .await?;
+        let image_path = format!("{PERSON_IMAGE}.{extension}");
+        write_atomically(&person_dir.join(&image_path), &image_bytes).await?;
         let relative_image_path = person_dir
             .join(&image_path)
             .strip_prefix(metadata_root(&self.config_dir))
@@ -1317,38 +1347,9 @@ impl PeopleService {
                 "profile image payload is invalid".to_owned(),
             ));
         }
-        let relative = self.store_shared_profile_asset(&bytes, extension).await?;
-        let shared_path = metadata_root(&self.config_dir).join(relative);
-        self.materialize_profile_asset(&shared_path, person_dir)
-            .await
-            .map(Some)
-    }
-
-    async fn store_shared_profile_asset(
-        &self,
-        bytes: &[u8],
-        extension: &str,
-    ) -> Result<String, PeopleError> {
-        if !PROFILE_EXTENSIONS.contains(&extension) {
-            return Err(PeopleError::InvalidImage(
-                "unsupported profile image extension".to_owned(),
-            ));
-        }
-        let digest = Sha256::digest(bytes);
-        let mut encoded = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            let _ = write!(encoded, "{byte:02x}");
-        }
-        let relative = format!("people/assets/{encoded}.{extension}");
-        let path = metadata_root(&self.config_dir).join(&relative);
-        let parent = path.parent().ok_or_else(|| {
-            PeopleError::Serialization("profile asset path has no parent".to_owned())
-        })?;
-        create_private_dir(parent).await?;
-        if safe_metadata(&path).await?.is_none() {
-            write_atomically(&path, bytes).await?;
-        }
-        Ok(relative)
+        let image_path = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
+        write_atomically(&image_path, &bytes).await?;
+        Ok(Some(format!("{PERSON_IMAGE}.{extension}")))
     }
 
     async fn materialize_profile_asset(
@@ -1385,8 +1386,8 @@ impl PeopleService {
         let target = person_dir.join(&file_name);
         let temporary = person_dir.join(format!(".{file_name}.{}.tmp", Uuid::now_v7()));
         let result = async {
-            // Keep one physical copy in the content-addressed pool while exposing
-            // the Emby-compatible folder.<ext> entry inside each person directory.
+            // Materialize an old shared asset into the current Emby-compatible
+            // folder.<ext> layout without copying its bytes.
             fs::hard_link(shared_path, &temporary)
                 .await
                 .map_err(|source| PeopleError::Io {
@@ -1529,6 +1530,146 @@ fn person_nfo_bytes(
         escape(provider_id),
     )
     .into_bytes()
+}
+
+#[derive(Default)]
+struct ParsedPersonNfo {
+    fields: BTreeMap<String, String>,
+    uniqueids: BTreeSet<(String, String)>,
+}
+
+fn merge_person_nfo_bytes(
+    existing: &[u8],
+    name: &str,
+    provider: &str,
+    provider_id: &str,
+    metadata: Option<&PersonMetadata>,
+) -> Option<Vec<u8>> {
+    let parsed = parse_person_nfo(existing)?;
+    let mut additions = String::new();
+    append_missing_person_nfo_field(&mut additions, &parsed, "name", Some(name));
+    for (tag, value) in [
+        (
+            "biography",
+            metadata.and_then(|value| value.biography.as_deref()),
+        ),
+        (
+            "birthday",
+            metadata.and_then(|value| value.birthday.as_deref()),
+        ),
+        (
+            "deathday",
+            metadata.and_then(|value| value.deathday.as_deref()),
+        ),
+        (
+            "knownfor",
+            metadata.and_then(|value| value.known_for_department.as_deref()),
+        ),
+        (
+            "placeofbirth",
+            metadata.and_then(|value| value.place_of_birth.as_deref()),
+        ),
+    ] {
+        append_missing_person_nfo_field(&mut additions, &parsed, tag, value);
+    }
+    let provider = provider.trim().to_ascii_lowercase();
+    let provider_id = provider_id.trim();
+    if !provider.is_empty()
+        && !provider_id.is_empty()
+        && !parsed
+            .uniqueids
+            .contains(&(provider.clone(), provider_id.to_owned()))
+    {
+        additions.push_str(&format!(
+            "<uniqueid type=\"{}\">{}</uniqueid>",
+            escape(&provider),
+            escape(provider_id)
+        ));
+    }
+    if additions.is_empty() {
+        return Some(existing.to_owned());
+    }
+    let mut existing = String::from_utf8(existing.to_owned()).ok()?;
+    let closing = existing.rfind("</person>")?;
+    existing.insert_str(closing, &additions);
+    Some(existing.into_bytes())
+}
+
+fn append_missing_person_nfo_field(
+    additions: &mut String,
+    parsed: &ParsedPersonNfo,
+    tag: &str,
+    value: Option<&str>,
+) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let already_present = parsed
+        .fields
+        .get(tag)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !already_present {
+        additions.push_str(&format!("<{tag}>{}</{tag}>", escape(value)));
+    }
+}
+
+fn parse_person_nfo(bytes: &[u8]) -> Option<ParsedPersonNfo> {
+    if bytes.len() as u64 > MAX_PEOPLE_FILE_BYTES {
+        return None;
+    }
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut result = ParsedPersonNfo::default();
+    let mut active: Option<(String, Option<String>, String)> = None;
+    loop {
+        match reader.read_event_into(&mut buffer).ok()? {
+            Event::Eof => return Some(result),
+            Event::Start(event) => {
+                let tag = String::from_utf8(event.name().as_ref().to_ascii_lowercase()).ok()?;
+                if tag == "uniqueid" {
+                    let mut provider = None;
+                    for attribute in event.attributes() {
+                        let attribute = attribute.ok()?;
+                        if attribute.key.as_ref() == b"type" {
+                            provider = Some(attribute.unescape_value().ok()?.into_owned());
+                        }
+                    }
+                    active = Some((tag, provider, String::new()));
+                } else if matches!(
+                    tag.as_str(),
+                    "name" | "biography" | "birthday" | "deathday" | "knownfor" | "placeofbirth"
+                ) {
+                    active = Some((tag, None, String::new()));
+                }
+            }
+            Event::Text(text) => {
+                if let Some((_, _, value)) = active.as_mut() {
+                    let decoded = text.decode().ok()?;
+                    value.push_str(unescape(decoded.as_ref()).ok()?.as_ref());
+                }
+            }
+            Event::End(_) => {
+                if let Some((tag, provider, value)) = active.take() {
+                    let value = value.trim().to_owned();
+                    if tag == "uniqueid" {
+                        if let Some(provider) = provider
+                            .map(|provider| provider.trim().to_ascii_lowercase())
+                            .filter(|provider| !provider.is_empty())
+                        {
+                            if !value.is_empty() {
+                                result.uniqueids.insert((provider, value));
+                            }
+                        }
+                    } else {
+                        result.fields.entry(tag).or_insert(value);
+                    }
+                }
+            }
+            _ => {}
+        }
+        buffer.clear();
+    }
 }
 
 fn person_metadata_xml(metadata: &PersonMetadata) -> String {
@@ -2242,33 +2383,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_assets_are_content_addressed_and_reused()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let config = tempfile::tempdir()?;
-        let service = PeopleService::new(config.path().to_owned());
-        let first = service
-            .store_shared_profile_asset(b"same-image", "png")
-            .await?;
-        let second = service
-            .store_shared_profile_asset(b"same-image", "png")
-            .await?;
-
-        assert_eq!(first, second);
-        let shared_path = config.path().join("metadata").join(&first);
-        assert_eq!(tokio::fs::read(shared_path).await?, b"same-image");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shared_profile_asset_is_materialized_in_person_directory()
+    async fn legacy_shared_profile_asset_is_materialized_in_person_directory()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::MetadataExt;
 
         let config = tempfile::tempdir()?;
         let service = PeopleService::new(config.path().to_owned());
-        let shared_relative = service
-            .store_shared_profile_asset(b"same-image", "png")
-            .await?;
+        let shared_relative = "people/assets/legacy-hash.png";
+        let shared_path = config.path().join("metadata").join(shared_relative);
+        tokio::fs::create_dir_all(shared_path.parent().ok_or("missing shared parent")?).await?;
+        tokio::fs::write(&shared_path, b"same-image").await?;
         let person_key = super::person_key_for_identities(&[PersonIdentity {
             provider: "tmdb".to_owned(),
             id: "9".to_owned(),
@@ -2311,7 +2435,6 @@ mod tests {
         let person_dir = canonical_person_directory(config.path(), &person_key)?;
         let person_image = person_dir.join("folder.png");
         assert_eq!(tokio::fs::read(&person_image).await?, b"same-image");
-        let shared_path = config.path().join("metadata").join(&shared_relative);
         assert_eq!(
             tokio::fs::metadata(&person_image).await?.ino(),
             tokio::fs::metadata(shared_path).await?.ino()
@@ -2320,7 +2443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploaded_profile_asset_is_materialized_in_person_directory()
+    async fn uploaded_profile_image_is_written_in_person_directory()
     -> Result<(), Box<dyn std::error::Error>> {
         let config = tempfile::tempdir()?;
         let service = PeopleService::new(config.path().to_owned());
@@ -2336,6 +2459,7 @@ mod tests {
         let person_dir = canonical_person_directory(config.path(), &person_key)?;
         let person_image = person_dir.join("folder.png");
         assert_eq!(tokio::fs::read(&person_image).await?, PNG_1X1);
+        assert!(!config.path().join("metadata/people/assets").exists());
         let index_path = people_index_path_for_provider(config.path(), "tmdb", "9")?;
         let index: serde_json::Value = serde_json::from_slice(&tokio::fs::read(index_path).await?)?;
         assert!(
@@ -2343,6 +2467,85 @@ mod tests {
                 .as_str()
                 .is_some_and(|path| path.ends_with("/folder.png"))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn person_nfo_supplements_missing_fields_without_replacing_existing_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let identities = vec![
+            PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "9".to_owned(),
+            },
+            PersonIdentity {
+                provider: "douban".to_owned(),
+                id: "db-9".to_owned(),
+            },
+        ];
+        service
+            .persist_item_actors(
+                "item-nfo-first",
+                "tmdb",
+                &[ActorCredit {
+                    id: "9".to_owned(),
+                    provider: Some("tmdb".to_owned()),
+                    identities: identities.clone(),
+                    name: "演员甲".to_owned(),
+                    character: None,
+                    order: Some(0),
+                    profile_url: None,
+                    person: Some(super::PersonMetadata {
+                        biography: Some("TMDb biography".to_owned()),
+                        birthday: None,
+                        deathday: None,
+                        known_for_department: None,
+                        place_of_birth: None,
+                    }),
+                }],
+            )
+            .await?;
+        service
+            .persist_item_actors(
+                "item-nfo-second",
+                "douban",
+                &[ActorCredit {
+                    id: "db-9".to_owned(),
+                    provider: Some("douban".to_owned()),
+                    identities,
+                    name: "演员甲".to_owned(),
+                    character: None,
+                    order: Some(0),
+                    profile_url: None,
+                    person: Some(super::PersonMetadata {
+                        biography: Some("Douban biography".to_owned()),
+                        birthday: Some("1970-01-01".to_owned()),
+                        deathday: None,
+                        known_for_department: None,
+                        place_of_birth: None,
+                    }),
+                }],
+            )
+            .await?;
+
+        let person_key = super::person_key_for_identities(&[
+            PersonIdentity {
+                provider: "douban".to_owned(),
+                id: "db-9".to_owned(),
+            },
+            PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "9".to_owned(),
+            },
+        ])
+        .ok_or("missing person key")?;
+        let nfo_path = canonical_person_directory(config.path(), &person_key)?.join("person.nfo");
+        let nfo = tokio::fs::read_to_string(nfo_path).await?;
+        assert!(nfo.contains("<biography>TMDb biography</biography>"));
+        assert!(!nfo.contains("Douban biography"));
+        assert!(nfo.contains("<birthday>1970-01-01</birthday>"));
         Ok(())
     }
 

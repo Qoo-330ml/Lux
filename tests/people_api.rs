@@ -406,7 +406,8 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         canonical_person_directory(&temp_dir.path().join("config"), person_key)?.join("person.nfo");
     let person_nfo_body = tokio::fs::read_to_string(person_nfo).await?;
     assert!(person_nfo_body.contains("<name>演员丁</name>"));
-    assert!(person_nfo_body.contains("<biography>MDC 更新后的演员简介</biography>"));
+    assert!(person_nfo_body.contains("<biography>演员丁简介</biography>"));
+    assert!(!person_nfo_body.contains("MDC 更新后的演员简介"));
     assert!(person_nfo_body.contains("<birthday>1990-01-02</birthday>"));
     assert!(person_nfo_body.contains("<knownfor>Acting</knownfor>"));
     assert!(person_nfo_body.contains("<placeofbirth>北京</placeofbirth>"));
