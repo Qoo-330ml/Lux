@@ -326,7 +326,11 @@ impl PluginService {
                 continue;
             }
             if let Some(plugin) = local_plugin {
-                views.push(self.dynamic_view(plugin, installed, enabled).await?);
+                let mut view = self.dynamic_view(plugin, installed, enabled).await?;
+                view.latest_version = Some(entry.version.clone());
+                view.update_available =
+                    installed && plugin_version_is_newer(&plugin.manifest.version, &entry.version);
+                views.push(view);
             } else {
                 views.push(remote_plugin_view(entry, installed, enabled));
             }
@@ -427,6 +431,45 @@ impl PluginService {
         }
         *self.catalog.write().await = PluginCatalog::discover(&self.config_dir.join("plugins"));
         Ok(())
+    }
+
+    pub async fn update(&self, plugin_id: &str) -> Result<PluginView, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
+        if !self.database.has_plugin_installation(&plugin_id).await? {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        let entry = self
+            .store_index()
+            .await
+            .plugins
+            .into_iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !plugin_version_is_newer(&plugin.manifest.version, &entry.version) {
+            return Err(PluginServiceError::NoUpdate);
+        }
+        self.supervisor.stop(&plugin_id).await;
+        self.install_remote_package(&entry).await?;
+        let current_catalog = self.catalog_snapshot().await;
+        if plugin_id == MEDIA_INFO_PLUGIN_ID {
+            self.sync_media_info_scheduled_task().await?;
+        } else if current_catalog
+            .get(&plugin_id)
+            .is_some_and(is_chapter_detector_plugin)
+        {
+            self.sync_chapter_detection_scheduled_tasks().await?;
+        }
+        let enabled = self
+            .database
+            .plugin_installation_status(&plugin_id)
+            .await?
+            .unwrap_or(false);
+        self.view_for_id(&plugin_id, true, enabled).await
     }
 
     pub async fn set_enabled(
@@ -1662,6 +1705,8 @@ impl PluginService {
             } else {
                 public_config_values
             },
+            latest_version: None,
+            update_available: false,
         })
     }
 
@@ -1894,6 +1939,8 @@ fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) 
         config_fields: Vec::new(),
         config_source: CONFIG_SOURCE_NONE.to_owned(),
         config_values: Map::new(),
+        latest_version: Some(entry.version.clone()),
+        update_available: false,
     }
 }
 
@@ -2100,6 +2147,8 @@ pub struct PluginView {
     pub config_fields: Vec<PluginConfigField>,
     pub config_source: String,
     pub config_values: serde_json::Map<String, Value>,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
 }
 
 #[derive(Debug)]
@@ -2107,6 +2156,7 @@ pub enum PluginServiceError {
     UnknownPlugin(String),
     Unavailable(String),
     InvalidConfig,
+    NoUpdate,
     InvalidResponse,
     ConfigIo(io::Error),
     Runtime(PluginRuntimeError),
@@ -2122,6 +2172,7 @@ impl fmt::Display for PluginServiceError {
                 write!(formatter, "plugin is unavailable: {plugin_id}")
             }
             Self::InvalidConfig => formatter.write_str("invalid plugin configuration"),
+            Self::NoUpdate => formatter.write_str("plugin is already up to date"),
             Self::InvalidResponse => formatter.write_str("plugin returned an invalid response"),
             Self::ConfigIo(error) => write!(formatter, "plugin configuration IO error: {error}"),
             Self::Runtime(error) => error.fmt(formatter),
@@ -2141,6 +2192,7 @@ impl std::error::Error for PluginServiceError {
             Self::UnknownPlugin(_)
             | Self::Unavailable(_)
             | Self::InvalidConfig
+            | Self::NoUpdate
             | Self::InvalidResponse => None,
         }
     }

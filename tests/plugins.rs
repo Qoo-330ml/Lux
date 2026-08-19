@@ -401,6 +401,50 @@ async fn admin_can_disable_an_installed_plugin_without_removing_it()
 }
 
 #[tokio::test]
+async fn admin_update_returns_no_update_for_a_plugin_newer_than_the_store_catalog()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    seed_local_tmdb_package(&config_dir).await?;
+    let manifest_path = config_dir.join("plugins/org.lux.tmdb/manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&tokio::fs::read(&manifest_path).await?)?;
+    manifest["version"] = Value::String("99.0.0".to_owned());
+    tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?).await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir,
+    };
+    let (base_url, server) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = admin_session(&client, &base_url).await?;
+
+    let installed = client
+        .post(format!("{base_url}/api/v1/admin/plugins/tmdb/install"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+
+    let update = client
+        .post(format!(
+            "{base_url}/api/v1/admin/plugins/org.lux.tmdb/update"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(update.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        update.json::<Value>().await?["error"]["code"],
+        "PLUGIN_NO_UPDATE"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_uninstall_an_installed_plugin_and_remove_its_package()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -651,6 +651,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_install_plugin),
         )
         .route(
+            "/api/v1/admin/plugins/{plugin_id}/update",
+            post(admin_update_plugin),
+        )
+        .route(
             "/api/v1/admin/plugins/{plugin_id}",
             delete(admin_uninstall_plugin),
         )
@@ -16372,6 +16376,40 @@ async fn admin_install_plugin(
     }
 }
 
+async fn admin_update_plugin(
+    headers: HeaderMap,
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match plugins.update(&plugin_id).await {
+        Ok(plugin) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PLUGIN_UPDATED",
+                Some("plugin"),
+                Some(&plugin_id),
+                "{}",
+            )
+            .await;
+            Json(json!({ "plugin": plugin_json(&plugin) })).into_response()
+        }
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
 async fn admin_uninstall_plugin(
     headers: HeaderMap,
     Path(plugin_id): Path<String>,
@@ -17263,6 +17301,13 @@ fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
             "插件配置无效",
         )
         .into_response(),
+        PluginServiceError::NoUpdate => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginNoUpdate,
+            "插件已经是最新版本",
+        )
+        .into_response(),
         PluginServiceError::ConfigIo(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -17497,6 +17542,8 @@ fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
         })).collect::<Vec<_>>(),
         "configValues": plugin.config_values,
         "configSource": plugin.config_source,
+        "latestVersion": plugin.latest_version,
+        "updateAvailable": plugin.update_available,
     })
 }
 
