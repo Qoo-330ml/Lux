@@ -11,6 +11,9 @@ use tokio::{
     time::sleep,
 };
 
+use crate::application::provider_cache::{
+    CacheLookup, ProviderResponseCache, cache_key, tmdb_ttl_for_endpoint,
+};
 use crate::network::{apply_proxy, proxy_url_from_env};
 
 const DEFAULT_BASE_URL: &str = "https://api.themoviedb.org/";
@@ -63,6 +66,7 @@ pub struct TmdbClient {
     request_interval: Option<Duration>,
     next_request: Arc<Mutex<Instant>>,
     request_concurrency: Arc<Semaphore>,
+    response_cache: ProviderResponseCache,
 }
 
 impl TmdbClient {
@@ -114,7 +118,13 @@ impl TmdbClient {
             request_interval,
             next_request: Arc::new(Mutex::new(Instant::now())),
             request_concurrency: Arc::new(Semaphore::new(TMDB_MAX_CONCURRENT_REQUESTS)),
+            response_cache: ProviderResponseCache::new(None),
         })
+    }
+
+    pub fn with_cache_dir(mut self, cache_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.response_cache = ProviderResponseCache::new(Some(cache_dir.into()));
+        self
     }
 
     pub fn from_env() -> Result<Self, TmdbError> {
@@ -673,6 +683,45 @@ impl TmdbClient {
     }
 
     pub async fn request_value(
+        &self,
+        endpoint: &str,
+        params: &[(String, String)],
+    ) -> Result<serde_json::Value, TmdbError> {
+        let cache_params = serde_json::json!(params);
+        let cache_key = cache_key("tmdb", endpoint, &cache_params);
+        if let Some(cache_key) = cache_key.as_deref() {
+            loop {
+                match self.response_cache.begin(cache_key).await {
+                    CacheLookup::Hit(value) if value.is_null() => {
+                        return Err(TmdbError::NotFound);
+                    }
+                    CacheLookup::Hit(value) => return Ok(value),
+                    CacheLookup::Wait(notify) => {
+                        notify.notified().await;
+                    }
+                    CacheLookup::Owner => break,
+                }
+            }
+        }
+        let result = self.request_value_uncached(endpoint, params).await;
+        if let Some(cache_key) = cache_key.as_deref() {
+            match &result {
+                Ok(value) => {
+                    self.response_cache
+                        .store(cache_key, value, tmdb_ttl_for_endpoint(endpoint))
+                        .await;
+                }
+                Err(TmdbError::NotFound) => {
+                    self.response_cache.store_negative(cache_key, 10 * 60).await;
+                }
+                Err(_) => {}
+            }
+            self.response_cache.finish(cache_key).await;
+        }
+        result
+    }
+
+    async fn request_value_uncached(
         &self,
         endpoint: &str,
         params: &[(String, String)],

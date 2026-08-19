@@ -367,7 +367,16 @@ impl AppState {
         let Some(database) = self.database.clone() else {
             return self;
         };
-        let tmdb = TmdbProvider::from(tmdb);
+        let tmdb = TmdbProvider::from(
+            tmdb.with_cache_dir(
+                self.config_dir
+                    .clone()
+                    .map(|path| path.join("metadata/provider-responses.json"))
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from("./config/metadata/provider-responses.json")
+                    }),
+            ),
+        );
         self.tmdb = Some(tmdb.clone());
         if let Some(resolver) = self.scraper_resolver.clone() {
             let mut collections =

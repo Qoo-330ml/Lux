@@ -28,6 +28,7 @@ pub mod plugin_runtime;
 pub mod plugin_store;
 pub mod plugins;
 pub mod probe;
+pub(crate) mod provider_cache;
 pub mod recommendations;
 pub mod reidentify;
 pub mod remote_url_policy;

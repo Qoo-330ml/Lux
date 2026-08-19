@@ -28,7 +28,11 @@ pub struct TmdbPluginClient {
 impl TmdbPluginClient {
     pub fn new(plugins: PluginService) -> Self {
         Self {
-            scraper: ScraperPluginClient::new(plugins, TMDB_DYNAMIC_PLUGIN_ID),
+            scraper: ScraperPluginClient::new(
+                plugins.clone(),
+                TMDB_DYNAMIC_PLUGIN_ID,
+                plugins.provider_cache(),
+            ),
         }
     }
 

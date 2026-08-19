@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::{
     application::plugins::{PluginService, PluginServiceError},
+    application::provider_cache::{CacheLookup, ProviderResponseCache, cache_key, ttl_for_method},
     storage::{Database, StorageError},
 };
 
@@ -463,13 +464,19 @@ pub struct ScraperTrailer {
 pub struct ScraperPluginClient {
     plugins: PluginService,
     plugin_id: String,
+    response_cache: ProviderResponseCache,
 }
 
 impl ScraperPluginClient {
-    pub(crate) fn new(plugins: PluginService, plugin_id: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        plugins: PluginService,
+        plugin_id: impl Into<String>,
+        response_cache: ProviderResponseCache,
+    ) -> Self {
         Self {
             plugins,
             plugin_id: plugin_id.into(),
+            response_cache,
         }
     }
 
@@ -535,10 +542,32 @@ impl ScraperPluginClient {
         method: &str,
         params: Value,
     ) -> Result<Value, ScraperError> {
-        self.plugins
+        let Some(cache_key) = cache_key(&self.plugin_id, method, &params) else {
+            return self
+                .plugins
+                .call_scraper(&self.plugin_id, method, params)
+                .await
+                .map_err(ScraperError::Plugin);
+        };
+        loop {
+            match self.response_cache.begin(&cache_key).await {
+                CacheLookup::Hit(value) => return Ok(value),
+                CacheLookup::Wait(notify) => notify.notified().await,
+                CacheLookup::Owner => break,
+            }
+        }
+        let result = self
+            .plugins
             .call_scraper(&self.plugin_id, method, params)
             .await
-            .map_err(ScraperError::Plugin)
+            .map_err(ScraperError::Plugin);
+        if let Ok(value) = &result {
+            self.response_cache
+                .store(&cache_key, value, ttl_for_method(method))
+                .await;
+        }
+        self.response_cache.finish(&cache_key).await;
+        result
     }
 }
 
