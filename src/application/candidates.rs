@@ -205,36 +205,71 @@ impl MetadataCandidateService {
             )
         };
         let expires_at = candidate_expiry();
-        let results = response.items.into_iter().take(20).collect::<Vec<_>>();
-        let results = match mode {
-            CandidateSearchMode::Manual => results,
-            CandidateSearchMode::Automatic => results
-                .into_iter()
-                .max_by(|left, right| {
-                    metadata_match_score(
-                        &current.title,
-                        current.production_year,
-                        left.title.as_deref(),
-                        left.original_title.as_deref(),
-                        left.production_year,
-                    )
-                    .total_cmp(&metadata_match_score(
-                        &current.title,
-                        current.production_year,
-                        right.title.as_deref(),
-                        right.original_title.as_deref(),
-                        right.production_year,
-                    ))
-                })
-                .into_iter()
-                .collect(),
-        };
-        for result in results {
+        let mut results = response.items.into_iter().take(20).collect::<Vec<_>>();
+        if matches!(mode, CandidateSearchMode::Automatic) {
+            results.sort_by(|left, right| {
+                search_result_score(&current, left)
+                    .total_cmp(&search_result_score(&current, right))
+                    .reverse()
+            });
+            results.truncate(2);
+        }
+        for (result_index, result) in results.into_iter().enumerate() {
             let Some((provider, provider_id)) = tmdb.selected_provider_entry(&result) else {
                 continue;
             };
             let provider = provider.to_owned();
             let provider_id = provider_id.to_owned();
+            if matches!(mode, CandidateSearchMode::Automatic) && result_index > 0 {
+                let score = search_result_score(&current, &result);
+                let mut provider_ids = result.provider_ids.clone();
+                provider_ids
+                    .entry("Tmdb".to_owned())
+                    .or_insert_with(|| provider_id.clone());
+                self.store_candidate(
+                    item_id,
+                    &current,
+                    CandidateMetadata {
+                        title: result
+                            .title
+                            .clone()
+                            .or_else(|| result.original_title.clone())
+                            .unwrap_or_else(|| query.to_owned()),
+                        original_title: result.original_title,
+                        overview: result.overview,
+                        tagline: None,
+                        website: None,
+                        release_date: result.premiere_date,
+                        end_date: None,
+                        status: None,
+                        set_name: None,
+                        set_id: None,
+                        poster_url: result.image_url,
+                        backdrop_url: result.backdrop_image_url,
+                        production_year: result.production_year,
+                        rating: result.rating,
+                        original_language: result.original_language,
+                        runtime: None,
+                        votes: None,
+                        certification: None,
+                        countries: Vec::new(),
+                        genres: Vec::new(),
+                        studios: Vec::new(),
+                        provider_ids,
+                        directors: Vec::new(),
+                        writers: Vec::new(),
+                        trailers: Vec::new(),
+                        provider,
+                        provider_id,
+                        images: BTreeMap::new(),
+                        actors: Vec::new(),
+                        score: Some(score),
+                    },
+                    expires_at,
+                )
+                .await?;
+                continue;
+            }
             let details = if direct_details.is_some() {
                 direct_details.clone()
             } else if matches!(
@@ -834,6 +869,16 @@ fn metadata_match_score(
         _ => 0.0,
     };
     (title_score + year_score).max(0.0)
+}
+
+fn search_result_score(current: &StoredMediaMetadata, result: &ScraperSearchResult) -> f64 {
+    metadata_match_score(
+        &current.title,
+        current.production_year,
+        result.title.as_deref(),
+        result.original_title.as_deref(),
+        result.production_year,
+    )
 }
 
 fn title_similarity_score(current: &str, candidate: &str) -> f64 {

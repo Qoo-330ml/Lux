@@ -26,6 +26,7 @@ use crate::{
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
+const AUTO_MATCH_MIN_MARGIN: f64 = 5.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataRefreshMode {
@@ -602,7 +603,7 @@ impl MetadataReidentifyService {
         let Some(candidate) = best_pending_candidate(&page) else {
             return Err(MetadataReidentifyError::LowConfidence);
         };
-        let needs_review = candidate.score < AUTO_MATCH_MIN_SCORE;
+        let needs_review = best_automatic_candidate(&page).is_none();
         let selection_mode = match mode {
             MetadataRefreshMode::FillMissing => MetadataSelectionMode::FillMissing,
             MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
@@ -832,9 +833,21 @@ impl From<StorageError> for MetadataReidentifyError {
     }
 }
 
-#[cfg(test)]
 fn best_automatic_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
-    best_pending_candidate(page).filter(|candidate| candidate.score >= AUTO_MATCH_MIN_SCORE)
+    let candidate = best_pending_candidate(page)?;
+    if candidate.score < AUTO_MATCH_MIN_SCORE {
+        return None;
+    }
+    let second_score = page
+        .items
+        .iter()
+        .filter(|item| item.status == "PENDING" && item.id != candidate.id)
+        .map(|item| item.score)
+        .max_by(f64::total_cmp);
+    if second_score.is_some_and(|score| candidate.score - score < AUTO_MATCH_MIN_MARGIN) {
+        return None;
+    }
+    Some(candidate)
 }
 
 fn best_pending_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
@@ -868,7 +881,7 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AUTO_MATCH_MIN_SCORE, MetadataCandidatePage, MetadataCandidateView,
+        AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, MetadataCandidatePage, MetadataCandidateView,
         best_automatic_candidate,
     };
 
@@ -906,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_matching_allows_any_candidate_when_scores_tie() {
+    fn automatic_matching_sends_close_candidates_to_review() {
         let page = MetadataCandidatePage {
             items: vec![candidate("first", 90.0), candidate("second", 90.0)],
             total: 2,
@@ -914,8 +927,22 @@ mod tests {
             limit: 50,
         };
 
-        let selected = best_automatic_candidate(&page).expect("tied candidate is selectable");
-        assert_eq!(selected.score, 90.0);
+        assert!(best_automatic_candidate(&page).is_none());
+    }
+
+    #[test]
+    fn automatic_matching_sends_candidates_with_a_small_margin_to_review() {
+        let page = MetadataCandidatePage {
+            items: vec![
+                candidate("first", 90.0),
+                candidate("second", 90.0 - AUTO_MATCH_MIN_MARGIN + 0.1),
+            ],
+            total: 2,
+            offset: 0,
+            limit: 50,
+        };
+
+        assert!(best_automatic_candidate(&page).is_none());
     }
 
     #[test]

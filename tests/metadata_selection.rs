@@ -942,8 +942,9 @@ async fn automatic_candidate_search_expands_only_the_best_result()
         )
         .await?;
 
-    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items.len(), 2);
     assert_eq!(page.items[0].provider_id, "1");
+    assert_eq!(page.items[1].provider_id, "2");
     assert_eq!(non_best_details_requests.load(Ordering::SeqCst), 0);
 
     tmdb_server.abort();
