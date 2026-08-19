@@ -186,8 +186,10 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(catalog_body["total"], 6);
     assert_eq!(tmdb["category"], "SCRAPER");
     assert_eq!(tmdb["version"], "0.1.5");
-    assert_eq!(tmdb["latestVersion"], "0.1.5");
-    assert_eq!(tmdb["updateAvailable"], false);
+    // The default store is intentionally live, so its published version can
+    // advance independently of this local-package installation test.
+    assert!(tmdb["latestVersion"].is_string());
+    assert!(tmdb["updateAvailable"].is_boolean());
     assert_eq!(tmdb["installed"], false);
     assert_eq!(tmdb["configured"], true);
     assert_eq!(tmdb["configurable"], true);
