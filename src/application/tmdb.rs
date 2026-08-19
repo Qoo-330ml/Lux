@@ -696,9 +696,7 @@ impl TmdbClient {
         if let Some(cache_key) = cache_key.as_deref() {
             loop {
                 match self.response_cache.begin(cache_key).await {
-                    CacheLookup::Hit(value) if value.is_null() => {
-                        return Err(TmdbError::NotFound);
-                    }
+                    CacheLookup::Negative => return Err(TmdbError::NotFound),
                     CacheLookup::Hit(value) => return Ok(value),
                     CacheLookup::Wait(notify) => {
                         notify.notified().await;

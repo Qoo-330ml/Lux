@@ -34,6 +34,7 @@ struct CacheEntry {
 
 pub(crate) enum CacheLookup {
     Hit(Value),
+    Negative,
     Wait(Arc<Notify>),
     Owner,
 }
@@ -58,7 +59,7 @@ impl ProviderResponseCache {
         if let Some(entry) = state.entries.get(key) {
             if entry.expires_at > now {
                 return if entry.negative {
-                    CacheLookup::Hit(Value::Null)
+                    CacheLookup::Negative
                 } else {
                     CacheLookup::Hit(entry.value.clone())
                 };
@@ -262,7 +263,10 @@ mod tests {
         assert!(matches!(cache.begin("missing").await, CacheLookup::Owner));
         cache.store_negative("missing", 60).await;
         cache.finish("missing").await;
-        assert!(matches!(cache.begin("missing").await, CacheLookup::Hit(value) if value.is_null()));
+        assert!(matches!(
+            cache.begin("missing").await,
+            CacheLookup::Negative
+        ));
     }
 
     #[tokio::test]

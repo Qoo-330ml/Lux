@@ -556,6 +556,11 @@ impl ScraperPluginClient {
         loop {
             match self.response_cache.begin(&cache_key).await {
                 CacheLookup::Hit(value) => return Ok(value),
+                CacheLookup::Negative => {
+                    return Err(ScraperError::Provider(
+                        "cached scraper result was not found".to_owned(),
+                    ));
+                }
                 CacheLookup::Wait(notify) => notify.notified().await,
                 CacheLookup::Owner => break,
             }
@@ -569,9 +574,31 @@ impl ScraperPluginClient {
             self.response_cache
                 .store(&cache_key, value, ttl_for_method(method))
                 .await;
+        } else if result.as_ref().err().is_some_and(is_negative_scraper_error) {
+            self.response_cache
+                .store_negative(&cache_key, 10 * 60)
+                .await;
         }
         self.response_cache.finish(&cache_key).await;
         result
+    }
+}
+
+fn is_negative_scraper_error(error: &ScraperError) -> bool {
+    match error {
+        ScraperError::Provider(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("not found") || message.contains("404")
+        }
+        ScraperError::Plugin(PluginServiceError::Runtime(
+            crate::application::plugin_runtime::PluginRuntimeError::Plugin { code, .. },
+        )) => {
+            let code = code.to_ascii_lowercase();
+            code == "not_found" || code == "notfound" || code == "404"
+        }
+        ScraperError::Plugin(_) | ScraperError::Storage(_) | ScraperError::InvalidResponse(_) => {
+            false
+        }
     }
 }
 
