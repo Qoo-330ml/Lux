@@ -9,6 +9,7 @@ fn tmdb_settings_default_to_simplified_chinese_and_disabled_fallback() {
 
     assert_eq!(settings.preferred_language, "zh-CN");
     assert!(!settings.language_fallback_enabled);
+    assert!(!settings.title_alias_replacement_enabled);
     assert_eq!(settings.fallback_languages, vec!["zh-SG", "zh-HK", "zh-TW"]);
     assert!(!settings.alternate_api_enabled);
     assert_eq!(settings.api_base_url, TMDB_DEFAULT_API_BASE_URL);
@@ -89,10 +90,13 @@ fn tmdb_language_options_prioritize_chinese_regions() {
 #[tokio::test]
 async fn tmdb_settings_round_trip_without_exposing_credentials() {
     let directory = tempfile::tempdir().expect("temporary directory should exist");
-    let settings = TmdbSettings::new(
+    let settings = TmdbSettings::new_with_api_and_title_alias_config(
         "zh-SG".to_owned(),
         true,
+        true,
         vec!["zh-HK".to_owned(), "zh-TW".to_owned()],
+        false,
+        "https://api.themoviedb.org".to_owned(),
     )
     .expect("settings should be valid");
 
@@ -102,6 +106,7 @@ async fn tmdb_settings_round_trip_without_exposing_credentials() {
     let restored = read_tmdb_settings(directory.path()).await;
 
     assert_eq!(restored, settings);
+    assert!(restored.title_alias_replacement_enabled);
     let serialized = std::fs::read_to_string(directory.path().join("tmdb_settings.json"))
         .expect("settings file should exist");
     assert!(!serialized.contains("apiKey"));

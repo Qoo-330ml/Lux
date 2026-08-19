@@ -172,6 +172,7 @@ describe("AdminPluginsPage plugin cards", () => {
       configValues: {
         preferredLanguage: "zh-CN",
         languageFallbackEnabled: false,
+        titleAliasReplacementEnabled: false,
         fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
         alternateApiEnabled: false,
         apiBaseUrl: "https://api.themoviedb.org",
@@ -197,6 +198,14 @@ describe("AdminPluginsPage plugin cards", () => {
           required: false,
           sensitive: false,
           description: "按顺序补全缺失元数据。",
+        },
+        {
+          key: "titleAliasReplacementEnabled",
+          label: "标题别名替换",
+          type: "toggle",
+          required: false,
+          sensitive: false,
+          description: "当tmdb语言检索不到中文名称时，尝试使用中文别名替换",
         },
         {
           key: "fallbackLanguages",
@@ -249,7 +258,9 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(fallbackListbox?.getAttribute("aria-multiselectable")).toBe("true");
     expect([...fallbackListbox?.querySelectorAll<HTMLElement>("[role='option'][aria-selected='true']") ?? []].map((option) => option.textContent?.trim())).toEqual(["zh-SG", "zh-HK", "zh-TW"]);
     await act(async () => selects[1]?.click());
-    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(2);
+    expect(dialog?.textContent).toContain("标题别名替换");
+    expect(dialog?.textContent).toContain("当tmdb语言检索不到中文名称时，尝试使用中文别名替换");
+    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(3);
 
     await act(async () => {
       dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
@@ -257,6 +268,7 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.tmdb", expect.objectContaining({
       preferredLanguage: "zh-CN",
       languageFallbackEnabled: false,
+      titleAliasReplacementEnabled: false,
       fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
       alternateApiEnabled: false,
       apiBaseUrl: "https://api.themoviedb.org",

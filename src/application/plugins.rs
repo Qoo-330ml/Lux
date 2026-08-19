@@ -72,6 +72,7 @@ pub struct TmdbConfigUpdate<'a> {
     pub api_key: Option<&'a str>,
     pub preferred_language: Option<&'a str>,
     pub language_fallback_enabled: Option<bool>,
+    pub title_alias_replacement_enabled: Option<bool>,
     pub fallback_languages: Option<Vec<String>>,
     pub alternate_api_enabled: Option<bool>,
     pub api_base_url: Option<&'a str>,
@@ -197,6 +198,20 @@ fn tmdb_config_fields() -> Vec<PluginConfigField> {
                     label: option.label,
                 })
                 .collect(),
+            options_source: None,
+            default_value: None,
+            minimum: None,
+            maximum: None,
+        },
+        PluginConfigField {
+            key: "titleAliasReplacementEnabled".to_owned(),
+            label: "标题别名替换".to_owned(),
+            input_type: "toggle".to_owned(),
+            required: false,
+            sensitive: false,
+            description: Some("当tmdb语言检索不到中文名称时，尝试使用中文别名替换".to_owned()),
+            multiple: false,
+            options: Vec::new(),
             options_source: None,
             default_value: None,
             minimum: None,
@@ -452,7 +467,7 @@ impl PluginService {
             return Err(PluginServiceError::InvalidConfig);
         }
         let current_settings = read_tmdb_settings(&self.config_dir).await;
-        let settings = TmdbSettings::new_with_api_config(
+        let settings = TmdbSettings::new_with_api_and_title_alias_config(
             update
                 .preferred_language
                 .map(str::to_owned)
@@ -460,6 +475,9 @@ impl PluginService {
             update
                 .language_fallback_enabled
                 .unwrap_or(current_settings.language_fallback_enabled),
+            update
+                .title_alias_replacement_enabled
+                .unwrap_or(current_settings.title_alias_replacement_enabled),
             update
                 .fallback_languages
                 .unwrap_or(current_settings.fallback_languages),
@@ -2458,6 +2476,10 @@ async fn tmdb_config_values(config_dir: &std::path::Path) -> serde_json::Map<Str
         (
             "languageFallbackEnabled".to_owned(),
             Value::Bool(settings.language_fallback_enabled),
+        ),
+        (
+            "titleAliasReplacementEnabled".to_owned(),
+            Value::Bool(settings.title_alias_replacement_enabled),
         ),
         (
             "fallbackLanguages".to_owned(),

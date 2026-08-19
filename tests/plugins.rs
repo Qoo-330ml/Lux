@@ -200,6 +200,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
         json!(["zh-SG", "zh-HK", "zh-TW"])
     );
     assert_eq!(tmdb["configValues"]["alternateApiEnabled"], false);
+    assert_eq!(tmdb["configValues"]["titleAliasReplacementEnabled"], false);
     assert_eq!(
         tmdb["configValues"]["apiBaseUrl"],
         "https://api.themoviedb.org"
@@ -208,6 +209,10 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(
         tmdb["configFields"][5]["options"][1]["label"],
         "https://api.tmdb.org"
+    );
+    assert_eq!(
+        tmdb["configFields"][6]["key"],
+        "titleAliasReplacementEnabled"
     );
     assert!(tmdb.get("apiKey").is_none());
 
@@ -475,6 +480,7 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
             "apiKey": custom_key,
             "preferredLanguage": "zh-SG",
             "languageFallbackEnabled": true,
+            "titleAliasReplacementEnabled": true,
             "fallbackLanguages": ["zh-HK", "zh-TW"],
             "alternateApiEnabled": true,
             "apiBaseUrl": "https://api.tmdb.org"
@@ -490,6 +496,10 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
     );
     assert_eq!(
         configured_body["plugin"]["configValues"]["languageFallbackEnabled"],
+        true
+    );
+    assert_eq!(
+        configured_body["plugin"]["configValues"]["titleAliasReplacementEnabled"],
         true
     );
     assert_eq!(
