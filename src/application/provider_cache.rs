@@ -205,9 +205,10 @@ pub(crate) fn tmdb_ttl_for_endpoint(endpoint: &str) -> i64 {
         5 * 60
     } else if endpoint.contains("/images") || endpoint.contains("/credits") {
         24 * 60 * 60
-    } else if endpoint.contains("/external_ids") || endpoint.contains("/videos") {
-        7 * 24 * 60 * 60
-    } else if endpoint.starts_with("3/person/") {
+    } else if endpoint.contains("/external_ids")
+        || endpoint.contains("/videos")
+        || endpoint.starts_with("3/person/")
+    {
         7 * 24 * 60 * 60
     } else {
         24 * 60 * 60
