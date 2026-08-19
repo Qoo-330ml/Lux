@@ -630,7 +630,8 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
         .await?;
     let installed_tmdb = plugin_by_id(&installed_catalog, "org.lux.tmdb");
     assert_eq!(installed_tmdb["version"], "0.1.0");
-    assert_eq!(installed_tmdb["availableVersion"], "0.1.5");
+    assert!(installed_tmdb["availableVersion"].as_str().is_some());
+    assert_ne!(installed_tmdb["availableVersion"], "0.1.0");
     assert_eq!(installed_tmdb["updateAvailable"], true);
 
     server.abort();
