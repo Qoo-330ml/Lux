@@ -16,7 +16,7 @@ type ChangelogRelease = {
 export const changelogReleases: ChangelogRelease[] = [
   {
     version: "0.2.7",
-    date: "2026-08-18",
+    date: "2026-08-19",
     sections: [
       { kind: "added", items: [
         "增加 Web 端 Matroska/HEVC+AAC 客户端播放回退，支持浏览器端解复用、Worker/WASM 处理和 MSE 播放。",
@@ -28,7 +28,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "增加管理台元数据任务失败详情，支持查看失败条目和具体错误信息。",
         "支持 MDC 通过 Emby POST /Items/{personId} 更新人物简介、生日、职业领域和出生地等元数据，并同步人物关系。",
         "支持 MDC 通过 Emby POST /Items/{personId}/Images/Primary 上传演员头像，并在人物图片接口中读取。",
-        "MDC 人物资料更新同步写入人物 person.nfo，保留简介、生日、职业领域和出生地等信息。",
+        "MDC 人物资料更新同步写入人物 person.nfo，支持 ProviderIds、Genres、Tags、制作地区、上映日期/年份和标语等信息。",
       ] },
       { kind: "fixed", items: [
         "修复 Matroska 流式处理和 HEVC+AAC 播放链路的兼容问题，提升非原生浏览器播放稳定性。",
@@ -47,6 +47,8 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 MDC 更新人物资料后人物 NFO 未同步写入的问题。",
         "修复共享人物头像未物化为人物目录中的 Emby folder.<ext> 文件、导致目录读取不兼容的问题。",
         "修复没有 provider ID 的本地人物身份无法写入人物 person.nfo 的问题。",
+        "修复追加人物 NFO 字段时覆盖已有非空内容或重复写入相同字段的问题。",
+        "修复同一规范人物的后续 provider 处理覆盖已有头像的问题。",
       ] },
       { kind: "changed", items: [
         "完成 Web 媒体能力探针阶段验收，继续区分浏览器能力声明与实际 4K 实时播放性能。",
@@ -58,6 +60,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "媒体详情和媒体卡片的扫描操作改为只扫描媒体源所在文件夹，媒体库管理页继续负责整库扫描。",
         "增加 SQLite/PostgreSQL 首页与人物名称查询索引，数据库 schema version 更新至 69。",
         "规范人物资源目录使用 people/person/<shard>/<person-key>/ 和 Emby 风格的 folder.<ext> 图片；图片字节继续通过共享内容哈希资源去重，旧目录保持兼容读取。",
+        "规范人物 NFO 更新采用字段级追加策略，保留已有自定义字段和非空元数据；已有共享头像资源继续兼容读取，新头像写入规范人物目录。",
       ] },
     ],
   },
