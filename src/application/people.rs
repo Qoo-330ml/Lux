@@ -866,6 +866,27 @@ impl PeopleService {
         person_id: &str,
         update: PersonMetadataUpdate,
     ) -> Result<bool, PeopleError> {
+        self.update_person_metadata_with_nfo_mode(library_ids, person_id, update, false)
+            .await
+    }
+
+    pub async fn replace_person_metadata(
+        &self,
+        library_ids: &[String],
+        person_id: &str,
+        update: PersonMetadataUpdate,
+    ) -> Result<bool, PeopleError> {
+        self.update_person_metadata_with_nfo_mode(library_ids, person_id, update, true)
+            .await
+    }
+
+    async fn update_person_metadata_with_nfo_mode(
+        &self,
+        library_ids: &[String],
+        person_id: &str,
+        update: PersonMetadataUpdate,
+        replace_existing_nfo: bool,
+    ) -> Result<bool, PeopleError> {
         if !is_valid_person_id(person_id) {
             return Err(PeopleError::InvalidComponent(person_id.to_owned()));
         }
@@ -916,7 +937,12 @@ impl PeopleService {
                     production_year: update.production_year,
                     taglines: update.taglines.clone(),
                 });
-                self.write_person_nfo_for_actor(actor).await?;
+                if replace_existing_nfo {
+                    self.write_person_nfo_for_actor_replacing_metadata(actor)
+                        .await?;
+                } else {
+                    self.write_person_nfo_for_actor(actor).await?;
+                }
                 item_updated = true;
             }
             if !item_updated {
@@ -940,6 +966,22 @@ impl PeopleService {
     }
 
     async fn write_person_nfo_for_actor(&self, actor: &StoredActor) -> Result<(), PeopleError> {
+        self.write_person_nfo_for_actor_with_mode(actor, false)
+            .await
+    }
+
+    async fn write_person_nfo_for_actor_replacing_metadata(
+        &self,
+        actor: &StoredActor,
+    ) -> Result<(), PeopleError> {
+        self.write_person_nfo_for_actor_with_mode(actor, true).await
+    }
+
+    async fn write_person_nfo_for_actor_with_mode(
+        &self,
+        actor: &StoredActor,
+        replace_existing_metadata: bool,
+    ) -> Result<(), PeopleError> {
         let person_id = actor_id_from_stored_actor(actor);
         let provider = if actor.provider.trim().is_empty() {
             actor
@@ -965,15 +1007,25 @@ impl PeopleService {
         };
         create_private_dir(&person_dir).await?;
         let nfo_path = person_dir.join(PERSON_NFO);
-        let bytes = self
-            .person_nfo_bytes_with_existing(
+        let bytes = if replace_existing_metadata {
+            self.person_nfo_bytes_with_replaced_metadata(
                 &nfo_path,
                 &actor.name,
                 provider,
                 &person_id,
                 actor.person.as_ref(),
             )
-            .await?;
+            .await?
+        } else {
+            self.person_nfo_bytes_with_existing(
+                &nfo_path,
+                &actor.name,
+                provider,
+                &person_id,
+                actor.person.as_ref(),
+            )
+            .await?
+        };
         write_atomically(&nfo_path, &bytes).await
     }
 
@@ -991,6 +1043,23 @@ impl PeopleService {
         Ok(
             merge_person_nfo_bytes(&existing, name, provider, provider_id, metadata)
                 .unwrap_or(existing),
+        )
+    }
+
+    async fn person_nfo_bytes_with_replaced_metadata(
+        &self,
+        path: &Path,
+        name: &str,
+        provider: &str,
+        provider_id: &str,
+        metadata: Option<&PersonMetadata>,
+    ) -> Result<Vec<u8>, PeopleError> {
+        let Some(existing) = read_people_file(path).await? else {
+            return Ok(person_nfo_bytes(name, provider, provider_id, metadata));
+        };
+        Ok(
+            replace_person_nfo_bytes(&existing, name, provider, provider_id, metadata)
+                .unwrap_or_else(|| person_nfo_bytes(name, provider, provider_id, metadata)),
         )
     }
 
@@ -1791,6 +1860,77 @@ fn merge_person_nfo_bytes(
     let closing = existing.rfind("</person>")?;
     existing.insert_str(closing, &additions);
     Some(existing.into_bytes())
+}
+
+fn replace_person_nfo_bytes(
+    existing: &[u8],
+    name: &str,
+    provider: &str,
+    provider_id: &str,
+    metadata: Option<&PersonMetadata>,
+) -> Option<Vec<u8>> {
+    parse_person_nfo(existing)?;
+    let mut document = String::from_utf8(existing.to_owned()).ok()?;
+    for tag in [
+        "name",
+        "biography",
+        "birthday",
+        "deathday",
+        "knownfor",
+        "placeofbirth",
+        "uniqueid",
+        "genre",
+        "tag",
+        "country",
+        "tagline",
+        "premiered",
+        "year",
+    ] {
+        remove_person_nfo_elements(&mut document, tag)?;
+    }
+    let closing = document.rfind("</person>")?;
+    let generated =
+        String::from_utf8(person_nfo_bytes(name, provider, provider_id, metadata)).ok()?;
+    let generated_start = generated.find("<person>")? + "<person>".len();
+    let generated_end = generated.rfind("</person>")?;
+    document.insert_str(closing, &generated[generated_start..generated_end]);
+    Some(document.into_bytes())
+}
+
+fn remove_person_nfo_elements(document: &mut String, tag: &str) -> Option<()> {
+    let opening = format!("<{tag}");
+    let closing = format!("</{tag}>");
+    loop {
+        let lower = document.to_ascii_lowercase();
+        let Some(start) = find_person_nfo_element_start(&lower, &opening) else {
+            return Some(());
+        };
+        let open_end = lower[start..].find('>')? + start;
+        if lower.as_bytes().get(open_end.checked_sub(1)?) == Some(&b'/') {
+            document.replace_range(start..=open_end, "");
+            continue;
+        }
+        let content_start = open_end + 1;
+        let close_start = lower[content_start..].find(&closing)? + content_start;
+        let end = close_start + closing.len();
+        document.replace_range(start..end, "");
+    }
+}
+
+fn find_person_nfo_element_start(document: &str, opening: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(relative_start) = document[search_from..].find(opening) {
+        let start = search_from + relative_start;
+        let boundary = document.as_bytes().get(start + opening.len()).copied();
+        if matches!(
+            boundary,
+            Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')
+        ) {
+            return Some(start);
+        }
+        search_from = start + opening.len();
+    }
+    None
 }
 
 fn append_missing_person_nfo_uniqueid(
@@ -2971,6 +3111,47 @@ mod tests {
         assert!(nfo.contains("<premiered>2000-01-02</premiered>"));
         assert!(nfo.contains("<year>2000</year>"));
         assert!(nfo.contains("<tagline>A &lt;tagline&gt;</tagline>"));
+    }
+
+    #[test]
+    fn person_nfo_replacement_updates_known_fields_and_preserves_unknown_xml() {
+        let existing = "<?xml version=\"1.0\"?><person><name>旧姓名</name><biography>旧简介</biography><genre>旧类型</genre><uniqueid type=\"imdb\">old-id</uniqueid><custom>保留</custom></person>".as_bytes();
+        let metadata = super::PersonMetadata {
+            biography: Some("新简介".to_owned()),
+            birthday: None,
+            deathday: None,
+            known_for_department: None,
+            place_of_birth: None,
+            provider_ids: BTreeMap::new(),
+            genres: vec!["新类型".to_owned()],
+            tags: Vec::new(),
+            production_locations: Vec::new(),
+            premiere_date: None,
+            production_year: None,
+            taglines: Vec::new(),
+        };
+
+        let nfo = String::from_utf8(
+            super::replace_person_nfo_bytes(
+                existing,
+                "新姓名",
+                "local",
+                "local-id",
+                Some(&metadata),
+            )
+            .expect("valid person nfo"),
+        )
+        .expect("utf-8 nfo");
+
+        assert!(nfo.contains("<name>新姓名</name>"));
+        assert!(!nfo.contains("旧姓名"));
+        assert!(nfo.contains("<biography>新简介</biography>"));
+        assert!(!nfo.contains("旧简介"));
+        assert!(nfo.contains("<genre>新类型</genre>"));
+        assert!(!nfo.contains("旧类型"));
+        assert!(nfo.contains("<uniqueid type=\"local\">local-id</uniqueid>"));
+        assert!(!nfo.contains("old-id"));
+        assert!(nfo.contains("<custom>保留</custom>"));
     }
 
     #[tokio::test]

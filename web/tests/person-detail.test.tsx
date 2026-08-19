@@ -121,4 +121,46 @@ describe("person detail", () => {
     expect(biography?.textContent).toBe("第一行第二行第三行");
     expect(biography?.textContent).not.toContain("<br>");
   });
+
+  it("lets a server manager edit and save person metadata", async () => {
+    vi.spyOn(api, "person").mockResolvedValue({ id: "person-3", name: "演员丙", biography: "旧简介" });
+    const updatePerson = vi.spyOn(api, "updatePerson").mockResolvedValue({
+      id: "person-3",
+      name: "演员丙（编辑）",
+      biography: "新简介",
+    });
+    root = createRoot(container!);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/people/person-3"]}>
+            <Routes>
+              <Route path="people/:personId" element={<PersonDetailPage user={{ id: "admin", canManageServer: true }} />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("[aria-label='编辑人物资料']")?.click();
+    });
+    const nameInput = container?.querySelector<HTMLInputElement>("#person-name");
+    expect(nameInput).not.toBeNull();
+    await act(async () => {
+      if (nameInput) {
+        const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        valueSetter?.call(nameInput, "演员丙（编辑）");
+        nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+        nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      container?.querySelector<HTMLButtonElement>("[aria-label='保存人物资料']")?.click();
+    });
+    expect(updatePerson).toHaveBeenCalledWith("person-3", expect.objectContaining({ name: "演员丙（编辑）" }));
+  });
 });

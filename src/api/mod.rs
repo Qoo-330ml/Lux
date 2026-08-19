@@ -883,7 +883,10 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_list_library_items),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
-        .route("/api/v1/people/{person_id}", get(lux_get_person))
+        .route(
+            "/api/v1/people/{person_id}",
+            get(lux_get_person).patch(lux_update_person),
+        )
         .route(
             "/api/v1/people/{person_id}/image",
             get(lux_get_person_image),
@@ -10436,6 +10439,186 @@ async fn lux_get_person(
         .into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LuxPersonUpdateRequest {
+    name: String,
+    #[serde(default)]
+    biography: Option<String>,
+    #[serde(default)]
+    birthday: Option<String>,
+    #[serde(default)]
+    deathday: Option<String>,
+    #[serde(default)]
+    known_for_department: Option<String>,
+    #[serde(default)]
+    place_of_birth: Option<String>,
+    #[serde(default)]
+    provider_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    production_locations: Vec<String>,
+    #[serde(default)]
+    premiere_date: Option<String>,
+    #[serde(default)]
+    production_year: Option<i32>,
+    #[serde(default)]
+    taglines: Vec<String>,
+}
+
+async fn lux_update_person(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<LuxPersonUpdateRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if !person_update_is_bounded(&request) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物资料内容过长或格式无效",
+        )
+        .into_response();
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let update = PersonMetadataUpdate {
+        name: request.name.trim().to_owned(),
+        biography: clean_person_text(request.biography),
+        birthday: clean_person_text(request.birthday),
+        deathday: clean_person_text(request.deathday),
+        known_for_department: clean_person_text(request.known_for_department),
+        place_of_birth: clean_person_text(request.place_of_birth),
+        provider_ids: clean_person_provider_ids(request.provider_ids),
+        genres: clean_person_values(request.genres),
+        tags: clean_person_values(request.tags),
+        production_locations: clean_person_values(request.production_locations),
+        premiere_date: clean_person_text(request.premiere_date),
+        production_year: request.production_year,
+        taglines: clean_person_values(request.taglines),
+    };
+    match people
+        .replace_person_metadata(&library_ids, &person_id, update)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "人物不存在",
+            )
+            .into_response();
+        }
+        Err(PeopleError::InvalidComponent(_)) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "人物资料无效",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    record_audit_event(
+        &state,
+        &headers,
+        "PERSON_METADATA_EDITED",
+        Some("person"),
+        Some(&person_id),
+        "{}",
+    )
+    .await;
+    match people.find_person(&library_ids, "Actor", &person_id).await {
+        Ok(Some(person)) => Json(person).into_response(),
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+fn clean_person_text(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn clean_person_values(values: Vec<String>) -> Vec<String> {
+    let mut cleaned = Vec::new();
+    for value in values {
+        let value = value.trim().to_owned();
+        if !value.is_empty() && !cleaned.contains(&value) {
+            cleaned.push(value);
+        }
+    }
+    cleaned
+}
+
+fn clean_person_provider_ids(values: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    values
+        .into_iter()
+        .filter_map(|(provider, id)| {
+            let provider = provider.trim().to_owned();
+            let id = id.trim().to_owned();
+            (!provider.is_empty() && !id.is_empty()).then_some((provider, id))
+        })
+        .collect()
+}
+
+fn person_update_is_bounded(request: &LuxPersonUpdateRequest) -> bool {
+    const MAX_PERSON_TEXT_BYTES: usize = 64 * 1024;
+    const MAX_PERSON_LIST_ITEMS: usize = 256;
+    const MAX_PERSON_LIST_VALUE_BYTES: usize = 2048;
+    let text_is_bounded =
+        |value: Option<&String>| value.is_none_or(|value| value.len() <= MAX_PERSON_TEXT_BYTES);
+    let values_are_bounded = |values: &[String]| {
+        values.len() <= MAX_PERSON_LIST_ITEMS
+            && values
+                .iter()
+                .all(|value| value.len() <= MAX_PERSON_LIST_VALUE_BYTES)
+    };
+    request.name.len() <= 128
+        && text_is_bounded(request.biography.as_ref())
+        && text_is_bounded(request.birthday.as_ref())
+        && text_is_bounded(request.deathday.as_ref())
+        && text_is_bounded(request.known_for_department.as_ref())
+        && text_is_bounded(request.place_of_birth.as_ref())
+        && text_is_bounded(request.premiere_date.as_ref())
+        && request.provider_ids.len() <= MAX_PERSON_LIST_ITEMS
+        && request
+            .provider_ids
+            .iter()
+            .all(|(provider, id)| provider.len() <= 128 && id.len() <= MAX_PERSON_LIST_VALUE_BYTES)
+        && values_are_bounded(&request.genres)
+        && values_are_bounded(&request.tags)
+        && values_are_bounded(&request.production_locations)
+        && values_are_bounded(&request.taglines)
 }
 
 async fn lux_get_person_image_for_provider(

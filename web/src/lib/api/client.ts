@@ -266,6 +266,30 @@ export class LuxApiClient {
     return this.request<PersonDetail>(`/api/v1/people/${encodeURIComponent(personId)}`);
   }
 
+  updatePerson(
+    personId: string,
+    input: {
+      name: string;
+      biography?: string;
+      birthday?: string;
+      deathday?: string;
+      knownForDepartment?: string;
+      placeOfBirth?: string;
+      providerIds?: Record<string, string>;
+      genres?: string[];
+      tags?: string[];
+      productionLocations?: string[];
+      premiereDate?: string;
+      productionYear?: number;
+      taglines?: string[];
+    },
+  ) {
+    return this.request<PersonDetail>(`/api/v1/people/${encodeURIComponent(personId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
   itemMetadata(itemId: string) {
     return this.request<ItemMetadata>(`/api/v1/items/${encodeURIComponent(itemId)}/metadata`);
   }

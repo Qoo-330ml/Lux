@@ -529,6 +529,60 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(lux_person_detail_body["name"], "演员丁");
     assert_eq!(lux_person_detail_body["biography"], "MDC 更新后的演员简介");
 
+    let lux_person_update = client
+        .patch(format!("http://{address}/api/v1/people/104"))
+        .header("X-Lux-Api-Key", &key)
+        .json(&json!({
+            "name": "演员丁（已编辑）",
+            "biography": "编辑后的简介",
+            "birthday": "1991-02-03",
+            "knownForDepartment": "Directing",
+            "placeOfBirth": "上海",
+            "providerIds": {"Imdb": "nm7654321"},
+            "genres": ["Comedy"],
+            "tags": ["已编辑"],
+            "productionLocations": ["中国"],
+            "premiereDate": "2001-02-03",
+            "productionYear": 2001,
+            "taglines": ["编辑标语"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(lux_person_update.status(), reqwest::StatusCode::OK);
+    let lux_person_update_body: serde_json::Value = lux_person_update.json().await?;
+    assert_eq!(lux_person_update_body["name"], "演员丁（已编辑）");
+    assert_eq!(lux_person_update_body["biography"], "编辑后的简介");
+    assert_eq!(lux_person_update_body["birthday"], "1991-02-03");
+    assert_eq!(lux_person_update_body["knownForDepartment"], "Directing");
+    assert_eq!(lux_person_update_body["placeOfBirth"], "上海");
+    assert_eq!(lux_person_update_body["providerIds"]["Imdb"], "nm7654321");
+    assert_eq!(lux_person_update_body["genres"], json!(["Comedy"]));
+    assert_eq!(lux_person_update_body["tags"], json!(["已编辑"]));
+    assert_eq!(
+        lux_person_update_body["productionLocations"],
+        json!(["中国"])
+    );
+    assert_eq!(lux_person_update_body["premiereDate"], "2001-02-03");
+    assert_eq!(lux_person_update_body["productionYear"], 2001);
+    assert_eq!(lux_person_update_body["taglines"], json!(["编辑标语"]));
+
+    let edited_person_nfo = tokio::fs::read_to_string(
+        canonical_person_directory(&temp_dir.path().join("config"), person_key)?.join("person.nfo"),
+    )
+    .await?;
+    assert!(edited_person_nfo.contains("<name>演员丁（已编辑）</name>"));
+    assert!(edited_person_nfo.contains("<biography>编辑后的简介</biography>"));
+    assert!(edited_person_nfo.contains("<birthday>1991-02-03</birthday>"));
+    assert!(edited_person_nfo.contains("<knownfor>Directing</knownfor>"));
+    assert!(edited_person_nfo.contains("<placeofbirth>上海</placeofbirth>"));
+    assert!(edited_person_nfo.contains("<uniqueid type=\"imdb\">nm7654321</uniqueid>"));
+    assert!(edited_person_nfo.contains("<genre>Comedy</genre>"));
+    assert!(edited_person_nfo.contains("<tag>已编辑</tag>"));
+    assert!(edited_person_nfo.contains("<country>中国</country>"));
+    assert!(edited_person_nfo.contains("<premiered>2001-02-03</premiered>"));
+    assert!(edited_person_nfo.contains("<year>2001</year>"));
+    assert!(edited_person_nfo.contains("<tagline>编辑标语</tagline>"));
+
     let missing_person = client
         .get(format!("http://{address}/Persons/missing?api_key={key}"))
         .send()

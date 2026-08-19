@@ -75,7 +75,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
           <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
           <Route path="favorites" element={<FavoritesPage />} />
           <Route path="items/:itemId" element={<MediaDetailPage />} />
-          <Route path="people/:personId" element={<PersonDetailPage />} />
+          <Route path="people/:personId" element={<PersonDetailPage user={user} />} />
           <Route path="search" element={<SearchPage />} />
           <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />
           <Route path="account/:userId" element={<AccountRoute user={user} />} />
