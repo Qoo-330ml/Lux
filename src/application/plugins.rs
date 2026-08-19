@@ -1548,6 +1548,18 @@ impl PluginService {
             let _ = fs::remove_dir_all(&validation_dir).await;
             return Err(PluginServiceError::ConfigIo(error));
         }
+        // Keep the previous archives until the newly moved archive is visible in a
+        // fresh catalog. This matters for updates: a discovery failure must leave
+        // the old package available for the next attempt.
+        let catalog = PluginCatalog::discover(&plugin_dir);
+        if !catalog
+            .get(&entry.id)
+            .is_some_and(|plugin| plugin.manifest.version == entry.version)
+        {
+            let _ = fs::remove_file(&destination).await;
+            let _ = fs::remove_dir_all(&validation_dir).await;
+            return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
+        }
         let mut entries = fs::read_dir(&plugin_dir)
             .await
             .map_err(PluginServiceError::ConfigIo)?;
@@ -1570,11 +1582,6 @@ impl PluginService {
             }
         }
         let _ = fs::remove_dir_all(&validation_dir).await;
-        let catalog = PluginCatalog::discover(&plugin_dir);
-        if catalog.get(&entry.id).is_none() {
-            let _ = fs::remove_file(&destination).await;
-            return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
-        }
         *self.catalog.write().await = catalog;
         Ok(())
     }
