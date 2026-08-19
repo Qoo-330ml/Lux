@@ -4041,6 +4041,43 @@ DirectPlay；浏览器无法原生解码 HEVC、但具备 WebAssembly、Web Work
 
 依赖：LUX-184、LUX-113、LUX-073。
 
+#### LUX-186：插件商店更新检查与安全更新
+
+范围：为管理员插件页面增加插件商店更新检查和已安装插件更新能力。Lux 使用当前已配置的插件商店目录
+返回的版本与 SHA-256，比较已发现的本地插件 manifest 版本；页面展示 `latestVersion` 和
+`updateAvailable`，管理员可以显式触发检查并更新单个插件。
+
+更新必须复用现有插件包下载、大小、路径、manifest、平台入口和 SHA-256 校验。更新前停止该插件进程，
+校验并原子写入新包，再刷新进程内目录；插件配置文件、`installed_plugins` 安装状态、启用状态和媒体库
+选择均保持不变。无可用更新、未安装、未找到当前平台包或目录校验失败时不得删除旧包。
+
+API：
+
+- `GET /api/v1/admin/plugins` 返回可选 `latestVersion` 和 `updateAvailable` 字段；请求本身重新读取当前
+  插件目录，因此也作为更新检查接口。
+- `POST /api/v1/admin/plugins/{pluginId}/update` 只允许管理员并要求 CSRF；成功返回更新后的插件视图，
+  无更新返回结构化 `PLUGIN_NO_UPDATE` 冲突错误。
+- 更新包仍只允许当前插件商店目录声明的 HTTPS 地址，不接受请求体覆盖下载地址、版本或 SHA-256。
+
+验收：
+
+- [ ] 已安装插件页面可以手动检查更新，并显示当前版本、最新版本和是否可更新。
+- [ ] 可更新插件显示“更新插件”；更新成功后插件仍保持原配置和启用状态，页面显示已是最新。
+- [ ] 更新下载失败、包校验失败、平台不支持或无更新时旧包仍可用，且不删除插件配置。
+- [ ] 更新过程中插件进程被停止，更新后通过正常 RPC 调用按需启动新版本；STRM 插件计划任务保持同步。
+- [ ] 非管理员不能检查或更新；更新接口不记录完整外部 URL、token 或包内容。
+
+验证：
+
+- `cargo test --locked --test plugins --test plugin_runtime`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+- 使用真实浏览器检查插件页面的更新状态、键盘操作、网络请求和无错误控制台。
+
+依赖：LUX-162、LUX-171。
+
 ## 26. 风险与缓解
 
 | 风险 | 影响 | 缓解 |
