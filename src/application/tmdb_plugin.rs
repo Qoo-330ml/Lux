@@ -8,8 +8,8 @@ use crate::application::{
     scraper::{
         ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse, ScraperGetRequest,
         ScraperImage, ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
-        ScraperPluginClient, ScraperSearchRequest, ScraperSearchResponse, ScraperSearchResult,
-        ScraperTrailer, ScraperTrailersResponse,
+        ScraperMetadataBundle, ScraperPluginClient, ScraperSearchRequest, ScraperSearchResponse,
+        ScraperSearchResult, ScraperTrailer, ScraperTrailersResponse,
     },
     tmdb::{
         TmdbClient, TmdbCollectionDetails, TmdbCreditsResponse, TmdbEpisodeDetails, TmdbError,
@@ -56,6 +56,13 @@ impl TmdbPluginClient {
         request: ScraperGetRequest,
     ) -> Result<ScraperMetadata, ScraperError> {
         self.scraper.get(request).await
+    }
+
+    pub async fn bundle_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperMetadataBundle, ScraperError> {
+        self.scraper.bundle(request).await
     }
 
     pub async fn images_generic(
@@ -987,6 +994,19 @@ impl ScraperProvider {
             Self::Direct(client) => direct_get_generic(client, request).await,
             Self::Plugin(client) => client.get_generic(request).await,
             Self::Generic(client) => client.get(request).await,
+        }
+    }
+
+    pub async fn bundle_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperMetadataBundle, ScraperError> {
+        match self {
+            Self::Direct(_) => Err(ScraperError::Provider(
+                "metadata bundle is not available for the direct provider".to_owned(),
+            )),
+            Self::Plugin(client) => client.bundle_generic(request).await,
+            Self::Generic(client) => client.bundle(request).await,
         }
     }
 

@@ -270,8 +270,26 @@ impl MetadataCandidateService {
                 .await?;
                 continue;
             }
+            let bundle = if direct_details.is_none()
+                && matches!(
+                    item_type,
+                    crate::application::scraper::ScraperItemType::Movie
+                        | crate::application::scraper::ScraperItemType::Series
+                ) {
+                tmdb.bundle_generic(ScraperGetRequest::new(
+                    item_type,
+                    provider_id.clone(),
+                    "zh-CN",
+                ))
+                .await
+                .ok()
+            } else {
+                None
+            };
             let details = if direct_details.is_some() {
                 direct_details.clone()
+            } else if let Some(bundle) = bundle.as_ref() {
+                Some(bundle.metadata.clone())
             } else if matches!(
                 item_type,
                 crate::application::scraper::ScraperItemType::Movie
@@ -293,67 +311,83 @@ impl MetadataCandidateService {
                 .or_else(|| details.as_ref().and_then(|value| value.title.clone()))
                 .or_else(|| result.original_title.clone())
                 .unwrap_or_else(|| query.to_owned());
-            let (images, credits, external_ids, trailers) = tokio::join!(
-                async {
-                    tmdb.images_generic(crate::application::scraper::ScraperImageRequest::new(
-                        item_type,
-                        provider_id.clone(),
-                        "zh-CN",
-                    ))
-                    .await
-                    .unwrap_or_default()
-                },
-                async {
-                    if matches!(
-                        item_type,
-                        crate::application::scraper::ScraperItemType::Movie
-                            | crate::application::scraper::ScraperItemType::Series
-                    ) {
-                        tmdb.credits_generic(crate::application::scraper::ScraperGetRequest::new(
+            let (images, credits, external_ids, trailers) = if let Some(bundle) = bundle {
+                (
+                    bundle.images,
+                    bundle.credits,
+                    Some(bundle.external_ids),
+                    bundle
+                        .trailers
+                        .trailers
+                        .into_iter()
+                        .filter_map(|trailer| trailer.url)
+                        .collect(),
+                )
+            } else {
+                tokio::join!(
+                    async {
+                        tmdb.images_generic(crate::application::scraper::ScraperImageRequest::new(
                             item_type,
                             provider_id.clone(),
                             "zh-CN",
                         ))
                         .await
                         .unwrap_or_default()
-                    } else {
-                        crate::application::scraper::ScraperCreditsResponse::default()
-                    }
-                },
-                async {
-                    if item_type == ScraperItemType::Movie {
-                        tmdb.external_ids_generic(ScraperGetRequest::new(
+                    },
+                    async {
+                        if matches!(
                             item_type,
-                            provider_id.clone(),
-                            "zh-CN",
-                        ))
-                        .await
-                        .ok()
-                    } else {
-                        None
+                            crate::application::scraper::ScraperItemType::Movie
+                                | crate::application::scraper::ScraperItemType::Series
+                        ) {
+                            tmdb.credits_generic(
+                                crate::application::scraper::ScraperGetRequest::new(
+                                    item_type,
+                                    provider_id.clone(),
+                                    "zh-CN",
+                                ),
+                            )
+                            .await
+                            .unwrap_or_default()
+                        } else {
+                            crate::application::scraper::ScraperCreditsResponse::default()
+                        }
+                    },
+                    async {
+                        if item_type == ScraperItemType::Movie {
+                            tmdb.external_ids_generic(ScraperGetRequest::new(
+                                item_type,
+                                provider_id.clone(),
+                                "zh-CN",
+                            ))
+                            .await
+                            .ok()
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if item_type == ScraperItemType::Movie {
+                            tmdb.trailers_generic(ScraperGetRequest::new(
+                                item_type,
+                                provider_id.clone(),
+                                "zh-CN",
+                            ))
+                            .await
+                            .map(|response| {
+                                response
+                                    .trailers
+                                    .into_iter()
+                                    .filter_map(|trailer| trailer.url)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
                     }
-                },
-                async {
-                    if item_type == ScraperItemType::Movie {
-                        tmdb.trailers_generic(ScraperGetRequest::new(
-                            item_type,
-                            provider_id.clone(),
-                            "zh-CN",
-                        ))
-                        .await
-                        .map(|response| {
-                            response
-                                .trailers
-                                .into_iter()
-                                .filter_map(|trailer| trailer.url)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
-                }
-            );
+                )
+            };
             let mut actors = generic_candidate_actors(&credits.cast);
             if matches!(mode, CandidateSearchMode::Manual) {
                 enrich_actor_metadata(tmdb, &mut actors).await;

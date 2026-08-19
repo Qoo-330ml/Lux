@@ -189,7 +189,8 @@ pub struct ScraperSearchResult {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::ScraperSearchResult;
+    use super::{ScraperSearchResult, decode_bundle_response};
+    use serde_json::json;
 
     #[test]
     fn selects_the_id_for_the_configured_scraper() {
@@ -216,6 +217,23 @@ mod tests {
             ..ScraperSearchResult::default()
         };
         assert_eq!(only_other_provider.selected_provider_entry("tmdb"), None);
+    }
+
+    #[test]
+    fn decodes_metadata_bundle_with_attached_provider_data() {
+        let bundle = decode_bundle_response(json!({
+            "metadata": {"Name": "Example", "ProviderIds": {"Tmdb": "7"}},
+            "images": {"images": [{"Type": "Primary", "Url": "https://image.example/poster.jpg"}]},
+            "credits": {"cast": [{"Id": "9", "Name": "演员甲"}], "crew": []},
+            "externalIds": {"providerIds": {"Tmdb": "7", "Imdb": "tt7"}},
+            "trailers": {"trailers": []}
+        }))
+        .expect("valid metadata bundle");
+
+        assert_eq!(bundle.metadata.title.as_deref(), Some("Example"));
+        assert_eq!(bundle.images.images.len(), 1);
+        assert_eq!(bundle.credits.cast[0].provider_id, "9");
+        assert_eq!(bundle.external_ids.provider_ids["Imdb"], "tt7");
     }
 }
 
@@ -341,6 +359,19 @@ pub struct ScraperMetadata {
     pub collection: Option<ScraperCollectionReference>,
     #[serde(rename = "Items", alias = "items", default)]
     pub items: Vec<ScraperMetadataItem>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ScraperMetadataBundle {
+    pub metadata: ScraperMetadata,
+    #[serde(default)]
+    pub images: ScraperImagesResponse,
+    #[serde(default)]
+    pub credits: ScraperCreditsResponse,
+    #[serde(rename = "externalIds", alias = "external_ids", default)]
+    pub external_ids: ScraperExternalIdsResponse,
+    #[serde(default)]
+    pub trailers: ScraperTrailersResponse,
 }
 
 impl ScraperMetadata {
@@ -501,6 +532,14 @@ impl ScraperPluginClient {
         decode_metadata_response(value)
     }
 
+    pub async fn bundle(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperMetadataBundle, ScraperError> {
+        let value = self.call("metadata.bundle", request).await?;
+        decode_bundle_response(value)
+    }
+
     pub async fn images(
         &self,
         request: ScraperImageRequest,
@@ -657,6 +696,10 @@ pub fn decode_images_response(value: Value) -> Result<ScraperImagesResponse, Scr
 }
 
 pub fn decode_credits_response(value: Value) -> Result<ScraperCreditsResponse, ScraperError> {
+    serde_json::from_value(value).map_err(|error| ScraperError::InvalidResponse(error.to_string()))
+}
+
+pub fn decode_bundle_response(value: Value) -> Result<ScraperMetadataBundle, ScraperError> {
     serde_json::from_value(value).map_err(|error| ScraperError::InvalidResponse(error.to_string()))
 }
 
