@@ -5936,7 +5936,7 @@ fn emby_safe_path(item: &CatalogItem, default_source: Option<&CatalogSource>) ->
 /// return None and the field is omitted instead of emitting a fabricated value.
 fn emby_item_timestamp(item_id: &str) -> Option<String> {
     let compact = item_id.replace('-', "");
-    if compact.len() != 32 || !compact.as_bytes().get(12).is_some_and(|byte| *byte == b'7') {
+    if compact.len() != 32 || compact.as_bytes().get(12).is_none_or(|byte| *byte != b'7') {
         return None;
     }
     let millis = u64::from_str_radix(&compact[..12], 16).ok()?;
