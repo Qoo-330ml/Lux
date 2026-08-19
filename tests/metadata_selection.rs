@@ -982,6 +982,30 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
                 }))
             }),
         )
+        .route(
+            "/3/movie/999/credits",
+            get(|| async {
+                Json(json!({
+                    "cast": [{
+                        "id": 10,
+                        "name": "后台演员",
+                        "character": "后台角色",
+                        "order": 0
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/3/person/10",
+            get(|| async {
+                Json(json!({
+                    "id": 10,
+                    "name": "后台演员",
+                    "biography": "后台补全的人物简介",
+                    "birthday": "1970-01-01"
+                }))
+            }),
+        )
         .fallback(any(|| async { (StatusCode::NOT_FOUND, Json(json!({}))) }));
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
@@ -998,9 +1022,10 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let selection = MetadataSelectionService::new(
+    let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
         ImageWriteService::new(fixture.database.clone())?,
+        fixture.config.config_dir.clone(),
     );
     let metadata = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
@@ -1047,6 +1072,37 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     .fetch_one(fixture.database.pool())
     .await?;
     assert_eq!(mode, MetadataRefreshMode::FillMissing.as_str());
+
+    let people_file =
+        library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
+    for _ in 0..40 {
+        if people_file.exists() {
+            let people: Value = serde_json::from_slice(&tokio::fs::read(&people_file).await?)?;
+            if let Some(person_key) = people["actors"][0]["personKey"].as_str() {
+                let person_nfo =
+                    canonical_person_directory(&fixture.config.config_dir, person_key)?
+                        .join("person.nfo");
+                if tokio::fs::read_to_string(person_nfo)
+                    .await
+                    .is_ok_and(|value| value.contains("后台补全的人物简介"))
+                {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let people: Value = serde_json::from_slice(&tokio::fs::read(&people_file).await?)?;
+    let person_key = people["actors"][0]["personKey"]
+        .as_str()
+        .ok_or("background person key missing")?;
+    let person_nfo =
+        canonical_person_directory(&fixture.config.config_dir, person_key)?.join("person.nfo");
+    assert!(
+        tokio::fs::read_to_string(person_nfo)
+            .await?
+            .contains("后台补全的人物简介")
+    );
 
     tmdb_server.abort();
     Ok(())

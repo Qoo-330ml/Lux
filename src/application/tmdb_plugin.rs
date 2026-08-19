@@ -40,6 +40,10 @@ impl TmdbPluginClient {
         Self { scraper }
     }
 
+    pub(crate) async fn clear_response_cache(&self) {
+        self.scraper.clear_response_cache().await;
+    }
+
     pub async fn search_generic(
         &self,
         request: ScraperSearchRequest,
@@ -1033,6 +1037,14 @@ impl ScraperProvider {
     pub async fn set_api_key(&self, api_key: Option<&str>) {
         if let Self::Direct(client) = self {
             client.set_api_key(api_key).await;
+        }
+    }
+
+    pub(crate) async fn clear_response_cache(&self) {
+        match self {
+            Self::Direct(client) => client.clear_response_cache().await,
+            Self::Plugin(client) => client.clear_response_cache().await,
+            Self::Generic(client) => client.clear_response_cache().await,
         }
     }
 }

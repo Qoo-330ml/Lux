@@ -202,6 +202,10 @@ impl TmdbClient {
         *self.credential.write().await = credential;
     }
 
+    pub(crate) async fn clear_response_cache(&self) {
+        self.response_cache.clear().await;
+    }
+
     pub async fn search_movies(
         &self,
         query: &str,

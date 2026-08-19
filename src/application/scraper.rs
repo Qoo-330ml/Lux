@@ -484,6 +484,10 @@ impl ScraperPluginClient {
         &self.plugin_id
     }
 
+    pub(crate) async fn clear_response_cache(&self) {
+        self.response_cache.clear().await;
+    }
+
     pub async fn search(
         &self,
         request: ScraperSearchRequest,

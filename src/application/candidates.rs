@@ -1171,6 +1171,33 @@ impl MetadataSelectionService {
             .await
     }
 
+    pub(crate) async fn enrich_selected_actors(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        scraper: &TmdbProvider,
+    ) -> Result<usize, MetadataSelectionError> {
+        let candidate = self
+            .database
+            .find_metadata_candidate(item_id, candidate_id)
+            .await?
+            .ok_or(MetadataSelectionError::CandidateNotFound)?;
+        let mut actors = candidate_payload(&candidate)?.actors;
+        if actors.is_empty() {
+            return Ok(0);
+        }
+        enrich_actor_metadata(scraper, &mut actors).await;
+        for actor in &mut actors {
+            if actor.provider.is_none() && !actor.id.trim().is_empty() {
+                actor.provider = Some(candidate.provider.to_ascii_lowercase());
+            }
+        }
+        self.people
+            .persist_item_actors(item_id, &candidate.provider, &actors)
+            .await
+            .map_err(MetadataSelectionError::People)
+    }
+
     pub async fn confirm_best_pending(
         &self,
         item_id: &str,

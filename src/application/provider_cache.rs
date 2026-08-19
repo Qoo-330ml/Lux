@@ -126,6 +126,12 @@ impl ProviderResponseCache {
         }
     }
 
+    pub(crate) async fn clear(&self) {
+        self.ensure_loaded().await;
+        self.state.lock().await.entries.clear();
+        self.persist().await;
+    }
+
     async fn ensure_loaded(&self) {
         let Some(path) = self.path.clone() else {
             return;
