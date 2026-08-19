@@ -296,6 +296,8 @@ export type AdminPlugin = {
   configFields: AdminPluginConfigField[];
   configValues?: Record<string, unknown>;
   configSource: "PLUGIN_DEFAULT" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
+  latestVersion?: string | null;
+  updateAvailable?: boolean;
 };
 
 export type ChapterSource = {
