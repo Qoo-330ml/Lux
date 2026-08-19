@@ -268,6 +268,7 @@ impl LibraryScanner {
         let generation = Uuid::now_v7().to_string();
         let roots = self.database.list_library_roots(&library_id_text).await?;
         let mut report = ScanReport::default();
+        let mut refreshed_series = HashSet::new();
         for root in roots {
             let root_path = PathBuf::from(&root.canonical_path);
             let root_is_available = fs::metadata(&root_path)
@@ -290,12 +291,13 @@ impl LibraryScanner {
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
                 for path in files {
                     report.merge(
-                        self.scan_episode_file(
+                        self.scan_episode_file_with_provider_cache(
                             &library_id_text,
                             &root,
                             &root_path,
                             &path,
                             &generation,
+                            Some(&mut refreshed_series),
                         )
                         .await?,
                     );
@@ -327,6 +329,7 @@ impl LibraryScanner {
         let generation = Uuid::now_v7().to_string();
         let roots = self.database.list_library_roots(&library_id_text).await?;
         let mut report = ScanReport::default();
+        let mut refreshed_series = HashSet::new();
         for root in roots {
             let root_path = PathBuf::from(&root.canonical_path);
             let root_is_available = fs::metadata(&root_path)
@@ -361,12 +364,13 @@ impl LibraryScanner {
                             .await?
                         }
                         MixedClassification::Episode => {
-                            self.scan_episode_file(
+                            self.scan_episode_file_with_provider_cache(
                                 &library_id_text,
                                 &root,
                                 &root_path,
                                 &path,
                                 &generation,
+                                Some(&mut refreshed_series),
                             )
                             .await?
                         }
@@ -401,6 +405,26 @@ impl LibraryScanner {
         root_path: &Path,
         path: &Path,
         generation: &str,
+    ) -> Result<ScanReport, ScannerError> {
+        self.scan_episode_file_with_provider_cache(
+            library_id_text,
+            root,
+            root_path,
+            path,
+            generation,
+            None,
+        )
+        .await
+    }
+
+    async fn scan_episode_file_with_provider_cache(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        generation: &str,
+        mut refreshed_series: Option<&mut HashSet<String>>,
     ) -> Result<ScanReport, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(ScanReport::default());
@@ -508,6 +532,25 @@ impl LibraryScanner {
         } else {
             false
         };
+        let should_refresh_series_provider_ids = episode_is_current
+            && !hierarchy.provider_ids.is_empty()
+            && refreshed_series
+                .as_ref()
+                .is_none_or(|series| !series.contains(&series_identity));
+        if should_refresh_series_provider_ids {
+            let series_provider_ids_json = provider_ids_json(&hierarchy.provider_ids);
+            if let Some(series_provider_ids_json) = series_provider_ids_json.as_deref() {
+                self.database
+                    .update_local_provider_ids_for_identity_if_empty(
+                        &series_identity,
+                        series_provider_ids_json,
+                    )
+                    .await?;
+            }
+            if let Some(series) = refreshed_series.as_mut() {
+                series.insert(series_identity.clone());
+            }
+        }
         if episode_is_current && let Some(existing_entry) = existing_entry.as_ref() {
             if is_strm {
                 self.database

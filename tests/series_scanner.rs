@@ -343,6 +343,49 @@ async fn series_scan_allows_same_title_and_year_in_different_directories()
 }
 
 #[tokio::test]
+async fn series_rescan_restores_tmdb_id_for_unchanged_episode_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    create_file(&root.join("Example Show (2024) {tmdb-12345}/Season 01/Example.Show.S01E01.mkv"))
+        .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+
+    scanner.scan_series_library(library.id).await?;
+    sqlx::query(
+        "UPDATE media_items SET provider_ids_json = NULL
+         WHERE item_type = 'SERIES' AND library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    scanner.scan_series_library(library.id).await?;
+    let provider_ids: Option<String> = sqlx::query_scalar(
+        "SELECT provider_ids_json FROM media_items
+         WHERE item_type = 'SERIES' AND library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(provider_ids.as_deref(), Some(r#"{"Tmdb":"12345"}"#));
+    Ok(())
+}
+
+#[tokio::test]
 async fn series_scan_repairs_legacy_identity_keys_without_creating_duplicates()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
