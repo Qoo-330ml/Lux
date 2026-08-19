@@ -589,5 +589,9 @@ function adminTimestamp(value?: string | number | null) {
 }
 
 function AdminOperationsState({ label, error = false }: { label: string; error?: boolean }) {
-  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "任务数据加载失败" : "正在加载任务"}</h1><p>{label}</p></section>;
+  return <section className="lux-admin-page-state" role={error ? "alert" : "status"} aria-busy={!error}>
+    {!error ? <div className="lux-spinner" aria-hidden="true" /> : null}
+    <h1>{error ? "任务数据加载失败" : "正在加载任务"}</h1>
+    <p>{label}</p>
+  </section>;
 }
