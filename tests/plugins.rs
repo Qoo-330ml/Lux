@@ -19,7 +19,7 @@ fn signed_dynamic_manifest() -> Value {
         "formatVersion": 1,
         "id": "org.lux.tmdb",
         "name": "TMDb 动态插件",
-        "version": "1.0.0",
+        "version": "0.1.0",
         "apiVersion": 1,
         "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
         "type": "metadata",
@@ -599,7 +599,7 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
     let tmdb = plugin_by_id(&catalog, "org.lux.tmdb");
     assert_eq!(catalog["total"], 6);
     assert_eq!(tmdb["category"], "SCRAPER");
-    assert_eq!(tmdb["version"], "1.0.0");
+    assert_eq!(tmdb["version"], "0.1.0");
     assert_eq!(tmdb["runtime"], "process");
     assert_eq!(tmdb["installed"], false);
     assert_eq!(tmdb["enabled"], false);
@@ -618,6 +618,20 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
         installed.json::<Value>().await?["plugin"]["installed"],
         true
     );
+
+    let installed_catalog = client
+        .get(format!(
+            "{base_url}/api/v1/admin/plugins/installed?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let installed_tmdb = plugin_by_id(&installed_catalog, "org.lux.tmdb");
+    assert_eq!(installed_tmdb["version"], "0.1.0");
+    assert_eq!(installed_tmdb["availableVersion"], "0.1.5");
+    assert_eq!(installed_tmdb["updateAvailable"], true);
 
     server.abort();
     Ok(())

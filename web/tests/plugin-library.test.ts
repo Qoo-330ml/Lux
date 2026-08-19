@@ -69,6 +69,7 @@ describe("AdminPluginsPage plugin cards", () => {
     vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
     vi.spyOn(api, "installAdminPlugin").mockResolvedValue({ plugin: configuredPlugin });
     vi.spyOn(api, "uninstallAdminPlugin").mockResolvedValue(undefined);
+    vi.spyOn(api, "upgradeAdminPlugin").mockResolvedValue({ plugin: { ...configuredPlugin, version: "1.1.0", updateAvailable: false } });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -132,6 +133,20 @@ describe("AdminPluginsPage plugin cards", () => {
       dialog?.querySelector<HTMLButtonElement>('[aria-label="关闭插件商店来源设置"]')?.click();
     });
     expect(container.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("shows and triggers an available plugin upgrade", async () => {
+    currentPlugin = { ...configuredPlugin, availableVersion: "1.1.0", updateAvailable: true };
+    await renderPage();
+
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-pressed="false"]')?.click());
+
+    const upgrade = container.querySelector<HTMLButtonElement>('[aria-label="升级 TMDb 元数据插件"]');
+    expect(upgrade).toBeTruthy();
+    expect(upgrade?.textContent).toContain("升级到 v1.1.0");
+
+    await act(async () => upgrade?.click());
+    expect(api.upgradeAdminPlugin).toHaveBeenCalledWith("org.lux.tmdb");
   });
 
   it("lays out plugin cards two per row on desktop", async () => {

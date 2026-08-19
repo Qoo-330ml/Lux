@@ -651,6 +651,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_install_plugin),
         )
         .route(
+            "/api/v1/admin/plugins/{plugin_id}/upgrade",
+            post(admin_upgrade_plugin),
+        )
+        .route(
             "/api/v1/admin/plugins/{plugin_id}",
             delete(admin_uninstall_plugin),
         )
@@ -16406,6 +16410,44 @@ async fn admin_uninstall_plugin(
     }
 }
 
+async fn admin_upgrade_plugin(
+    headers: HeaderMap,
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match plugins.upgrade(&plugin_id).await {
+        Ok(plugin) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PLUGIN_UPGRADED",
+                Some("plugin"),
+                Some(&plugin_id),
+                "{}",
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({ "plugin": plugin_json(&plugin) })),
+            )
+                .into_response()
+        }
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginEnabledRequest {
@@ -17256,6 +17298,13 @@ fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
             "插件尚未安装或配置完成",
         )
         .into_response(),
+        PluginServiceError::NoUpdate(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            "当前没有可用的插件升级",
+        )
+        .into_response(),
         PluginServiceError::InvalidConfig => api_error(
             headers,
             StatusCode::BAD_REQUEST,
@@ -17467,6 +17516,8 @@ fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
         "description": plugin.description,
         "category": plugin.category,
         "version": plugin.version,
+        "availableVersion": plugin.available_version,
+        "updateAvailable": plugin.update_available,
         "runtime": plugin.runtime,
         "capabilities": plugin.capabilities,
         "status": plugin.status,

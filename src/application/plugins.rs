@@ -30,7 +30,9 @@ use crate::{
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
-        plugin_store::{PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex},
+        plugin_store::{
+            PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex, is_newer_version,
+        },
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
         schedule::{
             DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE,
@@ -326,7 +328,11 @@ impl PluginService {
                 continue;
             }
             if let Some(plugin) = local_plugin {
-                views.push(self.dynamic_view(plugin, installed, enabled).await?);
+                let mut view = self.dynamic_view(plugin, installed, enabled).await?;
+                view.available_version = Some(entry.version.clone());
+                view.update_available =
+                    installed && is_newer_version(&entry.version, &plugin.manifest.version);
+                views.push(view);
             } else {
                 views.push(remote_plugin_view(entry, installed, enabled));
             }
@@ -382,7 +388,7 @@ impl PluginService {
                 .into_iter()
                 .find(|entry| entry.id == plugin_id)
                 .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
-            self.install_remote_package(&entry).await?;
+            self.install_remote_package(&entry, false).await?;
         }
         self.database.install_plugin(&plugin_id).await?;
         let current_catalog = self.catalog_snapshot().await;
@@ -399,6 +405,31 @@ impl PluginService {
             plugin,
             was_installed,
         })
+    }
+
+    pub async fn upgrade(&self, plugin_id: &str) -> Result<PluginView, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
+        if !self.database.has_plugin_installation(&plugin_id).await? {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        let Some(plugin) = catalog.get(&plugin_id) else {
+            return Err(PluginServiceError::UnknownPlugin(plugin_id));
+        };
+        let store_entry = self
+            .store_index()
+            .await
+            .plugins
+            .into_iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_newer_version(&store_entry.version, &plugin.manifest.version) {
+            return Err(PluginServiceError::NoUpdate(plugin_id));
+        }
+        self.install_remote_package(&store_entry, true).await?;
+        let (installed, enabled) = self.plugin_state(&plugin_id).await?;
+        self.view_for_id(&plugin_id, installed, enabled).await
     }
 
     pub async fn uninstall(&self, plugin_id: &str) -> Result<(), PluginServiceError> {
@@ -1463,6 +1494,7 @@ impl PluginService {
     async fn install_remote_package(
         &self,
         entry: &PluginStoreEntry,
+        stop_running: bool,
     ) -> Result<(), PluginServiceError> {
         let Some(store) = self.store.as_ref() else {
             return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
@@ -1489,9 +1521,13 @@ impl PluginService {
             return Err(PluginServiceError::ConfigIo(error));
         }
         let validation_catalog = PluginCatalog::discover(&validation_dir);
-        if validation_catalog.get(&entry.id).is_none() {
+        let valid_plugin = validation_catalog.get(&entry.id);
+        if valid_plugin.is_none_or(|plugin| plugin.manifest.version != entry.version) {
             let _ = fs::remove_dir_all(&validation_dir).await;
             return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
+        }
+        if stop_running {
+            self.supervisor.stop(&entry.id).await;
         }
         let destination = plugin_dir.join(format!("{}-{}.zip", entry.id, entry.version));
         let staged_destination =
@@ -1662,6 +1698,8 @@ impl PluginService {
             } else {
                 public_config_values
             },
+            available_version: None,
+            update_available: false,
         })
     }
 
@@ -1865,6 +1903,8 @@ fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) 
         config_fields: Vec::new(),
         config_source: CONFIG_SOURCE_NONE.to_owned(),
         config_values: Map::new(),
+        available_version: None,
+        update_available: false,
     }
 }
 
@@ -2057,6 +2097,8 @@ pub struct PluginView {
     pub description: String,
     pub category: String,
     pub version: Option<String>,
+    pub available_version: Option<String>,
+    pub update_available: bool,
     pub runtime: Option<String>,
     pub capabilities: Vec<String>,
     pub status: String,
@@ -2077,6 +2119,7 @@ pub struct PluginView {
 pub enum PluginServiceError {
     UnknownPlugin(String),
     Unavailable(String),
+    NoUpdate(String),
     InvalidConfig,
     InvalidResponse,
     ConfigIo(io::Error),
@@ -2091,6 +2134,9 @@ impl fmt::Display for PluginServiceError {
             Self::UnknownPlugin(plugin_id) => write!(formatter, "unknown plugin: {plugin_id}"),
             Self::Unavailable(plugin_id) => {
                 write!(formatter, "plugin is unavailable: {plugin_id}")
+            }
+            Self::NoUpdate(plugin_id) => {
+                write!(formatter, "plugin has no available update: {plugin_id}")
             }
             Self::InvalidConfig => formatter.write_str("invalid plugin configuration"),
             Self::InvalidResponse => formatter.write_str("plugin returned an invalid response"),
@@ -2111,6 +2157,7 @@ impl std::error::Error for PluginServiceError {
             Self::Storage(error) => Some(error),
             Self::UnknownPlugin(_)
             | Self::Unavailable(_)
+            | Self::NoUpdate(_)
             | Self::InvalidConfig
             | Self::InvalidResponse => None,
         }

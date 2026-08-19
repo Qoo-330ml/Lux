@@ -557,6 +557,13 @@ export class LuxApiClient {
     );
   }
 
+  upgradeAdminPlugin(pluginId: string) {
+    return this.request<{ plugin: AdminPlugin }>(
+      `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/upgrade`,
+      { method: "POST" },
+    );
+  }
+
   uninstallAdminPlugin(pluginId: string) {
     return this.request<void>(
       `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}`,

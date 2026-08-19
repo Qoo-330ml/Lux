@@ -1,4 +1,4 @@
-use std::{fmt, io::Write, path::PathBuf, time::Duration};
+use std::{cmp::Ordering, fmt, io::Write, path::PathBuf, time::Duration};
 
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -278,6 +278,121 @@ fn select_package(entry: &PluginStoreEntry) -> Result<(&str, &str), PluginStoreE
     Err(PluginStoreError::UnsupportedPlatform)
 }
 
+pub(crate) fn is_newer_version(candidate: &str, installed: &str) -> bool {
+    let Some(candidate) = ParsedVersion::parse(candidate) else {
+        return false;
+    };
+    let Some(installed) = ParsedVersion::parse(installed) else {
+        return false;
+    };
+    candidate > installed
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedVersion {
+    core: [u64; 3],
+    prerelease: Option<Vec<VersionIdentifier>>,
+}
+
+impl Ord for ParsedVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.core.cmp(&other.core) {
+            Ordering::Equal => match (&self.prerelease, &other.prerelease) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(right),
+            },
+            ordering => ordering,
+        }
+    }
+}
+
+impl PartialOrd for ParsedVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum VersionIdentifier {
+    Numeric(u64),
+    Text(String),
+}
+
+impl Ord for VersionIdentifier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Numeric(left), Self::Numeric(right)) => left.cmp(right),
+            (Self::Numeric(_), Self::Text(_)) => Ordering::Less,
+            (Self::Text(_), Self::Numeric(_)) => Ordering::Greater,
+            (Self::Text(left), Self::Text(right)) => left.cmp(right),
+        }
+    }
+}
+
+impl PartialOrd for VersionIdentifier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl ParsedVersion {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty() || value.starts_with('v') {
+            return None;
+        }
+        let value = value.split_once('+').map_or(value, |(value, _)| value);
+        let (core, prerelease) = value
+            .split_once('-')
+            .map_or((value, None), |(core, prerelease)| (core, Some(prerelease)));
+        let mut core_parts = core.split('.');
+        let core = [
+            parse_version_number(core_parts.next()?)?,
+            parse_version_number(core_parts.next()?)?,
+            parse_version_number(core_parts.next()?)?,
+        ];
+        if core_parts.next().is_some() {
+            return None;
+        }
+        let prerelease = match prerelease {
+            Some(value) => Some(
+                value
+                    .split('.')
+                    .map(|identifier| {
+                        if identifier.is_empty() {
+                            return None;
+                        }
+                        if identifier
+                            .chars()
+                            .all(|character| character.is_ascii_digit())
+                        {
+                            if identifier.len() > 1 && identifier.starts_with('0') {
+                                return None;
+                            }
+                            return identifier.parse().ok().map(VersionIdentifier::Numeric);
+                        }
+                        identifier
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                            .then(|| VersionIdentifier::Text(identifier.to_owned()))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        Some(Self { core, prerelease })
+    }
+}
+
+fn parse_version_number(value: &str) -> Option<u64> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn current_platform_and_arch() -> (&'static str, &'static str) {
     let platform = match std::env::consts::OS {
         "macos" => "darwin",
@@ -493,6 +608,16 @@ mod tests {
         assert_eq!(index.plugins.len(), 6);
         assert_eq!(index.plugins[0].id, "org.lux.tmdb");
         assert_eq!(index.plugins[0].packages.len(), 2);
+    }
+
+    #[test]
+    fn compares_plugin_versions_without_treating_downgrades_as_updates() {
+        assert!(is_newer_version("1.1.0", "1.0.9"));
+        assert!(is_newer_version("2.0.0", "1.99.99"));
+        assert!(is_newer_version("1.0.0", "1.0.0-rc.1"));
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "1.1.0"));
+        assert!(!is_newer_version("not-semver", "1.0.0"));
     }
 
     #[test]
