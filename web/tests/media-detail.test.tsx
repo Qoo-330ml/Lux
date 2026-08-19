@@ -1009,4 +1009,49 @@ describe("MediaDetailPage series hierarchy", () => {
       pageSize: 100,
     });
   });
+
+  it("offers a single-item confirmation action for pending metadata", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-1",
+      libraryId: "library-1",
+      title: "待确认电影",
+      itemType: "MOVIE",
+      metadataPending: true,
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 60 });
+    const confirm = vi.spyOn(api, "confirmAdminMetadata").mockResolvedValue({
+      confirmedCount: 1,
+      failedCount: 0,
+      failedItemIds: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/movie-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector("button[data-action='confirm-metadata']")).not.toBeNull());
+    });
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("button[data-action='confirm-metadata']")?.click();
+    });
+
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledWith(["movie-1"]));
+    expect(container.textContent).toContain("元数据已确认");
+  });
 });

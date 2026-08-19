@@ -50,6 +50,7 @@ export function MediaDetailPage() {
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
+  const [confirmingMetadata, setConfirmingMetadata] = useState(false);
   const [pendingPlaybackAction, setPendingPlaybackAction] = useState<"favorite" | "played">();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const isSeries = item.data?.itemType === "SERIES";
@@ -156,6 +157,29 @@ export function MediaDetailPage() {
     }
   }
 
+  async function confirmMetadata() {
+    setActionError(undefined);
+    setActionNotice(undefined);
+    setConfirmingMetadata(true);
+    try {
+      const result = await api.confirmAdminMetadata([media.id]);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) }),
+        queryClient.invalidateQueries({ queryKey: ["library", media.libraryId ?? ""] }),
+        queryClient.invalidateQueries({ queryKey: pendingItemsQueryKey }),
+      ]);
+      if (result.failedCount > 0) {
+        setActionError("当前待确认候选确认失败，请重新搜索候选后再试。");
+      } else {
+        setActionNotice("元数据已确认。");
+      }
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "元数据确认失败，请重试。");
+    } finally {
+      setConfirmingMetadata(false);
+    }
+  }
+
   async function scanLibrary() {
     setActionError(undefined);
     setActionNotice(undefined);
@@ -248,6 +272,11 @@ export function MediaDetailPage() {
               <button className="lux-button lux-button-glass" type="button" data-action="toggle-favorite" aria-pressed={Boolean(playback.data?.isFavorite)} disabled={pendingPlaybackAction !== undefined} onClick={() => void updatePlaybackFlag("favorite")}>
                 <Heart size={17} fill={playback.data?.isFavorite ? "currentColor" : "none"} /> {playback.data?.isFavorite ? "已收藏" : "收藏"}
               </button>
+              {media.metadataPending || pendingReview ? (
+                <button className="lux-button lux-button-glass" type="button" data-action="confirm-metadata" disabled={confirmingMetadata} onClick={() => void confirmMetadata()}>
+                  <Check size={17} /> {confirmingMetadata ? "确认中…" : "确认元数据"}
+                </button>
+              ) : null}
               <button
                 className={`lux-detail-watched-status${playback.data?.isPlayed ? " is-played" : ""}`}
                 type="button"

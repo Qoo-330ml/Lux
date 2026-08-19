@@ -264,6 +264,15 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     let library_items_body: Value = library_items.json().await?;
     assert_eq!(library_items_body["items"][0]["metadataPending"], true);
 
+    let item_detail = client
+        .get(format!("{base_url}/api/v1/items/{item_id}"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(item_detail.status(), reqwest::StatusCode::OK);
+    let item_detail_body: Value = item_detail.json().await?;
+    assert_eq!(item_detail_body["metadataPending"], true);
+
     let pending = client
         .get(format!(
             "{base_url}/api/v1/admin/metadata/pending?page=1&pageSize=1"

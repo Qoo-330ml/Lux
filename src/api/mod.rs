@@ -8394,6 +8394,13 @@ async fn lux_get_item(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let metadata_pending = match database
+        .list_pending_metadata_item_ids(std::slice::from_ref(&item_id))
+        .await
+    {
+        Ok(item_ids) => item_ids.contains(&item_id),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     match catalog.find_item(principal, &item_id).await {
         Ok(Some(item)) => match database
             .find_user_item_state(&user.id.to_string(), &item.id)
@@ -8432,6 +8439,7 @@ async fn lux_get_item(
                 if let Value::Object(object) = &mut body {
                     object.insert("actors".to_owned(), json!(actors));
                     object.insert("nfo".to_owned(), json!(nfo));
+                    object.insert("metadataPending".to_owned(), json!(metadata_pending));
                     if let Some(nfo) = nfo.as_ref() {
                         apply_local_nfo_details(object, nfo);
                     }
@@ -16448,6 +16456,8 @@ struct PluginConfigRequest {
     #[serde(default)]
     language_fallback_enabled: Option<bool>,
     #[serde(default)]
+    title_alias_replacement_enabled: Option<bool>,
+    #[serde(default)]
     fallback_languages: Option<Vec<String>>,
     #[serde(default)]
     alternate_api_enabled: Option<bool>,
@@ -16486,6 +16496,7 @@ async fn admin_update_plugin_config(
                     api_key,
                     preferred_language: request.preferred_language.as_deref(),
                     language_fallback_enabled: request.language_fallback_enabled,
+                    title_alias_replacement_enabled: request.title_alias_replacement_enabled,
                     fallback_languages: request.fallback_languages,
                     alternate_api_enabled: request.alternate_api_enabled,
                     api_base_url: request.api_base_url.as_deref(),

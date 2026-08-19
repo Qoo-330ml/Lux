@@ -500,4 +500,60 @@ describe("LibraryPage infinite scroll", () => {
     expect(container?.querySelector("button[aria-label='打开 待确认电影 操作菜单']")).toBeTruthy();
     expect(container?.querySelector("button[aria-label='打开 已确认电影 操作菜单']")).toBeTruthy();
   });
+
+  it("reports failed items when batch confirmation cannot confirm them", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [
+        { id: "pending-1", title: "待确认电影", itemType: "MOVIE", metadataPending: true },
+      ],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+    const confirm = vi.spyOn(api, "confirmAdminMetadata").mockResolvedValue({
+      confirmedCount: 0,
+      failedCount: 1,
+      failedItemIds: ["pending-1"],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(1));
+    });
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("button[aria-label='开启媒体库多选']")?.click();
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector<HTMLInputElement>(".lux-media-selection-checkbox")).not.toBeNull());
+      container?.querySelector<HTMLInputElement>(".lux-media-selection-checkbox")?.click();
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector("button[data-action='batch-confirm-metadata']")).not.toBeNull());
+      container?.querySelector<HTMLButtonElement>("button[data-action='batch-confirm-metadata']")?.click();
+    });
+
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledWith(["pending-1"]));
+    expect(container.textContent).toContain("1 项确认失败");
+  });
 });

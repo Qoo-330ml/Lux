@@ -103,6 +103,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   }));
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [confirmNotice, setConfirmNotice] = useState<string>();
   const sortPreference = sortState.libraryId === libraryId ? sortState.preference : readLibrarySortPreference(libraryId);
   const { sortBy, sortOrder } = sortPreference;
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
@@ -111,10 +112,15 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const itemTypes = libraryItemTypeFilter(library?.kind);
   const confirmMetadata = useMutation({
     mutationFn: () => api.confirmAdminMetadata([...selectedIds]),
-    onSuccess: () => {
-      setSelectedIds(new Set());
-      setSelectionMode(false);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder, metadataStatus ?? "all") });
+    onSuccess: (result) => {
+      setConfirmNotice(result.failedCount > 0
+        ? `已确认 ${result.confirmedCount} 项，${result.failedCount} 项确认失败，请打开单项处理。`
+        : `已确认 ${result.confirmedCount} 项元数据。`);
+      if (result.confirmedCount > 0) {
+        setSelectedIds(new Set());
+        setSelectionMode(false);
+      }
+      void queryClient.invalidateQueries({ queryKey: ["library", libraryId] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
     },
   });
@@ -225,12 +231,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
           onClick={() => {
             setSelectionMode((value) => !value);
             setSelectedIds(new Set());
+            setConfirmNotice(undefined);
           }}
         >
           {selectionMode ? "退出多选" : "多选"}
         </button>
         {selectionMode && selectedIds.size > 0 ? <span>{`已选 ${selectedIds.size} 项`}</span> : null}
         {allSelectedPending ? <button className="lux-button lux-button-primary" type="button" data-action="batch-confirm-metadata" disabled={confirmMetadata.isPending} onClick={() => confirmMetadata.mutate()}>{confirmMetadata.isPending ? "确认中…" : "批量确认"}</button> : null}
+        {confirmNotice ? <span className="lux-muted-copy" role="status">{confirmNotice}</span> : null}
         {confirmMetadata.error ? <span className="lux-error-copy" role="alert">{confirmMetadata.error.message}</span> : null}
       </div>
       <div className="lux-library-sort-toolbar" aria-label="媒体库排序">

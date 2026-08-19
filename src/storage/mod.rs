@@ -7210,7 +7210,7 @@ impl Database {
                  rating = COALESCE(?, rating),
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  provider_ids_json = ?,
-                 identification_status = CASE WHEN ? THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
+                 identification_status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
                  thumbnail_fallback_required = ?
              WHERE id = ? AND removed_at IS NULL",
@@ -7243,7 +7243,7 @@ impl Database {
         let selected = self
             .query(
                 "UPDATE metadata_candidates
-             SET status = CASE WHEN ? THEN 'PENDING' ELSE 'SELECTED' END,
+             SET status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'SELECTED' END,
                  updated_at = unixepoch()
              WHERE id = ? AND item_id = ? AND status = 'PENDING'",
             )
