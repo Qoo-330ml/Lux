@@ -14043,7 +14043,7 @@ mod tests {
     use super::*;
     use crate::{
         application::{libraries::LibraryService, scanner::LibraryScanner},
-        config::Config,
+        config::{Config, PostgresConnection},
         library::LibraryKind,
     };
 
@@ -14699,5 +14699,121 @@ mod tests {
                 .await
                 .expect("active duplicate should be rejected")
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local PostgreSQL instance"]
+    async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let connection = DatabaseConfiguration::Postgres(PostgresConnection {
+            host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+            port: std::env::var("POSTGRES_TEST_PORT")
+                .unwrap_or_else(|_| "55432".to_owned())
+                .parse()
+                .expect("test port"),
+            database: std::env::var("POSTGRES_TEST_DATABASE").unwrap_or_else(|_| "lux".to_owned()),
+            username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+            password: std::env::var("POSTGRES_TEST_PASSWORD")
+                .unwrap_or_else(|_| "lux-test-password".to_owned()),
+            ssl_mode: "disable".to_owned(),
+        });
+        let database = Database::connect_with_configuration(&config, &connection)
+            .await
+            .expect("PostgreSQL database");
+        let library = LibraryService::new(database.clone())
+            .create_library("Metadata selection", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let item_id = Uuid::now_v7().to_string();
+        let candidate_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                has_available_source
+             ) VALUES (?, ?, 'MOVIE', 'Metadata selection', 'metadata selection',
+                       'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                id, item_id, provider, provider_id, candidate_json, score, status
+             ) VALUES (?, ?, 'TMDB', '603', '{}', 100, 'PENDING')",
+        )
+        .bind(&candidate_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await
+        .expect("metadata candidate");
+
+        let update = |keep_pending| SelectedMetadataUpdate {
+            item_id: &item_id,
+            candidate_id: &candidate_id,
+            title: "Metadata selection",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            last_air_date: None,
+            status: None,
+            original_language: None,
+            rating: None,
+            rating_source: None,
+            provider_ids_json: "{}",
+            metadata_fingerprint: &[],
+            provenance_json: "{}",
+            locked_fields_json: "[]",
+            thumbnail_fallback_required: false,
+            keep_pending,
+        };
+
+        assert!(
+            database
+                .select_metadata_candidate(update(true))
+                .await
+                .expect("keep-pending selection")
+        );
+        let identification_status: String =
+            sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("identification status");
+        assert_eq!(identification_status, "PENDING");
+        let candidate_status: String =
+            sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+                .bind(&candidate_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("candidate status");
+        assert_eq!(candidate_status, "PENDING");
+
+        assert!(
+            database
+                .select_metadata_candidate(update(false))
+                .await
+                .expect("confirmed selection")
+        );
+        let identification_status: String =
+            sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("confirmed identification status");
+        assert_eq!(identification_status, "ONLINE_CONFIRMED");
+        let candidate_status: String =
+            sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+                .bind(&candidate_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("confirmed candidate status");
+        assert_eq!(candidate_status, "SELECTED");
     }
 }

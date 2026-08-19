@@ -8,8 +8,8 @@ use crate::application::{
     scraper::{
         ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse, ScraperGetRequest,
         ScraperImage, ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
-        ScraperPluginClient, ScraperSearchRequest, ScraperSearchResponse, ScraperSearchResult,
-        ScraperTrailer, ScraperTrailersResponse,
+        ScraperMetadataBundle, ScraperPluginClient, ScraperSearchRequest, ScraperSearchResponse,
+        ScraperSearchResult, ScraperTrailer, ScraperTrailersResponse,
     },
     tmdb::{
         TmdbClient, TmdbCollectionDetails, TmdbCreditsResponse, TmdbEpisodeDetails, TmdbError,
@@ -28,12 +28,20 @@ pub struct TmdbPluginClient {
 impl TmdbPluginClient {
     pub fn new(plugins: PluginService) -> Self {
         Self {
-            scraper: ScraperPluginClient::new(plugins, TMDB_DYNAMIC_PLUGIN_ID),
+            scraper: ScraperPluginClient::new(
+                plugins.clone(),
+                TMDB_DYNAMIC_PLUGIN_ID,
+                plugins.provider_cache(),
+            ),
         }
     }
 
     pub fn from_scraper(scraper: ScraperPluginClient) -> Self {
         Self { scraper }
+    }
+
+    pub(crate) async fn clear_response_cache(&self) {
+        self.scraper.clear_response_cache().await;
     }
 
     pub async fn search_generic(
@@ -48,6 +56,13 @@ impl TmdbPluginClient {
         request: ScraperGetRequest,
     ) -> Result<ScraperMetadata, ScraperError> {
         self.scraper.get(request).await
+    }
+
+    pub async fn bundle_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperMetadataBundle, ScraperError> {
+        self.scraper.bundle(request).await
     }
 
     pub async fn images_generic(
@@ -982,6 +997,19 @@ impl ScraperProvider {
         }
     }
 
+    pub async fn bundle_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperMetadataBundle, ScraperError> {
+        match self {
+            Self::Direct(_) => Err(ScraperError::Provider(
+                "metadata bundle is not available for the direct provider".to_owned(),
+            )),
+            Self::Plugin(client) => client.bundle_generic(request).await,
+            Self::Generic(client) => client.bundle(request).await,
+        }
+    }
+
     pub async fn images_generic(
         &self,
         request: ScraperImageRequest,
@@ -1029,6 +1057,14 @@ impl ScraperProvider {
     pub async fn set_api_key(&self, api_key: Option<&str>) {
         if let Self::Direct(client) = self {
             client.set_api_key(api_key).await;
+        }
+    }
+
+    pub(crate) async fn clear_response_cache(&self) {
+        match self {
+            Self::Direct(client) => client.clear_response_cache().await,
+            Self::Plugin(client) => client.clear_response_cache().await,
+            Self::Generic(client) => client.clear_response_cache().await,
         }
     }
 }

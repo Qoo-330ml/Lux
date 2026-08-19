@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::network::is_public_address;
 use crate::{
+    application::provider_cache::ProviderResponseCache,
     application::{
         plugin_protocol::{
             CHAPTER_DETECT_CAPABILITY, CHAPTER_DETECT_METHOD,
@@ -227,6 +228,7 @@ pub struct PluginService {
     catalog: Arc<RwLock<PluginCatalog>>,
     supervisor: PluginSupervisor,
     store: Option<PluginStore>,
+    provider_cache: ProviderResponseCache,
 }
 
 impl PluginService {
@@ -248,11 +250,18 @@ impl PluginService {
         let store = PluginStore::new(config_dir.clone(), proxy_url).ok();
         Self {
             database,
-            config_dir,
+            config_dir: config_dir.clone(),
             catalog,
             supervisor,
             store,
+            provider_cache: ProviderResponseCache::new(Some(
+                config_dir.join("metadata/provider-responses.json"),
+            )),
         }
+    }
+
+    pub(crate) fn provider_cache(&self) -> ProviderResponseCache {
+        self.provider_cache.clone()
     }
 
     pub async fn list(&self, offset: i64, limit: i64) -> Result<PluginPage, PluginServiceError> {
@@ -1389,6 +1398,7 @@ impl PluginService {
         Ok(crate::application::scraper::ScraperPluginClient::new(
             self.clone(),
             plugin_id,
+            self.provider_cache(),
         ))
     }
 

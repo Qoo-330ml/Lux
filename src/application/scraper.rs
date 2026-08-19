@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::{
     application::plugins::{PluginService, PluginServiceError},
+    application::provider_cache::{CacheLookup, ProviderResponseCache, cache_key, ttl_for_method},
     storage::{Database, StorageError},
 };
 
@@ -188,7 +189,8 @@ pub struct ScraperSearchResult {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::ScraperSearchResult;
+    use super::{ScraperSearchResult, decode_bundle_response};
+    use serde_json::json;
 
     #[test]
     fn selects_the_id_for_the_configured_scraper() {
@@ -215,6 +217,23 @@ mod tests {
             ..ScraperSearchResult::default()
         };
         assert_eq!(only_other_provider.selected_provider_entry("tmdb"), None);
+    }
+
+    #[test]
+    fn decodes_metadata_bundle_with_attached_provider_data() {
+        let bundle = decode_bundle_response(json!({
+            "metadata": {"Name": "Example", "ProviderIds": {"Tmdb": "7"}},
+            "images": {"images": [{"Type": "Primary", "Url": "https://image.example/poster.jpg"}]},
+            "credits": {"cast": [{"Id": "9", "Name": "演员甲"}], "crew": []},
+            "externalIds": {"providerIds": {"Tmdb": "7", "Imdb": "tt7"}},
+            "trailers": {"trailers": []}
+        }))
+        .expect("valid metadata bundle");
+
+        assert_eq!(bundle.metadata.title.as_deref(), Some("Example"));
+        assert_eq!(bundle.images.images.len(), 1);
+        assert_eq!(bundle.credits.cast[0].provider_id, "9");
+        assert_eq!(bundle.external_ids.provider_ids["Imdb"], "tt7");
     }
 }
 
@@ -342,6 +361,19 @@ pub struct ScraperMetadata {
     pub items: Vec<ScraperMetadataItem>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ScraperMetadataBundle {
+    pub metadata: ScraperMetadata,
+    #[serde(default)]
+    pub images: ScraperImagesResponse,
+    #[serde(default)]
+    pub credits: ScraperCreditsResponse,
+    #[serde(rename = "externalIds", alias = "external_ids", default)]
+    pub external_ids: ScraperExternalIdsResponse,
+    #[serde(default)]
+    pub trailers: ScraperTrailersResponse,
+}
+
 impl ScraperMetadata {
     pub fn provider_id(&self, provider: &str) -> Option<&str> {
         self.provider_ids
@@ -463,18 +495,28 @@ pub struct ScraperTrailer {
 pub struct ScraperPluginClient {
     plugins: PluginService,
     plugin_id: String,
+    response_cache: ProviderResponseCache,
 }
 
 impl ScraperPluginClient {
-    pub(crate) fn new(plugins: PluginService, plugin_id: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        plugins: PluginService,
+        plugin_id: impl Into<String>,
+        response_cache: ProviderResponseCache,
+    ) -> Self {
         Self {
             plugins,
             plugin_id: plugin_id.into(),
+            response_cache,
         }
     }
 
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+
+    pub(crate) async fn clear_response_cache(&self) {
+        self.response_cache.clear().await;
     }
 
     pub async fn search(
@@ -488,6 +530,14 @@ impl ScraperPluginClient {
     pub async fn get(&self, request: ScraperGetRequest) -> Result<ScraperMetadata, ScraperError> {
         let value = self.call("metadata.get", request).await?;
         decode_metadata_response(value)
+    }
+
+    pub async fn bundle(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperMetadataBundle, ScraperError> {
+        let value = self.call("metadata.bundle", request).await?;
+        decode_bundle_response(value)
     }
 
     pub async fn images(
@@ -535,10 +585,59 @@ impl ScraperPluginClient {
         method: &str,
         params: Value,
     ) -> Result<Value, ScraperError> {
-        self.plugins
+        let Some(cache_key) = cache_key(&self.plugin_id, method, &params) else {
+            return self
+                .plugins
+                .call_scraper(&self.plugin_id, method, params)
+                .await
+                .map_err(ScraperError::Plugin);
+        };
+        let cache_owner = loop {
+            match self.response_cache.begin(&cache_key).await {
+                CacheLookup::Hit(value) => return Ok(value),
+                CacheLookup::Negative => {
+                    return Err(ScraperError::Provider(
+                        "cached scraper result was not found".to_owned(),
+                    ));
+                }
+                CacheLookup::Wait(waiter) => waiter.await,
+                CacheLookup::Owner(owner) => break owner,
+            }
+        };
+        let result = self
+            .plugins
             .call_scraper(&self.plugin_id, method, params)
             .await
-            .map_err(ScraperError::Plugin)
+            .map_err(ScraperError::Plugin);
+        if let Ok(value) = &result {
+            self.response_cache
+                .store(&cache_key, value, ttl_for_method(method))
+                .await;
+        } else if result.as_ref().err().is_some_and(is_negative_scraper_error) {
+            self.response_cache
+                .store_negative(&cache_key, 10 * 60)
+                .await;
+        }
+        cache_owner.finish();
+        result
+    }
+}
+
+fn is_negative_scraper_error(error: &ScraperError) -> bool {
+    match error {
+        ScraperError::Provider(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("not found") || message.contains("404")
+        }
+        ScraperError::Plugin(PluginServiceError::Runtime(
+            crate::application::plugin_runtime::PluginRuntimeError::Plugin { code, .. },
+        )) => {
+            let code = code.to_ascii_lowercase();
+            code == "not_found" || code == "notfound" || code == "404"
+        }
+        ScraperError::Plugin(_) | ScraperError::Storage(_) | ScraperError::InvalidResponse(_) => {
+            false
+        }
     }
 }
 
@@ -597,6 +696,10 @@ pub fn decode_images_response(value: Value) -> Result<ScraperImagesResponse, Scr
 }
 
 pub fn decode_credits_response(value: Value) -> Result<ScraperCreditsResponse, ScraperError> {
+    serde_json::from_value(value).map_err(|error| ScraperError::InvalidResponse(error.to_string()))
+}
+
+pub fn decode_bundle_response(value: Value) -> Result<ScraperMetadataBundle, ScraperError> {
     serde_json::from_value(value).map_err(|error| ScraperError::InvalidResponse(error.to_string()))
 }
 

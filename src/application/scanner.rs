@@ -4192,7 +4192,7 @@ async fn discover_reconciliation_directory(
             path: path.clone(),
             source,
         })?;
-        if !file_type.is_dir() && !(file_type.is_file() && is_supported_movie_file(&path)) {
+        if !(file_type.is_dir() || file_type.is_file() && is_supported_movie_file(&path)) {
             continue;
         }
         let relative_path = path

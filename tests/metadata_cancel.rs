@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use axum::{Json, Router, extract::State, routing::any};
+use axum::{Json, Router, extract::State, http::Uri, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
@@ -63,11 +63,13 @@ struct RequestCounter {
     maximum: Arc<AtomicUsize>,
 }
 
-async fn counted_tmdb_search(State(counter): State<RequestCounter>) -> Json<Value> {
-    let active = counter.active.fetch_add(1, Ordering::SeqCst) + 1;
-    counter.maximum.fetch_max(active, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    counter.active.fetch_sub(1, Ordering::SeqCst);
+async fn counted_tmdb_search(State(counter): State<RequestCounter>, uri: Uri) -> Json<Value> {
+    if uri.path().contains("/search/") {
+        let active = counter.active.fetch_add(1, Ordering::SeqCst) + 1;
+        counter.maximum.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        counter.active.fetch_sub(1, Ordering::SeqCst);
+    }
     delayed_tmdb_search().await
 }
 

@@ -1,8 +1,15 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
     body::Body,
+    extract::State as AxumState,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -860,6 +867,91 @@ async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
+async fn automatic_candidate_search_expands_only_the_best_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let non_best_details_requests = Arc::new(AtomicUsize::new(0));
+    let tmdb_app = Router::new()
+        .fallback(any(
+            |AxumState(non_best_details_requests): AxumState<Arc<AtomicUsize>>,
+             request: Request<Body>| async move {
+                let path = request.uri().path();
+                if path == "/3/search/movie" {
+                    return Json(json!({
+                        "page": 1,
+                        "total_pages": 1,
+                        "total_results": 2,
+                        "results": [
+                            {
+                                "id": 1,
+                                "title": "Example Movie",
+                                "original_title": "Example Movie",
+                                "release_date": "2020-01-01"
+                            },
+                            {
+                                "id": 2,
+                                "title": "Unrelated Movie",
+                                "original_title": "Unrelated Movie",
+                                "release_date": "2020-01-01"
+                            }
+                        ]
+                    }))
+                    .into_response();
+                }
+                if path == "/3/movie/1" {
+                    return Json(json!({
+                        "id": 1,
+                        "title": "Example Movie",
+                        "original_title": "Example Movie",
+                        "overview": "Best result",
+                        "release_date": "2020-01-01",
+                        "original_language": "en"
+                    }))
+                    .into_response();
+                }
+                if path == "/3/movie/2" {
+                    non_best_details_requests.fetch_add(1, Ordering::SeqCst);
+                }
+                StatusCode::NOT_FOUND.into_response()
+            },
+        ))
+        .with_state(non_best_details_requests.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let candidates = MetadataCandidateService::new(fixture.database.clone());
+
+    let page = candidates
+        .search_and_store_for_automatic_match(
+            &fixture.item_id,
+            "Example Movie",
+            Some(2020),
+            &TmdbProvider::from(tmdb),
+        )
+        .await?;
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].provider_id, "1");
+    assert_eq!(page.items[1].provider_id, "2");
+    assert_eq!(non_best_details_requests.load(Ordering::SeqCst), 0);
+
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_scan_automatically_matches_and_writes_metadata()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
@@ -891,6 +983,31 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
                 }))
             }),
         )
+        .route(
+            "/3/movie/999/credits",
+            get(|| async {
+                Json(json!({
+                    "cast": [{
+                        "id": 10,
+                        "name": "后台演员",
+                        "character": "后台角色",
+                        "order": 0
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/3/person/10",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                Json(json!({
+                    "id": 10,
+                    "name": "后台演员",
+                    "biography": "后台补全的人物简介",
+                    "birthday": "1970-01-01"
+                }))
+            }),
+        )
         .fallback(any(|| async { (StatusCode::NOT_FOUND, Json(json!({}))) }));
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
@@ -907,9 +1024,10 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let selection = MetadataSelectionService::new(
+    let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
         ImageWriteService::new(fixture.database.clone())?,
+        fixture.config.config_dir.clone(),
     );
     let metadata = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
@@ -956,6 +1074,20 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     .fetch_one(fixture.database.pool())
     .await?;
     assert_eq!(mode, MetadataRefreshMode::FillMissing.as_str());
+
+    let people_file =
+        library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
+    let people: Value = serde_json::from_slice(&tokio::fs::read(&people_file).await?)?;
+    let person_key = people["actors"][0]["personKey"]
+        .as_str()
+        .ok_or("background person key missing")?;
+    let person_nfo =
+        canonical_person_directory(&fixture.config.config_dir, person_key)?.join("person.nfo");
+    assert!(
+        tokio::fs::read_to_string(person_nfo)
+            .await?
+            .contains("后台补全的人物简介")
+    );
 
     tmdb_server.abort();
     Ok(())

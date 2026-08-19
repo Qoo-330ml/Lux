@@ -367,7 +367,16 @@ impl AppState {
         let Some(database) = self.database.clone() else {
             return self;
         };
-        let tmdb = TmdbProvider::from(tmdb);
+        let tmdb = TmdbProvider::from(
+            tmdb.with_cache_dir(
+                self.config_dir
+                    .clone()
+                    .map(|path| path.join("metadata/provider-responses.json"))
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from("./config/metadata/provider-responses.json")
+                    }),
+            ),
+        );
         self.tmdb = Some(tmdb.clone());
         if let Some(resolver) = self.scraper_resolver.clone() {
             let mut collections =
@@ -5979,7 +5988,7 @@ fn emby_safe_path(item: &CatalogItem, default_source: Option<&CatalogSource>) ->
 /// return None and the field is omitted instead of emitting a fabricated value.
 fn emby_item_timestamp(item_id: &str) -> Option<String> {
     let compact = item_id.replace('-', "");
-    if compact.len() != 32 || !compact.as_bytes().get(12).is_some_and(|byte| *byte == b'7') {
+    if compact.len() != 32 || compact.as_bytes().get(12).is_none_or(|byte| *byte != b'7') {
         return None;
     }
     let millis = u64::from_str_radix(&compact[..12], 16).ok()?;

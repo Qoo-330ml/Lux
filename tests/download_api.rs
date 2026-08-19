@@ -130,7 +130,8 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
     .await?;
     tokio::fs::write(
         root.join("Remote.Movie.2024.strm"),
-        b"http://example.com/Remote.Movie.2024.mkv\nignored\n",
+        // Use a public literal so the test is independent of DNS rewrites on the host.
+        b"http://1.1.1.1/Remote.Movie.2024.mkv\nignored\n",
     )
     .await?;
     libraries
