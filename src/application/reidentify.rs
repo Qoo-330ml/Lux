@@ -1,6 +1,8 @@
 use std::{
+    collections::HashMap,
     fmt,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
@@ -25,6 +27,7 @@ use crate::{
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
+const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
 const AUTO_MATCH_MIN_MARGIN: f64 = 5.0;
 
@@ -55,6 +58,35 @@ pub struct MetadataReidentifyService {
     admin_events: AdminEventHub,
     resources: ResourceMetrics,
     webhooks: Option<WebhookService>,
+    progress_events: MetadataProgressEventGate,
+}
+
+#[derive(Clone, Default)]
+struct MetadataProgressEventGate {
+    last_published: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl MetadataProgressEventGate {
+    fn should_publish(&self, job_id: &str) -> bool {
+        let now = Instant::now();
+        let Ok(mut last_published) = self.last_published.lock() else {
+            return true;
+        };
+        if last_published
+            .get(job_id)
+            .is_some_and(|last| now.duration_since(*last) < METADATA_PROGRESS_EVENT_INTERVAL)
+        {
+            return false;
+        }
+        last_published.insert(job_id.to_owned(), now);
+        true
+    }
+
+    fn clear(&self, job_id: &str) {
+        if let Ok(mut last_published) = self.last_published.lock() {
+            last_published.remove(job_id);
+        }
+    }
 }
 
 impl MetadataReidentifyService {
@@ -71,6 +103,7 @@ impl MetadataReidentifyService {
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
             webhooks: None,
+            progress_events: MetadataProgressEventGate::default(),
         }
     }
 
@@ -98,6 +131,7 @@ impl MetadataReidentifyService {
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
             webhooks: None,
+            progress_events: MetadataProgressEventGate::default(),
         }
     }
 
@@ -119,6 +153,7 @@ impl MetadataReidentifyService {
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
             webhooks: None,
+            progress_events: MetadataProgressEventGate::default(),
         }
     }
 
@@ -424,7 +459,7 @@ impl MetadataReidentifyService {
             )
             .await;
         }
-        self.admin_events.publish(AdminEventScope::Jobs);
+        self.publish_job_finished(job_id);
     }
 
     async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
@@ -486,8 +521,7 @@ impl MetadataReidentifyService {
                         None,
                     )
                     .await;
-                self.admin_events.publish(AdminEventScope::Jobs);
-                self.admin_events.publish(AdminEventScope::Metadata);
+                self.publish_job_progress(job_id);
                 if !matches!(mode, MetadataRefreshMode::Reidentify) {
                     self.publish_webhook(
                         WebhookEventType::MetadataUpdated,
@@ -518,8 +552,7 @@ impl MetadataReidentifyService {
                         "metadata refresh item result could not be recorded"
                     );
                 }
-                self.admin_events.publish(AdminEventScope::Jobs);
-                self.admin_events.publish(AdminEventScope::Metadata);
+                self.publish_job_progress(job_id);
             }
             Err(error) => {
                 let code = error.code();
@@ -536,8 +569,7 @@ impl MetadataReidentifyService {
                         "metadata refresh item result could not be recorded"
                     );
                 }
-                self.admin_events.publish(AdminEventScope::Jobs);
-                self.admin_events.publish(AdminEventScope::Metadata);
+                self.publish_job_progress(job_id);
             }
         }
     }
@@ -555,6 +587,17 @@ impl MetadataReidentifyService {
                 "failed to enqueue webhook event"
             );
         }
+    }
+
+    fn publish_job_progress(&self, job_id: &str) {
+        if self.progress_events.should_publish(job_id) {
+            self.admin_events.publish(AdminEventScope::Jobs);
+        }
+    }
+
+    fn publish_job_finished(&self, job_id: &str) {
+        self.progress_events.clear(job_id);
+        self.admin_events.publish(AdminEventScope::Jobs);
     }
 
     async fn provider_for_item_with_requirement(

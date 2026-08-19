@@ -110,7 +110,7 @@ describe("admin SSE events", () => {
     expect(source.closed).toBe(true);
   });
 
-  it("refreshes metadata jobs without a standalone pending-metadata query", async () => {
+  it("does not refresh metadata jobs twice for metadata audit events", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
 
@@ -128,7 +128,6 @@ describe("admin SSE events", () => {
 
     act(() => FakeEventSource.instances[0].emit("invalidate", JSON.stringify({ scope: "metadata" })));
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
-      { queryKey: ["admin", "metadata-jobs"] },
       { queryKey: ["admin", "logs"] },
     ]);
   });

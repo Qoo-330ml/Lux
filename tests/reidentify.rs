@@ -10,6 +10,7 @@ use axum::{Json, Router, extract::State as AxumState, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
+        admin_events::{AdminEventHub, AdminEventScope},
         candidates::MetadataSelectionService,
         images::ImageWriteService,
         libraries::LibraryService,
@@ -801,14 +802,30 @@ async fn library_metadata_job_processes_items_concurrently()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let admin_events = AdminEventHub::new();
+    let mut event_receiver = admin_events.subscribe();
+    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb))
+        .with_admin_events(admin_events);
     let job = metadata.create_library_job(&library.id.to_string()).await?;
+    assert_eq!(event_receiver.recv().await, Ok(AdminEventScope::Jobs));
     metadata.run(&job.id).await;
 
     let completed = metadata.get_job(&job.id).await?;
     assert_eq!(completed.total_count, 24);
     assert_eq!(completed.status, "COMPLETED");
     assert!(tracker.maximum.load(Ordering::SeqCst) > 1);
+    let mut progress_events = Vec::new();
+    while let Ok(scope) = event_receiver.try_recv() {
+        progress_events.push(scope);
+    }
+    assert_eq!(
+        progress_events
+            .iter()
+            .filter(|scope| **scope == AdminEventScope::Jobs)
+            .count(),
+        2
+    );
+    assert!(!progress_events.contains(&AdminEventScope::Metadata));
     tmdb_server.abort();
     Ok(())
 }
