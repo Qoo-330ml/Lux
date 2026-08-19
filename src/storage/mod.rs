@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -1197,12 +1197,23 @@ impl Database {
                 source,
             })?;
         for credit in credits {
+            let provider_ids_json = serde_json::to_string(&credit.provider_ids)
+                .map_err(|source| StorageError::Serialization(source.to_string()))?;
+            let genres_json = serde_json::to_string(&credit.genres)
+                .map_err(|source| StorageError::Serialization(source.to_string()))?;
+            let tags_json = serde_json::to_string(&credit.tags)
+                .map_err(|source| StorageError::Serialization(source.to_string()))?;
+            let production_locations_json = serde_json::to_string(&credit.production_locations)
+                .map_err(|source| StorageError::Serialization(source.to_string()))?;
+            let taglines_json = serde_json::to_string(&credit.taglines)
+                .map_err(|source| StorageError::Serialization(source.to_string()))?;
             self.query(
                 "INSERT INTO person_credits (
                     item_id, person_id, person_type, person_name, provider, role,
                     sort_order, biography, birthday, deathday, known_for_department,
-                    place_of_birth
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    place_of_birth, provider_ids_json, genres_json, tags_json,
+                    production_locations_json, premiere_date, production_year, taglines_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(item_id)
             .bind(&credit.person_id)
@@ -1216,6 +1227,13 @@ impl Database {
             .bind(&credit.deathday)
             .bind(&credit.known_for_department)
             .bind(&credit.place_of_birth)
+            .bind(provider_ids_json)
+            .bind(genres_json)
+            .bind(tags_json)
+            .bind(production_locations_json)
+            .bind(&credit.premiere_date)
+            .bind(credit.production_year)
+            .bind(taglines_json)
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -1329,7 +1347,8 @@ impl Database {
                 source,
             })?;
         let list_query = format!(
-            "SELECT pc.person_id,
+            "SELECT MIN(pc.item_id) AS item_id,
+                    pc.person_id,
                     pc.provider,
                     MIN(pc.person_name) AS person_name,
                     MIN(pc.role) AS role,
@@ -1338,7 +1357,14 @@ impl Database {
                     MIN(pc.birthday) AS birthday,
                     MIN(pc.deathday) AS deathday,
                     MIN(pc.known_for_department) AS known_for_department,
-                    MIN(pc.place_of_birth) AS place_of_birth
+                    MIN(pc.place_of_birth) AS place_of_birth,
+                    MIN(pc.provider_ids_json) AS provider_ids_json,
+                    MIN(pc.genres_json) AS genres_json,
+                    MIN(pc.tags_json) AS tags_json,
+                    MIN(pc.production_locations_json) AS production_locations_json,
+                    MIN(pc.premiere_date) AS premiere_date,
+                    MIN(pc.production_year) AS production_year,
+                    MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
              WHERE mi.library_id IN ({placeholders})
@@ -1387,7 +1413,8 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "SELECT pc.person_id,
+            "SELECT MIN(pc.item_id) AS item_id,
+                    pc.person_id,
                     pc.provider,
                     MIN(pc.person_name) AS person_name,
                     MIN(pc.role) AS role,
@@ -1396,7 +1423,14 @@ impl Database {
                     MIN(pc.birthday) AS birthday,
                     MIN(pc.deathday) AS deathday,
                     MIN(pc.known_for_department) AS known_for_department,
-                    MIN(pc.place_of_birth) AS place_of_birth
+                    MIN(pc.place_of_birth) AS place_of_birth,
+                    MIN(pc.provider_ids_json) AS provider_ids_json,
+                    MIN(pc.genres_json) AS genres_json,
+                    MIN(pc.tags_json) AS tags_json,
+                    MIN(pc.production_locations_json) AS production_locations_json,
+                    MIN(pc.premiere_date) AS premiere_date,
+                    MIN(pc.production_year) AS production_year,
+                    MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
              WHERE mi.library_id IN ({placeholders})
@@ -1440,7 +1474,8 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "SELECT pc.person_id,
+            "SELECT MIN(pc.item_id) AS item_id,
+                    pc.person_id,
                     pc.provider,
                     MIN(pc.person_name) AS person_name,
                     MIN(pc.role) AS role,
@@ -1449,7 +1484,14 @@ impl Database {
                     MIN(pc.birthday) AS birthday,
                     MIN(pc.deathday) AS deathday,
                     MIN(pc.known_for_department) AS known_for_department,
-                    MIN(pc.place_of_birth) AS place_of_birth
+                    MIN(pc.place_of_birth) AS place_of_birth,
+                    MIN(pc.provider_ids_json) AS provider_ids_json,
+                    MIN(pc.genres_json) AS genres_json,
+                    MIN(pc.tags_json) AS tags_json,
+                    MIN(pc.production_locations_json) AS production_locations_json,
+                    MIN(pc.premiere_date) AS premiere_date,
+                    MIN(pc.production_year) AS production_year,
+                    MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
              WHERE mi.library_id IN ({placeholders})
@@ -12663,10 +12705,18 @@ pub(crate) struct NewPersonCredit {
     pub(crate) deathday: Option<String>,
     pub(crate) known_for_department: Option<String>,
     pub(crate) place_of_birth: Option<String>,
+    pub(crate) provider_ids: BTreeMap<String, String>,
+    pub(crate) genres: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) production_locations: Vec<String>,
+    pub(crate) premiere_date: Option<String>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) taglines: Vec<String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct StoredPersonCredit {
+    pub(crate) item_id: String,
     pub(crate) person_id: String,
     pub(crate) provider: String,
     pub(crate) person_name: String,
@@ -12677,10 +12727,23 @@ pub(crate) struct StoredPersonCredit {
     pub(crate) deathday: Option<String>,
     pub(crate) known_for_department: Option<String>,
     pub(crate) place_of_birth: Option<String>,
+    pub(crate) provider_ids: BTreeMap<String, String>,
+    pub(crate) genres: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) production_locations: Vec<String>,
+    pub(crate) premiere_date: Option<String>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) taglines: Vec<String>,
 }
 
 fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
+    let provider_ids_json: String = row.get("provider_ids_json");
+    let genres_json: String = row.get("genres_json");
+    let tags_json: String = row.get("tags_json");
+    let production_locations_json: String = row.get("production_locations_json");
+    let taglines_json: String = row.get("taglines_json");
     StoredPersonCredit {
+        item_id: row.get("item_id"),
         person_id: row.get("person_id"),
         provider: row.get("provider"),
         person_name: row.get("person_name"),
@@ -12691,6 +12754,13 @@ fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
         deathday: row.get("deathday"),
         known_for_department: row.get("known_for_department"),
         place_of_birth: row.get("place_of_birth"),
+        provider_ids: serde_json::from_str(&provider_ids_json).unwrap_or_default(),
+        genres: serde_json::from_str(&genres_json).unwrap_or_default(),
+        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+        production_locations: serde_json::from_str(&production_locations_json).unwrap_or_default(),
+        premiere_date: row.get("premiere_date"),
+        production_year: row.get("production_year"),
+        taglines: serde_json::from_str(&taglines_json).unwrap_or_default(),
     }
 }
 
@@ -13852,6 +13922,7 @@ pub enum StorageError {
         path: PathBuf,
         source: MigrateError,
     },
+    Serialization(String),
     LastManager,
 }
 
@@ -13883,6 +13954,9 @@ impl std::fmt::Display for StorageError {
                     "database migration '{}': {source}",
                     path.display()
                 )
+            }
+            Self::Serialization(source) => {
+                write!(formatter, "database serialization failed: {source}")
             }
             Self::LastManager => {
                 formatter.write_str("at least one active server manager is required")
@@ -13936,7 +14010,7 @@ impl std::error::Error for StorageError {
             Self::Io { source, .. } => Some(source),
             Self::Sqlx { source, .. } => Some(source),
             Self::Migration { source, .. } => Some(source),
-            Self::LastManager => None,
+            Self::LastManager | Self::Serialization(_) => None,
         }
     }
 }
@@ -13998,6 +14072,13 @@ mod tests {
                         deathday: None,
                         known_for_department: None,
                         place_of_birth: None,
+                        provider_ids: BTreeMap::new(),
+                        genres: Vec::new(),
+                        tags: Vec::new(),
+                        production_locations: Vec::new(),
+                        premiere_date: None,
+                        production_year: None,
+                        taglines: Vec::new(),
                     },
                     NewPersonCredit {
                         person_id: "2".to_owned(),
@@ -14011,6 +14092,13 @@ mod tests {
                         deathday: None,
                         known_for_department: None,
                         place_of_birth: None,
+                        provider_ids: BTreeMap::new(),
+                        genres: Vec::new(),
+                        tags: Vec::new(),
+                        production_locations: Vec::new(),
+                        premiere_date: None,
+                        production_year: None,
+                        taglines: Vec::new(),
                     },
                 ],
             )

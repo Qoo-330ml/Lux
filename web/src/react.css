@@ -422,6 +422,14 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-person-facts > div { min-width: 0; }
 .lux-person-facts dt { display: flex; align-items: center; gap: 6px; color: var(--lux-subtle); font-size: .72rem; }
 .lux-person-facts dd { margin: 5px 0 0; color: var(--lux-text); font-size: .9rem; overflow-wrap: anywhere; }
+.lux-person-metadata-group { margin-top: 26px; }
+.lux-person-metadata-group h2 { margin: 0; color: var(--lux-text); font-size: .85rem; }
+.lux-person-metadata-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 28px; margin: 12px 0 0; }
+.lux-person-metadata-list > div { min-width: 0; }
+.lux-person-metadata-list dt { color: var(--lux-subtle); font-size: .72rem; text-transform: capitalize; }
+.lux-person-metadata-list dd { margin: 4px 0 0; color: var(--lux-text); font-size: .84rem; overflow-wrap: anywhere; }
+.lux-person-metadata-values { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.lux-person-metadata-values li { padding: 5px 9px; border: 1px solid var(--lux-line); border-radius: 999px; color: var(--lux-subtle); font-size: .76rem; }
 .lux-person-overview { margin-top: 34px; }
 .lux-person-overview h2 { margin: 0; color: var(--lux-text); font-size: 1rem; }
 .lux-person-overview p { max-width: 70ch; margin: 12px 0 0; color: var(--lux-subtle); line-height: 1.8; white-space: pre-wrap; }

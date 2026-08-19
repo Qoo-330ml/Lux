@@ -62,7 +62,7 @@ pub struct ActorCredit {
     pub person: Option<PersonMetadata>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +89,48 @@ pub struct PersonMetadata {
     pub production_year: Option<i32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub taglines: Vec<String>,
+}
+
+impl PersonMetadata {
+    fn supplement_missing_from(mut self, fallback: Self) -> Self {
+        if self.biography.is_none() {
+            self.biography = fallback.biography;
+        }
+        if self.birthday.is_none() {
+            self.birthday = fallback.birthday;
+        }
+        if self.deathday.is_none() {
+            self.deathday = fallback.deathday;
+        }
+        if self.known_for_department.is_none() {
+            self.known_for_department = fallback.known_for_department;
+        }
+        if self.place_of_birth.is_none() {
+            self.place_of_birth = fallback.place_of_birth;
+        }
+        if self.provider_ids.is_empty() {
+            self.provider_ids = fallback.provider_ids;
+        }
+        if self.genres.is_empty() {
+            self.genres = fallback.genres;
+        }
+        if self.tags.is_empty() {
+            self.tags = fallback.tags;
+        }
+        if self.production_locations.is_empty() {
+            self.production_locations = fallback.production_locations;
+        }
+        if self.premiere_date.is_none() {
+            self.premiere_date = fallback.premiere_date;
+        }
+        if self.production_year.is_none() {
+            self.production_year = fallback.production_year;
+        }
+        if self.taglines.is_empty() {
+            self.taglines = fallback.taglines;
+        }
+        self
+    }
 }
 
 /// Metadata supplied by an Emby-compatible person update request.
@@ -184,6 +226,13 @@ pub struct ActorView {
     pub deathday: Option<String>,
     pub known_for_department: Option<String>,
     pub place_of_birth: Option<String>,
+    pub provider_ids: BTreeMap<String, String>,
+    pub genres: Vec<String>,
+    pub tags: Vec<String>,
+    pub production_locations: Vec<String>,
+    pub premiere_date: Option<String>,
+    pub production_year: Option<i64>,
+    pub taglines: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -618,6 +667,39 @@ impl PeopleService {
                     .person
                     .as_ref()
                     .and_then(|person| person.place_of_birth.clone()),
+                provider_ids: actor
+                    .person
+                    .as_ref()
+                    .map(|person| person.provider_ids.clone())
+                    .unwrap_or_default(),
+                genres: actor
+                    .person
+                    .as_ref()
+                    .map(|person| person.genres.clone())
+                    .unwrap_or_default(),
+                tags: actor
+                    .person
+                    .as_ref()
+                    .map(|person| person.tags.clone())
+                    .unwrap_or_default(),
+                production_locations: actor
+                    .person
+                    .as_ref()
+                    .map(|person| person.production_locations.clone())
+                    .unwrap_or_default(),
+                premiere_date: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.premiere_date.clone()),
+                production_year: actor
+                    .person
+                    .as_ref()
+                    .and_then(|person| person.production_year.map(i64::from)),
+                taglines: actor
+                    .person
+                    .as_ref()
+                    .map(|person| person.taglines.clone())
+                    .unwrap_or_default(),
             });
         }
         Ok(views)
@@ -919,6 +1001,31 @@ impl PeopleService {
             let image_url = self
                 .person_image_url(provider.as_deref(), &credit.person_id)
                 .await;
+            let stored_metadata = PersonMetadata {
+                biography: credit.biography.clone(),
+                birthday: credit.birthday.clone(),
+                deathday: credit.deathday.clone(),
+                known_for_department: credit.known_for_department.clone(),
+                place_of_birth: credit.place_of_birth.clone(),
+                provider_ids: credit.provider_ids.clone(),
+                genres: credit.genres.clone(),
+                tags: credit.tags.clone(),
+                production_locations: credit.production_locations.clone(),
+                premiere_date: credit.premiere_date.clone(),
+                production_year: credit
+                    .production_year
+                    .and_then(|year| i32::try_from(year).ok()),
+                taglines: credit.taglines.clone(),
+            };
+            let metadata = self
+                .person_metadata_from_relation(&credit.item_id, &credit.person_id)
+                .await
+                .map(|relation_metadata| {
+                    stored_metadata
+                        .clone()
+                        .supplement_missing_from(relation_metadata)
+                })
+                .unwrap_or(stored_metadata);
             views.push(ActorView {
                 id: credit.person_id,
                 provider,
@@ -926,14 +1033,44 @@ impl PeopleService {
                 character: (!credit.role.is_empty()).then_some(credit.role),
                 date_created: Some(credit.date_created),
                 image_url,
-                biography: credit.biography,
-                birthday: credit.birthday,
-                deathday: credit.deathday,
-                known_for_department: credit.known_for_department,
-                place_of_birth: credit.place_of_birth,
+                biography: metadata.biography,
+                birthday: metadata.birthday,
+                deathday: metadata.deathday,
+                known_for_department: metadata.known_for_department,
+                place_of_birth: metadata.place_of_birth,
+                provider_ids: metadata.provider_ids,
+                genres: metadata.genres,
+                tags: metadata.tags,
+                production_locations: metadata.production_locations,
+                premiere_date: metadata.premiere_date,
+                production_year: metadata.production_year.map(i64::from),
+                taglines: metadata.taglines,
             });
         }
         views
+    }
+
+    async fn person_metadata_from_relation(
+        &self,
+        item_id: &str,
+        person_id: &str,
+    ) -> Option<PersonMetadata> {
+        let path = library_item_directory(&self.config_dir, item_id)
+            .ok()?
+            .join("people.json");
+        let legacy_path = self
+            .legacy_people_dir()
+            .join(LEGACY_ITEMS_DIR)
+            .join(format!("{item_id}.json"));
+        let relation = match read_relation(&path).await.ok()? {
+            Some(relation) => relation,
+            None => read_relation(&legacy_path).await.ok()??,
+        };
+        relation
+            .actors
+            .iter()
+            .find(|actor| actor_id_from_stored_actor(actor) == person_id)
+            .and_then(|actor| actor.person.clone())
     }
 
     async fn person_image_url(&self, provider: Option<&str>, person_id: &str) -> Option<String> {
@@ -1929,6 +2066,39 @@ fn person_credit_from_stored_actor(actor: &StoredActor) -> NewPersonCredit {
             .person
             .as_ref()
             .and_then(|person| person.place_of_birth.clone()),
+        provider_ids: actor
+            .person
+            .as_ref()
+            .map(|person| person.provider_ids.clone())
+            .unwrap_or_default(),
+        genres: actor
+            .person
+            .as_ref()
+            .map(|person| person.genres.clone())
+            .unwrap_or_default(),
+        tags: actor
+            .person
+            .as_ref()
+            .map(|person| person.tags.clone())
+            .unwrap_or_default(),
+        production_locations: actor
+            .person
+            .as_ref()
+            .map(|person| person.production_locations.clone())
+            .unwrap_or_default(),
+        premiere_date: actor
+            .person
+            .as_ref()
+            .and_then(|person| person.premiere_date.clone()),
+        production_year: actor
+            .person
+            .as_ref()
+            .and_then(|person| person.production_year.map(i64::from)),
+        taglines: actor
+            .person
+            .as_ref()
+            .map(|person| person.taglines.clone())
+            .unwrap_or_default(),
     }
 }
 

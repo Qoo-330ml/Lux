@@ -3958,6 +3958,34 @@ fn emby_person_json_with_fields(
     {
         object.insert("PlaceOfBirth".to_owned(), json!(place_of_birth));
     }
+    if include("ProviderIds") {
+        object.insert("ProviderIds".to_owned(), json!(actor.provider_ids));
+    }
+    if include("Genres") {
+        object.insert("Genres".to_owned(), json!(actor.genres));
+    }
+    if include("Tags") {
+        object.insert("Tags".to_owned(), json!(actor.tags));
+    }
+    if include("ProductionLocations") {
+        object.insert(
+            "ProductionLocations".to_owned(),
+            json!(actor.production_locations),
+        );
+    }
+    if include("PremiereDate")
+        && let Some(premiere_date) = actor.premiere_date
+    {
+        object.insert("PremiereDate".to_owned(), json!(premiere_date));
+    }
+    if include("ProductionYear")
+        && let Some(production_year) = actor.production_year
+    {
+        object.insert("ProductionYear".to_owned(), json!(production_year));
+    }
+    if include("Taglines") {
+        object.insert("Taglines".to_owned(), json!(actor.taglines));
+    }
     if include("DateCreated")
         && let Some(date_created) = actor.date_created.and_then(emby_timestamp)
     {

@@ -51,6 +51,13 @@ describe("person detail", () => {
       birthday: "1970-01-01",
       knownForDepartment: "Acting",
       placeOfBirth: "测试城市",
+      providerIds: { Imdb: "nm1234567", Tmdb: "123456" },
+      genres: ["Drama"],
+      tags: ["MDC"],
+      productionLocations: ["日本"],
+      premiereDate: "2000-01-02",
+      productionYear: 2000,
+      taglines: ["MDC 标语"],
     });
     root = createRoot(container!);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -77,5 +84,41 @@ describe("person detail", () => {
       .toContain("/api/v1/people/tmdb/person-1/image");
     expect(container?.textContent).toContain("1970-01-01");
     expect(container?.textContent).toContain("测试城市");
+    expect(container?.textContent).toContain("Drama");
+    expect(container?.textContent).toContain("MDC");
+    expect(container?.textContent).toContain("日本");
+    expect(container?.textContent).toContain("2000-01-02");
+    expect(container?.textContent).toContain("MDC 标语");
+    expect(container?.textContent).toContain("nm1234567");
+  });
+
+  it("renders escaped line breaks in a biography as actual line breaks", async () => {
+    vi.spyOn(api, "person").mockResolvedValue({
+      id: "person-2",
+      name: "演员乙",
+      biography: "第一行<br>第二行<br/>第三行",
+    });
+    root = createRoot(container!);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/people/person-2"]}>
+            <Routes>
+              <Route path="people/:personId" element={<PersonDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const biography = container?.querySelector(".lux-person-overview p");
+    expect(biography?.querySelectorAll("br")).toHaveLength(2);
+    expect(biography?.textContent).toBe("第一行第二行第三行");
+    expect(biography?.textContent).not.toContain("<br>");
   });
 });

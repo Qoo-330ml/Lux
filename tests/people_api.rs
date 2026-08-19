@@ -408,6 +408,13 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(person_update_body["BirthDate"], "1990-01-02");
     assert_eq!(person_update_body["KnownForDepartment"], "Acting");
     assert_eq!(person_update_body["PlaceOfBirth"], "北京");
+    assert_eq!(person_update_body["Genres"], json!(["Drama"]));
+    assert_eq!(person_update_body["Tags"], json!(["MDC"]));
+    assert_eq!(person_update_body["ProductionLocations"], json!(["日本"]));
+    assert_eq!(person_update_body["PremiereDate"], "2000-01-02");
+    assert_eq!(person_update_body["ProductionYear"], 2000);
+    assert_eq!(person_update_body["Taglines"], json!(["MDC 标语"]));
+    assert_eq!(person_update_body["ProviderIds"]["Imdb"], "nm1234567");
 
     let updated_relation_path =
         library_item_directory(&temp_dir.path().join("config"), &second_item_id)?

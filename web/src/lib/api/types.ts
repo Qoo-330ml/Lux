@@ -108,6 +108,13 @@ export type MediaActor = {
   deathday?: string | null;
   knownForDepartment?: string | null;
   placeOfBirth?: string | null;
+  providerIds?: Record<string, string>;
+  genres?: string[];
+  tags?: string[];
+  productionLocations?: string[];
+  premiereDate?: string | null;
+  productionYear?: number | null;
+  taglines?: string[];
 };
 
 export type PersonDetail = MediaActor;
