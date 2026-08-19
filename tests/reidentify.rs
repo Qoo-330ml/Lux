@@ -813,7 +813,9 @@ async fn library_metadata_job_processes_items_concurrently()
     let completed = metadata.get_job(&job.id).await?;
     assert_eq!(completed.total_count, 24);
     assert_eq!(completed.status, "COMPLETED");
-    assert!(tracker.maximum.load(Ordering::SeqCst) > 1);
+    let maximum_concurrency = tracker.maximum.load(Ordering::SeqCst);
+    assert!(maximum_concurrency > 1);
+    assert!(maximum_concurrency <= 8);
     let mut progress_events = Vec::new();
     while let Ok(scope) = event_receiver.try_recv() {
         progress_events.push(scope);
@@ -849,6 +851,25 @@ async fn library_metadata_job_excludes_parent_folders() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
+async fn library_metadata_job_rejects_a_second_active_full_library_job()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
+
+    let first = metadata.create_library_job(&library_id).await?;
+    let second = metadata.create_library_job(&library_id).await;
+
+    assert!(matches!(
+        second,
+        Err(luxd::application::reidentify::MetadataReidentifyError::LibraryJobAlreadyActive(
+            job_id
+        )) if job_id == first.id
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_job_skips_explicit_parent_folder_without_failing()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, database, _library_id, folder_id) =
@@ -861,6 +882,31 @@ async fn metadata_job_skips_explicit_parent_folder_without_failing()
     let finished = metadata.get_job(&job.id).await?;
     assert_eq!(finished.status, "COMPLETED");
     assert_eq!(finished.processed_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_job_requeues_running_items_after_owner_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata.create_job(vec![folder_id]).await?;
+    sqlx::query("UPDATE metadata_reidentify_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE metadata_reidentify_job_items SET status = 'RUNNING' WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.processed_count, 1);
+    assert_eq!(completed.items[0].status, "COMPLETED");
     Ok(())
 }
 

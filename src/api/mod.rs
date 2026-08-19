@@ -16014,6 +16014,13 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
             "该批量元数据匹配任务当前不可取消",
         )
         .into_response(),
+        MetadataReidentifyError::LibraryJobAlreadyActive(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "已有整库元数据任务正在运行，请等待完成或先取消该任务",
+        )
+        .into_response(),
         MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => {
             api_error(
                 headers,

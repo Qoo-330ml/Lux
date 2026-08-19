@@ -4356,8 +4356,9 @@ impl Database {
         mode: &str,
     ) -> Result<(), StorageError> {
         self.query(
-            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode, library_id)
-             VALUES (?, 'CANCELLED', ?, ?, ?)",
+            "INSERT INTO metadata_reidentify_jobs (
+                 id, status, total_count, mode, library_id, job_scope
+             ) VALUES (?, 'CANCELLED', ?, ?, ?, 'LIBRARY')",
         )
         .bind(job_id)
         .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
@@ -4415,6 +4416,24 @@ impl Database {
             source,
         })?;
         Ok(())
+    }
+
+    pub(crate) async fn active_library_metadata_reidentify_job_id(
+        &self,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id
+             FROM metadata_reidentify_jobs
+             WHERE job_scope = 'LIBRARY' AND status IN ('QUEUED', 'RUNNING')
+             ORDER BY created_at, id
+             LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn find_metadata_reidentify_job(
@@ -4547,6 +4566,25 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn requeue_running_metadata_reidentify_items(
+        &self,
+        job_id: &str,
+    ) -> Result<u64, StorageError> {
+        self.query(
+            "UPDATE metadata_reidentify_job_items
+             SET status = 'PENDING', error = NULL, updated_at = unixepoch()
+             WHERE job_id = ? AND status = 'RUNNING'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

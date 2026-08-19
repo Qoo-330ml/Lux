@@ -1,12 +1,15 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::{Mutex as AsyncMutex, Semaphore},
+    task::JoinSet,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -26,6 +29,7 @@ use crate::{
 };
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
+const METADATA_GLOBAL_WORKER_LIMIT: usize = 8;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
@@ -59,6 +63,9 @@ pub struct MetadataReidentifyService {
     resources: ResourceMetrics,
     webhooks: Option<WebhookService>,
     progress_events: MetadataProgressEventGate,
+    worker_permits: Arc<Semaphore>,
+    running_jobs: MetadataJobOwners,
+    library_job_creation: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Clone, Default)]
@@ -89,6 +96,39 @@ impl MetadataProgressEventGate {
     }
 }
 
+#[derive(Clone, Default)]
+struct MetadataJobOwners {
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl MetadataJobOwners {
+    fn claim(&self, job_id: &str) -> Option<MetadataJobOwnerGuard> {
+        let Ok(mut active) = self.active.lock() else {
+            return None;
+        };
+        if !active.insert(job_id.to_owned()) {
+            return None;
+        }
+        Some(MetadataJobOwnerGuard {
+            job_id: job_id.to_owned(),
+            active: Arc::clone(&self.active),
+        })
+    }
+}
+
+struct MetadataJobOwnerGuard {
+    job_id: String,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for MetadataJobOwnerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.job_id);
+        }
+    }
+}
+
 impl MetadataReidentifyService {
     pub fn new<T>(database: Database, tmdb: T) -> Self
     where
@@ -104,6 +144,9 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
+            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -132,6 +175,9 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
+            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -154,6 +200,9 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
+            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -268,6 +317,14 @@ impl MetadataReidentifyService {
         if !library.is_enabled {
             return Err(MetadataReidentifyError::ItemNotFound(library_id.to_owned()));
         }
+        let _creation_guard = self.library_job_creation.lock().await;
+        if let Some(job_id) = self
+            .database
+            .active_library_metadata_reidentify_job_id()
+            .await?
+        {
+            return Err(MetadataReidentifyError::LibraryJobAlreadyActive(job_id));
+        }
         let mut item_ids = Vec::new();
         let mut offset = 0_i64;
         loop {
@@ -297,6 +354,9 @@ impl MetadataReidentifyService {
     }
 
     pub async fn run(&self, job_id: &str) {
+        let Some(_owner) = self.running_jobs.claim(job_id) else {
+            return;
+        };
         let Ok(Some(job)) = self.database.find_metadata_reidentify_job(job_id).await else {
             return;
         };
@@ -308,6 +368,19 @@ impl MetadataReidentifyService {
                 .database
                 .finish_metadata_reidentify_job(job_id, "CANCELLED", None)
                 .await;
+            return;
+        }
+        if job.status == "RUNNING"
+            && self
+                .database
+                .requeue_running_metadata_reidentify_items(job_id)
+                .await
+                .is_err()
+        {
+            tracing::error!(
+                job_id,
+                "metadata refresh could not requeue interrupted items"
+            );
             return;
         }
         if job.status == "QUEUED"
@@ -354,6 +427,10 @@ impl MetadataReidentifyService {
                 last_concurrency = Some(concurrency);
             }
             while workers.len() < concurrency {
+                let Ok(worker_permit) = Arc::clone(&self.worker_permits).acquire_owned().await
+                else {
+                    break;
+                };
                 if self
                     .database
                     .metadata_reidentify_job_cancel_requested(job_id)
@@ -377,6 +454,7 @@ impl MetadataReidentifyService {
                 let service = self.clone();
                 let job_id = job_id.to_owned();
                 workers.spawn(async move {
+                    let _worker_permit = worker_permit;
                     service.process_item(&job_id, &item_id, mode).await;
                 });
             }
@@ -793,6 +871,7 @@ pub enum MetadataReidentifyError {
     JobNotFound,
     JobNotRetryable,
     JobNotCancelable,
+    LibraryJobAlreadyActive(String),
     Candidate(MetadataCandidateError),
     Scraper(ScraperError),
     Selection(MetadataSelectionError),
@@ -811,6 +890,7 @@ impl MetadataReidentifyError {
             Self::JobNotFound => "JOB_NOT_FOUND",
             Self::JobNotRetryable => "JOB_NOT_RETRYABLE",
             Self::JobNotCancelable => "JOB_NOT_CANCELABLE",
+            Self::LibraryJobAlreadyActive(_) => "LIBRARY_JOB_ALREADY_ACTIVE",
             Self::Candidate(MetadataCandidateError::Tmdb(_)) => "TMDB_UNAVAILABLE",
             Self::Candidate(MetadataCandidateError::InvalidSearch) => "INVALID_SEARCH",
             Self::Candidate(MetadataCandidateError::ItemNotFound) => "ITEM_NOT_FOUND",
@@ -845,6 +925,12 @@ impl fmt::Display for MetadataReidentifyError {
             }
             Self::JobNotCancelable => {
                 formatter.write_str("metadata reidentify job is not cancelable")
+            }
+            Self::LibraryJobAlreadyActive(job_id) => {
+                write!(
+                    formatter,
+                    "a full-library metadata job is already active: {job_id}"
+                )
             }
             Self::Candidate(error) => error.fmt(formatter),
             Self::Scraper(error) => error.fmt(formatter),
@@ -921,8 +1007,19 @@ mod tests {
 
     use super::{
         AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, MetadataCandidatePage, MetadataCandidateView,
-        best_automatic_candidate,
+        MetadataJobOwners, best_automatic_candidate,
     };
+
+    #[test]
+    fn metadata_job_owner_is_exclusive_and_released_on_drop() {
+        let owners = MetadataJobOwners::default();
+        let owner = owners.claim("job").expect("first owner should claim job");
+        assert!(owners.claim("job").is_none());
+
+        drop(owner);
+
+        assert!(owners.claim("job").is_some());
+    }
 
     fn candidate(id: &str, score: f64) -> MetadataCandidateView {
         MetadataCandidateView {
