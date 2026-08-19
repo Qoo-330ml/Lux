@@ -8877,6 +8877,29 @@ impl Database {
         })
     }
 
+    pub(crate) async fn update_local_provider_ids_for_identity_if_empty(
+        &self,
+        identity_key: &str,
+        provider_ids_json: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_items
+             SET provider_ids_json = ?
+             WHERE identity_key = ? AND item_type = 'SERIES'
+               AND removed_at IS NULL
+               AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
+        )
+        .bind(provider_ids_json)
+        .bind(identity_key)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn insert_media_source(
         &self,
         source: NewMediaSource<'_>,
