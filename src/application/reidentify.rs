@@ -581,7 +581,7 @@ impl MetadataReidentifyService {
     ) -> Result<i64, MetadataReidentifyError> {
         let page = self
             .candidates
-            .search_and_store(
+            .search_and_store_for_automatic_match(
                 item_id,
                 &item.title,
                 item.production_year

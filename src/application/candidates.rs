@@ -108,6 +108,29 @@ impl MetadataCandidateService {
         year: Option<i32>,
         tmdb: &TmdbProvider,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_with_mode(item_id, query, year, tmdb, CandidateSearchMode::Manual)
+            .await
+    }
+
+    pub async fn search_and_store_for_automatic_match(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        tmdb: &TmdbProvider,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_with_mode(item_id, query, year, tmdb, CandidateSearchMode::Automatic)
+            .await
+    }
+
+    async fn search_and_store_with_mode(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        tmdb: &TmdbProvider,
+        mode: CandidateSearchMode,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let current = self
             .database
             .find_media_item_metadata(item_id)
@@ -148,7 +171,7 @@ impl MetadataCandidateService {
                 year.is_none_or(|year| current.production_year == Some(i64::from(year)));
             same_title && same_year
         });
-        let response = if let Some(provider_id) = direct_provider_id.as_deref() {
+        let (response, direct_details) = if let Some(provider_id) = direct_provider_id.as_deref() {
             let details = tmdb
                 .get_generic(ScraperGetRequest::new(item_type, provider_id, "zh-CN"))
                 .await
@@ -157,32 +180,64 @@ impl MetadataCandidateService {
             provider_ids
                 .entry("Tmdb".to_owned())
                 .or_insert_with(|| provider_id.to_owned());
-            ScraperSearchResponse {
-                items: vec![ScraperSearchResult {
-                    item_type: details.item_type.clone(),
-                    title: details.title.clone(),
-                    original_title: details.original_title.clone(),
-                    overview: details.overview.clone(),
-                    production_year: details.production_year,
-                    premiere_date: details.premiere_date.clone(),
-                    original_language: details.original_language.clone(),
-                    provider_ids,
-                    ..ScraperSearchResult::default()
-                }],
-            }
+            (
+                ScraperSearchResponse {
+                    items: vec![ScraperSearchResult {
+                        item_type: details.item_type.clone(),
+                        title: details.title.clone(),
+                        original_title: details.original_title.clone(),
+                        overview: details.overview.clone(),
+                        production_year: details.production_year,
+                        premiere_date: details.premiere_date.clone(),
+                        original_language: details.original_language.clone(),
+                        provider_ids,
+                        ..ScraperSearchResult::default()
+                    }],
+                },
+                Some(details),
+            )
         } else {
-            search_generic(tmdb, item_type, query, year)
-                .await
-                .map_err(MetadataCandidateError::Scraper)?
+            (
+                search_generic(tmdb, item_type, query, year)
+                    .await
+                    .map_err(MetadataCandidateError::Scraper)?,
+                None,
+            )
         };
         let expires_at = candidate_expiry();
-        for result in response.items.into_iter().take(20) {
+        let results = response.items.into_iter().take(20).collect::<Vec<_>>();
+        let results = match mode {
+            CandidateSearchMode::Manual => results,
+            CandidateSearchMode::Automatic => results
+                .into_iter()
+                .max_by(|left, right| {
+                    metadata_match_score(
+                        &current.title,
+                        current.production_year,
+                        left.title.as_deref(),
+                        left.original_title.as_deref(),
+                        left.production_year,
+                    )
+                    .total_cmp(&metadata_match_score(
+                        &current.title,
+                        current.production_year,
+                        right.title.as_deref(),
+                        right.original_title.as_deref(),
+                        right.production_year,
+                    ))
+                })
+                .into_iter()
+                .collect(),
+        };
+        for result in results {
             let Some((provider, provider_id)) = tmdb.selected_provider_entry(&result) else {
                 continue;
             };
             let provider = provider.to_owned();
             let provider_id = provider_id.to_owned();
-            let details = if matches!(
+            let details = if direct_details.is_some() {
+                direct_details.clone()
+            } else if matches!(
                 item_type,
                 crate::application::scraper::ScraperItemType::Movie
                     | crate::application::scraper::ScraperItemType::Series
@@ -227,7 +282,9 @@ impl MetadataCandidateService {
                 crate::application::scraper::ScraperCreditsResponse::default()
             };
             let mut actors = generic_candidate_actors(&credits.cast);
-            enrich_actor_metadata(tmdb, &mut actors).await;
+            if matches!(mode, CandidateSearchMode::Manual) {
+                enrich_actor_metadata(tmdb, &mut actors).await;
+            }
             let mut provider_ids = details
                 .as_ref()
                 .map(|value| value.provider_ids.clone())
@@ -641,6 +698,12 @@ struct CandidateMetadata {
     images: BTreeMap<String, Vec<String>>,
     actors: Vec<ActorCredit>,
     score: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+enum CandidateSearchMode {
+    Manual,
+    Automatic,
 }
 
 struct ParentProvider {
