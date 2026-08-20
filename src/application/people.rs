@@ -16,7 +16,11 @@ use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+    time::{Duration, sleep},
+};
 use uuid::Uuid;
 
 use crate::application::metadata_paths::{
@@ -35,7 +39,7 @@ const PERSON_NFO: &str = "person.nfo";
 const PERSON_MANIFEST: &str = "person.json";
 const PERSON_IMAGE: &str = "folder";
 const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 3;
-const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
 const PENDING_PERSON_NFO: &str = "personNfo";
 const PENDING_PERSON_MANIFEST: &str = "personManifest";
@@ -241,11 +245,17 @@ struct StoredPersonIndex {
 #[serde(rename_all = "camelCase")]
 struct PersonManifest {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    generation: u64,
     lux_person_id: String,
     display_name: String,
     identities: Vec<PersonIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     person: Option<PersonMetadata>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    field_sources: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    locked_fields: BTreeSet<String>,
     checksum: String,
 }
 
@@ -687,6 +697,7 @@ impl PeopleService {
                     &person_dir,
                     person_key,
                     &actor.name,
+                    provider,
                     identities,
                     actor.person.as_ref(),
                 )
@@ -804,59 +815,73 @@ impl PeopleService {
         person_dir: &Path,
         lux_person_id: &str,
         display_name: &str,
+        source_provider: &str,
         identities: &[PersonIdentity],
         metadata: Option<&PersonMetadata>,
     ) -> Result<(), PeopleError> {
         let manifest_path = person_dir.join(PERSON_MANIFEST);
-        let existing = read_people_file(&manifest_path).await?;
-        let mut manifest = existing
-            .map(|bytes| {
-                serde_json::from_slice::<PersonManifest>(&bytes)
-                    .map_err(|source| PeopleError::Serialization(source.to_string()))
-            })
-            .transpose()?
-            .unwrap_or_default();
-        if !manifest.lux_person_id.is_empty() && manifest.lux_person_id != lux_person_id {
-            return Err(PeopleError::Serialization(
-                "person manifest identity does not match directory".to_owned(),
-            ));
-        }
-        manifest.schema_version = PERSON_MANIFEST_SCHEMA_VERSION;
-        manifest.lux_person_id = lux_person_id.to_owned();
-        if !display_name.trim().is_empty() {
-            manifest.display_name = display_name.trim().to_owned();
-        }
-        for identity in identities {
-            if !manifest
-                .identities
-                .iter()
-                .any(|existing| existing == identity)
-            {
-                manifest.identities.push(identity.clone());
+        acquire_person_manifest_lock(&manifest_path).await?;
+        let result = async {
+            let existing = read_people_file(&manifest_path).await?;
+            let mut manifest = existing
+                .map(|bytes| {
+                    serde_json::from_slice::<PersonManifest>(&bytes)
+                        .map_err(|source| PeopleError::Serialization(source.to_string()))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if !manifest.lux_person_id.is_empty() && manifest.lux_person_id != lux_person_id {
+                return Err(PeopleError::Serialization(
+                    "person manifest identity does not match directory".to_owned(),
+                ));
             }
+            manifest.schema_version = PERSON_MANIFEST_SCHEMA_VERSION;
+            manifest.generation = manifest.generation.saturating_add(1).max(1);
+            manifest.lux_person_id = lux_person_id.to_owned();
+            if !display_name.trim().is_empty() {
+                manifest.display_name = display_name.trim().to_owned();
+            }
+            for identity in identities {
+                if !manifest
+                    .identities
+                    .iter()
+                    .any(|existing| existing == identity)
+                {
+                    manifest.identities.push(identity.clone());
+                }
+            }
+            manifest.identities.sort_by(|left, right| {
+                left.provider
+                    .cmp(&right.provider)
+                    .then(left.id.cmp(&right.id))
+            });
+            if let Some(metadata) = metadata {
+                for field in person_metadata_fields(metadata) {
+                    manifest
+                        .field_sources
+                        .entry(field.to_owned())
+                        .or_insert_with(|| source_provider.to_owned());
+                }
+                manifest.person = Some(
+                    manifest
+                        .person
+                        .take()
+                        .map(|existing| existing.supplement_missing_from(metadata.clone()))
+                        .unwrap_or_else(|| metadata.clone()),
+                );
+            }
+            manifest.checksum.clear();
+            let checksum_source = serde_json::to_vec(&manifest)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            let digest = Sha256::digest(checksum_source);
+            manifest.checksum = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            let bytes = serde_json::to_vec_pretty(&manifest)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            write_atomically(&manifest_path, &bytes).await
         }
-        manifest.identities.sort_by(|left, right| {
-            left.provider
-                .cmp(&right.provider)
-                .then(left.id.cmp(&right.id))
-        });
-        if let Some(metadata) = metadata {
-            manifest.person = Some(
-                manifest
-                    .person
-                    .take()
-                    .map(|existing| existing.supplement_missing_from(metadata.clone()))
-                    .unwrap_or_else(|| metadata.clone()),
-            );
-        }
-        manifest.checksum.clear();
-        let checksum_source = serde_json::to_vec(&manifest)
-            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
-        let digest = Sha256::digest(checksum_source);
-        manifest.checksum = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        let bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
-        write_atomically(&manifest_path, &bytes).await
+        .await;
+        let _ = fs::remove_file(&manifest_path.with_file_name(".person.json.lock")).await;
+        result
     }
 
     pub async fn item_actor_relation_exists(&self, item_id: &str) -> Result<bool, PeopleError> {
@@ -1206,21 +1231,40 @@ impl PeopleService {
                 ) else {
                     continue;
                 };
-                let Some(source_locator) = database
+                let source_locator = database
                     .find_item_by_source_locator(source_root, source_relative_path)
                     .await
-                    .map_err(|error| PeopleError::Storage(error.to_string()))?
-                else {
-                    continue;
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                let source_locator = match source_locator {
+                    Some(locator) if relation_source_snapshot_matches(&relation, &locator) => {
+                        Some(locator)
+                    }
+                    Some(_) | None => {
+                        if let Some(fingerprint) = relation
+                            .media_fingerprint
+                            .as_deref()
+                            .and_then(decode_fingerprint)
+                        {
+                            let mut candidates = database
+                                .find_items_by_source_fingerprint(&fingerprint)
+                                .await
+                                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                            candidates.retain(|candidate| {
+                                relation_media_snapshot_matches(&relation, candidate)
+                            });
+                            (candidates.len() == 1).then(|| candidates.remove(0))
+                        } else {
+                            None
+                        }
+                    }
                 };
-                if !relation_source_snapshot_matches(&relation, &source_locator) {
+                let Some(source_locator) = source_locator else {
                     tracing::warn!(
                         path = %relation_path.display(),
-                        item_id = %source_locator.item_id,
-                        "skipping people relation for a changed media source"
+                        "skipping people relation without a unique matching media source"
                     );
                     continue;
-                }
+                };
                 let credits = relation
                     .actors
                     .iter()
@@ -2924,7 +2968,7 @@ fn valid_person_manifest(manifest: &PersonManifest) -> bool {
     let Some(sequence) = manifest.lux_person_id.strip_prefix("lux-") else {
         return false;
     };
-    if manifest.schema_version != PERSON_MANIFEST_SCHEMA_VERSION
+    if !matches!(manifest.schema_version, 1 | PERSON_MANIFEST_SCHEMA_VERSION)
         || sequence.len() < 6
         || !sequence.chars().all(|character| character.is_ascii_digit())
         || manifest.display_name.trim().is_empty()
@@ -2949,6 +2993,51 @@ fn valid_person_manifest(manifest: &PersonManifest) -> bool {
     actual == expected
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn person_metadata_fields(metadata: &PersonMetadata) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if metadata.biography.is_some() {
+        fields.push("biography");
+    }
+    if metadata.birthday.is_some() {
+        fields.push("birthday");
+    }
+    if metadata.deathday.is_some() {
+        fields.push("deathday");
+    }
+    if metadata.known_for_department.is_some() {
+        fields.push("knownForDepartment");
+    }
+    if metadata.place_of_birth.is_some() {
+        fields.push("placeOfBirth");
+    }
+    if !metadata.provider_ids.is_empty() {
+        fields.push("providerIds");
+    }
+    if !metadata.genres.is_empty() {
+        fields.push("genres");
+    }
+    if !metadata.tags.is_empty() {
+        fields.push("tags");
+    }
+    if !metadata.production_locations.is_empty() {
+        fields.push("productionLocations");
+    }
+    if metadata.premiere_date.is_some() {
+        fields.push("premiereDate");
+    }
+    if metadata.production_year.is_some() {
+        fields.push("productionYear");
+    }
+    if !metadata.taglines.is_empty() {
+        fields.push("taglines");
+    }
+    fields
+}
+
 fn stable_source_key(root_path: &str, relative_path: &str) -> String {
     let mut source = Vec::with_capacity(root_path.len() + relative_path.len() + 1);
     source.extend_from_slice(root_path.as_bytes());
@@ -2969,13 +3058,29 @@ fn relation_source_snapshot_matches(
     {
         return false;
     }
+    relation_media_snapshot_matches(relation, current)
+}
 
+fn relation_media_snapshot_matches(
+    relation: &StoredPeopleRelation,
+    current: &crate::storage::StoredItemSourceLocator,
+) -> bool {
     if let Some(expected_fingerprint) = relation.media_fingerprint.as_deref() {
-        return current
+        let matches = current
             .fingerprint
             .as_deref()
             .map(|fingerprint| encode_fingerprint(fingerprint) == expected_fingerprint)
             .unwrap_or(false);
+        if !matches {
+            return false;
+        }
+        if relation.media_title.as_deref().is_some_and(|title| {
+            normalize_person_match_text(title) != normalize_person_match_text(&current.title)
+        }) {
+            return false;
+        }
+        return relation.media_production_year.is_none()
+            || relation.media_production_year == current.production_year;
     }
 
     let Some(expected_size) = relation.media_size else {
@@ -3143,6 +3248,57 @@ async fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), PeopleError> 
     result
 }
 
+async fn acquire_person_manifest_lock(manifest_path: &Path) -> Result<(), PeopleError> {
+    let lock_path = manifest_path.with_file_name(".person.json.lock");
+    for _ in 0..100 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .await
+        {
+            Ok(mut file) => {
+                file.write_all(Uuid::now_v7().to_string().as_bytes())
+                    .await
+                    .map_err(|source| PeopleError::Io {
+                        path: lock_path.clone(),
+                        source,
+                    })?;
+                file.sync_all().await.map_err(|source| PeopleError::Io {
+                    path: lock_path.clone(),
+                    source,
+                })?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = safe_metadata(&lock_path)
+                    .await?
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(300));
+                if stale {
+                    let _ = fs::remove_file(&lock_path).await;
+                } else {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: lock_path,
+                    source,
+                });
+            }
+        }
+    }
+    Err(PeopleError::Io {
+        path: lock_path,
+        source: std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "person manifest lock could not be acquired",
+        ),
+    })
+}
+
 async fn restrict_permissions(path: &Path, directory: bool) -> Result<(), PeopleError> {
     #[cfg(unix)]
     {
@@ -3304,7 +3460,7 @@ mod tests {
             source_key: Some("old-source".to_owned()),
             source_root: Some("/library".to_owned()),
             source_relative_path: Some("movie.mkv".to_owned()),
-            media_fingerprint: Some("old-fingerprint".to_owned()),
+            media_fingerprint: Some(super::encode_fingerprint(b"old-fingerprint")),
             media_size: Some(100),
             media_modified_at: Some(10),
             media_title: Some("Old Movie".to_owned()),
@@ -3325,6 +3481,15 @@ mod tests {
         assert!(!super::relation_source_snapshot_matches(
             &relation, &current
         ));
+        assert!(!super::relation_media_snapshot_matches(&relation, &current));
+        let moved = crate::storage::StoredItemSourceLocator {
+            root_path: "/new-library".to_owned(),
+            relative_path: "renamed.mkv".to_owned(),
+            fingerprint: Some(b"old-fingerprint".to_vec()),
+            ..current
+        };
+        assert!(!super::relation_source_snapshot_matches(&relation, &moved));
+        assert!(super::relation_media_snapshot_matches(&relation, &moved));
     }
 
     #[tokio::test]
@@ -3364,6 +3529,9 @@ mod tests {
             .await;
         let person_dir = lux_person_directory(&config.config_dir, "华晨宇", &first_person)?;
         assert!(person_dir.join("person.json").exists());
+        let first_manifest: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(person_dir.join("person.json")).await?)?;
+        assert_eq!(first_manifest["generation"], 1);
 
         let previous_relation = super::StoredPeopleRelation {
             schema_version: 2,
@@ -3443,6 +3611,7 @@ mod tests {
             serde_json::from_slice(&tokio::fs::read(person_dir.join("person.json")).await?)?;
         assert_eq!(manifest["luxPersonId"], "lux-000001");
         assert_eq!(manifest["identities"].as_array().map(Vec::len), Some(2));
+        assert_eq!(manifest["generation"], 2);
         let nfo = tokio::fs::read_to_string(person_dir.join("person.nfo")).await?;
         assert!(nfo.contains("type=\"tmdb\">57975"));
         assert!(nfo.contains("type=\"douban\">1313123"));

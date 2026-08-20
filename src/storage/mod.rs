@@ -1240,6 +1240,45 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_items_by_source_fingerprint(
+        &self,
+        fingerprint: &[u8],
+    ) -> Result<Vec<StoredItemSourceLocator>, StorageError> {
+        self.query(
+            "SELECT ms.item_id, lr.canonical_path, fe.relative_path,
+                    fe.fingerprint, fe.size, fe.modified_at,
+                    mi.title, mi.production_year
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE fe.fingerprint = ?
+               AND mi.removed_at IS NULL AND fe.is_missing = 0
+             ORDER BY ms.is_default DESC, ms.id",
+        )
+        .bind(fingerprint)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredItemSourceLocator {
+                    item_id: row.get("item_id"),
+                    root_path: row.get("canonical_path"),
+                    relative_path: row.get("relative_path"),
+                    fingerprint: row.get("fingerprint"),
+                    size: row.get("size"),
+                    modified_at: row.get("modified_at"),
+                    title: row.get("title"),
+                    production_year: row.get("production_year"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_item_scraper_id(
         &self,
         item_id: &str,
@@ -1520,6 +1559,28 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        for (provider, provider_id) in identities {
+            let owner = self
+                .query_scalar::<String>(
+                    "SELECT person_id FROM person_identities
+                     WHERE provider = ? AND provider_id = ?",
+                )
+                .bind(provider)
+                .bind(provider_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if let Some(owner) = owner
+                && owner != person_id
+            {
+                return Err(StorageError::Conflict(format!(
+                    "provider identity '{provider}:{provider_id}' belongs to '{owner}'"
+                )));
+            }
+        }
         self.query(
             "INSERT INTO people (
                 id, display_name, directory_name, normalized_name, status, created_at, updated_at
@@ -14763,6 +14824,42 @@ mod tests {
             .await
             .expect("identity count");
         assert_eq!(identity_count, 2);
+    }
+
+    #[tokio::test]
+    async fn restoring_a_manifest_rejects_a_provider_identity_owned_by_another_person() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        database
+            .resolve_or_create_canonical_person(
+                "华晨宇",
+                "tmdb",
+                "57975",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await
+            .expect("first canonical person");
+
+        let error = database
+            .restore_canonical_person("lux-000002", "另一位演员", &[("tmdb", "57975")])
+            .await
+            .expect_err("conflicting manifest must be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        assert_eq!(
+            database
+                .find_canonical_person_by_identity("tmdb", "57975")
+                .await
+                .expect("identity lookup")
+                .expect("existing identity")
+                .id,
+            "lux-000001"
+        );
     }
 
     #[tokio::test]
