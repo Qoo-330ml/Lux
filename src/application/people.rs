@@ -448,6 +448,7 @@ impl PeopleService {
                 .as_ref()
                 .and_then(|person| person.birthday.as_deref())
                 .filter(|value| !value.trim().is_empty())
+            && birthday_parts(Some(incoming_birthday)).is_some_and(|(_, _, day)| day.is_some())
         {
             let candidates = database
                 .list_canonical_people_by_normalized_name(&normalize_person_match_text(&actor.name))
@@ -457,7 +458,8 @@ impl PeopleService {
                 .iter()
                 .filter(|candidate| {
                     candidate.birthdays.iter().any(|birthday| {
-                        birthdays_compatible(Some(incoming_birthday), Some(birthday))
+                        birthday_parts(Some(birthday)).is_some_and(|(_, _, day)| day.is_some())
+                            && birthdays_compatible(Some(incoming_birthday), Some(birthday))
                     })
                 })
                 .collect::<Vec<_>>();
@@ -4733,6 +4735,17 @@ mod tests {
             .await?
             .ok_or("legacy provider identity was not restored")?;
         assert_eq!(person.id, "lux-000001");
+        let next = database
+            .resolve_or_create_canonical_person(
+                "新人物",
+                "tmdb",
+                "57976",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"method":"test"}"#,
+            )
+            .await?;
+        assert_eq!(next.id, "lux-000002");
         let target = lux_person_directory(&config.config_dir, "旧人物", &person.id)?;
         assert!(target.join(super::PERSON_MANIFEST).exists());
         assert!(target.join(super::PERSON_NFO).exists());

@@ -2153,6 +2153,37 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
+        if let Some(sequence) = person_id
+            .strip_prefix("lux-")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            self.query(
+                "INSERT INTO person_id_sequence (id) VALUES (?)
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(sequence)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            if self.backend == DatabaseBackend::Postgres {
+                self.query(
+                    "SELECT setval(
+                        pg_get_serial_sequence('person_id_sequence', 'id'),
+                        COALESCE((SELECT MAX(id) FROM person_id_sequence), 1),
+                        true
+                    )",
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
         for (provider, provider_id) in identities {
             self.query(
                 "INSERT INTO person_identities (
