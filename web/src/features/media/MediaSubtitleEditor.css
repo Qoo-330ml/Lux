@@ -2,13 +2,13 @@
 .lux-subtitle-editor-body > .lux-muted-copy { margin: 0; }
 .lux-subtitle-list { display: grid; gap: 7px; }
 .lux-subtitle-option { display: flex; align-items: center; gap: 9px; min-height: 44px; padding: 0 12px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); background: rgba(255,255,255,.03); text-align: left; }
-.lux-subtitle-option:hover, .lux-subtitle-option.is-active { border-color: rgba(210,71,191,.48); color: #fff; background: rgba(210,71,191,.1); }
+.lux-subtitle-option:hover, .lux-subtitle-option.is-active { border-color: color-mix(in srgb, var(--lux-accent) 48%, transparent); color: #fff; background: color-mix(in srgb, var(--lux-accent) 10%, transparent); }
 .lux-subtitle-option span { min-width: 0; overflow: hidden; flex: 1; text-overflow: ellipsis; white-space: nowrap; }
 .lux-subtitle-option small { color: var(--lux-subtle); font-size: .68rem; }
 .lux-subtitle-form { display: grid; gap: 15px; padding-top: 4px; }
 .lux-subtitle-form > label { display: grid; gap: 7px; color: var(--lux-muted); font-size: .76rem; }
 .lux-subtitle-form input[type="text"], .lux-subtitle-form input:not([type]) { min-height: 42px; padding: 10px 12px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
-.lux-subtitle-form input:focus { border-color: rgba(210,71,191,.58); box-shadow: 0 0 0 3px rgba(210,71,191,.12); }
+.lux-subtitle-form input:focus { border-color: color-mix(in srgb, var(--lux-accent) 58%, var(--lux-line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--lux-accent) 12%, transparent); }
 .lux-subtitle-checks { display: flex; flex-wrap: wrap; gap: 18px; color: var(--lux-muted); font-size: .78rem; }
 .lux-subtitle-checks label { display: inline-flex; align-items: center; gap: 7px; }
 .lux-subtitle-checks input { accent-color: var(--lux-accent); }

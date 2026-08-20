@@ -141,10 +141,10 @@
 
 .lux-admin-plugin-category {
   padding: 4px 8px;
-  border: 1px solid rgba(210, 71, 191, .24);
+  border: 1px solid color-mix(in srgb, var(--lux-accent) 24%, transparent);
   border-radius: 999px;
-  color: #efb2e4;
-  background: rgba(210, 71, 191, .1);
+  color: color-mix(in srgb, var(--lux-accent) 70%, #fff);
+  background: color-mix(in srgb, var(--lux-accent) 10%, transparent);
   font-size: .68rem;
 }
 
@@ -387,7 +387,7 @@
   width: 17px;
   min-height: 17px;
   margin-top: 2px;
-  accent-color: #d247bf;
+  accent-color: var(--lux-accent);
 }
 
 .lux-admin-plugin-toggle span {
