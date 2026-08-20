@@ -484,7 +484,43 @@ impl PeopleService {
             let actor_provider = primary
                 .map(|identity| identity.provider.as_str())
                 .unwrap_or_default();
-            let bridge_person_key = same_media_bridge_person_key(previous_relation.as_ref(), actor);
+            let bridge_candidates = same_media_bridge_candidates(previous_relation.as_ref(), actor);
+            if bridge_candidates.len() > 1
+                && !identities.is_empty()
+                && let Some(database) = &self.database
+            {
+                let candidate_ids = bridge_candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.person_key.as_deref())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let evidence = serde_json::json!({
+                    "method": "same-media-ambiguous",
+                    "normalizedName": normalize_person_match_text(&actor.name),
+                    "candidateCount": candidate_ids.len(),
+                    "hasRole": actor.character.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                    "hasOrder": actor.order.is_some(),
+                    "hasBirthday": actor.person.as_ref().and_then(|person| person.birthday.as_deref()).is_some(),
+                });
+                let candidate_ids_json = serde_json::to_string(&candidate_ids)
+                    .map_err(|error| PeopleError::Serialization(error.to_string()))?;
+                if let Err(error) = database
+                    .enqueue_person_match_candidate(
+                        item_id,
+                        actor_provider,
+                        actor_id,
+                        &candidate_ids_json,
+                        Some(0.55),
+                        &evidence.to_string(),
+                    )
+                    .await
+                {
+                    tracing::warn!(item_id, person_id = actor_id, %error, "could not persist ambiguous person match");
+                }
+            }
+            let bridge_person_key = (bridge_candidates.len() == 1)
+                .then(|| bridge_candidates[0].person_key.as_deref())
+                .flatten();
             let person_key = self
                 .resolve_person_key(actor, &identities, bridge_person_key)
                 .await?;
@@ -2880,13 +2916,15 @@ fn actor_identities(actor: &ActorCredit, fallback_provider: &str) -> Vec<PersonI
     identities
 }
 
-fn same_media_bridge_person_key<'a>(
+fn same_media_bridge_candidates<'a>(
     relation: Option<&'a StoredPeopleRelation>,
     actor: &ActorCredit,
-) -> Option<&'a str> {
-    let relation = relation?;
+) -> Vec<&'a StoredActor> {
+    let Some(relation) = relation else {
+        return Vec::new();
+    };
     let name = normalize_person_match_text(&actor.name);
-    let candidates = relation
+    relation
         .actors
         .iter()
         .filter(|previous| {
@@ -2928,8 +2966,7 @@ fn same_media_bridge_person_key<'a>(
                     .is_some_and(|value| !value.trim().is_empty())
                 || actor.order.is_some() && previous.order.is_some()
         })
-        .collect::<Vec<_>>();
-    (candidates.len() == 1).then(|| candidates[0].person_key.as_deref())?
+        .collect::<Vec<_>>()
 }
 
 fn normalize_person_match_text(value: &str) -> String {
@@ -3570,9 +3607,12 @@ mod tests {
             person: None,
         };
         let bridge_identities = super::actor_identities(&bridge_actor, "douban");
-        let bridge_key =
-            super::same_media_bridge_person_key(Some(&previous_relation), &bridge_actor)
-                .ok_or("same-media bridge was not selected")?;
+        let bridge_candidates =
+            super::same_media_bridge_candidates(Some(&previous_relation), &bridge_actor);
+        let bridge_key = bridge_candidates
+            .first()
+            .and_then(|candidate| candidate.person_key.as_deref())
+            .ok_or("same-media bridge was not selected")?;
         let bridged_person = service
             .resolve_person_key(&bridge_actor, &bridge_identities, Some(bridge_key))
             .await?

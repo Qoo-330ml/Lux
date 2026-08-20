@@ -1544,6 +1544,46 @@ impl Database {
         })
     }
 
+    pub(crate) async fn enqueue_person_match_candidate(
+        &self,
+        item_id: &str,
+        provider: &str,
+        provider_id: &str,
+        candidate_person_ids_json: &str,
+        score: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<(), StorageError> {
+        let now = current_unix_timestamp();
+        self.query(
+            "INSERT INTO person_match_candidates (
+                id, item_id, provider, provider_id, candidate_person_ids_json,
+                status, score, evidence_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
+             ON CONFLICT(item_id, provider, provider_id) DO UPDATE SET
+                candidate_person_ids_json = excluded.candidate_person_ids_json,
+                status = 'PENDING',
+                score = excluded.score,
+                evidence_json = excluded.evidence_json,
+                updated_at = excluded.updated_at",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(item_id)
+        .bind(provider)
+        .bind(provider_id)
+        .bind(candidate_person_ids_json)
+        .bind(score)
+        .bind(evidence_json)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn restore_canonical_person(
         &self,
         person_id: &str,
@@ -14860,6 +14900,63 @@ mod tests {
                 .id,
             "lux-000001"
         );
+    }
+
+    #[tokio::test]
+    async fn person_match_candidates_are_persistent_and_idempotent() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-1', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        database
+            .enqueue_person_match_candidate(
+                "item-1",
+                "douban",
+                "1313123",
+                r#"["lux-000001","lux-000002"]"#,
+                Some(0.62),
+                r#"{"method":"same-media-ambiguous"}"#,
+            )
+            .await
+            .expect("first candidate");
+        database
+            .enqueue_person_match_candidate(
+                "item-1",
+                "douban",
+                "1313123",
+                r#"["lux-000002","lux-000001"]"#,
+                Some(0.65),
+                r#"{"method":"same-media-ambiguous","retry":true}"#,
+            )
+            .await
+            .expect("idempotent candidate update");
+
+        let (count, status, score): (i64, String, f64) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(status), MAX(score)
+             FROM person_match_candidates
+             WHERE item_id = 'item-1' AND provider = 'douban' AND provider_id = '1313123'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("candidate row");
+        assert_eq!(count, 1);
+        assert_eq!(status, "PENDING");
+        assert_eq!(score, 0.65);
     }
 
     #[tokio::test]
