@@ -2822,6 +2822,13 @@ fn same_media_bridge_person_key<'a>(
                     (Some(current), Some(previous)) => current == previous,
                     _ => true,
                 }
+                && birthdays_compatible(
+                    actor.person.as_ref().and_then(|person| person.birthday.as_deref()),
+                    previous
+                        .person
+                        .as_ref()
+                        .and_then(|person| person.birthday.as_deref()),
+                )
         })
         .filter(|previous| {
             actor
@@ -2845,6 +2852,29 @@ fn normalize_person_match_text(value: &str) -> String {
         .filter(|character| !character.is_whitespace())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn birthdays_compatible(current: Option<&str>, previous: Option<&str>) -> bool {
+    match (full_birthday(current), full_birthday(previous)) {
+        (Some(current), Some(previous)) => current == previous,
+        _ => true,
+    }
+}
+
+fn full_birthday(value: Option<&str>) -> Option<(u32, u32, u32)> {
+    let value = value?.trim();
+    let components = value
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components.len() != 3 {
+        return None;
+    }
+    Some((
+        components[0].parse().ok()?,
+        components[1].parse().ok()?,
+        components[2].parse().ok()?,
+    ))
 }
 
 fn valid_person_manifest(manifest: &PersonManifest) -> bool {
@@ -3166,6 +3196,19 @@ mod tests {
         0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
         0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
+
+    #[test]
+    fn birthday_matching_accepts_format_variants_but_rejects_full_date_conflicts() {
+        assert!(super::birthdays_compatible(
+            Some("1990-01-02"),
+            Some("1990年1月2日")
+        ));
+        assert!(!super::birthdays_compatible(
+            Some("1990-01-02"),
+            Some("1991-01-02")
+        ));
+        assert!(super::birthdays_compatible(Some("1990-01"), Some("1990-01-02")));
+    }
 
     #[tokio::test]
     async fn database_backed_people_reuse_lux_id_when_provider_changes()
