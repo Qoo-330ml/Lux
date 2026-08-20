@@ -29,7 +29,7 @@ use crate::{
 };
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
-const METADATA_GLOBAL_WORKER_LIMIT: usize = 8;
+const METADATA_GLOBAL_WORKER_LIMIT: usize = 4;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
@@ -414,10 +414,11 @@ impl MetadataReidentifyService {
         let mut workers = JoinSet::new();
         let mut last_concurrency = None;
         loop {
-            let concurrency = self
-                .resources
-                .background_concurrency(METADATA_MATCH_CONCURRENCY)
-                .await;
+            let concurrency = metadata_worker_concurrency(
+                self.resources
+                    .background_concurrency(METADATA_MATCH_CONCURRENCY)
+                    .await,
+            );
             if last_concurrency != Some(concurrency) {
                 tracing::info!(
                     job_id,
@@ -634,6 +635,14 @@ impl MetadataReidentifyService {
             }
             Err(error) => {
                 let code = error.code();
+                let detail = safe_metadata_error_detail(&error);
+                tracing::warn!(
+                    job_id,
+                    item_id,
+                    error_code = code,
+                    error_detail = %detail,
+                    "metadata refresh item failed"
+                );
                 if self
                     .database
                     .finish_metadata_reidentify_item(job_id, item_id, "FAILED", 0, Some(code))
@@ -1001,14 +1010,59 @@ fn metadata_reidentify_item(item: StoredMetadataReidentifyItem) -> MetadataReide
     }
 }
 
+fn safe_metadata_error_detail(error: &MetadataReidentifyError) -> String {
+    safe_metadata_error_text(&error.to_string())
+}
+
+fn metadata_worker_concurrency(recommended: usize) -> usize {
+    recommended.clamp(1, METADATA_GLOBAL_WORKER_LIMIT)
+}
+
+fn safe_metadata_error_text(detail: &str) -> String {
+    let redacted = detail
+        .split_whitespace()
+        .map(|token| {
+            if token.contains("://") {
+                "<external-url>"
+            } else if token.contains("/media/") || token.contains("/config/") {
+                "<local-path>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    redacted.chars().take(512).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
 
     use super::{
         AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, MetadataCandidatePage, MetadataCandidateView,
-        MetadataJobOwners, best_automatic_candidate,
+        MetadataJobOwners, best_automatic_candidate, metadata_worker_concurrency,
+        safe_metadata_error_detail,
     };
+
+    #[test]
+    fn metadata_error_details_redact_urls_and_local_paths() {
+        let error = super::MetadataReidentifyError::InvalidSearch;
+        let detail = safe_metadata_error_detail(&error);
+        assert_eq!(detail, "metadata reidentify search is invalid");
+
+        let redacted = super::safe_metadata_error_text(
+            "download https://example.test/image.jpg?token=secret /media/library/poster.jpg",
+        );
+        assert_eq!(redacted, "download <external-url> <local-path>");
+    }
+
+    #[test]
+    fn metadata_worker_concurrency_leaves_capacity_for_foreground_requests() {
+        assert_eq!(metadata_worker_concurrency(16), 4);
+        assert_eq!(metadata_worker_concurrency(2), 2);
+        assert_eq!(metadata_worker_concurrency(0), 1);
+    }
 
     #[test]
     fn metadata_job_owner_is_exclusive_and_released_on_drop() {
