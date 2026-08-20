@@ -1594,6 +1594,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 
 /* Account settings */
 .lux-account-page { --lux-settings-surface: rgba(20,20,24,.72); --lux-settings-line: var(--lux-line-soft); --lux-account-settings-gap: clamp(28px, 5vw, 84px); }
+.lux-account-page .lux-button { min-height: 36px; font-size: .72rem; }
 .lux-account-page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-right: 0; margin-bottom: 42px; }
 .lux-account-page-heading h1 { margin: 10px 0 8px; color: var(--lux-text); font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.075em; }
 .lux-account-page-heading p { margin: 0; color: var(--lux-muted); }
@@ -1686,15 +1687,13 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-settings-avatar-large { width: 68px; height: 68px; font-size: 1.4rem; }
 .lux-account-avatar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .lux-upload-button { display: inline-flex; align-items: center; min-height: 33px; margin-top: 10px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-settings-line); border-radius: 7px; color: var(--lux-text); background: rgba(255,255,255,.06); font-size: .72rem; cursor: pointer; transition: background .2s ease, border-color .2s ease; }
-.lux-account-avatar-actions .lux-upload-button { margin-top: 0; }
-.lux-account-avatar-actions .lux-button { min-height: 33px; font-size: .72rem; }
+.lux-account-avatar-actions .lux-upload-button { margin-top: 0; min-height: 36px; }
 .lux-upload-button:hover { border-color: rgba(255,255,255,.38); background: rgba(255,255,255,.1); }
 .lux-upload-button input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
 .lux-account-form-grid { padding-top: 4px; }
 .lux-password-panel { margin-top: 5px; padding: 17px; border: 1px solid var(--lux-settings-line); border-radius: 10px; background: rgba(255,255,255,.025); }
 .lux-password-panel > .lux-setting-block-heading > svg { flex: 0 0 auto; color: var(--lux-subtle); }
 .lux-password-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); padding-bottom: 5px; }
-.lux-account-password-button { min-height: 37px; font-size: .73rem; }
 .lux-account-notice { margin: 12px 0 0; color: #f3c788; font-size: .72rem; line-height: 1.5; }
 .lux-account-footer-card { display: grid; grid-template-columns: 1fr 1fr auto; align-items: center; gap: 12px; margin-top: 4px; padding: 16px 18px; border: 1px solid var(--lux-settings-line); border-radius: 12px; color: var(--lux-muted); background: rgba(20,20,24,.54); }
 .lux-account-footer-card > div { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -1702,7 +1701,6 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-account-footer-card strong, .lux-account-footer-card span { display: block; }
 .lux-account-footer-card strong { color: var(--lux-text); font-size: .75rem; font-weight: 550; }
 .lux-account-footer-card span { margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
-.lux-account-footer-card .lux-button { min-height: 36px; font-size: .72rem; }
 
 html[data-lux-theme="light"] { color-scheme: light; --lux-bg: #f4f3f1; --lux-surface: rgba(255,255,255,.9); --lux-surface-strong: #fff; --lux-line: rgba(28,28,34,.22); --lux-line-soft: rgba(28,28,34,.13); --lux-text: #25252a; --lux-muted: #55565e; --lux-subtle: #6c6d75; }
 html[data-lux-theme="light"] .lux-select-trigger { border-color: var(--lux-line-soft); color: var(--lux-text); background: rgba(28,28,34,.035); }
