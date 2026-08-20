@@ -1166,20 +1166,34 @@ impl Database {
     pub(crate) async fn find_item_source_locator(
         &self,
         item_id: &str,
-    ) -> Result<Option<(String, String)>, StorageError> {
+    ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
         self.query(
-            "SELECT lr.canonical_path, fe.relative_path
+            "SELECT ms.item_id, lr.canonical_path, fe.relative_path,
+                    fe.fingerprint, fe.size, fe.modified_at,
+                    mi.title, mi.production_year
              FROM media_sources ms
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
-             WHERE ms.item_id = ? AND fe.is_missing = 0
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE ms.item_id = ? AND mi.removed_at IS NULL AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id
              LIMIT 1",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(|row| (row.get("canonical_path"), row.get("relative_path"))))
+        .map(|row| {
+            row.map(|row| StoredItemSourceLocator {
+                item_id: row.get("item_id"),
+                root_path: row.get("canonical_path"),
+                relative_path: row.get("relative_path"),
+                fingerprint: row.get("fingerprint"),
+                size: row.get("size"),
+                modified_at: row.get("modified_at"),
+                title: row.get("title"),
+                production_year: row.get("production_year"),
+            })
+        })
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -1190,14 +1204,17 @@ impl Database {
         &self,
         root_path: &str,
         relative_path: &str,
-    ) -> Result<Option<String>, StorageError> {
-        self.query_scalar(
-            "SELECT ms.item_id
+    ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
+        self.query(
+            "SELECT ms.item_id, lr.canonical_path, fe.relative_path,
+                    fe.fingerprint, fe.size, fe.modified_at,
+                    mi.title, mi.production_year
              FROM media_sources ms
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
+             JOIN media_items mi ON mi.id = ms.item_id
              WHERE lr.canonical_path = ? AND fe.relative_path = ?
-               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id
              LIMIT 1",
         )
@@ -1205,6 +1222,18 @@ impl Database {
         .bind(relative_path)
         .fetch_optional(&self.pool)
         .await
+        .map(|row| {
+            row.map(|row| StoredItemSourceLocator {
+                item_id: row.get("item_id"),
+                root_path: row.get("canonical_path"),
+                relative_path: row.get("relative_path"),
+                fingerprint: row.get("fingerprint"),
+                size: row.get("size"),
+                modified_at: row.get("modified_at"),
+                title: row.get("title"),
+                production_year: row.get("production_year"),
+            })
+        })
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -13136,6 +13165,18 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) item_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredItemSourceLocator {
+    pub(crate) item_id: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+    pub(crate) fingerprint: Option<Vec<u8>>,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) title: String,
+    pub(crate) production_year: Option<i32>,
 }
 
 #[derive(Debug)]

@@ -34,7 +34,7 @@ const LEGACY_PROFILES_DIR: &str = "profiles";
 const PERSON_NFO: &str = "person.nfo";
 const PERSON_MANIFEST: &str = "person.json";
 const PERSON_IMAGE: &str = "folder";
-const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 2;
+const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 3;
 const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
 const PENDING_PERSON_NFO: &str = "personNfo";
@@ -204,6 +204,16 @@ struct StoredPeopleRelation {
     source_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_modified_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_production_year: Option<i32>,
     #[serde(default)]
     actors: Vec<StoredActor>,
 }
@@ -524,9 +534,23 @@ impl PeopleService {
             item_id: Some(item_id.to_owned()),
             source_key: source_locator
                 .as_ref()
-                .map(|(root, relative)| stable_source_key(root, relative)),
-            source_root: source_locator.as_ref().map(|(root, _)| root.clone()),
-            source_relative_path: source_locator.map(|(_, relative)| relative),
+                .map(|locator| stable_source_key(&locator.root_path, &locator.relative_path)),
+            source_root: source_locator
+                .as_ref()
+                .map(|locator| locator.root_path.clone()),
+            source_relative_path: source_locator
+                .as_ref()
+                .map(|locator| locator.relative_path.clone()),
+            media_fingerprint: source_locator
+                .as_ref()
+                .and_then(|locator| locator.fingerprint.as_deref())
+                .map(encode_fingerprint),
+            media_size: source_locator.as_ref().map(|locator| locator.size),
+            media_modified_at: source_locator.as_ref().map(|locator| locator.modified_at),
+            media_title: source_locator.as_ref().map(|locator| locator.title.clone()),
+            media_production_year: source_locator
+                .as_ref()
+                .and_then(|locator| locator.production_year),
             actors: stored,
         };
         let bytes = serde_json::to_vec_pretty(&relation)
@@ -1182,13 +1206,21 @@ impl PeopleService {
                 ) else {
                     continue;
                 };
-                let Some(item_id) = database
+                let Some(source_locator) = database
                     .find_item_by_source_locator(source_root, source_relative_path)
                     .await
                     .map_err(|error| PeopleError::Storage(error.to_string()))?
                 else {
                     continue;
                 };
+                if !relation_source_snapshot_matches(&relation, &source_locator) {
+                    tracing::warn!(
+                        path = %relation_path.display(),
+                        item_id = %source_locator.item_id,
+                        "skipping people relation for a changed media source"
+                    );
+                    continue;
+                }
                 let credits = relation
                     .actors
                     .iter()
@@ -1197,7 +1229,7 @@ impl PeopleService {
                     .map(person_credit_from_stored_actor)
                     .collect::<Vec<_>>();
                 database
-                    .replace_person_credits(&item_id, &credits)
+                    .replace_person_credits(&source_locator.item_id, &credits)
                     .await
                     .map_err(|error| PeopleError::Storage(error.to_string()))?;
                 restored += 1;
@@ -2141,6 +2173,11 @@ fn parse_relation(bytes: &[u8]) -> Result<StoredPeopleRelation, PeopleError> {
             source_key: None,
             source_root: None,
             source_relative_path: None,
+            media_fingerprint: None,
+            media_size: None,
+            media_modified_at: None,
+            media_title: None,
+            media_production_year: None,
             actors,
         });
     }
@@ -2923,6 +2960,42 @@ fn stable_source_key(root_path: &str, relative_path: &str) -> String {
         .collect()
 }
 
+fn relation_source_snapshot_matches(
+    relation: &StoredPeopleRelation,
+    current: &crate::storage::StoredItemSourceLocator,
+) -> bool {
+    if relation.source_root.as_deref() != Some(current.root_path.as_str())
+        || relation.source_relative_path.as_deref() != Some(current.relative_path.as_str())
+    {
+        return false;
+    }
+
+    if let Some(expected_fingerprint) = relation.media_fingerprint.as_deref() {
+        return current
+            .fingerprint
+            .as_deref()
+            .map(|fingerprint| encode_fingerprint(fingerprint) == expected_fingerprint)
+            .unwrap_or(false);
+    }
+
+    let Some(expected_size) = relation.media_size else {
+        return false;
+    };
+    let Some(expected_modified_at) = relation.media_modified_at else {
+        return false;
+    };
+    if expected_size != current.size || expected_modified_at != current.modified_at {
+        return false;
+    }
+    if relation.media_title.as_deref().is_some_and(|title| {
+        normalize_person_match_text(title) != normalize_person_match_text(&current.title)
+    }) {
+        return false;
+    }
+    relation.media_production_year.is_none()
+        || relation.media_production_year == current.production_year
+}
+
 fn person_key_for_identities(identities: &[PersonIdentity]) -> Option<String> {
     if identities.is_empty() {
         return None;
@@ -3222,6 +3295,38 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn relation_restore_rejects_a_replaced_file_at_the_same_path() {
+        let relation = super::StoredPeopleRelation {
+            schema_version: 3,
+            source_fingerprint: None,
+            item_id: Some("old-item".to_owned()),
+            source_key: Some("old-source".to_owned()),
+            source_root: Some("/library".to_owned()),
+            source_relative_path: Some("movie.mkv".to_owned()),
+            media_fingerprint: Some("old-fingerprint".to_owned()),
+            media_size: Some(100),
+            media_modified_at: Some(10),
+            media_title: Some("Old Movie".to_owned()),
+            media_production_year: Some(2020),
+            actors: Vec::new(),
+        };
+        let current = crate::storage::StoredItemSourceLocator {
+            item_id: "new-item".to_owned(),
+            root_path: "/library".to_owned(),
+            relative_path: "movie.mkv".to_owned(),
+            fingerprint: Some(b"new-fingerprint".to_vec()),
+            size: 100,
+            modified_at: 10,
+            title: "Old Movie".to_owned(),
+            production_year: Some(2020),
+        };
+
+        assert!(!super::relation_source_snapshot_matches(
+            &relation, &current
+        ));
+    }
+
     #[tokio::test]
     async fn database_backed_people_reuse_lux_id_when_provider_changes()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3267,6 +3372,11 @@ mod tests {
             source_key: None,
             source_root: None,
             source_relative_path: None,
+            media_fingerprint: None,
+            media_size: None,
+            media_modified_at: None,
+            media_title: None,
+            media_production_year: None,
             actors: vec![super::StoredActor {
                 id: Some("57975".to_owned()),
                 name: "华晨宇".to_owned(),
@@ -3405,7 +3515,7 @@ mod tests {
         let relation = library_item_directory(config.path(), "item-1")?.join("people.json");
         let relation: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(relation).await?)?;
-        assert_eq!(relation["schemaVersion"], 2);
+        assert_eq!(relation["schemaVersion"], 3);
         assert_eq!(relation["actors"][0]["provider"], "tmdb");
         assert_eq!(relation["actors"][0]["imageFile"], "folder.png");
 
