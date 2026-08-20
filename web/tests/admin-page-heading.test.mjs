@@ -8,9 +8,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const styles = readFileSync(resolve(here, "../src/react.css"), "utf8");
 
 test("admin page headers hide title copy visually while keeping page names accessible", () => {
-  const titleRule = styles.match(/\.lux-admin-page-heading\s*>\s*div\s*\{([^}]*)\}/)?.[1] ?? "";
+  const titleRule = styles.match(/\.lux-admin-page-heading\s*>\s*div:first-child\s*\{([^}]*)\}/)?.[1] ?? "";
   const headingRule = styles.match(/\.lux-admin-page-heading\s*\{([^}]*)\}/)?.[1] ?? "";
-  const emptyHeadingRule = styles.match(/\.lux-admin-page-heading:not\(:has\(> \.lux-button\)\)\s*\{([^}]*)\}/)?.[1] ?? "";
+  const emptyHeadingRule = styles.match(/\.lux-admin-page-heading:not\(:has\(> \.lux-button, > \.lux-admin-plugin-heading-actions\)\)\s*\{([^}]*)\}/)?.[1] ?? "";
   const operationsTitleRule = styles.match(/\.lux-operations-heading\s*>\s*div\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(titleRule, /position:\s*absolute/);

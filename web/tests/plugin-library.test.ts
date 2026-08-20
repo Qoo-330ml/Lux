@@ -12,6 +12,7 @@ import { api } from "../src/lib/api/client";
 import type { AdminPlugin } from "../src/lib/api/types";
 
 const pluginLibraryCss = readFileSync(resolve(process.cwd(), "src/features/admin/plugin-library.css"), "utf8");
+const reactCss = readFileSync(resolve(process.cwd(), "src/react.css"), "utf8");
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -133,6 +134,23 @@ describe("AdminPluginsPage plugin cards", () => {
       dialog?.querySelector<HTMLButtonElement>('[aria-label="关闭插件商店来源设置"]')?.click();
     });
     expect(container.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("keeps the plugin heading actions visible instead of clipping them", async () => {
+    await renderPage();
+
+    const style = document.createElement("style");
+    style.textContent = reactCss;
+    document.head.append(style);
+
+    try {
+      const actions = container.querySelector<HTMLElement>(".lux-admin-plugin-heading-actions");
+      expect(actions).toBeTruthy();
+      expect(getComputedStyle(actions!).position).not.toBe("absolute");
+      expect(getComputedStyle(actions!).width).not.toBe("1px");
+    } finally {
+      style.remove();
+    }
   });
 
   it("lays out plugin cards two per row on desktop", async () => {

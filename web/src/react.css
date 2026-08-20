@@ -708,8 +708,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-content { width: 100%; padding: 0 0 90px clamp(28px, 5vw, 84px); }
 .lux-admin-page { width: 100%; }
 .lux-admin-page-heading { display: flex; align-items: flex-end; justify-content: flex-end; gap: 24px; margin-bottom: 28px; }
-.lux-admin-page-heading > div { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
-.lux-admin-page-heading:not(:has(> .lux-button)) { height: 0; margin-bottom: 0; }
+.lux-admin-page-heading > div:first-child { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+.lux-admin-page-heading:not(:has(> .lux-button, > .lux-admin-plugin-heading-actions)) { height: 0; margin-bottom: 0; }
 .lux-admin-page-heading h1 { margin: 10px 0 8px; color: #fff; font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.075em; }
 .lux-admin-page-heading p { margin: 0; color: var(--lux-muted); }
 .lux-admin-dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(310px, .95fr); gap: 0; margin-top: 28px; border-bottom: 1px solid var(--lux-line-soft); }
