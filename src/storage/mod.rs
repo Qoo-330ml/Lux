@@ -1544,6 +1544,20 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_canonical_person_display_name(
+        &self,
+        person_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar::<String>("SELECT display_name FROM people WHERE id = ?")
+            .bind(person_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn enqueue_person_match_candidate(
         &self,
         item_id: &str,
@@ -1582,6 +1596,372 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn count_pending_person_match_candidates(&self) -> Result<i64, StorageError> {
+        self.query_scalar("SELECT COUNT(*) FROM person_match_candidates WHERE status = 'PENDING'")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_pending_person_match_candidates(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredPersonMatchCandidate>, StorageError> {
+        self.query(
+            "SELECT id, item_id, provider, provider_id,
+                    candidate_person_ids_json, status, score,
+                    evidence_json, created_at, updated_at
+             FROM person_match_candidates
+             WHERE status = 'PENDING'
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(stored_person_match_candidate)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_person_match_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<Option<StoredPersonMatchCandidate>, StorageError> {
+        self.query(
+            "SELECT id, item_id, provider, provider_id,
+                    candidate_person_ids_json, status, score,
+                    evidence_json, created_at, updated_at
+             FROM person_match_candidates WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_person_match_candidate))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn reject_person_match_candidate(
+        &self,
+        candidate_id: &str,
+        evidence_json: &str,
+    ) -> Result<(), StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_match_candidates
+                 SET status = 'REJECTED', evidence_json = ?, updated_at = ?
+                 WHERE id = ? AND status = 'PENDING'",
+            )
+            .bind(evidence_json)
+            .bind(current_unix_timestamp())
+            .bind(candidate_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if result.rows_affected() == 0 {
+            return Err(StorageError::Conflict(format!(
+                "person match candidate '{candidate_id}' is missing or not pending"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn confirm_person_match_candidate(
+        &self,
+        candidate_id: &str,
+        target_person_id: &str,
+        evidence_json: &str,
+    ) -> Result<StoredPersonIdentityMove, StorageError> {
+        let now = current_unix_timestamp();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let candidate = self
+            .query(
+                "SELECT id, item_id, provider, provider_id,
+                        candidate_person_ids_json, status, score,
+                        evidence_json, created_at, updated_at
+                 FROM person_match_candidates WHERE id = ?",
+            )
+            .bind(candidate_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .map(stored_person_match_candidate)
+            .ok_or_else(|| {
+                StorageError::Conflict(format!("person match candidate '{candidate_id}' not found"))
+            })?;
+        if candidate.status != "PENDING" {
+            return Err(StorageError::Conflict(format!(
+                "person match candidate '{candidate_id}' is {}",
+                candidate.status
+            )));
+        }
+        let candidate_person_ids =
+            serde_json::from_str::<Vec<String>>(&candidate.candidate_person_ids_json)
+                .map_err(|source| StorageError::Serialization(source.to_string()))?;
+        if !candidate_person_ids
+            .iter()
+            .any(|person_id| person_id == target_person_id)
+        {
+            return Err(StorageError::Conflict(
+                "selected person is not one of the candidate matches".to_owned(),
+            ));
+        }
+        let target_exists = self
+            .query_scalar::<String>("SELECT id FROM people WHERE id = ?")
+            .bind(target_person_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if !target_exists {
+            return Err(StorageError::Conflict(format!(
+                "canonical person '{target_person_id}' does not exist"
+            )));
+        }
+        let previous_person_id = self
+            .query_scalar::<String>(
+                "SELECT person_id FROM person_identities
+                 WHERE provider = ? AND provider_id = ?",
+            )
+            .bind(&candidate.provider)
+            .bind(&candidate.provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if previous_person_id.as_deref() != Some(target_person_id) {
+            self.query(
+                "DELETE FROM person_identities
+                 WHERE provider = ? AND provider_id = ?",
+            )
+            .bind(&candidate.provider)
+            .bind(&candidate.provider_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "INSERT INTO person_identities (
+                    person_id, provider, provider_id, match_method, confidence,
+                    evidence_json, created_at, updated_at
+                 ) VALUES (?, ?, ?, 'MANUAL_CONFIRM', ?, ?, ?, ?)",
+            )
+            .bind(target_person_id)
+            .bind(&candidate.provider)
+            .bind(&candidate.provider_id)
+            .bind(Some(1.0_f64))
+            .bind(evidence_json)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE person_credits SET lux_person_id = ?
+                 WHERE provider = ? AND person_id = ?",
+            )
+            .bind(target_person_id)
+            .bind(&candidate.provider)
+            .bind(&candidate.provider_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        self.query(
+            "UPDATE person_match_candidates
+             SET status = 'CONFIRMED', evidence_json = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(evidence_json)
+        .bind(now)
+        .bind(candidate_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(StoredPersonIdentityMove { previous_person_id })
+    }
+
+    pub(crate) async fn split_canonical_person_identity(
+        &self,
+        source_person_id: &str,
+        provider: &str,
+        provider_id: &str,
+        display_name: &str,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        let now = current_unix_timestamp();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let owner = self
+            .query_scalar::<String>(
+                "SELECT person_id FROM person_identities
+                 WHERE provider = ? AND provider_id = ?",
+            )
+            .bind(provider)
+            .bind(provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .ok_or_else(|| {
+                StorageError::Conflict(format!(
+                    "provider identity '{provider}:{provider_id}' does not exist"
+                ))
+            })?;
+        if owner != source_person_id {
+            return Err(StorageError::Conflict(format!(
+                "provider identity '{provider}:{provider_id}' belongs to '{owner}'"
+            )));
+        }
+        let new_person_id = loop {
+            let sequence: i64 = self
+                .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let candidate = format!("lux-{sequence:06}");
+            let exists: Option<i64> = self
+                .query_scalar("SELECT 1 FROM people WHERE id = ?")
+                .bind(&candidate)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if exists.is_none() {
+                break candidate;
+            }
+        };
+        self.query(
+            "INSERT INTO people (
+                id, display_name, directory_name, normalized_name, status, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)",
+        )
+        .bind(&new_person_id)
+        .bind(display_name)
+        .bind(display_name)
+        .bind(display_name)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query("DELETE FROM person_identities WHERE provider = ? AND provider_id = ?")
+            .bind(provider)
+            .bind(provider_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
+            "INSERT INTO person_identities (
+                person_id, provider, provider_id, match_method, confidence,
+                evidence_json, created_at, updated_at
+             ) VALUES (?, ?, ?, 'MANUAL_SPLIT', ?, ?, ?, ?)",
+        )
+        .bind(&new_person_id)
+        .bind(provider)
+        .bind(provider_id)
+        .bind(Some(1.0_f64))
+        .bind(evidence_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE person_credits SET lux_person_id = ?
+             WHERE provider = ? AND person_id = ?",
+        )
+        .bind(&new_person_id)
+        .bind(provider)
+        .bind(provider_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(StoredCanonicalPerson { id: new_person_id })
     }
 
     pub(crate) async fn restore_canonical_person(
@@ -13345,6 +13725,40 @@ fn stored_canonical_person(row: sqlx::any::AnyRow) -> StoredCanonicalPerson {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredPersonMatchCandidate {
+    pub(crate) id: String,
+    pub(crate) item_id: String,
+    pub(crate) provider: String,
+    pub(crate) provider_id: String,
+    pub(crate) candidate_person_ids_json: String,
+    pub(crate) status: String,
+    pub(crate) score: Option<f64>,
+    pub(crate) evidence_json: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+fn stored_person_match_candidate(row: sqlx::any::AnyRow) -> StoredPersonMatchCandidate {
+    StoredPersonMatchCandidate {
+        id: row.get("id"),
+        item_id: row.get("item_id"),
+        provider: row.get("provider"),
+        provider_id: row.get("provider_id"),
+        candidate_person_ids_json: row.get("candidate_person_ids_json"),
+        status: row.get("status"),
+        score: row.get("score"),
+        evidence_json: row.get("evidence_json"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredPersonIdentityMove {
+    pub(crate) previous_person_id: Option<String>,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredPersonCredit {
     pub(crate) item_id: String,
     pub(crate) person_id: String,
@@ -14957,6 +15371,222 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(status, "PENDING");
         assert_eq!(score, 0.65);
+    }
+
+    #[tokio::test]
+    async fn confirming_person_match_moves_identity_and_credit_atomically() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-confirm', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        let old = database
+            .resolve_or_create_canonical_person(
+                "旧人物",
+                "douban",
+                "1313123",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"douban"}"#,
+            )
+            .await
+            .expect("old person");
+        let target = database
+            .resolve_or_create_canonical_person(
+                "目标人物",
+                "tmdb",
+                "57975",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await
+            .expect("target person");
+        database
+            .replace_person_credits(
+                "item-confirm",
+                &[NewPersonCredit {
+                    person_id: "1313123".to_owned(),
+                    lux_person_id: Some(old.id.clone()),
+                    person_type: "Actor".to_owned(),
+                    person_name: "旧人物".to_owned(),
+                    provider: "douban".to_owned(),
+                    role: "角色".to_owned(),
+                    sort_order: 0,
+                    biography: None,
+                    birthday: None,
+                    deathday: None,
+                    known_for_department: None,
+                    place_of_birth: None,
+                    provider_ids: BTreeMap::new(),
+                    genres: Vec::new(),
+                    tags: Vec::new(),
+                    production_locations: Vec::new(),
+                    premiere_date: None,
+                    production_year: None,
+                    taglines: Vec::new(),
+                }],
+            )
+            .await
+            .expect("credit");
+        database
+            .enqueue_person_match_candidate(
+                "item-confirm",
+                "douban",
+                "1313123",
+                &format!("[\"{}\"]", target.id),
+                Some(0.9),
+                r#"{"method":"same-media"}"#,
+            )
+            .await
+            .expect("candidate");
+        let candidate_id: String = sqlx::query_scalar(
+            "SELECT id FROM person_match_candidates
+             WHERE item_id = 'item-confirm'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("candidate id");
+
+        let moved = database
+            .confirm_person_match_candidate(
+                &candidate_id,
+                &target.id,
+                r#"{"method":"manual-confirm"}"#,
+            )
+            .await
+            .expect("confirm candidate");
+        assert_eq!(moved.previous_person_id.as_deref(), Some(old.id.as_str()));
+        assert_eq!(
+            database
+                .find_canonical_person_by_identity("douban", "1313123")
+                .await
+                .expect("identity lookup")
+                .expect("moved identity")
+                .id,
+            target.id
+        );
+        let lux_id: String = sqlx::query_scalar(
+            "SELECT lux_person_id FROM person_credits
+             WHERE item_id = 'item-confirm'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("credit lux id");
+        assert_eq!(lux_id, target.id);
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM person_match_candidates
+             WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("candidate status");
+        assert_eq!(status, "CONFIRMED");
+    }
+
+    #[tokio::test]
+    async fn splitting_person_identity_allocates_a_new_lux_person_and_repoints_credits() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-split', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        let old = database
+            .resolve_or_create_canonical_person(
+                "人物甲",
+                "douban",
+                "1313123",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"douban"}"#,
+            )
+            .await
+            .expect("person");
+        database
+            .replace_person_credits(
+                "item-split",
+                &[NewPersonCredit {
+                    person_id: "1313123".to_owned(),
+                    lux_person_id: Some(old.id.clone()),
+                    person_type: "Actor".to_owned(),
+                    person_name: "人物甲".to_owned(),
+                    provider: "douban".to_owned(),
+                    role: "角色".to_owned(),
+                    sort_order: 0,
+                    biography: None,
+                    birthday: None,
+                    deathday: None,
+                    known_for_department: None,
+                    place_of_birth: None,
+                    provider_ids: BTreeMap::new(),
+                    genres: Vec::new(),
+                    tags: Vec::new(),
+                    production_locations: Vec::new(),
+                    premiere_date: None,
+                    production_year: None,
+                    taglines: Vec::new(),
+                }],
+            )
+            .await
+            .expect("credit");
+        let split = database
+            .split_canonical_person_identity(
+                &old.id,
+                "douban",
+                "1313123",
+                "人物乙",
+                r#"{"method":"undo-merge"}"#,
+            )
+            .await
+            .expect("split");
+        assert_ne!(split.id, old.id);
+        assert_eq!(split.id, "lux-000002");
+        assert_eq!(
+            database
+                .find_canonical_person_by_identity("douban", "1313123")
+                .await
+                .expect("identity")
+                .expect("new owner")
+                .id,
+            split.id
+        );
+        let lux_id: String = sqlx::query_scalar(
+            "SELECT lux_person_id FROM person_credits WHERE item_id = 'item-split'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("credit owner");
+        assert_eq!(lux_id, split.id);
     }
 
     #[tokio::test]

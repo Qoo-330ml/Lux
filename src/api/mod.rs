@@ -695,6 +695,22 @@ pub fn app_with_state(state: AppState) -> Router {
             get(admin_list_pending_metadata),
         )
         .route(
+            "/api/v1/admin/people/matches",
+            get(admin_list_pending_person_matches),
+        )
+        .route(
+            "/api/v1/admin/people/matches/{candidate_id}/confirm",
+            post(admin_confirm_person_match),
+        )
+        .route(
+            "/api/v1/admin/people/matches/{candidate_id}/reject",
+            post(admin_reject_person_match),
+        )
+        .route(
+            "/api/v1/admin/people/{person_id}/split",
+            post(admin_split_person_identity),
+        )
+        .route(
             "/api/v1/admin/metadata/reidentify",
             get(admin_list_metadata_reidentify).post(admin_start_metadata_reidentify),
         )
@@ -10792,6 +10808,31 @@ struct MetadataCandidateQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PersonMatchConfirmRequest {
+    target_person_id: String,
+    #[serde(default)]
+    evidence: Value,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PersonMatchRejectRequest {
+    #[serde(default)]
+    evidence: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonIdentitySplitRequest {
+    provider: String,
+    provider_id: String,
+    display_name: String,
+    #[serde(default)]
+    evidence: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MetadataCandidateSearchRequest {
     query: String,
     year: Option<i32>,
@@ -15184,6 +15225,275 @@ async fn admin_list_pending_metadata(
     match candidates.list_pending(offset, limit).await {
         Ok(page) => Json(metadata_candidate_page_json(&page)).into_response(),
         Err(error) => metadata_candidate_error(&headers, error),
+    }
+}
+
+async fn admin_list_pending_person_matches(
+    headers: HeaderMap,
+    Query(query): Query<MetadataCandidateQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match metadata_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match people
+        .list_pending_person_match_candidates(offset, limit)
+        .await
+    {
+        Ok((items, total)) => Json(json!({
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }))
+        .into_response(),
+        Err(error) => people_match_error(&headers, error),
+    }
+}
+
+async fn admin_confirm_person_match(
+    headers: HeaderMap,
+    Path(candidate_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PersonMatchConfirmRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let evidence_json = match serde_json::to_string(&request.evidence) {
+        Ok(value) if value.len() <= 16 * 1024 => value,
+        Ok(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "匹配证据过大",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "匹配证据无效",
+            )
+            .into_response();
+        }
+    };
+    match people
+        .confirm_person_match_candidate(&candidate_id, &request.target_person_id, &evidence_json)
+        .await
+    {
+        Ok(move_result) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PERSON_MATCH_CONFIRMED",
+                Some("person_match_candidate"),
+                Some(&candidate_id),
+                &json!({
+                    "targetPersonId": request.target_person_id,
+                    "previousPersonId": move_result.previous_person_id,
+                    "evidence": request.evidence,
+                })
+                .to_string(),
+            )
+            .await;
+            Json(json!({
+                "candidateId": candidate_id,
+                "status": "CONFIRMED",
+                "targetPersonId": request.target_person_id,
+                "previousPersonId": move_result.previous_person_id,
+            }))
+            .into_response()
+        }
+        Err(error) => people_match_error(&headers, error),
+    }
+}
+
+async fn admin_reject_person_match(
+    headers: HeaderMap,
+    Path(candidate_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PersonMatchRejectRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let evidence_json = match serde_json::to_string(&request.evidence) {
+        Ok(value) if value.len() <= 16 * 1024 => value,
+        Ok(_) | Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "匹配证据无效或过大",
+            )
+            .into_response();
+        }
+    };
+    match people
+        .reject_person_match_candidate(&candidate_id, &evidence_json)
+        .await
+    {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PERSON_MATCH_REJECTED",
+                Some("person_match_candidate"),
+                Some(&candidate_id),
+                &evidence_json,
+            )
+            .await;
+            Json(json!({
+                "candidateId": candidate_id,
+                "status": "REJECTED",
+            }))
+            .into_response()
+        }
+        Err(error) => people_match_error(&headers, error),
+    }
+}
+
+async fn admin_split_person_identity(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PersonIdentitySplitRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let evidence_json = match serde_json::to_string(&request.evidence) {
+        Ok(value) if value.len() <= 16 * 1024 => value,
+        Ok(_) | Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "拆分证据无效或过大",
+            )
+            .into_response();
+        }
+    };
+    match people
+        .split_person_identity(
+            &person_id,
+            &request.provider,
+            &request.provider_id,
+            &request.display_name,
+            &evidence_json,
+        )
+        .await
+    {
+        Ok(new_person_id) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PERSON_IDENTITY_SPLIT",
+                Some("person"),
+                Some(&person_id),
+                &json!({
+                    "provider": request.provider,
+                    "providerId": request.provider_id,
+                    "newPersonId": new_person_id,
+                    "displayName": request.display_name,
+                    "evidence": request.evidence,
+                })
+                .to_string(),
+            )
+            .await;
+            Json(json!({
+                "sourcePersonId": person_id,
+                "newPersonId": new_person_id,
+                "status": "SPLIT",
+            }))
+            .into_response()
+        }
+        Err(error) => people_match_error(&headers, error),
+    }
+}
+
+fn people_match_error(headers: &HeaderMap, error: PeopleError) -> Response {
+    match error {
+        PeopleError::InvalidComponent(_) | PeopleError::Serialization(_) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物匹配请求无效",
+        )
+        .into_response(),
+        PeopleError::Storage(message) if message.contains("candidate") => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物匹配候选状态已变化或不存在",
+        )
+        .into_response(),
+        PeopleError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "人物索引暂时不可用",
+        )
+        .into_response(),
+        _ => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "人物匹配处理失败",
+        )
+        .into_response(),
     }
 }
 
