@@ -424,7 +424,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
         {library.coverImageUrl ? <img className="lux-admin-library-cover" src={library.coverImageUrl} alt={`${library.name} 封面`} /> : <div className="lux-admin-library-cover-placeholder"><Image size={30} aria-hidden="true" /></div>}
         <button className="lux-admin-library-overflow" type="button" aria-label={`打开 ${library.name} 操作菜单`} aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}><MoreHorizontal size={20} /></button>
       </div>
-      <div className="lux-admin-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span><small>{library.roots[0]?.displayPath ?? "尚未配置根路径"}</small></div>
+      <div className="lux-admin-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span><small>{library.roots.length > 1 ? `${library.roots.length}个文件夹` : library.roots[0]?.displayPath ?? "尚未配置根路径"}</small></div>
       {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
       {editOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setEditOpen(false); }}>
         <div className="lux-library-dialog" role="dialog" aria-modal="true" aria-labelledby={`edit-library-title-${library.id}`}>

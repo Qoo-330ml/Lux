@@ -290,6 +290,24 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("/media/strm/video/每日更新");
   });
 
+  it("summarizes multiple library roots on the card", async () => {
+    vi.mocked(api.adminLibraries).mockResolvedValueOnce({
+      libraries: [{
+        ...library,
+        roots: [
+          ...library.roots,
+          { ...library.roots[0], id: "root-2", displayPath: "/media/strm/video/电影" },
+          { ...library.roots[0], id: "root-3", displayPath: "/media/strm/video/剧集" },
+        ],
+      }],
+    });
+
+    await renderPage();
+
+    expect(container.textContent).toContain("3个文件夹");
+    expect(container.textContent).not.toContain("/media/strm/video/每日更新");
+  });
+
   it("opens the library actions menu from the card overflow button", async () => {
     await renderPage();
 
