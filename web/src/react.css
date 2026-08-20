@@ -1044,7 +1044,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-admin-log-row { grid-template-columns: 30px minmax(0, 1fr) auto; }
 .lux-admin-log-icon { color: var(--lux-subtle); }
 .lux-admin-log-row time { color: var(--lux-subtle); font-size: .68rem; white-space: nowrap; }
-.lux-admin-operations-page { max-width: 1040px; }
+.lux-admin-operations-page { width: 100%; max-width: none; }
 .lux-operations-heading { align-items: flex-end; justify-content: space-between; }
 .lux-operations-heading h1 { margin: 9px 0 7px; }
 .lux-operations-heading p { margin: 0; color: var(--lux-muted); font-size: .8rem; }
@@ -1143,7 +1143,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-settings-saved { display: flex; align-items: center; gap: 7px; margin: 17px 0 0; color: #9bdcb3; font-size: .78rem; }
 .lux-admin-settings-note { max-width: 760px; margin-top: 16px; }
 .lux-admin-settings-note p { margin: 0; color: var(--lux-muted); font-size: .8rem; line-height: 1.7; }
-.lux-changelog-page { max-width: 940px; padding-bottom: 32px; }
+.lux-changelog-page { width: 100%; max-width: none; padding-bottom: 32px; }
 .lux-changelog-header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 4px 0 26px; border-bottom: 1px solid var(--lux-line-soft); }
 .lux-changelog-header-mark { display: grid; place-items: center; width: 48px; height: 48px; border: 1px solid rgba(210,71,191,.38); border-radius: 14px; color: #f3a9e4; background: rgba(210,71,191,.1); }
 .lux-changelog-header h1 { margin: 7px 0 5px; color: #fff; font-size: clamp(1.7rem, 3vw, 2.35rem); letter-spacing: -.065em; }
