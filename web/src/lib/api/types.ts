@@ -560,6 +560,20 @@ export type AdminMetadataReidentifyJobItem = {
   updatedAt: string | number;
 };
 
+export type AdminStrmProbeJob = {
+  id: string;
+  operationId: string;
+  libraryId: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  cursor?: string | null;
+  processedCount: number;
+  totalCount: number;
+  cancelRequested?: boolean;
+  error?: string | null;
+  createdAt?: string | number;
+  finishedAt?: string | number | null;
+};
+
 export type AdminMetadataReidentifyStart = {
   totalCount: number;
   mode?: MetadataRefreshMode;

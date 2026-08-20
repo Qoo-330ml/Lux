@@ -8,6 +8,7 @@ import type {
   AdminScheduledTask,
   AdminScheduledTaskPage,
   AdminMetadataReidentifyJob,
+  AdminStrmProbeJob,
   AdminLibrary,
   AdminRoot,
   AdminSettings,
@@ -765,6 +766,28 @@ export class LuxApiClient {
     if (status) params.set("status", status);
     return this.request<{ jobs?: AdminMetadataReidentifyJob[] }>(
       `/api/v1/admin/metadata/reidentify?${params}`,
+    );
+  }
+
+  adminStrmProbeJobs(status?: string) {
+    const params = new URLSearchParams({ page: "1", pageSize: "50" });
+    if (status) params.set("status", status);
+    return this.request<{ jobs?: AdminStrmProbeJob[] }>(
+      `/api/v1/admin/strm-probe-jobs?${params}`,
+    );
+  }
+
+  cancelStrmProbeJob(jobId: string) {
+    return this.request<void>(
+      `/api/v1/admin/strm-probe-jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
+    );
+  }
+
+  retryStrmProbeJob(jobId: string) {
+    return this.request<{ job: AdminStrmProbeJob }>(
+      `/api/v1/admin/strm-probe-jobs/${encodeURIComponent(jobId)}/retry`,
+      { method: "POST" },
     );
   }
 

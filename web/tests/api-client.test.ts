@@ -386,6 +386,32 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("loads, cancels, and retries STRM probe jobs through the admin API", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/admin/strm-probe-jobs?page=1&pageSize=50&status=RUNNING") {
+        return new Response(JSON.stringify({ jobs: [{ id: "strm-job-1", status: "RUNNING", operationId: "operation-1", libraryId: "library-1", processedCount: 2, totalCount: 10 }] }), { status: 200 });
+      }
+      if (path === "/api/v1/admin/strm-probe-jobs/strm-job-1/cancel") {
+        expect(init?.method).toBe("POST");
+        return new Response(null, { status: 202 });
+      }
+      expect(path).toBe("/api/v1/admin/strm-probe-jobs/strm-job-1/retry");
+      expect(init?.method).toBe("POST");
+      return new Response(JSON.stringify({ job: { id: "strm-job-2", status: "PENDING", operationId: "operation-2", libraryId: "library-1", processedCount: 0, totalCount: 10 } }), { status: 202 });
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.adminStrmProbeJobs("RUNNING")).resolves.toMatchObject({
+      jobs: [{ id: "strm-job-1", status: "RUNNING" }],
+    });
+    await expect(client.cancelStrmProbeJob("strm-job-1")).resolves.toBeUndefined();
+    await expect(client.retryStrmProbeJob("strm-job-1")).resolves.toMatchObject({
+      job: { id: "strm-job-2", status: "PENDING" },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("loads metadata job item details from the existing job detail endpoint", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

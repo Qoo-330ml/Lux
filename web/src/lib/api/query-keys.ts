@@ -35,6 +35,7 @@ export const queryKeys = {
   adminJobs: (status?: string) => ["admin", "jobs", status ?? "all"] as const,
   adminScheduledTasks: (page = 1) => ["admin", "scheduled-tasks", page] as const,
   adminMetadataJobs: (status?: string) => ["admin", "metadata-jobs", status ?? "all"] as const,
+  adminStrmProbeJobs: (status?: string) => ["admin", "strm-probe-jobs", status ?? "all"] as const,
   adminLogs: ["admin", "logs"] as const,
   adminSettings: ["admin", "settings"] as const,
   adminApiKey: ["admin", "api-key"] as const,
