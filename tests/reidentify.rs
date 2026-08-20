@@ -885,3 +885,39 @@ async fn metadata_job_with_item_issues_does_not_enqueue_job_failed_webhook()
     assert_eq!(failed_events, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn scraper_unavailable_metadata_job_is_deferred() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    sqlx::query("UPDATE metadata_reidentify_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE' WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+
+    metadata.run(&job.id).await;
+
+    let finished = metadata.get_job(&job.id).await?;
+    assert_eq!(finished.status, "DEFERRED");
+    assert_eq!(
+        finished.error.as_deref(),
+        Some("DEFERRED_PROVIDER_UNAVAILABLE")
+    );
+    Ok(())
+}

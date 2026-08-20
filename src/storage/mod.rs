@@ -4917,6 +4917,28 @@ impl Database {
         })
     }
 
+    pub(crate) async fn metadata_reidentify_job_has_item_error(
+        &self,
+        job_id: &str,
+        error: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND error = ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .bind(error)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_active_metadata_reidentify_job_ids(
         &self,
     ) -> Result<Vec<String>, StorageError> {

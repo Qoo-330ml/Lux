@@ -397,17 +397,26 @@ impl MetadataReidentifyService {
         } else {
             match self
                 .database
-                .metadata_reidentify_job_has_failed_items(job_id)
+                .metadata_reidentify_job_has_item_error(job_id, "SCRAPER_UNAVAILABLE")
                 .await
             {
-                Ok(true) => "COMPLETED_WITH_ISSUES",
-                Ok(false) => "COMPLETED",
+                Ok(true) => "DEFERRED",
+                Ok(false) => match self
+                    .database
+                    .metadata_reidentify_job_has_failed_items(job_id)
+                    .await
+                {
+                    Ok(true) => "COMPLETED_WITH_ISSUES",
+                    Ok(false) => "COMPLETED",
+                    Err(_) => "FAILED",
+                },
                 Err(_) => "FAILED",
             }
         };
         let error = match status {
             "FAILED" => Some("ITEM_FAILED"),
             "COMPLETED_WITH_ISSUES" => Some("ITEM_ISSUES"),
+            "DEFERRED" => Some("DEFERRED_PROVIDER_UNAVAILABLE"),
             _ => None,
         };
         let finish_result = self
