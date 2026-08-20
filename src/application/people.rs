@@ -47,6 +47,8 @@ const PENDING_PERSON_NFO: &str = "personNfo";
 const PENDING_PERSON_MANIFEST: &str = "personManifest";
 const PENDING_PROFILE_IMAGE: &str = "profileImage";
 const PENDING_PERSON_INDEX: &str = "personIndex";
+const PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const PERSON_MATCH_SNAPSHOT_DIR: &str = "matches";
 const MAX_ACTORS: usize = 12;
 const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
@@ -251,6 +253,24 @@ pub struct PersonMatchCandidateView {
 #[serde(rename_all = "camelCase")]
 pub struct PersonIdentityMove {
     pub previous_person_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonMatchCandidateSnapshot {
+    schema_version: u32,
+    id: String,
+    item_id: String,
+    provider: String,
+    provider_id: String,
+    candidate_person_ids: Vec<String>,
+    status: String,
+    score: Option<f64>,
+    evidence: Value,
+    created_at: i64,
+    updated_at: i64,
+    #[serde(default)]
+    checksum: String,
 }
 
 struct PersonAssetResult {
@@ -567,7 +587,7 @@ impl PeopleService {
                 });
                 let candidate_ids_json = serde_json::to_string(&candidate_ids)
                     .map_err(|error| PeopleError::Serialization(error.to_string()))?;
-                if let Err(error) = database
+                match database
                     .enqueue_person_match_candidate(
                         item_id,
                         actor_provider,
@@ -578,7 +598,46 @@ impl PeopleService {
                     )
                     .await
                 {
-                    tracing::warn!(item_id, person_id = actor_id, %error, "could not persist ambiguous person match");
+                    Ok(candidate_id) => {
+                        let persisted = database
+                            .find_person_match_candidate(&candidate_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        let snapshot = PersonMatchCandidateSnapshot {
+                            schema_version: PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION,
+                            id: candidate_id,
+                            item_id: item_id.to_owned(),
+                            provider: actor_provider.to_owned(),
+                            provider_id: actor_id.to_owned(),
+                            candidate_person_ids: candidate_ids,
+                            status: persisted
+                                .as_ref()
+                                .map(|candidate| candidate.status.clone())
+                                .unwrap_or_else(|| "PENDING".to_owned()),
+                            score: persisted
+                                .as_ref()
+                                .and_then(|candidate| candidate.score)
+                                .or(Some(0.55)),
+                            evidence: persisted
+                                .as_ref()
+                                .and_then(|candidate| {
+                                    serde_json::from_str(&candidate.evidence_json).ok()
+                                })
+                                .unwrap_or_else(|| evidence.clone()),
+                            created_at: current_people_unix_timestamp(),
+                            updated_at: current_people_unix_timestamp(),
+                            checksum: String::new(),
+                        };
+                        if let Err(error) =
+                            self.persist_person_match_candidate_snapshot(snapshot).await
+                        {
+                            tracing::warn!(item_id, person_id = actor_id, %error, "could not persist ambiguous person match snapshot");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(item_id, person_id = actor_id, %error, "could not persist ambiguous person match");
+                    }
                 }
             }
             let bridge_person_key = (bridge_candidates.len() == 1)
@@ -1166,6 +1225,95 @@ impl PeopleService {
         Ok((candidates, total))
     }
 
+    async fn persist_person_match_candidate_snapshot(
+        &self,
+        mut snapshot: PersonMatchCandidateSnapshot,
+    ) -> Result<(), PeopleError> {
+        if !is_valid_person_id(&snapshot.id) {
+            return Err(PeopleError::InvalidComponent(snapshot.id));
+        }
+        let directory = metadata_root(&self.config_dir)
+            .join(LEGACY_PEOPLE_DIR)
+            .join(PERSON_MATCH_SNAPSHOT_DIR);
+        create_private_dir(&directory).await?;
+        snapshot.schema_version = PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION;
+        snapshot.checksum.clear();
+        let checksum_source = serde_json::to_vec(&snapshot)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        snapshot.checksum = Sha256::digest(checksum_source)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let bytes = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        write_atomically(&directory.join(format!("{}.json", snapshot.id)), &bytes).await
+    }
+
+    async fn restore_person_match_candidate_snapshots(
+        &self,
+        database: &Database,
+    ) -> Result<usize, PeopleError> {
+        let directory = metadata_root(&self.config_dir)
+            .join(LEGACY_PEOPLE_DIR)
+            .join(PERSON_MATCH_SNAPSHOT_DIR);
+        let mut entries = match fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        };
+        let mut restored = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: directory.clone(),
+                source,
+            })?
+        {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(bytes) = read_people_file(&path).await? else {
+                continue;
+            };
+            let snapshot = match serde_json::from_slice::<PersonMatchCandidateSnapshot>(&bytes) {
+                Ok(snapshot) if valid_person_match_snapshot(&snapshot) => snapshot,
+                Ok(_) | Err(_) => {
+                    tracing::warn!(path = %path.display(), "skipping invalid person match snapshot");
+                    continue;
+                }
+            };
+            match database
+                .restore_person_match_candidate(
+                    &snapshot.id,
+                    &snapshot.item_id,
+                    &snapshot.provider,
+                    &snapshot.provider_id,
+                    &serde_json::to_string(&snapshot.candidate_person_ids)
+                        .map_err(|source| PeopleError::Serialization(source.to_string()))?,
+                    &snapshot.status,
+                    snapshot.score,
+                    &snapshot.evidence.to_string(),
+                    snapshot.created_at,
+                    snapshot.updated_at,
+                )
+                .await
+            {
+                Ok(_) => restored += 1,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "skipping person match snapshot during restore")
+                }
+            }
+        }
+        Ok(restored)
+    }
+
     pub async fn confirm_person_match_candidate(
         &self,
         candidate_id: &str,
@@ -1200,10 +1348,9 @@ impl PeopleService {
                 previous_person_id: movement.previous_person_id,
             })
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
-        let Some(previous_person_id) = movement.previous_person_id.as_deref() else {
-            return Ok(movement);
-        };
-        if previous_person_id != target_person_id {
+        if let Some(previous_person_id) = movement.previous_person_id.as_deref()
+            && previous_person_id != target_person_id
+        {
             let target_name = database
                 .find_canonical_person_display_name(target_person_id)
                 .await
@@ -1237,6 +1384,24 @@ impl PeopleService {
             )
             .await?;
         }
+        let candidate_person_ids =
+            serde_json::from_str(&candidate.candidate_person_ids_json).unwrap_or_default();
+        self.persist_person_match_candidate_snapshot(PersonMatchCandidateSnapshot {
+            schema_version: PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION,
+            id: candidate.id,
+            item_id: candidate.item_id,
+            provider: candidate.provider,
+            provider_id: candidate.provider_id,
+            candidate_person_ids,
+            status: "CONFIRMED".to_owned(),
+            score: candidate.score,
+            evidence: serde_json::from_str(evidence_json)
+                .unwrap_or(Value::String(evidence_json.to_owned())),
+            created_at: candidate.created_at,
+            updated_at: current_people_unix_timestamp(),
+            checksum: String::new(),
+        })
+        .await?;
         Ok(movement)
     }
 
@@ -1253,10 +1418,35 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
+        let candidate = database
+            .find_person_match_candidate(candidate_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?
+            .ok_or_else(|| {
+                PeopleError::Storage(format!("person match candidate '{candidate_id}' not found"))
+            })?;
         database
             .reject_person_match_candidate(candidate_id, evidence_json)
             .await
-            .map_err(|error| PeopleError::Storage(error.to_string()))
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        self.persist_person_match_candidate_snapshot(PersonMatchCandidateSnapshot {
+            schema_version: PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION,
+            id: candidate.id,
+            item_id: candidate.item_id,
+            provider: candidate.provider,
+            provider_id: candidate.provider_id,
+            candidate_person_ids: serde_json::from_str(&candidate.candidate_person_ids_json)
+                .unwrap_or_default(),
+            status: "REJECTED".to_owned(),
+            score: candidate.score,
+            evidence: serde_json::from_str(evidence_json)
+                .unwrap_or(Value::String(evidence_json.to_owned())),
+            created_at: candidate.created_at,
+            updated_at: current_people_unix_timestamp(),
+            checksum: String::new(),
+        })
+        .await
+        .map_err(|error| PeopleError::Storage(error.to_string()))
     }
 
     pub async fn split_person_identity(
@@ -1471,6 +1661,15 @@ impl PeopleService {
         let restored_people = self.restore_person_manifests(database).await?;
         if restored_people > 0 {
             tracing::info!(restored_people, "canonical people manifests restored");
+        }
+        let restored_match_candidates = self
+            .restore_person_match_candidate_snapshots(database)
+            .await?;
+        if restored_match_candidates > 0 {
+            tracing::info!(
+                restored_match_candidates,
+                "person match candidate snapshots restored"
+            );
         }
         let restored_relations = self.restore_person_relation_snapshots(database).await?;
         if restored_relations > 0 {
@@ -3430,6 +3629,32 @@ fn valid_person_manifest(manifest: &PersonManifest) -> bool {
     };
     let digest = Sha256::digest(bytes);
     let actual = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    actual == expected
+}
+
+fn valid_person_match_snapshot(snapshot: &PersonMatchCandidateSnapshot) -> bool {
+    if snapshot.schema_version != PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION
+        || !is_valid_person_id(&snapshot.id)
+        || !is_valid_person_id(&snapshot.provider)
+        || !is_valid_person_id(&snapshot.provider_id)
+        || !matches!(
+            snapshot.status.as_str(),
+            "PENDING" | "CONFIRMED" | "REJECTED"
+        )
+        || snapshot.checksum.is_empty()
+    {
+        return false;
+    }
+    let mut unsigned = snapshot.clone();
+    let expected = unsigned.checksum.clone();
+    unsigned.checksum.clear();
+    let Ok(bytes) = serde_json::to_vec(&unsigned) else {
+        return false;
+    };
+    let actual = Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();

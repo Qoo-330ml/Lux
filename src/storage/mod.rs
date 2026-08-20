@@ -1566,8 +1566,9 @@ impl Database {
         candidate_person_ids_json: &str,
         score: Option<f64>,
         evidence_json: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<String, StorageError> {
         let now = current_unix_timestamp();
+        let candidate_id = Uuid::now_v7().to_string();
         self.query(
             "INSERT INTO person_match_candidates (
                 id, item_id, provider, provider_id, candidate_person_ids_json,
@@ -1575,12 +1576,16 @@ impl Database {
              ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
              ON CONFLICT(item_id, provider, provider_id) DO UPDATE SET
                 candidate_person_ids_json = excluded.candidate_person_ids_json,
-                status = 'PENDING',
+                status = CASE
+                    WHEN person_match_candidates.status IN ('CONFIRMED', 'REJECTED')
+                        THEN person_match_candidates.status
+                    ELSE excluded.status
+                END,
                 score = excluded.score,
                 evidence_json = excluded.evidence_json,
                 updated_at = excluded.updated_at",
         )
-        .bind(Uuid::now_v7().to_string())
+        .bind(&candidate_id)
         .bind(item_id)
         .bind(provider)
         .bind(provider_id)
@@ -1591,7 +1596,85 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query_scalar::<String>(
+            "SELECT id FROM person_match_candidates
+             WHERE item_id = ? AND provider = ? AND provider_id = ?",
+        )
+        .bind(item_id)
+        .bind(provider)
+        .bind(provider_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn restore_person_match_candidate(
+        &self,
+        candidate_id: &str,
+        item_id: &str,
+        provider: &str,
+        provider_id: &str,
+        candidate_person_ids_json: &str,
+        status: &str,
+        score: Option<f64>,
+        evidence_json: &str,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Result<String, StorageError> {
+        if !matches!(status, "PENDING" | "CONFIRMED" | "REJECTED") {
+            return Err(StorageError::Serialization(
+                "invalid person match candidate status".to_owned(),
+            ));
+        }
+        self.query(
+            "INSERT INTO person_match_candidates (
+                id, item_id, provider, provider_id, candidate_person_ids_json,
+                status, score, evidence_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(item_id, provider, provider_id) DO UPDATE SET
+                candidate_person_ids_json = excluded.candidate_person_ids_json,
+                status = CASE
+                    WHEN person_match_candidates.status IN ('CONFIRMED', 'REJECTED')
+                        AND excluded.status = 'PENDING'
+                        THEN person_match_candidates.status
+                    ELSE excluded.status
+                END,
+                score = excluded.score,
+                evidence_json = excluded.evidence_json,
+                updated_at = excluded.updated_at",
+        )
+        .bind(candidate_id)
+        .bind(item_id)
+        .bind(provider)
+        .bind(provider_id)
+        .bind(candidate_person_ids_json)
+        .bind(status)
+        .bind(score)
+        .bind(evidence_json)
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query_scalar::<String>(
+            "SELECT id FROM person_match_candidates
+             WHERE item_id = ? AND provider = ? AND provider_id = ?",
+        )
+        .bind(item_id)
+        .bind(provider)
+        .bind(provider_id)
+        .fetch_one(&self.pool)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -3522,6 +3605,73 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn user_library_order(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT library_id FROM user_library_order
+             WHERE user_id = ?
+             ORDER BY position, library_id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn replace_user_library_order(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query("DELETE FROM user_library_order WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for (position, library_id) in library_ids.iter().enumerate() {
+            self.query(
+                "INSERT INTO user_library_order (user_id, library_id, position)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(user_id)
+            .bind(library_id)
+            .bind(
+                i64::try_from(position).map_err(|_| {
+                    StorageError::Serialization("媒体库排序位置超出范围".to_owned())
+                })?,
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn set_server_settings(
@@ -15337,7 +15487,7 @@ mod tests {
         .execute(database.pool())
         .await
         .expect("media item");
-        database
+        let first_id = database
             .enqueue_person_match_candidate(
                 "item-1",
                 "douban",
@@ -15348,7 +15498,7 @@ mod tests {
             )
             .await
             .expect("first candidate");
-        database
+        let second_id = database
             .enqueue_person_match_candidate(
                 "item-1",
                 "douban",
@@ -15359,6 +15509,7 @@ mod tests {
             )
             .await
             .expect("idempotent candidate update");
+        assert_eq!(first_id, second_id);
 
         let (count, status, score): (i64, String, f64) = sqlx::query_as(
             "SELECT COUNT(*), MIN(status), MAX(score)
@@ -15371,6 +15522,30 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(status, "PENDING");
         assert_eq!(score, 0.65);
+
+        sqlx::query("UPDATE person_match_candidates SET status = 'CONFIRMED' WHERE id = ?")
+            .bind(&first_id)
+            .execute(database.pool())
+            .await
+            .expect("mark candidate decided");
+        database
+            .enqueue_person_match_candidate(
+                "item-1",
+                "douban",
+                "1313123",
+                r#"["lux-000002"]"#,
+                Some(0.9),
+                r#"{"method":"retry"}"#,
+            )
+            .await
+            .expect("retry decided candidate");
+        let preserved_status: String =
+            sqlx::query_scalar("SELECT status FROM person_match_candidates WHERE id = ?")
+                .bind(&first_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("preserved candidate status");
+        assert_eq!(preserved_status, "CONFIRMED");
     }
 
     #[tokio::test]
