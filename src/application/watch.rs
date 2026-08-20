@@ -250,16 +250,12 @@ impl LibraryWatchService {
 
     async fn watch_root(&self, root: StoredLibraryRoot, running_jobs: Arc<Mutex<HashSet<String>>>) {
         let root_path = root.canonical_path.clone();
-        let mut watcher = match tokio::task::spawn_blocking(move || LibraryWatcher::new(root_path))
-            .await
-        {
-            Ok(Ok(watcher)) => watcher,
-            Ok(Err(error)) => {
-                tracing::warn!(root_id = %root.id, %error, "library root realtime watch unavailable");
-                return;
-            }
+        // notify performs a one-time, lightweight watcher registration here. Keeping it in
+        // this task avoids waiting behind a saturated Tokio blocking pool during startup.
+        let mut watcher = match LibraryWatcher::new(root_path) {
+            Ok(watcher) => watcher,
             Err(error) => {
-                tracing::warn!(root_id = %root.id, %error, "library root realtime watch worker stopped");
+                tracing::warn!(root_id = %root.id, %error, "library root realtime watch unavailable");
                 return;
             }
         };
