@@ -223,6 +223,80 @@ describe("AdminOperationsPage", () => {
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="正在取消任务"]')?.disabled).toBe(true);
   });
 
+  it("shows STRM probe progress and can cancel the active job", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminStrmProbeJobs").mockResolvedValue({ jobs: [{
+      id: "strm-job-1",
+      operationId: "operation-1",
+      libraryId: "library-1",
+      status: "RUNNING",
+      processedCount: 2,
+      totalCount: 10,
+      cancelRequested: false,
+    }] });
+    const cancelStrm = vi.spyOn(api, "cancelStrmProbeJob").mockResolvedValue(undefined);
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    expect(container.textContent).toContain("STRM 媒体信息扫描");
+    expect(container.textContent).toContain("STRM 媒体信息任务 · 媒体库：电影库");
+    expect(container.textContent).toContain("2 / 10");
+    expect(container.querySelector<HTMLElement>(".lux-job-progress span")?.getAttribute("style")).toContain("20%");
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="取消任务"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(cancelStrm).toHaveBeenCalledWith("strm-job-1"));
+    });
+  });
+
+  it("shows STRM probe retry actions and its audit event label", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminStrmProbeJobs").mockResolvedValue({ jobs: [{
+      id: "strm-job-failed",
+      operationId: "operation-1",
+      libraryId: "library-1",
+      status: "FAILED",
+      processedCount: 10,
+      totalCount: 10,
+      error: "STRM_MEDIA_INFO_FAILED",
+    }] });
+    const retryStrm = vi.spyOn(api, "retryStrmProbeJob").mockResolvedValue({ job: {
+      id: "strm-job-retry",
+      operationId: "operation-2",
+      libraryId: "library-1",
+      status: "PENDING",
+      processedCount: 0,
+      totalCount: 10,
+    } });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [{
+      id: "strm-audit-1",
+      eventType: "STRM_PROBE_STARTED",
+      targetType: "strm_probe_operation",
+      createdAt: 1_700_000_000,
+    }] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="重试任务"]')).not.toBeNull();
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="重试任务"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(retryStrm).toHaveBeenCalledWith("strm-job-failed"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(3)')?.click());
+    expect(container.textContent).toContain("开始 STRM 媒体信息扫描");
+  });
+
   it("exports a selected UTC log date range from the system log tab", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
@@ -502,6 +576,9 @@ describe("AdminOperationsPage", () => {
         roots: [],
       }],
     });
+    if (!vi.isMockFunction(api.adminStrmProbeJobs)) {
+      vi.spyOn(api, "adminStrmProbeJobs").mockResolvedValue({ jobs: [] });
+    }
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     act(() => {

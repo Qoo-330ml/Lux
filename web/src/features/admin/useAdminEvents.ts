@@ -21,6 +21,7 @@ const queryKeysByScope: Record<Exclude<AdminEventScope, "all">, QueryKey[]> = {
   jobs: [
     ["admin", "jobs"],
     ["admin", "metadata-jobs"],
+    ["admin", "strm-probe-jobs"],
     ["admin", "scheduled-tasks"],
     ["admin", "dashboard"],
     ["admin", "logs"],

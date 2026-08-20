@@ -86,6 +86,7 @@ describe("admin SSE events", () => {
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
       { queryKey: ["admin", "jobs"] },
       { queryKey: ["admin", "metadata-jobs"] },
+      { queryKey: ["admin", "strm-probe-jobs"] },
       { queryKey: ["admin", "scheduled-tasks"] },
       { queryKey: ["admin", "dashboard"] },
       { queryKey: ["admin", "logs"] },

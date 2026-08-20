@@ -26,13 +26,15 @@ import type {
   AdminJob,
   AdminMetadataReidentifyJob,
   AdminScheduledTask,
+  AdminStrmProbeJob,
 } from "../../lib/api/types";
 import { formatAdminDate } from "./date";
 
 type OperationsTab = "registered" | "runs" | "logs";
 type OperationsJob =
   | (AdminJob & { kind: "scan"; jobType: string; libraryId?: string | null })
-  | (AdminMetadataReidentifyJob & { kind: "metadata"; jobType: string; libraryId?: string | null });
+  | (AdminMetadataReidentifyJob & { kind: "metadata"; jobType: string; libraryId?: string | null })
+  | (AdminStrmProbeJob & { kind: "strm"; jobType: string; libraryId?: string | null });
 
 const JOB_STATUS_LABELS: Record<string, string> = {
   PENDING: "等待中",
@@ -84,6 +86,9 @@ const AUDIT_EVENT_LABELS: Record<string, string> = {
   LIBRARY_DELETED: "删除媒体库",
   SCHEDULE_UPDATED: "更新计划任务",
   LIBRARY_COVER_GENERATION_STARTED: "开始生成媒体库封面",
+  STRM_PROBE_STARTED: "开始 STRM 媒体信息扫描",
+  STRM_PROBE_CANCEL_REQUESTED: "取消 STRM 媒体信息扫描",
+  STRM_PROBE_RETRIED: "重试 STRM 媒体信息扫描",
 };
 
 const ERROR_LABELS: Record<string, string> = {
@@ -134,6 +139,11 @@ export function AdminOperationsPage() {
     queryKey: queryKeys.adminMetadataJobs(status),
     queryFn: () => api.adminMetadataReidentifyJobs(metadataStatusFilter(status)),
   });
+  const strmJobs = useQuery({
+    queryKey: queryKeys.adminStrmProbeJobs(status),
+    queryFn: () => api.adminStrmProbeJobs(status || undefined),
+    refetchInterval: 5_000,
+  });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
   const cancel = useMutation({
     mutationFn: (jobId: string) => api.cancelAdminJob(jobId),
@@ -143,6 +153,10 @@ export function AdminOperationsPage() {
     mutationFn: (jobId: string) => api.cancelMetadataReidentify(jobId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] }),
   });
+  const cancelStrm = useMutation({
+    mutationFn: (jobId: string) => api.cancelStrmProbeJob(jobId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "strm-probe-jobs"] }),
+  });
   const retry = useMutation({
     mutationFn: (jobId: string) => api.retryAdminJob(jobId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "jobs"] }),
@@ -151,6 +165,10 @@ export function AdminOperationsPage() {
     mutationFn: (jobId: string) => api.retryMetadataReidentify(jobId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] }),
   });
+  const retryStrm = useMutation({
+    mutationFn: (jobId: string) => api.retryStrmProbeJob(jobId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "strm-probe-jobs"] }),
+  });
 
   const jobItems: OperationsJob[] = [
     ...(jobs.data?.jobs ?? []).map((job): OperationsJob => ({ ...job, kind: "scan", jobType: job.jobType })),
@@ -158,6 +176,11 @@ export function AdminOperationsPage() {
       ...job,
       kind: "metadata",
       jobType: jobTypeForMetadataJob(job),
+    })),
+    ...(strmJobs.data?.jobs ?? []).map((job): OperationsJob => ({
+      ...job,
+      kind: "strm",
+      jobType: "STRM_MEDIA_INFO",
     })),
   ].sort(compareOperationsJobs);
   const registeredTasks = tasks.data?.scheduledTasks ?? [];
@@ -170,11 +193,11 @@ export function AdminOperationsPage() {
     });
   }, [logLevel, logSearch, logs.data?.events]);
 
-  if (tasks.isPending || libraries.isPending || jobs.isPending || metadataJobs.isPending || logs.isPending) {
+  if (tasks.isPending || libraries.isPending || jobs.isPending || metadataJobs.isPending || strmJobs.isPending || logs.isPending) {
     return <AdminOperationsState label="正在读取注册任务、运行记录与日志…" />;
   }
-  if (tasks.error || libraries.error || jobs.error || metadataJobs.error || logs.error) {
-    return <AdminOperationsState label={(tasks.error || libraries.error || jobs.error || metadataJobs.error || logs.error)?.message || "任务数据加载失败"} error />;
+  if (tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || logs.error) {
+    return <AdminOperationsState label={(tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || logs.error)?.message || "任务数据加载失败"} error />;
   }
 
   const runningCount = jobItems.filter((job) => isActiveJob(job.status)).length;
@@ -243,9 +266,9 @@ export function AdminOperationsPage() {
           libraryNames={libraryNames}
           status={status}
           onStatusChange={setStatus}
-          onCancel={(job) => job.kind === "metadata" ? cancelMetadata.mutate(job.id) : cancel.mutate(job.id)}
-          onRetry={(job) => job.kind === "metadata" ? retryMetadata.mutate(job.id) : retry.mutate(job.id)}
-          busy={cancel.isPending || cancelMetadata.isPending || retry.isPending || retryMetadata.isPending}
+          onCancel={(job) => job.kind === "metadata" ? cancelMetadata.mutate(job.id) : job.kind === "strm" ? cancelStrm.mutate(job.id) : cancel.mutate(job.id)}
+          onRetry={(job) => job.kind === "metadata" ? retryMetadata.mutate(job.id) : job.kind === "strm" ? retryStrm.mutate(job.id) : retry.mutate(job.id)}
+          busy={cancel.isPending || cancelMetadata.isPending || cancelStrm.isPending || retry.isPending || retryMetadata.isPending || retryStrm.isPending}
         />
       ) : null}
       {tab === "logs" ? (
@@ -322,6 +345,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLogs });
       onSaved();
     },
@@ -463,6 +487,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
   const active = isActiveJob(job.status);
   const cancelling = active && Boolean(job.cancelRequested);
   const discovering = active && job.kind === "scan" && job.discoveryCompleted === false;
+  const jobContext = job.kind === "strm" ? "STRM 媒体信息任务" : job.kind === "metadata" ? "元数据任务" : "扫描任务";
   const retryable = job.status === "FAILED" || job.status === "CANCELLED" || job.status === "COMPLETED_WITH_ISSUES" || job.status === "DEFERRED";
   const error = formatJobError(job.error);
   const libraryLabel = job.libraryId ? libraryNames.get(job.libraryId) ?? job.libraryId : "";
@@ -479,7 +504,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
     <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" || job.status === "COMPLETED_WITH_ISSUES" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
     <div className="lux-admin-job-main">
       <div className="lux-admin-job-heading"><strong>{jobLabel}</strong><span className={`lux-job-status status-${job.status.toLowerCase().replaceAll("_", "-")}`}>{formatJobStatus(job.status)}</span></div>
-      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : discovering ? "正在发现目录" : job.kind === "metadata" ? "元数据任务" : "扫描任务"}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}</span></div>
+      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : discovering ? "正在发现目录" : jobContext}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}</span></div>
       {error ? <div className="lux-admin-job-error" role="alert"><strong>失败原因</strong><span>{error}</span></div> : null}
       {detailsOpen && job.kind === "metadata" ? <div className="lux-admin-job-details">
         {details.isPending ? <p role="status">正在读取失败详情…</p> : null}
@@ -568,6 +593,7 @@ function formatTargetType(targetType: string) {
     library: "媒体库",
     scan_job: "扫描任务",
     metadata_reidentify_job: "元数据任务",
+    strm_probe_operation: "STRM任务",
     settings: "服务端设置",
     user: "用户",
     plugin: "插件",
