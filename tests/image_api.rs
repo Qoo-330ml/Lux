@@ -18,15 +18,55 @@ use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-async fn image_stub() -> Json<Value> {
+async fn image_stub(request: axum::http::Request<axum::body::Body>) -> Json<Value> {
+    let query = request.uri().query().unwrap_or_default();
+    let posters = if query.is_empty() {
+        json!([
+            {
+                "file_path": "/poster-zh.jpg",
+                "iso_639_1": "zh",
+                "width": 1000,
+                "height": 1500,
+                "vote_average": 8.0
+            },
+            {
+                "file_path": "/poster-en.jpg",
+                "iso_639_1": "en",
+                "width": 1000,
+                "height": 1500,
+                "vote_average": 8.0
+            },
+            {
+                "file_path": "/poster-ja.jpg",
+                "iso_639_1": "ja",
+                "width": 1000,
+                "height": 1500,
+                "vote_average": 8.0
+            }
+        ])
+    } else if query.contains("language=zh-CN") {
+        json!([
+            {
+                "file_path": "/poster.jpg",
+                "iso_639_1": "zh",
+                "width": 1000,
+                "height": 1500,
+                "vote_average": 8.0
+            }
+        ])
+    } else {
+        json!([
+            {
+                "file_path": "/poster-en.jpg",
+                "iso_639_1": "en",
+                "width": 1000,
+                "height": 1500,
+                "vote_average": 8.0
+            }
+        ])
+    };
     Json(json!({
-        "posters": [{
-            "file_path": "/poster.jpg",
-            "iso_639_1": "zh",
-            "width": 1000,
-            "height": 1500,
-            "vote_average": 8.0
-        }],
+        "posters": posters,
         "backdrops": [],
         "logos": []
     }))
@@ -115,7 +155,7 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
     );
     let response = client
         .post(format!("{base_url}/api/v1/items/{item_id}/images/search"))
-        .header(COOKIE, cookie)
+        .header(COOKIE, cookie.clone())
         .json(&json!({ "imageType": "POSTER", "language": "zh-CN", "source": "TMDB" }))
         .send()
         .await?;
@@ -126,6 +166,22 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
         "https://image.tmdb.org/t/p/w780/poster.jpg"
     );
     assert_eq!(body["images"][0]["language"], "zh");
+
+    let response = client
+        .post(format!("{base_url}/api/v1/items/{item_id}/images/search"))
+        .header(COOKIE, cookie)
+        .json(&json!({ "imageType": "POSTER", "language": "", "source": "TMDB" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await?;
+    let languages = body["images"]
+        .as_array()
+        .ok_or("image result list is missing")?
+        .iter()
+        .filter_map(|image| image["language"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(languages, vec!["zh", "en", "ja"]);
 
     server.abort();
     tmdb_server.abort();

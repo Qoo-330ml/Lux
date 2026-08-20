@@ -560,13 +560,14 @@ impl TmdbClient {
             ));
         }
         let endpoint = format!("3/tv/{series_id}/season/{season_number}/images");
-        let params = [
-            ("language", language.trim().to_owned()),
-            (
+        let mut params = Vec::new();
+        if !language.trim().is_empty() {
+            params.push(("language", language.trim().to_owned()));
+            params.push((
                 "include_image_language",
                 format!("{},en,null", language.trim()),
-            ),
-        ];
+            ));
+        }
         self.request_json(&endpoint, &params).await
     }
 
@@ -577,7 +578,7 @@ impl TmdbClient {
         episode_number: i32,
         language: &str,
     ) -> Result<TmdbImagesResponse, TmdbError> {
-        validate_id_language(series_id, language, "series")?;
+        validate_id(series_id, "series")?;
         if !(-1..=1000).contains(&season_number) || !(0..=10000).contains(&episode_number) {
             return Err(TmdbError::InvalidRequest(
                 "episode number is out of range".to_owned(),
@@ -585,13 +586,14 @@ impl TmdbClient {
         }
         let endpoint =
             format!("3/tv/{series_id}/season/{season_number}/episode/{episode_number}/images");
-        let params = [
-            ("language", language.trim().to_owned()),
-            (
+        let mut params = Vec::new();
+        if !language.trim().is_empty() {
+            params.push(("language", language.trim().to_owned()));
+            params.push((
                 "include_image_language",
                 format!("{},en,null", language.trim()),
-            ),
-        ];
+            ));
+        }
         self.request_json(&endpoint, &params).await
     }
 
@@ -609,15 +611,16 @@ impl TmdbClient {
         item_id: i64,
         language: &str,
     ) -> Result<TmdbImagesResponse, TmdbError> {
-        validate_id_language(item_id, language, item_type)?;
+        validate_id(item_id, item_type)?;
         let endpoint = format!("3/{item_type}/{item_id}/images");
-        let params = [
-            ("language", language.trim().to_owned()),
-            (
+        let mut params = Vec::new();
+        if !language.trim().is_empty() {
+            params.push(("language", language.trim().to_owned()));
+            params.push((
                 "include_image_language",
                 format!("{},en,null", language.trim()),
-            ),
-        ];
+            ));
+        }
         self.request_json(&endpoint, &params).await
     }
 

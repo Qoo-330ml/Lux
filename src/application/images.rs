@@ -682,11 +682,6 @@ impl ImageCandidateService {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .ok_or(ImageCandidateError::ItemNotIdentified)?;
-        let request_language = if language.is_empty() {
-            "en-US"
-        } else {
-            language
-        };
         let item_type = match identity.item_type.as_str() {
             "MOVIE" => ScraperItemType::Movie,
             "SERIES" => ScraperItemType::Series,
@@ -695,7 +690,7 @@ impl ImageCandidateService {
             _ => return Ok(Vec::new()),
         };
         let tmdb = self.provider_for_item(item_id).await?;
-        let mut image_request = ScraperImageRequest::new(item_type, provider_id, request_language);
+        let mut image_request = ScraperImageRequest::new(item_type, provider_id, language);
         image_request.season_number = identity
             .season_number
             .map(|value| i32::try_from(value).map_err(|_| ImageCandidateError::InvalidItem))

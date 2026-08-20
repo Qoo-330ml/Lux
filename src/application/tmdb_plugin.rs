@@ -162,18 +162,17 @@ impl TmdbPluginClient {
         item_id: i64,
         language: &str,
     ) -> Result<TmdbImagesResponse, TmdbError> {
-        validate_id_language(item_id, language, item_type)?;
-        self.request(
-            &format!("3/{item_type}/{item_id}/images"),
-            vec![
-                ("language".to_owned(), language.trim().to_owned()),
-                (
-                    "include_image_language".to_owned(),
-                    format!("{},en,null", language.trim()),
-                ),
-            ],
-        )
-        .await
+        validate_id(item_id, item_type)?;
+        let mut params = Vec::new();
+        if !language.trim().is_empty() {
+            params.push(("language".to_owned(), language.trim().to_owned()));
+            params.push((
+                "include_image_language".to_owned(),
+                format!("{},en,null", language.trim()),
+            ));
+        }
+        self.request(&format!("3/{item_type}/{item_id}/images"), params)
+            .await
     }
 
     async fn season_images(
@@ -182,21 +181,23 @@ impl TmdbPluginClient {
         season_number: i32,
         language: &str,
     ) -> Result<TmdbImagesResponse, TmdbError> {
-        validate_id_language(series_id, language, "series")?;
+        validate_id(series_id, "series")?;
         if !(-1..=1000).contains(&season_number) {
             return Err(TmdbError::InvalidRequest(
                 "season number is out of range".to_owned(),
             ));
         }
+        let mut params = Vec::new();
+        if !language.trim().is_empty() {
+            params.push(("language".to_owned(), language.trim().to_owned()));
+            params.push((
+                "include_image_language".to_owned(),
+                format!("{},en,null", language.trim()),
+            ));
+        }
         self.request(
             &format!("3/tv/{series_id}/season/{season_number}/images"),
-            vec![
-                ("language".to_owned(), language.trim().to_owned()),
-                (
-                    "include_image_language".to_owned(),
-                    format!("{},en,null", language.trim()),
-                ),
-            ],
+            params,
         )
         .await
     }
@@ -208,21 +209,23 @@ impl TmdbPluginClient {
         episode_number: i32,
         language: &str,
     ) -> Result<TmdbImagesResponse, TmdbError> {
-        validate_id_language(series_id, language, "series")?;
+        validate_id(series_id, "series")?;
         if !(-1..=1000).contains(&season_number) || !(0..=10000).contains(&episode_number) {
             return Err(TmdbError::InvalidRequest(
                 "episode number is out of range".to_owned(),
             ));
         }
+        let mut params = Vec::new();
+        if !language.trim().is_empty() {
+            params.push(("language".to_owned(), language.trim().to_owned()));
+            params.push((
+                "include_image_language".to_owned(),
+                format!("{},en,null", language.trim()),
+            ));
+        }
         self.request(
             &format!("3/tv/{series_id}/season/{season_number}/episode/{episode_number}/images"),
-            vec![
-                ("language".to_owned(), language.trim().to_owned()),
-                (
-                    "include_image_language".to_owned(),
-                    format!("{},en,null", language.trim()),
-                ),
-            ],
+            params,
         )
         .await
     }
