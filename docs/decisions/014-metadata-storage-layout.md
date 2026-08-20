@@ -13,12 +13,14 @@ Emby 的 `/config/metadata` 目录提供了可借鉴的按对象分组和分片�
 
 - Lux 管理的元数据资源统一位于 `/config/metadata`。
 - `library/<shard>/<item-id>/` 存放 Lux 管理的媒体条目图片、章节缩略图和后续资源。
-- 规范人物使用 `people/person/<shard>/<person-key>/` 存放人物头像和 `person.nfo`；旧版
-  `people/<bucket>/<display-name>-<provider>-<provider-id>/` 目录只作为兼容读取位置。
+- 规范人物使用 `people/person/<initial>/<display-name>-lux-<number>/` 存放人物头像、`person.nfo`
+  和可恢复的 `person.json`；其中 `lux-<number>` 是永久不复用的 Lux 人物 ID，展示名只用于可读性。
+  旧版 `people/<bucket>/<display-name>-<provider>-<provider-id>/` 以及旧的哈希目录只作为兼容读取位置。
 - `collections`、`genres`、`studios`、`tags` 使用
   `<kind>/<bucket>/<display-name>-<provider>-<object-id>/` 的对象目录模式，按后续任务逐步启用；
   当前只确定路径合同，不代表这些对象已经进入数据库或 API。
-- 文件系统只保存资源和可迁移快照；媒体筛选、人物关系和对象索引仍由数据库负责。
+- 文件系统只保存资源和可迁移快照；媒体筛选、人物关系和对象索引仍由数据库负责。数据库丢失后，
+  后台可从 `person.json`、`people.json` 和媒体的稳定来源键恢复人物及关系，不要求原数据库中的 UUID。
 - 媒体目录中的现有 NFO 和本地图片继续遵守 ADR-005，不因新增配置卷目录而自动迁移或降低优先级。
 - 由 Lux 在线刮削或后台任务新生成的图片优先写入 metadata/library；媒体目录仍作为本地图片输入和
   兼容资源位置。
@@ -28,8 +30,11 @@ Emby 的 `/config/metadata` 目录提供了可借鉴的按对象分组和分片�
 
 - 媒体条目使用稳定的 Lux item ID，不使用标题或媒体文件名作为身份；目录前增加稳定分片，避免
   单目录堆积大量文件。
-- 人物目录名称只用于可读性，真实身份必须包含 provider 和 provider ID；展示名经过受限清洗，
-  不得产生路径穿越或控制字符。
+- 人物目录名称只用于可读性，真实身份是不可变的 Lux 人物 ID；展示名经过受限清洗，不得产生
+  路径穿越或控制字符。同名人物通过不同 Lux 人物 ID 隔离，不能因为目录名相同而合并。
+- `person.json` 保存 Lux 人物 ID、当前展示名、所有已确认的 `(provider, provider ID)` 映射、
+  匹配证据和快照版本；数据库只保存运行时索引。更换刮削器时，先查映射和媒体关系，再按可解释的
+  高置信证据自动复用人物；只有候选冲突或证据不足时进入后台待确认队列。
 - 辅助对象目录名称同样只用于可读性，使用展示名首字符桶分散目录；真实身份必须包含 provider
   和 object ID，provider 与 object ID 必须是受限 ASCII 路径组件。
 - 对象主图使用 `folder.<ext>`；人物资料快照使用 `person.nfo`。文件写入采用临时文件、同步和

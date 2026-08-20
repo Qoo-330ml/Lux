@@ -2,15 +2,17 @@
 
 ## 范围
 
-建立 `/config/metadata` 的路径合同和安全写入基础，并将人物缓存迁移到按首字符、名称、Provider
-和 Provider ID 分组的对象目录。旧 `/config/people/items` 与 `/config/people/profiles` 继续只读兼容。
+建立 `/config/metadata` 的路径合同和安全写入基础，并将人物缓存迁移到按首字符、可读名称和永久
+Lux 人物 ID 分组的对象目录。旧 `/config/people/items`、`/config/people/profiles`、旧 Provider
+目录和旧哈希目录继续只读兼容。
 
 本任务不新增人物数据库关系、不改变媒体目录 NFO 写回、不实现 genres/studios/tags API；这些内容
 在后续任务中按垂直切片实施。
 
 ## 验收
 
-- [x] 人物头像和 `person.nfo` 写入 `/config/metadata/people/<bucket>/<name>-<provider>-<id>/`。
+- [x] 人物头像和 `person.nfo` 写入 `/config/metadata/people/person/<initial>/<name>-lux-<number>/`。
+- [ ] 人物目录同时保存带版本和校验信息的 `person.json`，记录 Lux 人物 ID、Provider 映射和恢复证据。
 - [x] 人物条目关系快照写入 `/config/metadata/library/<shard>/<item-id>/people.json`。
 - [x] 旧人物目录仍可读取，升级不会要求手工搬运或删除文件。
 - [x] 路径清洗、稳定分片、符号链接拒绝和原子写入有自动化测试。
