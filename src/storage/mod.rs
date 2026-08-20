@@ -1728,6 +1728,8 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let person_group =
+            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
         let person_sort_order = person_sort_order(options.sort_by, options.descending);
         let recursive_clause = if options.recursive {
             String::new()
@@ -1736,14 +1738,14 @@ impl Database {
         };
         let count_query = format!(
             "SELECT COUNT(*) FROM (
-                 SELECT pc.provider, pc.person_id
+                 SELECT {person_group}
                  FROM person_credits pc
                  JOIN media_items mi ON mi.id = pc.item_id
                  WHERE mi.library_id IN ({placeholders})
                    AND mi.removed_at IS NULL
                    {recursive_clause}
                    AND pc.person_type = ?
-                 GROUP BY pc.provider, pc.person_id
+                 GROUP BY {person_group}
              )"
         );
         let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
@@ -1765,8 +1767,9 @@ impl Database {
             })?;
         let list_query = format!(
             "SELECT MIN(pc.item_id) AS item_id,
-                    pc.person_id,
-                    pc.provider,
+                    MIN(pc.person_id) AS person_id,
+                    MIN(pc.lux_person_id) AS lux_person_id,
+                    MIN(pc.provider) AS provider,
                     MIN(pc.person_name) AS person_name,
                     MIN(pc.role) AS role,
                     MIN(mi.added_at) AS date_created,
@@ -1788,7 +1791,7 @@ impl Database {
                AND mi.removed_at IS NULL
                {recursive_clause}
                AND pc.person_type = ?
-             GROUP BY pc.provider, pc.person_id
+             GROUP BY {person_group}
              ORDER BY {person_sort_order}
              LIMIT ? OFFSET ?"
         );
@@ -1829,10 +1832,13 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let person_group =
+            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
         let query = format!(
             "SELECT MIN(pc.item_id) AS item_id,
-                    pc.person_id,
-                    pc.provider,
+                    MIN(pc.person_id) AS person_id,
+                    MIN(pc.lux_person_id) AS lux_person_id,
+                    MIN(pc.provider) AS provider,
                     MIN(pc.person_name) AS person_name,
                     MIN(pc.role) AS role,
                     MIN(mi.added_at) AS date_created,
@@ -1853,11 +1859,11 @@ impl Database {
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                AND pc.person_type = ?
-               AND pc.person_id = ?
-             GROUP BY pc.provider, pc.person_id
-             ORDER BY CASE WHEN pc.provider = '' THEN 1 ELSE 0 END,
-                      pc.provider ASC,
-                      pc.person_id ASC"
+               AND (pc.person_id = ? OR pc.lux_person_id = ?)
+             GROUP BY {person_group}
+             ORDER BY CASE WHEN MIN(pc.provider) = '' THEN 1 ELSE 0 END,
+                      MIN(pc.provider) ASC,
+                      MIN(pc.person_id) ASC"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
         for library_id in library_ids {
@@ -1865,6 +1871,7 @@ impl Database {
         }
         let rows = statement
             .bind(person_type)
+            .bind(person_id)
             .bind(person_id)
             .fetch_all(&self.pool)
             .await
@@ -1890,10 +1897,13 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let person_group =
+            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
         let query = format!(
             "SELECT MIN(pc.item_id) AS item_id,
-                    pc.person_id,
-                    pc.provider,
+                    MIN(pc.person_id) AS person_id,
+                    MIN(pc.lux_person_id) AS lux_person_id,
+                    MIN(pc.provider) AS provider,
                     MIN(pc.person_name) AS person_name,
                     MIN(pc.role) AS role,
                     MIN(mi.added_at) AS date_created,
@@ -1915,10 +1925,10 @@ impl Database {
                AND mi.removed_at IS NULL
                AND pc.person_type = ?
                AND pc.person_name = ?
-             GROUP BY pc.provider, pc.person_id
-             ORDER BY CASE WHEN pc.provider = '' THEN 1 ELSE 0 END,
-                      pc.provider ASC,
-                      pc.person_id ASC"
+             GROUP BY {person_group}
+             ORDER BY CASE WHEN MIN(pc.provider) = '' THEN 1 ELSE 0 END,
+                      MIN(pc.provider) ASC,
+                      MIN(pc.person_id) ASC"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
         for library_id in library_ids {
@@ -13866,10 +13876,10 @@ fn person_sort_order(sort_by: PersonSort, descending: bool) -> String {
     let direction = if descending { "DESC" } else { "ASC" };
     match sort_by {
         PersonSort::Name => format!(
-            "MIN(pc.person_name) {direction}, MIN(mi.added_at) DESC, pc.provider ASC, pc.person_id ASC"
+            "MIN(pc.person_name) {direction}, MIN(mi.added_at) DESC, MIN(pc.provider) ASC, MIN(pc.person_id) ASC"
         ),
         PersonSort::DateCreated => format!(
-            "MIN(mi.added_at) {direction}, MIN(pc.person_name) ASC, pc.provider ASC, pc.person_id ASC"
+            "MIN(mi.added_at) {direction}, MIN(pc.person_name) ASC, MIN(pc.provider) ASC, MIN(pc.person_id) ASC"
         ),
     }
 }
@@ -14585,10 +14595,31 @@ mod tests {
                 &[
                     NewPersonCredit {
                         person_id: "1".to_owned(),
-                        lux_person_id: None,
+                        lux_person_id: Some("lux-000001".to_owned()),
                         person_type: "Actor".to_owned(),
                         person_name: "演员甲".to_owned(),
                         provider: "tmdb".to_owned(),
+                        role: "角色甲".to_owned(),
+                        sort_order: 0,
+                        biography: None,
+                        birthday: None,
+                        deathday: None,
+                        known_for_department: None,
+                        place_of_birth: None,
+                        provider_ids: BTreeMap::new(),
+                        genres: Vec::new(),
+                        tags: Vec::new(),
+                        production_locations: Vec::new(),
+                        premiere_date: None,
+                        production_year: None,
+                        taglines: Vec::new(),
+                    },
+                    NewPersonCredit {
+                        person_id: "9".to_owned(),
+                        lux_person_id: Some("lux-000001".to_owned()),
+                        person_type: "Actor".to_owned(),
+                        person_name: "演员甲".to_owned(),
+                        provider: "douban".to_owned(),
                         role: "角色甲".to_owned(),
                         sort_order: 0,
                         biography: None,
@@ -14651,6 +14682,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"演员甲"));
         assert!(names.contains(&"演员乙"));
+        assert_eq!(
+            credits
+                .iter()
+                .filter(|credit| credit.lux_person_id.as_deref() == Some("lux-000001"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
