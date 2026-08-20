@@ -5,6 +5,7 @@ import test from "node:test";
 const stylesheet = fs.readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
 const pluginStyles = fs.readFileSync(new URL("../src/features/admin/plugin-library.css", import.meta.url), "utf8");
 const pluginsPage = fs.readFileSync(new URL("../src/features/admin/AdminPluginsPage.tsx", import.meta.url), "utf8");
+const usersPage = fs.readFileSync(new URL("../src/features/admin/AdminUsersPage.tsx", import.meta.url), "utf8");
 
 function rule(selector) {
   return stylesheet.match(new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
@@ -43,4 +44,13 @@ test("plugin heading actions share the compact button tier", () => {
   assert.match(pluginsPage, /className="lux-button lux-button-compact lux-button-secondary lux-admin-plugin-store-trigger"/);
   const storeTriggerRule = pluginStyles.match(/\.lux-admin-plugin-store-trigger\s*\{([^}]*)\}/)?.[1] ?? "";
   assert.doesNotMatch(storeTriggerRule, /min-height:|font-size:/);
+});
+
+test("user row actions share the compact button tier", () => {
+  assert.match(usersPage, /className="lux-button lux-button-compact lux-button-secondary"/);
+  const userIconRule = rule(".lux-admin-user-actions .lux-icon-button-small");
+  assert.match(userIconRule, /min-width:\s*var\(--lux-button-height-compact\)/);
+  assert.match(userIconRule, /width:\s*var\(--lux-button-height-compact\)/);
+  assert.match(userIconRule, /height:\s*var\(--lux-button-height-compact\)/);
+  assert.doesNotMatch(rule(".lux-admin-delete-user"), /min-width:|width:|height:/);
 });

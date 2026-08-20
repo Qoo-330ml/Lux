@@ -979,7 +979,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-user-badge.is-ok { border-color: rgba(96,194,132,.25); color: #9bdcb3; background: rgba(96,194,132,.09); }
 .lux-user-badge.is-warn { border-color: rgba(226,163,75,.25); color: #f3c788; background: rgba(226,163,75,.09); }
 .lux-admin-user-actions { display: flex; align-items: center; gap: 7px; }
-.lux-admin-delete-user { min-width: 44px; width: 44px; height: 44px; color: #ee9eaa; }
+.lux-admin-user-actions .lux-icon-button-small { min-width: var(--lux-button-height-compact); width: var(--lux-button-height-compact); height: var(--lux-button-height-compact); }
+.lux-admin-delete-user { color: #ee9eaa; }
 .lux-admin-delete-user:hover { border-color: rgba(238,158,170,.55); color: #ffd6dc; background: rgba(190,54,76,.16); }
 .lux-admin-user-action-error { grid-column: 1 / -1; margin: 0; }
 .lux-admin-user-detail { grid-column: 1 / -1; display: grid; gap: 17px; padding: 17px 0 2px; border-top: 1px solid var(--lux-line-soft); }
