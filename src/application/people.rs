@@ -173,6 +173,8 @@ struct StoredActor {
     provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     person_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lux_person_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     identities: Vec<PersonIdentity>,
     #[serde(default)]
@@ -194,6 +196,14 @@ struct StoredPeopleRelation {
     schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_relative_path: Option<String>,
     #[serde(default)]
     actors: Vec<StoredActor>,
 }
@@ -299,9 +309,10 @@ impl PeopleService {
         &self,
         actor: &ActorCredit,
         identities: &[PersonIdentity],
+        bridge_person_key: Option<&str>,
     ) -> Result<Option<String>, PeopleError> {
         if identities.is_empty() {
-            return Ok(None);
+            return Ok(bridge_person_key.map(str::to_owned));
         }
         let Some(database) = &self.database else {
             return Ok(person_key_for_identities(identities));
@@ -327,6 +338,28 @@ impl PeopleService {
                 return Ok(None);
             }
             mapped_person = Some(candidate);
+        }
+
+        if mapped_person.is_none()
+            && let Some(bridge_person_key) = bridge_person_key
+        {
+            if identities.is_empty() {
+                return Ok(Some(bridge_person_key.to_owned()));
+            }
+            for identity in identities {
+                database
+                    .attach_canonical_person_identity(
+                        bridge_person_key,
+                        &identity.provider,
+                        &identity.id,
+                        "SAME_MEDIA_BRIDGE",
+                        Some(0.97),
+                        r#"{"method":"same-media-bridge"}"#,
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            }
+            return Ok(Some(bridge_person_key.to_owned()));
         }
 
         let person = match mapped_person {
@@ -403,6 +436,18 @@ impl PeopleService {
             PeopleError::Serialization("people relation path has no parent".to_owned())
         })?;
         create_private_dir(relation_dir).await?;
+        let previous_relation = read_relation(&relation_path).await?;
+        let source_locator = if let Some(database) = &self.database {
+            match database.find_item_source_locator(item_id).await {
+                Ok(locator) => locator,
+                Err(error) => {
+                    tracing::warn!(item_id, %error, "person relation source locator was unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let mut stored = Vec::new();
         let mut pending_assets = Vec::new();
@@ -419,7 +464,13 @@ impl PeopleService {
             let actor_provider = primary
                 .map(|identity| identity.provider.as_str())
                 .unwrap_or_default();
-            let person_key = self.resolve_person_key(actor, &identities).await?;
+            let bridge_person_key = same_media_bridge_person_key(
+                previous_relation.as_ref(),
+                actor,
+            );
+            let person_key = self
+                .resolve_person_key(actor, &identities, bridge_person_key)
+                .await?;
             let has_stable_identity = person_key.is_some();
             let assets = if has_stable_identity {
                 self.persist_person_assets(
@@ -439,6 +490,10 @@ impl PeopleService {
             if has_stable_identity && !assets.pending_assets.is_empty() {
                 pending_assets.push(actor_id.to_owned());
             }
+            let lux_person_id = person_key
+                .as_deref()
+                .filter(|person_key| person_key.starts_with("lux-"))
+                .map(str::to_owned);
             stored.push(StoredActor {
                 id: has_stable_identity.then(|| actor_id.to_owned()),
                 name: actor.name.trim().to_owned(),
@@ -448,6 +503,7 @@ impl PeopleService {
                     String::new()
                 },
                 person_key,
+                lux_person_id,
                 identities,
                 character: actor
                     .character
@@ -468,6 +524,12 @@ impl PeopleService {
             source_fingerprint: source_fingerprint
                 .filter(|fingerprint| !fingerprint.is_empty())
                 .map(encode_fingerprint),
+            item_id: Some(item_id.to_owned()),
+            source_key: source_locator
+                .as_ref()
+                .map(|(root, relative)| stable_source_key(root, relative)),
+            source_root: source_locator.as_ref().map(|(root, _)| root.clone()),
+            source_relative_path: source_locator.map(|(_, relative)| relative),
             actors: stored,
         };
         let bytes = serde_json::to_vec_pretty(&relation)
@@ -933,6 +995,14 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
+        let restored_people = self.restore_person_manifests(database).await?;
+        if restored_people > 0 {
+            tracing::info!(restored_people, "canonical people manifests restored");
+        }
+        let restored_relations = self.restore_person_relation_snapshots(database).await?;
+        if restored_relations > 0 {
+            tracing::info!(restored_relations, "people relation snapshots restored");
+        }
         let library_ids = database
             .list_enabled_library_ids()
             .await
@@ -968,6 +1038,163 @@ impl PeopleService {
             }
         }
         Ok(rebuilt_items)
+    }
+
+    async fn restore_person_manifests(&self, database: &Database) -> Result<usize, PeopleError> {
+        let root = metadata_root(&self.config_dir)
+            .join(LEGACY_PEOPLE_DIR)
+            .join("person");
+        let mut initials = match fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: root,
+                    source,
+                });
+            }
+        };
+        let mut restored = 0;
+        while let Some(initial) = initials.next_entry().await.map_err(|source| PeopleError::Io {
+            path: root.clone(),
+            source,
+        })? {
+            let initial_path = initial.path();
+            if safe_metadata(&initial_path)
+                .await?
+                .is_none_or(|metadata| !metadata.is_dir())
+            {
+                continue;
+            }
+            let mut persons = fs::read_dir(&initial_path)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: initial_path.clone(),
+                    source,
+                })?;
+            while let Some(person) = persons.next_entry().await.map_err(|source| PeopleError::Io {
+                path: initial_path.clone(),
+                source,
+            })? {
+                let person_dir = person.path();
+                if safe_metadata(&person_dir)
+                    .await?
+                    .is_none_or(|metadata| !metadata.is_dir())
+                {
+                    continue;
+                }
+                let manifest_path = person_dir.join(PERSON_MANIFEST);
+                let Some(bytes) = (match read_people_file(&manifest_path).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(path = %manifest_path.display(), %error, "skipping unreadable person manifest");
+                        continue;
+                    }
+                }) else {
+                    continue;
+                };
+                let manifest = match serde_json::from_slice::<PersonManifest>(&bytes) {
+                    Ok(manifest) if valid_person_manifest(&manifest) => manifest,
+                    Ok(_) | Err(_) => {
+                        tracing::warn!(path = %manifest_path.display(), "skipping invalid person manifest");
+                        continue;
+                    }
+                };
+                let identities = manifest
+                    .identities
+                    .iter()
+                    .map(|identity| (identity.provider.as_str(), identity.id.as_str()))
+                    .collect::<Vec<_>>();
+                if database
+                    .restore_canonical_person(
+                        &manifest.lux_person_id,
+                        &manifest.display_name,
+                        &identities,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    restored += 1;
+                }
+            }
+        }
+        Ok(restored)
+    }
+
+    async fn restore_person_relation_snapshots(
+        &self,
+        database: &Database,
+    ) -> Result<usize, PeopleError> {
+        let root = metadata_root(&self.config_dir).join("library");
+        let mut shards = match fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: root,
+                    source,
+                });
+            }
+        };
+        let mut restored = 0;
+        while let Some(shard) = shards.next_entry().await.map_err(|source| PeopleError::Io {
+            path: root.clone(),
+            source,
+        })? {
+            let shard_path = shard.path();
+            if safe_metadata(&shard_path)
+                .await?
+                .is_none_or(|metadata| !metadata.is_dir())
+            {
+                continue;
+            }
+            let mut items = fs::read_dir(&shard_path)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: shard_path.clone(),
+                    source,
+                })?;
+            while let Some(item) = items.next_entry().await.map_err(|source| PeopleError::Io {
+                path: shard_path.clone(),
+                source,
+            })? {
+                let relation_path = item.path().join("people.json");
+                let relation = match read_relation(&relation_path).await {
+                    Ok(Some(relation)) => relation,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(path = %relation_path.display(), %error, "skipping unreadable people relation snapshot");
+                        continue;
+                    }
+                };
+                let (Some(source_root), Some(source_relative_path)) = (
+                    relation.source_root.as_deref(),
+                    relation.source_relative_path.as_deref(),
+                ) else {
+                    continue;
+                };
+                let Some(item_id) = database
+                    .find_item_by_source_locator(source_root, source_relative_path)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?
+                else {
+                    continue;
+                };
+                let credits = relation
+                    .actors
+                    .iter()
+                    .take(MAX_ACTORS)
+                    .filter(|actor| !actor.name.trim().is_empty())
+                    .map(person_credit_from_stored_actor)
+                    .collect::<Vec<_>>();
+                database
+                    .replace_person_credits(&item_id, &credits)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                restored += 1;
+            }
+        }
+        Ok(restored)
     }
 
     async fn rebuild_item_person_credit_index(&self, item_id: &str) -> Result<(), PeopleError> {
@@ -1907,6 +2134,10 @@ fn parse_relation(bytes: &[u8]) -> Result<StoredPeopleRelation, PeopleError> {
         return Ok(StoredPeopleRelation {
             schema_version: 0,
             source_fingerprint: None,
+            item_id: None,
+            source_key: None,
+            source_root: None,
+            source_relative_path: None,
             actors,
         });
     }
@@ -2565,6 +2796,94 @@ fn actor_identities(actor: &ActorCredit, fallback_provider: &str) -> Vec<PersonI
     identities
 }
 
+fn same_media_bridge_person_key<'a>(
+    relation: Option<&'a StoredPeopleRelation>,
+    actor: &ActorCredit,
+) -> Option<&'a str> {
+    let relation = relation?;
+    let name = normalize_person_match_text(&actor.name);
+    let candidates = relation
+        .actors
+        .iter()
+        .filter(|previous| {
+            previous
+                .person_key
+                .as_deref()
+                .is_some_and(|person_key| person_key.starts_with("lux-"))
+                && normalize_person_match_text(&previous.name) == name
+                && match (actor.character.as_deref(), previous.character.as_deref()) {
+                    (Some(current), Some(previous)) => {
+                        normalize_person_match_text(current)
+                            == normalize_person_match_text(previous)
+                    }
+                    _ => true,
+                }
+                && match (actor.order, previous.order) {
+                    (Some(current), Some(previous)) => current == previous,
+                    _ => true,
+                }
+        })
+        .filter(|previous| {
+            actor
+                .character
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && previous
+                    .character
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                || actor.order.is_some() && previous.order.is_some()
+        })
+        .collect::<Vec<_>>();
+    (candidates.len() == 1).then(|| candidates[0].person_key.as_deref())?
+}
+
+fn normalize_person_match_text(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn valid_person_manifest(manifest: &PersonManifest) -> bool {
+    let Some(sequence) = manifest.lux_person_id.strip_prefix("lux-") else {
+        return false;
+    };
+    if manifest.schema_version != PERSON_MANIFEST_SCHEMA_VERSION
+        || sequence.len() < 6
+        || !sequence.chars().all(|character| character.is_ascii_digit())
+        || manifest.display_name.trim().is_empty()
+        || manifest.checksum.is_empty()
+        || manifest.identities.iter().any(|identity| {
+            !is_valid_person_id(&identity.provider) || !is_valid_person_id(&identity.id)
+        })
+    {
+        return false;
+    }
+    let mut unsigned = manifest.clone();
+    let expected = unsigned.checksum.clone();
+    unsigned.checksum.clear();
+    let Ok(bytes) = serde_json::to_vec(&unsigned) else {
+        return false;
+    };
+    let digest = Sha256::digest(bytes);
+    let actual = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    actual == expected
+}
+
+fn stable_source_key(root_path: &str, relative_path: &str) -> String {
+    let mut source = Vec::with_capacity(root_path.len() + relative_path.len() + 1);
+    source.extend_from_slice(root_path.as_bytes());
+    source.push(0);
+    source.extend_from_slice(relative_path.as_bytes());
+    Sha256::digest(source)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn person_key_for_identities(identities: &[PersonIdentity]) -> Option<String> {
     if identities.is_empty() {
         return None;
@@ -2857,7 +3176,7 @@ mod tests {
             config_dir: config_dir.path().join("config"),
         };
         let database = Database::connect(&config).await?;
-        let service = PeopleService::new(config.config_dir.clone()).with_database(database);
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
         let first = ActorCredit {
             id: "57975".to_owned(),
             provider: Some("tmdb".to_owned()),
@@ -2870,7 +3189,7 @@ mod tests {
         };
         let first_identities = super::actor_identities(&first, "tmdb");
         let first_person = service
-            .resolve_person_key(&first, &first_identities)
+            .resolve_person_key(&first, &first_identities, None)
             .await?
             .ok_or("first person was not created")?;
         assert_eq!(first_person, "lux-000001");
@@ -2885,6 +3204,49 @@ mod tests {
             .await;
         let person_dir = lux_person_directory(&config.config_dir, "华晨宇", &first_person)?;
         assert!(person_dir.join("person.json").exists());
+
+        let previous_relation = super::StoredPeopleRelation {
+            schema_version: 2,
+            source_fingerprint: None,
+            item_id: None,
+            source_key: None,
+            source_root: None,
+            source_relative_path: None,
+            actors: vec![super::StoredActor {
+                id: Some("57975".to_owned()),
+                name: "华晨宇".to_owned(),
+                provider: "tmdb".to_owned(),
+                person_key: Some(first_person.clone()),
+                lux_person_id: Some(first_person.clone()),
+                identities: first_identities.clone(),
+                character: None,
+                order: Some(0),
+                image_file: None,
+                pending_assets: Vec::new(),
+                person: None,
+            }],
+        };
+        let bridge_actor = ActorCredit {
+            id: "1313123".to_owned(),
+            provider: Some("douban".to_owned()),
+            identities: Vec::new(),
+            name: "华晨宇".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+        let bridge_identities = super::actor_identities(&bridge_actor, "douban");
+        let bridge_key = super::same_media_bridge_person_key(
+            Some(&previous_relation),
+            &bridge_actor,
+        )
+        .ok_or("same-media bridge was not selected")?;
+        let bridged_person = service
+            .resolve_person_key(&bridge_actor, &bridge_identities, Some(bridge_key))
+            .await?
+            .ok_or("same-media bridge did not resolve")?;
+        assert_eq!(bridged_person, first_person);
 
         let second = ActorCredit {
             id: "1313123".to_owned(),
@@ -2901,7 +3263,7 @@ mod tests {
         };
         let second_identities = super::actor_identities(&second, "douban");
         let second_person = service
-            .resolve_person_key(&second, &second_identities)
+            .resolve_person_key(&second, &second_identities, None)
             .await?
             .ok_or("second person was not resolved")?;
         assert_eq!(second_person, first_person);
@@ -2921,6 +3283,23 @@ mod tests {
         let nfo = tokio::fs::read_to_string(person_dir.join("person.nfo")).await?;
         assert!(nfo.contains("type=\"tmdb\">57975"));
         assert!(nfo.contains("type=\"douban\">1313123"));
+
+        sqlx::query("DELETE FROM person_identities")
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM people")
+            .execute(database.pool())
+            .await?;
+        assert_eq!(
+            service.restore_person_manifests(&database).await?,
+            1,
+            "manifest should restore one canonical person"
+        );
+        let restored = database
+            .find_canonical_person_by_identity("douban", "1313123")
+            .await?
+            .ok_or("restored provider identity was not indexed")?;
+        assert_eq!(restored.id, "lux-000001");
         Ok(())
     }
 
@@ -3043,6 +3422,7 @@ mod tests {
             name: "本地演员".to_owned(),
             provider: String::new(),
             person_key: None,
+            lux_person_id: None,
             identities: Vec::new(),
             character: None,
             order: Some(0),

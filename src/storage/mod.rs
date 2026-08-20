@@ -1163,6 +1163,54 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_item_source_locator(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        self.query(
+            "SELECT lr.canonical_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE ms.item_id = ? AND fe.is_missing = 0
+             ORDER BY ms.is_default DESC, ms.id
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(|row| (row.get("canonical_path"), row.get("relative_path"))))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_item_by_source_locator(
+        &self,
+        root_path: &str,
+        relative_path: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT ms.item_id
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE lr.canonical_path = ? AND fe.relative_path = ?
+               AND fe.is_missing = 0
+             ORDER BY ms.is_default DESC, ms.id
+             LIMIT 1",
+        )
+        .bind(root_path)
+        .bind(relative_path)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_item_scraper_id(
         &self,
         item_id: &str,
@@ -1308,15 +1356,29 @@ impl Database {
             return Ok(stored);
         }
 
-        let sequence: i64 = self
-            .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let person_id = format!("lux-{sequence:06}");
+        let person_id = loop {
+            let sequence: i64 = self
+                .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let candidate = format!("lux-{sequence:06}");
+            let exists: Option<i64> = self
+                .query_scalar("SELECT 1 FROM people WHERE id = ?")
+                .bind(&candidate)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if exists.is_none() {
+                break candidate;
+            }
+        };
         self.query(
             "INSERT INTO people (
                 id, display_name, directory_name, normalized_name, status, created_at, updated_at
@@ -1412,6 +1474,85 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn restore_canonical_person(
+        &self,
+        person_id: &str,
+        display_name: &str,
+        identities: &[(&str, &str)],
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        let now = current_unix_timestamp();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
+            "INSERT INTO people (
+                id, display_name, directory_name, normalized_name, status, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                display_name = excluded.display_name,
+                directory_name = excluded.directory_name,
+                normalized_name = excluded.normalized_name,
+                updated_at = excluded.updated_at",
+        )
+        .bind(person_id)
+        .bind(display_name)
+        .bind(display_name)
+        .bind(display_name)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        for (provider, provider_id) in identities {
+            self.query(
+                "INSERT INTO person_identities (
+                    person_id, provider, provider_id, match_method, confidence,
+                    evidence_json, created_at, updated_at
+                 ) VALUES (?, ?, ?, 'RECOVERED_MANIFEST', ?, ?, ?, ?)
+                 ON CONFLICT(provider, provider_id) DO NOTHING",
+            )
+            .bind(person_id)
+            .bind(provider)
+            .bind(provider_id)
+            .bind(Some(1.0_f64))
+            .bind(r#"{"method":"person-manifest"}"#)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        let row = self
+            .query("SELECT id, display_name, directory_name, status FROM people WHERE id = ?")
+            .bind(person_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let stored = stored_canonical_person(row);
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(stored)
     }
 
     pub(crate) async fn attach_canonical_person_identity(
