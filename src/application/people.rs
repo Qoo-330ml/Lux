@@ -20,20 +20,25 @@ use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::application::metadata_paths::{
-    MetadataPathError, canonical_person_directory, library_item_directory, metadata_root,
-    people_directory, people_index_directory, people_index_path, people_index_path_for_provider,
-    readable_component,
+    MetadataPathError, canonical_person_directory, library_item_directory, lux_person_directory,
+    metadata_root, people_directory, people_index_directory, people_index_path,
+    people_index_path_for_provider, readable_component,
 };
-use crate::storage::{Database, NewPersonCredit, PersonListOptions, StoredPersonCredit};
+use crate::storage::{
+    Database, NewPersonCredit, PersonListOptions, StoredCanonicalPerson, StoredPersonCredit,
+};
 
 const LEGACY_PEOPLE_DIR: &str = "people";
 const LEGACY_ITEMS_DIR: &str = "items";
 const LEGACY_PROFILES_DIR: &str = "profiles";
 const PERSON_NFO: &str = "person.nfo";
+const PERSON_MANIFEST: &str = "person.json";
 const PERSON_IMAGE: &str = "folder";
 const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 2;
+const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
 const PENDING_PERSON_NFO: &str = "personNfo";
+const PENDING_PERSON_MANIFEST: &str = "personManifest";
 const PENDING_PROFILE_IMAGE: &str = "profileImage";
 const PENDING_PERSON_INDEX: &str = "personIndex";
 const MAX_ACTORS: usize = 12;
@@ -212,6 +217,18 @@ struct StoredPersonIndex {
     person_key: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonManifest {
+    schema_version: u32,
+    lux_person_id: String,
+    display_name: String,
+    identities: Vec<PersonIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    person: Option<PersonMetadata>,
+    checksum: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActorView {
@@ -278,6 +295,78 @@ impl PeopleService {
         }
     }
 
+    async fn resolve_person_key(
+        &self,
+        actor: &ActorCredit,
+        identities: &[PersonIdentity],
+    ) -> Result<Option<String>, PeopleError> {
+        if identities.is_empty() {
+            return Ok(None);
+        }
+        let Some(database) = &self.database else {
+            return Ok(person_key_for_identities(identities));
+        };
+
+        let mut mapped_person: Option<StoredCanonicalPerson> = None;
+        for identity in identities {
+            let candidate = database
+                .find_canonical_person_by_identity(&identity.provider, &identity.id)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if mapped_person
+                .as_ref()
+                .is_some_and(|person| person.id != candidate.id)
+            {
+                tracing::warn!(
+                    actor = %actor.name,
+                    "actor provider identities map to different canonical people"
+                );
+                return Ok(None);
+            }
+            mapped_person = Some(candidate);
+        }
+
+        let person = match mapped_person {
+            Some(person) => person,
+            None => database
+                .resolve_or_create_canonical_person(
+                    &actor.name,
+                    &identities[0].provider,
+                    &identities[0].id,
+                    "PROVIDER_ID",
+                    Some(1.0),
+                    r#"{"method":"provider-id"}"#,
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?,
+        };
+        for identity in identities {
+            if database
+                .find_canonical_person_by_identity(&identity.provider, &identity.id)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+                .is_some()
+            {
+                continue;
+            }
+            database
+                .attach_canonical_person_identity(
+                    &person.id,
+                    &identity.provider,
+                    &identity.id,
+                    "SAME_SOURCE_ID_SET",
+                    Some(0.99),
+                    r#"{"method":"same-source-id-set"}"#,
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        }
+        Ok(Some(person.id))
+    }
+
     pub async fn persist_item_actors(
         &self,
         item_id: &str,
@@ -330,7 +419,7 @@ impl PeopleService {
             let actor_provider = primary
                 .map(|identity| identity.provider.as_str())
                 .unwrap_or_default();
-            let person_key = person_key_for_identities(&identities);
+            let person_key = self.resolve_person_key(actor, &identities).await?;
             let has_stable_identity = person_key.is_some();
             let assets = if has_stable_identity {
                 self.persist_person_assets(
@@ -410,7 +499,24 @@ impl PeopleService {
         identities: &[PersonIdentity],
     ) -> PersonAssetResult {
         let mut pending_assets = Vec::new();
-        let person_dir =
+        let person_dir = if let Some(person_key) = person_key.filter(|key| key.starts_with("lux-"))
+        {
+            match lux_person_directory(&self.config_dir, &actor.name, person_key) {
+                Ok(person_dir) => person_dir,
+                Err(error) => {
+                    tracing::warn!(
+                        person_id = %provider_id,
+                        %error,
+                        "actor person path was not prepared"
+                    );
+                    pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
+                    return PersonAssetResult {
+                        image_file: None,
+                        pending_assets,
+                    };
+                }
+            }
+        } else {
             match people_directory(&self.config_dir, &actor.name, provider, provider_id) {
                 Ok(legacy_dir) => {
                     let path = if safe_metadata(&legacy_dir).await.ok().flatten().is_some() {
@@ -421,26 +527,21 @@ impl PeopleService {
                     } else {
                         Ok(legacy_dir)
                     };
-                    let Ok(person_dir) = path else {
-                        pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
-                        return PersonAssetResult {
-                            image_file: None,
-                            pending_assets,
-                        };
-                    };
-                    if let Err(error) = create_private_dir(&person_dir).await {
-                        tracing::warn!(
-                            person_id = %provider_id,
-                            %error,
-                            "actor person directory was not prepared"
-                        );
-                        pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
-                        return PersonAssetResult {
-                            image_file: None,
-                            pending_assets,
-                        };
+                    match path {
+                        Ok(person_dir) => person_dir,
+                        Err(error) => {
+                            tracing::warn!(
+                                person_id = %provider_id,
+                                %error,
+                                "actor person path was not prepared"
+                            );
+                            pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
+                            return PersonAssetResult {
+                                image_file: None,
+                                pending_assets,
+                            };
+                        }
                     }
-                    person_dir
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -454,7 +555,20 @@ impl PeopleService {
                         pending_assets,
                     };
                 }
+            }
+        };
+        if let Err(error) = create_private_dir(&person_dir).await {
+            tracing::warn!(
+                person_id = %provider_id,
+                %error,
+                "actor person directory was not prepared"
+            );
+            pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
+            return PersonAssetResult {
+                image_file: None,
+                pending_assets,
             };
+        }
 
         let nfo_path = person_dir.join(PERSON_NFO);
         let index_dir = people_index_directory(&self.config_dir);
@@ -473,6 +587,7 @@ impl PeopleService {
                     provider,
                     provider_id,
                     actor.person.as_ref(),
+                    identities,
                 )
                 .await?;
             write_atomically(&nfo_path, &bytes).await
@@ -481,6 +596,22 @@ impl PeopleService {
         if let Err(error) = nfo_result {
             tracing::warn!(person_id = %provider_id, %error, "actor person NFO was not cached");
             pending_assets.push(PENDING_PERSON_NFO.to_owned());
+        }
+
+        if let Some(person_key) = person_key.filter(|key| key.starts_with("lux-")) {
+            if let Err(error) = self
+                .persist_person_manifest(
+                    &person_dir,
+                    person_key,
+                    &actor.name,
+                    identities,
+                    actor.person.as_ref(),
+                )
+                .await
+            {
+                tracing::warn!(person_id = %provider_id, %error, "actor person manifest was not cached");
+                pending_assets.push(PENDING_PERSON_MANIFEST.to_owned());
+            }
         }
 
         let image_file = match self
@@ -560,12 +691,85 @@ impl PeopleService {
                 );
                 pending_assets.push(PENDING_PERSON_INDEX.to_owned());
             }
+            if let Some(person_key) = person_key.filter(|key| key.starts_with("lux-"))
+                && let Ok(index_path) = people_index_path(&self.config_dir, person_key)
+            {
+                let index = StoredPersonIndex {
+                    image_path: image_path
+                        .strip_prefix(metadata_root(&self.config_dir))
+                        .ok()
+                        .map(|relative| relative.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    person_key: Some(person_key.to_owned()),
+                };
+                if let Ok(bytes) = serde_json::to_vec_pretty(&index)
+                    && write_atomically(&index_path, &bytes).await.is_err()
+                {
+                    pending_assets.push(PENDING_PERSON_INDEX.to_owned());
+                }
+            }
         }
 
         PersonAssetResult {
             image_file,
             pending_assets,
         }
+    }
+
+    async fn persist_person_manifest(
+        &self,
+        person_dir: &Path,
+        lux_person_id: &str,
+        display_name: &str,
+        identities: &[PersonIdentity],
+        metadata: Option<&PersonMetadata>,
+    ) -> Result<(), PeopleError> {
+        let manifest_path = person_dir.join(PERSON_MANIFEST);
+        let existing = read_people_file(&manifest_path).await?;
+        let mut manifest = existing
+            .map(|bytes| {
+                serde_json::from_slice::<PersonManifest>(&bytes)
+                    .map_err(|source| PeopleError::Serialization(source.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if !manifest.lux_person_id.is_empty() && manifest.lux_person_id != lux_person_id {
+            return Err(PeopleError::Serialization(
+                "person manifest identity does not match directory".to_owned(),
+            ));
+        }
+        manifest.schema_version = PERSON_MANIFEST_SCHEMA_VERSION;
+        manifest.lux_person_id = lux_person_id.to_owned();
+        if !display_name.trim().is_empty() {
+            manifest.display_name = display_name.trim().to_owned();
+        }
+        for identity in identities {
+            if !manifest.identities.iter().any(|existing| existing == identity) {
+                manifest.identities.push(identity.clone());
+            }
+        }
+        manifest.identities.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then(left.id.cmp(&right.id))
+        });
+        if let Some(metadata) = metadata {
+            manifest.person = Some(
+                manifest
+                    .person
+                    .take()
+                    .map(|existing| existing.supplement_missing_from(metadata.clone()))
+                    .unwrap_or_else(|| metadata.clone()),
+            );
+        }
+        manifest.checksum.clear();
+        let checksum_source = serde_json::to_vec(&manifest)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        let digest = Sha256::digest(checksum_source);
+        manifest.checksum = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        write_atomically(&manifest_path, &bytes).await
     }
 
     pub async fn item_actor_relation_exists(&self, item_id: &str) -> Result<bool, PeopleError> {
@@ -996,14 +1200,24 @@ impl PeopleService {
         if !is_valid_person_id(&person_id) || !is_valid_person_id(provider) {
             return Err(PeopleError::InvalidComponent(person_id));
         }
-        let legacy_dir = people_directory(&self.config_dir, &actor.name, provider, &person_id)
-            .map_err(PeopleError::from)?;
-        let person_dir = if safe_metadata(&legacy_dir).await.ok().flatten().is_some() {
-            legacy_dir
-        } else if let Some(person_key) = actor.person_key.as_deref() {
-            canonical_person_directory(&self.config_dir, person_key).map_err(PeopleError::from)?
+        let person_dir = if let Some(person_key) = actor
+            .person_key
+            .as_deref()
+            .filter(|person_key| person_key.starts_with("lux-"))
+        {
+            lux_person_directory(&self.config_dir, &actor.name, person_key)
+                .map_err(PeopleError::from)?
         } else {
-            legacy_dir
+            let legacy_dir = people_directory(&self.config_dir, &actor.name, provider, &person_id)
+                .map_err(PeopleError::from)?;
+            if safe_metadata(&legacy_dir).await.ok().flatten().is_some() {
+                legacy_dir
+            } else if let Some(person_key) = actor.person_key.as_deref() {
+                canonical_person_directory(&self.config_dir, person_key)
+                    .map_err(PeopleError::from)?
+            } else {
+                legacy_dir
+            }
         };
         create_private_dir(&person_dir).await?;
         let nfo_path = person_dir.join(PERSON_NFO);
@@ -1023,6 +1237,7 @@ impl PeopleService {
                 provider,
                 &person_id,
                 actor.person.as_ref(),
+                &[],
             )
             .await?
         };
@@ -1036,14 +1251,29 @@ impl PeopleService {
         provider: &str,
         provider_id: &str,
         metadata: Option<&PersonMetadata>,
+        identities: &[PersonIdentity],
     ) -> Result<Vec<u8>, PeopleError> {
-        let Some(existing) = read_people_file(path).await? else {
-            return Ok(person_nfo_bytes(name, provider, provider_id, metadata));
-        };
-        Ok(
-            merge_person_nfo_bytes(&existing, name, provider, provider_id, metadata)
-                .unwrap_or(existing),
-        )
+        let mut bytes = read_people_file(path)
+            .await?
+            .map(|existing| {
+                merge_person_nfo_bytes(&existing, name, provider, provider_id, metadata)
+                    .unwrap_or(existing)
+            })
+            .unwrap_or_else(|| person_nfo_bytes(name, provider, provider_id, metadata));
+        for identity in identities {
+            if identity.provider == provider && identity.id == provider_id {
+                continue;
+            }
+            bytes = merge_person_nfo_bytes(
+                &bytes,
+                name,
+                &identity.provider,
+                &identity.id,
+                None,
+            )
+            .unwrap_or(bytes);
+        }
+        Ok(bytes)
     }
 
     async fn person_nfo_bytes_with_replaced_metadata(
@@ -1067,9 +1297,17 @@ impl PeopleService {
         let mut views = Vec::with_capacity(credits.len());
         for credit in credits {
             let provider = (!credit.provider.is_empty()).then(|| credit.provider.clone());
-            let image_url = self
-                .person_image_url(provider.as_deref(), &credit.person_id)
-                .await;
+            let image_url = if let Some(lux_person_id) = credit.lux_person_id.as_deref()
+                && matches!(self.profile_image(lux_person_id).await, Ok(Some(_)))
+            {
+                provider
+                    .as_deref()
+                    .and_then(|provider| actor_image_url(provider, &credit.person_id))
+                    .or_else(|| Some(format!("/api/v1/people/{}/image", credit.person_id)))
+            } else {
+                self.person_image_url(provider.as_deref(), &credit.person_id)
+                    .await
+            };
             let stored_metadata = PersonMetadata {
                 biography: credit.biography.clone(),
                 birthday: credit.birthday.clone(),
@@ -1261,6 +1499,10 @@ impl PeopleService {
             let index = serde_json::from_slice::<StoredPersonIndex>(&bytes)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
             if let Some(person_key) = index.person_key.as_deref() {
+                if person_key.starts_with("lux-") {
+                    return lux_person_directory(&self.config_dir, person_name, person_key)
+                        .map_err(PeopleError::from);
+                }
                 return canonical_person_directory(&self.config_dir, person_key)
                     .map_err(PeopleError::from);
             }
@@ -2181,6 +2423,11 @@ fn actor_provider_from_stored_actor(actor: &StoredActor) -> Option<String> {
 fn person_credit_from_stored_actor(actor: &StoredActor) -> NewPersonCredit {
     NewPersonCredit {
         person_id: actor_id_from_stored_actor(actor),
+        lux_person_id: actor
+            .person_key
+            .as_deref()
+            .filter(|person_key| person_key.starts_with("lux-"))
+            .map(str::to_owned),
         person_type: "Actor".to_owned(),
         person_name: actor.name.clone(),
         provider: actor_provider_from_stored_actor(actor).unwrap_or_default(),
@@ -2587,9 +2834,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{ActorCredit, PeopleError, PeopleService, PersonIdentity};
+    use crate::{config::Config, storage::Database};
     use crate::application::metadata_paths::{
-        canonical_person_directory, library_item_directory, people_directory,
-        people_index_path_for_provider,
+        canonical_person_directory, library_item_directory, lux_person_directory,
+        people_directory, people_index_path_for_provider,
     };
 
     const PNG_1X1: &[u8] = &[
@@ -2599,6 +2847,82 @@ mod tests {
         0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
         0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
+
+    #[tokio::test]
+    async fn database_backed_people_reuse_lux_id_when_provider_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database);
+        let first = ActorCredit {
+            id: "57975".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "华晨宇".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+        let first_identities = super::actor_identities(&first, "tmdb");
+        let first_person = service
+            .resolve_person_key(&first, &first_identities)
+            .await?
+            .ok_or("first person was not created")?;
+        assert_eq!(first_person, "lux-000001");
+        let _first_assets = service
+            .persist_person_assets(
+                &first,
+                "tmdb",
+                "57975",
+                Some(&first_person),
+                &first_identities,
+            )
+            .await;
+        let person_dir = lux_person_directory(&config.config_dir, "华晨宇", &first_person)?;
+        assert!(person_dir.join("person.json").exists());
+
+        let second = ActorCredit {
+            id: "1313123".to_owned(),
+            provider: Some("douban".to_owned()),
+            identities: vec![PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "57975".to_owned(),
+            }],
+            name: "华晨宇".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+        let second_identities = super::actor_identities(&second, "douban");
+        let second_person = service
+            .resolve_person_key(&second, &second_identities)
+            .await?
+            .ok_or("second person was not resolved")?;
+        assert_eq!(second_person, first_person);
+        service
+            .persist_person_assets(
+                &second,
+                "douban",
+                "1313123",
+                Some(&second_person),
+                &second_identities,
+            )
+            .await;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(person_dir.join("person.json")).await?)?;
+        assert_eq!(manifest["luxPersonId"], "lux-000001");
+        assert_eq!(manifest["identities"].as_array().map(Vec::len), Some(2));
+        let nfo = tokio::fs::read_to_string(person_dir.join("person.nfo")).await?;
+        assert!(nfo.contains("type=\"tmdb\">57975"));
+        assert!(nfo.contains("type=\"douban\">1313123"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn profile_image_rejects_symlinked_files() -> Result<(), Box<dyn std::error::Error>> {

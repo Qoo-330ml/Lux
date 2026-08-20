@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use sqlx::{
@@ -23,6 +24,14 @@ const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 
 fn database_flag(value: bool) -> i64 {
     i64::from(value)
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
 }
 
 fn playback_reached_played_threshold(
@@ -1213,7 +1222,8 @@ impl Database {
                     sort_order, biography, birthday, deathday, known_for_department,
                     place_of_birth, provider_ids_json, genres_json, tags_json,
                     production_locations_json, premiere_date, production_year, taglines_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    , lux_person_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(item_id)
             .bind(&credit.person_id)
@@ -1234,6 +1244,7 @@ impl Database {
             .bind(&credit.premiere_date)
             .bind(credit.production_year)
             .bind(taglines_json)
+            .bind(&credit.lux_person_id)
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -1249,6 +1260,242 @@ impl Database {
                 source,
             })?;
         Ok(())
+    }
+
+    pub(crate) async fn resolve_or_create_canonical_person(
+        &self,
+        display_name: &str,
+        provider: &str,
+        provider_id: &str,
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        let now = current_unix_timestamp();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        if let Some(person) = self
+            .query(
+                "SELECT p.id, p.display_name, p.directory_name, p.status
+                 FROM people p
+                 JOIN person_identities pi ON pi.person_id = p.id
+                 WHERE pi.provider = ? AND pi.provider_id = ?",
+            )
+            .bind(provider)
+            .bind(provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        {
+            let stored = stored_canonical_person(person);
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(stored);
+        }
+
+        let sequence: i64 = self
+            .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let person_id = format!("lux-{sequence:06}");
+        self.query(
+            "INSERT INTO people (
+                id, display_name, directory_name, normalized_name, status, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)",
+        )
+        .bind(&person_id)
+        .bind(display_name)
+        .bind(display_name)
+        .bind(display_name)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "INSERT INTO person_identities (
+                person_id, provider, provider_id, match_method, confidence,
+                evidence_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(provider, provider_id) DO NOTHING",
+        )
+        .bind(&person_id)
+        .bind(provider)
+        .bind(provider_id)
+        .bind(match_method)
+        .bind(confidence)
+        .bind(evidence_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let person = self
+            .query(
+                "SELECT p.id, p.display_name, p.directory_name, p.status
+                 FROM people p
+                 JOIN person_identities pi ON pi.person_id = p.id
+                 WHERE pi.provider = ? AND pi.provider_id = ?",
+            )
+            .bind(provider)
+            .bind(provider_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let stored = stored_canonical_person(person);
+        if stored.id != person_id {
+            self.query("DELETE FROM people WHERE id = ?")
+                .bind(&person_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(stored)
+    }
+
+    pub(crate) async fn find_canonical_person_by_identity(
+        &self,
+        provider: &str,
+        provider_id: &str,
+    ) -> Result<Option<StoredCanonicalPerson>, StorageError> {
+        self.query(
+            "SELECT p.id, p.display_name, p.directory_name, p.status
+             FROM people p
+             JOIN person_identities pi ON pi.person_id = p.id
+             WHERE pi.provider = ? AND pi.provider_id = ?",
+        )
+        .bind(provider)
+        .bind(provider_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_canonical_person))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn attach_canonical_person_identity(
+        &self,
+        person_id: &str,
+        provider: &str,
+        provider_id: &str,
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        let now = current_unix_timestamp();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let person = self
+            .query(
+                "SELECT id, display_name, directory_name, status
+                 FROM people WHERE id = ?",
+            )
+            .bind(person_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .ok_or_else(|| {
+                StorageError::Conflict(format!("canonical person '{person_id}' does not exist"))
+            })?;
+
+        self.query(
+            "INSERT INTO person_identities (
+                person_id, provider, provider_id, match_method, confidence,
+                evidence_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(provider, provider_id) DO NOTHING",
+        )
+        .bind(person_id)
+        .bind(provider)
+        .bind(provider_id)
+        .bind(match_method)
+        .bind(confidence)
+        .bind(evidence_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let owner_id: String = self
+            .query_scalar(
+                "SELECT person_id FROM person_identities
+                 WHERE provider = ? AND provider_id = ?",
+            )
+            .bind(provider)
+            .bind(provider_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if owner_id != person_id {
+            return Err(StorageError::Conflict(format!(
+                "provider identity '{provider}:{provider_id}' belongs to '{owner_id}'"
+            )));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(stored_canonical_person(person))
     }
 
     pub(crate) async fn list_person_credit_item_ids(
@@ -12775,6 +13022,7 @@ pub(crate) struct StoredMediaItem {
 #[derive(Debug)]
 pub(crate) struct NewPersonCredit {
     pub(crate) person_id: String,
+    pub(crate) lux_person_id: Option<String>,
     pub(crate) person_type: String,
     pub(crate) person_name: String,
     pub(crate) provider: String,
@@ -12795,9 +13043,27 @@ pub(crate) struct NewPersonCredit {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredCanonicalPerson {
+    pub(crate) id: String,
+    pub(crate) display_name: String,
+    pub(crate) directory_name: String,
+    pub(crate) status: String,
+}
+
+fn stored_canonical_person(row: sqlx::any::AnyRow) -> StoredCanonicalPerson {
+    StoredCanonicalPerson {
+        id: row.get("id"),
+        display_name: row.get("display_name"),
+        directory_name: row.get("directory_name"),
+        status: row.get("status"),
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredPersonCredit {
     pub(crate) item_id: String,
     pub(crate) person_id: String,
+    pub(crate) lux_person_id: Option<String>,
     pub(crate) provider: String,
     pub(crate) person_name: String,
     pub(crate) role: String,
@@ -12825,6 +13091,7 @@ fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
     StoredPersonCredit {
         item_id: row.get("item_id"),
         person_id: row.get("person_id"),
+        lux_person_id: row.try_get("lux_person_id").ok(),
         provider: row.get("provider"),
         person_name: row.get("person_name"),
         role: row.get("role"),
@@ -14002,6 +14269,7 @@ pub enum StorageError {
         path: PathBuf,
         source: MigrateError,
     },
+    Conflict(String),
     Serialization(String),
     LastManager,
 }
@@ -14035,6 +14303,7 @@ impl std::fmt::Display for StorageError {
                     path.display()
                 )
             }
+            Self::Conflict(source) => write!(formatter, "database conflict: {source}"),
             Self::Serialization(source) => {
                 write!(formatter, "database serialization failed: {source}")
             }
@@ -14090,7 +14359,7 @@ impl std::error::Error for StorageError {
             Self::Io { source, .. } => Some(source),
             Self::Sqlx { source, .. } => Some(source),
             Self::Migration { source, .. } => Some(source),
-            Self::LastManager | Self::Serialization(_) => None,
+            Self::Conflict(_) | Self::LastManager | Self::Serialization(_) => None,
         }
     }
 }
@@ -14142,6 +14411,7 @@ mod tests {
                 &[
                     NewPersonCredit {
                         person_id: "1".to_owned(),
+                        lux_person_id: None,
                         person_type: "Actor".to_owned(),
                         person_name: "演员甲".to_owned(),
                         provider: "tmdb".to_owned(),
@@ -14162,6 +14432,7 @@ mod tests {
                     },
                     NewPersonCredit {
                         person_id: "2".to_owned(),
+                        lux_person_id: None,
                         person_type: "Actor".to_owned(),
                         person_name: "演员乙".to_owned(),
                         provider: "tmdb".to_owned(),
@@ -14206,6 +14477,83 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"演员甲"));
         assert!(names.contains(&"演员乙"));
+    }
+
+    #[tokio::test]
+    async fn canonical_people_migration_creates_recoverable_identity_tables() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        for table in ["people", "person_identities", "person_id_sequence"] {
+            let table_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(database.pool())
+            .await
+            .expect("canonical people table");
+            assert_eq!(table_count, 1, "missing canonical people table {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_people_reuse_one_lux_id_across_provider_identities() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let first = database
+            .resolve_or_create_canonical_person(
+                "华晨宇",
+                "tmdb",
+                "57975",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await
+            .expect("first canonical person");
+        assert_eq!(first.id, "lux-000001");
+        assert_eq!(first.display_name, "华晨宇");
+        assert_eq!(first.directory_name, "华晨宇");
+        assert_eq!(first.status, "ACTIVE");
+
+        let second = database
+            .attach_canonical_person_identity(
+                &first.id,
+                "douban",
+                "1313123",
+                "MEDIA_BRIDGE",
+                Some(0.98),
+                r#"{"source":"same-media"}"#,
+            )
+            .await
+            .expect("second canonical identity");
+        assert_eq!(second.id, first.id);
+
+        let repeated = database
+            .resolve_or_create_canonical_person(
+                "华晨宇",
+                "tmdb",
+                "57975",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await
+            .expect("repeated canonical identity");
+        assert_eq!(repeated.id, first.id);
+
+        let identity_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM person_identities")
+            .fetch_one(database.pool())
+            .await
+            .expect("identity count");
+        assert_eq!(identity_count, 2);
     }
 
     #[tokio::test]
