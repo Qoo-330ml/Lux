@@ -1673,18 +1673,9 @@ impl Database {
 
     pub(crate) async fn restore_person_match_candidate(
         &self,
-        candidate_id: &str,
-        item_id: &str,
-        provider: &str,
-        provider_id: &str,
-        candidate_person_ids_json: &str,
-        status: &str,
-        score: Option<f64>,
-        evidence_json: &str,
-        created_at: i64,
-        updated_at: i64,
+        restore: &PersonMatchCandidateRestore<'_>,
     ) -> Result<String, StorageError> {
-        if !matches!(status, "PENDING" | "CONFIRMED" | "REJECTED") {
+        if !matches!(restore.status, "PENDING" | "CONFIRMED" | "REJECTED") {
             return Err(StorageError::Serialization(
                 "invalid person match candidate status".to_owned(),
             ));
@@ -1706,16 +1697,16 @@ impl Database {
                 evidence_json = excluded.evidence_json,
                 updated_at = excluded.updated_at",
         )
-        .bind(candidate_id)
-        .bind(item_id)
-        .bind(provider)
-        .bind(provider_id)
-        .bind(candidate_person_ids_json)
-        .bind(status)
-        .bind(score)
-        .bind(evidence_json)
-        .bind(created_at)
-        .bind(updated_at)
+        .bind(restore.candidate_id)
+        .bind(restore.item_id)
+        .bind(restore.provider)
+        .bind(restore.provider_id)
+        .bind(restore.candidate_person_ids_json)
+        .bind(restore.status)
+        .bind(restore.score)
+        .bind(restore.evidence_json)
+        .bind(restore.created_at)
+        .bind(restore.updated_at)
         .execute(&self.pool)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -1726,9 +1717,9 @@ impl Database {
             "SELECT id FROM person_match_candidates
              WHERE item_id = ? AND provider = ? AND provider_id = ?",
         )
-        .bind(item_id)
-        .bind(provider)
-        .bind(provider_id)
+        .bind(restore.item_id)
+        .bind(restore.provider)
+        .bind(restore.provider_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -13946,6 +13937,19 @@ pub(crate) struct StoredPersonMatchCandidate {
     pub(crate) status: String,
     pub(crate) score: Option<f64>,
     pub(crate) evidence_json: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+pub(crate) struct PersonMatchCandidateRestore<'a> {
+    pub(crate) candidate_id: &'a str,
+    pub(crate) item_id: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) provider_id: &'a str,
+    pub(crate) candidate_person_ids_json: &'a str,
+    pub(crate) status: &'a str,
+    pub(crate) score: Option<f64>,
+    pub(crate) evidence_json: &'a str,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }

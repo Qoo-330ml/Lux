@@ -30,8 +30,8 @@ use crate::application::metadata_paths::{
     people_index_path_for_provider, readable_component,
 };
 use crate::storage::{
-    Database, NewPersonCredit, PersonListOptions, StoredCanonicalPerson, StoredPersonCredit,
-    StoredPersonMatchCandidate,
+    Database, NewPersonCredit, PersonListOptions, PersonMatchCandidateRestore,
+    StoredCanonicalPerson, StoredPersonCredit, StoredPersonMatchCandidate,
 };
 
 const LEGACY_PEOPLE_DIR: &str = "people";
@@ -1033,11 +1033,20 @@ impl PeopleService {
     ) -> Result<(), PeopleError> {
         let legacy_dir = people_directory(&self.config_dir, display_name, provider, provider_id)
             .map_err(PeopleError::from)?;
-        if legacy_dir == person_dir || safe_metadata(&legacy_dir).await?.is_none() {
+        self.migrate_person_assets_from_directory(&legacy_dir, person_dir)
+            .await
+    }
+
+    async fn migrate_person_assets_from_directory(
+        &self,
+        source_dir: &Path,
+        person_dir: &Path,
+    ) -> Result<(), PeopleError> {
+        if source_dir == person_dir || safe_metadata(source_dir).await?.is_none() {
             return Ok(());
         }
 
-        let legacy_nfo = legacy_dir.join(PERSON_NFO);
+        let legacy_nfo = source_dir.join(PERSON_NFO);
         let target_nfo = person_dir.join(PERSON_NFO);
         if safe_metadata(&target_nfo).await?.is_none()
             && let Some(bytes) = read_people_file(&legacy_nfo).await?
@@ -1046,7 +1055,7 @@ impl PeopleService {
         }
 
         for extension in PROFILE_EXTENSIONS {
-            let legacy_image = legacy_dir.join(format!("{PERSON_IMAGE}.{extension}"));
+            let legacy_image = source_dir.join(format!("{PERSON_IMAGE}.{extension}"));
             let target_image = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
             if safe_metadata(&target_image).await?.is_none()
                 && safe_metadata(&legacy_image)
@@ -1377,22 +1386,22 @@ impl PeopleService {
                     continue;
                 }
             };
-            match database
-                .restore_person_match_candidate(
-                    &snapshot.id,
-                    &snapshot.item_id,
-                    &snapshot.provider,
-                    &snapshot.provider_id,
-                    &serde_json::to_string(&snapshot.candidate_person_ids)
-                        .map_err(|source| PeopleError::Serialization(source.to_string()))?,
-                    &snapshot.status,
-                    snapshot.score,
-                    &snapshot.evidence.to_string(),
-                    snapshot.created_at,
-                    snapshot.updated_at,
-                )
-                .await
-            {
+            let candidate_person_ids = serde_json::to_string(&snapshot.candidate_person_ids)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            let evidence = snapshot.evidence.to_string();
+            let restore = PersonMatchCandidateRestore {
+                candidate_id: &snapshot.id,
+                item_id: &snapshot.item_id,
+                provider: &snapshot.provider,
+                provider_id: &snapshot.provider_id,
+                candidate_person_ids_json: &candidate_person_ids,
+                status: &snapshot.status,
+                score: snapshot.score,
+                evidence_json: &evidence,
+                created_at: snapshot.created_at,
+                updated_at: snapshot.updated_at,
+            };
+            match database.restore_person_match_candidate(&restore).await {
                 Ok(_) => restored += 1,
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "skipping person match snapshot during restore")
@@ -1746,6 +1755,10 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
+        let restored_legacy_people = self.restore_legacy_person_directories(database).await?;
+        if restored_legacy_people > 0 {
+            tracing::info!(restored_legacy_people, "legacy people directories migrated");
+        }
         let restored_people = self.restore_person_manifests(database).await?;
         if restored_people > 0 {
             tracing::info!(restored_people, "canonical people manifests restored");
@@ -1798,6 +1811,210 @@ impl PeopleService {
             }
         }
         Ok(rebuilt_items)
+    }
+
+    async fn restore_legacy_person_directories(
+        &self,
+        database: &Database,
+    ) -> Result<usize, PeopleError> {
+        let people_root = metadata_root(&self.config_dir).join(LEGACY_PEOPLE_DIR);
+        let roots = [people_root.clone(), people_root.join("person")];
+        let mut restored = 0;
+        for root in roots {
+            restored += self.restore_legacy_person_root(&root, database).await?;
+        }
+        Ok(restored)
+    }
+
+    async fn restore_legacy_person_root(
+        &self,
+        root: &Path,
+        database: &Database,
+    ) -> Result<usize, PeopleError> {
+        let mut buckets = match fs::read_dir(root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: root.to_owned(),
+                    source,
+                });
+            }
+        };
+        let reserved = ["person", "index", "assets", "items", "profiles", "matches"];
+        let mut restored = 0;
+        while let Some(bucket) = buckets
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: root.to_owned(),
+                source,
+            })?
+        {
+            let bucket_path = bucket.path();
+            let bucket_name = bucket.file_name();
+            if reserved
+                .iter()
+                .any(|name| bucket_name.to_string_lossy().eq_ignore_ascii_case(name))
+                || safe_metadata(&bucket_path)
+                    .await?
+                    .is_none_or(|metadata| !metadata.is_dir())
+            {
+                continue;
+            }
+            let mut persons =
+                fs::read_dir(&bucket_path)
+                    .await
+                    .map_err(|source| PeopleError::Io {
+                        path: bucket_path.clone(),
+                        source,
+                    })?;
+            while let Some(person_entry) =
+                persons
+                    .next_entry()
+                    .await
+                    .map_err(|source| PeopleError::Io {
+                        path: bucket_path.clone(),
+                        source,
+                    })?
+            {
+                let source_dir = person_entry.path();
+                if safe_metadata(&source_dir)
+                    .await?
+                    .is_none_or(|metadata| !metadata.is_dir())
+                {
+                    continue;
+                }
+                let manifest_path = source_dir.join(PERSON_MANIFEST);
+                if safe_metadata(&manifest_path).await?.is_some() {
+                    continue;
+                }
+                let nfo_path = source_dir.join(PERSON_NFO);
+                let Some(nfo_bytes) = read_people_file(&nfo_path).await? else {
+                    continue;
+                };
+                let Some(parsed) = parse_person_nfo(&nfo_bytes) else {
+                    tracing::warn!(path = %nfo_path.display(), "skipping malformed legacy person NFO");
+                    continue;
+                };
+                let identities = parsed
+                    .uniqueids
+                    .iter()
+                    .filter(|(provider, provider_id)| {
+                        is_valid_person_id(provider) && is_valid_person_id(provider_id)
+                    })
+                    .map(|(provider, provider_id)| PersonIdentity {
+                        provider: provider.clone(),
+                        id: provider_id.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let Some(primary) = identities.first() else {
+                    continue;
+                };
+                let Some(display_name) = parsed
+                    .fields
+                    .get("name")
+                    .map(String::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                else {
+                    tracing::warn!(path = %nfo_path.display(), "skipping legacy person NFO without a name");
+                    continue;
+                };
+                let person = match database
+                    .resolve_or_create_canonical_person(
+                        display_name,
+                        &primary.provider,
+                        &primary.id,
+                        "RECOVERED_LEGACY_NFO",
+                        Some(1.0),
+                        r#"{"method":"legacy-person-nfo"}"#,
+                    )
+                    .await
+                {
+                    Ok(person) => person,
+                    Err(error) => {
+                        tracing::warn!(path = %nfo_path.display(), %error, "skipping legacy person with conflicting identity");
+                        continue;
+                    }
+                };
+                let mut identities_attached = true;
+                for identity in identities.iter().skip(1) {
+                    if let Err(error) = database
+                        .attach_canonical_person_identity(
+                            &person.id,
+                            &identity.provider,
+                            &identity.id,
+                            "RECOVERED_LEGACY_NFO",
+                            Some(1.0),
+                            r#"{"method":"legacy-person-nfo"}"#,
+                        )
+                        .await
+                    {
+                        tracing::warn!(path = %nfo_path.display(), %error, "skipping conflicting legacy person identity");
+                        identities_attached = false;
+                        break;
+                    }
+                }
+                if !identities_attached {
+                    continue;
+                }
+                let target_dir = match lux_person_directory(
+                    &self.config_dir,
+                    display_name,
+                    &person.id,
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        tracing::warn!(path = %nfo_path.display(), %error, "skipping legacy person with unsafe name");
+                        continue;
+                    }
+                };
+                if let Some(bytes) = read_people_file(&target_dir.join(PERSON_MANIFEST)).await?
+                    && let Ok(manifest) = serde_json::from_slice::<PersonManifest>(&bytes)
+                    && manifest.lux_person_id == person.id
+                    && identities.iter().all(|identity| {
+                        manifest
+                            .identities
+                            .iter()
+                            .any(|existing| existing == identity)
+                    })
+                {
+                    continue;
+                }
+                if let Err(error) = create_private_dir(&target_dir).await {
+                    tracing::warn!(path = %nfo_path.display(), %error, "could not create migrated person directory");
+                    continue;
+                }
+                if let Err(error) = self
+                    .migrate_person_assets_from_directory(&source_dir, &target_dir)
+                    .await
+                {
+                    tracing::warn!(path = %nfo_path.display(), %error, "could not migrate legacy person assets");
+                    continue;
+                }
+                let actor = ActorCredit {
+                    id: primary.id.clone(),
+                    provider: Some(primary.provider.clone()),
+                    identities: identities.clone(),
+                    name: display_name.to_owned(),
+                    character: None,
+                    order: None,
+                    profile_url: None,
+                    person: None,
+                };
+                let _ = self
+                    .persist_person_assets(
+                        &actor,
+                        &primary.provider,
+                        &primary.id,
+                        Some(&person.id),
+                        &identities,
+                    )
+                    .await;
+                restored += 1;
+            }
+        }
+        Ok(restored)
     }
 
     async fn restore_person_manifests(&self, database: &Database) -> Result<usize, PeopleError> {
@@ -4482,6 +4699,43 @@ mod tests {
         );
         assert!(legacy_dir.join("person.nfo").exists());
         assert!(legacy_dir.join("folder.png").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuilding_people_migrates_legacy_nfo_without_a_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let legacy_dir = people_directory(&config.config_dir, "旧人物", "tmdb", "57975")?;
+        tokio::fs::create_dir_all(&legacy_dir).await?;
+        tokio::fs::write(
+            legacy_dir.join("person.nfo"),
+            r#"<?xml version="1.0"?><person><name>旧人物</name><uniqueid type="tmdb">57975</uniqueid></person>"#
+                .as_bytes(),
+        )
+        .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        assert_eq!(
+            service.restore_legacy_person_directories(&database).await?,
+            1
+        );
+        assert_eq!(
+            service.restore_legacy_person_directories(&database).await?,
+            0
+        );
+        let person = database
+            .find_canonical_person_by_identity("tmdb", "57975")
+            .await?
+            .ok_or("legacy provider identity was not restored")?;
+        assert_eq!(person.id, "lux-000001");
+        let target = lux_person_directory(&config.config_dir, "旧人物", &person.id)?;
+        assert!(target.join(super::PERSON_MANIFEST).exists());
+        assert!(target.join(super::PERSON_NFO).exists());
         Ok(())
     }
 
