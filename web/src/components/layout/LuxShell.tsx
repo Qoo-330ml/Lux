@@ -13,6 +13,8 @@ import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import type { LuxUser } from "../../lib/api/types";
 import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
+import { ScanActivityPopover } from "../../features/activity/ScanActivityPopover";
+import { useUserEvents } from "../../features/activity/useUserEvents";
 import { LuxLogo } from "../LuxLogo";
 
 type LuxShellProps = { user: LuxUser; serverName?: string | null };
@@ -29,6 +31,7 @@ export function useAvatar(): AvatarContextValue {
 }
 
 export function LuxShell({ user, serverName }: LuxShellProps) {
+  useUserEvents();
   const navigate = useNavigate();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -92,6 +95,7 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
           </div>
 
           <div className="lux-header-actions">
+            {user.canManageServer ? <ScanActivityPopover /> : null}
             <button
               className="lux-user-button"
               type="button"

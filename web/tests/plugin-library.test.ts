@@ -68,6 +68,7 @@ describe("AdminPluginsPage plugin cards", () => {
     vi.spyOn(api, "updateAdminPluginEnabled").mockImplementation(async (_pluginId, enabled) => ({ plugin: { ...currentPlugin, enabled, available: enabled } }));
     vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
     vi.spyOn(api, "installAdminPlugin").mockResolvedValue({ plugin: configuredPlugin });
+    vi.spyOn(api, "updateAdminPlugin").mockResolvedValue({ plugin: configuredPlugin });
     vi.spyOn(api, "uninstallAdminPlugin").mockResolvedValue(undefined);
     container = document.createElement("div");
     document.body.append(container);
@@ -329,6 +330,25 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(toggle?.getAttribute("aria-checked")).toBe("false");
     expect(toggle?.getAttribute("aria-label")).toBe("启用 TMDb 元数据插件");
     expect(toggle?.textContent).toContain("已禁用");
+  });
+
+  it("shows the available version and updates an installed plugin", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      version: "0.1.0",
+      latestVersion: "0.2.0",
+      updateAvailable: true,
+    };
+    await renderPage();
+
+    const card = container.querySelector<HTMLElement>(".lux-admin-plugin-card");
+    expect(card?.textContent).toContain("最新 v0.2.0");
+    expect(card?.querySelector('[aria-label="更新插件 TMDb 元数据插件"]')).toBeTruthy();
+
+    await act(async () => {
+      card?.querySelector<HTMLButtonElement>('[aria-label="更新插件 TMDb 元数据插件"]')?.click();
+    });
+    expect(api.updateAdminPlugin).toHaveBeenCalledWith("org.lux.tmdb");
   });
 
   it("confirms before uninstalling a plugin from installed management", async () => {

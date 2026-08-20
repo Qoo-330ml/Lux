@@ -14,6 +14,19 @@ pub enum AdminEventScope {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserEventScope {
+    Home,
+}
+
+impl UserEventScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+        }
+    }
+}
+
 impl AdminEventScope {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -32,6 +45,11 @@ impl AdminEventScope {
 #[derive(Clone)]
 pub struct AdminEventHub {
     sender: broadcast::Sender<AdminEventScope>,
+}
+
+#[derive(Clone)]
+pub struct UserEventHub {
+    sender: broadcast::Sender<UserEventScope>,
 }
 
 impl AdminEventHub {
@@ -55,9 +73,30 @@ impl Default for AdminEventHub {
     }
 }
 
+impl UserEventHub {
+    pub fn new() -> Self {
+        let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        Self { sender }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<UserEventScope> {
+        self.sender.subscribe()
+    }
+
+    pub fn publish(&self, scope: UserEventScope) {
+        let _ = self.sender.send(scope);
+    }
+}
+
+impl Default for UserEventHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AdminEventHub, AdminEventScope};
+    use super::{AdminEventHub, AdminEventScope, UserEventHub, UserEventScope};
 
     #[tokio::test]
     async fn publishes_scopes_to_all_subscribers() {
@@ -81,5 +120,18 @@ mod tests {
         assert_eq!(AdminEventScope::Users.as_str(), "users");
         assert_eq!(AdminEventScope::Metadata.as_str(), "metadata");
         assert_eq!(AdminEventScope::Settings.as_str(), "settings");
+        assert_eq!(UserEventScope::Home.as_str(), "home");
+    }
+
+    #[tokio::test]
+    async fn publishes_user_scopes_to_all_subscribers() {
+        let hub = UserEventHub::new();
+        let mut first = hub.subscribe();
+        let mut second = hub.subscribe();
+
+        hub.publish(UserEventScope::Home);
+
+        assert_eq!(first.recv().await, Ok(UserEventScope::Home));
+        assert_eq!(second.recv().await, Ok(UserEventScope::Home));
     }
 }

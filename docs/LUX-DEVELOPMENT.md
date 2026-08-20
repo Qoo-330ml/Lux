@@ -1859,6 +1859,7 @@ services:
 | LUX-151 | src/application/ip_location.rs、src/api/mod.rs、tests/、web/src/features/admin/、web/src/lib/api/、docs/ |
 | LUX-153 | src/application/admin_events.rs、src/api/mod.rs、tests/admin_events.rs、web/src/features/admin/、web/tests/、docs/ |
 | LUX-154 | src/application/scanner.rs、src/storage/mod.rs、migrations/、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
+| LUX-187 | src/application/admin_events.rs、src/application/scanner.rs、src/storage/mod.rs、src/api/mod.rs、migrations/、tests/、web/src/components/layout/、web/src/features/activity/、web/src/features/admin/、web/src/lib/api/、web/src/react.css、docs/ |
 | LUX-156 | src/observability/、src/main.rs、src/api/mod.rs、Cargo.toml、Cargo.lock、tests/observability.rs、tests/log_export.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 | LUX-158 | src/application/strm_target.rs、src/application/、tests/strm_target.rs、docs/ |
 | LUX-160 | src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、tests/、docs/ |
@@ -1877,6 +1878,7 @@ services:
 | LUX-183 至 186 | src/application/webhooks.rs、src/storage/、src/api/mod.rs、migrations/、migrations-postgres/、tests/、docs/ |
 | LUX-184 | web/public/media-capability-probe.html、web/public/media-capability-probe.js、web/tests/、docs/ |
 | LUX-185 | web/src/features/player/、web/public/hevc/、web/tests/、web/package.json、web/pnpm-lock.yaml、web/vite.config.ts、docs/ |
+| LUX-186 | src/application/plugins.rs、src/api/lux/mod.rs、src/api/mod.rs、tests/plugins.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3435,6 +3437,42 @@ ffprobe、本地 NFO/图片、缩略图、自动封面和在线元数据调度�
 
 依赖：LUX-041、LUX-043、LUX-045。
 
+#### LUX-187：全局扫描活动与首页即时刷新
+
+管理员 Web 页面右上角显示当前活动的扫描任务，摘要包括媒体库名称、扫描阶段、已处理/总数
+和当前正在处理的相对条目显示名。摘要不得返回媒体库根路径、完整本地路径、`.strm` 原始
+目标、token、查询参数或其他凭据。活动入口可以进入“任务与日志”并取消活动任务。
+
+扫描任务持久化当前安全显示名和阶段；发现目录、索引文件、收尾、完成、失败和取消会通过
+管理员 SSE 的 `jobs` 作用域刷新任务摘要。新增同源 `GET /api/v1/events`，只允许已登录的
+Lux Web 用户，发送不携带业务数据的 `ready` 与 `invalidate` 事件。扫描索引提交后发布
+`home` 作用域，普通用户 Web 客户端收到后立即失效首页、媒体库列表和当前媒体库分页缓存；
+断线时继续保留低频轮询兜底。该端点不向 Emby 兼容 API 或未认证请求开放。
+
+验收：
+
+- [ ] 任意普通 Lux Web 页面在管理员会话下显示全局活动扫描入口和实时进度。
+- [ ] 当前条目摘要经过 basename/相对显示名清理，不包含完整路径、`.strm` URL、token 或 query string。
+- [ ] 扫描写入后普通用户首页和媒体库列表立即刷新，事件不携带业务数据。
+- [ ] 管理员 SSE、普通用户事件流分别完成鉴权、ready、刷新和断线退化测试。
+- [ ] Rust/Web 测试、格式化、Clippy 和 Web 构建通过，并记录 ARM 本机 `uname -m`。
+
+验证：
+
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-153、LUX-154、LUX-110、LUX-114。
+
+明确不做：
+
+- 不向 Emby 兼容 API 提供 Lux 活动浮层或普通用户 SSE。
+- 不在用户请求路径中扫描文件、解析 NFO、调用 ffprobe 或访问 TMDb。
+- 不把完整本地路径或 `.strm` 原始目标写入 API、日志或浏览器存储。
+
 明确不做：
 
 - 不把实时增量扫描纳入 cron 调度；全量校验、元数据和 STRM 任务使用持久化的五段式 cron，跨库串行化仅使用进程内扫描互斥锁。
@@ -4040,6 +4078,43 @@ DirectPlay；浏览器无法原生解码 HEVC、但具备 WebAssembly、Web Work
 平台、样本分辨率、媒体耗时、客户端转码速度和丢帧。未通过真实性能门时不得宣称该设备支持 4K 实时 fallback。
 
 依赖：LUX-184、LUX-113、LUX-073。
+
+#### LUX-186：插件商店更新检查与安全更新
+
+范围：为管理员插件页面增加插件商店更新检查和已安装插件更新能力。Lux 使用当前已配置的插件商店目录
+返回的版本与 SHA-256，比较已发现的本地插件 manifest 版本；页面展示 `latestVersion` 和
+`updateAvailable`，管理员可以显式触发检查并更新单个插件。
+
+更新必须复用现有插件包下载、大小、路径、manifest、平台入口和 SHA-256 校验。更新前停止该插件进程，
+校验并原子写入新包，再刷新进程内目录；插件配置文件、`installed_plugins` 安装状态、启用状态和媒体库
+选择均保持不变。无可用更新、未安装、未找到当前平台包或目录校验失败时不得删除旧包。
+
+API：
+
+- `GET /api/v1/admin/plugins` 返回可选 `latestVersion` 和 `updateAvailable` 字段；请求本身重新读取当前
+  插件目录，因此也作为更新检查接口。
+- `POST /api/v1/admin/plugins/{pluginId}/update` 只允许管理员并要求 CSRF；成功返回更新后的插件视图，
+  无更新返回结构化 `PLUGIN_NO_UPDATE` 冲突错误。
+- 更新包仍只允许当前插件商店目录声明的 HTTPS 地址，不接受请求体覆盖下载地址、版本或 SHA-256。
+
+验收：
+
+- [x] 已安装插件页面可以手动检查更新，并显示当前版本、最新版本和是否可更新。
+- [x] 可更新插件显示“更新插件”；更新成功后插件仍保持原配置和启用状态，页面显示已是最新。
+- [x] 更新下载失败、包校验失败、平台不支持或无更新时旧包仍可用，且不删除插件配置。
+- [x] 更新过程中插件进程被停止，更新后通过正常 RPC 调用按需启动新版本；STRM 插件计划任务保持同步。
+- [x] 非管理员不能检查或更新；更新接口不记录完整外部 URL、token 或包内容。
+
+验证：
+
+- `cargo test --locked --test plugins --test plugin_runtime`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+- 使用真实浏览器检查插件页面的更新状态、键盘操作、网络请求和无错误控制台。
+
+依赖：LUX-162、LUX-171。
 
 ## 26. 风险与缓解
 

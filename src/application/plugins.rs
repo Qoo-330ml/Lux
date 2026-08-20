@@ -326,7 +326,11 @@ impl PluginService {
                 continue;
             }
             if let Some(plugin) = local_plugin {
-                views.push(self.dynamic_view(plugin, installed, enabled).await?);
+                let mut view = self.dynamic_view(plugin, installed, enabled).await?;
+                view.latest_version = Some(entry.version.clone());
+                view.update_available =
+                    installed && plugin_version_is_newer(&plugin.manifest.version, &entry.version);
+                views.push(view);
             } else {
                 views.push(remote_plugin_view(entry, installed, enabled));
             }
@@ -427,6 +431,45 @@ impl PluginService {
         }
         *self.catalog.write().await = PluginCatalog::discover(&self.config_dir.join("plugins"));
         Ok(())
+    }
+
+    pub async fn update(&self, plugin_id: &str) -> Result<PluginView, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
+        if !self.database.has_plugin_installation(&plugin_id).await? {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        let entry = self
+            .store_index()
+            .await
+            .plugins
+            .into_iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !plugin_version_is_newer(&plugin.manifest.version, &entry.version) {
+            return Err(PluginServiceError::NoUpdate);
+        }
+        self.supervisor.stop(&plugin_id).await;
+        self.install_remote_package(&entry).await?;
+        let current_catalog = self.catalog_snapshot().await;
+        if plugin_id == MEDIA_INFO_PLUGIN_ID {
+            self.sync_media_info_scheduled_task().await?;
+        } else if current_catalog
+            .get(&plugin_id)
+            .is_some_and(is_chapter_detector_plugin)
+        {
+            self.sync_chapter_detection_scheduled_tasks().await?;
+        }
+        let enabled = self
+            .database
+            .plugin_installation_status(&plugin_id)
+            .await?
+            .unwrap_or(false);
+        self.view_for_id(&plugin_id, true, enabled).await
     }
 
     pub async fn set_enabled(
@@ -1505,6 +1548,18 @@ impl PluginService {
             let _ = fs::remove_dir_all(&validation_dir).await;
             return Err(PluginServiceError::ConfigIo(error));
         }
+        // Keep the previous archives until the newly moved archive is visible in a
+        // fresh catalog. This matters for updates: a discovery failure must leave
+        // the old package available for the next attempt.
+        let catalog = PluginCatalog::discover(&plugin_dir);
+        if !catalog
+            .get(&entry.id)
+            .is_some_and(|plugin| plugin.manifest.version == entry.version)
+        {
+            let _ = fs::remove_file(&destination).await;
+            let _ = fs::remove_dir_all(&validation_dir).await;
+            return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
+        }
         let mut entries = fs::read_dir(&plugin_dir)
             .await
             .map_err(PluginServiceError::ConfigIo)?;
@@ -1527,11 +1582,6 @@ impl PluginService {
             }
         }
         let _ = fs::remove_dir_all(&validation_dir).await;
-        let catalog = PluginCatalog::discover(&plugin_dir);
-        if catalog.get(&entry.id).is_none() {
-            let _ = fs::remove_file(&destination).await;
-            return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
-        }
         *self.catalog.write().await = catalog;
         Ok(())
     }
@@ -1662,6 +1712,8 @@ impl PluginService {
             } else {
                 public_config_values
             },
+            latest_version: None,
+            update_available: false,
         })
     }
 
@@ -1831,6 +1883,35 @@ fn is_tmdb_plugin_id(plugin_id: &str) -> bool {
     plugin_id == TMDB_PLUGIN_ID || plugin_id == TMDB_DYNAMIC_PLUGIN_ID
 }
 
+fn plugin_version_is_newer(current: &str, latest: &str) -> bool {
+    if current == latest {
+        return false;
+    }
+    let current_parts = current
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>();
+    let latest_parts = latest
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>();
+    match (current_parts, latest_parts) {
+        (Ok(current_parts), Ok(latest_parts)) => {
+            let length = current_parts.len().max(latest_parts.len());
+            (0..length)
+                .map(|index| {
+                    (
+                        current_parts.get(index).copied().unwrap_or(0),
+                        latest_parts.get(index).copied().unwrap_or(0),
+                    )
+                })
+                .find(|(current_part, latest_part)| current_part != latest_part)
+                .is_some_and(|(current_part, latest_part)| latest_part > current_part)
+        }
+        _ => latest > current,
+    }
+}
+
 fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) -> PluginView {
     let enabled = installed && enabled;
     PluginView {
@@ -1865,6 +1946,8 @@ fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) 
         config_fields: Vec::new(),
         config_source: CONFIG_SOURCE_NONE.to_owned(),
         config_values: Map::new(),
+        latest_version: Some(entry.version.clone()),
+        update_available: false,
     }
 }
 
@@ -2071,6 +2154,8 @@ pub struct PluginView {
     pub config_fields: Vec<PluginConfigField>,
     pub config_source: String,
     pub config_values: serde_json::Map<String, Value>,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
 }
 
 #[derive(Debug)]
@@ -2078,6 +2163,7 @@ pub enum PluginServiceError {
     UnknownPlugin(String),
     Unavailable(String),
     InvalidConfig,
+    NoUpdate,
     InvalidResponse,
     ConfigIo(io::Error),
     Runtime(PluginRuntimeError),
@@ -2093,6 +2179,7 @@ impl fmt::Display for PluginServiceError {
                 write!(formatter, "plugin is unavailable: {plugin_id}")
             }
             Self::InvalidConfig => formatter.write_str("invalid plugin configuration"),
+            Self::NoUpdate => formatter.write_str("plugin is already up to date"),
             Self::InvalidResponse => formatter.write_str("plugin returned an invalid response"),
             Self::ConfigIo(error) => write!(formatter, "plugin configuration IO error: {error}"),
             Self::Runtime(error) => error.fmt(formatter),
@@ -2112,6 +2199,7 @@ impl std::error::Error for PluginServiceError {
             Self::UnknownPlugin(_)
             | Self::Unavailable(_)
             | Self::InvalidConfig
+            | Self::NoUpdate
             | Self::InvalidResponse => None,
         }
     }
@@ -2510,4 +2598,23 @@ async fn tmdb_config_values(config_dir: &std::path::Path) -> serde_json::Map<Str
             Value::String(settings.api_base_url),
         ),
     ])
+}
+
+#[cfg(test)]
+mod plugin_update_tests {
+    use super::plugin_version_is_newer;
+
+    #[test]
+    fn compares_numeric_plugin_versions_without_lexical_ordering() {
+        assert!(plugin_version_is_newer("0.1.0", "0.2.0"));
+        assert!(plugin_version_is_newer("0.9.0", "0.10.0"));
+        assert!(!plugin_version_is_newer("1.0.1", "1.0.0"));
+        assert!(!plugin_version_is_newer("1.0.0", "1.0.0"));
+    }
+
+    #[test]
+    fn treats_a_changed_non_numeric_version_as_an_update_candidate() {
+        assert!(plugin_version_is_newer("build-a", "build-b"));
+        assert!(!plugin_version_is_newer("build-a", "build-a"));
+    }
 }

@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{
-        admin_events::{AdminEventHub, AdminEventScope},
+        admin_events::{AdminEventHub, AdminEventScope, UserEventHub, UserEventScope},
         home::HomeService,
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
         media_matching::{MediaKind, clean_title, has_multi_part_marker, parse_media_name},
@@ -1520,6 +1520,7 @@ pub struct ScanJobService {
     scanner: LibraryScanner,
     database: Database,
     admin_events: AdminEventHub,
+    user_events: UserEventHub,
     scan_lock: Arc<Semaphore>,
     library_covers: Option<LibraryCoverService>,
     strm_probe: Option<StrmProbeService>,
@@ -1544,6 +1545,7 @@ impl ScanJobService {
             scanner: LibraryScanner::new(database.clone()),
             database,
             admin_events: AdminEventHub::new(),
+            user_events: UserEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
             library_covers: None,
             strm_probe: None,
@@ -1563,6 +1565,11 @@ impl ScanJobService {
 
     pub fn with_admin_events(mut self, admin_events: AdminEventHub) -> Self {
         self.admin_events = admin_events;
+        self
+    }
+
+    pub fn with_user_events(mut self, user_events: UserEventHub) -> Self {
+        self.user_events = user_events;
         self
     }
 
@@ -1658,6 +1665,20 @@ impl ScanJobService {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    async fn update_activity(
+        &self,
+        job_id: &str,
+        current_item: Option<&str>,
+        scan_phase: &str,
+    ) -> Result<(), ScanJobError> {
+        let current_item = current_item.and_then(safe_scan_activity_label);
+        self.database
+            .update_scan_job_activity(job_id, current_item.as_deref(), scan_phase)
+            .await?;
+        self.admin_events.publish(AdminEventScope::Jobs);
+        Ok(())
     }
 
     pub async fn enqueue_incremental_changes(
@@ -1865,6 +1886,7 @@ impl ScanJobService {
             && let Some(home) = &self.home
         {
             home.invalidate();
+            self.user_events.publish(UserEventScope::Home);
         }
         Ok(report)
     }
@@ -1929,6 +1951,14 @@ impl ScanJobService {
             .database
             .list_reconciliation_scan_entries(&job.id, "DIRECTORY", limit)
             .await?;
+        self.update_activity(
+            &job.id,
+            directories
+                .last()
+                .map(|directory| directory.relative_path.as_str()),
+            "DISCOVERY",
+        )
+        .await?;
         let mut unavailable_root_ids = HashSet::new();
         let mut discovered_count = job.total_count;
         for directory in directories {
@@ -2059,6 +2089,16 @@ impl ScanJobService {
                 i64::try_from(batch_size).unwrap_or(i64::MAX),
             )
             .await?;
+        self.update_activity(
+            &job.id,
+            batch.last().map(|entry| entry.relative_path.as_str()),
+            if batch.is_empty() {
+                "FINALIZING"
+            } else {
+                "INDEXING"
+            },
+        )
+        .await?;
         if batch.is_empty() {
             let mut removed_count = 0_usize;
             for root in &roots {
@@ -2637,6 +2677,16 @@ impl ScanJobService {
             .database
             .list_pending_scan_job_paths(job_id, i64::try_from(batch_size).unwrap_or(i64::MAX))
             .await?;
+        self.update_activity(
+            job_id,
+            paths.last().map(|path| path.relative_path.as_str()),
+            if paths.is_empty() {
+                "FINALIZING"
+            } else {
+                "INDEXING"
+            },
+        )
+        .await?;
         if paths.is_empty() {
             if self.database.finish_scan_job_if_idle(job_id).await? {
                 self.database
@@ -2914,6 +2964,7 @@ impl ScanJobService {
                 && let Some(home) = &self.home
             {
                 home.invalidate();
+                self.user_events.publish(UserEventScope::Home);
             }
             created_items = created_items.saturating_add(report.created_items);
             if !report.completed {
@@ -2949,6 +3000,7 @@ impl ScanJobService {
                     self.run_auto_library_cover_after_scan(job_id).await?;
                     if let Some(home) = &self.home {
                         home.invalidate();
+                        self.user_events.publish(UserEventScope::Home);
                     }
                     self.publish_media_added_event(&completed_job, created_items)
                         .await;
@@ -2966,6 +3018,7 @@ impl ScanJobService {
                 }
                 if let Some(home) = &self.home {
                     home.invalidate();
+                    self.user_events.publish(UserEventScope::Home);
                 }
                 self.publish_media_added_event(&completed_job, created_items)
                     .await;
@@ -3646,6 +3699,8 @@ pub struct ScanJob {
     pub cancel_requested: bool,
     pub error: Option<String>,
     pub finished_at: Option<i64>,
+    pub current_item: Option<String>,
+    pub scan_phase: String,
 }
 
 fn scan_job(job: StoredScanJob) -> ScanJob {
@@ -3662,6 +3717,8 @@ fn scan_job(job: StoredScanJob) -> ScanJob {
         cancel_requested: job.cancel_requested,
         error: job.error,
         finished_at: job.finished_at,
+        current_item: job.current_item,
+        scan_phase: job.scan_phase,
     }
 }
 
@@ -4248,6 +4305,24 @@ fn strm_target_kind_name(target: &StrmTarget) -> &'static str {
     }
 }
 
+fn safe_scan_activity_label(relative_path: &str) -> Option<String> {
+    let trimmed = relative_path.trim_matches(|character| character == '/' || character == '\\');
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .rsplit(['/', '\\'])
+        .find(|part| !part.trim().is_empty())
+        .map(|part| {
+            let mut label = part.trim().chars().take(160).collect::<String>();
+            if label.contains('?') {
+                label.truncate(label.find('?').unwrap_or(label.len()));
+            }
+            label
+        })
+        .filter(|label| !label.is_empty())
+}
+
 #[derive(Debug)]
 pub enum ScannerError {
     LibraryNotFound,
@@ -4320,7 +4395,7 @@ impl From<StorageError> for ScannerError {
 
 #[cfg(test)]
 mod tests {
-    use super::media_source_folder;
+    use super::{media_source_folder, safe_scan_activity_label};
 
     #[test]
     fn media_source_folder_uses_the_source_parent_directory() {
@@ -4329,5 +4404,18 @@ mod tests {
             "Movies/Dune"
         );
         assert_eq!(media_source_folder("Dune.2021.mkv").unwrap(), ".");
+    }
+
+    #[test]
+    fn scan_activity_label_uses_only_the_relative_basename() {
+        assert_eq!(
+            safe_scan_activity_label("Movies/Dune/Dune.2021.mkv").as_deref(),
+            Some("Dune.2021.mkv")
+        );
+        assert_eq!(
+            safe_scan_activity_label("/private/root/Secret.strm?token=abc").as_deref(),
+            Some("Secret.strm")
+        );
+        assert_eq!(safe_scan_activity_label("/"), None);
     }
 }

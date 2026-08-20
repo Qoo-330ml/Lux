@@ -18,6 +18,7 @@ pub enum ApiErrorCode {
     NotFound,
     PermissionDenied,
     PluginUnavailable,
+    PluginNoUpdate,
     InvalidCredentials,
     SetupAlreadyCompleted,
 }
@@ -40,6 +41,7 @@ impl ApiErrorCode {
             Self::NotFound => "NOT_FOUND",
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::PluginUnavailable => "PLUGIN_UNAVAILABLE",
+            Self::PluginNoUpdate => "PLUGIN_NO_UPDATE",
             Self::InvalidCredentials => "INVALID_CREDENTIALS",
             Self::SetupAlreadyCompleted => "SETUP_ALREADY_COMPLETED",
         }
