@@ -785,9 +785,11 @@ impl PeopleService {
             .count_person_index_items(&job.library_id)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
-        let total_count = (job.total_count > 0)
-            .then_some(job.total_count)
-            .unwrap_or(total_count);
+        let total_count = if job.total_count > 0 {
+            job.total_count
+        } else {
+            total_count
+        };
         let mut after_id = job.cursor_id.clone();
         let mut processed_count = job.processed_count;
         loop {

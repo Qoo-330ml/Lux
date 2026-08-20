@@ -2912,8 +2912,17 @@ services:
 - 热查询有 EXPLAIN 记录。
 - 消除 N+1。
 - 按真实筛选增加最小必要索引。
+- 人物索引重建使用稳定的 keyset 游标，不再使用大库上的 `OFFSET + CASE ORDER BY`。
+- 人物索引任务的游标、进度、取消标记和状态持久化；进程重启会把 `RUNNING` 任务恢复为
+  `QUEUED`，取消或完成后不会重复领取已处理条目。
+- `people.json` 内容指纹未变化时跳过关系表的 DELETE/INSERT；关系更新和指纹状态在同一事务中提交。
+- 人物详情查询使用 `person_credits(person_id, item_id)` 和可见媒体条目索引，避免为每个请求重复扫描大表。
 
-验证：60k 基准。
+验证：60k 基准；专项测试覆盖 keyset 分页、重启恢复、取消后续请求可继续、指纹跳过和查询索引。
+
+实现记录（2026-08）：SQLite schema 已推进到 76，PostgreSQL schema 已推进到 31。飞牛部署前必须
+在目标实例执行迁移并记录 `EXPLAIN`、`pg_stat_activity`、临时字节增量和前台 p50/p95；本机 ARM
+验证结果不得替代 NAS x86_64 性能结论。
 
 依赖：阶段 12。
 
