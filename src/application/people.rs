@@ -464,10 +464,7 @@ impl PeopleService {
             let actor_provider = primary
                 .map(|identity| identity.provider.as_str())
                 .unwrap_or_default();
-            let bridge_person_key = same_media_bridge_person_key(
-                previous_relation.as_ref(),
-                actor,
-            );
+            let bridge_person_key = same_media_bridge_person_key(previous_relation.as_ref(), actor);
             let person_key = self
                 .resolve_person_key(actor, &identities, bridge_person_key)
                 .await?;
@@ -806,7 +803,11 @@ impl PeopleService {
             manifest.display_name = display_name.trim().to_owned();
         }
         for identity in identities {
-            if !manifest.identities.iter().any(|existing| existing == identity) {
+            if !manifest
+                .identities
+                .iter()
+                .any(|existing| existing == identity)
+            {
                 manifest.identities.push(identity.clone());
             }
         }
@@ -1048,17 +1049,18 @@ impl PeopleService {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(source) => {
-                return Err(PeopleError::Io {
-                    path: root,
-                    source,
-                });
+                return Err(PeopleError::Io { path: root, source });
             }
         };
         let mut restored = 0;
-        while let Some(initial) = initials.next_entry().await.map_err(|source| PeopleError::Io {
-            path: root.clone(),
-            source,
-        })? {
+        while let Some(initial) = initials
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: root.clone(),
+                source,
+            })?
+        {
             let initial_path = initial.path();
             if safe_metadata(&initial_path)
                 .await?
@@ -1066,16 +1068,22 @@ impl PeopleService {
             {
                 continue;
             }
-            let mut persons = fs::read_dir(&initial_path)
-                .await
-                .map_err(|source| PeopleError::Io {
-                    path: initial_path.clone(),
-                    source,
-                })?;
-            while let Some(person) = persons.next_entry().await.map_err(|source| PeopleError::Io {
-                path: initial_path.clone(),
-                source,
-            })? {
+            let mut persons =
+                fs::read_dir(&initial_path)
+                    .await
+                    .map_err(|source| PeopleError::Io {
+                        path: initial_path.clone(),
+                        source,
+                    })?;
+            while let Some(person) =
+                persons
+                    .next_entry()
+                    .await
+                    .map_err(|source| PeopleError::Io {
+                        path: initial_path.clone(),
+                        source,
+                    })?
+            {
                 let person_dir = person.path();
                 if safe_metadata(&person_dir)
                     .await?
@@ -1130,17 +1138,18 @@ impl PeopleService {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(source) => {
-                return Err(PeopleError::Io {
-                    path: root,
-                    source,
-                });
+                return Err(PeopleError::Io { path: root, source });
             }
         };
         let mut restored = 0;
-        while let Some(shard) = shards.next_entry().await.map_err(|source| PeopleError::Io {
-            path: root.clone(),
-            source,
-        })? {
+        while let Some(shard) = shards
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: root.clone(),
+                source,
+            })?
+        {
             let shard_path = shard.path();
             if safe_metadata(&shard_path)
                 .await?
@@ -1491,14 +1500,8 @@ impl PeopleService {
             if identity.provider == provider && identity.id == provider_id {
                 continue;
             }
-            bytes = merge_person_nfo_bytes(
-                &bytes,
-                name,
-                &identity.provider,
-                &identity.id,
-                None,
-            )
-            .unwrap_or(bytes);
+            bytes = merge_person_nfo_bytes(&bytes, name, &identity.provider, &identity.id, None)
+                .unwrap_or(bytes);
         }
         Ok(bytes)
     }
@@ -2823,7 +2826,10 @@ fn same_media_bridge_person_key<'a>(
                     _ => true,
                 }
                 && birthdays_compatible(
-                    actor.person.as_ref().and_then(|person| person.birthday.as_deref()),
+                    actor
+                        .person
+                        .as_ref()
+                        .and_then(|person| person.birthday.as_deref()),
                     previous
                         .person
                         .as_ref()
@@ -2899,7 +2905,10 @@ fn valid_person_manifest(manifest: &PersonManifest) -> bool {
         return false;
     };
     let digest = Sha256::digest(bytes);
-    let actual = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let actual = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     actual == expected
 }
 
@@ -3183,11 +3192,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{ActorCredit, PeopleError, PeopleService, PersonIdentity};
-    use crate::{config::Config, storage::Database};
     use crate::application::metadata_paths::{
-        canonical_person_directory, library_item_directory, lux_person_directory,
-        people_directory, people_index_path_for_provider,
+        canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
+        people_index_path_for_provider,
     };
+    use crate::{config::Config, storage::Database};
 
     const PNG_1X1: &[u8] = &[
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
@@ -3207,7 +3216,10 @@ mod tests {
             Some("1990-01-02"),
             Some("1991-01-02")
         ));
-        assert!(super::birthdays_compatible(Some("1990-01"), Some("1990-01-02")));
+        assert!(super::birthdays_compatible(
+            Some("1990-01"),
+            Some("1990-01-02")
+        ));
     }
 
     #[tokio::test]
@@ -3280,11 +3292,9 @@ mod tests {
             person: None,
         };
         let bridge_identities = super::actor_identities(&bridge_actor, "douban");
-        let bridge_key = super::same_media_bridge_person_key(
-            Some(&previous_relation),
-            &bridge_actor,
-        )
-        .ok_or("same-media bridge was not selected")?;
+        let bridge_key =
+            super::same_media_bridge_person_key(Some(&previous_relation), &bridge_actor)
+                .ok_or("same-media bridge was not selected")?;
         let bridged_person = service
             .resolve_person_key(&bridge_actor, &bridge_identities, Some(bridge_key))
             .await?
