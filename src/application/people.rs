@@ -735,12 +735,12 @@ impl PeopleService {
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
         let mut rebuilt_items = 0;
         for library_id in library_ids {
-            let mut offset = 0;
+            let mut after_id = None;
             loop {
                 let item_ids = database
-                    .list_media_item_ids_for_library(
+                    .list_person_index_item_ids(
                         &library_id,
-                        offset,
+                        after_id.as_deref(),
                         PERSON_INDEX_REBUILD_BATCH_SIZE,
                     )
                     .await
@@ -757,7 +757,7 @@ impl PeopleService {
                         Err(error) => return Err(error),
                     }
                 }
-                offset += item_ids.len() as i64;
+                after_id = item_ids.last().cloned();
                 if item_ids.len() < PERSON_INDEX_REBUILD_BATCH_SIZE as usize {
                     break;
                 }

@@ -1551,6 +1551,40 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_person_index_item_ids(
+        &self,
+        library_id: &str,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let sql = if after_id.is_some() {
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+               AND id > ?
+             ORDER BY id
+             LIMIT ?"
+        } else {
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+             ORDER BY id
+             LIMIT ?"
+        };
+        let mut statement = self.query_scalar::<String>(sql).bind(library_id);
+        if let Some(after_id) = after_id {
+            statement = statement.bind(after_id);
+        }
+        statement
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn insert_library(&self, library: NewLibrary<'_>) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -14222,6 +14256,58 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"演员甲"));
         assert!(names.contains(&"演员乙"));
+    }
+
+    #[tokio::test]
+    async fn person_index_pages_use_keyset_order_and_skip_ineligible_items() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        for (item_id, item_type) in [
+            ("item-a", "MOVIE"),
+            ("item-b", "SERIES"),
+            ("item-c", "EPISODE"),
+            ("item-folder", "FOLDER"),
+            ("item-removed", "MOVIE"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await
+            .expect("media item");
+        }
+        sqlx::query("UPDATE media_items SET removed_at = 1 WHERE id = 'item-removed'")
+            .execute(database.pool())
+            .await
+            .expect("removed item");
+
+        let first_page = database
+            .list_person_index_item_ids(&library_id, None, 2)
+            .await
+            .expect("first page");
+        assert_eq!(first_page, vec!["item-a", "item-b"]);
+        let second_page = database
+            .list_person_index_item_ids(&library_id, first_page.last().map(String::as_str), 2)
+            .await
+            .expect("second page");
+        assert_eq!(second_page, vec!["item-c"]);
     }
 
     #[tokio::test]
