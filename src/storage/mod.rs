@@ -34,6 +34,15 @@ fn current_unix_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
+fn normalize_person_name(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn playback_reached_played_threshold(
     position_ticks: i64,
     duration_ticks: i64,
@@ -1455,7 +1464,7 @@ impl Database {
         .bind(&person_id)
         .bind(display_name)
         .bind(display_name)
-        .bind(display_name)
+        .bind(normalize_person_name(display_name))
         .bind(now)
         .bind(now)
         .execute(&mut *transaction)
@@ -1556,6 +1565,53 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn list_canonical_people_by_normalized_name(
+        &self,
+        normalized_name: &str,
+    ) -> Result<Vec<StoredCanonicalPersonMatch>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT p.id, p.display_name, pc.birthday
+                 FROM people p
+                 LEFT JOIN person_credits pc
+                   ON pc.lux_person_id = p.id AND pc.person_type = 'Actor'
+                 WHERE p.status = 'ACTIVE'
+                 ORDER BY p.id, pc.birthday",
+            )
+            .bind(normalized_name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut matches = Vec::<StoredCanonicalPersonMatch>::new();
+        for row in rows {
+            let id: String = row.get("id");
+            let display_name: String = row.get("display_name");
+            if normalize_person_name(&display_name) != normalized_name {
+                continue;
+            }
+            let birthday: Option<String> = row.try_get("birthday").ok();
+            if let Some(existing) = matches.iter_mut().find(|candidate| candidate.id == id) {
+                if let Some(birthday) = birthday.filter(|value| !value.trim().is_empty())
+                    && !existing.birthdays.iter().any(|value| value == &birthday)
+                {
+                    existing.birthdays.push(birthday);
+                }
+            } else {
+                matches.push(StoredCanonicalPersonMatch {
+                    id,
+                    birthdays: birthday
+                        .filter(|value| !value.trim().is_empty())
+                        .into_iter()
+                        .collect(),
+                });
+            }
+        }
+        Ok(matches)
     }
 
     pub(crate) async fn enqueue_person_match_candidate(
@@ -1987,7 +2043,7 @@ impl Database {
         .bind(&new_person_id)
         .bind(display_name)
         .bind(display_name)
-        .bind(display_name)
+        .bind(normalize_person_name(display_name))
         .bind(now)
         .bind(now)
         .execute(&mut *transaction)
@@ -2097,7 +2153,7 @@ impl Database {
         .bind(person_id)
         .bind(display_name)
         .bind(display_name)
-        .bind(display_name)
+        .bind(normalize_person_name(display_name))
         .bind(now)
         .bind(now)
         .execute(&mut *transaction)
@@ -13868,6 +13924,12 @@ pub(crate) struct NewPersonCredit {
 #[derive(Debug)]
 pub(crate) struct StoredCanonicalPerson {
     pub(crate) id: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredCanonicalPersonMatch {
+    pub(crate) id: String,
+    pub(crate) birthdays: Vec<String>,
 }
 
 fn stored_canonical_person(row: sqlx::any::AnyRow) -> StoredCanonicalPerson {

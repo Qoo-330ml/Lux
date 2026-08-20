@@ -442,6 +442,49 @@ impl PeopleService {
             return Ok(Some(bridge_person_key.to_owned()));
         }
 
+        if mapped_person.is_none()
+            && let Some(incoming_birthday) = actor
+                .person
+                .as_ref()
+                .and_then(|person| person.birthday.as_deref())
+                .filter(|value| !value.trim().is_empty())
+        {
+            let candidates = database
+                .list_canonical_people_by_normalized_name(&normalize_person_match_text(&actor.name))
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            let compatible = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.birthdays.iter().any(|birthday| {
+                        birthdays_compatible(Some(incoming_birthday), Some(birthday))
+                    })
+                })
+                .collect::<Vec<_>>();
+            if compatible.len() == 1 {
+                let person_id = &compatible[0].id;
+                for identity in identities {
+                    database
+                        .attach_canonical_person_identity(
+                            person_id,
+                            &identity.provider,
+                            &identity.id,
+                            "NAME_BIRTHDAY_UNIQUE",
+                            Some(0.96),
+                            &serde_json::json!({
+                                "method": "unique-name-birthday",
+                                "normalizedName": normalize_person_match_text(&actor.name),
+                                "birthday": incoming_birthday,
+                            })
+                            .to_string(),
+                        )
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                }
+                return Ok(Some(person_id.to_owned()));
+            }
+        }
+
         let person = match mapped_person {
             Some(person) => person,
             None => database
@@ -824,6 +867,14 @@ impl PeopleService {
                 pending_assets,
             };
         }
+        if person_key.is_some_and(|key| key.starts_with("lux-"))
+            && let Err(error) = self
+                .migrate_legacy_person_assets(&actor.name, provider, provider_id, &person_dir)
+                .await
+        {
+            tracing::warn!(person_id = %provider_id, %error, "legacy person assets were not migrated");
+            pending_assets.push(PENDING_PERSON_DIRECTORY.to_owned());
+        }
 
         let nfo_path = person_dir.join(PERSON_NFO);
         let index_dir = people_index_directory(&self.config_dir);
@@ -876,6 +927,7 @@ impl PeopleService {
                 provider,
                 actor.profile_url.as_deref(),
                 &person_dir,
+                person_key.is_some_and(|key| key.starts_with("lux-")),
             )
             .await
         {
@@ -970,6 +1022,42 @@ impl PeopleService {
             image_file,
             pending_assets,
         }
+    }
+
+    async fn migrate_legacy_person_assets(
+        &self,
+        display_name: &str,
+        provider: &str,
+        provider_id: &str,
+        person_dir: &Path,
+    ) -> Result<(), PeopleError> {
+        let legacy_dir = people_directory(&self.config_dir, display_name, provider, provider_id)
+            .map_err(PeopleError::from)?;
+        if legacy_dir == person_dir || safe_metadata(&legacy_dir).await?.is_none() {
+            return Ok(());
+        }
+
+        let legacy_nfo = legacy_dir.join(PERSON_NFO);
+        let target_nfo = person_dir.join(PERSON_NFO);
+        if safe_metadata(&target_nfo).await?.is_none()
+            && let Some(bytes) = read_people_file(&legacy_nfo).await?
+        {
+            write_atomically(&target_nfo, &bytes).await?;
+        }
+
+        for extension in PROFILE_EXTENSIONS {
+            let legacy_image = legacy_dir.join(format!("{PERSON_IMAGE}.{extension}"));
+            let target_image = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
+            if safe_metadata(&target_image).await?.is_none()
+                && safe_metadata(&legacy_image)
+                    .await?
+                    .is_some_and(|metadata| metadata.is_file())
+            {
+                self.materialize_profile_asset(&legacy_image, person_dir)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn persist_person_manifest(
@@ -2654,7 +2742,20 @@ impl PeopleService {
         provider: &str,
         image_url: Option<&str>,
         person_dir: &Path,
+        prefer_local: bool,
     ) -> Result<Option<String>, PeopleError> {
+        if prefer_local {
+            for extension in PROFILE_EXTENSIONS {
+                let path = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
+                if safe_metadata(&path)
+                    .await?
+                    .is_some_and(|metadata| metadata.is_file())
+                {
+                    return Ok(Some(format!("{PERSON_IMAGE}.{extension}")));
+                }
+            }
+        }
+
         if let Some(image) = self
             .indexed_profile_image_for_provider(provider, person_id)
             .await?
@@ -2665,13 +2766,15 @@ impl PeopleService {
                 .map(Some);
         }
 
-        for extension in PROFILE_EXTENSIONS {
-            let path = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
-            if safe_metadata(&path)
-                .await?
-                .is_some_and(|metadata| metadata.is_file())
-            {
-                return Ok(Some(format!("{PERSON_IMAGE}.{extension}")));
+        if !prefer_local {
+            for extension in PROFILE_EXTENSIONS {
+                let path = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
+                if safe_metadata(&path)
+                    .await?
+                    .is_some_and(|metadata| metadata.is_file())
+                {
+                    return Ok(Some(format!("{PERSON_IMAGE}.{extension}")));
+                }
             }
         }
 
@@ -3584,25 +3687,34 @@ fn normalize_person_match_text(value: &str) -> String {
 }
 
 fn birthdays_compatible(current: Option<&str>, previous: Option<&str>) -> bool {
-    match (full_birthday(current), full_birthday(previous)) {
-        (Some(current), Some(previous)) => current == previous,
+    match (birthday_parts(current), birthday_parts(previous)) {
+        (Some(current), Some(previous)) => {
+            current.0 == previous.0
+                && current.1 == previous.1
+                && match (current.2, previous.2) {
+                    (Some(current), Some(previous)) => current == previous,
+                    _ => true,
+                }
+        }
         _ => true,
     }
 }
 
-fn full_birthday(value: Option<&str>) -> Option<(u32, u32, u32)> {
+fn birthday_parts(value: Option<&str>) -> Option<(u32, u32, Option<u32>)> {
     let value = value?.trim();
     let components = value
         .split(|character: char| !character.is_ascii_digit())
         .filter(|component| !component.is_empty())
         .collect::<Vec<_>>();
-    if components.len() != 3 {
+    if !matches!(components.len(), 2 | 3) {
         return None;
     }
     Some((
         components[0].parse().ok()?,
         components[1].parse().ok()?,
-        components[2].parse().ok()?,
+        components
+            .get(2)
+            .and_then(|component| component.parse().ok()),
     ))
 }
 
@@ -4104,7 +4216,10 @@ mod tests {
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
         people_index_path_for_provider,
     };
-    use crate::{config::Config, storage::Database};
+    use crate::{
+        application::libraries::LibraryService, config::Config, library::LibraryKind,
+        storage::Database,
+    };
 
     const PNG_1X1: &[u8] = &[
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
@@ -4316,6 +4431,134 @@ mod tests {
             .await?
             .ok_or("restored provider identity was not indexed")?;
         assert_eq!(restored.id, "lux-000001");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lux_person_first_write_migrates_existing_legacy_assets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database);
+        let actor = ActorCredit {
+            id: "57975".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "华晨宇".to_owned(),
+            character: None,
+            order: None,
+            profile_url: None,
+            person: None,
+        };
+        let identities = super::actor_identities(&actor, "tmdb");
+        let lux_person_id = service
+            .resolve_person_key(&actor, &identities, None)
+            .await?
+            .ok_or("missing Lux person")?;
+        let legacy_dir = people_directory(&config.config_dir, "华晨宇", "tmdb", "57975")?;
+        tokio::fs::create_dir_all(&legacy_dir).await?;
+        tokio::fs::write(
+            legacy_dir.join("person.nfo"),
+            r#"<?xml version="1.0"?><person><name>旧姓名</name><biography>旧简介</biography></person>"#
+                .as_bytes(),
+        )
+        .await?;
+        tokio::fs::write(legacy_dir.join("folder.png"), PNG_1X1).await?;
+
+        service
+            .persist_person_assets(&actor, "tmdb", "57975", Some(&lux_person_id), &identities)
+            .await;
+
+        let target_dir = lux_person_directory(&config.config_dir, "华晨宇", &lux_person_id)?;
+        let nfo = tokio::fs::read_to_string(target_dir.join("person.nfo")).await?;
+        assert!(nfo.contains("旧简介"));
+        assert_eq!(
+            tokio::fs::read(target_dir.join("folder.png")).await?,
+            PNG_1X1
+        );
+        assert!(legacy_dir.join("person.nfo").exists());
+        assert!(legacy_dir.join("folder.png").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unique_name_and_compatible_birthday_bridge_without_media_role_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        for item_id in ["item-global-first", "item-global-second"] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        service
+            .persist_item_actors(
+                "item-global-first",
+                "tmdb",
+                &[ActorCredit {
+                    id: "57975".to_owned(),
+                    provider: Some("tmdb".to_owned()),
+                    identities: Vec::new(),
+                    name: "同名演员".to_owned(),
+                    character: None,
+                    order: None,
+                    profile_url: None,
+                    person: Some(super::PersonMetadata {
+                        birthday: Some("1970-01-02".to_owned()),
+                        ..Default::default()
+                    }),
+                }],
+            )
+            .await?;
+        service
+            .persist_item_actors(
+                "item-global-second",
+                "douban",
+                &[ActorCredit {
+                    id: "1313123".to_owned(),
+                    provider: Some("douban".to_owned()),
+                    identities: Vec::new(),
+                    name: "同名演员".to_owned(),
+                    character: None,
+                    order: None,
+                    profile_url: None,
+                    person: Some(super::PersonMetadata {
+                        birthday: Some("1970年1月2日".to_owned()),
+                        ..Default::default()
+                    }),
+                }],
+            )
+            .await?;
+
+        let first = database
+            .find_canonical_person_by_identity("tmdb", "57975")
+            .await?
+            .ok_or("missing first provider identity")?;
+        let person = database
+            .find_canonical_person_by_identity("douban", "1313123")
+            .await?
+            .ok_or("missing bridged provider identity")?;
+        assert_eq!(person.id, first.id);
         Ok(())
     }
 
