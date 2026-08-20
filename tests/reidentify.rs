@@ -871,6 +871,10 @@ async fn metadata_job_with_item_issues_does_not_enqueue_job_failed_webhook()
     let job = metadata
         .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
         .await?;
+    sqlx::query("UPDATE media_items SET title = '', sort_title = '' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
     metadata.run(&job.id).await;
 
     let finished = metadata.get_job(&job.id).await?;
