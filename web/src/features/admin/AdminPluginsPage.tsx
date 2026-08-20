@@ -213,11 +213,6 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
     },
   });
-  const run = useMutation({
-    mutationFn: () => api.runAdminPlugin(plugin.id),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "jobs"] }),
-  });
-
   useEffect(() => {
     if (!open) return;
     closeRef.current?.focus();
@@ -318,7 +313,6 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
         ) : (
           <button className="lux-admin-plugin-install-status is-install" type="button" aria-label={`安装 ${plugin.name}`} disabled={installing} onClick={onInstall}><Download size={15} /> {installing ? "安装中…" : "安装"}</button>
         )}
-        {isMediaInfo && plugin.installed && plugin.configured ? <button className="lux-button lux-button-secondary" type="button" aria-label="开始提取" onClick={() => run.mutate()} disabled={run.isPending}>{run.isPending ? "启动中…" : "开始提取"}</button> : null}
         {canConfigure ? <button className="lux-admin-plugin-config-button" type="button" aria-label={`配置 ${plugin.name}`} onClick={() => setOpen(true)}><Settings2 size={15} /> 配置</button> : null}
       </div>
       {open && canConfigure ? (

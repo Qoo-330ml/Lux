@@ -54,6 +54,7 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   FILL_MISSING: "元数据仅补全",
   FULL_REFRESH: "元数据完整刷新",
   AUTO_LIBRARY_COVER: "自动生成媒体库封面",
+  STRM_MEDIA_INFO: "STRM 媒体信息扫描",
 };
 
 const AUDIT_EVENT_LABELS: Record<string, string> = {
@@ -506,7 +507,8 @@ function taskLabel(taskType: string) {
 }
 
 function isRunnableTask(task: AdminScheduledTask) {
-  return task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE", "AUTO_LIBRARY_COVER"].includes(task.taskType);
+  return isPluginScheduledTask(task)
+    || (task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE", "AUTO_LIBRARY_COVER"].includes(task.taskType));
 }
 
 function isSchedulableTask(task: AdminScheduledTask) {
@@ -519,6 +521,11 @@ function isPluginScheduledTask(task: AdminScheduledTask) {
 }
 
 async function runRegisteredTask(task: AdminScheduledTask) {
+  if (isPluginScheduledTask(task)) {
+    if (!task.pluginId) return Promise.reject(new Error("该插件任务缺少插件标识"));
+    await api.runAdminPlugin(task.pluginId);
+    return;
+  }
   if (task.taskType === "RECONCILIATION_SCAN") {
     await api.startAdminScan(task.ownerId);
     return;

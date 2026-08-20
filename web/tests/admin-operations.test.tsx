@@ -346,6 +346,7 @@ describe("AdminOperationsPage", () => {
         isEnabled: true,
       },
     });
+    const runPlugin = vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({
       scheduledTasks: [{
         id: "GLOBAL:global:STRM_MEDIA_INFO",
@@ -386,6 +387,10 @@ describe("AdminOperationsPage", () => {
         schedule: "0 4 * * *",
         isEnabled: undefined,
       }));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行STRM 媒体信息扫描"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(runPlugin).toHaveBeenCalledWith("org.lux.strm-media-info"));
     });
   });
 

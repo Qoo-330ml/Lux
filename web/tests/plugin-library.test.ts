@@ -146,6 +146,9 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(grid).toBeTruthy();
     expect(grid?.querySelectorAll(":scope > .lux-admin-plugin-card")).toHaveLength(2);
     expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
+    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-card\s*\{[^}]*align-items:\s*start;/s);
+    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-heading-line\s*\{[^}]*align-items:\s*baseline;/s);
+    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-actions\s*\{[^}]*justify-content:\s*flex-start;/s);
   });
 
   it("opens configuration in a separate dialog card", async () => {
@@ -372,7 +375,7 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(api.uninstallAdminPlugin).toHaveBeenCalledWith("org.lux.tmdb");
   });
 
-  it("renders media-info settings and runs with the saved plugin configuration", async () => {
+  it("renders media-info settings without exposing a run action in the plugin card", async () => {
     currentPlugin = {
       ...configuredPlugin,
       id: "org.lux.strm-media-info",
@@ -402,7 +405,7 @@ describe("AdminPluginsPage plugin cards", () => {
     };
     await renderPage();
 
-    expect(container.querySelector('[aria-label="开始提取"]')).toBeTruthy();
+    expect(container.querySelector('[aria-label="开始提取"]')).toBeNull();
     await act(async () => {
       container.querySelector<HTMLButtonElement>('[aria-label="配置 strm媒体信息提取"]')?.click();
     });
@@ -435,10 +438,7 @@ describe("AdminPluginsPage plugin cards", () => {
       writeSidecars: true,
       schedule: "0 3 * * *",
     }));
-    await act(async () => {
-      container.querySelector<HTMLButtonElement>('[aria-label="开始提取"]')?.click();
-    });
-    expect(api.runAdminPlugin).toHaveBeenCalledWith("org.lux.strm-media-info");
+    expect(api.runAdminPlugin).not.toHaveBeenCalled();
   });
 
   it("does not show configuration action for plugins without configuration", async () => {
