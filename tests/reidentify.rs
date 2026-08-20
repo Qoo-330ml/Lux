@@ -391,7 +391,7 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
         .ok_or("missing failed job ID")?
         .to_owned();
     let mut failed_job = Value::Null;
-    for _ in 0..80 {
+    for _ in 0..200 {
         let response = client
             .get(format!(
                 "{base_url}/api/v1/admin/metadata/reidentify/{failed_job_id}"
@@ -400,12 +400,13 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
             .send()
             .await?;
         failed_job = response.json().await?;
-        if failed_job["job"]["status"] == "FAILED" {
+        if failed_job["job"]["status"] == "COMPLETED_WITH_ISSUES" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(failed_job["job"]["status"], "FAILED");
+    assert_eq!(failed_job["job"]["status"], "COMPLETED_WITH_ISSUES");
+    assert_eq!(failed_job["job"]["error"], "ITEM_ISSUES");
     assert_eq!(failed_job["job"]["items"][0]["error"], "INVALID_SEARCH");
 
     sqlx::query(
@@ -424,7 +425,7 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(retry.status(), reqwest::StatusCode::ACCEPTED);
     let mut retried_job = Value::Null;
-    for _ in 0..80 {
+    for _ in 0..200 {
         let response = client
             .get(format!(
                 "{base_url}/api/v1/admin/metadata/reidentify/{failed_job_id}"
@@ -433,7 +434,10 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
             .send()
             .await?;
         retried_job = response.json().await?;
-        if retried_job["job"]["status"] == "COMPLETED" || retried_job["job"]["status"] == "FAILED" {
+        if retried_job["job"]["status"] == "COMPLETED"
+            || retried_job["job"]["status"] == "COMPLETED_WITH_ISSUES"
+            || retried_job["job"]["status"] == "FAILED"
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -842,8 +846,8 @@ async fn metadata_job_skips_explicit_parent_folder_without_failing()
 }
 
 #[tokio::test]
-async fn failed_metadata_job_enqueues_job_failed_webhook() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn metadata_job_with_item_issues_does_not_enqueue_job_failed_webhook()
+-> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, database, _library_id, _folder_id) =
         setup_movie_library_with_parent_folder().await?;
     let item_id: String = sqlx::query_scalar(
@@ -870,7 +874,7 @@ async fn failed_metadata_job_enqueues_job_failed_webhook() -> Result<(), Box<dyn
     metadata.run(&job.id).await;
 
     let finished = metadata.get_job(&job.id).await?;
-    assert_eq!(finished.status, "FAILED");
+    assert_eq!(finished.status, "COMPLETED_WITH_ISSUES");
     let failed_events: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM notification_events
          WHERE event_type = 'JOB_FAILED' AND dedupe_key = ?",
@@ -878,6 +882,6 @@ async fn failed_metadata_job_enqueues_job_failed_webhook() -> Result<(), Box<dyn
     .bind(format!("job-failed:{}", job.id))
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(failed_events, 1);
+    assert_eq!(failed_events, 0);
     Ok(())
 }

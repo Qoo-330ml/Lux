@@ -1026,6 +1026,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-job-status { padding: 4px 7px; border-radius: 999px; font-size: .62rem; white-space: nowrap; }
 .status-running, .status-pending { color: #b8a4ec; background: rgba(154,126,232,.12); }
 .status-completed { color: #9bdcb3; background: rgba(96,194,132,.1); }
+.status-completed-with-issues { color: #f3c788; background: rgba(226,163,75,.12); }
+.status-deferred { color: #c8b6f2; background: rgba(154,126,232,.12); }
 .status-failed { color: #f3aab8; background: rgba(220,89,115,.1); }
 .status-cancelled { color: var(--lux-subtle); background: rgba(255,255,255,.07); }
 .lux-job-progress { height: 3px; margin-top: 9px; overflow: hidden; border-radius: 4px; background: rgba(255,255,255,.12); }

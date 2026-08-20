@@ -15211,7 +15211,13 @@ async fn admin_list_metadata_reidentify(
     if status.as_deref().is_some_and(|value| {
         !matches!(
             value,
-            "QUEUED" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED"
+            "QUEUED"
+                | "RUNNING"
+                | "COMPLETED"
+                | "COMPLETED_WITH_ISSUES"
+                | "DEFERRED"
+                | "CANCELLED"
+                | "FAILED"
         )
     }) {
         return api_error(

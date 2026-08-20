@@ -4770,7 +4770,7 @@ impl Database {
                  ),
                  cancel_requested = 0, error = NULL, started_at = NULL, finished_at = NULL,
                  updated_at = unixepoch()
-             WHERE id = ? AND status IN ('FAILED', 'CANCELLED')",
+             WHERE id = ? AND status IN ('FAILED', 'CANCELLED', 'COMPLETED_WITH_ISSUES', 'DEFERRED')",
             )
             .bind(job_id)
             .bind(job_id)

@@ -89,11 +89,11 @@ describe("AdminOperationsPage", () => {
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({
       jobs: [{
         id: "metadata-job-failed",
-        status: "FAILED",
+        status: "COMPLETED_WITH_ISSUES",
         mode: "FILL_MISSING",
         processedCount: 2,
         totalCount: 2,
-        error: "METADATA_BATCH_PARTIAL_FAILURE",
+        error: "ITEM_ISSUES",
         createdAt: 1_700_000_000,
         libraryId: "library-1",
       }],
@@ -101,11 +101,11 @@ describe("AdminOperationsPage", () => {
     const getJob = vi.spyOn(api, "adminMetadataReidentifyJob").mockResolvedValue({
       job: {
         id: "metadata-job-failed",
-        status: "FAILED",
+        status: "COMPLETED_WITH_ISSUES",
         mode: "FILL_MISSING",
         processedCount: 2,
         totalCount: 2,
-        error: "METADATA_BATCH_PARTIAL_FAILURE",
+        error: "ITEM_ISSUES",
         createdAt: 1_700_000_000,
         libraryId: "library-1",
         items: [
@@ -125,14 +125,14 @@ describe("AdminOperationsPage", () => {
     });
     act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
 
-    expect(container.textContent).toContain("任务处理失败（METADATA_BATCH_PARTIAL_FAILURE）");
+    expect(container.textContent).toContain("部分条目处理失败");
     expect(container.textContent).toContain("失败原因");
 
     await act(async () => {
-      container.querySelector<HTMLButtonElement>('button[aria-label="查看元数据仅补全失败详情"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="查看元数据仅补全问题详情"]')?.click();
       await vi.waitFor(() => expect(getJob).toHaveBeenCalledWith("metadata-job-failed"));
     });
-    expect(container.textContent).toContain("失败条目 3 个");
+    expect(container.textContent).toContain("问题条目 3 个");
     expect(container.textContent).toContain("图片下载或写回失败");
     expect(container.textContent).toContain("TMDb 服务暂时不可用");
     expect(container.textContent).toContain("movie-1");

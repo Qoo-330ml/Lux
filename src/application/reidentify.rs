@@ -265,7 +265,10 @@ impl MetadataReidentifyService {
         let Ok(Some(job)) = self.database.find_metadata_reidentify_job(job_id).await else {
             return;
         };
-        if matches!(job.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") {
+        if matches!(
+            job.status.as_str(),
+            "COMPLETED" | "COMPLETED_WITH_ISSUES" | "DEFERRED" | "FAILED" | "CANCELLED"
+        ) {
             return;
         }
         if job.cancel_requested {
@@ -318,6 +321,7 @@ impl MetadataReidentifyService {
                 );
                 last_concurrency = Some(concurrency);
             }
+            let mut queue_exhausted = false;
             while workers.len() < concurrency {
                 if self
                     .database
@@ -325,10 +329,12 @@ impl MetadataReidentifyService {
                     .await
                     .unwrap_or(true)
                 {
+                    queue_exhausted = true;
                     break;
                 }
                 let Ok(Some(item_id)) = self.database.next_metadata_reidentify_item(job_id).await
                 else {
+                    queue_exhausted = true;
                     break;
                 };
                 if !self
@@ -344,6 +350,9 @@ impl MetadataReidentifyService {
                 workers.spawn(async move {
                     service.process_item(&job_id, &item_id, mode).await;
                 });
+            }
+            if workers.is_empty() && queue_exhausted {
+                break;
             }
             let Some(worker_result) = workers.join_next().await else {
                 break;
@@ -391,22 +400,23 @@ impl MetadataReidentifyService {
                 .metadata_reidentify_job_has_failed_items(job_id)
                 .await
             {
-                Ok(true) => "FAILED",
+                Ok(true) => "COMPLETED_WITH_ISSUES",
                 Ok(false) => "COMPLETED",
                 Err(_) => "FAILED",
             }
         };
-        if self
+        let error = match status {
+            "FAILED" => Some("ITEM_FAILED"),
+            "COMPLETED_WITH_ISSUES" => Some("ITEM_ISSUES"),
+            _ => None,
+        };
+        let finish_result = self
             .database
-            .finish_metadata_reidentify_job(
-                job_id,
-                status,
-                (status == "FAILED").then_some("ITEM_FAILED"),
-            )
-            .await
-            .is_err()
-        {
-            tracing::error!(job_id, "metadata refresh job status could not be recorded");
+            .finish_metadata_reidentify_job(job_id, status, error)
+            .await;
+        if let Err(error) = finish_result {
+            tracing::error!(job_id, %error, "metadata refresh job status could not be recorded");
+            return;
         }
         if status == "FAILED" {
             self.publish_webhook(
@@ -697,8 +707,10 @@ impl MetadataReidentifyService {
         job_id: &str,
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         let job = self.get_job(job_id).await?;
-        if !matches!(job.status.as_str(), "FAILED" | "CANCELLED")
-            || !self.database.retry_metadata_reidentify_job(job_id).await?
+        if !matches!(
+            job.status.as_str(),
+            "FAILED" | "CANCELLED" | "COMPLETED_WITH_ISSUES" | "DEFERRED"
+        ) || !self.database.retry_metadata_reidentify_job(job_id).await?
         {
             return Err(MetadataReidentifyError::JobNotRetryable);
         }
