@@ -36,7 +36,11 @@ COPY --from=web-builder /src/web/dist ./web/dist
 
 RUN cargo build --release --locked --bin luxd
 
-FROM debian:bookworm-slim
+# External process plugins are distributed as Linux/glibc binaries. The
+# current official STRM media-info plugin requires GLIBC_2.39, while
+# bookworm ships GLIBC_2.36. Keep the runtime on a newer Debian release so
+# the supported plugin packages can start inside the Lux container.
+FROM debian:trixie-slim
 
 ARG LUX_VERSION=dev
 ARG LUX_REVISION=unknown

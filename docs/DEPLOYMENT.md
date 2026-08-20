@@ -146,6 +146,17 @@ docker compose up -d
 
 启动时会自动执行当前已选择数据库的 migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。当前版本不提供应用内备份/恢复或跨数据库迁移工具，也不提供 SQLite 与 PostgreSQL 之间的数据迁移；正式 NAS 发布前必须由运维侧完成配置目录、媒体目录和（如使用）PostgreSQL 数据库的快照与恢复演练。
 
+插件兼容性：运行时镜像使用 Debian Trixie，以满足当前官方 Linux 插件包的 glibc 要求。只替换 `/config/plugins` 中的插件包不会升级容器运行时；升级到包含此修复的 Lux 镜像后，应重新创建容器并确认插件进程能够启动：
+
+```bash
+docker build --build-arg LUX_VERSION=0.2.7-plugin-runtime -t pdzhou/lux:0.2.7-plugin-runtime .
+# 将 compose.yaml 中 lux.image 临时改为 pdzhou/lux:0.2.7-plugin-runtime
+docker compose up -d --force-recreate lux
+docker exec lux sh -c 'uname -m; command -v ffprobe; command -v ffmpeg'
+```
+
+如果使用已发布镜像，应先拉取包含该 Dockerfile 变更的版本标签，再执行 `docker compose up -d --force-recreate lux`；不要仅依赖 `latest` 标签判断镜像是否已更新。
+
 升级后的验收最少包括：
 
 ```bash
