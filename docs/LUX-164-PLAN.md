@@ -12,7 +12,7 @@ Lux 人物 ID 分组的对象目录。旧 `/config/people/items`、`/config/peop
 ## 验收
 
 - [x] 人物头像和 `person.nfo` 写入 `/config/metadata/people/person/<initial>/<name>-lux-<number>/`。
-- [ ] 人物目录同时保存带版本和校验信息的 `person.json`，记录 Lux 人物 ID、Provider 映射和恢复证据。
+- [x] 人物目录同时保存带版本和校验信息的 `person.json`，记录 Lux 人物 ID、Provider 映射、别名、字段来源/锁定状态和恢复证据。
 - [x] 人物条目关系快照写入 `/config/metadata/library/<shard>/<item-id>/people.json`。
 - [x] 旧人物目录仍可读取，升级不会要求手工搬运或删除文件。
 - [x] 路径清洗、稳定分片、符号链接拒绝和原子写入有自动化测试。

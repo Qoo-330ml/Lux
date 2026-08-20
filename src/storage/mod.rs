@@ -1641,7 +1641,7 @@ impl Database {
                 evidence_json = excluded.evidence_json,
                 updated_at = excluded.updated_at",
         )
-        .bind(&candidate_id)
+        .bind(candidate_id)
         .bind(item_id)
         .bind(provider)
         .bind(provider_id)
@@ -1683,8 +1683,9 @@ impl Database {
         self.query(
             "INSERT INTO person_match_candidates (
                 id, item_id, provider, provider_id, candidate_person_ids_json,
-                status, score, evidence_json, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, score, evidence_json, target_person_id, previous_person_id,
+                created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(item_id, provider, provider_id) DO UPDATE SET
                 candidate_person_ids_json = excluded.candidate_person_ids_json,
                 status = CASE
@@ -1695,6 +1696,8 @@ impl Database {
                 END,
                 score = excluded.score,
                 evidence_json = excluded.evidence_json,
+                target_person_id = COALESCE(excluded.target_person_id, person_match_candidates.target_person_id),
+                previous_person_id = COALESCE(excluded.previous_person_id, person_match_candidates.previous_person_id),
                 updated_at = excluded.updated_at",
         )
         .bind(restore.candidate_id)
@@ -1705,6 +1708,8 @@ impl Database {
         .bind(restore.status)
         .bind(restore.score)
         .bind(restore.evidence_json)
+        .bind(restore.target_person_id)
+        .bind(restore.previous_person_id)
         .bind(restore.created_at)
         .bind(restore.updated_at)
         .execute(&self.pool)
@@ -1746,7 +1751,8 @@ impl Database {
         self.query(
             "SELECT id, item_id, provider, provider_id,
                     candidate_person_ids_json, status, score,
-                    evidence_json, created_at, updated_at
+                    evidence_json, target_person_id, previous_person_id,
+                    created_at, updated_at
              FROM person_match_candidates
              WHERE status = 'PENDING'
              ORDER BY updated_at DESC, id DESC
@@ -1774,7 +1780,8 @@ impl Database {
         self.query(
             "SELECT id, item_id, provider, provider_id,
                     candidate_person_ids_json, status, score,
-                    evidence_json, created_at, updated_at
+                    evidence_json, target_person_id, previous_person_id,
+                    created_at, updated_at
              FROM person_match_candidates WHERE id = ?",
         )
         .bind(candidate_id)
@@ -1834,7 +1841,8 @@ impl Database {
             .query(
                 "SELECT id, item_id, provider, provider_id,
                         candidate_person_ids_json, status, score,
-                        evidence_json, created_at, updated_at
+                        evidence_json, target_person_id, previous_person_id,
+                        created_at, updated_at
                  FROM person_match_candidates WHERE id = ?",
             )
             .bind(candidate_id)
@@ -1941,8 +1949,161 @@ impl Database {
         }
         self.query(
             "UPDATE person_match_candidates
-             SET status = 'CONFIRMED', evidence_json = ?, updated_at = ?
+             SET status = 'CONFIRMED', evidence_json = ?,
+                 target_person_id = ?, previous_person_id = ?, updated_at = ?
              WHERE id = ?",
+        )
+        .bind(evidence_json)
+        .bind(target_person_id)
+        .bind(previous_person_id.as_deref())
+        .bind(now)
+        .bind(candidate_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(StoredPersonIdentityMove { previous_person_id })
+    }
+
+    pub(crate) async fn undo_person_match_candidate(
+        &self,
+        candidate_id: &str,
+        evidence_json: &str,
+    ) -> Result<StoredPersonIdentityMove, StorageError> {
+        let now = current_unix_timestamp();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let candidate = self
+            .query(
+                "SELECT id, item_id, provider, provider_id,
+                        candidate_person_ids_json, status, score,
+                        evidence_json, target_person_id, previous_person_id,
+                        created_at, updated_at
+                 FROM person_match_candidates WHERE id = ?",
+            )
+            .bind(candidate_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .map(stored_person_match_candidate)
+            .ok_or_else(|| {
+                StorageError::Conflict(format!("person match candidate '{candidate_id}' not found"))
+            })?;
+        if candidate.status != "CONFIRMED" {
+            return Err(StorageError::Conflict(format!(
+                "person match candidate '{candidate_id}' is {}",
+                candidate.status
+            )));
+        }
+        let target_person_id = candidate.target_person_id.ok_or_else(|| {
+            StorageError::Conflict(
+                "confirmed person match has no recorded target identity".to_owned(),
+            )
+        })?;
+        let current_owner = self
+            .query_scalar::<String>(
+                "SELECT person_id FROM person_identities
+                 WHERE provider = ? AND provider_id = ?",
+            )
+            .bind(&candidate.provider)
+            .bind(&candidate.provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if current_owner.as_deref() != Some(target_person_id.as_str()) {
+            return Err(StorageError::Conflict(
+                "provider identity no longer belongs to the confirmed target".to_owned(),
+            ));
+        }
+        let previous_person_id = candidate.previous_person_id;
+        if let Some(previous_person_id) = previous_person_id.as_deref() {
+            let previous_exists = self
+                .query_scalar::<String>("SELECT id FROM people WHERE id = ?")
+                .bind(previous_person_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .is_some();
+            if !previous_exists {
+                return Err(StorageError::Conflict(
+                    "previous canonical person no longer exists".to_owned(),
+                ));
+            }
+        }
+        self.query(
+            "DELETE FROM person_identities
+             WHERE provider = ? AND provider_id = ?",
+        )
+        .bind(&candidate.provider)
+        .bind(&candidate.provider_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if let Some(previous_person_id) = previous_person_id.as_deref() {
+            self.query(
+                "INSERT INTO person_identities (
+                    person_id, provider, provider_id, match_method, confidence,
+                    evidence_json, created_at, updated_at
+                 ) VALUES (?, ?, ?, 'MANUAL_UNDO', ?, ?, ?, ?)",
+            )
+            .bind(previous_person_id)
+            .bind(&candidate.provider)
+            .bind(&candidate.provider_id)
+            .bind(Some(1.0_f64))
+            .bind(evidence_json)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        self.query(
+            "UPDATE person_credits SET lux_person_id = ?
+             WHERE provider = ? AND person_id = ?",
+        )
+        .bind(previous_person_id.as_deref())
+        .bind(&candidate.provider)
+        .bind(&candidate.provider_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE person_match_candidates
+             SET status = 'REJECTED', evidence_json = ?, updated_at = ?
+             WHERE id = ? AND status = 'CONFIRMED'",
         )
         .bind(evidence_json)
         .bind(now)
@@ -13968,6 +14129,8 @@ pub(crate) struct StoredPersonMatchCandidate {
     pub(crate) status: String,
     pub(crate) score: Option<f64>,
     pub(crate) evidence_json: String,
+    pub(crate) target_person_id: Option<String>,
+    pub(crate) previous_person_id: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
@@ -13981,6 +14144,8 @@ pub(crate) struct PersonMatchCandidateRestore<'a> {
     pub(crate) status: &'a str,
     pub(crate) score: Option<f64>,
     pub(crate) evidence_json: &'a str,
+    pub(crate) target_person_id: Option<&'a str>,
+    pub(crate) previous_person_id: Option<&'a str>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
@@ -13995,6 +14160,8 @@ fn stored_person_match_candidate(row: sqlx::any::AnyRow) -> StoredPersonMatchCan
         status: row.get("status"),
         score: row.get("score"),
         evidence_json: row.get("evidence_json"),
+        target_person_id: row.get("target_person_id"),
+        previous_person_id: row.get("previous_person_id"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -15765,11 +15932,40 @@ mod tests {
             "SELECT status FROM person_match_candidates
              WHERE id = ?",
         )
-        .bind(candidate_id)
+        .bind(&candidate_id)
         .fetch_one(database.pool())
         .await
         .expect("candidate status");
         assert_eq!(status, "CONFIRMED");
+
+        database
+            .undo_person_match_candidate(&candidate_id, r#"{"reason":"test-undo"}"#)
+            .await
+            .expect("undo candidate");
+        assert_eq!(
+            database
+                .find_canonical_person_by_identity("douban", "1313123")
+                .await
+                .expect("identity lookup after undo")
+                .expect("restored identity")
+                .id,
+            old.id
+        );
+        let restored_lux_id: String = sqlx::query_scalar(
+            "SELECT lux_person_id FROM person_credits
+             WHERE item_id = 'item-confirm'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("restored credit lux id");
+        assert_eq!(restored_lux_id, old.id);
+        let undone_status: String =
+            sqlx::query_scalar("SELECT status FROM person_match_candidates WHERE id = ?")
+                .bind(candidate_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("undone candidate status");
+        assert_eq!(undone_status, "REJECTED");
     }
 
     #[tokio::test]

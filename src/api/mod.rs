@@ -711,8 +711,16 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_reject_person_match),
         )
         .route(
+            "/api/v1/admin/people/matches/{candidate_id}/undo",
+            post(admin_undo_person_match),
+        )
+        .route(
             "/api/v1/admin/people/{person_id}/split",
             post(admin_split_person_identity),
+        )
+        .route(
+            "/api/v1/admin/people/{person_id}/locks",
+            post(admin_set_person_field_locks),
         )
         .route(
             "/api/v1/admin/metadata/reidentify",
@@ -10962,6 +10970,15 @@ struct PersonIdentitySplitRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PersonFieldLocksRequest {
+    #[serde(default)]
+    fields: Vec<String>,
+    #[serde(default)]
+    evidence: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MetadataCandidateSearchRequest {
     query: String,
     year: Option<i32>,
@@ -15525,6 +15542,61 @@ async fn admin_reject_person_match(
     }
 }
 
+async fn admin_undo_person_match(
+    headers: HeaderMap,
+    Path(candidate_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PersonMatchRejectRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let evidence_json = match serde_json::to_string(&request.evidence) {
+        Ok(value) if value.len() <= 16 * 1024 => value,
+        Ok(_) | Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "撤销证据无效或过大",
+            )
+            .into_response();
+        }
+    };
+    match people
+        .undo_person_match_candidate(&candidate_id, &evidence_json)
+        .await
+    {
+        Ok(move_result) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PERSON_MATCH_UNDONE",
+                Some("person_match_candidate"),
+                Some(&candidate_id),
+                &evidence_json,
+            )
+            .await;
+            Json(json!({
+                "candidateId": candidate_id,
+                "status": "UNDONE",
+                "previousPersonId": move_result.previous_person_id,
+            }))
+            .into_response()
+        }
+        Err(error) => people_match_error(&headers, error),
+    }
+}
+
 async fn admin_split_person_identity(
     headers: HeaderMap,
     Path(person_id): Path<String>,
@@ -15586,6 +15658,61 @@ async fn admin_split_person_identity(
                 "sourcePersonId": person_id,
                 "newPersonId": new_person_id,
                 "status": "SPLIT",
+            }))
+            .into_response()
+        }
+        Err(error) => people_match_error(&headers, error),
+    }
+}
+
+async fn admin_set_person_field_locks(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PersonFieldLocksRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let evidence_json = match serde_json::to_string(&request.evidence) {
+        Ok(value) if value.len() <= 16 * 1024 => value,
+        Ok(_) | Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "人物字段锁定证据无效或过大",
+            )
+            .into_response();
+        }
+    };
+    match people
+        .set_person_field_locks(&person_id, &request.fields, &evidence_json)
+        .await
+    {
+        Ok(fields) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PERSON_FIELD_LOCKS_UPDATED",
+                Some("person"),
+                Some(&person_id),
+                &json!({"fields": fields, "evidence": request.evidence}).to_string(),
+            )
+            .await;
+            Json(json!({
+                "personId": person_id,
+                "lockedFields": fields,
+                "status": "UPDATED",
             }))
             .into_response()
         }

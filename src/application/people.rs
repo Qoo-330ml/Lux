@@ -41,7 +41,7 @@ const PERSON_NFO: &str = "person.nfo";
 const PERSON_MANIFEST: &str = "person.json";
 const PERSON_IMAGE: &str = "folder";
 const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 4;
-const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 2;
+const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 3;
 const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
 const PENDING_PERSON_NFO: &str = "personNfo";
 const PENDING_PERSON_MANIFEST: &str = "personManifest";
@@ -49,11 +49,29 @@ const PENDING_PROFILE_IMAGE: &str = "profileImage";
 const PENDING_PERSON_INDEX: &str = "personIndex";
 const PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const PERSON_MATCH_SNAPSHOT_DIR: &str = "matches";
+const PERSON_DECISION_OPERATION_SCHEMA_VERSION: u32 = 1;
+const PERSON_DECISION_OPERATION_DIR: &str = "operations";
 const MAX_ACTORS: usize = 12;
 const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
 const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 const PERSON_INDEX_REBUILD_BATCH_SIZE: i64 = 100;
+const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
+    "name",
+    "biography",
+    "birthday",
+    "deathday",
+    "knownForDepartment",
+    "placeOfBirth",
+    "providerIds",
+    "genres",
+    "tags",
+    "productionLocations",
+    "premiereDate",
+    "productionYear",
+    "taglines",
+    "aliases",
+];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +161,72 @@ impl PersonMetadata {
             self.taglines = fallback.taglines;
         }
         self
+    }
+}
+
+fn metadata_update_respecting_locks(
+    existing: &PersonMetadata,
+    update: &PersonMetadataUpdate,
+    locked_fields: &BTreeSet<String>,
+) -> PersonMetadata {
+    let locked = |field: &str| locked_fields.contains(field);
+    PersonMetadata {
+        biography: (locked("biography") && existing.biography.is_some())
+            .then(|| existing.biography.clone())
+            .flatten()
+            .or_else(|| update.biography.clone()),
+        birthday: (locked("birthday") && existing.birthday.is_some())
+            .then(|| existing.birthday.clone())
+            .flatten()
+            .or_else(|| update.birthday.clone()),
+        deathday: (locked("deathday") && existing.deathday.is_some())
+            .then(|| existing.deathday.clone())
+            .flatten()
+            .or_else(|| update.deathday.clone()),
+        known_for_department: (locked("knownForDepartment")
+            && existing.known_for_department.is_some())
+        .then(|| existing.known_for_department.clone())
+        .flatten()
+        .or_else(|| update.known_for_department.clone()),
+        place_of_birth: (locked("placeOfBirth") && existing.place_of_birth.is_some())
+            .then(|| existing.place_of_birth.clone())
+            .flatten()
+            .or_else(|| update.place_of_birth.clone()),
+        provider_ids: if locked("providerIds") && !existing.provider_ids.is_empty() {
+            existing.provider_ids.clone()
+        } else {
+            update.provider_ids.clone()
+        },
+        genres: if locked("genres") && !existing.genres.is_empty() {
+            existing.genres.clone()
+        } else {
+            update.genres.clone()
+        },
+        tags: if locked("tags") && !existing.tags.is_empty() {
+            existing.tags.clone()
+        } else {
+            update.tags.clone()
+        },
+        production_locations: if locked("productionLocations")
+            && !existing.production_locations.is_empty()
+        {
+            existing.production_locations.clone()
+        } else {
+            update.production_locations.clone()
+        },
+        premiere_date: (locked("premiereDate") && existing.premiere_date.is_some())
+            .then(|| existing.premiere_date.clone())
+            .flatten()
+            .or_else(|| update.premiere_date.clone()),
+        production_year: (locked("productionYear") && existing.production_year.is_some())
+            .then_some(existing.production_year)
+            .flatten()
+            .or(update.production_year),
+        taglines: if locked("taglines") && !existing.taglines.is_empty() {
+            existing.taglines.clone()
+        } else {
+            update.taglines.clone()
+        },
     }
 }
 
@@ -267,6 +351,32 @@ struct PersonMatchCandidateSnapshot {
     status: String,
     score: Option<f64>,
     evidence: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_person_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_person_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    #[serde(default)]
+    checksum: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonDecisionOperation {
+    schema_version: u32,
+    operation_id: String,
+    operation: String,
+    candidate_id: String,
+    item_id: String,
+    candidate_person_ids_json: String,
+    score: Option<f64>,
+    provider: String,
+    provider_id: String,
+    target_person_id: String,
+    previous_person_id: Option<String>,
+    state: String,
+    evidence_json: String,
     created_at: i64,
     updated_at: i64,
     #[serde(default)]
@@ -294,6 +404,8 @@ struct PersonManifest {
     generation: u64,
     lux_person_id: String,
     display_name: String,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    aliases: BTreeSet<String>,
     identities: Vec<PersonIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     person: Option<PersonMetadata>,
@@ -303,6 +415,8 @@ struct PersonManifest {
     locked_fields: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     identity_events: Vec<PersonManifestIdentityEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    metadata_events: Vec<PersonManifestMetadataEvent>,
     checksum: String,
 }
 
@@ -315,6 +429,16 @@ struct PersonManifestIdentityEvent {
     provider_id: String,
     from_person_id: Option<String>,
     to_person_id: Option<String>,
+    evidence_json: String,
+    created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonManifestMetadataEvent {
+    event_id: String,
+    event_type: String,
+    fields: Vec<String>,
     evidence_json: String,
     created_at: i64,
 }
@@ -670,6 +794,12 @@ impl PeopleService {
                                     serde_json::from_str(&candidate.evidence_json).ok()
                                 })
                                 .unwrap_or_else(|| evidence.clone()),
+                            target_person_id: persisted
+                                .as_ref()
+                                .and_then(|candidate| candidate.target_person_id.clone()),
+                            previous_person_id: persisted
+                                .as_ref()
+                                .and_then(|candidate| candidate.previous_person_id.clone()),
                             created_at: current_people_unix_timestamp(),
                             updated_at: current_people_unix_timestamp(),
                             checksum: String::new(),
@@ -1100,6 +1230,11 @@ impl PeopleService {
             manifest.generation = manifest.generation.saturating_add(1).max(1);
             manifest.lux_person_id = lux_person_id.to_owned();
             if !display_name.trim().is_empty() {
+                if !manifest.display_name.trim().is_empty()
+                    && manifest.display_name != display_name.trim()
+                {
+                    manifest.aliases.insert(manifest.display_name.clone());
+                }
                 manifest.display_name = display_name.trim().to_owned();
             }
             for identity in identities {
@@ -1109,6 +1244,26 @@ impl PeopleService {
                     .any(|existing| existing == identity)
                 {
                     manifest.identities.push(identity.clone());
+                    if !manifest.identity_events.iter().any(|event| {
+                        event.event_type == "AUTO_PROVIDER_IDENTITY"
+                            && event.provider == identity.provider
+                            && event.provider_id == identity.id
+                    }) {
+                        manifest.identity_events.push(PersonManifestIdentityEvent {
+                            event_id: Uuid::now_v7().to_string(),
+                            event_type: "AUTO_PROVIDER_IDENTITY".to_owned(),
+                            provider: identity.provider.clone(),
+                            provider_id: identity.id.clone(),
+                            from_person_id: None,
+                            to_person_id: Some(lux_person_id.to_owned()),
+                            evidence_json: serde_json::json!({
+                                "method": "provider-identity",
+                                "sourceProvider": source_provider,
+                            })
+                            .to_string(),
+                            created_at: current_people_unix_timestamp(),
+                        });
+                    }
                 }
             }
             manifest.identities.sort_by(|left, right| {
@@ -1324,6 +1479,71 @@ impl PeopleService {
         Ok((candidates, total))
     }
 
+    pub async fn set_person_field_locks(
+        &self,
+        person_id: &str,
+        fields: &[String],
+        evidence_json: &str,
+    ) -> Result<Vec<String>, PeopleError> {
+        if !is_valid_person_id(person_id) {
+            return Err(PeopleError::InvalidComponent(person_id.to_owned()));
+        }
+        let mut locked_fields = BTreeSet::new();
+        for field in fields {
+            if !PERSON_LOCKABLE_FIELDS.contains(&field.as_str()) {
+                return Err(PeopleError::InvalidComponent(field.clone()));
+            }
+            locked_fields.insert(field.clone());
+        }
+        let manifest_path = self.find_person_manifest_path(person_id, person_id).await?;
+        let parent = manifest_path.parent().ok_or_else(|| {
+            PeopleError::Serialization("person manifest path has no parent".to_owned())
+        })?;
+        create_private_dir(parent).await?;
+        acquire_person_manifest_lock(&manifest_path).await?;
+        let result = async {
+            let existing = read_people_file(&manifest_path).await?;
+            let mut manifest = existing
+                .map(|bytes| {
+                    serde_json::from_slice::<PersonManifest>(&bytes)
+                        .map_err(|source| PeopleError::Serialization(source.to_string()))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if !manifest.lux_person_id.is_empty() && manifest.lux_person_id != person_id {
+                return Err(PeopleError::Serialization(
+                    "person manifest identity does not match directory".to_owned(),
+                ));
+            }
+            manifest.schema_version = PERSON_MANIFEST_SCHEMA_VERSION;
+            manifest.generation = manifest.generation.saturating_add(1).max(1);
+            manifest.lux_person_id = person_id.to_owned();
+            manifest.locked_fields = locked_fields.clone();
+            let event = PersonManifestMetadataEvent {
+                event_id: Uuid::now_v7().to_string(),
+                event_type: "FIELD_LOCKS_UPDATED".to_owned(),
+                fields: locked_fields.iter().cloned().collect(),
+                evidence_json: evidence_json.to_owned(),
+                created_at: current_people_unix_timestamp(),
+            };
+            manifest.metadata_events.push(event);
+            manifest.checksum.clear();
+            let checksum_source = serde_json::to_vec(&manifest)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            manifest.checksum = Sha256::digest(checksum_source)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let bytes = serde_json::to_vec_pretty(&manifest)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            write_atomically(&manifest_path, &bytes).await?;
+            Ok::<_, PeopleError>(locked_fields.iter().cloned().collect::<Vec<_>>())
+        }
+        .await;
+        let _ = fs::remove_file(&manifest_path.with_file_name(".person.json.lock")).await;
+        result
+    }
+
     async fn persist_person_match_candidate_snapshot(
         &self,
         mut snapshot: PersonMatchCandidateSnapshot,
@@ -1346,6 +1566,220 @@ impl PeopleService {
         let bytes = serde_json::to_vec_pretty(&snapshot)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
         write_atomically(&directory.join(format!("{}.json", snapshot.id)), &bytes).await
+    }
+
+    async fn persist_person_decision_operation(
+        &self,
+        mut operation: PersonDecisionOperation,
+    ) -> Result<(), PeopleError> {
+        if !is_valid_person_id(&operation.operation_id)
+            || !is_valid_person_id(&operation.candidate_id)
+            || !is_valid_person_id(&operation.provider)
+            || !is_valid_person_id(&operation.provider_id)
+            || !is_valid_person_id(&operation.target_person_id)
+            || operation
+                .previous_person_id
+                .as_deref()
+                .is_some_and(|id| !is_valid_person_id(id))
+        {
+            return Err(PeopleError::InvalidComponent(
+                operation.operation_id.clone(),
+            ));
+        }
+        let directory = metadata_root(&self.config_dir)
+            .join(LEGACY_PEOPLE_DIR)
+            .join(PERSON_DECISION_OPERATION_DIR);
+        create_private_dir(&directory).await?;
+        operation.schema_version = PERSON_DECISION_OPERATION_SCHEMA_VERSION;
+        operation.checksum.clear();
+        let checksum_source = serde_json::to_vec(&operation)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        operation.checksum = Sha256::digest(checksum_source)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let bytes = serde_json::to_vec_pretty(&operation)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        write_atomically(
+            &directory.join(format!("{}.json", operation.operation_id)),
+            &bytes,
+        )
+        .await
+    }
+
+    async fn replay_person_decision_operations(
+        &self,
+        database: &Database,
+    ) -> Result<usize, PeopleError> {
+        let directory = metadata_root(&self.config_dir)
+            .join(LEGACY_PEOPLE_DIR)
+            .join(PERSON_DECISION_OPERATION_DIR);
+        let mut entries = match fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        };
+        let mut replayed = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: directory.clone(),
+                source,
+            })?
+        {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(bytes) = read_people_file(&path).await? else {
+                continue;
+            };
+            let operation = match serde_json::from_slice::<PersonDecisionOperation>(&bytes) {
+                Ok(operation) if valid_person_decision_operation(&operation) => operation,
+                Ok(_) | Err(_) => {
+                    tracing::warn!(path = %path.display(), "skipping invalid person decision operation");
+                    continue;
+                }
+            };
+            if operation.state == "COMPLETED" {
+                continue;
+            }
+            let candidate = database
+                .find_person_match_candidate(&operation.candidate_id)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            let candidate = match candidate {
+                Some(candidate) => candidate,
+                None if operation.state == "COMMITTED" => {
+                    let status = if operation.operation == "UNDO" {
+                        "REJECTED"
+                    } else {
+                        "CONFIRMED"
+                    };
+                    let restore = PersonMatchCandidateRestore {
+                        candidate_id: &operation.candidate_id,
+                        item_id: &operation.item_id,
+                        provider: &operation.provider,
+                        provider_id: &operation.provider_id,
+                        candidate_person_ids_json: &operation.candidate_person_ids_json,
+                        status,
+                        score: operation.score,
+                        evidence_json: &operation.evidence_json,
+                        target_person_id: Some(&operation.target_person_id),
+                        previous_person_id: operation.previous_person_id.as_deref(),
+                        created_at: operation.created_at,
+                        updated_at: operation.updated_at,
+                    };
+                    database
+                        .restore_person_match_candidate(&restore)
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                    database
+                        .find_person_match_candidate(&operation.candidate_id)
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?
+                        .ok_or_else(|| {
+                            PeopleError::Storage(
+                                "restored person decision candidate could not be read".to_owned(),
+                            )
+                        })?
+                }
+                None => continue,
+            };
+            let committed = match operation.operation.as_str() {
+                "CONFIRM" => candidate.status == "CONFIRMED",
+                "UNDO" => candidate.status == "REJECTED",
+                _ => false,
+            };
+            if !committed {
+                continue;
+            }
+            let event = PersonManifestIdentityEvent {
+                event_id: operation.operation_id.clone(),
+                event_type: if operation.operation == "UNDO" {
+                    "MANUAL_UNDO".to_owned()
+                } else {
+                    "MANUAL_CONFIRM".to_owned()
+                },
+                provider: operation.provider.clone(),
+                provider_id: operation.provider_id.clone(),
+                from_person_id: if operation.operation == "UNDO" {
+                    Some(operation.target_person_id.clone())
+                } else {
+                    operation.previous_person_id.clone()
+                },
+                to_person_id: if operation.operation == "UNDO" {
+                    operation.previous_person_id.clone()
+                } else {
+                    Some(operation.target_person_id.clone())
+                },
+                evidence_json: operation.evidence_json.clone(),
+                created_at: operation.created_at,
+            };
+            if operation.operation == "UNDO" {
+                self.update_person_manifest_identity(
+                    &operation.target_person_id,
+                    None,
+                    None,
+                    Some((&operation.provider, &operation.provider_id)),
+                    &event,
+                )
+                .await?;
+                if let Some(previous) = operation.previous_person_id.as_deref() {
+                    let name = database
+                        .find_canonical_person_display_name(previous)
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?
+                        .unwrap_or_else(|| previous.to_owned());
+                    self.update_person_manifest_identity(
+                        previous,
+                        Some(&name),
+                        Some((&operation.provider, &operation.provider_id)),
+                        None,
+                        &event,
+                    )
+                    .await?;
+                }
+            } else {
+                if let Some(previous) = operation.previous_person_id.as_deref()
+                    && previous != operation.target_person_id
+                {
+                    self.update_person_manifest_identity(
+                        previous,
+                        None,
+                        None,
+                        Some((&operation.provider, &operation.provider_id)),
+                        &event,
+                    )
+                    .await?;
+                }
+                let name = database
+                    .find_canonical_person_display_name(&operation.target_person_id)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?
+                    .unwrap_or_else(|| operation.target_person_id.clone());
+                self.update_person_manifest_identity(
+                    &operation.target_person_id,
+                    Some(&name),
+                    Some((&operation.provider, &operation.provider_id)),
+                    None,
+                    &event,
+                )
+                .await?;
+            }
+            let mut completed = operation;
+            completed.state = "COMPLETED".to_owned();
+            completed.updated_at = current_people_unix_timestamp();
+            self.persist_person_decision_operation(completed).await?;
+            replayed += 1;
+        }
+        Ok(replayed)
     }
 
     async fn restore_person_match_candidate_snapshots(
@@ -1400,6 +1834,8 @@ impl PeopleService {
                 status: &snapshot.status,
                 score: snapshot.score,
                 evidence_json: &evidence,
+                target_person_id: snapshot.target_person_id.as_deref(),
+                previous_person_id: snapshot.previous_person_id.as_deref(),
                 created_at: snapshot.created_at,
                 updated_at: snapshot.updated_at,
             };
@@ -1440,6 +1876,32 @@ impl PeopleService {
                 candidate.status
             )));
         }
+        let previous_person_id = database
+            .find_canonical_person_by_identity(&candidate.provider, &candidate.provider_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?
+            .map(|person| person.id);
+        let operation_id = Uuid::now_v7().to_string();
+        let operation = PersonDecisionOperation {
+            schema_version: PERSON_DECISION_OPERATION_SCHEMA_VERSION,
+            operation_id: operation_id.clone(),
+            operation: "CONFIRM".to_owned(),
+            candidate_id: candidate.id.clone(),
+            item_id: candidate.item_id.clone(),
+            candidate_person_ids_json: candidate.candidate_person_ids_json.clone(),
+            score: candidate.score,
+            provider: candidate.provider.clone(),
+            provider_id: candidate.provider_id.clone(),
+            target_person_id: target_person_id.to_owned(),
+            previous_person_id: previous_person_id.clone(),
+            state: "PREPARED".to_owned(),
+            evidence_json: evidence_json.to_owned(),
+            created_at: current_people_unix_timestamp(),
+            updated_at: current_people_unix_timestamp(),
+            checksum: String::new(),
+        };
+        self.persist_person_decision_operation(operation.clone())
+            .await?;
         let movement = database
             .confirm_person_match_candidate(candidate_id, target_person_id, evidence_json)
             .await
@@ -1447,9 +1909,13 @@ impl PeopleService {
                 previous_person_id: movement.previous_person_id,
             })
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
-        if let Some(previous_person_id) = movement.previous_person_id.as_deref()
-            && previous_person_id != target_person_id
-        {
+        let mut committed_operation = operation;
+        committed_operation.state = "COMMITTED".to_owned();
+        committed_operation.previous_person_id = movement.previous_person_id.clone();
+        committed_operation.updated_at = current_people_unix_timestamp();
+        self.persist_person_decision_operation(committed_operation.clone())
+            .await?;
+        if movement.previous_person_id.as_deref() != Some(target_person_id) {
             let target_name = database
                 .find_canonical_person_display_name(target_person_id)
                 .await
@@ -1461,19 +1927,21 @@ impl PeopleService {
                 event_type: "MANUAL_CONFIRM".to_owned(),
                 provider: candidate.provider.clone(),
                 provider_id: candidate.provider_id.clone(),
-                from_person_id: Some(previous_person_id.to_owned()),
+                from_person_id: movement.previous_person_id.clone(),
                 to_person_id: Some(target_person_id.to_owned()),
                 evidence_json: evidence_json.to_owned(),
                 created_at: current_people_unix_timestamp(),
             };
-            self.update_person_manifest_identity(
-                previous_person_id,
-                None,
-                None,
-                Some((&candidate.provider, &candidate.provider_id)),
-                &event,
-            )
-            .await?;
+            if let Some(previous_person_id) = movement.previous_person_id.as_deref() {
+                self.update_person_manifest_identity(
+                    previous_person_id,
+                    None,
+                    None,
+                    Some((&candidate.provider, &candidate.provider_id)),
+                    &event,
+                )
+                .await?;
+            }
             self.update_person_manifest_identity(
                 target_person_id,
                 Some(&target_name),
@@ -1496,11 +1964,17 @@ impl PeopleService {
             score: candidate.score,
             evidence: serde_json::from_str(evidence_json)
                 .unwrap_or(Value::String(evidence_json.to_owned())),
+            target_person_id: Some(target_person_id.to_owned()),
+            previous_person_id: movement.previous_person_id.clone(),
             created_at: candidate.created_at,
             updated_at: current_people_unix_timestamp(),
             checksum: String::new(),
         })
         .await?;
+        committed_operation.state = "COMPLETED".to_owned();
+        committed_operation.updated_at = current_people_unix_timestamp();
+        self.persist_person_decision_operation(committed_operation)
+            .await?;
         Ok(movement)
     }
 
@@ -1540,12 +2014,144 @@ impl PeopleService {
             score: candidate.score,
             evidence: serde_json::from_str(evidence_json)
                 .unwrap_or(Value::String(evidence_json.to_owned())),
+            target_person_id: candidate.target_person_id,
+            previous_person_id: candidate.previous_person_id,
             created_at: candidate.created_at,
             updated_at: current_people_unix_timestamp(),
             checksum: String::new(),
         })
         .await
         .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub async fn undo_person_match_candidate(
+        &self,
+        candidate_id: &str,
+        evidence_json: &str,
+    ) -> Result<PersonIdentityMove, PeopleError> {
+        if !is_valid_person_id(candidate_id) {
+            return Err(PeopleError::InvalidComponent(candidate_id.to_owned()));
+        }
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        let candidate = database
+            .find_person_match_candidate(candidate_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?
+            .ok_or_else(|| {
+                PeopleError::Storage(format!("person match candidate '{candidate_id}' not found"))
+            })?;
+        if candidate.status != "CONFIRMED" {
+            return Err(PeopleError::Storage(format!(
+                "person match candidate '{candidate_id}' is {}",
+                candidate.status
+            )));
+        }
+        let Some(target_person_id) = candidate.target_person_id.clone() else {
+            return Err(PeopleError::Storage(
+                "confirmed person match has no recorded target identity".to_owned(),
+            ));
+        };
+        let previous_person_id = candidate.previous_person_id.clone();
+        let operation_id = Uuid::now_v7().to_string();
+        let operation = PersonDecisionOperation {
+            schema_version: PERSON_DECISION_OPERATION_SCHEMA_VERSION,
+            operation_id: operation_id.clone(),
+            operation: "UNDO".to_owned(),
+            candidate_id: candidate.id.clone(),
+            item_id: candidate.item_id.clone(),
+            candidate_person_ids_json: candidate.candidate_person_ids_json.clone(),
+            score: candidate.score,
+            provider: candidate.provider.clone(),
+            provider_id: candidate.provider_id.clone(),
+            target_person_id: target_person_id.clone(),
+            previous_person_id: previous_person_id.clone(),
+            state: "PREPARED".to_owned(),
+            evidence_json: evidence_json.to_owned(),
+            created_at: current_people_unix_timestamp(),
+            updated_at: current_people_unix_timestamp(),
+            checksum: String::new(),
+        };
+        self.persist_person_decision_operation(operation.clone())
+            .await?;
+        let movement = database
+            .undo_person_match_candidate(candidate_id, evidence_json)
+            .await
+            .map(|movement| PersonIdentityMove {
+                previous_person_id: movement.previous_person_id,
+            })
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let mut committed_operation = operation;
+        committed_operation.state = "COMMITTED".to_owned();
+        committed_operation.updated_at = current_people_unix_timestamp();
+        self.persist_person_decision_operation(committed_operation.clone())
+            .await?;
+        if previous_person_id.as_deref() != Some(target_person_id.as_str()) {
+            let event = PersonManifestIdentityEvent {
+                event_id: Uuid::now_v7().to_string(),
+                event_type: "MANUAL_UNDO".to_owned(),
+                provider: candidate.provider.clone(),
+                provider_id: candidate.provider_id.clone(),
+                from_person_id: Some(target_person_id.clone()),
+                to_person_id: previous_person_id.clone(),
+                evidence_json: evidence_json.to_owned(),
+                created_at: current_people_unix_timestamp(),
+            };
+            self.update_person_manifest_identity(
+                &target_person_id,
+                None,
+                None,
+                Some((&candidate.provider, &candidate.provider_id)),
+                &event,
+            )
+            .await?;
+            if let Some(previous_person_id) = previous_person_id.as_deref() {
+                let previous_name = database
+                    .find_canonical_person_display_name(previous_person_id)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?
+                    .unwrap_or_else(|| previous_person_id.to_owned());
+                self.update_person_manifest_identity(
+                    previous_person_id,
+                    Some(&previous_name),
+                    Some((&candidate.provider, &candidate.provider_id)),
+                    None,
+                    &event,
+                )
+                .await?;
+            }
+        }
+        let mut evidence = serde_json::from_str::<Value>(evidence_json)
+            .unwrap_or(Value::String(evidence_json.to_owned()));
+        if let Value::Object(object) = &mut evidence {
+            object.insert("operation".to_owned(), Value::String("undo".to_owned()));
+        }
+        self.persist_person_match_candidate_snapshot(PersonMatchCandidateSnapshot {
+            schema_version: PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION,
+            id: candidate.id,
+            item_id: candidate.item_id,
+            provider: candidate.provider,
+            provider_id: candidate.provider_id,
+            candidate_person_ids: serde_json::from_str(&candidate.candidate_person_ids_json)
+                .unwrap_or_default(),
+            status: "REJECTED".to_owned(),
+            score: candidate.score,
+            evidence,
+            target_person_id: Some(target_person_id),
+            previous_person_id,
+            created_at: candidate.created_at,
+            updated_at: current_people_unix_timestamp(),
+            checksum: String::new(),
+        })
+        .await?;
+        committed_operation.state = "COMPLETED".to_owned();
+        committed_operation.updated_at = current_people_unix_timestamp();
+        self.persist_person_decision_operation(committed_operation)
+            .await?;
+        Ok(movement)
     }
 
     pub async fn split_person_identity(
@@ -1773,6 +2379,10 @@ impl PeopleService {
                 restored_match_candidates,
                 "person match candidate snapshots restored"
             );
+        }
+        let replayed_decisions = self.replay_person_decision_operations(database).await?;
+        if replayed_decisions > 0 {
+            tracing::info!(replayed_decisions, "person decision operations replayed");
         }
         let restored_relations = self.restore_person_relation_snapshots(database).await?;
         if restored_relations > 0 {
@@ -2194,13 +2804,9 @@ impl PeopleService {
                     );
                     continue;
                 };
-                let credits = relation
-                    .actors
-                    .iter()
-                    .take(MAX_ACTORS)
-                    .filter(|actor| !actor.name.trim().is_empty())
-                    .map(person_credit_from_stored_actor)
-                    .collect::<Vec<_>>();
+                let credits = self
+                    .person_credits_from_relation(database, &relation)
+                    .await?;
                 database
                     .replace_person_credits(&source_locator.item_id, &credits)
                     .await
@@ -2223,27 +2829,60 @@ impl PeopleService {
             Some(relation) => Some(relation),
             None => read_relation(&legacy_path).await?,
         };
-        let credits = relation
-            .as_ref()
-            .map(|relation| {
-                relation
-                    .actors
-                    .iter()
-                    .take(MAX_ACTORS)
-                    .filter(|actor| !actor.name.trim().is_empty())
-                    .map(person_credit_from_stored_actor)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
                 "people database index is unavailable".to_owned(),
             ));
         };
+        let credits = match relation.as_ref() {
+            Some(relation) => {
+                self.person_credits_from_relation(database, relation)
+                    .await?
+            }
+            None => Vec::new(),
+        };
         database
             .replace_person_credits(item_id, &credits)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    async fn person_credits_from_relation(
+        &self,
+        database: &Database,
+        relation: &StoredPeopleRelation,
+    ) -> Result<Vec<NewPersonCredit>, PeopleError> {
+        let mut credits = Vec::new();
+        for actor in relation.actors.iter().take(MAX_ACTORS) {
+            if actor.name.trim().is_empty() {
+                continue;
+            }
+            let mut actor = actor.clone();
+            if !actor.identities.is_empty() {
+                let mut mapped_person_id = None;
+                let mut conflicting = false;
+                for identity in &actor.identities {
+                    let mapped = database
+                        .find_canonical_person_by_identity(&identity.provider, &identity.id)
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                    if let Some(mapped) = mapped {
+                        if mapped_person_id
+                            .as_ref()
+                            .is_some_and(|person_id| person_id != &mapped.id)
+                        {
+                            conflicting = true;
+                            break;
+                        }
+                        mapped_person_id = Some(mapped.id);
+                    }
+                }
+                actor.person_key = (!conflicting).then_some(mapped_person_id.clone()).flatten();
+                actor.lux_person_id = actor.person_key.clone();
+            }
+            credits.push(person_credit_from_stored_actor(&actor));
+        }
+        Ok(credits)
     }
 
     pub async fn list_libraries_actors(
@@ -2343,6 +2982,17 @@ impl PeopleService {
                 "people index storage is unavailable".to_owned(),
             ));
         };
+        let manifest_path = self
+            .find_person_manifest_path(person_id, &update.name)
+            .await?;
+        let (locked_fields, existing_metadata) = match read_people_file(&manifest_path).await? {
+            Some(bytes) => {
+                let manifest = serde_json::from_slice::<PersonManifest>(&bytes)
+                    .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+                (manifest.locked_fields, manifest.person)
+            }
+            None => (BTreeSet::new(), None),
+        };
         let item_ids = database
             .list_person_credit_item_ids(library_ids, "Actor", person_id)
             .await
@@ -2367,21 +3017,18 @@ impl PeopleService {
                 if actor_id_from_stored_actor(actor) != person_id {
                     continue;
                 }
-                actor.name = update.name.clone();
-                actor.person = Some(PersonMetadata {
-                    biography: update.biography.clone(),
-                    birthday: update.birthday.clone(),
-                    deathday: update.deathday.clone(),
-                    known_for_department: update.known_for_department.clone(),
-                    place_of_birth: update.place_of_birth.clone(),
-                    provider_ids: update.provider_ids.clone(),
-                    genres: update.genres.clone(),
-                    tags: update.tags.clone(),
-                    production_locations: update.production_locations.clone(),
-                    premiere_date: update.premiere_date.clone(),
-                    production_year: update.production_year,
-                    taglines: update.taglines.clone(),
-                });
+                if !locked_fields.contains("name") || actor.name.trim().is_empty() {
+                    actor.name = update.name.clone();
+                }
+                actor.person = Some(metadata_update_respecting_locks(
+                    actor
+                        .person
+                        .as_ref()
+                        .or(existing_metadata.as_ref())
+                        .unwrap_or(&PersonMetadata::default()),
+                    &update,
+                    &locked_fields,
+                ));
                 if replace_existing_nfo {
                     self.write_person_nfo_for_actor_replacing_metadata(actor)
                         .await?;
@@ -3941,7 +4588,7 @@ fn valid_person_manifest(manifest: &PersonManifest) -> bool {
     let Some(sequence) = manifest.lux_person_id.strip_prefix("lux-") else {
         return false;
     };
-    if !matches!(manifest.schema_version, 1 | PERSON_MANIFEST_SCHEMA_VERSION)
+    if !matches!(manifest.schema_version, 1..=PERSON_MANIFEST_SCHEMA_VERSION)
         || sequence.len() < 6
         || !sequence.chars().all(|character| character.is_ascii_digit())
         || manifest.display_name.trim().is_empty()
@@ -3980,6 +4627,35 @@ fn valid_person_match_snapshot(snapshot: &PersonMatchCandidateSnapshot) -> bool 
         return false;
     }
     let mut unsigned = snapshot.clone();
+    let expected = unsigned.checksum.clone();
+    unsigned.checksum.clear();
+    let Ok(bytes) = serde_json::to_vec(&unsigned) else {
+        return false;
+    };
+    let actual = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    actual == expected
+}
+
+fn valid_person_decision_operation(operation: &PersonDecisionOperation) -> bool {
+    if operation.schema_version != PERSON_DECISION_OPERATION_SCHEMA_VERSION
+        || !is_valid_person_id(&operation.operation_id)
+        || !is_valid_person_id(&operation.candidate_id)
+        || !is_valid_person_id(&operation.provider)
+        || !is_valid_person_id(&operation.provider_id)
+        || !is_valid_person_id(&operation.target_person_id)
+        || !matches!(operation.operation.as_str(), "CONFIRM" | "UNDO")
+        || !matches!(
+            operation.state.as_str(),
+            "PREPARED" | "COMMITTED" | "COMPLETED"
+        )
+        || operation.checksum.is_empty()
+    {
+        return false;
+    }
+    let mut unsigned = operation.clone();
     let expected = unsigned.checksum.clone();
     unsigned.checksum.clear();
     let Ok(bytes) = serde_json::to_vec(&unsigned) else {
@@ -4428,9 +5104,12 @@ fn detected_profile_image_format(bytes: &[u8]) -> Option<(&'static str, &'static
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{ActorCredit, PeopleError, PeopleService, PersonIdentity};
+    use super::{
+        ActorCredit, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PeopleError, PeopleService,
+        PersonIdentity, PersonManifest, PersonMetadata,
+    };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
         people_index_path_for_provider,
@@ -4439,6 +5118,7 @@ mod tests {
         application::libraries::LibraryService, config::Config, library::LibraryKind,
         storage::Database,
     };
+    use sha2::{Digest, Sha256};
 
     const PNG_1X1: &[u8] = &[
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
@@ -4871,7 +5551,11 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(person_dir.join("person.json")).await?)?;
         assert_eq!(manifest["identities"].as_array().map(Vec::len), Some(0));
-        assert_eq!(manifest["identityEvents"][0]["eventType"], "MANUAL_SPLIT");
+        assert!(manifest["identityEvents"].as_array().is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event["eventType"] == "MANUAL_SPLIT")
+        }));
         assert_eq!(manifest["generation"], 2);
         Ok(())
     }
@@ -5596,6 +6280,58 @@ mod tests {
         assert_eq!(actors.len(), 1);
         assert_eq!(actors[0].name, "演员甲");
         assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn person_field_locks_are_versioned_and_recoverable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let person_dir = lux_person_directory(config.path(), "演员甲", "lux-000001")?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+        let manifest = PersonManifest {
+            schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
+            generation: 1,
+            lux_person_id: "lux-000001".to_owned(),
+            display_name: "演员甲".to_owned(),
+            aliases: BTreeSet::new(),
+            identities: Vec::new(),
+            person: Some(PersonMetadata {
+                biography: Some("本地简介".to_owned()),
+                ..PersonMetadata::default()
+            }),
+            field_sources: BTreeMap::new(),
+            locked_fields: BTreeSet::new(),
+            identity_events: Vec::new(),
+            metadata_events: Vec::new(),
+            checksum: String::new(),
+        };
+        let mut manifest_bytes = serde_json::to_vec(&manifest)?;
+        let mut signed = manifest.clone();
+        signed.checksum = Sha256::digest(&manifest_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        manifest_bytes = serde_json::to_vec(&signed)?;
+        tokio::fs::write(person_dir.join(PERSON_MANIFEST), manifest_bytes).await?;
+        let fields = service
+            .set_person_field_locks(
+                "lux-000001",
+                &["biography".to_owned(), "name".to_owned()],
+                r#"{"source":"test"}"#,
+            )
+            .await?;
+        assert_eq!(fields, vec!["biography".to_owned(), "name".to_owned()]);
+        let saved: PersonManifest =
+            serde_json::from_slice(&tokio::fs::read(person_dir.join(PERSON_MANIFEST)).await?)?;
+        assert_eq!(saved.generation, 2);
+        assert_eq!(saved.locked_fields, fields.into_iter().collect());
+        assert_eq!(
+            saved.person.and_then(|person| person.biography),
+            Some("本地简介".to_owned())
+        );
+        assert_eq!(saved.metadata_events.len(), 1);
         Ok(())
     }
 }
