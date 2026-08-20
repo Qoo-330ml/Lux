@@ -1331,7 +1331,7 @@ impl Database {
 
         if let Some(person) = self
             .query(
-                "SELECT p.id, p.display_name, p.directory_name, p.status
+                "SELECT p.id
                  FROM people p
                  JOIN person_identities pi ON pi.person_id = p.id
                  WHERE pi.provider = ? AND pi.provider_id = ?",
@@ -1420,7 +1420,7 @@ impl Database {
 
         let person = self
             .query(
-                "SELECT p.id, p.display_name, p.directory_name, p.status
+                "SELECT p.id
                  FROM people p
                  JOIN person_identities pi ON pi.person_id = p.id
                  WHERE pi.provider = ? AND pi.provider_id = ?",
@@ -1460,7 +1460,7 @@ impl Database {
         provider_id: &str,
     ) -> Result<Option<StoredCanonicalPerson>, StorageError> {
         self.query(
-            "SELECT p.id, p.display_name, p.directory_name, p.status
+            "SELECT p.id
              FROM people p
              JOIN person_identities pi ON pi.person_id = p.id
              WHERE pi.provider = ? AND pi.provider_id = ?",
@@ -1536,7 +1536,7 @@ impl Database {
             })?;
         }
         let row = self
-            .query("SELECT id, display_name, directory_name, status FROM people WHERE id = ?")
+            .query("SELECT id FROM people WHERE id = ?")
             .bind(person_id)
             .fetch_one(&mut *transaction)
             .await
@@ -1575,7 +1575,7 @@ impl Database {
             })?;
         let person = self
             .query(
-                "SELECT id, display_name, directory_name, status
+                "SELECT id
                  FROM people WHERE id = ?",
             )
             .bind(person_id)
@@ -13186,17 +13186,11 @@ pub(crate) struct NewPersonCredit {
 #[derive(Debug)]
 pub(crate) struct StoredCanonicalPerson {
     pub(crate) id: String,
-    pub(crate) display_name: String,
-    pub(crate) directory_name: String,
-    pub(crate) status: String,
 }
 
 fn stored_canonical_person(row: sqlx::any::AnyRow) -> StoredCanonicalPerson {
     StoredCanonicalPerson {
         id: row.get("id"),
-        display_name: row.get("display_name"),
-        directory_name: row.get("directory_name"),
-        status: row.get("status"),
     }
 }
 
@@ -14660,9 +14654,6 @@ mod tests {
             .await
             .expect("first canonical person");
         assert_eq!(first.id, "lux-000001");
-        assert_eq!(first.display_name, "华晨宇");
-        assert_eq!(first.directory_name, "华晨宇");
-        assert_eq!(first.status, "ACTIVE");
 
         let second = database
             .attach_canonical_person_identity(
