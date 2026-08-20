@@ -12449,6 +12449,8 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
             "CREATE INDEX idx_media_items_library_type_visible
              ON media_items(library_id, item_type, id)
              WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_people_visible
+             ON media_items(library_id, id)",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
                 VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
@@ -14578,6 +14580,32 @@ mod tests {
         .await
         .expect("person index item state table");
         assert_eq!(table_count, 1);
+    }
+
+    #[tokio::test]
+    async fn person_index_query_migration_creates_library_join_indexes() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let index_names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name IN (
+                 'idx_media_items_people_visible',
+                 'idx_person_credits_person_item'
+             ) ORDER BY name",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("people query indexes");
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(database.pool())
+            .await
+            .expect("schema version");
+        assert_eq!(version, 76);
+        assert_eq!(index_names.len(), 2);
     }
 
     #[tokio::test]
