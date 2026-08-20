@@ -707,6 +707,14 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_cancel_metadata_reidentify),
         )
         .route(
+            "/api/v1/admin/people/index-rebuild",
+            get(admin_list_people_index_rebuild),
+        )
+        .route(
+            "/api/v1/admin/people/index-rebuild/{library_id}/cancel",
+            post(admin_cancel_people_index_rebuild),
+        )
+        .route(
             "/api/v1/admin/items/{item_id}/identify/candidates",
             get(admin_list_item_candidates).post(admin_search_item_candidates),
         )
@@ -13322,6 +13330,93 @@ async fn admin_list_jobs(
             "page": offset / limit + 1,
             "pageSize": limit,
         }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_list_people_index_rebuild(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let jobs = match database.list_person_index_rebuild_jobs().await {
+        Ok(jobs) => jobs,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let total = jobs.len();
+    let jobs = jobs
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|job| {
+            json!({
+                "libraryId": job.library_id,
+                "status": job.status,
+                "cursorId": job.cursor_id,
+                "processedCount": job.processed_count,
+                "totalCount": job.total_count,
+                "cancelRequested": job.cancel_requested,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "jobs": jobs,
+        "total": total,
+        "page": offset / limit + 1,
+        "pageSize": limit,
+    }))
+    .into_response()
+}
+
+async fn admin_cancel_people_index_rebuild(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match people.cancel_person_index_rebuild(&library_id).await {
+        Ok(true) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PERSON_INDEX_REBUILD_CANCELLED",
+                Some("person_index_rebuild_job"),
+                Some(&library_id),
+                "{}",
+            )
+            .await;
+            StatusCode::ACCEPTED.into_response()
+        }
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物索引重建任务当前不可取消",
+        )
         .into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }

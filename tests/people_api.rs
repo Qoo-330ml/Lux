@@ -205,6 +205,14 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     )
     .rotate()
     .await?;
+    sqlx::query(
+        "UPDATE person_index_rebuild_jobs
+         SET status = 'RUNNING', cancel_requested = 0
+         WHERE library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
@@ -214,6 +222,24 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::new();
+    let rebuilds = client
+        .get(format!(
+            "http://{address}/api/v1/admin/people/index-rebuild"
+        ))
+        .header("X-Lux-Api-Key", &key)
+        .send()
+        .await?;
+    assert_eq!(rebuilds.status(), reqwest::StatusCode::OK);
+    assert_eq!(rebuilds.json::<serde_json::Value>().await?["total"], 1);
+    let cancel = client
+        .post(format!(
+            "http://{address}/api/v1/admin/people/index-rebuild/{}/cancel",
+            library.id
+        ))
+        .header("X-Lux-Api-Key", &key)
+        .send()
+        .await?;
+    assert_eq!(cancel.status(), reqwest::StatusCode::ACCEPTED);
     let query = format!(
         "ParentId={}&PersonTypes=Actor&StartIndex=0&Limit=10&api_key={key}",
         library.id
