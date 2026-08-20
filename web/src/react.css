@@ -1123,7 +1123,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-operations-log-copy pre { max-width: 100%; margin: 10px 0 0; padding: 9px; overflow: auto; border: 1px solid var(--lux-line-soft); border-radius: 7px; color: var(--lux-muted); background: rgba(0,0,0,.14); font: .64rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .lux-operations-log-row time { padding-top: 2px; color: var(--lux-subtle); font-size: .65rem; white-space: nowrap; }
 .lux-admin-settings-panel { max-width: 760px; }
-.lux-admin-settings-form { display: grid; gap: 22px; max-width: 520px; }
+.lux-admin-settings-form { display: grid; width: 100%; gap: 22px; max-width: 760px; }
 .lux-admin-settings-form label { display: grid; gap: 7px; color: #fff; font-size: .86rem; }
 .lux-admin-settings-form label small { color: var(--lux-subtle); font-size: .72rem; line-height: 1.5; }
 .lux-admin-input-with-suffix { display: flex; align-items: center; max-width: 250px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.05); }
