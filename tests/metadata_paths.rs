@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use luxd::application::metadata_paths::{
-    MetadataObjectKind, canonical_person_directory, library_item_directory,
+    canonical_person_directory, library_item_directory, lux_person_directory,
     metadata_object_directory, metadata_root, people_directory, people_index_path,
-    people_index_path_for_provider,
+    people_index_path_for_provider, MetadataObjectKind,
 };
 
 #[test]
@@ -62,6 +62,16 @@ fn canonical_person_paths_are_provider_independent() {
 }
 
 #[test]
+fn lux_person_paths_are_readable_and_use_the_immutable_lux_id() {
+    let config = Path::new("/config");
+    let path = lux_person_directory(config, "华晨宇", "lux-000001").expect("valid Lux person");
+    assert_eq!(
+        path,
+        Path::new("/config/metadata/people/person/华/华晨宇-lux-000001")
+    );
+}
+
+#[test]
 fn metadata_paths_reject_traversal_components() {
     let config = Path::new("/config");
     assert!(library_item_directory(config, "../item").is_err());
@@ -115,16 +125,14 @@ fn metadata_object_paths_reject_unsafe_identity_components() {
         metadata_object_directory(config, MetadataObjectKind::Tag, "tag", "local", "../tag")
             .is_err()
     );
-    assert!(
-        metadata_object_directory(
-            config,
-            MetadataObjectKind::Tag,
-            "tag",
-            "local/provider",
-            "tag"
-        )
-        .is_err()
-    );
+    assert!(metadata_object_directory(
+        config,
+        MetadataObjectKind::Tag,
+        "tag",
+        "local/provider",
+        "tag"
+    )
+    .is_err());
     assert!(
         metadata_object_directory(config, MetadataObjectKind::Tag, "", "local", "tag").is_err()
     );

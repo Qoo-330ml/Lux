@@ -92,6 +92,36 @@ pub fn canonical_person_directory(
         .join(person_key))
 }
 
+/// Returns the human-readable directory for a canonical Lux person.
+///
+/// The display name is intentionally not part of the identity. The immutable
+/// `lux-######` component keeps same-name people separate and lets a renamed
+/// person retain the same directory identity once the manifest is created.
+pub fn lux_person_directory(
+    config_dir: &Path,
+    display_name: &str,
+    lux_person_id: &str,
+) -> Result<PathBuf, MetadataPathError> {
+    validate_lux_person_id(lux_person_id)?;
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        return Err(MetadataPathError::EmptyComponent("display name"));
+    }
+    let bucket = display_name
+        .chars()
+        .find(|character| character.is_alphanumeric())
+        .map(|character| character.to_string())
+        .unwrap_or_else(|| "_".to_owned());
+    Ok(metadata_root(config_dir)
+        .join(PEOPLE_DIR)
+        .join("person")
+        .join(bucket)
+        .join(format!(
+            "{}-{lux_person_id}",
+            readable_component(display_name)
+        )))
+}
+
 pub fn people_index_path(config_dir: &Path, person_id: &str) -> Result<PathBuf, MetadataPathError> {
     validate_component(person_id, "person ID")?;
     Ok(metadata_root(config_dir)
@@ -171,6 +201,16 @@ fn ascii_component(value: &str, label: &'static str) -> Result<String, MetadataP
     } else {
         Ok(value.to_ascii_lowercase())
     }
+}
+
+fn validate_lux_person_id(value: &str) -> Result<(), MetadataPathError> {
+    let Some(number) = value.strip_prefix("lux-") else {
+        return Err(MetadataPathError::InvalidComponent("Lux person ID"));
+    };
+    if number.len() < 6 || !number.chars().all(|character| character.is_ascii_digit()) {
+        return Err(MetadataPathError::InvalidComponent("Lux person ID"));
+    }
+    Ok(())
 }
 
 pub(crate) fn readable_component(value: &str) -> String {
