@@ -15,5 +15,5 @@ test("mobile library action menu remains inside the dynamic viewport", () => {
 });
 
 test("mobile library action menu keeps touch targets at least 44 pixels tall", () => {
-  assert.match(mobileRules, /\.lux-library-action-menu button\s*\{[^}]*min-height:\s*44px/);
+  assert.match(mobileRules, /\.lux-library-action-menu button\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
 });

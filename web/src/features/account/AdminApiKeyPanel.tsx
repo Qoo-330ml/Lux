@@ -74,19 +74,19 @@ export function AdminApiKeyPanel() {
           <div className="lux-account-api-key-value">
             <code>{currentKey}</code>
             <div className="lux-account-api-key-actions">
-              <button className="lux-button lux-button-secondary" type="button" onClick={() => void copyKey()} disabled={busy}>
+              <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => void copyKey()} disabled={busy}>
                 <Copy size={15} />复制 Key
               </button>
-              <button className="lux-button lux-button-secondary" type="button" onClick={rotateKey} disabled={busy}>
+              <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={rotateKey} disabled={busy}>
                 <RefreshCw size={15} />轮换
               </button>
-              <button className="lux-button lux-button-danger" type="button" onClick={revokeKey} disabled={busy}>
+              <button className="lux-button lux-button-compact lux-button-danger" type="button" onClick={revokeKey} disabled={busy}>
                 <Trash2 size={15} />撤销
               </button>
             </div>
           </div>
         ) : (
-          <button className="lux-button lux-button-secondary lux-account-api-key-generate" type="button" onClick={rotateKey} disabled={busy}>
+          <button className="lux-button lux-button-compact lux-button-secondary lux-account-api-key-generate" type="button" onClick={rotateKey} disabled={busy}>
             <KeyRound size={15} />生成共享 API Key
           </button>
         )

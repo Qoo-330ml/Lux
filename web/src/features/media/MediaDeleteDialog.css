@@ -5,6 +5,6 @@
 .lux-delete-dialog-body small { max-width: 350px; color: var(--lux-subtle); font-size: .74rem; line-height: 1.6; }
 .lux-delete-dialog-body .lux-editor-error { width: 100%; text-align: left; }
 .lux-delete-dialog-actions { display: flex; justify-content: center; gap: 9px; margin-top: 6px; }
-.lux-delete-dialog-actions .lux-button { min-height: 40px; padding: 0 18px; font-size: .78rem; }
+.lux-delete-dialog-actions .lux-button { padding: 0 18px; }
 .lux-button-danger { border-color: rgba(243,170,184,.34); color: #fff; background: rgba(170,53,77,.78); }
 .lux-button-danger:hover { border-color: rgba(255,208,218,.58); background: rgba(185,62,87,.95); }

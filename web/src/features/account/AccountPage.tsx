@@ -313,7 +313,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                   <input aria-label="自动标记已看百分比" type="number" min="1" max="100" value={playedPercent} onChange={(event) => { setPlayedPercentNotice(null); setPlayedPercent(event.target.value); }} />
                   <em>%</em>
                 </div>
-                <button className="lux-button lux-button-secondary" type="submit" disabled={savePlaybackSettings.isPending || playbackSettings.isPending}>
+                <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={savePlaybackSettings.isPending || playbackSettings.isPending}>
                   {savePlaybackSettings.isPending ? "保存中…" : "保存"}
                 </button>
                 {playedPercentNotice ? <span role="status">{playedPercentNotice}</span> : null}
@@ -339,7 +339,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                     />
                   </label>
                   <button
-                    className="lux-button lux-button-secondary"
+                    className="lux-button lux-button-compact lux-button-secondary"
                     type="button"
                     onClick={saveAvatar}
                     disabled={!pendingAvatarFile || !pendingAvatarUrl || avatarReading || avatarUpload.isPending}
@@ -363,7 +363,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                 <label className="lux-setting-field"><span>新密码</span><input type="password" autoComplete="new-password" placeholder="输入新密码" /></label>
                 <label className="lux-setting-field"><span>确认新密码</span><input type="password" autoComplete="new-password" placeholder="再次输入新密码" /></label>
               </div>
-              <button className="lux-button lux-button-secondary lux-account-password-button" type="submit">修改密码</button>
+              <button className="lux-button lux-button-compact lux-button-secondary" type="submit">修改密码</button>
               {accountNotice ? <p className="lux-account-notice" role="status">{accountNotice}</p> : null}
             </form>
           </SettingsSection>
@@ -371,7 +371,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
           <div className="lux-account-footer-card">
             <div><Monitor size={18} /><div><strong>当前设备</strong><span>Web 浏览器</span></div></div>
             <div><ShieldCheck size={18} /><div><strong>账户权限</strong><span>{user.canManageServer ? "服务器管理员" : "普通用户"}</span></div></div>
-            <button className="lux-button lux-button-secondary" type="button" onClick={() => logout.mutate()} disabled={logout.isPending}><LogOut size={17} />{logout.isPending ? "正在退出…" : "退出登录"}</button>
+            <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => logout.mutate()} disabled={logout.isPending}><LogOut size={17} />{logout.isPending ? "正在退出…" : "退出登录"}</button>
           </div>
           {logout.error ? <p className="lux-error-copy">{logout.error.message}</p> : null}
         </div>

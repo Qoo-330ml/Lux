@@ -259,21 +259,21 @@ export function MediaDetailPage() {
             <ExpandableOverview overview={media.overview || "暂无简介。"} />
             <div className="lux-hero-actions">
               {watchHref ? (
-                <Link className="lux-button lux-button-primary" to={watchHref}><Play size={17} fill="currentColor" /> 播放</Link>
+                <Link className="lux-button lux-button-large lux-button-primary" to={watchHref}><Play size={17} fill="currentColor" /> 播放</Link>
               ) : (
                 <button
-                  className="lux-button lux-button-primary"
+                  className="lux-button lux-button-large lux-button-primary"
                   type="button"
                   onClick={() => setActionNotice(episodes.isPending ? "正在查找可播放单集，请稍候。" : "没有可播放的单集。")}
                 >
                   <Play size={17} fill="currentColor" /> 播放
                 </button>
               )}
-              <button className="lux-button lux-button-glass" type="button" data-action="toggle-favorite" aria-pressed={Boolean(playback.data?.isFavorite)} disabled={pendingPlaybackAction !== undefined} onClick={() => void updatePlaybackFlag("favorite")}>
+              <button className="lux-button lux-button-large lux-button-glass" type="button" data-action="toggle-favorite" aria-pressed={Boolean(playback.data?.isFavorite)} disabled={pendingPlaybackAction !== undefined} onClick={() => void updatePlaybackFlag("favorite")}>
                 <Heart size={17} fill={playback.data?.isFavorite ? "currentColor" : "none"} /> {playback.data?.isFavorite ? "已收藏" : "收藏"}
               </button>
               {media.metadataPending || pendingReview ? (
-                <button className="lux-button lux-button-glass" type="button" data-action="confirm-metadata" disabled={confirmingMetadata} onClick={() => void confirmMetadata()}>
+                <button className="lux-button lux-button-large lux-button-glass" type="button" data-action="confirm-metadata" disabled={confirmingMetadata} onClick={() => void confirmMetadata()}>
                   <Check size={17} /> {confirmingMetadata ? "确认中…" : "确认元数据"}
                 </button>
               ) : null}
@@ -290,7 +290,7 @@ export function MediaDetailPage() {
                 <Check size={20} strokeWidth={2.4} />
               </button>
               <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
-              {pendingReview && nextPendingItem ? <Link className="lux-button lux-button-glass lux-detail-next-pending" data-action="next-pending" to={`/items/${nextPendingItem.id}?metadataStatus=pending`}>下一个待确认</Link> : null}
+              {pendingReview && nextPendingItem ? <Link className="lux-button lux-button-large lux-button-glass lux-detail-next-pending" data-action="next-pending" to={`/items/${nextPendingItem.id}?metadataStatus=pending`}>下一个待确认</Link> : null}
               {source ? <span className="lux-detail-source"><Radio size={16} /> {source.container || "DIRECT PLAY"}</span> : null}
             </div>
             {actionError ? <p className="lux-editor-error lux-detail-action-error" role="alert">{actionError}</p> : null}

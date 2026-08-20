@@ -47,12 +47,15 @@ test("account settings keeps the sidebar left and sync status aligned across the
 });
 
 test("account settings uses one compact height for action buttons", () => {
-  const accountButtonRule = accountStyles.match(/\.lux-account-page \.lux-button\s*\{([^}]*)\}/)?.[1] ?? "";
+  const compactButtonRule = stylesheet.match(/\.lux-button-compact\s*\{([^}]*)\}/)?.[1] ?? "";
+  const uploadRule = stylesheet.match(/\.lux-upload-button\s*\{([^}]*)\}/)?.[1] ?? "";
   const avatarUploadRule = accountStyles.match(/\.lux-account-avatar-actions \.lux-upload-button\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(accountButtonRule, /min-height:\s*36px/);
-  assert.match(accountButtonRule, /font-size:\s*\.72rem/);
-  assert.match(avatarUploadRule, /min-height:\s*36px/);
+  assert.match(compactButtonRule, /min-height:\s*var\(--lux-button-height-compact\)/);
+  assert.match(compactButtonRule, /font-size:\s*\.72rem/);
+  assert.match(uploadRule, /min-height:\s*var\(--lux-button-height-compact\)/);
+  assert.match(avatarUploadRule, /margin-top:\s*0/);
+  assert.doesNotMatch(accountStyles, /\.lux-account-page \.lux-button\s*\{/);
   assert.doesNotMatch(accountStyles, /\.lux-account-avatar-actions \.lux-button\s*\{[^}]*min-height:\s*33px/);
   assert.doesNotMatch(accountStyles, /\.lux-account-password-button\s*\{[^}]*min-height:\s*37px/);
   assert.doesNotMatch(accountStyles, /\.lux-account-footer-card \.lux-button\s*\{[^}]*min-height:\s*36px/);

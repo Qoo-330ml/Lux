@@ -18,11 +18,11 @@
 .lux-identifier-diffs span { color: var(--lux-subtle); }
 .lux-identifier-diffs small { overflow: hidden; color: var(--lux-muted); text-overflow: ellipsis; white-space: nowrap; }
 .lux-identifier-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-.lux-identifier-actions .lux-button { min-height: 36px; padding: 0 11px; font-size: .72rem; }
+.lux-identifier-actions .lux-button { padding: 0 11px; }
 
 @media (max-width: 560px) {
   .lux-identifier-search { grid-template-columns: minmax(0, 1fr); gap: 14px; padding: 16px; }
-  .lux-identifier-search .lux-button { justify-self: stretch; min-height: 44px; }
+  .lux-identifier-search .lux-button { justify-self: stretch; min-height: var(--lux-button-height-touch); }
   .lux-identifier-results { max-height: calc(100vh - 330px); max-height: calc(100dvh - 330px); padding: 16px; }
-  .lux-identifier-actions .lux-button { min-height: 44px; }
+  .lux-identifier-actions .lux-button { min-height: var(--lux-button-height-touch); }
 }

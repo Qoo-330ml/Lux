@@ -97,8 +97,8 @@ function HeroCarousel({ items }: { items: MediaItem[] }) {
           <p>{item?.overview || "在属于你的空间里，继续观看收藏的电影与剧集。"}</p>
           <div className="lux-hero-action-row">
             <div className="lux-hero-actions">
-              {item ? <Link className="lux-button lux-button-primary" to={`/items/${item.id}`}><Play size={17} fill="currentColor" /> {playbackPositionTicks(item) ? "继续播放" : "播放"}</Link> : <Link className="lux-button lux-button-primary" to="/libraries"><Play size={17} fill="currentColor" /> 浏览媒体库</Link>}
-              {item ? <Link className="lux-button lux-button-glass" to={`/items/${item.id}`}><Info size={17} /> 详情</Link> : null}
+              {item ? <Link className="lux-button lux-button-large lux-button-primary" to={`/items/${item.id}`}><Play size={17} fill="currentColor" /> {playbackPositionTicks(item) ? "继续播放" : "播放"}</Link> : <Link className="lux-button lux-button-large lux-button-primary" to="/libraries"><Play size={17} fill="currentColor" /> 浏览媒体库</Link>}
+              {item ? <Link className="lux-button lux-button-large lux-button-glass" to={`/items/${item.id}`}><Info size={17} /> 详情</Link> : null}
             </div>
             {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><button className="lux-hero-carousel-arrow" type="button" aria-label="上一条精选" onClick={() => goTo(safeIndex - 1)}><ChevronLeft size={17} /></button><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)} />)}</div><button className="lux-hero-carousel-arrow" type="button" aria-label="下一条精选" onClick={() => goTo(safeIndex + 1)}><ChevronRight size={17} /></button></div> : null}
           </div>

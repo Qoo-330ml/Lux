@@ -20,6 +20,10 @@
   --lux-page-top: 126px;
   --lux-control-padding-x: 12px;
   --lux-button-padding-x: 16px;
+  --lux-button-height-large: 48px;
+  --lux-button-height: 40px;
+  --lux-button-height-compact: 36px;
+  --lux-button-height-touch: 44px;
   --lux-card-copy-padding: 10px 0 0;
   --lux-card-rail-padding: 16px 0 8px;
   --lux-panel-padding: 20px;
@@ -166,7 +170,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-scan-activity-progress span { display: block; width: 35%; height: 100%; border-radius: inherit; background: var(--lux-accent); animation: lux-job-progress-indeterminate 1.2s ease-in-out infinite; }
 .lux-scan-activity-progress[aria-valuenow] span { animation: none; }
 .lux-scan-activity-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.lux-scan-activity-actions a, .lux-scan-activity-actions button { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 0 9px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); background: rgba(255,255,255,.04); font-size: .67rem; transition: color .18s ease, background .18s ease, border-color .18s ease; }
+.lux-scan-activity-actions a, .lux-scan-activity-actions button { display: inline-flex; align-items: center; gap: 6px; min-height: var(--lux-button-height-compact); padding: 0 9px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); background: rgba(255,255,255,.04); font-size: .67rem; transition: color .18s ease, background .18s ease, border-color .18s ease; }
 .lux-scan-activity-actions a:hover, .lux-scan-activity-actions button:hover:not(:disabled) { border-color: rgba(255,255,255,.25); color: #fff; background: rgba(255,255,255,.08); }
 .lux-scan-activity-actions button:disabled { cursor: default; opacity: .6; }
 .lux-scan-activity-empty { margin: 0; padding: 18px 15px; color: var(--lux-muted); font-size: .72rem; }
@@ -204,7 +208,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-hero-dot { width: 7px; height: 7px; padding: 0; border: 0; border-radius: 50%; background: rgba(255,255,255,.38); transition: width .22s var(--lux-ease), background .2s ease; }
 .lux-hero-dot:hover { background: rgba(255,255,255,.78); }
 .lux-hero-dot.is-active { width: 23px; border-radius: 999px; background: #fff; }
-.lux-button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 48px; padding: 0 var(--lux-button-padding-x); border: 1px solid transparent; border-radius: 999px; color: #111; font-size: .9rem; font-weight: 650; transition: transform .2s var(--lux-ease), border-color .2s ease, background .2s ease, box-shadow .2s ease; }
+.lux-button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: var(--lux-button-height); padding: 0 var(--lux-button-padding-x); border: 1px solid transparent; border-radius: 999px; color: #111; font-size: .8rem; font-weight: 650; transition: transform .2s var(--lux-ease), border-color .2s ease, background .2s ease, box-shadow .2s ease; }
+.lux-button-large { min-height: var(--lux-button-height-large); font-size: .9rem; }
+.lux-button-compact { min-height: var(--lux-button-height-compact); font-size: .72rem; }
+.lux-button-touch { min-height: var(--lux-button-height-touch); }
 .lux-button:hover { transform: translateY(-2px); }
 .lux-button-primary { background: #f2f2f3; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
 .lux-button-primary:hover { background: #fff; box-shadow: 0 12px 28px rgba(0,0,0,.35); }
@@ -314,7 +321,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-editor-error { margin: 0; color: #f3aab8; font-size: .78rem; line-height: 1.5; }
 .lux-media-editor-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding-top: 5px; color: var(--lux-subtle); font-size: .72rem; }
 .lux-media-editor-footer > div { display: flex; gap: 9px; }
-.lux-media-editor-footer .lux-button { min-height: 40px; font-size: .78rem; }
 .lux-image-editor { width: min(1080px, 100%); }
 .lux-image-editor-body { max-height: min(740px, calc(100vh - 150px)); overflow-y: auto; padding: var(--lux-dialog-content-padding); }
 .lux-image-type-tabs { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; }
@@ -323,7 +329,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-image-type-tabs button.is-active svg { color: var(--lux-accent); }
 .lux-image-editor-toolbar { display: flex; align-items: flex-end; gap: 10px; margin-top: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--lux-line-soft); }
 .lux-image-editor-toolbar label { display: grid; flex: 1; gap: 7px; min-width: 0; }
-.lux-image-editor-toolbar .lux-button { min-height: 41px; }
 .lux-editor-section-label { display: block; margin-bottom: 10px; color: var(--lux-muted); font-size: .74rem; }
 .lux-image-editor-current { margin-top: 20px; }
 .lux-image-current-card { display: grid; place-items: center; width: 145px; aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-subtle); background: rgba(255,255,255,.035); }
@@ -787,7 +792,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-server-name-dialog-form input:focus { border-color: var(--lux-overview-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--lux-overview-accent) 16%, transparent); }
 .lux-server-name-dialog-form p { margin: 4px 0 0; color: var(--lux-muted); font-size: .65rem; line-height: 1.45; }
 .lux-server-name-dialog-form .lux-server-name-dialog-error { color: #e58e98; }
-.lux-server-name-dialog-save { min-height: 34px; margin-top: auto; border: 0; border-radius: 999px; color: #fff; background: #4fb64b; font-size: .72rem; font-weight: 650; }
+.lux-server-name-dialog-save { min-height: var(--lux-button-height-compact); margin-top: auto; border: 0; border-radius: 999px; color: #fff; background: #4fb64b; font-size: .72rem; font-weight: 650; }
 .lux-server-name-dialog-save:hover:not(:disabled) { background: #5bc456; }
 .lux-admin-server-identity { display: grid; grid-template-columns: auto minmax(0, 1fr) minmax(280px, .82fr); align-items: center; gap: 20px; padding: 22px 24px; border: 1px solid var(--lux-line-soft); border-radius: 17px; background: linear-gradient(105deg, rgba(255,255,255,.055), rgba(255,255,255,.018)); }
 .lux-admin-server-mark { display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid rgba(210,71,191,.38); border-radius: 15px; color: #f5a7e5; background: rgba(210,71,191,.11); box-shadow: 0 10px 28px rgba(210,71,191,.1); }
@@ -802,7 +807,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-server-form label { display: grid; flex: 1; gap: 7px; color: var(--lux-muted); font-size: .72rem; }
 .lux-admin-server-form input:not([type="checkbox"]):not([type="radio"]) { width: 100%; min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 9px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
 .lux-admin-server-form input:not([type="checkbox"]):not([type="radio"]):focus { border-color: rgba(210,71,191,.66); box-shadow: 0 0 0 3px rgba(210,71,191,.12); }
-.lux-admin-server-form .lux-button { min-height: 42px; white-space: nowrap; }
+.lux-admin-server-form .lux-button { white-space: nowrap; }
 .lux-dashboard-inline-error { margin: 12px 0 -4px; }
 .lux-admin-dashboard-monitor-section { margin-top: 46px; }
 .lux-admin-activity-section { margin-top: 52px; }
@@ -1016,7 +1021,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-job-details ul { display: grid; gap: 7px; margin: 8px 0 0; padding: 0; list-style: none; }
 .lux-admin-job-details li { display: grid; grid-template-columns: minmax(110px, .7fr) minmax(0, 1fr); gap: 10px; }
 .lux-admin-job-details code { overflow: hidden; color: var(--lux-subtle); text-overflow: ellipsis; white-space: nowrap; }
-.lux-admin-job-details-toggle { display: inline-flex; align-items: center; gap: 4px; min-height: 30px; padding: 0 8px; border: 1px solid var(--lux-line-soft); border-radius: 7px; color: var(--lux-muted); font: inherit; font-size: .68rem; background: transparent; cursor: pointer; }
+.lux-admin-job-details-toggle { display: inline-flex; align-items: center; gap: 4px; min-height: var(--lux-button-height-compact); padding: 0 8px; border: 1px solid var(--lux-line-soft); border-radius: 7px; color: var(--lux-muted); font: inherit; font-size: .68rem; background: transparent; cursor: pointer; }
 .lux-admin-job-details-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
 html[data-lux-theme="light"] .lux-admin-job-error { color: #9f3047; background: rgba(190,47,76,.07); }
 html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,.035); }
@@ -1078,7 +1083,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-registered-task-meta code { color: var(--lux-subtle); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .62rem; }
 .lux-registered-task-schedule { display: block; margin-top: 10px; color: var(--lux-subtle); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .66rem; }
 .lux-registered-task-actions { display: flex; align-items: flex-start; gap: 7px; }
-.lux-registered-task-run { min-height: 32px; padding: 0 11px; font-size: .68rem; white-space: nowrap; }
+.lux-registered-task-run { padding: 0 11px; white-space: nowrap; }
 .lux-registered-task-edit { margin-top: 3px; }
 .lux-registered-task-error { grid-column: 2 / -1; margin: 0; }
 .lux-registered-task-editor { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; align-items: end; gap: 10px 13px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--lux-line-soft); }
@@ -1104,7 +1109,6 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-log-export-controls label { display: grid; gap: 5px; color: var(--lux-subtle); font-size: .65rem; }
 .lux-log-export-controls input { min-height: 37px; padding: 0 9px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-text); background: rgba(255,255,255,.04); font: inherit; }
 .lux-log-export-controls input:focus { border-color: rgba(255,255,255,.46); outline: 0; box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
-.lux-log-export-controls .lux-button { min-height: 37px; }
 .lux-log-export-panel .lux-error-copy, .lux-log-export-success { margin: 0; font-size: .68rem; }
 .lux-log-export-success { color: #9bdcb3; }
 .lux-operations-log-row { display: grid; grid-template-columns: 45px minmax(0, 1fr) auto auto; align-items: start; gap: 11px; padding: 13px 12px; border-bottom: 1px solid var(--lux-line-soft); }
@@ -1369,12 +1373,12 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-library-management-header { display: grid; justify-items: center; margin-bottom: 27px; }
 .lux-library-management-header h1 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
 .lux-library-tabs { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--lux-line-soft); border-radius: 999px; background: rgba(255,255,255,.055); }
-.lux-library-tabs button { min-width: 80px; min-height: 34px; padding: 0 var(--lux-button-padding-x); border: 0; border-radius: 999px; color: var(--lux-muted); background: transparent; font-size: .85rem; font-weight: 650; transition: color .2s ease, background .2s ease, box-shadow .2s ease; }
+.lux-library-tabs button { min-width: 80px; min-height: var(--lux-button-height-compact); padding: 0 var(--lux-button-padding-x); border: 0; border-radius: 999px; color: var(--lux-muted); background: transparent; font-size: .85rem; font-weight: 650; transition: color .2s ease, background .2s ease, box-shadow .2s ease; }
 .lux-library-tabs button:hover { color: #fff; }
 .lux-library-tabs button.is-active { color: #fff; background: rgba(255,255,255,.14); box-shadow: 0 2px 12px rgba(0,0,0,.2); }
 .lux-library-management-toolbar { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 30px; color: var(--lux-muted); font-size: .78rem; }
 .lux-library-management-toolbar > div { display: flex; gap: 8px; }
-.lux-library-toolbar-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; padding: 0 var(--lux-button-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 999px; color: var(--lux-text); background: rgba(255,255,255,.055); font-size: .78rem; font-weight: 600; transition: background .2s ease, color .2s ease, transform .2s var(--lux-ease); }
+.lux-library-toolbar-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: var(--lux-button-height-compact); padding: 0 var(--lux-button-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 999px; color: var(--lux-text); background: rgba(255,255,255,.055); font-size: .78rem; font-weight: 600; transition: background .2s ease, color .2s ease, transform .2s var(--lux-ease); }
 .lux-library-toolbar-button:hover { color: #fff; border-color: rgba(255,255,255,.3); background: rgba(255,255,255,.1); transform: translateY(-1px); }
 .lux-library-toolbar-button.is-primary { border-color: transparent; color: #fff; background: var(--lux-accent); box-shadow: 0 8px 24px rgba(210,71,191,.2); }
 .lux-library-toolbar-button.is-primary:hover { background: #df5aca; }
@@ -1400,7 +1404,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-library-action-menu-heading img, .lux-library-action-menu-heading > span { display: grid; place-items: center; flex: 0 0 auto; width: 62px; height: 36px; overflow: hidden; border-radius: 4px; color: var(--lux-subtle); background: #1b1b20; object-fit: cover; }
 .lux-library-action-menu-heading strong { overflow: hidden; font-size: .8rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-library-action-menu > span { display: block; }
-.lux-library-action-menu button { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 38px; padding: 0 var(--lux-control-padding-x); border: 0; color: inherit; text-align: left; background: transparent; font-size: .78rem; }
+.lux-library-action-menu button { display: flex; align-items: center; gap: 12px; width: 100%; min-height: var(--lux-button-height); padding: 0 var(--lux-control-padding-x); border: 0; color: inherit; text-align: left; background: transparent; font-size: .78rem; }
 .lux-library-action-menu button:hover:not(:disabled), .lux-library-action-menu button:focus-visible { color: #fff; background: rgba(255,255,255,.09); }
 .lux-library-action-menu button:disabled { color: var(--lux-subtle); }
 .lux-library-action-menu button svg { flex: 0 0 auto; }
@@ -1494,7 +1498,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-library-dialog-icon:disabled { color: var(--lux-subtle); }
 .lux-library-root-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .lux-library-root-form input { flex: 1 1 calc(100% - 48px); min-width: 0; }
-.lux-library-root-form .lux-library-toolbar-button.lux-library-root-browser-button { flex: 0 0 40px; width: 40px; min-height: 40px; padding: 0; }
+.lux-library-root-form .lux-library-toolbar-button.lux-library-root-browser-button { flex: 0 0 40px; width: 40px; min-height: var(--lux-button-height); padding: 0; }
 .lux-directory-picker { display: grid; gap: 12px; margin-top: 12px; padding: 14px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: rgba(255,255,255,.025); }
 .lux-directory-picker-header, .lux-directory-picker-actions, .lux-directory-picker-selected { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .lux-directory-picker-header h4 { margin: 5px 0 0; color: var(--lux-text); font-size: .9rem; }
@@ -1565,7 +1569,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
     -webkit-overflow-scrolling: touch;
   }
   .lux-library-action-menu-heading { position: sticky; z-index: 1; top: 0; background: rgba(30,30,35,.98); backdrop-filter: blur(18px); }
-  .lux-library-action-menu button { min-height: 44px; }
+  .lux-library-action-menu button { min-height: var(--lux-button-height-touch); }
   .lux-library-dialog-header, .lux-library-dialog-scroll { padding-right: 16px; padding-left: 16px; }
   .lux-library-dialog-form { padding-right: 16px; padding-left: 16px; }
   .lux-library-strategy-heading { align-items: flex-start; flex-direction: column; }
@@ -1594,7 +1598,6 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 
 /* Account settings */
 .lux-account-page { --lux-settings-surface: rgba(20,20,24,.72); --lux-settings-line: var(--lux-line-soft); --lux-account-settings-gap: clamp(28px, 5vw, 84px); }
-.lux-account-page .lux-button { min-height: 36px; font-size: .72rem; }
 .lux-account-page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-right: 0; margin-bottom: 42px; }
 .lux-account-page-heading h1 { margin: 10px 0 8px; color: var(--lux-text); font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.075em; }
 .lux-account-page-heading p { margin: 0; color: var(--lux-muted); }
@@ -1626,11 +1629,11 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-account-playback-threshold .lux-admin-input-with-suffix { width: 100px; }
 .lux-account-playback-threshold > span { flex-basis: 100%; color: var(--lux-subtle); font-size: .7rem; text-align: right; }
 .lux-theme-options { display: flex; gap: 4px; padding: 4px; border: 1px solid var(--lux-settings-line); border-radius: 9px; background: rgba(255,255,255,.035); }
-.lux-theme-options button { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 var(--lux-control-padding-x); border: 0; border-radius: 6px; color: var(--lux-subtle); background: transparent; font-size: .74rem; transition: color .2s ease, background .2s ease; }
+.lux-theme-options button { display: inline-flex; align-items: center; gap: 7px; min-height: var(--lux-button-height-compact); padding: 0 var(--lux-control-padding-x); border: 0; border-radius: 6px; color: var(--lux-subtle); background: transparent; font-size: .74rem; transition: color .2s ease, background .2s ease; }
 .lux-theme-options button:hover, .lux-theme-options button.is-selected { color: var(--lux-text); background: rgba(255,255,255,.11); }
 .lux-accent-row { min-height: 86px; }
 .lux-accent-options { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
-.lux-accent-option { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 var(--lux-control-padding-x); border: 1px solid transparent; border-radius: 7px; color: var(--lux-subtle); background: transparent; font-size: .72rem; transition: color .2s ease, border-color .2s ease, background .2s ease; }
+.lux-accent-option { display: inline-flex; align-items: center; gap: 7px; min-height: var(--lux-button-height-compact); padding: 0 var(--lux-control-padding-x); border: 1px solid transparent; border-radius: 7px; color: var(--lux-subtle); background: transparent; font-size: .72rem; transition: color .2s ease, border-color .2s ease, background .2s ease; }
 .lux-accent-option:hover, .lux-accent-option.is-selected { border-color: var(--lux-settings-line); color: var(--lux-text); background: rgba(255,255,255,.07); }
 .lux-accent-swatch { display: block; width: 13px; height: 13px; border-radius: 50%; background: var(--lux-accent); box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
 .lux-accent-option.is-berry .lux-accent-swatch { background: #d247bf; }
@@ -1681,13 +1684,12 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-account-api-key-value { display: grid; gap: 11px; padding: 13px; border: 1px solid var(--lux-settings-line); border-radius: 9px; background: rgba(255,255,255,.035); }
 .lux-account-api-key-value code { overflow-wrap: anywhere; color: var(--lux-text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; line-height: 1.5; }
 .lux-account-api-key-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.lux-account-api-key-actions .lux-button, .lux-account-api-key-generate { min-height: 35px; font-size: .72rem; }
 .lux-button-danger { border-color: rgba(219,100,100,.42); color: #f1a5a5; background: rgba(180,62,62,.1); }
 .lux-button-danger:hover:not(:disabled), .lux-button-danger:focus-visible { border-color: rgba(219,100,100,.7); background: rgba(180,62,62,.2); }
 .lux-settings-avatar-large { width: 68px; height: 68px; font-size: 1.4rem; }
 .lux-account-avatar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.lux-upload-button { display: inline-flex; align-items: center; min-height: 33px; margin-top: 10px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-settings-line); border-radius: 7px; color: var(--lux-text); background: rgba(255,255,255,.06); font-size: .72rem; cursor: pointer; transition: background .2s ease, border-color .2s ease; }
-.lux-account-avatar-actions .lux-upload-button { margin-top: 0; min-height: 36px; }
+.lux-upload-button { display: inline-flex; align-items: center; min-height: var(--lux-button-height-compact); margin-top: 10px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-settings-line); border-radius: 7px; color: var(--lux-text); background: rgba(255,255,255,.06); font-size: .72rem; cursor: pointer; transition: background .2s ease, border-color .2s ease; }
+.lux-account-avatar-actions .lux-upload-button { margin-top: 0; }
 .lux-upload-button:hover { border-color: rgba(255,255,255,.38); background: rgba(255,255,255,.1); }
 .lux-upload-button input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
 .lux-account-form-grid { padding-top: 4px; }
