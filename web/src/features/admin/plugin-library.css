@@ -10,10 +10,8 @@
 
 .lux-admin-plugin-store-trigger {
   gap: 7px;
-  min-height: 34px;
   padding: 0 12px;
   border-radius: 999px;
-  font-size: .73rem;
 }
 
 .lux-admin-plugin-heading-actions {

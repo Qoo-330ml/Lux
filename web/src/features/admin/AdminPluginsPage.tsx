@@ -90,8 +90,8 @@ export function AdminPluginsPage() {
       <header className="lux-admin-page-heading">
         <div><h1>插件库</h1><p>从插件商店安装经过校验的插件，再为媒体库选择刮削器。</p></div>
         <div className="lux-admin-plugin-heading-actions">
-          <button className="lux-button lux-button-secondary" type="button" aria-label="检查插件更新" onClick={() => checkUpdates.mutate()} disabled={checkUpdates.isPending}><RefreshCw size={15} /> {checkUpdates.isPending ? "检查中…" : "检查更新"}</button>
-          <button className="lux-button lux-button-secondary lux-admin-plugin-store-trigger" type="button" aria-label="设置插件商店来源" aria-haspopup="dialog" aria-expanded={storeDialogOpen} onClick={() => setStoreDialogOpen(true)}><Globe2 size={15} /> 插件商店来源</button>
+          <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="检查插件更新" onClick={() => checkUpdates.mutate()} disabled={checkUpdates.isPending}><RefreshCw size={15} /> {checkUpdates.isPending ? "检查中…" : "检查更新"}</button>
+          <button className="lux-button lux-button-compact lux-button-secondary lux-admin-plugin-store-trigger" type="button" aria-label="设置插件商店来源" aria-haspopup="dialog" aria-expanded={storeDialogOpen} onClick={() => setStoreDialogOpen(true)}><Globe2 size={15} /> 插件商店来源</button>
         </div>
       </header>
       {storeDialogOpen ? (
