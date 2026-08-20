@@ -2,12 +2,16 @@ use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::time::{Duration, sleep};
 
 use crate::{
     application::plugins::{PluginService, PluginServiceError},
     application::provider_cache::{CacheLookup, ProviderResponseCache, cache_key, ttl_for_method},
     storage::{Database, StorageError},
 };
+
+const SCRAPER_MAX_RETRIES: u32 = 2;
+const SCRAPER_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// Stable item types understood by the scraper RPC contract.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -189,7 +193,11 @@ pub struct ScraperSearchResult {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{ScraperSearchResult, decode_bundle_response};
+    use super::{
+        PluginServiceError, ScraperError, ScraperSearchResult, decode_bundle_response,
+        retryable_scraper_error,
+    };
+    use crate::application::plugin_runtime::PluginRuntimeError;
     use serde_json::json;
 
     #[test]
@@ -234,6 +242,22 @@ mod tests {
         assert_eq!(bundle.images.images.len(), 1);
         assert_eq!(bundle.credits.cast[0].provider_id, "9");
         assert_eq!(bundle.external_ids.provider_ids["Imdb"], "tt7");
+    }
+
+    #[test]
+    fn scraper_retries_only_plugin_process_failures() {
+        assert!(retryable_scraper_error(&ScraperError::Plugin(
+            PluginServiceError::Runtime(PluginRuntimeError::Timeout),
+        )));
+        assert!(retryable_scraper_error(&ScraperError::Plugin(
+            PluginServiceError::Runtime(PluginRuntimeError::Exited),
+        )));
+        assert!(!retryable_scraper_error(&ScraperError::Provider(
+            "rate limited".to_owned(),
+        )));
+        assert!(!retryable_scraper_error(&ScraperError::InvalidResponse(
+            "invalid payload".to_owned(),
+        )));
     }
 }
 
@@ -586,11 +610,7 @@ impl ScraperPluginClient {
         params: Value,
     ) -> Result<Value, ScraperError> {
         let Some(cache_key) = cache_key(&self.plugin_id, method, &params) else {
-            return self
-                .plugins
-                .call_scraper(&self.plugin_id, method, params)
-                .await
-                .map_err(ScraperError::Plugin);
+            return self.call_scraper_with_retry(method, params).await;
         };
         let cache_owner = loop {
             match self.response_cache.begin(&cache_key).await {
@@ -604,11 +624,7 @@ impl ScraperPluginClient {
                 CacheLookup::Owner(owner) => break owner,
             }
         };
-        let result = self
-            .plugins
-            .call_scraper(&self.plugin_id, method, params)
-            .await
-            .map_err(ScraperError::Plugin);
+        let result = self.call_scraper_with_retry(method, params).await;
         if let Ok(value) = &result {
             self.response_cache
                 .store(&cache_key, value, ttl_for_method(method))
@@ -621,6 +637,41 @@ impl ScraperPluginClient {
         cache_owner.finish();
         result
     }
+
+    async fn call_scraper_with_retry(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ScraperError> {
+        let mut retry_count = 0;
+        loop {
+            let result = self
+                .plugins
+                .call_scraper(&self.plugin_id, method, params.clone())
+                .await
+                .map_err(ScraperError::Plugin);
+            match result {
+                Err(error)
+                    if retry_count < SCRAPER_MAX_RETRIES && retryable_scraper_error(&error) =>
+                {
+                    retry_count += 1;
+                    sleep(SCRAPER_RETRY_DELAY * retry_count).await;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+fn retryable_scraper_error(error: &ScraperError) -> bool {
+    matches!(
+        error,
+        ScraperError::Plugin(PluginServiceError::Runtime(
+            crate::application::plugin_runtime::PluginRuntimeError::Io(_)
+                | crate::application::plugin_runtime::PluginRuntimeError::Timeout
+                | crate::application::plugin_runtime::PluginRuntimeError::Exited
+        ))
+    )
 }
 
 fn is_negative_scraper_error(error: &ScraperError) -> bool {
