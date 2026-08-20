@@ -1,4 +1,8 @@
-use std::{fmt, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::Path,
+};
 
 use crate::{
     application::schedule::validate_cron,
@@ -115,6 +119,80 @@ impl LibraryService {
             views.push(LibraryView { library, roots });
         }
         Ok(views)
+    }
+
+    pub async fn list_libraries_for_user(
+        &self,
+        user_id: &str,
+        accessible_library_ids: &[String],
+    ) -> Result<Vec<LibraryView>, LibraryServiceError> {
+        let mut views = self.list_libraries().await?;
+        let order = self.database.user_library_order(user_id).await?;
+        order_library_views(&mut views, &order);
+        let accessible = accessible_library_ids.iter().collect::<HashSet<_>>();
+        views.retain(|view| {
+            view.library.is_enabled && accessible.contains(&view.library.id.to_string())
+        });
+        Ok(views)
+    }
+
+    pub async fn saved_library_order(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, LibraryServiceError> {
+        Ok(self.database.user_library_order(user_id).await?)
+    }
+
+    pub async fn saved_library_order_for_user(
+        &self,
+        user_id: &str,
+        accessible_library_ids: &[String],
+    ) -> Result<Vec<String>, LibraryServiceError> {
+        let accessible = accessible_library_ids.iter().collect::<HashSet<_>>();
+        Ok(self
+            .saved_library_order(user_id)
+            .await?
+            .into_iter()
+            .filter(|library_id| accessible.contains(library_id))
+            .collect())
+    }
+
+    pub async fn set_library_order(
+        &self,
+        user_id: &str,
+        requested_library_ids: &[String],
+        accessible_library_ids: &[String],
+    ) -> Result<Vec<String>, LibraryServiceError> {
+        let accessible = accessible_library_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::with_capacity(requested_library_ids.len());
+        let mut ordered = Vec::with_capacity(accessible.len());
+        for library_id in requested_library_ids {
+            if !accessible.contains(library_id) {
+                return Err(LibraryServiceError::InvalidLibraryOrder(
+                    "媒体库不可访问或不存在".to_owned(),
+                ));
+            }
+            if !seen.insert(library_id.clone()) {
+                return Err(LibraryServiceError::InvalidLibraryOrder(
+                    "媒体库排序不能包含重复项".to_owned(),
+                ));
+            }
+            ordered.push(library_id.clone());
+        }
+        let views = self.list_libraries().await?;
+        for view in views {
+            let library_id = view.library.id.to_string();
+            if accessible.contains(&library_id) && seen.insert(library_id.clone()) {
+                ordered.push(library_id);
+            }
+        }
+        self.database
+            .replace_user_library_order(user_id, &ordered)
+            .await?;
+        Ok(ordered)
     }
 
     pub async fn get_library(
@@ -374,6 +452,7 @@ pub enum LibraryServiceError {
     InvalidSchedule,
     InvalidConcurrency,
     InvalidLibraryId(String),
+    InvalidLibraryOrder(String),
     InvalidRootId(String),
     InvalidKind(String),
     InvalidScraperId,
@@ -402,6 +481,7 @@ impl fmt::Display for LibraryServiceError {
                 )
             }
             Self::InvalidLibraryId(error) => write!(formatter, "invalid library ID: {error}"),
+            Self::InvalidLibraryOrder(error) => write!(formatter, "invalid library order: {error}"),
             Self::InvalidRootId(error) => write!(formatter, "invalid library root ID: {error}"),
             Self::InvalidKind(error) => write!(formatter, "invalid library kind: {error}"),
             Self::InvalidScraperId => formatter.write_str("invalid library scraper ID"),
@@ -433,6 +513,7 @@ impl std::error::Error for LibraryServiceError {
             | Self::InvalidSchedule
             | Self::InvalidConcurrency
             | Self::InvalidLibraryId(_)
+            | Self::InvalidLibraryOrder(_)
             | Self::InvalidRootId(_)
             | Self::InvalidKind(_)
             | Self::InvalidScraperId
@@ -445,6 +526,24 @@ impl std::error::Error for LibraryServiceError {
             | Self::OverlappingRoot => None,
         }
     }
+}
+
+fn order_library_views(views: &mut [LibraryView], saved_order: &[String]) {
+    let positions = saved_order
+        .iter()
+        .enumerate()
+        .map(|(position, library_id)| (library_id.as_str(), position))
+        .collect::<HashMap<_, _>>();
+    views.sort_by(|left, right| {
+        let left_id = left.library.id.to_string();
+        let right_id = right.library.id.to_string();
+        positions
+            .get(left_id.as_str())
+            .unwrap_or(&usize::MAX)
+            .cmp(positions.get(right_id.as_str()).unwrap_or(&usize::MAX))
+            .then_with(|| left.library.name.cmp(&right.library.name))
+            .then_with(|| left_id.cmp(&right_id))
+    });
 }
 
 fn validate_concurrency(value: Option<i64>) -> Result<(), LibraryServiceError> {

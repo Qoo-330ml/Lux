@@ -26,6 +26,7 @@ import type {
   ApiErrorBody,
   DatabaseSetupInput,
   HomeResponse,
+  UserLibraryOrder,
   Library,
   LibrariesResponse,
   LuxUser,
@@ -195,6 +196,17 @@ export class LuxApiClient {
 
   updateUserSettings(input: Partial<UserPlaybackSettings>) {
     return this.request<UserPlaybackSettings>("/api/v1/auth/settings", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  libraryOrder() {
+    return this.request<UserLibraryOrder>("/api/v1/auth/library-order");
+  }
+
+  updateLibraryOrder(input: UserLibraryOrder) {
+    return this.request<UserLibraryOrder>("/api/v1/auth/library-order", {
       method: "PATCH",
       body: JSON.stringify(input),
     });

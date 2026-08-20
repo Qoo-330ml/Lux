@@ -114,6 +114,29 @@ describe("LuxApiClient", () => {
     expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
   });
 
+  it("reads and updates the current user's library order", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (!init?.method) {
+        return new Response(JSON.stringify({ libraryOrder: ["movies", "series"] }), { status: 200 });
+      }
+      expect(String(input)).toBe("/api/v1/auth/library-order");
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(String(init.body))).toEqual({ libraryOrder: ["series", "movies"] });
+      return new Response(JSON.stringify({ libraryOrder: ["series", "movies"] }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.libraryOrder()).resolves.toEqual({ libraryOrder: ["movies", "series"] });
+    await expect(client.updateLibraryOrder({ libraryOrder: ["series", "movies"] })).resolves.toEqual({
+      libraryOrder: ["series", "movies"],
+    });
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
   it("filters library browse requests by the requested root item type", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),

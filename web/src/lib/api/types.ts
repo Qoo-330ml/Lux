@@ -36,6 +36,10 @@ export type UserPlaybackSettings = {
   playedPercent: number;
 };
 
+export type UserLibraryOrder = {
+  libraryOrder: string[];
+};
+
 export type AuthSession = {
   user: LuxUser;
   serverName?: string | null;

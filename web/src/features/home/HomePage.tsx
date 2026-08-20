@@ -4,7 +4,6 @@ import { ChevronLeft, ChevronRight, Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
-import { orderLibraries, readAccountSettings } from "../account/account-settings";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { LuxUser, MediaItem } from "../../lib/api/types";
@@ -32,7 +31,7 @@ export function HomePage({ user }: { user: LuxUser }) {
   if (home.error) return <section className="lux-page-state"><h1>首页加载失败</h1><p>{home.error.message}</p></section>;
 
   const data = home.data;
-  const libraries = orderLibraries(data.libraries ?? [], readAccountSettings(user.id).libraryOrder);
+  const libraries = data.libraries ?? [];
   const slides = heroSlides(data);
   return (
     <div className="lux-home">

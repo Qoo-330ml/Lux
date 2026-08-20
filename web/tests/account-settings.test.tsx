@@ -32,6 +32,8 @@ describe("account settings", () => {
       ],
     });
     vi.spyOn(api, "userSettings").mockResolvedValue({ playedPercent: 95 });
+    vi.spyOn(api, "libraryOrder").mockResolvedValue({ libraryOrder: [] });
+    vi.spyOn(api, "updateLibraryOrder").mockImplementation(async (input) => input);
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);

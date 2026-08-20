@@ -609,6 +609,10 @@ pub fn app_with_state(state: AppState) -> Router {
             get(auth_settings).patch(auth_update_settings),
         )
         .route(
+            "/api/v1/auth/library-order",
+            get(auth_library_order).patch(auth_update_library_order),
+        )
+        .route(
             "/api/v1/auth/avatar",
             get(auth_avatar)
                 .put(auth_update_avatar)
@@ -1651,7 +1655,7 @@ async fn emby_public_users(State(state): State<AppState>) -> Json<Value> {
     Json(Value::Array(
         users
             .iter()
-            .map(|user| emby_user_json(user, &server_id, &server_name))
+            .map(|user| emby_user_json(user, &server_id, &server_name, &[]))
             .collect(),
     ))
 }
@@ -1670,7 +1674,28 @@ async fn emby_user(
         return status.into_response();
     }
     let server_name = current_emby_server_name(&state).await;
-    Json(emby_user_json(&user, &state.server_id, &server_name)).into_response()
+    let ordered_views = emby_ordered_views(&state, &user).await;
+    Json(emby_user_json(
+        &user,
+        &state.server_id,
+        &server_name,
+        &ordered_views,
+    ))
+    .into_response()
+}
+
+async fn emby_ordered_views(state: &AppState, user: &UserRecord) -> Vec<String> {
+    let (Some(libraries), Some(access)) = (state.libraries.as_ref(), state.access.as_ref()) else {
+        return Vec::new();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let Ok(accessible_library_ids) = access.accessible_library_ids(principal).await else {
+        return Vec::new();
+    };
+    libraries
+        .saved_library_order_for_user(&user.id.to_string(), &accessible_library_ids)
+        .await
+        .unwrap_or_default()
 }
 
 #[derive(Deserialize)]
@@ -1724,8 +1749,9 @@ async fn emby_authenticate(
             )
             .await;
             let server_name = current_emby_server_name(&state).await;
+            let ordered_views = emby_ordered_views(&state, &result.user).await;
             Json(json!({
-                "User": emby_user_json(&result.user, &state.server_id, &server_name),
+                "User": emby_user_json(&result.user, &state.server_id, &server_name, &ordered_views),
                 "SessionInfo": emby_login_session_json(&result, &state.server_id),
                 "AccessToken": result.token,
                 "ServerId": state.server_id
@@ -2278,6 +2304,9 @@ async fn emby_library_virtual_folders(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let media_strategy = match read_media_strategy_settings(database).await {
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2287,11 +2316,18 @@ async fn emby_library_virtual_folders(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
-    match libraries.list_libraries().await {
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match libraries
+        .list_libraries_for_user(&user.id.to_string(), &accessible_library_ids)
+        .await
+    {
         Ok(views) => Json(
             views
                 .iter()
-                .filter(|view| view.library.is_enabled)
                 .map(|view| {
                     emby_virtual_folder_json(
                         view,
@@ -2531,20 +2567,17 @@ async fn emby_visible_library_items(
     let Some(libraries) = state.libraries.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
+    let accessible_library_ids = access
+        .accessible_library_ids(principal)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let views = libraries
-        .list_libraries()
+        .list_libraries_for_user(&principal.user_id.to_string(), &accessible_library_ids)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mut items = Vec::new();
     for view in views {
         let library_id = view.library.id.to_string();
-        let can_view = access
-            .can_view_library(principal, &library_id)
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if !view.library.is_enabled || !can_view {
-            continue;
-        }
         let child_count =
             emby_library_root_count(state, principal, &library_id, view.library.kind).await?;
         items.push(emby_library_view_json(
@@ -6635,7 +6668,12 @@ fn emby_stream_type(stream_type: &str) -> &'static str {
     }
 }
 
-fn emby_user_json(user: &UserRecord, server_id: &str, server_name: &str) -> Value {
+fn emby_user_json(
+    user: &UserRecord,
+    server_id: &str,
+    server_name: &str,
+    ordered_views: &[String],
+) -> Value {
     json!({
         "Id": user.id.to_string(),
         "ServerId": server_id,
@@ -6647,12 +6685,12 @@ fn emby_user_json(user: &UserRecord, server_id: &str, server_name: &str) -> Valu
         "EnableAutoLogin": false,
         "LastLoginDate": "1970-01-01T00:00:00.0000000Z",
         "LastActivityDate": "1970-01-01T00:00:00.0000000Z",
-        "Configuration": emby_user_configuration_json(),
+        "Configuration": emby_user_configuration_json(ordered_views),
         "Policy": emby_user_policy_json(user),
     })
 }
 
-fn emby_user_configuration_json() -> Value {
+fn emby_user_configuration_json(ordered_views: &[String]) -> Value {
     json!({
         "AudioLanguagePreference": "",
         "PlayDefaultAudioTrack": true,
@@ -6662,7 +6700,7 @@ fn emby_user_configuration_json() -> Value {
         "SubtitleMode": "Default",
         "DisplayCollectionsView": true,
         "EnableLocalPassword": false,
-        "OrderedViews": [],
+        "OrderedViews": ordered_views,
         "LatestItemsExcludes": [],
         "MyMediaExcludes": [],
         "HidePlayedInLatest": false,
@@ -7425,6 +7463,89 @@ async fn auth_update_settings(
     }
 }
 
+async fn auth_library_order(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match libraries
+        .saved_library_order_for_user(&user.id.to_string(), &accessible_library_ids)
+        .await
+    {
+        Ok(library_order) => Json(json!({ "libraryOrder": library_order })).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryOrderPatch {
+    library_order: Vec<String>,
+}
+
+async fn auth_update_library_order(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<LibraryOrderPatch>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    if request.library_order.len() > 1024 {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库排序数量超出上限",
+        )
+        .into_response();
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match libraries
+        .set_library_order(
+            &user.id.to_string(),
+            &request.library_order,
+            &accessible_library_ids,
+        )
+        .await
+    {
+        Ok(library_order) => Json(json!({ "libraryOrder": library_order })).into_response(),
+        Err(LibraryServiceError::InvalidLibraryOrder(message)) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn auth_avatar(headers: HeaderMap, State(state): State<AppState>) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
@@ -7957,6 +8078,16 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let ordered_views = match libraries
+        .list_libraries_for_user(&user_id, &accessible_library_ids)
+        .await
+    {
+        Ok(views) => views,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
     let latest_groups = snapshot
         .latest_groups
@@ -7995,7 +8126,7 @@ async fn lux_home(headers: HeaderMap, State(state): State<AppState>) -> Response
             .push(value);
     }
     let mut visible = Vec::new();
-    for view in &snapshot.views {
+    for view in &ordered_views {
         let library_id = view.library.id.to_string();
         if !accessible_library_ids.contains(&library_id) {
             continue;
@@ -8134,25 +8265,23 @@ async fn lux_list_libraries(headers: HeaderMap, State(state): State<AppState>) -
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    match libraries.list_libraries().await {
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match libraries
+        .list_libraries_for_user(&user.id.to_string(), &accessible_library_ids)
+        .await
+    {
         Ok(views) => {
             let mut visible = Vec::new();
             for view in views {
-                let can_view = match access
-                    .can_view_library(principal, &view.library.id.to_string())
-                    .await
-                {
-                    Ok(can_view) => can_view,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
-                if view.library.is_enabled && can_view {
-                    visible.push(json!({
-                        "id": view.library.id.to_string(),
-                        "name": view.library.name,
-                        "kind": view.library.kind.as_str(),
-                        "coverImageUrl": library_cover_url(&view.library),
-                    }));
-                }
+                visible.push(json!({
+                    "id": view.library.id.to_string(),
+                    "name": view.library.name,
+                    "kind": view.library.kind.as_str(),
+                    "coverImageUrl": library_cover_url(&view.library),
+                }));
             }
             Json(json!({
                 "libraries": visible,
@@ -17600,7 +17729,8 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
         | LibraryServiceError::InvalidRootId(_)
         | LibraryServiceError::InvalidKind(_)
         | LibraryServiceError::InvalidScraperId
-        | LibraryServiceError::InvalidChapterSourceId => (
+        | LibraryServiceError::InvalidChapterSourceId
+        | LibraryServiceError::InvalidLibraryOrder(_) => (
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "媒体库请求无效",

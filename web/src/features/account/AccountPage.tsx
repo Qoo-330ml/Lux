@@ -12,7 +12,7 @@ import {
   Sun,
   UserRound,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -34,8 +34,10 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const queryClient = useQueryClient();
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const playbackSettings = useQuery({ queryKey: queryKeys.userSettings, queryFn: () => api.userSettings() });
+  const libraryOrder = useQuery({ queryKey: queryKeys.libraryOrder, queryFn: () => api.libraryOrder() });
   const { avatarUrl, setAvatarUrl } = useAvatar();
   const [settings, setSettings] = useState<AccountSettings>(() => readAccountSettings(user.id));
+  const [pendingLibraryOrder, setPendingLibraryOrder] = useState<string[] | null>(null);
   const [draggedLibraryId, setDraggedLibraryId] = useState<string | null>(null);
   const [avatarImageFailed, setAvatarImageFailed] = useState(false);
   const [pendingAvatarUrl, setPendingAvatarUrl] = useState<string | null>(null);
@@ -43,6 +45,8 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const [avatarReading, setAvatarReading] = useState(false);
   const [avatarNotice, setAvatarNotice] = useState<string | null>(null);
   const [accountNotice, setAccountNotice] = useState<string | null>(null);
+  const [libraryOrderNotice, setLibraryOrderNotice] = useState<string | null>(null);
+  const legacyLibraryOrderMigrationAttempted = useRef(false);
   const [playedPercent, setPlayedPercent] = useState("95");
   const [playedPercentNotice, setPlayedPercentNotice] = useState<string | null>(null);
   const [profileName, setProfileName] = useState(user.displayName || user.usernameNormalized);
@@ -52,24 +56,26 @@ export function AccountPage({ user }: { user: LuxUser }) {
   }, [playbackSettings.data]);
 
   const orderedLibraries = useMemo(
-    () => orderLibraries(libraries.data?.libraries ?? [], settings.libraryOrder),
-    [libraries.data?.libraries, settings.libraryOrder],
+    () => pendingLibraryOrder
+      ? orderLibraries(libraries.data?.libraries ?? [], pendingLibraryOrder)
+      : libraries.data?.libraries ?? [],
+    [libraries.data?.libraries, pendingLibraryOrder],
   );
+
+  useEffect(() => {
+    if (!pendingLibraryOrder || !libraries.data?.libraries) return;
+    const serverOrder = libraries.data.libraries.map((library) => library.id);
+    if (serverOrder.length === pendingLibraryOrder.length
+      && serverOrder.every((id, index) => id === pendingLibraryOrder[index])) {
+      setPendingLibraryOrder(null);
+    }
+  }, [libraries.data?.libraries, pendingLibraryOrder]);
 
   useEffect(() => {
     applyAccountTheme(settings.theme);
     applyAccountAccent(settings.accentColor);
     saveAccountSettings(settings, user.id);
   }, [settings, user.id]);
-
-  useEffect(() => {
-    if (!libraries.data?.libraries?.length) return;
-    const ids = orderedLibraries.map((library) => library.id);
-    if (ids.every((id, index) => settings.libraryOrder[index] === id) && ids.length === settings.libraryOrder.length) {
-      return;
-    }
-    setSettings((current) => ({ ...current, libraryOrder: ids }));
-  }, [libraries.data?.libraries, orderedLibraries, settings.libraryOrder]);
 
   const logout = useMutation({
     mutationFn: () => api.logout(),
@@ -103,14 +109,49 @@ export function AccountPage({ user }: { user: LuxUser }) {
     onError: (error) => setPlayedPercentNotice(error instanceof Error ? error.message : "播放阈值保存失败，请重试。"),
   });
 
+  const saveLibraryOrder = useMutation({
+    mutationFn: (libraryOrder: string[]) => api.updateLibraryOrder({ libraryOrder }),
+    onSuccess: (data) => {
+      setPendingLibraryOrder(data.libraryOrder);
+      updateSettings({ libraryOrder: data.libraryOrder });
+      setLibraryOrderNotice("媒体库顺序已保存");
+      queryClient.setQueryData(queryKeys.libraryOrder, data);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.home });
+    },
+    onError: (error) => {
+      setPendingLibraryOrder(null);
+      setLibraryOrderNotice(error instanceof Error ? `媒体库顺序保存失败：${error.message}` : "媒体库顺序保存失败，请重试。");
+    },
+  });
+
+  useEffect(() => {
+    if (
+      legacyLibraryOrderMigrationAttempted.current
+      || !libraryOrder.isSuccess
+      || (libraryOrder.data?.libraryOrder.length ?? 0)
+      || !settings.libraryOrder.length
+    ) return;
+    legacyLibraryOrderMigrationAttempted.current = true;
+    setPendingLibraryOrder(settings.libraryOrder);
+    saveLibraryOrder.mutate(settings.libraryOrder);
+  }, [libraryOrder.data?.libraryOrder, libraryOrder.isSuccess, saveLibraryOrder, settings.libraryOrder]);
+
   const updateSettings = (patch: Partial<AccountSettings>) => {
     setSettings((current) => ({ ...current, ...patch }));
+  };
+
+  const persistLibraryOrder = (libraryOrder: string[]) => {
+    setLibraryOrderNotice(null);
+    setPendingLibraryOrder(libraryOrder);
+    updateSettings({ libraryOrder });
+    saveLibraryOrder.mutate(libraryOrder);
   };
 
   const reorderLibrary = (libraryId: string, direction: "up" | "down") => {
     const index = orderedLibraries.findIndex((library) => library.id === libraryId);
     if (index === -1) return;
-    updateSettings({ libraryOrder: moveLibrary(orderedLibraries.map((library) => library.id), index, direction) });
+    persistLibraryOrder(moveLibrary(orderedLibraries.map((library) => library.id), index, direction));
   };
 
   const dropLibrary = (targetId: string) => {
@@ -121,7 +162,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
     const next = [...orderedLibraries.map((library) => library.id)];
     const [moved] = next.splice(fromIndex, 1);
     next.splice(targetIndex, 0, moved);
-    updateSettings({ libraryOrder: next });
+    persistLibraryOrder(next);
     setDraggedLibraryId(null);
   };
 
@@ -271,6 +312,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
               ) : (
                 <div className="lux-account-empty">还没有可排序的媒体库。</div>
               )}
+              {libraryOrderNotice ? <p className="lux-account-notice" role="status">{libraryOrderNotice}</p> : null}
             </div>
             <div className="lux-setting-divider" />
             <ToggleRow title="显示媒体库区块" description="在首页展示你有权限访问的媒体库。" checked={settings.showMediaLibraries} onChange={(checked) => updateSettings({ showMediaLibraries: checked })} />

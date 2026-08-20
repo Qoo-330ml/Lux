@@ -6,7 +6,6 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HomePage } from "../src/features/home/HomePage";
-import { accountSettingsStorageKey } from "../src/features/account/account-settings";
 import { api } from "../src/lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 
@@ -86,11 +85,10 @@ describe("HomePage shelves", () => {
   });
 
   it("renders homepage library shelves in the current account's saved order", async () => {
-    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({ libraryOrder: ["library-2", "library-1"] }));
     vi.spyOn(api, "home").mockResolvedValue({
       libraries: [
-        { id: "library-1", name: "电影库", kind: "MOVIE", latest: [{ id: "movie-latest", title: "电影最新", itemType: "MOVIE" }] },
         { id: "library-2", name: "剧集库", kind: "SERIES", latest: [{ id: "series-latest", title: "剧集最新", itemType: "SERIES" }] },
+        { id: "library-1", name: "电影库", kind: "MOVIE", latest: [{ id: "movie-latest", title: "电影最新", itemType: "MOVIE" }] },
       ],
       recommended: [],
       continueWatching: [],
