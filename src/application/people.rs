@@ -24,7 +24,9 @@ use crate::application::metadata_paths::{
     people_directory, people_index_directory, people_index_path, people_index_path_for_provider,
     readable_component,
 };
-use crate::storage::{Database, NewPersonCredit, PersonListOptions, StoredPersonCredit};
+use crate::storage::{
+    Database, NewPersonCredit, PersonListOptions, StoredPersonCredit, StoredPersonIndexRebuildJob,
+};
 
 const LEGACY_PEOPLE_DIR: &str = "people";
 const LEGACY_ITEMS_DIR: &str = "items";
@@ -41,6 +43,7 @@ const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
 const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 const PERSON_INDEX_REBUILD_BATCH_SIZE: i64 = 100;
+const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -729,41 +732,118 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
-        let library_ids = database
-            .list_enabled_library_ids()
+        let jobs = database
+            .sync_person_index_rebuild_jobs(PERSON_INDEX_REBUILD_SCHEMA_VERSION)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
         let mut rebuilt_items = 0;
-        for library_id in library_ids {
-            let mut after_id = None;
-            loop {
-                let item_ids = database
-                    .list_person_index_item_ids(
-                        &library_id,
-                        after_id.as_deref(),
-                        PERSON_INDEX_REBUILD_BATCH_SIZE,
-                    )
-                    .await
-                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
-                if item_ids.is_empty() {
-                    break;
+        for job in jobs {
+            if matches!(job.status.as_str(), "COMPLETED" | "CANCELLED") || job.cancel_requested {
+                continue;
+            }
+            if !database
+                .claim_person_index_rebuild_job(&job.library_id)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+            {
+                continue;
+            }
+            match self.run_person_index_rebuild_job(database, &job).await {
+                Ok(processed) => {
+                    database
+                        .finish_person_index_rebuild_job(&job.library_id, "COMPLETED", None)
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                    rebuilt_items += processed;
                 }
-                for item_id in &item_ids {
-                    match self.rebuild_item_person_credit_index(item_id).await {
-                        Ok(()) => rebuilt_items += 1,
-                        Err(PeopleError::Serialization(message)) => {
-                            tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                after_id = item_ids.last().cloned();
-                if item_ids.len() < PERSON_INDEX_REBUILD_BATCH_SIZE as usize {
-                    break;
+                Err(error) => {
+                    let detail = error.to_string();
+                    let _ = database
+                        .finish_person_index_rebuild_job(
+                            &job.library_id,
+                            "FAILED",
+                            Some(detail.as_str()),
+                        )
+                        .await;
+                    return Err(error);
                 }
             }
         }
         Ok(rebuilt_items)
+    }
+
+    async fn run_person_index_rebuild_job(
+        &self,
+        database: &Database,
+        job: &StoredPersonIndexRebuildJob,
+    ) -> Result<usize, PeopleError> {
+        let total_count = database
+            .count_person_index_items(&job.library_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let total_count = (job.total_count > 0)
+            .then_some(job.total_count)
+            .unwrap_or(total_count);
+        let mut after_id = job.cursor_id.clone();
+        let mut processed_count = job.processed_count;
+        loop {
+            if database
+                .person_index_rebuild_job_cancel_requested(&job.library_id)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+            {
+                break;
+            }
+            let item_ids = database
+                .list_person_index_item_ids(
+                    &job.library_id,
+                    after_id.as_deref(),
+                    PERSON_INDEX_REBUILD_BATCH_SIZE,
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            if item_ids.is_empty() {
+                break;
+            }
+            for item_id in &item_ids {
+                match self.rebuild_item_person_credit_index(item_id).await {
+                    Ok(()) => processed_count += 1,
+                    Err(PeopleError::Serialization(message)) => {
+                        tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
+                        processed_count += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+                after_id = Some(item_id.clone());
+            }
+            if let Some(cursor_id) = after_id.as_deref() {
+                database
+                    .update_person_index_rebuild_progress(
+                        &job.library_id,
+                        cursor_id,
+                        processed_count,
+                        total_count,
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            }
+            if item_ids.len() < PERSON_INDEX_REBUILD_BATCH_SIZE as usize {
+                break;
+            }
+        }
+        Ok(processed_count.saturating_sub(job.processed_count) as usize)
+    }
+
+    pub async fn cancel_person_index_rebuild(&self, library_id: &str) -> Result<bool, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .request_person_index_rebuild_job_cancel(library_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
     }
 
     async fn rebuild_item_person_credit_index(&self, item_id: &str) -> Result<(), PeopleError> {

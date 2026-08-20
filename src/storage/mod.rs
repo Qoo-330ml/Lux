@@ -730,6 +730,208 @@ impl Database {
             })
     }
 
+    pub(crate) async fn sync_person_index_rebuild_jobs(
+        &self,
+        schema_version: i64,
+    ) -> Result<Vec<StoredPersonIndexRebuildJob>, StorageError> {
+        for library_id in self.list_enabled_library_ids().await? {
+            self.query(
+                "INSERT INTO person_index_rebuild_jobs (
+                    library_id, schema_version
+                 ) VALUES (?, ?)
+                 ON CONFLICT(library_id) DO UPDATE SET
+                    status = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 'QUEUED'
+                        WHEN person_index_rebuild_jobs.cancel_requested = 1
+                            THEN 'CANCELLED'
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            THEN 'QUEUED'
+                        ELSE person_index_rebuild_jobs.status
+                    END,
+                    cursor_id = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN NULL
+                        ELSE person_index_rebuild_jobs.cursor_id
+                    END,
+                    processed_count = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.processed_count
+                    END,
+                    total_count = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.total_count
+                    END,
+                    cancel_requested = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.cancel_requested
+                    END,
+                    schema_version = excluded.schema_version,
+                    updated_at = unixepoch()",
+            )
+            .bind(library_id)
+            .bind(schema_version)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        self.list_person_index_rebuild_jobs().await
+    }
+
+    pub(crate) async fn list_person_index_rebuild_jobs(
+        &self,
+    ) -> Result<Vec<StoredPersonIndexRebuildJob>, StorageError> {
+        self.query(
+            "SELECT library_id, status, cursor_id, processed_count, total_count,
+                    cancel_requested
+             FROM person_index_rebuild_jobs
+             ORDER BY library_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(stored_person_index_rebuild_job)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn count_person_index_items(
+        &self,
+        library_id: &str,
+    ) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
+                     updated_at = unixepoch()
+                 WHERE library_id = ? AND status = 'QUEUED' AND cancel_requested = 0",
+            )
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn person_index_rebuild_job_cancel_requested(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT cancel_requested FROM person_index_rebuild_jobs WHERE library_id = ?",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn request_person_index_rebuild_job_cancel(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET cancel_requested = 1, updated_at = unixepoch()
+                 WHERE library_id = ? AND status IN ('QUEUED', 'RUNNING')",
+            )
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn update_person_index_rebuild_progress(
+        &self,
+        library_id: &str,
+        cursor_id: &str,
+        processed_count: i64,
+        total_count: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE person_index_rebuild_jobs
+             SET cursor_id = ?, processed_count = ?, total_count = ?, updated_at = unixepoch()
+             WHERE library_id = ? AND status = 'RUNNING'",
+        )
+        .bind(cursor_id)
+        .bind(processed_count)
+        .bind(total_count)
+        .bind(library_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE person_index_rebuild_jobs
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE library_id = ? AND status = 'RUNNING'",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(library_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn create_notification_destination(
         &self,
         destination: NewNotificationDestination<'_>,
@@ -12977,6 +13179,16 @@ pub(crate) struct StoredMetadataReidentifyJob {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredPersonIndexRebuildJob {
+    pub(crate) library_id: String,
+    pub(crate) status: String,
+    pub(crate) cursor_id: Option<String>,
+    pub(crate) processed_count: i64,
+    pub(crate) total_count: i64,
+    pub(crate) cancel_requested: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredMetadataReidentifyItem {
     pub(crate) job_id: String,
     pub(crate) item_id: String,
@@ -13012,6 +13224,17 @@ fn stored_metadata_reidentify_item(row: sqlx::any::AnyRow) -> StoredMetadataReid
         candidate_count: row.get("candidate_count"),
         error: row.get("error"),
         updated_at: row.get("updated_at"),
+    }
+}
+
+fn stored_person_index_rebuild_job(row: sqlx::any::AnyRow) -> StoredPersonIndexRebuildJob {
+    StoredPersonIndexRebuildJob {
+        library_id: row.get("library_id"),
+        status: row.get("status"),
+        cursor_id: row.get("cursor_id"),
+        processed_count: row.get("processed_count"),
+        total_count: row.get("total_count"),
+        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
     }
 }
 
@@ -14256,6 +14479,83 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"演员甲"));
         assert!(names.contains(&"演员乙"));
+    }
+
+    #[tokio::test]
+    async fn person_index_rebuild_state_migration_creates_the_job_table() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'person_index_rebuild_jobs'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("person index rebuild jobs table");
+        assert_eq!(table_count, 1);
+    }
+
+    #[tokio::test]
+    async fn person_index_rebuild_job_state_recovers_and_honors_cancel() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+
+        let jobs = database
+            .sync_person_index_rebuild_jobs(1)
+            .await
+            .expect("sync jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "QUEUED");
+        assert!(
+            database
+                .claim_person_index_rebuild_job(&library_id)
+                .await
+                .expect("claim job")
+        );
+        database
+            .update_person_index_rebuild_progress(&library_id, "item-1", 1, 2)
+            .await
+            .expect("progress");
+        assert!(
+            database
+                .request_person_index_rebuild_job_cancel(&library_id)
+                .await
+                .expect("request cancel")
+        );
+        assert!(
+            database
+                .person_index_rebuild_job_cancel_requested(&library_id)
+                .await
+                .expect("cancel requested")
+        );
+        database
+            .finish_person_index_rebuild_job(&library_id, "COMPLETED", None)
+            .await
+            .expect("finish job");
+        let finished = database
+            .list_person_index_rebuild_jobs()
+            .await
+            .expect("list jobs")
+            .pop()
+            .expect("job");
+        assert_eq!(finished.status, "CANCELLED");
+        assert_eq!(finished.cursor_id.as_deref(), Some("item-1"));
+        assert_eq!(finished.processed_count, 1);
+        assert_eq!(finished.total_count, 2);
     }
 
     #[tokio::test]
