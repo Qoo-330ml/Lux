@@ -1859,6 +1859,7 @@ services:
 | LUX-151 | src/application/ip_location.rs、src/api/mod.rs、tests/、web/src/features/admin/、web/src/lib/api/、docs/ |
 | LUX-153 | src/application/admin_events.rs、src/api/mod.rs、tests/admin_events.rs、web/src/features/admin/、web/tests/、docs/ |
 | LUX-154 | src/application/scanner.rs、src/storage/mod.rs、migrations/、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
+| LUX-187 | src/application/admin_events.rs、src/application/scanner.rs、src/storage/mod.rs、src/api/mod.rs、migrations/、tests/、web/src/components/layout/、web/src/features/activity/、web/src/features/admin/、web/src/lib/api/、web/src/react.css、docs/ |
 | LUX-156 | src/observability/、src/main.rs、src/api/mod.rs、Cargo.toml、Cargo.lock、tests/observability.rs、tests/log_export.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 | LUX-158 | src/application/strm_target.rs、src/application/、tests/strm_target.rs、docs/ |
 | LUX-160 | src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、tests/、docs/ |
@@ -3435,6 +3436,42 @@ ffprobe、本地 NFO/图片、缩略图、自动封面和在线元数据调度�
 实施记录（2026-08-07）：`./scripts/check-all.sh` 全部通过；原生验证架构为 `arm64`。
 
 依赖：LUX-041、LUX-043、LUX-045。
+
+#### LUX-187：全局扫描活动与首页即时刷新
+
+管理员 Web 页面右上角显示当前活动的扫描任务，摘要包括媒体库名称、扫描阶段、已处理/总数
+和当前正在处理的相对条目显示名。摘要不得返回媒体库根路径、完整本地路径、`.strm` 原始
+目标、token、查询参数或其他凭据。活动入口可以进入“任务与日志”并取消活动任务。
+
+扫描任务持久化当前安全显示名和阶段；发现目录、索引文件、收尾、完成、失败和取消会通过
+管理员 SSE 的 `jobs` 作用域刷新任务摘要。新增同源 `GET /api/v1/events`，只允许已登录的
+Lux Web 用户，发送不携带业务数据的 `ready` 与 `invalidate` 事件。扫描索引提交后发布
+`home` 作用域，普通用户 Web 客户端收到后立即失效首页、媒体库列表和当前媒体库分页缓存；
+断线时继续保留低频轮询兜底。该端点不向 Emby 兼容 API 或未认证请求开放。
+
+验收：
+
+- [ ] 任意普通 Lux Web 页面在管理员会话下显示全局活动扫描入口和实时进度。
+- [ ] 当前条目摘要经过 basename/相对显示名清理，不包含完整路径、`.strm` URL、token 或 query string。
+- [ ] 扫描写入后普通用户首页和媒体库列表立即刷新，事件不携带业务数据。
+- [ ] 管理员 SSE、普通用户事件流分别完成鉴权、ready、刷新和断线退化测试。
+- [ ] Rust/Web 测试、格式化、Clippy 和 Web 构建通过，并记录 ARM 本机 `uname -m`。
+
+验证：
+
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-153、LUX-154、LUX-110、LUX-114。
+
+明确不做：
+
+- 不向 Emby 兼容 API 提供 Lux 活动浮层或普通用户 SSE。
+- 不在用户请求路径中扫描文件、解析 NFO、调用 ffprobe 或访问 TMDb。
+- 不把完整本地路径或 `.strm` 原始目标写入 API、日志或浏览器存储。
 
 明确不做：
 

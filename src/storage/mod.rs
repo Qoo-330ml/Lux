@@ -3492,7 +3492,8 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-             SET status = 'COMPLETED', finished_at = unixepoch(), updated_at = unixepoch()
+             SET status = 'COMPLETED', current_item = NULL, scan_phase = 'IDLE',
+                 finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')
                AND NOT EXISTS (
                    SELECT 1 FROM scan_job_paths
@@ -4839,7 +4840,8 @@ impl Database {
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
                     finished_at,
-                    discovery_completed, auto_metadata_match
+                    discovery_completed, auto_metadata_match,
+                    current_item, scan_phase
              FROM scan_jobs WHERE id = ?",
         )
         .bind(id)
@@ -4863,7 +4865,8 @@ impl Database {
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
                         finished_at,
-                        discovery_completed, auto_metadata_match
+                        discovery_completed, auto_metadata_match,
+                        current_item, scan_phase
                  FROM scan_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -4877,7 +4880,8 @@ impl Database {
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
                         finished_at,
-                        discovery_completed, auto_metadata_match
+                        discovery_completed, auto_metadata_match,
+                        current_item, scan_phase
                  FROM scan_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -4937,7 +4941,8 @@ impl Database {
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
                     finished_at,
-                    discovery_completed, auto_metadata_match
+                    discovery_completed, auto_metadata_match,
+                    current_item, scan_phase
              FROM scan_jobs
              WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')
              ORDER BY created_at DESC LIMIT 1",
@@ -4961,7 +4966,8 @@ impl Database {
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
                     finished_at,
-                    discovery_completed, auto_metadata_match
+                    discovery_completed, auto_metadata_match,
+                    current_item, scan_phase
              FROM scan_jobs
              WHERE library_id = ? AND job_type = ? AND status IN ('PENDING', 'RUNNING')
              ORDER BY created_at DESC LIMIT 1",
@@ -5007,6 +5013,29 @@ impl Database {
         )
         .bind(cursor)
         .bind(processed_count)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_scan_job_activity(
+        &self,
+        id: &str,
+        current_item: Option<&str>,
+        scan_phase: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scan_jobs
+             SET current_item = ?, scan_phase = ?, updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(current_item)
+        .bind(scan_phase)
         .bind(id)
         .execute(&self.pool)
         .await
@@ -5189,7 +5218,8 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
-             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             SET status = ?, error = ?, current_item = NULL, scan_phase = 'IDLE',
+                 finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
         .bind(status)
@@ -5208,6 +5238,7 @@ impl Database {
         self.query(
             "UPDATE scan_jobs
              SET status = 'PENDING', cancel_requested = 0, error = NULL,
+                 current_item = NULL, scan_phase = 'IDLE',
                  started_at = NULL, finished_at = NULL, updated_at = unixepoch()
              WHERE id = ? AND status IN ('FAILED', 'CANCELLED')",
         )
@@ -12518,6 +12549,8 @@ pub(crate) struct StoredScanJob {
     pub(crate) finished_at: Option<i64>,
     pub(crate) discovery_completed: bool,
     pub(crate) auto_metadata_match: bool,
+    pub(crate) current_item: Option<String>,
+    pub(crate) scan_phase: String,
 }
 
 #[derive(Debug)]
@@ -12602,6 +12635,8 @@ fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
         finished_at: row.get("finished_at"),
         discovery_completed: row.get::<i64, _>("discovery_completed") != 0,
         auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
+        current_item: row.get("current_item"),
+        scan_phase: row.get("scan_phase"),
     }
 }
 

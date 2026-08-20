@@ -43,7 +43,7 @@ use crate::{
     application::setup::{SetupError, SetupService},
     application::{
         access::{AccessPrincipal, MediaAccessService},
-        admin_events::{AdminEventHub, AdminEventScope},
+        admin_events::{AdminEventHub, AdminEventScope, UserEventHub},
         candidates::{
             MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
@@ -160,6 +160,7 @@ pub struct AppState {
     user_avatars: Option<UserAvatarService>,
     ip_location: Option<IpLocationService>,
     admin_events: AdminEventHub,
+    user_events: UserEventHub,
     resources: ResourceMetrics,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
@@ -196,6 +197,7 @@ impl AppState {
             database.backend(),
         ));
         let admin_events = AdminEventHub::new();
+        let user_events = UserEventHub::new();
         let access = MediaAccessService::new(database.clone());
         let libraries = LibraryService::new(database.clone());
         let catalog = CatalogService::new(database.clone(), access.clone());
@@ -270,6 +272,7 @@ impl AppState {
         let scan_jobs = {
             let service = ScanJobService::new(database.clone())
                 .with_admin_events(admin_events.clone())
+                .with_user_events(user_events.clone())
                 .with_resource_metrics(resources.clone())
                 .with_home(home.clone());
             let service = match library_covers.clone() {
@@ -357,6 +360,7 @@ impl AppState {
             user_avatars,
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
+            user_events,
             resources,
             remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
@@ -880,6 +884,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
         .route("/api/v1/admin/events", get(admin_events))
+        .route("/api/v1/events", get(user_events))
         .route("/api/v1/admin/audit", get(admin_list_audit))
         .route("/api/v1/admin/logs/export", get(admin_export_logs))
         .route("/api/v1/admin/logs", get(admin_list_logs))
@@ -13521,6 +13526,8 @@ fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) -> Value {
         "cancelRequested": job.cancel_requested,
         "error": job.error,
         "finishedAt": job.finished_at,
+        "currentItem": job.current_item,
+        "scanPhase": job.scan_phase,
     })
 }
 
@@ -13577,6 +13584,8 @@ fn scan_job_json(job: &crate::application::scanner::ScanJob) -> Value {
         "cancelRequested": job.cancel_requested,
         "error": job.error,
         "finishedAt": job.finished_at,
+        "currentItem": job.current_item,
+        "scanPhase": job.scan_phase,
     })
 }
 
@@ -14555,6 +14564,10 @@ async fn admin_events(headers: HeaderMap, State(state): State<AppState>) -> Resp
         }
     });
 
+    event_stream_response(reader)
+}
+
+fn event_stream_response(reader: tokio::io::DuplexStream) -> Response {
     let mut response = Response::new(Body::from_stream(tokio_util::io::ReaderStream::new(reader)));
     response.headers_mut().insert(
         "Content-Type",
@@ -14568,6 +14581,52 @@ async fn admin_events(headers: HeaderMap, State(state): State<AppState>) -> Resp
         .headers_mut()
         .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
     response
+}
+
+async fn user_events(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_web_user(&headers, &state).await {
+        return response;
+    }
+
+    let mut receiver = state.user_events.subscribe();
+    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+    tokio::spawn(async move {
+        if writer
+            .write_all(b"event: ready\ndata: {\"version\":1}\n\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                event = receiver.recv() => {
+                    let scope = match event {
+                        Ok(scope) => scope,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => crate::application::admin_events::UserEventScope::Home,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    let frame = format!(
+                        "event: invalidate\ndata: {{\"scope\":\"{}\"}}\n\n",
+                        scope.as_str(),
+                    );
+                    if writer.write_all(frame.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if writer.write_all(b": keep-alive\n\n").await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    event_stream_response(reader)
 }
 
 async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {

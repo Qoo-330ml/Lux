@@ -69,6 +69,13 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     let first_batch = jobs.run_batch(&job.id, 1).await?;
     assert_eq!(first_batch.status, "RUNNING");
     assert_eq!(first_batch.processed, 1);
+    let activity: (Option<String>, String) =
+        sqlx::query_as("SELECT current_item, scan_phase FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(activity.0.as_deref(), Some("Alpha.Movie.2020.mkv"));
+    assert_eq!(activity.1, "INDEXING");
     let visible_items: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_items
          WHERE has_available_source = 1 AND removed_at IS NULL",
@@ -124,6 +131,12 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     assert_eq!(final_status.1, 3);
     assert_eq!(final_status.2, None);
     assert!(final_status.3.is_some());
+    let completed_activity: (Option<String>, String) =
+        sqlx::query_as("SELECT current_item, scan_phase FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(completed_activity, (None, "IDLE".to_owned()));
     assert!(
         !restarted_jobs
             .active_job_ids()

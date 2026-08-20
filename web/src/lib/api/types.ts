@@ -502,6 +502,8 @@ export type AdminJob = {
   error?: string | null;
   createdAt?: string | number;
   finishedAt?: string | number | null;
+  currentItem?: string | null;
+  scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "IDLE" | string;
 };
 
 export type AdminScheduledTask = {
