@@ -195,6 +195,9 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     sqlx::query("DELETE FROM person_credits")
         .execute(database.pool())
         .await?;
+    sqlx::query("DELETE FROM person_index_item_state")
+        .execute(database.pool())
+        .await?;
     let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
     assert!(people.rebuild_person_credit_index().await? > 0);
     assert_eq!(people.rebuild_person_credit_index().await?, 0);

@@ -1377,10 +1377,11 @@ impl Database {
         Ok(value.filter(|value| !value.trim().is_empty()))
     }
 
-    pub(crate) async fn replace_person_credits(
+    pub(crate) async fn replace_person_credits_with_fingerprint(
         &self,
         item_id: &str,
         credits: &[NewPersonCredit],
+        source_fingerprint: Option<&str>,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -1443,6 +1444,23 @@ impl Database {
                 source,
             })?;
         }
+        self.query(
+            "INSERT INTO person_index_item_state (
+                item_id, source_fingerprint, relation_schema_version, updated_at
+             ) VALUES (?, ?, 2, unixepoch())
+             ON CONFLICT(item_id) DO UPDATE SET
+                source_fingerprint = excluded.source_fingerprint,
+                relation_schema_version = excluded.relation_schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(item_id)
+        .bind(source_fingerprint)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         transaction
             .commit()
             .await
@@ -4652,6 +4670,34 @@ impl Database {
             source,
         })?;
         Ok(())
+    }
+
+    pub(crate) async fn person_index_item_state_is_current(
+        &self,
+        item_id: &str,
+        source_fingerprint: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let Some(row) = self
+            .query(
+                "SELECT source_fingerprint, relation_schema_version
+                 FROM person_index_item_state
+                 WHERE item_id = ?",
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(false);
+        };
+        Ok(row
+            .get::<Option<String>, _>("source_fingerprint")
+            .as_deref()
+            == source_fingerprint
+            && row.get::<i64, _>("relation_schema_version") == 2)
     }
 
     pub(crate) async fn active_library_metadata_reidentify_job_id(
@@ -14410,7 +14456,7 @@ mod tests {
         .await
         .expect("media item");
         database
-            .replace_person_credits(
+            .replace_person_credits_with_fingerprint(
                 "item-credits",
                 &[
                     NewPersonCredit {
@@ -14454,6 +14500,7 @@ mod tests {
                         taglines: Vec::new(),
                     },
                 ],
+                None,
             )
             .await
             .expect("person credits");
@@ -14479,6 +14526,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"演员甲"));
         assert!(names.contains(&"演员乙"));
+        database
+            .replace_person_credits_with_fingerprint("item-credits", &[], Some("fingerprint-a"))
+            .await
+            .expect("person credit fingerprint");
+        assert!(
+            database
+                .person_index_item_state_is_current("item-credits", Some("fingerprint-a"))
+                .await
+                .expect("current fingerprint")
+        );
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-credits", Some("fingerprint-b"))
+                .await
+                .expect("stale fingerprint")
+        );
     }
 
     #[tokio::test]
@@ -14496,6 +14559,24 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .expect("person index rebuild jobs table");
+        assert_eq!(table_count, 1);
+    }
+
+    #[tokio::test]
+    async fn person_index_item_state_migration_creates_the_fingerprint_table() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'person_index_item_state'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("person index item state table");
         assert_eq!(table_count, 1);
     }
 

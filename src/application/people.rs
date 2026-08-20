@@ -394,7 +394,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits(item_id, &credits)
+                .replace_person_credits_with_fingerprint(
+                    item_id,
+                    &credits,
+                    relation.source_fingerprint.as_deref(),
+                )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
         }
@@ -875,8 +879,18 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
+        let source_fingerprint = relation
+            .as_ref()
+            .and_then(|relation| relation.source_fingerprint.as_deref());
+        if database
+            .person_index_item_state_is_current(item_id, source_fingerprint)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?
+        {
+            return Ok(());
+        }
         database
-            .replace_person_credits(item_id, &credits)
+            .replace_person_credits_with_fingerprint(item_id, &credits, source_fingerprint)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))
     }
@@ -1037,7 +1051,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits(&item_id, &credits)
+                .replace_person_credits_with_fingerprint(
+                    &item_id,
+                    &credits,
+                    relation.source_fingerprint.as_deref(),
+                )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
             updated = true;
