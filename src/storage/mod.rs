@@ -13189,9 +13189,7 @@ pub(crate) struct StoredCanonicalPerson {
 }
 
 fn stored_canonical_person(row: sqlx::any::AnyRow) -> StoredCanonicalPerson {
-    StoredCanonicalPerson {
-        id: row.get("id"),
-    }
+    StoredCanonicalPerson { id: row.get("id") }
 }
 
 #[derive(Debug)]

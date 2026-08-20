@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use luxd::application::metadata_paths::{
-    canonical_person_directory, library_item_directory, lux_person_directory,
+    MetadataObjectKind, canonical_person_directory, library_item_directory, lux_person_directory,
     metadata_object_directory, metadata_root, people_directory, people_index_path,
-    people_index_path_for_provider, MetadataObjectKind,
+    people_index_path_for_provider,
 };
 
 #[test]
@@ -125,14 +125,16 @@ fn metadata_object_paths_reject_unsafe_identity_components() {
         metadata_object_directory(config, MetadataObjectKind::Tag, "tag", "local", "../tag")
             .is_err()
     );
-    assert!(metadata_object_directory(
-        config,
-        MetadataObjectKind::Tag,
-        "tag",
-        "local/provider",
-        "tag"
-    )
-    .is_err());
+    assert!(
+        metadata_object_directory(
+            config,
+            MetadataObjectKind::Tag,
+            "tag",
+            "local/provider",
+            "tag"
+        )
+        .is_err()
+    );
     assert!(
         metadata_object_directory(config, MetadataObjectKind::Tag, "", "local", "tag").is_err()
     );
