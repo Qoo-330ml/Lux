@@ -284,12 +284,12 @@ IP 归属地插件必须声明 `type: "ip_location"`、`category: "NETWORK"` 和
 
 ### `.strm` 目标解析调用约定
 
-`.strm` 解析插件必须声明 `type: "strm_resolver"`、`category: "MEDIA"` 和
-`capabilities: ["strm.resolve"]`。Lux 只把路径型或其他非 HTTP(S) 原始目标发送给该能力，
+`.strm` 协议解析插件必须声明 `type: "strm_resolver"`、`category: "MEDIA"` 和
+`capabilities: ["strm.resolve"]`。Lux 只把 SMB/FTP 原始目标发送给该能力，
 请求格式为：
 
 ```json
-{"target":"/library/movie.mp4"}
+{"target":"smb://nas/media/movie.mkv"}
 ```
 
 插件成功时返回 `{"status":"RESOLVED","url":"https://media.example.invalid/movie.mkv"}`；
