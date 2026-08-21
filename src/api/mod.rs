@@ -85,7 +85,7 @@ use crate::{
         },
         thumbnails::ThumbnailService,
         tmdb::{TmdbClient, TmdbError},
-        tmdb_plugin::{TmdbPluginClient, TmdbProvider},
+        tmdb_plugin::{ScraperProvider, TmdbPluginClient},
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
         webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
@@ -153,7 +153,7 @@ pub struct AppState {
     danmaku: Option<DanmakuService>,
     plugins: Option<PluginService>,
     scraper_resolver: Option<ScraperResolver>,
-    tmdb: Option<TmdbProvider>,
+    tmdb: Option<ScraperProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
@@ -220,7 +220,7 @@ impl AppState {
             config_dir.clone(),
             network_proxy_url.clone(),
         );
-        let tmdb = TmdbProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
+        let tmdb = ScraperProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
         let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
         let collections = Some(
             CollectionService::with_resolver(
@@ -369,7 +369,7 @@ impl AppState {
         let Some(database) = self.database.clone() else {
             return self;
         };
-        let tmdb = TmdbProvider::from(
+        let tmdb = ScraperProvider::from(
             tmdb.with_cache_dir(
                 self.config_dir
                     .clone()
@@ -16469,7 +16469,7 @@ async fn admin_search_item_candidates(
     };
     let tmdb = if let Some(resolver) = state.scraper_resolver.as_ref() {
         match resolver.for_item(&item_id).await {
-            Ok(Some(scraper)) => TmdbProvider::from_scraper(scraper),
+            Ok(Some(scraper)) => ScraperProvider::from_scraper(scraper),
             Ok(None) => fallback_tmdb,
             Err(error) => {
                 return api_error(

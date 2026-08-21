@@ -19,7 +19,7 @@ use crate::{
             ScraperSearchResponse, ScraperSearchResult,
         },
         tmdb::TmdbError,
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
     },
     storage::{
         Database, NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
@@ -106,7 +106,7 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        tmdb: &TmdbProvider,
+        tmdb: &ScraperProvider,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         self.search_and_store_with_mode(item_id, query, year, tmdb, CandidateSearchMode::Manual)
             .await
@@ -117,7 +117,7 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        tmdb: &TmdbProvider,
+        tmdb: &ScraperProvider,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         self.search_and_store_with_mode(item_id, query, year, tmdb, CandidateSearchMode::Automatic)
             .await
@@ -128,7 +128,7 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        tmdb: &TmdbProvider,
+        tmdb: &ScraperProvider,
         mode: CandidateSearchMode,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let current = self
@@ -481,7 +481,7 @@ impl MetadataCandidateService {
         query: &str,
         year: Option<i32>,
         current: &StoredMediaMetadata,
-        scraper: &TmdbProvider,
+        scraper: &ScraperProvider,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let item_type = match current.item_type.as_str() {
             "SEASON" => ScraperItemType::Season,
@@ -626,7 +626,7 @@ impl MetadataCandidateService {
     async fn parent_providers(
         &self,
         current: &StoredMediaMetadata,
-        scraper: &TmdbProvider,
+        scraper: &ScraperProvider,
         series_query: &str,
         series_year: Option<i32>,
     ) -> Result<Vec<ParentProvider>, MetadataCandidateError> {
@@ -791,7 +791,7 @@ struct ParentProvider {
 }
 
 async fn search_generic(
-    scraper: &TmdbProvider,
+    scraper: &ScraperProvider,
     item_type: crate::application::scraper::ScraperItemType,
     query: &str,
     year: Option<i32>,
@@ -1083,7 +1083,7 @@ fn generic_candidate_actors(
         .collect()
 }
 
-async fn enrich_actor_metadata(scraper: &TmdbProvider, actors: &mut [ActorCredit]) {
+async fn enrich_actor_metadata(scraper: &ScraperProvider, actors: &mut [ActorCredit]) {
     for actor in actors.iter_mut() {
         let provider_id = actor.id.trim();
         if provider_id.is_empty() {
@@ -1270,7 +1270,7 @@ impl MetadataSelectionService {
         &self,
         item_id: &str,
         candidate_id: &str,
-        scraper: &TmdbProvider,
+        scraper: &ScraperProvider,
     ) -> Result<usize, MetadataSelectionError> {
         let candidate = self
             .database

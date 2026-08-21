@@ -21,7 +21,7 @@ use crate::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperResolver,
         },
         tmdb::TmdbError,
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
     },
     network::client_builder_from_env_or,
     storage::{Database, ItemImageMetadata, StorageError},
@@ -616,7 +616,7 @@ impl ImageWriteService {
 #[derive(Clone)]
 pub struct ImageCandidateService {
     database: Database,
-    tmdb: TmdbProvider,
+    tmdb: ScraperProvider,
     resolver: Option<ScraperResolver>,
 }
 
@@ -635,7 +635,7 @@ pub struct ImageCandidate {
 impl ImageCandidateService {
     pub fn new<T>(database: Database, tmdb: T) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             database,
@@ -646,7 +646,7 @@ impl ImageCandidateService {
 
     pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             database,
@@ -748,7 +748,10 @@ impl ImageCandidateService {
             .collect())
     }
 
-    async fn provider_for_item(&self, item_id: &str) -> Result<TmdbProvider, ImageCandidateError> {
+    async fn provider_for_item(
+        &self,
+        item_id: &str,
+    ) -> Result<ScraperProvider, ImageCandidateError> {
         let Some(resolver) = &self.resolver else {
             return Ok(self.tmdb.clone());
         };
@@ -758,7 +761,7 @@ impl ImageCandidateService {
             .map_err(ImageCandidateError::Scraper)
             .map(|client| {
                 client
-                    .map(TmdbProvider::from_scraper)
+                    .map(ScraperProvider::from_scraper)
                     .unwrap_or_else(|| self.tmdb.clone())
             })
     }

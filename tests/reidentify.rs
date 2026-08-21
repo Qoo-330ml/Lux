@@ -18,7 +18,7 @@ use luxd::{
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
         webhooks::WebhookService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
@@ -124,7 +124,7 @@ async fn setup_movie_library_with_parent_folder()
     Ok((temp_dir, database, library.id.to_string(), folder_id))
 }
 
-fn unreachable_tmdb_provider() -> Result<TmdbProvider, Box<dyn std::error::Error>> {
+fn unreachable_tmdb_provider() -> Result<ScraperProvider, Box<dyn std::error::Error>> {
     let tmdb = TmdbClient::new(TmdbClientConfig {
         base_url: "http://127.0.0.1:1".to_owned(),
         read_access_token: Some("stub-token".to_owned()),
@@ -135,7 +135,7 @@ fn unreachable_tmdb_provider() -> Result<TmdbProvider, Box<dyn std::error::Error
         retry_jitter: Duration::ZERO,
         ..TmdbClientConfig::default()
     })?;
-    Ok(TmdbProvider::from(tmdb))
+    Ok(ScraperProvider::from(tmdb))
 }
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
@@ -605,7 +605,7 @@ async fn item_metadata_refresh_includes_series_children() -> Result<(), Box<dyn 
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
     let job = metadata
         .create_item_refresh_job(&series_id, MetadataRefreshMode::FillMissing)
         .await?;
@@ -713,7 +713,7 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
         .await?;
     let metadata = MetadataReidentifyService::with_selection(
         database.clone(),
-        TmdbProvider::from(tmdb),
+        ScraperProvider::from(tmdb),
         Some(selection),
     )
     .with_webhooks(webhooks);
@@ -805,7 +805,7 @@ async fn library_metadata_job_processes_items_concurrently()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
     let job = metadata.create_library_job(&library.id.to_string()).await?;
     metadata.run(&job.id).await;
 

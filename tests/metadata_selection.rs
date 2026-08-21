@@ -27,7 +27,7 @@ use luxd::{
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -847,7 +847,7 @@ async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std:
             &fixture.series_id,
             "Example Show",
             Some(2020),
-            &TmdbProvider::from(tmdb),
+            &ScraperProvider::from(tmdb),
         )
         .await?;
 
@@ -938,7 +938,7 @@ async fn automatic_candidate_search_expands_only_the_best_result()
             &fixture.item_id,
             "Example Movie",
             Some(2020),
-            &TmdbProvider::from(tmdb),
+            &ScraperProvider::from(tmdb),
         )
         .await?;
 
@@ -1031,7 +1031,7 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     );
     let metadata = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
-        TmdbProvider::from(tmdb),
+        ScraperProvider::from(tmdb),
         Some(selection),
     );
     let scan_jobs = luxd::application::scanner::ScanJobService::new(fixture.database.clone());

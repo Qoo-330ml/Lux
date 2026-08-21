@@ -16,7 +16,7 @@ use crate::{
             MetadataSelectionService,
         },
         scraper::{ScraperError, ScraperResolver},
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
         webhooks::{WebhookEventType, WebhookService},
     },
     observability::resources::ResourceMetrics,
@@ -50,7 +50,7 @@ pub struct MetadataReidentifyService {
     database: Database,
     candidates: MetadataCandidateService,
     selection: Option<MetadataSelectionService>,
-    tmdb: TmdbProvider,
+    tmdb: ScraperProvider,
     resolver: Option<ScraperResolver>,
     admin_events: AdminEventHub,
     resources: ResourceMetrics,
@@ -60,7 +60,7 @@ pub struct MetadataReidentifyService {
 impl MetadataReidentifyService {
     pub fn new<T>(database: Database, tmdb: T) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             candidates: MetadataCandidateService::new(database.clone()),
@@ -76,7 +76,7 @@ impl MetadataReidentifyService {
 
     pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self::with_resolver_and_selection(database, tmdb, resolver, None)
     }
@@ -87,7 +87,7 @@ impl MetadataReidentifyService {
         selection: Option<MetadataSelectionService>,
     ) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             candidates: MetadataCandidateService::new(database.clone()),
@@ -108,7 +108,7 @@ impl MetadataReidentifyService {
         selection: Option<MetadataSelectionService>,
     ) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             candidates: MetadataCandidateService::new(database.clone()),
@@ -580,7 +580,7 @@ impl MetadataReidentifyService {
         &self,
         item_id: &str,
         require_selected_scraper: bool,
-    ) -> Result<Option<TmdbProvider>, ScraperError> {
+    ) -> Result<Option<ScraperProvider>, ScraperError> {
         let Some(resolver) = &self.resolver else {
             return Ok(Some(self.tmdb.clone()));
         };
@@ -590,7 +590,7 @@ impl MetadataReidentifyService {
         }
         Ok(Some(
             client
-                .map(TmdbProvider::from_scraper)
+                .map(ScraperProvider::from_scraper)
                 .unwrap_or_else(|| self.tmdb.clone()),
         ))
     }
@@ -600,7 +600,7 @@ impl MetadataReidentifyService {
         item_id: &str,
         item: &crate::storage::StoredMediaMetadata,
         mode: MetadataRefreshMode,
-        provider: &TmdbProvider,
+        provider: &ScraperProvider,
     ) -> Result<i64, MetadataReidentifyError> {
         let page = self
             .candidates
