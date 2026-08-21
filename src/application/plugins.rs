@@ -392,7 +392,7 @@ impl PluginService {
                 .into_iter()
                 .find(|entry| entry.id == plugin_id)
                 .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
-            self.install_remote_package(&entry).await?;
+            self.install_remote_package(&entry, false).await?;
         }
         self.database.install_plugin(&plugin_id).await?;
         let current_catalog = self.catalog_snapshot().await;
@@ -459,8 +459,7 @@ impl PluginService {
         if !is_newer_version(&entry.version, &plugin.manifest.version) {
             return Err(PluginServiceError::NoUpdate);
         }
-        self.supervisor.stop(&plugin_id).await;
-        self.install_remote_package(&entry).await?;
+        self.install_remote_package(&entry, true).await?;
         let current_catalog = self.catalog_snapshot().await;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
@@ -1631,6 +1630,7 @@ impl PluginService {
     async fn install_remote_package(
         &self,
         entry: &PluginStoreEntry,
+        stop_running: bool,
     ) -> Result<(), PluginServiceError> {
         let Some(store) = self.store.as_ref() else {
             return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
@@ -1660,6 +1660,9 @@ impl PluginService {
         if validation_catalog.get(&entry.id).is_none() {
             let _ = fs::remove_dir_all(&validation_dir).await;
             return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
+        }
+        if stop_running {
+            self.supervisor.stop(&entry.id).await;
         }
         let destination = plugin_dir.join(format!("{}-{}.zip", entry.id, entry.version));
         let staged_destination =
