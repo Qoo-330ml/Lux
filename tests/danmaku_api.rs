@@ -6,23 +6,9 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-
-fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
-    headers
-        .get_all(SET_COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .find_map(|value| {
-            let (pair, _) = value.split_once(';')?;
-            let (cookie_name, cookie_value) = pair.split_once('=')?;
-            (cookie_name == name).then(|| cookie_value.to_owned())
-        })
-        .ok_or("missing cookie")
-        .expect("expected cookie")
-}
 
 #[tokio::test]
 async fn emby_can_read_xml_sidecar_without_danmaku_settings()
@@ -76,10 +62,6 @@ async fn emby_can_read_xml_sidecar_without_danmaku_settings()
         .send()
         .await?;
     assert_eq!(login.status(), reqwest::StatusCode::OK);
-    let session = cookie_value(login.headers(), "lux_session");
-    let csrf = cookie_value(login.headers(), "lux_csrf");
-    let cookies = format!("lux_session={session}; lux_csrf={csrf}");
-
     let emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
