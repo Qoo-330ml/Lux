@@ -210,9 +210,9 @@ pub fn merge_item_state(
         MigrationMergePolicy::Merge => {
             let incoming_is_newer = incoming.last_played_at > existing.last_played_at;
             Some(StoredItemState {
-                position_ticks: if incoming_is_newer
-                    || incoming.last_played_at == existing.last_played_at
-                {
+                position_ticks: if incoming_is_newer {
+                    incoming.position_ticks
+                } else if incoming.last_played_at == existing.last_played_at {
                     incoming.position_ticks.max(existing.position_ticks)
                 } else {
                     existing.position_ticks
@@ -424,6 +424,30 @@ mod tests {
                 play_count: 3,
                 last_played_at: Some(200),
             })
+        );
+    }
+
+    #[test]
+    fn merge_uses_the_newer_playback_position_even_when_it_is_lower() {
+        let existing = StoredItemState {
+            position_ticks: 900,
+            is_played: false,
+            is_favorite: false,
+            play_count: 1,
+            last_played_at: Some(100),
+        };
+        let incoming = StoredItemState {
+            position_ticks: 120,
+            is_played: false,
+            is_favorite: false,
+            play_count: 1,
+            last_played_at: Some(200),
+        };
+        assert_eq!(
+            merge_item_state(Some(existing), incoming, MigrationMergePolicy::Merge)
+                .expect("merge should return a state")
+                .position_ticks,
+            120
         );
     }
 }
