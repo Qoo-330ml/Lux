@@ -13,9 +13,9 @@ use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{ModifyKind, RenameMode},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
     task::{AbortHandle, JoinSet},
     time::sleep,
 };
@@ -31,6 +31,29 @@ use crate::{
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
+const WATCHER_INIT_CONCURRENCY: usize = 2;
+
+async fn initialize_watcher_on_dedicated_thread(
+    root: PathBuf,
+    permits: Arc<Semaphore>,
+) -> Result<(LibraryWatcher, std::thread::ThreadId), WatchError> {
+    let _permit = permits
+        .acquire_owned()
+        .await
+        .map_err(|_| WatchError::Notify("watcher initialization permits are closed".to_owned()))?;
+    let (sender, receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("lux-watcher-init".to_owned())
+        .spawn(move || {
+            let thread_id = std::thread::current().id();
+            let result = LibraryWatcher::new(root).map(|watcher| (watcher, thread_id));
+            let _ = sender.send(result);
+        })
+        .map_err(|error| WatchError::Notify(format!("could not start watcher thread: {error}")))?;
+    receiver.await.map_err(|_| {
+        WatchError::Notify("watcher initialization thread stopped unexpectedly".to_owned())
+    })?
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ChangeKind {
@@ -145,6 +168,7 @@ pub struct LibraryWatchService {
     database: Database,
     scan_jobs: ScanJobService,
     metadata: Option<MetadataReidentifyService>,
+    watcher_init_permits: Arc<Semaphore>,
 }
 
 impl LibraryWatchService {
@@ -166,6 +190,7 @@ impl LibraryWatchService {
             scan_jobs,
             database,
             metadata,
+            watcher_init_permits: Arc::new(Semaphore::new(WATCHER_INIT_CONCURRENCY)),
         }
     }
 
@@ -250,16 +275,15 @@ impl LibraryWatchService {
 
     async fn watch_root(&self, root: StoredLibraryRoot, running_jobs: Arc<Mutex<HashSet<String>>>) {
         let root_path = root.canonical_path.clone();
-        let mut watcher = match tokio::task::spawn_blocking(move || LibraryWatcher::new(root_path))
-            .await
+        let mut watcher = match initialize_watcher_on_dedicated_thread(
+            root_path.into(),
+            Arc::clone(&self.watcher_init_permits),
+        )
+        .await
         {
-            Ok(Ok(watcher)) => watcher,
-            Ok(Err(error)) => {
-                tracing::warn!(root_id = %root.id, %error, "library root realtime watch unavailable");
-                return;
-            }
+            Ok((watcher, _initialization_thread)) => watcher,
             Err(error) => {
-                tracing::warn!(root_id = %root.id, %error, "library root realtime watch worker stopped");
+                tracing::warn!(root_id = %root.id, %error, "library root realtime watch unavailable");
                 return;
             }
         };
@@ -474,6 +498,21 @@ mod tests {
 
     use super::*;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn watcher_initialization_runs_on_a_dedicated_thread() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let current_thread = std::thread::current().id();
+        let permits = Arc::new(Semaphore::new(1));
+
+        let (watcher, initialization_thread) =
+            initialize_watcher_on_dedicated_thread(root.path().to_owned(), permits)
+                .await
+                .expect("watcher should initialize");
+
+        assert_ne!(initialization_thread, current_thread);
+        assert!(watcher.watcher_alive());
+    }
 
     #[tokio::test]
     async fn disabled_root_aborts_its_watch_task() {
