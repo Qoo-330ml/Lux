@@ -23,6 +23,8 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type {
   AdminAuditEvent,
+  AdminChapterDetectionJob,
+  AdminDanmakuMatchJob,
   AdminJob,
   AdminMetadataReidentifyJob,
   AdminScheduledTask,
@@ -34,7 +36,9 @@ type OperationsTab = "registered" | "runs" | "logs";
 type OperationsJob =
   | (AdminJob & { kind: "scan"; jobType: string; libraryId?: string | null })
   | (AdminMetadataReidentifyJob & { kind: "metadata"; jobType: string; libraryId?: string | null })
-  | (AdminStrmProbeJob & { kind: "strm"; jobType: string; libraryId?: string | null });
+  | (AdminStrmProbeJob & { kind: "strm"; jobType: string; libraryId?: string | null })
+  | (AdminChapterDetectionJob & { kind: "chapter"; jobType: string; libraryId?: string | null })
+  | (AdminDanmakuMatchJob & { kind: "danmaku"; jobType: string; libraryId?: string | null });
 
 const JOB_STATUS_LABELS: Record<string, string> = {
   PENDING: "等待中",
@@ -59,6 +63,8 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   FULL_REFRESH: "元数据完整刷新",
   AUTO_LIBRARY_COVER: "自动生成媒体库封面",
   STRM_MEDIA_INFO: "STRM 媒体信息扫描",
+  CHAPTER_DETECTION: "片头片尾检测",
+  DANMAKU_MATCH: "弹幕匹配",
 };
 
 const AUDIT_EVENT_LABELS: Record<string, string> = {
@@ -89,6 +95,12 @@ const AUDIT_EVENT_LABELS: Record<string, string> = {
   STRM_PROBE_STARTED: "开始 STRM 媒体信息扫描",
   STRM_PROBE_CANCEL_REQUESTED: "取消 STRM 媒体信息扫描",
   STRM_PROBE_RETRIED: "重试 STRM 媒体信息扫描",
+  CHAPTER_DETECTION_STARTED: "开始片头片尾检测",
+  CHAPTER_DETECTION_CANCEL_REQUESTED: "取消片头片尾检测",
+  CHAPTER_DETECTION_RETRIED: "重试片头片尾检测",
+  DANMAKU_MATCH_STARTED: "开始弹幕匹配",
+  DANMAKU_MATCH_CANCEL_REQUESTED: "取消弹幕匹配",
+  DANMAKU_MATCH_RETRIED: "重试弹幕匹配",
 };
 
 const ERROR_LABELS: Record<string, string> = {
@@ -144,6 +156,16 @@ export function AdminOperationsPage() {
     queryFn: () => api.adminStrmProbeJobs(status || undefined),
     refetchInterval: 5_000,
   });
+  const chapterJobs = useQuery({
+    queryKey: queryKeys.adminChapterDetectionJobs(status),
+    queryFn: () => api.adminChapterDetectionJobs(status || undefined),
+    refetchInterval: 5_000,
+  });
+  const danmakuJobs = useQuery({
+    queryKey: queryKeys.adminDanmakuMatchJobs(status),
+    queryFn: () => api.adminDanmakuMatchJobs(status || undefined),
+    refetchInterval: 5_000,
+  });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
   const cancel = useMutation({
     mutationFn: (jobId: string) => api.cancelAdminJob(jobId),
@@ -169,6 +191,22 @@ export function AdminOperationsPage() {
     mutationFn: (jobId: string) => api.retryStrmProbeJob(jobId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "strm-probe-jobs"] }),
   });
+  const cancelChapter = useMutation({
+    mutationFn: (jobId: string) => api.cancelChapterDetection(jobId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "chapter-detection-jobs"] }),
+  });
+  const retryChapter = useMutation({
+    mutationFn: (jobId: string) => api.retryChapterDetection(jobId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "chapter-detection-jobs"] }),
+  });
+  const cancelDanmaku = useMutation({
+    mutationFn: (jobId: string) => api.cancelDanmakuMatch(jobId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "danmaku-match-jobs"] }),
+  });
+  const retryDanmaku = useMutation({
+    mutationFn: (jobId: string) => api.retryDanmakuMatch(jobId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "danmaku-match-jobs"] }),
+  });
 
   const jobItems: OperationsJob[] = [
     ...(jobs.data?.jobs ?? []).map((job): OperationsJob => ({ ...job, kind: "scan", jobType: job.jobType })),
@@ -182,6 +220,16 @@ export function AdminOperationsPage() {
       kind: "strm",
       jobType: "STRM_MEDIA_INFO",
     })),
+    ...(chapterJobs.data?.jobs ?? []).map((job): OperationsJob => ({
+      ...job,
+      kind: "chapter",
+      jobType: "CHAPTER_DETECTION",
+    })),
+    ...(danmakuJobs.data?.jobs ?? []).map((job): OperationsJob => ({
+      ...job,
+      kind: "danmaku",
+      jobType: "DANMAKU_MATCH",
+    })),
   ].sort(compareOperationsJobs);
   const registeredTasks = tasks.data?.scheduledTasks ?? [];
   const logItems = useMemo(() => {
@@ -193,11 +241,11 @@ export function AdminOperationsPage() {
     });
   }, [logLevel, logSearch, logs.data?.events]);
 
-  if (tasks.isPending || libraries.isPending || jobs.isPending || metadataJobs.isPending || strmJobs.isPending || logs.isPending) {
+  if (tasks.isPending || libraries.isPending || jobs.isPending || metadataJobs.isPending || strmJobs.isPending || chapterJobs.isPending || danmakuJobs.isPending || logs.isPending) {
     return <AdminOperationsState label="正在读取注册任务、运行记录与日志…" />;
   }
-  if (tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || logs.error) {
-    return <AdminOperationsState label={(tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || logs.error)?.message || "任务数据加载失败"} error />;
+  if (tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || logs.error) {
+    return <AdminOperationsState label={(tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || logs.error)?.message || "任务数据加载失败"} error />;
   }
 
   const runningCount = jobItems.filter((job) => isActiveJob(job.status)).length;
@@ -266,9 +314,9 @@ export function AdminOperationsPage() {
           libraryNames={libraryNames}
           status={status}
           onStatusChange={setStatus}
-          onCancel={(job) => job.kind === "metadata" ? cancelMetadata.mutate(job.id) : job.kind === "strm" ? cancelStrm.mutate(job.id) : cancel.mutate(job.id)}
-          onRetry={(job) => job.kind === "metadata" ? retryMetadata.mutate(job.id) : job.kind === "strm" ? retryStrm.mutate(job.id) : retry.mutate(job.id)}
-          busy={cancel.isPending || cancelMetadata.isPending || cancelStrm.isPending || retry.isPending || retryMetadata.isPending || retryStrm.isPending}
+          onCancel={(job) => job.kind === "metadata" ? cancelMetadata.mutate(job.id) : job.kind === "strm" ? cancelStrm.mutate(job.id) : job.kind === "chapter" ? cancelChapter.mutate(job.id) : job.kind === "danmaku" ? cancelDanmaku.mutate(job.id) : cancel.mutate(job.id)}
+          onRetry={(job) => job.kind === "metadata" ? retryMetadata.mutate(job.id) : job.kind === "strm" ? retryStrm.mutate(job.id) : job.kind === "chapter" ? retryChapter.mutate(job.id) : job.kind === "danmaku" ? retryDanmaku.mutate(job.id) : retry.mutate(job.id)}
+          busy={cancel.isPending || cancelMetadata.isPending || cancelStrm.isPending || cancelChapter.isPending || cancelDanmaku.isPending || retry.isPending || retryMetadata.isPending || retryStrm.isPending || retryChapter.isPending || retryDanmaku.isPending}
         />
       ) : null}
       {tab === "logs" ? (
@@ -346,6 +394,8 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLogs });
       onSaved();
     },
@@ -487,7 +537,13 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
   const active = isActiveJob(job.status);
   const cancelling = active && Boolean(job.cancelRequested);
   const discovering = active && job.kind === "scan" && job.discoveryCompleted === false;
-  const jobContext = job.kind === "strm" ? "STRM 媒体信息任务" : job.kind === "metadata" ? "元数据任务" : "扫描任务";
+  const jobContext = job.kind === "strm"
+    ? "STRM 媒体信息任务"
+    : job.kind === "chapter"
+      ? "片头片尾检测任务"
+      : job.kind === "danmaku"
+        ? "弹幕匹配任务"
+        : job.kind === "metadata" ? "元数据任务" : "扫描任务";
   const retryable = job.status === "FAILED" || job.status === "CANCELLED" || job.status === "COMPLETED_WITH_ISSUES" || job.status === "DEFERRED";
   const error = formatJobError(job.error);
   const libraryLabel = job.libraryId ? libraryNames.get(job.libraryId) ?? job.libraryId : "";
@@ -537,7 +593,7 @@ function taskLabel(taskType: string) {
 
 function isRunnableTask(task: AdminScheduledTask) {
   return isPluginScheduledTask(task)
-    || (task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE", "AUTO_LIBRARY_COVER"].includes(task.taskType));
+    || (task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE", "CHAPTER_DETECTION", "AUTO_LIBRARY_COVER"].includes(task.taskType));
 }
 
 function isSchedulableTask(task: AdminScheduledTask) {
@@ -561,6 +617,10 @@ async function runRegisteredTask(task: AdminScheduledTask) {
   }
   if (task.taskType === "METADATA_PARSE") {
     await api.startLibraryMetadataRefresh(task.ownerId, "FILL_MISSING");
+    return;
+  }
+  if (task.taskType === "CHAPTER_DETECTION") {
+    await api.startChapterDetection(task.ownerId);
     return;
   }
   if (task.taskType === "AUTO_LIBRARY_COVER") {

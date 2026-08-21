@@ -9,6 +9,8 @@ import type {
   AdminScheduledTaskPage,
   AdminMetadataReidentifyJob,
   AdminStrmProbeJob,
+  AdminChapterDetectionJob,
+  AdminDanmakuMatchJob,
   AdminLibrary,
   AdminRoot,
   AdminSettings,
@@ -774,6 +776,57 @@ export class LuxApiClient {
     if (status) params.set("status", status);
     return this.request<{ jobs?: AdminStrmProbeJob[] }>(
       `/api/v1/admin/strm-probe-jobs?${params}`,
+    );
+  }
+
+  startChapterDetection(libraryId: string) {
+    return this.request<{ job: AdminChapterDetectionJob }>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/chapter-detection`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+  }
+
+  adminChapterDetectionJobs(status?: string) {
+    const params = new URLSearchParams({ page: "1", pageSize: "50" });
+    if (status) params.set("status", status);
+    return this.request<{ jobs?: AdminChapterDetectionJob[] }>(
+      `/api/v1/admin/chapter-detection-jobs?${params}`,
+    );
+  }
+
+  cancelChapterDetection(jobId: string) {
+    return this.request<void>(
+      `/api/v1/admin/chapter-detection-jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
+    );
+  }
+
+  retryChapterDetection(jobId: string) {
+    return this.request<{ job: AdminChapterDetectionJob }>(
+      `/api/v1/admin/chapter-detection-jobs/${encodeURIComponent(jobId)}/retry`,
+      { method: "POST" },
+    );
+  }
+
+  adminDanmakuMatchJobs(status?: string) {
+    const params = new URLSearchParams({ page: "1", pageSize: "50" });
+    if (status) params.set("status", status);
+    return this.request<{ jobs?: AdminDanmakuMatchJob[] }>(
+      `/api/v1/admin/danmaku/match-jobs?${params}`,
+    );
+  }
+
+  cancelDanmakuMatch(jobId: string) {
+    return this.request<void>(
+      `/api/v1/admin/danmaku/match-jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
+    );
+  }
+
+  retryDanmakuMatch(jobId: string) {
+    return this.request<{ job: AdminDanmakuMatchJob }>(
+      `/api/v1/admin/danmaku/match-jobs/${encodeURIComponent(jobId)}/retry`,
+      { method: "POST" },
     );
   }
 

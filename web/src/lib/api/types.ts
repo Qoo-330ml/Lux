@@ -574,6 +574,34 @@ export type AdminStrmProbeJob = {
   finishedAt?: string | number | null;
 };
 
+export type AdminChapterDetectionJob = {
+  id: string;
+  libraryId: string;
+  pluginId: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  processedCount: number;
+  totalCount: number;
+  cancelRequested?: boolean;
+  error?: string | null;
+  createdAt?: string | number;
+  finishedAt?: string | number | null;
+};
+
+export type AdminDanmakuMatchJob = {
+  id: string;
+  libraryId: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  totalCount: number;
+  processedCount: number;
+  successCount?: number;
+  skippedCount?: number;
+  failedCount?: number;
+  cancelRequested?: boolean;
+  error?: string | null;
+  createdAt?: string | number;
+  finishedAt?: string | number | null;
+};
+
 export type AdminMetadataReidentifyStart = {
   totalCount: number;
   mode?: MetadataRefreshMode;

@@ -87,6 +87,8 @@ describe("admin SSE events", () => {
       { queryKey: ["admin", "jobs"] },
       { queryKey: ["admin", "metadata-jobs"] },
       { queryKey: ["admin", "strm-probe-jobs"] },
+      { queryKey: ["admin", "chapter-detection-jobs"] },
+      { queryKey: ["admin", "danmaku-match-jobs"] },
       { queryKey: ["admin", "scheduled-tasks"] },
       { queryKey: ["admin", "dashboard"] },
       { queryKey: ["admin", "logs"] },

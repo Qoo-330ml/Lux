@@ -412,6 +412,42 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("loads and controls chapter detection and danmaku jobs", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/admin/libraries/library-1/chapter-detection") {
+        expect(init?.method).toBe("POST");
+        return new Response(JSON.stringify({ job: { id: "chapter-job-1", libraryId: "library-1", pluginId: "org.lux.chapter", status: "PENDING", processedCount: 0, totalCount: 3 } }), { status: 202 });
+      }
+      if (path === "/api/v1/admin/chapter-detection-jobs?page=1&pageSize=50&status=RUNNING") {
+        return new Response(JSON.stringify({ jobs: [{ id: "chapter-job-1", libraryId: "library-1", pluginId: "org.lux.chapter", status: "RUNNING", processedCount: 1, totalCount: 3 }] }), { status: 200 });
+      }
+      if (path === "/api/v1/admin/chapter-detection-jobs/chapter-job-1/cancel") {
+        expect(init?.method).toBe("POST");
+        return new Response(null, { status: 202 });
+      }
+      if (path === "/api/v1/admin/chapter-detection-jobs/chapter-job-1/retry") {
+        expect(init?.method).toBe("POST");
+        return new Response(JSON.stringify({ job: { id: "chapter-job-2", libraryId: "library-1", pluginId: "org.lux.chapter", status: "PENDING", processedCount: 0, totalCount: 3 } }), { status: 202 });
+      }
+      if (path === "/api/v1/admin/danmaku/match-jobs?page=1&pageSize=50&status=FAILED") {
+        return new Response(JSON.stringify({ jobs: [{ id: "danmaku-job-1", libraryId: "library-1", status: "FAILED", processedCount: 3, totalCount: 3 }] }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/admin/danmaku/match-jobs/danmaku-job-1/retry");
+      expect(init?.method).toBe("POST");
+      return new Response(JSON.stringify({ job: { id: "danmaku-job-2", libraryId: "library-1", status: "PENDING", processedCount: 0, totalCount: 3 } }), { status: 202 });
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.startChapterDetection("library-1")).resolves.toMatchObject({ job: { id: "chapter-job-1" } });
+    await expect(client.adminChapterDetectionJobs("RUNNING")).resolves.toMatchObject({ jobs: [{ id: "chapter-job-1" }] });
+    await expect(client.cancelChapterDetection("chapter-job-1")).resolves.toBeUndefined();
+    await expect(client.retryChapterDetection("chapter-job-1")).resolves.toMatchObject({ job: { id: "chapter-job-2" } });
+    await expect(client.adminDanmakuMatchJobs("FAILED")).resolves.toMatchObject({ jobs: [{ id: "danmaku-job-1" }] });
+    await expect(client.retryDanmakuMatch("danmaku-job-1")).resolves.toMatchObject({ job: { id: "danmaku-job-2" } });
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+  });
+
   it("loads metadata job item details from the existing job detail endpoint", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

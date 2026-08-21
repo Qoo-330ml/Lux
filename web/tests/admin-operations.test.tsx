@@ -297,6 +297,50 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).toContain("开始 STRM 媒体信息扫描");
   });
 
+  it("includes chapter detection and danmaku jobs in the common run list", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminStrmProbeJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminChapterDetectionJobs").mockResolvedValue({ jobs: [{
+      id: "chapter-job-1",
+      libraryId: "library-1",
+      pluginId: "org.lux.chapter",
+      status: "RUNNING",
+      processedCount: 1,
+      totalCount: 4,
+    }] });
+    vi.spyOn(api, "adminDanmakuMatchJobs").mockResolvedValue({ jobs: [{
+      id: "danmaku-job-1",
+      libraryId: "library-1",
+      status: "FAILED",
+      processedCount: 4,
+      totalCount: 4,
+    }] });
+    const cancelChapter = vi.spyOn(api, "cancelChapterDetection").mockResolvedValue(undefined);
+    const retryDanmaku = vi.spyOn(api, "retryDanmakuMatch").mockResolvedValue({ job: {
+      id: "danmaku-job-2",
+      libraryId: "library-1",
+      status: "PENDING",
+      processedCount: 0,
+      totalCount: 4,
+    } });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    expect(container.textContent).toContain("片头片尾检测");
+    expect(container.textContent).toContain("弹幕匹配");
+    expect(container.textContent).toContain("1 / 4");
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="取消任务"]')?.click());
+    await act(async () => await vi.waitFor(() => expect(cancelChapter).toHaveBeenCalledWith("chapter-job-1")));
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="重试任务"]')?.click());
+    await act(async () => await vi.waitFor(() => expect(retryDanmaku).toHaveBeenCalledWith("danmaku-job-1")));
+  });
+
   it("exports a selected UTC log date range from the system log tab", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
@@ -578,6 +622,12 @@ describe("AdminOperationsPage", () => {
     });
     if (!vi.isMockFunction(api.adminStrmProbeJobs)) {
       vi.spyOn(api, "adminStrmProbeJobs").mockResolvedValue({ jobs: [] });
+    }
+    if (!vi.isMockFunction(api.adminChapterDetectionJobs)) {
+      vi.spyOn(api, "adminChapterDetectionJobs").mockResolvedValue({ jobs: [] });
+    }
+    if (!vi.isMockFunction(api.adminDanmakuMatchJobs)) {
+      vi.spyOn(api, "adminDanmakuMatchJobs").mockResolvedValue({ jobs: [] });
     }
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
