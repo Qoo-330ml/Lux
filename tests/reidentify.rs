@@ -914,10 +914,15 @@ async fn library_metadata_job_rejects_any_second_active_library_job()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, database, library_id, _folder_id) =
         setup_movie_library_with_parent_folder().await?;
+    let other_library = LibraryService::new(database.clone())
+        .create_library("Other Movies", LibraryKind::Movie, false)
+        .await?;
     let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
 
     let first = metadata.create_library_job(&library_id).await?;
-    let second = metadata.create_library_job(&library_id).await;
+    let second = metadata
+        .create_library_job(&other_library.id.to_string())
+        .await;
 
     assert!(matches!(
         second,
