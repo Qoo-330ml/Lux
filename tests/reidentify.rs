@@ -15,7 +15,7 @@ use luxd::{
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
-        reidentify::{MetadataRefreshMode, MetadataReidentifyService},
+        reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
@@ -849,6 +849,43 @@ async fn library_metadata_job_excludes_parent_folders() -> Result<(), Box<dyn st
             .fetch_one(database.pool())
             .await?;
     assert_eq!(stored_scope, "LIBRARY");
+    Ok(())
+}
+
+#[tokio::test]
+async fn retrying_library_metadata_job_rejects_another_active_library_job()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata.create_library_job(&library_id).await?;
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'FAILED', finished_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_jobs (
+            id, status, total_count, mode, library_id, job_scope
+         ) VALUES ('active-library-job', 'RUNNING', 1, 'REIDENTIFY', ?, 'LIBRARY')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+
+    let error = metadata
+        .retry_job(&job.id)
+        .await
+        .expect_err("an active library job should block retry");
+    assert!(matches!(
+        error,
+        MetadataReidentifyError::LibraryJobAlreadyActive(id)
+            if id == "active-library-job"
+    ));
     Ok(())
 }
 

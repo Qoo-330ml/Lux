@@ -844,8 +844,25 @@ impl MetadataReidentifyService {
         if !matches!(
             job.status.as_str(),
             "FAILED" | "CANCELLED" | "COMPLETED_WITH_ISSUES" | "DEFERRED"
-        ) || !self.database.retry_metadata_reidentify_job(job_id).await?
-        {
+        ) {
+            return Err(MetadataReidentifyError::JobNotRetryable);
+        }
+        let retried = if job.job_scope == "LIBRARY" {
+            let _creation_guard = self.library_job_creation.lock().await;
+            if let Some(active_job_id) = self
+                .database
+                .active_library_metadata_reidentify_job_id()
+                .await?
+            {
+                return Err(MetadataReidentifyError::LibraryJobAlreadyActive(
+                    active_job_id,
+                ));
+            }
+            self.database.retry_metadata_reidentify_job(job_id).await?
+        } else {
+            self.database.retry_metadata_reidentify_job(job_id).await?
+        };
+        if !retried {
             return Err(MetadataReidentifyError::JobNotRetryable);
         }
         self.admin_events.publish(AdminEventScope::Jobs);
