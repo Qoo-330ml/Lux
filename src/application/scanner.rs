@@ -4402,7 +4402,7 @@ fn strm_target_kind_name(target: &StrmTarget) -> &'static str {
         StrmTargetKind::Empty => "EMPTY",
         StrmTargetKind::Url => "URL",
         StrmTargetKind::Path => "PATH",
-        StrmTargetKind::Opaque => "OPAQUE",
+        StrmTargetKind::Smb | StrmTargetKind::Ftp | StrmTargetKind::Unsupported => "OPAQUE",
     }
 }
 

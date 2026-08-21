@@ -3,7 +3,9 @@ pub enum StrmTargetKind {
     Empty,
     Url,
     Path,
-    Opaque,
+    Smb,
+    Ftp,
+    Unsupported,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StrmTarget {
@@ -22,10 +24,14 @@ pub fn classify_strm_target(contents: &str) -> StrmTarget {
 
     let kind = if is_http_url(&value) {
         StrmTargetKind::Url
+    } else if has_scheme(&value, "smb") {
+        StrmTargetKind::Smb
+    } else if has_scheme(&value, "ftp") {
+        StrmTargetKind::Ftp
     } else if is_path_target(&value) {
         StrmTargetKind::Path
     } else {
-        StrmTargetKind::Opaque
+        StrmTargetKind::Unsupported
     };
     StrmTarget {
         kind,
@@ -45,6 +51,14 @@ fn is_http_url(value: &str) -> bool {
         || value
             .get(..8)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+fn has_scheme(value: &str, scheme: &str) -> bool {
+    let expected = format!("{scheme}://");
+    value
+        .as_bytes()
+        .get(..expected.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected.as_bytes()))
 }
 
 fn is_path_target(value: &str) -> bool {
@@ -99,8 +113,26 @@ mod tests {
         assert_eq!(
             classify_strm_target("magnet:?xt=urn:btih:example"),
             super::StrmTarget {
-                kind: StrmTargetKind::Opaque,
+                kind: StrmTargetKind::Unsupported,
                 value: Some("magnet:?xt=urn:btih:example".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_smb_and_ftp_uris_without_parsing_or_accessing_them() {
+        assert_eq!(
+            classify_strm_target("SMB://nas/media/movie.mkv"),
+            super::StrmTarget {
+                kind: StrmTargetKind::Smb,
+                value: Some("SMB://nas/media/movie.mkv".to_owned()),
+            }
+        );
+        assert_eq!(
+            classify_strm_target("ftp://example.com/movie.mkv"),
+            super::StrmTarget {
+                kind: StrmTargetKind::Ftp,
+                value: Some("ftp://example.com/movie.mkv".to_owned()),
             }
         );
     }
