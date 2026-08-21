@@ -17935,11 +17935,33 @@ mod tests {
                 .await
                 .expect("claim first run")
         );
+        sqlx::query(
+            "UPDATE person_index_rebuild_jobs
+             SET updated_at = unixepoch() - 61
+             WHERE library_id = ?",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("mark interrupted run stale");
+        let recovered_jobs = database
+            .sync_person_index_rebuild_jobs(1)
+            .await
+            .expect("recover stale run");
+        assert_eq!(recovered_jobs[0].status, "QUEUED");
+        let recovered_token: Option<String> = sqlx::query_scalar(
+            "SELECT run_token FROM person_index_rebuild_jobs WHERE library_id = ?",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("read recovered token");
+        assert_eq!(recovered_token, None);
         assert!(
-            !database
+            database
                 .claim_person_index_rebuild_job(&library_id, "run-b")
                 .await
-                .expect("reject duplicate claim")
+                .expect("claim recovered run")
         );
         assert!(
             database
@@ -17960,8 +17982,14 @@ mod tests {
                 .expect("ignore stale completion")
         );
         assert!(
+            !database
+                .finish_person_index_rebuild_job(&library_id, "run-b", "COMPLETED", None)
+                .await
+                .expect("ignore cancelled run completion")
+        );
+        assert!(
             database
-                .claim_person_index_rebuild_job(&library_id, "run-b")
+                .claim_person_index_rebuild_job(&library_id, "run-c")
                 .await
                 .expect("claim requeued run")
         );
@@ -17974,14 +18002,14 @@ mod tests {
         );
         assert!(
             database
-                .update_person_index_rebuild_progress(&library_id, "run-b", "item-b", 2, 2)
+                .update_person_index_rebuild_progress(&library_id, "run-c", "item-c", 2, 2)
                 .await
                 .expect("update progress")
                 .is_some()
         );
         assert!(
             database
-                .finish_person_index_rebuild_job(&library_id, "run-b", "COMPLETED", None)
+                .finish_person_index_rebuild_job(&library_id, "run-c", "COMPLETED", None)
                 .await
                 .expect("finish current run")
         );
@@ -18030,6 +18058,38 @@ mod tests {
             .await
             .expect("second keyset page");
         assert_eq!(second_page, ["item-c"]);
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-ab', ?, 'MOVIE', 'item-ab', 'item-ab', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("insert item before the cursor");
+        let second_page_after_insert = database
+            .list_person_index_item_ids(&library_id, first_page.last().map(String::as_str), 2)
+            .await
+            .expect("second keyset page after insert");
+        assert_eq!(second_page_after_insert, ["item-c"]);
+        sqlx::query("DELETE FROM media_items WHERE id = 'item-c'")
+            .execute(database.pool())
+            .await
+            .expect("delete item after the cursor");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-z', ?, 'MOVIE', 'item-z', 'item-z', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("insert item after the cursor");
+        let second_page_after_delete = database
+            .list_person_index_item_ids(&library_id, first_page.last().map(String::as_str), 2)
+            .await
+            .expect("second keyset page after delete");
+        assert_eq!(second_page_after_delete, ["item-z"]);
 
         database
             .replace_person_credits_with_fingerprint("item-a", &[], Some("fingerprint-a"))
@@ -18052,6 +18112,20 @@ mod tests {
                 .person_index_item_state_is_current("item-a", Some("fingerprint-b"))
                 .await
                 .expect("changed fingerprint")
+        );
+        sqlx::query(
+            "UPDATE person_index_item_state
+             SET relation_schema_version = 3
+             WHERE item_id = 'item-a'",
+        )
+        .execute(database.pool())
+        .await
+        .expect("change relation schema version");
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+                .await
+                .expect("changed relation schema version")
         );
         database
             .clear_person_credits("item-a")

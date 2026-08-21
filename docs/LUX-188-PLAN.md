@@ -55,6 +55,8 @@ uname -m
 
 当前记录（2026-08-21）：SQLite 空库迁移、人物索引任务专项测试和 ARM 本机检查已完成；本机
 PostgreSQL daemon 不可用，因此 PostgreSQL 空库迁移保留为未实测，不将其标记为通过。
+keyset 增删、stale RUNNING 回收、token 防旧 worker 覆盖、指纹判断、缺失关系清理和管理 API
+均有回归测试覆盖。
 
 ## Boundaries
 
