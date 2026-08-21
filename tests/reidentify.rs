@@ -836,11 +836,58 @@ async fn library_metadata_job_processes_items_concurrently()
 async fn library_metadata_job_excludes_parent_folders() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, database, library_id, _folder_id) =
         setup_movie_library_with_parent_folder().await?;
-    let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
 
     let job = metadata.create_library_job(&library_id).await?;
 
     assert_eq!(job.total_count, 1);
+    assert_eq!(job.library_id.as_deref(), Some(library_id.as_str()));
+    assert_eq!(job.job_scope, "LIBRARY");
+    let stored_scope: String =
+        sqlx::query_scalar("SELECT job_scope FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored_scope, "LIBRARY");
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_metadata_job_persists_item_scope_and_library_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+
+    let job = metadata.create_job(vec![folder_id]).await?;
+
+    assert_eq!(job.job_scope, "ITEMS");
+    assert_eq!(job.library_id.as_deref(), Some(_library_id.as_str()));
+    let stored: (Option<String>, String) =
+        sqlx::query_as("SELECT library_id, job_scope FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored, (Some(_library_id), "ITEMS".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_metadata_job_rejects_any_second_active_library_job()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
+
+    let first = metadata.create_library_job(&library_id).await?;
+    let second = metadata.create_library_job(&library_id).await;
+
+    assert!(matches!(
+        second,
+        Err(luxd::application::reidentify::MetadataReidentifyError::LibraryJobAlreadyActive(
+            job_id
+        )) if job_id == first.id
+    ));
     Ok(())
 }
 

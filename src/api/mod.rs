@@ -17168,6 +17168,7 @@ fn metadata_reidentify_job_json(
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
         "libraryId": job.library_id,
+        "jobScope": job.job_scope,
         "pendingCount": job.pending_count,
         "items": job.items.iter().map(|item| json!({
             "jobId": item.job_id,
@@ -17196,6 +17197,7 @@ fn metadata_reidentify_job_summary_json(
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
         "libraryId": job.library_id,
+        "jobScope": job.job_scope,
         "pendingCount": job.pending_count,
     })
 }
@@ -17236,6 +17238,13 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
             StatusCode::CONFLICT,
             lux::ApiErrorCode::InvalidRequest,
             "该批量元数据匹配任务当前不可取消",
+        )
+        .into_response(),
+        MetadataReidentifyError::LibraryJobAlreadyActive(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "已有整库元数据任务正在运行，请等待完成或先取消该任务",
         )
         .into_response(),
         MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => {

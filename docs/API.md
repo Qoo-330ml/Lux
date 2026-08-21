@@ -109,7 +109,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/admin/items/{itemId}/identify/candidates`：管理员发送 `{ "query": "标题", "year": 2020 }`，通过条目所属媒体库的 `scraperId` 搜索元数据匹配候选；候选的 provider ID 必须来自当前选中的刮削器，最多写入 20 个带 24 小时过期时间的 pending 候选，并返回当前条目的候选页。需要 `X-CSRF-Token`；刮削器不可用或请求失败不会改变本地条目。
 - `POST /api/v1/admin/items/{itemId}/identify/candidates/{candidateId}/select`：管理员选择元数据匹配候选并发送 `{ "mode": "fillMissing" }` 或 `{ "mode": "refreshUnlocked" }`，需要 `X-CSRF-Token`。前者只补空元数据字段和缺失图片，后者刷新未锁定字段和图片；候选中的每类图片只使用第一张，所属媒体库未启用的类型不写回，找不到的类型跳过；NFO/图片写回全部成功后才返回 `ONLINE_CONFIRMED`，失败返回可重试错误且候选保持 pending。
 - `POST /api/v1/admin/metadata/reidentify`：管理员发送 `{ "itemIds": ["..."] }` 创建指定条目的候选搜索任务；条目去重后限制为 1-100 个，任务持久化为 `QUEUED/RUNNING/COMPLETED/FAILED`，需要 `X-CSRF-Token`。任务使用条目所属媒体库的刮削器获取对应 provider ID；路径中的 `reidentify` 为兼容标识，不自动确认候选。
-- `GET /api/v1/admin/metadata/reidentify?page=1&pageSize=50&status=RUNNING`：管理员分页查看元数据匹配和元数据刷新任务；支持 `QUEUED`、`RUNNING`、`COMPLETED`、`FAILED`、`CANCELLED` 过滤，返回模式、进度和稳定错误代码。
+- `GET /api/v1/admin/metadata/reidentify?page=1&pageSize=50&status=RUNNING`：管理员分页查看元数据匹配和元数据刷新任务；支持 `QUEUED`、`RUNNING`、`COMPLETED`、`FAILED`、`CANCELLED` 过滤，返回模式、`jobScope`、媒体库身份、进度和稳定错误代码；摘要只聚合当前页任务。
 - `GET /api/v1/admin/metadata/reidentify/{jobId}`：管理员读取批量元数据匹配任务及逐条状态、候选数量和稳定错误代码；前端可按任务 ID 轮询。
 - `POST /api/v1/admin/metadata/reidentify/{jobId}/cancel`：管理员请求取消 `QUEUED` 或 `RUNNING` 的元数据任务，需要 `X-CSRF-Token`，返回 202；worker 在当前批次完成后停止领取新条目并将任务标记为 `CANCELLED`。
 - `POST /api/v1/admin/metadata/reidentify/{jobId}`：管理员对 `FAILED` 或 `CANCELLED` 任务重新排队未完成条目，保留已经成功的条目，需要 `X-CSRF-Token`；其他状态返回冲突。

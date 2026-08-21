@@ -6,7 +6,10 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::{Mutex as AsyncMutex, Semaphore},
+    task::JoinSet,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -62,6 +65,7 @@ pub struct MetadataReidentifyService {
     progress_events: MetadataProgressEventGate,
     worker_permits: Arc<Semaphore>,
     running_jobs: MetadataJobOwners,
+    library_job_creation: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Clone, Default)]
@@ -142,6 +146,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
             running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -172,6 +177,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
             running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -196,6 +202,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
             running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -310,6 +317,14 @@ impl MetadataReidentifyService {
         if !library.is_enabled {
             return Err(MetadataReidentifyError::ItemNotFound(library_id.to_owned()));
         }
+        let _creation_guard = self.library_job_creation.lock().await;
+        if let Some(job_id) = self
+            .database
+            .active_library_metadata_reidentify_job_id()
+            .await?
+        {
+            return Err(MetadataReidentifyError::LibraryJobAlreadyActive(job_id));
+        }
         let mut item_ids = Vec::new();
         let mut offset = 0_i64;
         loop {
@@ -332,7 +347,7 @@ impl MetadataReidentifyService {
         }
         let job_id = Uuid::now_v7().to_string();
         self.database
-            .create_metadata_reidentify_library_job(&job_id, &item_ids, mode.as_str())
+            .create_metadata_reidentify_library_job(&job_id, library_id, &item_ids, mode.as_str())
             .await?;
         self.admin_events.publish(AdminEventScope::Jobs);
         self.get_job(&job_id).await
@@ -798,6 +813,7 @@ impl MetadataReidentifyService {
             items: items.into_iter().map(metadata_reidentify_item).collect(),
             cancel_requested: job.cancel_requested,
             library_id: job.library_id,
+            job_scope: job.job_scope,
             pending_count: job.pending_count,
         })
     }
@@ -858,6 +874,7 @@ pub struct MetadataReidentifyJob {
     pub items: Vec<MetadataReidentifyItem>,
     pub cancel_requested: bool,
     pub library_id: Option<String>,
+    pub job_scope: String,
     pub pending_count: i64,
 }
 
@@ -880,6 +897,7 @@ pub enum MetadataReidentifyError {
     JobNotFound,
     JobNotRetryable,
     JobNotCancelable,
+    LibraryJobAlreadyActive(String),
     Candidate(MetadataCandidateError),
     Scraper(ScraperError),
     Selection(MetadataSelectionError),
@@ -898,6 +916,7 @@ impl MetadataReidentifyError {
             Self::JobNotFound => "JOB_NOT_FOUND",
             Self::JobNotRetryable => "JOB_NOT_RETRYABLE",
             Self::JobNotCancelable => "JOB_NOT_CANCELABLE",
+            Self::LibraryJobAlreadyActive(_) => "LIBRARY_JOB_ALREADY_ACTIVE",
             Self::Candidate(MetadataCandidateError::Tmdb(_)) => "TMDB_UNAVAILABLE",
             Self::Candidate(MetadataCandidateError::InvalidSearch) => "INVALID_SEARCH",
             Self::Candidate(MetadataCandidateError::ItemNotFound) => "ITEM_NOT_FOUND",
@@ -932,6 +951,12 @@ impl fmt::Display for MetadataReidentifyError {
             }
             Self::JobNotCancelable => {
                 formatter.write_str("metadata reidentify job is not cancelable")
+            }
+            Self::LibraryJobAlreadyActive(job_id) => {
+                write!(
+                    formatter,
+                    "a full-library metadata job is already active: {job_id}"
+                )
             }
             Self::Candidate(error) => error.fmt(formatter),
             Self::Scraper(error) => error.fmt(formatter),
