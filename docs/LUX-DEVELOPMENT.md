@@ -4223,11 +4223,11 @@ API：
 
 验收：
 
-- [ ] watcher 初始化不运行在 Tokio 核心 worker，初始化线程数量有界，现有根路径取消/重concile 行为不变。
-- [ ] metadata worker 总量有界，重复启动同一任务被拒绝，重启遗留 `RUNNING` 条目重新进入 `PENDING`。
+- [x] watcher 初始化不运行在 Tokio 核心 worker，初始化线程数量有界，现有根路径取消/重concile 行为不变。
+- [x] metadata worker 总量有界，重复启动同一任务被拒绝，重启遗留 `RUNNING` 条目重新进入 `PENDING`。
 - [ ] metadata 任务摘要不逐行扫描明细表，迁移从空 SQLite/PostgreSQL 数据库成功执行。
-- [ ] metadata 进度事件每个任务最多每秒发布一次，最终状态立即发布，前端不会重复失效同一查询。
-- [ ] 管理操作页加载态、错误态和无数据态均有 Web 测试；图片重试不重试永久错误。
+- [x] metadata 进度事件每个任务最多每秒发布一次，最终状态立即发布，前端不会重复失效同一查询。
+- [x] 管理操作页加载态、错误态和无数据态均有 Web 测试；图片重试不重试永久错误。
 - [ ] Rust/Web 测试、格式化、Clippy 和 ARM 本机 `uname -m` 记录完成。
 
 验证：参见 `docs/LUX-189-PLAN.md`。
