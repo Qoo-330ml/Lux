@@ -1881,6 +1881,7 @@ services:
 | LUX-185 | web/src/features/player/、web/public/hevc/、web/tests/、web/package.json、web/pnpm-lock.yaml、web/vite.config.ts、docs/ |
 | LUX-186 | src/application/plugins.rs、src/api/lux/mod.rs、src/api/mod.rs、tests/plugins.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 | LUX-188 | migrations/、migrations-postgres/、src/storage/mod.rs、src/application/people.rs、src/api/mod.rs、tests/people_api.rs、docs/ |
+| LUX-189 | src/application/watch.rs、src/application/reidentify.rs、src/application/images.rs、src/storage/mod.rs、migrations/、migrations-postgres/、web/src/features/admin/、web/src/react.css、tests/、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4206,6 +4207,30 @@ API：
 
 - 不改变人物资源目录合同、Emby 人物 DTO 或现有人物查询语义。
 - 不在用户请求中执行整库扫描，不增加无限 worker，不读取整份 metadata 目录作为查询方案。
+
+#### LUX-189：后台任务资源隔离与管理员任务体验
+
+范围：吸收 PR #14 中与当前架构一致的后台任务和管理员体验改进。watcher 的同步注册工作必须在
+有界的专用初始化线程中执行，不能因为 Tokio blocking pool 饱和而拖延启动，也不能直接阻塞 Tokio
+核心 worker。整库 metadata 任务使用持久化的媒体库身份和任务范围摘要，进度 worker 有全局上限，
+进程重启后遗留的条目重新排队；同一任务在单进程内只能有一个 owner。
+
+管理员任务页的加载状态必须有可见反馈并暴露 `aria-busy`，错误状态不持续显示 spinner。metadata
+进度事件按任务节流，完成、失败和取消立即发布；前端不能因为 `jobs` 与 `metadata` 两个作用域
+同时失效同一查询。图片下载只对 429、5xx、连接错误和超时做有限退避重试。
+
+验收：
+
+- [ ] watcher 初始化不运行在 Tokio 核心 worker，初始化线程数量有界，现有根路径取消/重concile 行为不变。
+- [ ] metadata worker 总量有界，重复启动同一任务被拒绝，重启遗留 `RUNNING` 条目重新进入 `PENDING`。
+- [ ] metadata 任务摘要不逐行扫描明细表，迁移从空 SQLite/PostgreSQL 数据库成功执行。
+- [ ] metadata 进度事件每个任务最多每秒发布一次，最终状态立即发布，前端不会重复失效同一查询。
+- [ ] 管理操作页加载态、错误态和无数据态均有 Web 测试；图片重试不重试永久错误。
+- [ ] Rust/Web 测试、格式化、Clippy 和 ARM 本机 `uname -m` 记录完成。
+
+验证：参见 `docs/LUX-189-PLAN.md`。
+
+依赖：LUX-153、LUX-162、LUX-172、LUX-187、LUX-188。
 
 ## 26. 风险与缓解
 
