@@ -847,6 +847,26 @@ impl Database {
         })
     }
 
+    pub(crate) async fn get_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+    ) -> Result<Option<StoredPersonIndexRebuildJob>, StorageError> {
+        self.query(
+            "SELECT library_id, status, cursor_id, processed_count, total_count,
+                    cancel_requested
+             FROM person_index_rebuild_jobs
+             WHERE library_id = ?",
+        )
+        .bind(library_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_person_index_rebuild_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn count_person_index_rebuild_jobs(&self) -> Result<i64, StorageError> {
         self.query_scalar("SELECT COUNT(*) FROM person_index_rebuild_jobs")
             .fetch_one(&self.pool)
@@ -952,14 +972,19 @@ impl Database {
         run_token: &str,
     ) -> Result<bool, StorageError> {
         self.query_scalar(
-            "SELECT cancel_requested FROM person_index_rebuild_jobs
-             WHERE library_id = ? AND status = 'RUNNING' AND run_token = ?",
+            "SELECT CASE
+                        WHEN status = 'RUNNING' AND run_token = ? AND cancel_requested = 0
+                            THEN 0
+                        ELSE 1
+                    END
+             FROM person_index_rebuild_jobs
+             WHERE library_id = ?",
         )
-        .bind(library_id)
         .bind(run_token)
+        .bind(library_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|value: Option<i64>| value == Some(1))
+        .map(|value: Option<i64>| value != Some(0))
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -1589,6 +1614,7 @@ impl Database {
         Ok(value.filter(|value| !value.trim().is_empty()))
     }
 
+    #[cfg(test)]
     pub(crate) async fn replace_person_credits(
         &self,
         item_id: &str,
@@ -1695,15 +1721,39 @@ impl Database {
     }
 
     pub(crate) async fn clear_person_credits(&self, item_id: &str) -> Result<u64, StorageError> {
-        self.query("DELETE FROM person_credits WHERE item_id = ?")
-            .bind(item_id)
-            .execute(&self.pool)
+        let mut transaction = self
+            .pool
+            .begin()
             .await
-            .map(|result| result.rows_affected())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+        let result = self
+            .query("DELETE FROM person_credits WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query("DELETE FROM person_index_item_state WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
     }
 
     pub(crate) async fn resolve_or_create_canonical_person(
@@ -17704,6 +17754,16 @@ mod tests {
                 .person_index_item_state_is_current("item-a", Some("fingerprint-b"))
                 .await
                 .expect("changed fingerprint")
+        );
+        database
+            .clear_person_credits("item-a")
+            .await
+            .expect("clear person credits");
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+                .await
+                .expect("cleared relation must be rebuilt")
         );
     }
 

@@ -2427,6 +2427,7 @@ impl PeopleService {
         let mut rebuilt_items = 0;
         for job in jobs {
             let run_token = Uuid::now_v7().to_string();
+            let force_rebuild = job.cursor_id.is_none() && job.processed_count == 0;
             if !database
                 .claim_person_index_rebuild_job(&job.library_id, &run_token)
                 .await
@@ -2435,7 +2436,7 @@ impl PeopleService {
                 continue;
             }
             match self
-                .run_person_index_rebuild_job(database, &job, &run_token)
+                .run_person_index_rebuild_job(database, &job, &run_token, force_rebuild)
                 .await
             {
                 Ok(processed) => {
@@ -2467,7 +2468,10 @@ impl PeopleService {
         Ok(rebuilt_items)
     }
 
-    pub async fn queue_person_index_rebuild(&self, library_id: &str) -> Result<bool, PeopleError> {
+    pub(crate) async fn queue_person_index_rebuild(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, PeopleError> {
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
                 "people database index is unavailable".to_owned(),
@@ -2479,7 +2483,10 @@ impl PeopleService {
             .map_err(|error| PeopleError::Storage(error.to_string()))
     }
 
-    pub async fn cancel_person_index_rebuild(&self, library_id: &str) -> Result<bool, PeopleError> {
+    pub(crate) async fn cancel_person_index_rebuild(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, PeopleError> {
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
                 "people database index is unavailable".to_owned(),
@@ -2491,7 +2498,7 @@ impl PeopleService {
             .map_err(|error| PeopleError::Storage(error.to_string()))
     }
 
-    pub async fn list_person_index_rebuild_jobs(
+    pub(crate) async fn list_person_index_rebuild_jobs(
         &self,
         offset: i64,
         limit: i64,
@@ -2507,7 +2514,22 @@ impl PeopleService {
             .map_err(|error| PeopleError::Storage(error.to_string()))
     }
 
-    pub async fn count_person_index_rebuild_jobs(&self) -> Result<i64, PeopleError> {
+    pub(crate) async fn get_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+    ) -> Result<Option<StoredPersonIndexRebuildJob>, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .get_person_index_rebuild_job(library_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub(crate) async fn count_person_index_rebuild_jobs(&self) -> Result<i64, PeopleError> {
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
                 "people database index is unavailable".to_owned(),
@@ -2524,6 +2546,7 @@ impl PeopleService {
         database: &Database,
         job: &StoredPersonIndexRebuildJob,
         run_token: &str,
+        force_rebuild: bool,
     ) -> Result<usize, PeopleError> {
         let total_count = database
             .count_person_index_items(&job.library_id)
@@ -2552,7 +2575,10 @@ impl PeopleService {
                 break;
             }
             for item_id in &item_ids {
-                match self.rebuild_item_person_credit_index(item_id).await {
+                match self
+                    .rebuild_item_person_credit_index(item_id, force_rebuild)
+                    .await
+                {
                     Ok(()) => processed_count += 1,
                     Err(PeopleError::Serialization(message)) => {
                         tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
@@ -2980,7 +3006,11 @@ impl PeopleService {
         Ok(restored)
     }
 
-    async fn rebuild_item_person_credit_index(&self, item_id: &str) -> Result<(), PeopleError> {
+    async fn rebuild_item_person_credit_index(
+        &self,
+        item_id: &str,
+        force_rebuild: bool,
+    ) -> Result<(), PeopleError> {
         let new_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
@@ -3011,10 +3041,11 @@ impl PeopleService {
             }
             return Ok(());
         };
-        if database
-            .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
-            .await
-            .map_err(|error| PeopleError::Storage(error.to_string()))?
+        if !force_rebuild
+            && database
+                .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
         {
             return Ok(());
         }

@@ -13,7 +13,8 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use serde_json::json;
+use reqwest::header::{COOKIE, HeaderMap, SET_COOKIE};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 const PNG_1X1: &[u8] = &[
@@ -726,4 +727,133 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
 
     server.abort();
     Ok(())
+}
+
+#[tokio::test]
+async fn people_index_rebuild_admin_api_supports_csrf_pagination_cancel_and_requeue()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{address}");
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "admin", "password": "correct password"}))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookies = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+
+    let initial = client
+        .get(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(initial.status(), reqwest::StatusCode::OK);
+    assert_eq!(initial.json::<Value>().await?["jobs"], json!([]));
+
+    let missing_csrf = client
+        .post(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild/{}",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let queued = client
+        .post(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild/{}",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(queued.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(queued.json::<Value>().await?["job"]["status"], "QUEUED");
+
+    let listed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild?page=1&pageSize=1"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let listed_body = listed.json::<Value>().await?;
+    assert_eq!(listed_body["total"], 1);
+    assert_eq!(listed_body["jobs"][0]["libraryId"], library.id.to_string());
+    assert_eq!(listed_body["jobs"][0]["status"], "QUEUED");
+
+    let cancelled = client
+        .post(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild/{}/cancel",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(cancelled.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        cancelled.json::<Value>().await?["job"]["status"],
+        "CANCELLED"
+    );
+
+    let requeued = client
+        .post(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild/{}",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(requeued.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(requeued.json::<Value>().await?["job"]["status"], "QUEUED");
+
+    server.abort();
+    Ok(())
+}
+
+fn cookie_pair(headers: &HeaderMap) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .find_map(|value| value.strip_prefix(&format!("{name}=")))
+        .unwrap_or_default()
+        .to_owned()
 }
