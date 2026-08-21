@@ -1,4 +1,4 @@
-use std::{fmt, io::Write, path::PathBuf, time::Duration};
+use std::{cmp::Ordering, fmt, io::Write, path::PathBuf, time::Duration};
 
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -278,6 +278,121 @@ fn select_package(entry: &PluginStoreEntry) -> Result<(&str, &str), PluginStoreE
     Err(PluginStoreError::UnsupportedPlatform)
 }
 
+pub(crate) fn is_newer_version(candidate: &str, installed: &str) -> bool {
+    let Some(candidate) = ParsedVersion::parse(candidate) else {
+        return false;
+    };
+    let Some(installed) = ParsedVersion::parse(installed) else {
+        return false;
+    };
+    candidate > installed
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedVersion {
+    core: [u64; 3],
+    prerelease: Option<Vec<VersionIdentifier>>,
+}
+
+impl Ord for ParsedVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.core.cmp(&other.core) {
+            Ordering::Equal => match (&self.prerelease, &other.prerelease) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(right),
+            },
+            ordering => ordering,
+        }
+    }
+}
+
+impl PartialOrd for ParsedVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum VersionIdentifier {
+    Numeric(u64),
+    Text(String),
+}
+
+impl Ord for VersionIdentifier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Numeric(left), Self::Numeric(right)) => left.cmp(right),
+            (Self::Numeric(_), Self::Text(_)) => Ordering::Less,
+            (Self::Text(_), Self::Numeric(_)) => Ordering::Greater,
+            (Self::Text(left), Self::Text(right)) => left.cmp(right),
+        }
+    }
+}
+
+impl PartialOrd for VersionIdentifier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl ParsedVersion {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty() || value.starts_with('v') {
+            return None;
+        }
+        let value = value.split_once('+').map_or(value, |(value, _)| value);
+        let (core, prerelease) = value
+            .split_once('-')
+            .map_or((value, None), |(core, prerelease)| (core, Some(prerelease)));
+        let mut core_parts = core.split('.');
+        let core = [
+            parse_version_number(core_parts.next()?)?,
+            parse_version_number(core_parts.next()?)?,
+            parse_version_number(core_parts.next()?)?,
+        ];
+        if core_parts.next().is_some() {
+            return None;
+        }
+        let prerelease = match prerelease {
+            Some(value) => Some(
+                value
+                    .split('.')
+                    .map(|identifier| {
+                        if identifier.is_empty() {
+                            return None;
+                        }
+                        if identifier
+                            .chars()
+                            .all(|character| character.is_ascii_digit())
+                        {
+                            if identifier.len() > 1 && identifier.starts_with('0') {
+                                return None;
+                            }
+                            return identifier.parse().ok().map(VersionIdentifier::Numeric);
+                        }
+                        identifier
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                            .then(|| VersionIdentifier::Text(identifier.to_owned()))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        Some(Self { core, prerelease })
+    }
+}
+
+fn parse_version_number(value: &str) -> Option<u64> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn current_platform_and_arch() -> (&'static str, &'static str) {
     let platform = match std::env::consts::OS {
         "macos" => "darwin",
@@ -422,7 +537,7 @@ const DEFAULT_PLUGIN_INDEX_JSON: &str = r#"
   "formatVersion": 1,
   "plugins": [
     {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.5","runtime":"process","capabilities":["metadata.search","metadata.get","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.tmdb-0.1.5-linux-aarch64.zip","sha256":"88e4683d6668fa75ec4accf355bd7edb176e50bf2e748a36aba99971a7c285fe"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.tmdb-0.1.5-linux-x86_64.zip","sha256":"fb2f07c5aaaa627dd89d68fbe5ccd5995c11475f7a9a933ee9dcc3b41367a4fb"}]},
-    {"id":"org.lux.strm-media-info","name":"strm媒体信息提取","description":"使用 ffprobe 提取媒体信息，并使用 ffmpeg 补全 STRM 缩略图。","category":"MEDIA","version":"0.2.0","runtime":"process","capabilities":["media.probe"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-aarch64.zip","sha256":"22977b5f23ab94c22c4e5be83888099f03079570e6b4953e5aea238735fabf82"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-x86_64.zip","sha256":"65411be32c8566a511d21a02ebd54e326f79f1225750d496fcae85c1302bc50c"}]},
+    {"id":"org.lux.strm-media-info","name":"strm媒体信息提取","description":"使用 ffprobe 提取媒体信息，并使用 ffmpeg 生成同时作为海报和缩略图的 STRM 截图。","category":"MEDIA","version":"0.2.0","runtime":"process","capabilities":["media.probe"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-aarch64.zip","sha256":"22977b5f23ab94c22c4e5be83888099f03079570e6b4953e5aea238735fabf82"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-x86_64.zip","sha256":"65411be32c8566a511d21a02ebd54e326f79f1225750d496fcae85c1302bc50c"}]},
     {"id":"org.lux.ip-hiofd","name":"IP归属地查询增强","description":"通过 Hiofd 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.ip-hiofd-0.1.0-linux-aarch64.zip","sha256":"f2e93e49e9b3507cd400720fe0a6480e16e146a1fd15abf945ba861a53255db9"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.ip-hiofd-0.1.0-linux-x86_64.zip","sha256":"d734697e3fafa490a1ade0698f2d1ca74d93d894d3ac23d3098564046bfdaab6"}]},
     {"id":"org.lux.qoo-ip138","name":"ip138 IP归属地查询","description":"通过 ipshudi.com 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.qoo-ip138-0.1.0-linux-aarch64.zip","sha256":"8b7879c4d6e82b823f476f8672b878b3aa127ab76c164492317a23a243632bd7"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.qoo-ip138-0.1.0-linux-x86_64.zip","sha256":"9423cfd53247ba55b6ec64fdbc0d9066ae73599c0fd35df8bf609446ca4a971f"}]},
     {"id":"org.lux.intro-outro-detector","name":"片头片尾检测","description":"使用带位误差容忍、对齐和跨分集共识的有界 Chromaprint 指纹识别共同片头和片尾。","category":"MEDIA","version":"0.2.0","runtime":"process","capabilities":["chapters.detect"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.intro-outro-detector-0.2.0-linux-aarch64.zip","sha256":"f158f0b933ce16e8f90d955d3cf98703333397b93dfb588154d1b5ec53539a9d"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.intro-outro-detector-0.2.0-linux-x86_64.zip","sha256":"d7889aebe26835d95de420a5ed2108642a21cfee58a3c293ea92b3b08247207e"}]},

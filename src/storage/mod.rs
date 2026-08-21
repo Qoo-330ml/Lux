@@ -749,6 +749,310 @@ impl Database {
             })
     }
 
+    pub(crate) async fn sync_person_index_rebuild_jobs(
+        &self,
+        schema_version: i64,
+    ) -> Result<Vec<StoredPersonIndexRebuildJob>, StorageError> {
+        for library_id in self.list_enabled_library_ids().await? {
+            self.query(
+                "INSERT INTO person_index_rebuild_jobs (library_id, schema_version)
+                 VALUES (?, ?)
+                 ON CONFLICT(library_id) DO UPDATE SET
+                    schema_version = excluded.schema_version,
+                    status = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 'QUEUED'
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                            THEN 'QUEUED'
+                        ELSE person_index_rebuild_jobs.status
+                    END,
+                    cursor_id = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN NULL
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                            THEN person_index_rebuild_jobs.cursor_id
+                        ELSE person_index_rebuild_jobs.cursor_id
+                    END,
+                    processed_count = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.processed_count
+                    END,
+                    total_count = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.total_count
+                    END,
+                    cancel_requested = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.cancel_requested
+                    END,
+                    run_token = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN NULL
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                            THEN NULL
+                        ELSE person_index_rebuild_jobs.run_token
+                    END,
+                    error = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN NULL
+                        ELSE person_index_rebuild_jobs.error
+                    END,
+                    updated_at = unixepoch()",
+            )
+            .bind(&library_id)
+            .bind(schema_version)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        self.list_person_index_rebuild_jobs(0, 500).await
+    }
+
+    pub(crate) async fn list_person_index_rebuild_jobs(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredPersonIndexRebuildJob>, StorageError> {
+        self.query(
+            "SELECT library_id, status, cursor_id, processed_count, total_count,
+                    cancel_requested
+             FROM person_index_rebuild_jobs
+             ORDER BY library_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(stored_person_index_rebuild_job)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn get_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+    ) -> Result<Option<StoredPersonIndexRebuildJob>, StorageError> {
+        self.query(
+            "SELECT library_id, status, cursor_id, processed_count, total_count,
+                    cancel_requested
+             FROM person_index_rebuild_jobs
+             WHERE library_id = ?",
+        )
+        .bind(library_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_person_index_rebuild_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn count_person_index_rebuild_jobs(&self) -> Result<i64, StorageError> {
+        self.query_scalar("SELECT COUNT(*) FROM person_index_rebuild_jobs")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn request_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+        schema_version: i64,
+    ) -> Result<bool, StorageError> {
+        let enabled = self
+            .query_scalar::<i64>("SELECT 1 FROM libraries WHERE id = ? AND is_enabled = 1 LIMIT 1")
+            .bind(library_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if !enabled {
+            return Ok(false);
+        }
+        self.query(
+            "INSERT INTO person_index_rebuild_jobs (
+                library_id, status, cursor_id, processed_count, total_count,
+                cancel_requested, schema_version, run_token, error,
+                created_at, updated_at, started_at, finished_at
+             ) VALUES (?, 'QUEUED', NULL, 0, 0, 0, ?, NULL, NULL,
+                       unixepoch(), unixepoch(), NULL, NULL)
+             ON CONFLICT(library_id) DO UPDATE SET
+                status = 'QUEUED', cursor_id = NULL, processed_count = 0,
+                total_count = 0, cancel_requested = 0, schema_version = excluded.schema_version,
+                run_token = NULL, error = NULL, updated_at = unixepoch(),
+                started_at = NULL, finished_at = NULL",
+        )
+        .bind(library_id)
+        .bind(schema_version)
+        .execute(&self.pool)
+        .await
+        .map(|_| true)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+        run_token: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET status = 'RUNNING', run_token = ?, started_at = unixepoch(),
+                     updated_at = unixepoch()
+                 WHERE library_id = ? AND status = 'QUEUED' AND cancel_requested = 0",
+            )
+            .bind(run_token)
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn request_person_index_rebuild_job_cancel(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET status = CASE WHEN status = 'QUEUED' THEN 'CANCELLED' ELSE status END,
+                     cancel_requested = CASE WHEN status = 'QUEUED' THEN 0 ELSE 1 END,
+                     run_token = CASE WHEN status = 'QUEUED' THEN NULL ELSE run_token END,
+                     finished_at = CASE WHEN status = 'QUEUED' THEN unixepoch() ELSE finished_at END,
+                     updated_at = unixepoch()
+                 WHERE library_id = ? AND status IN ('QUEUED', 'RUNNING')",
+            )
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn person_index_rebuild_job_cancel_requested(
+        &self,
+        library_id: &str,
+        run_token: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE
+                        WHEN status = 'RUNNING' AND run_token = ? AND cancel_requested = 0
+                            THEN 0
+                        ELSE 1
+                    END
+             FROM person_index_rebuild_jobs
+             WHERE library_id = ?",
+        )
+        .bind(run_token)
+        .bind(library_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value: Option<i64>| value != Some(0))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_person_index_rebuild_progress(
+        &self,
+        library_id: &str,
+        run_token: &str,
+        cursor_id: &str,
+        processed_count: i64,
+        total_count: i64,
+    ) -> Result<Option<()>, StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET cursor_id = ?, processed_count = ?, total_count = ?,
+                     updated_at = unixepoch()
+                 WHERE library_id = ? AND status = 'RUNNING' AND run_token = ?",
+            )
+            .bind(cursor_id)
+            .bind(processed_count)
+            .bind(total_count)
+            .bind(library_id)
+            .bind(run_token)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((result.rows_affected() == 1).then_some(()))
+    }
+
+    pub(crate) async fn finish_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+        run_token: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        if !matches!(status, "COMPLETED" | "CANCELLED" | "FAILED") {
+            return Err(StorageError::Conflict(
+                "invalid person index rebuild status".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                     error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                     run_token = NULL, finished_at = unixepoch(), updated_at = unixepoch()
+                 WHERE library_id = ? AND status = 'RUNNING' AND run_token = ?",
+            )
+            .bind(status)
+            .bind(error)
+            .bind(library_id)
+            .bind(run_token)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn create_notification_destination(
         &self,
         destination: NewNotificationDestination<'_>,
@@ -1310,10 +1614,21 @@ impl Database {
         Ok(value.filter(|value| !value.trim().is_empty()))
     }
 
+    #[cfg(test)]
     pub(crate) async fn replace_person_credits(
         &self,
         item_id: &str,
         credits: &[NewPersonCredit],
+    ) -> Result<(), StorageError> {
+        self.replace_person_credits_with_fingerprint(item_id, credits, None)
+            .await
+    }
+
+    pub(crate) async fn replace_person_credits_with_fingerprint(
+        &self,
+        item_id: &str,
+        credits: &[NewPersonCredit],
+        source_fingerprint: Option<&str>,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -1378,6 +1693,23 @@ impl Database {
                 source,
             })?;
         }
+        self.query(
+            "INSERT INTO person_index_item_state (
+                item_id, source_fingerprint, relation_schema_version, updated_at
+             ) VALUES (?, ?, 2, unixepoch())
+             ON CONFLICT(item_id) DO UPDATE SET
+                source_fingerprint = excluded.source_fingerprint,
+                relation_schema_version = excluded.relation_schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(item_id)
+        .bind(source_fingerprint)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         transaction
             .commit()
             .await
@@ -1386,6 +1718,42 @@ impl Database {
                 source,
             })?;
         Ok(())
+    }
+
+    pub(crate) async fn clear_person_credits(&self, item_id: &str) -> Result<u64, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let result = self
+            .query("DELETE FROM person_credits WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query("DELETE FROM person_index_item_state WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
     }
 
     pub(crate) async fn resolve_or_create_canonical_person(
@@ -2488,10 +2856,17 @@ impl Database {
             "SELECT DISTINCT pc.item_id
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                AND pc.person_type = ?
-               AND pc.person_id = ?
+               AND (
+                   pc.person_id = ?
+                   OR pc.lux_person_id = ?
+                   OR pi.person_id = ?
+               )
              ORDER BY pc.item_id"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -2500,6 +2875,8 @@ impl Database {
         }
         let rows = statement
             .bind(person_type)
+            .bind(person_id)
+            .bind(person_id)
             .bind(person_id)
             .fetch_all(&self.pool)
             .await
@@ -2532,8 +2909,11 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let person_group =
-            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
+        let person_group = "COALESCE(
+            NULLIF(pc.lux_person_id, ''),
+            NULLIF(pi.person_id, ''),
+            pc.provider || ':' || pc.person_id
+        )";
         let person_sort_order = person_sort_order(options.sort_by, options.descending);
         let recursive_clause = if options.recursive {
             String::new()
@@ -2545,6 +2925,9 @@ impl Database {
                  SELECT {person_group}
                  FROM person_credits pc
                  JOIN media_items mi ON mi.id = pc.item_id
+                 LEFT JOIN person_identities pi
+                   ON pi.provider = pc.provider
+                  AND pi.provider_id = pc.person_id
                  WHERE mi.library_id IN ({placeholders})
                    AND mi.removed_at IS NULL
                    {recursive_clause}
@@ -2591,6 +2974,9 @@ impl Database {
                     MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                {recursive_clause}
@@ -2636,8 +3022,11 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let person_group =
-            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
+        let person_group = "COALESCE(
+            NULLIF(pc.lux_person_id, ''),
+            NULLIF(pi.person_id, ''),
+            pc.provider || ':' || pc.person_id
+        )";
         let query = format!(
             "SELECT MIN(pc.item_id) AS item_id,
                     MIN(pc.person_id) AS person_id,
@@ -2660,10 +3049,17 @@ impl Database {
                     MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                AND pc.person_type = ?
-               AND (pc.person_id = ? OR pc.lux_person_id = ?)
+               AND (
+                   pc.person_id = ?
+                   OR pc.lux_person_id = ?
+                   OR pi.person_id = ?
+               )
              GROUP BY {person_group}
              ORDER BY CASE WHEN MIN(pc.provider) = '' THEN 1 ELSE 0 END,
                       MIN(pc.provider) ASC,
@@ -2675,6 +3071,7 @@ impl Database {
         }
         let rows = statement
             .bind(person_type)
+            .bind(person_id)
             .bind(person_id)
             .bind(person_id)
             .fetch_all(&self.pool)
@@ -2701,8 +3098,11 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let person_group =
-            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
+        let person_group = "COALESCE(
+            NULLIF(pc.lux_person_id, ''),
+            NULLIF(pi.person_id, ''),
+            pc.provider || ':' || pc.person_id
+        )";
         let query = format!(
             "SELECT MIN(pc.item_id) AS item_id,
                     MIN(pc.person_id) AS person_id,
@@ -2725,6 +3125,9 @@ impl Database {
                     MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                AND pc.person_type = ?
@@ -2878,6 +3281,84 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn list_person_index_item_ids(
+        &self,
+        library_id: &str,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let sql = if after_id.is_some() {
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+               AND id > ?
+             ORDER BY id LIMIT ?"
+        } else {
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+             ORDER BY id LIMIT ?"
+        };
+        let mut query = self.query_scalar::<String>(sql).bind(library_id);
+        if let Some(after_id) = after_id {
+            query = query.bind(after_id);
+        }
+        query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn count_person_index_items(
+        &self,
+        library_id: &str,
+    ) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn person_index_item_state_is_current(
+        &self,
+        item_id: &str,
+        source_fingerprint: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let Some(source_fingerprint) = source_fingerprint else {
+            return Ok(false);
+        };
+        let row = self
+            .query(
+                "SELECT source_fingerprint, relation_schema_version
+                 FROM person_index_item_state WHERE item_id = ?",
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(row.is_some_and(|row| {
+            row.get::<Option<String>, _>("source_fingerprint")
+                .as_deref()
+                == Some(source_fingerprint)
+                && row.get::<i64, _>("relation_schema_version") == 2
+        }))
     }
 
     pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
@@ -5773,8 +6254,9 @@ impl Database {
                 source,
             })?;
         self.query(
-            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode)
-             VALUES (?, 'QUEUED', ?, ?)",
+            "INSERT INTO metadata_reidentify_jobs (
+                id, status, total_count, mode, library_id, job_scope
+             ) VALUES (?, 'QUEUED', ?, ?, NULL, 'ITEMS')",
         )
         .bind(job_id)
         .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
@@ -5799,6 +6281,28 @@ impl Database {
                 source,
             })?;
         }
+        self.query(
+            "UPDATE metadata_reidentify_jobs
+             SET library_id = (
+                 SELECT CASE
+                     WHEN MIN(media_items.library_id) = MAX(media_items.library_id)
+                         THEN MIN(media_items.library_id)
+                     ELSE NULL
+                 END
+                 FROM metadata_reidentify_job_items
+                 JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
+                 WHERE metadata_reidentify_job_items.job_id = ?
+             )
+             WHERE id = ?",
+        )
+        .bind(job_id)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         transaction
             .commit()
             .await
@@ -5811,16 +6315,19 @@ impl Database {
     pub(crate) async fn create_metadata_reidentify_library_job(
         &self,
         job_id: &str,
+        library_id: &str,
         item_ids: &[String],
         mode: &str,
     ) -> Result<(), StorageError> {
         self.query(
-            "INSERT INTO metadata_reidentify_jobs (id, status, total_count, mode)
-             VALUES (?, 'CANCELLED', ?, ?)",
+            "INSERT INTO metadata_reidentify_jobs (
+                id, status, total_count, mode, library_id, job_scope
+             ) VALUES (?, 'CANCELLED', ?, ?, ?, 'LIBRARY')",
         )
         .bind(job_id)
         .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
         .bind(mode)
+        .bind(library_id)
         .execute(&self.pool)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -5880,25 +6387,25 @@ impl Database {
         job_id: &str,
     ) -> Result<Option<StoredMetadataReidentifyJob>, StorageError> {
         self.query(
-            "SELECT id, status, processed_count, total_count, error,
-                    created_at, updated_at, started_at, finished_at, mode,
-                    cancel_requested,
-                    (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
-                            THEN MIN(media_items.library_id)
-                            ELSE NULL END
-                     FROM metadata_reidentify_job_items
-                     JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
-                     WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                    ) AS library_id,
-                    (SELECT COUNT(DISTINCT pending_candidates.item_id)
-                     FROM metadata_candidates pending_candidates
-                     JOIN metadata_reidentify_job_items pending_job_items
-                       ON pending_job_items.item_id = pending_candidates.item_id
-                      AND pending_job_items.job_id = metadata_reidentify_jobs.id
-                     WHERE pending_candidates.status = 'PENDING'
-                    ) AS pending_count
-             FROM metadata_reidentify_jobs WHERE id = ?",
+            "WITH pending_counts AS (
+                 SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
+                 FROM metadata_reidentify_job_items job_items
+                 JOIN metadata_candidates candidates
+                   ON candidates.item_id = job_items.item_id
+                 WHERE job_items.job_id = ?
+                   AND candidates.status = 'PENDING'
+                 GROUP BY job_items.job_id
+             )
+             SELECT jobs.id, jobs.status, jobs.processed_count, jobs.total_count,
+                    jobs.error, jobs.created_at, jobs.updated_at, jobs.started_at,
+                    jobs.finished_at, jobs.mode, jobs.cancel_requested,
+                    jobs.library_id, jobs.job_scope,
+                    COALESCE(pending_counts.pending_count, 0) AS pending_count
+             FROM metadata_reidentify_jobs jobs
+             LEFT JOIN pending_counts ON pending_counts.job_id = jobs.id
+             WHERE jobs.id = ?",
         )
+        .bind(job_id)
         .bind(job_id)
         .fetch_optional(&self.pool)
         .await
@@ -5917,25 +6424,33 @@ impl Database {
     ) -> Result<Vec<StoredMetadataReidentifyJob>, StorageError> {
         let rows = if let Some(status) = status {
             self.query(
-                "SELECT id, status, processed_count, total_count, error,
-                        created_at, updated_at, started_at, finished_at, mode,
-                        cancel_requested,
-                        (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
-                                THEN MIN(media_items.library_id)
-                                ELSE NULL END
-                         FROM metadata_reidentify_job_items
-                         JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
-                         WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                        ) AS library_id,
-                        (SELECT COUNT(DISTINCT pending_candidates.item_id)
-                         FROM metadata_candidates pending_candidates
-                         JOIN metadata_reidentify_job_items pending_job_items
-                           ON pending_job_items.item_id = pending_candidates.item_id
-                          AND pending_job_items.job_id = metadata_reidentify_jobs.id
-                         WHERE pending_candidates.status = 'PENDING'
-                        ) AS pending_count
-                 FROM metadata_reidentify_jobs WHERE status = ?
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                "WITH selected_jobs AS (
+                     SELECT id, status, processed_count, total_count, error,
+                            created_at, updated_at, started_at, finished_at, mode,
+                            cancel_requested, library_id, job_scope
+                     FROM metadata_reidentify_jobs
+                     WHERE status = ?
+                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+                 ), pending_counts AS (
+                     SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
+                     FROM metadata_reidentify_job_items job_items
+                     JOIN selected_jobs ON selected_jobs.id = job_items.job_id
+                     JOIN metadata_candidates candidates
+                       ON candidates.item_id = job_items.item_id
+                      AND candidates.status = 'PENDING'
+                     GROUP BY job_items.job_id
+                 )
+                 SELECT selected_jobs.id, selected_jobs.status,
+                        selected_jobs.processed_count, selected_jobs.total_count,
+                        selected_jobs.error, selected_jobs.created_at,
+                        selected_jobs.updated_at, selected_jobs.started_at,
+                        selected_jobs.finished_at, selected_jobs.mode,
+                        selected_jobs.cancel_requested, selected_jobs.library_id,
+                        selected_jobs.job_scope,
+                        COALESCE(pending_counts.pending_count, 0) AS pending_count
+                 FROM selected_jobs
+                 LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id
+                 ORDER BY selected_jobs.created_at DESC, selected_jobs.id DESC",
             )
             .bind(status)
             .bind(limit)
@@ -5944,25 +6459,32 @@ impl Database {
             .await
         } else {
             self.query(
-                "SELECT id, status, processed_count, total_count, error,
-                        created_at, updated_at, started_at, finished_at, mode,
-                        cancel_requested,
-                        (SELECT CASE WHEN COUNT(DISTINCT media_items.library_id) = 1
-                                THEN MIN(media_items.library_id)
-                                ELSE NULL END
-                         FROM metadata_reidentify_job_items
-                         JOIN media_items ON media_items.id = metadata_reidentify_job_items.item_id
-                         WHERE metadata_reidentify_job_items.job_id = metadata_reidentify_jobs.id
-                        ) AS library_id,
-                        (SELECT COUNT(DISTINCT pending_candidates.item_id)
-                         FROM metadata_candidates pending_candidates
-                         JOIN metadata_reidentify_job_items pending_job_items
-                           ON pending_job_items.item_id = pending_candidates.item_id
-                          AND pending_job_items.job_id = metadata_reidentify_jobs.id
-                         WHERE pending_candidates.status = 'PENDING'
-                        ) AS pending_count
-                 FROM metadata_reidentify_jobs
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                "WITH selected_jobs AS (
+                     SELECT id, status, processed_count, total_count, error,
+                            created_at, updated_at, started_at, finished_at, mode,
+                            cancel_requested, library_id, job_scope
+                     FROM metadata_reidentify_jobs
+                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+                 ), pending_counts AS (
+                     SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
+                     FROM metadata_reidentify_job_items job_items
+                     JOIN selected_jobs ON selected_jobs.id = job_items.job_id
+                     JOIN metadata_candidates candidates
+                       ON candidates.item_id = job_items.item_id
+                      AND candidates.status = 'PENDING'
+                     GROUP BY job_items.job_id
+                 )
+                 SELECT selected_jobs.id, selected_jobs.status,
+                        selected_jobs.processed_count, selected_jobs.total_count,
+                        selected_jobs.error, selected_jobs.created_at,
+                        selected_jobs.updated_at, selected_jobs.started_at,
+                        selected_jobs.finished_at, selected_jobs.mode,
+                        selected_jobs.cancel_requested, selected_jobs.library_id,
+                        selected_jobs.job_scope,
+                        COALESCE(pending_counts.pending_count, 0) AS pending_count
+                 FROM selected_jobs
+                 LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id
+                 ORDER BY selected_jobs.created_at DESC, selected_jobs.id DESC",
             )
             .bind(limit)
             .bind(offset)
@@ -5974,6 +6496,25 @@ impl Database {
                 .map(stored_metadata_reidentify_job)
                 .collect()
         })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn active_library_metadata_reidentify_job_id(
+        &self,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id
+             FROM metadata_reidentify_jobs
+             WHERE job_scope = 'LIBRARY'
+               AND status IN ('QUEUED', 'RUNNING')
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -6168,6 +6709,25 @@ impl Database {
                 source,
             })?;
         Ok(affected)
+    }
+
+    pub(crate) async fn requeue_running_metadata_reidentify_items(
+        &self,
+        job_id: &str,
+    ) -> Result<u64, StorageError> {
+        self.query(
+            "UPDATE metadata_reidentify_job_items
+             SET status = 'PENDING', error = NULL, updated_at = unixepoch()
+             WHERE job_id = ? AND status = 'RUNNING'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn finish_metadata_reidentify_job(
@@ -8049,6 +8609,31 @@ impl Database {
                     source,
                 })?;
         }
+        let strm_item_ids = source_rows
+            .iter()
+            .filter(|(index, _, _)| files[*index].source_kind == "STRM_URL")
+            .map(|(_, item_id, _)| item_id)
+            .collect::<HashSet<_>>();
+        for item_id in strm_item_ids {
+            self.query(
+                "UPDATE media_items
+                 SET poster_fallback_required = 1
+                 WHERE id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM item_images
+                       WHERE item_id = media_items.id
+                         AND image_type IN ('POSTER', 'THUMB')
+                         AND image_index = 0
+                   )",
+            )
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -8994,7 +9579,7 @@ impl Database {
                  provider_ids_json = ?,
                  identification_status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
-                 thumbnail_fallback_required = ?
+                 poster_fallback_required = ?
              WHERE id = ? AND removed_at IS NULL",
         )
         .bind(update.title)
@@ -9014,7 +9599,7 @@ impl Database {
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
-        .bind(database_flag(update.thumbnail_fallback_required))
+        .bind(database_flag(update.poster_fallback_required))
         .bind(update.item_id)
         .execute(&mut *transaction)
         .await
@@ -10728,6 +11313,7 @@ impl Database {
         &self,
         source: NewMediaSource<'_>,
     ) -> Result<(), StorageError> {
+        let is_strm = source.source_kind == "STRM_URL";
         self.query(
             "INSERT INTO media_sources (
                 id, item_id, source_kind, filesystem_entry_id,
@@ -10752,7 +11338,28 @@ impl Database {
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        if is_strm {
+            self.query(
+                "UPDATE media_items
+                 SET poster_fallback_required = 1
+                 WHERE id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM item_images
+                       WHERE item_id = media_items.id
+                         AND image_type IN ('POSTER', 'THUMB')
+                         AND image_index = 0
+                   )",
+            )
+            .bind(source.item_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn list_media_sources_for_library_page(
@@ -11460,7 +12067,7 @@ impl Database {
         let rows = if let Some(after_source_id) = after_source_id {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
-                        mi.thumbnail_fallback_required,
+                        mi.poster_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -11490,7 +12097,7 @@ impl Database {
         } else {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
-                        mi.thumbnail_fallback_required,
+                        mi.poster_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -11522,8 +12129,7 @@ impl Database {
                 .map(|row| StoredStrmMediaSource {
                     source_id: row.get("source_id"),
                     item_id: row.get("item_id"),
-                    thumbnail_fallback_required: row.get::<i64, _>("thumbnail_fallback_required")
-                        != 0,
+                    poster_fallback_required: row.get::<i64, _>("poster_fallback_required") != 0,
                     has_media_info: row.get::<i64, _>("has_media_info") != 0,
                     external_url: row.get("external_url"),
                     root_path: row.get("root_path"),
@@ -11568,7 +12174,7 @@ impl Database {
         let rows = if let Some(after_source_id) = after_source_id {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
-                        mi.thumbnail_fallback_required,
+                        mi.poster_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -11610,7 +12216,7 @@ impl Database {
         } else {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
-                        mi.thumbnail_fallback_required,
+                        mi.poster_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -11654,8 +12260,7 @@ impl Database {
                 .map(|row| StoredStrmMediaSource {
                     source_id: row.get("source_id"),
                     item_id: row.get("item_id"),
-                    thumbnail_fallback_required: row.get::<i64, _>("thumbnail_fallback_required")
-                        != 0,
+                    poster_fallback_required: row.get::<i64, _>("poster_fallback_required") != 0,
                     has_media_info: row.get::<i64, _>("has_media_info") != 0,
                     external_url: row.get("external_url"),
                     root_path: row.get("root_path"),
@@ -13133,14 +13738,14 @@ impl Database {
         })
     }
 
-    pub(crate) async fn set_thumbnail_fallback_required(
+    pub(crate) async fn set_poster_fallback_required(
         &self,
         item_id: &str,
         required: bool,
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_items
-             SET thumbnail_fallback_required = ?
+             SET poster_fallback_required = ?
              WHERE id = ?",
         )
         .bind(database_flag(required))
@@ -13360,6 +13965,28 @@ impl Database {
         .bind(image_type)
         .fetch_optional(&self.pool)
         .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn item_image_path_is_shared(
+        &self,
+        local_path: &str,
+        image_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM item_images
+                 WHERE local_path = ? AND id <> ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(local_path)
+        .bind(image_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -13784,6 +14411,17 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
         source,
     })?;
     if has_legacy_unique == 0 {
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_media_items_people_visible
+             ON media_items(library_id, id)
+             WHERE removed_at IS NULL",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.to_path_buf(),
+            source,
+        })?;
         return Ok(());
     }
 
@@ -13841,7 +14479,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 status TEXT,
                 original_language TEXT,
                 has_available_source INTEGER NOT NULL DEFAULT 0 CHECK (has_available_source IN (0, 1)),
-                thumbnail_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (thumbnail_fallback_required IN (0, 1)),
+                poster_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (poster_fallback_required IN (0, 1)),
                 nfo_metadata_json TEXT,
                 nfo_metadata_fingerprint BLOB
             )",
@@ -13851,7 +14489,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
                 locked_fields_json, identification_status, added_at, removed_at,
                 metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
-                original_language, has_available_source, thumbnail_fallback_required,
+                original_language, has_available_source, poster_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
              )
              SELECT
@@ -13860,7 +14498,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
                 locked_fields_json, identification_status, added_at, removed_at,
                 metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
-                original_language, has_available_source, thumbnail_fallback_required,
+                original_language, has_available_source, poster_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
              FROM media_items",
             "DROP TABLE media_items",
@@ -13875,6 +14513,9 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
              ON media_items(series_id, removed_at)",
             "CREATE INDEX idx_media_items_library_type_visible
              ON media_items(library_id, item_type, id)
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_people_visible
+             ON media_items(library_id, id)
              WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
@@ -14657,6 +15298,27 @@ fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredPersonIndexRebuildJob {
+    pub(crate) library_id: String,
+    pub(crate) status: String,
+    pub(crate) cursor_id: Option<String>,
+    pub(crate) processed_count: i64,
+    pub(crate) total_count: i64,
+    pub(crate) cancel_requested: bool,
+}
+
+fn stored_person_index_rebuild_job(row: sqlx::any::AnyRow) -> StoredPersonIndexRebuildJob {
+    StoredPersonIndexRebuildJob {
+        library_id: row.get("library_id"),
+        status: row.get("status"),
+        cursor_id: row.get("cursor_id"),
+        processed_count: row.get("processed_count"),
+        total_count: row.get("total_count"),
+        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredCollectionRefresh {
     pub(crate) collection_item_id: String,
     pub(crate) member_count: usize,
@@ -14735,6 +15397,7 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) mode: String,
     pub(crate) cancel_requested: bool,
     pub(crate) library_id: Option<String>,
+    pub(crate) job_scope: String,
     pub(crate) pending_count: i64,
 }
 
@@ -14762,6 +15425,7 @@ fn stored_metadata_reidentify_job(row: sqlx::any::AnyRow) -> StoredMetadataReide
         mode: row.get("mode"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         library_id: row.get("library_id"),
+        job_scope: row.get("job_scope"),
         pending_count: row.get("pending_count"),
     }
 }
@@ -15365,7 +16029,7 @@ pub(crate) struct StoredThumbnailSource {
 pub(crate) struct StoredStrmMediaSource {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
-    pub(crate) thumbnail_fallback_required: bool,
+    pub(crate) poster_fallback_required: bool,
     pub(crate) has_media_info: bool,
     pub(crate) external_url: Option<String>,
     pub(crate) root_path: String,
@@ -15669,7 +16333,7 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
-    pub(crate) thumbnail_fallback_required: bool,
+    pub(crate) poster_fallback_required: bool,
     pub(crate) keep_pending: bool,
 }
 
@@ -15948,6 +16612,174 @@ mod tests {
         config::{Config, PostgresConnection},
         library::LibraryKind,
     };
+
+    #[tokio::test]
+    async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                AnyConnectOptions::from_str("sqlite://?mode=memory")
+                    .expect("in-memory SQLite options"),
+            )
+            .await
+            .expect("in-memory SQLite connection");
+        sqlx::query(
+            "CREATE TABLE metadata_reidentify_jobs (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                processed_count INTEGER NOT NULL,
+                total_count INTEGER NOT NULL,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                mode TEXT NOT NULL,
+                cancel_requested INTEGER NOT NULL,
+                library_id TEXT,
+                job_scope TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata jobs table");
+        sqlx::query(
+            "CREATE TABLE metadata_reidentify_job_items (
+                job_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata job items table");
+        sqlx::query(
+            "CREATE TABLE metadata_candidates (
+                item_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata candidates table");
+        sqlx::query(
+            "CREATE INDEX idx_metadata_reidentify_items_status
+             ON metadata_reidentify_job_items(job_id, status, item_id)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata job item index");
+        sqlx::query(
+            "CREATE INDEX idx_metadata_candidates_item
+             ON metadata_candidates(item_id, status)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata candidate index");
+        for (id, created_at) in [("older", 1_i64), ("newer", 2_i64)] {
+            sqlx::query(
+                "INSERT INTO metadata_reidentify_jobs (
+                    id, status, processed_count, total_count, error,
+                    created_at, updated_at, started_at, finished_at, mode,
+                    cancel_requested, library_id, job_scope
+                 ) VALUES (?, 'QUEUED', 0, 2, NULL, ?, ?, NULL, NULL,
+                           'REIDENTIFY', 0, NULL, 'ITEMS')",
+            )
+            .bind(id)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert metadata job");
+        }
+        for (job_id, item_id) in [("older", "old-item"), ("newer", "new-item")] {
+            sqlx::query(
+                "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+                 VALUES (?, ?, 'PENDING')",
+            )
+            .bind(job_id)
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .expect("insert metadata job item");
+        }
+        sqlx::query(
+            "INSERT INTO metadata_candidates (item_id, status)
+             VALUES ('old-item', 'PENDING'), ('new-item', 'PENDING'),
+                    ('new-item', 'PENDING')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert metadata candidates");
+
+        let database = Database {
+            pool,
+            path: PathBuf::from("metadata-summary-test.db"),
+            server_id: "test".to_owned(),
+            backend: DatabaseBackend::Sqlite,
+        };
+        let jobs = database
+            .list_metadata_reidentify_jobs(None, 0, 1)
+            .await
+            .expect("list metadata jobs");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "newer");
+        assert_eq!(jobs[0].pending_count, 1);
+
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             WITH selected_jobs AS (
+                 SELECT id
+                 FROM metadata_reidentify_jobs
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1 OFFSET 0
+             ), pending_counts AS (
+                 SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
+                 FROM metadata_reidentify_job_items job_items
+                 JOIN selected_jobs ON selected_jobs.id = job_items.job_id
+                 JOIN metadata_candidates candidates
+                   ON candidates.item_id = job_items.item_id
+                  AND candidates.status = 'PENDING'
+                 GROUP BY job_items.job_id
+             )
+             SELECT selected_jobs.id, pending_counts.pending_count
+             FROM selected_jobs
+             LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("explain metadata summary query");
+        let plan_details = plan
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            plan_details.iter().any(|detail| detail
+                .contains("USING COVERING INDEX idx_metadata_reidentify_items_status")),
+            "metadata summary should seek selected job items by job_id: {plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("USING COVERING INDEX idx_metadata_candidates_item")),
+            "metadata summary should seek candidates by item_id: {plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .all(|detail| !detail.contains("SCAN metadata_reidentify_job_items")),
+            "metadata summary must not scan all job items: {plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .all(|detail| !detail.contains("SCAN metadata_candidates")),
+            "metadata summary must not scan all candidates: {plan_details:?}"
+        );
+        database.close().await;
+    }
 
     #[tokio::test]
     async fn person_credits_migration_creates_the_index_table() {
@@ -17078,6 +17910,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn person_index_rebuild_tasks_are_token_guarded_and_requeueable() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("People", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+
+        let jobs = database
+            .sync_person_index_rebuild_jobs(1)
+            .await
+            .expect("sync jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "QUEUED");
+        assert!(
+            database
+                .claim_person_index_rebuild_job(&library_id, "run-a")
+                .await
+                .expect("claim first run")
+        );
+        sqlx::query(
+            "UPDATE person_index_rebuild_jobs
+             SET updated_at = unixepoch() - 61
+             WHERE library_id = ?",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("mark interrupted run stale");
+        let recovered_jobs = database
+            .sync_person_index_rebuild_jobs(1)
+            .await
+            .expect("recover stale run");
+        assert_eq!(recovered_jobs[0].status, "QUEUED");
+        let recovered_token: Option<String> = sqlx::query_scalar(
+            "SELECT run_token FROM person_index_rebuild_jobs WHERE library_id = ?",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("read recovered token");
+        assert_eq!(recovered_token, None);
+        assert!(
+            database
+                .claim_person_index_rebuild_job(&library_id, "run-b")
+                .await
+                .expect("claim recovered run")
+        );
+        assert!(
+            database
+                .request_person_index_rebuild_job_cancel(&library_id)
+                .await
+                .expect("request cancellation")
+        );
+        assert!(
+            database
+                .request_person_index_rebuild_job(&library_id, 1)
+                .await
+                .expect("requeue job")
+        );
+        assert!(
+            !database
+                .finish_person_index_rebuild_job(&library_id, "run-a", "COMPLETED", None)
+                .await
+                .expect("ignore stale completion")
+        );
+        assert!(
+            !database
+                .finish_person_index_rebuild_job(&library_id, "run-b", "COMPLETED", None)
+                .await
+                .expect("ignore cancelled run completion")
+        );
+        assert!(
+            database
+                .claim_person_index_rebuild_job(&library_id, "run-c")
+                .await
+                .expect("claim requeued run")
+        );
+        assert!(
+            database
+                .update_person_index_rebuild_progress(&library_id, "run-a", "item-a", 1, 2)
+                .await
+                .expect("ignore stale progress")
+                .is_none()
+        );
+        assert!(
+            database
+                .update_person_index_rebuild_progress(&library_id, "run-c", "item-c", 2, 2)
+                .await
+                .expect("update progress")
+                .is_some()
+        );
+        assert!(
+            database
+                .finish_person_index_rebuild_job(&library_id, "run-c", "COMPLETED", None)
+                .await
+                .expect("finish current run")
+        );
+        let jobs = database
+            .list_person_index_rebuild_jobs(0, 20)
+            .await
+            .expect("list jobs");
+        assert_eq!(jobs[0].status, "COMPLETED");
+        assert_eq!(jobs[0].processed_count, 2);
+    }
+
+    #[tokio::test]
+    async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("People", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        for item_id in ["item-a", "item-b", "item-c"] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await
+            .expect("media item");
+        }
+        let first_page = database
+            .list_person_index_item_ids(&library_id, None, 2)
+            .await
+            .expect("first keyset page");
+        assert_eq!(first_page, ["item-a", "item-b"]);
+        let second_page = database
+            .list_person_index_item_ids(&library_id, first_page.last().map(String::as_str), 2)
+            .await
+            .expect("second keyset page");
+        assert_eq!(second_page, ["item-c"]);
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-ab', ?, 'MOVIE', 'item-ab', 'item-ab', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("insert item before the cursor");
+        let second_page_after_insert = database
+            .list_person_index_item_ids(&library_id, first_page.last().map(String::as_str), 2)
+            .await
+            .expect("second keyset page after insert");
+        assert_eq!(second_page_after_insert, ["item-c"]);
+        sqlx::query("DELETE FROM media_items WHERE id = 'item-c'")
+            .execute(database.pool())
+            .await
+            .expect("delete item after the cursor");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-z', ?, 'MOVIE', 'item-z', 'item-z', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("insert item after the cursor");
+        let second_page_after_delete = database
+            .list_person_index_item_ids(&library_id, first_page.last().map(String::as_str), 2)
+            .await
+            .expect("second keyset page after delete");
+        assert_eq!(second_page_after_delete, ["item-z"]);
+
+        database
+            .replace_person_credits_with_fingerprint("item-a", &[], Some("fingerprint-a"))
+            .await
+            .expect("store fingerprint");
+        assert!(
+            database
+                .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+                .await
+                .expect("same fingerprint")
+        );
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-a", None)
+                .await
+                .expect("missing fingerprint must not be current")
+        );
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-a", Some("fingerprint-b"))
+                .await
+                .expect("changed fingerprint")
+        );
+        sqlx::query(
+            "UPDATE person_index_item_state
+             SET relation_schema_version = 3
+             WHERE item_id = 'item-a'",
+        )
+        .execute(database.pool())
+        .await
+        .expect("change relation schema version");
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+                .await
+                .expect("changed relation schema version")
+        );
+        database
+            .clear_person_credits("item-a")
+            .await
+            .expect("clear person credits");
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+                .await
+                .expect("cleared relation must be rebuilt")
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires a local PostgreSQL instance"]
     async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
         let temp_dir = tempfile::tempdir().expect("temporary directory");
@@ -17146,7 +18208,7 @@ mod tests {
             metadata_fingerprint: &[],
             provenance_json: "{}",
             locked_fields_json: "[]",
-            thumbnail_fallback_required: false,
+            poster_fallback_required: false,
             keep_pending,
         };
 

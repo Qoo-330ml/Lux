@@ -1,7 +1,7 @@
 use crate::application::{
     scraper::{ScraperGetRequest, ScraperItemType, ScraperSearchRequest, ScraperSearchResult},
     tmdb::{TmdbError, TmdbMovieSummary},
-    tmdb_plugin::TmdbProvider,
+    tmdb_plugin::ScraperProvider,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,13 +96,13 @@ impl IdentificationCandidate for ScraperSearchResult {
 
 #[derive(Clone)]
 pub struct MovieIdentifier {
-    client: TmdbProvider,
+    client: ScraperProvider,
 }
 
 impl MovieIdentifier {
     pub fn new<T>(client: T) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             client: client.into(),

@@ -5,7 +5,7 @@ use crate::{
         metadata_objects::{MetadataObjectError, MetadataObjectSnapshot, MetadataObjectStore},
         scraper::{ScraperError, ScraperGetRequest, ScraperItemType, ScraperResolver},
         tmdb::TmdbError,
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
     },
     storage::{Database, NewCollection, StorageError},
 };
@@ -13,7 +13,7 @@ use crate::{
 #[derive(Clone)]
 pub struct CollectionService {
     database: Database,
-    tmdb: TmdbProvider,
+    tmdb: ScraperProvider,
     resolver: Option<ScraperResolver>,
     metadata_objects: Option<MetadataObjectStore>,
 }
@@ -21,7 +21,7 @@ pub struct CollectionService {
 impl CollectionService {
     pub fn new<T>(database: Database, tmdb: T) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             database,
@@ -33,7 +33,7 @@ impl CollectionService {
 
     pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             database,
@@ -139,7 +139,7 @@ impl CollectionService {
         })
     }
 
-    async fn provider_for_item(&self, item_id: &str) -> Result<TmdbProvider, CollectionError> {
+    async fn provider_for_item(&self, item_id: &str) -> Result<ScraperProvider, CollectionError> {
         let Some(resolver) = &self.resolver else {
             return Ok(self.tmdb.clone());
         };
@@ -149,7 +149,7 @@ impl CollectionService {
             .map_err(CollectionError::Scraper)
             .map(|client| {
                 client
-                    .map(TmdbProvider::from_scraper)
+                    .map(ScraperProvider::from_scraper)
                     .unwrap_or_else(|| self.tmdb.clone())
             })
     }

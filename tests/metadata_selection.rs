@@ -21,13 +21,13 @@ use luxd::{
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
-        metadata_paths::{canonical_person_directory, library_item_directory, people_directory},
+        metadata_paths::{library_item_directory, lux_person_directory, people_directory},
         people::PeopleService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -211,7 +211,7 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     .await?;
     assert_eq!(image_count, 3);
     let fallback_required: i64 =
-        sqlx::query_scalar("SELECT thumbnail_fallback_required FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT poster_fallback_required FROM media_items WHERE id = ?")
             .bind(&item_id)
             .fetch_one(fixture.database.pool())
             .await?;
@@ -263,11 +263,11 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
         PNG_1X1
     );
     let fallback_required: i64 =
-        sqlx::query_scalar("SELECT thumbnail_fallback_required FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT poster_fallback_required FROM media_items WHERE id = ?")
             .bind(&fixture.item_id)
             .fetch_one(fixture.database.pool())
             .await?;
-    assert_eq!(fallback_required, 1);
+    assert_eq!(fallback_required, 0);
 
     image_server.abort();
     Ok(())
@@ -405,13 +405,19 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let people_file =
         library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
     let people: Value = serde_json::from_slice(&tokio::fs::read(people_file).await?)?;
-    assert_eq!(people["schemaVersion"], 2);
+    assert_eq!(people["schemaVersion"], 4);
     assert_eq!(people["actors"][0]["name"], "演员甲");
     assert_eq!(people["actors"][0]["provider"], "tmdb");
     let person_key = people["actors"][0]["personKey"]
         .as_str()
         .ok_or("missing canonical person key")?;
-    let person_dir = canonical_person_directory(&fixture.config.config_dir, person_key)?;
+    let person_dir = lux_person_directory(
+        &fixture.config.config_dir,
+        people["actors"][0]["name"]
+            .as_str()
+            .ok_or("missing actor name")?,
+        person_key,
+    )?;
     assert!(person_dir.join("person.nfo").exists());
 
     let detail = client
@@ -847,7 +853,7 @@ async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std:
             &fixture.series_id,
             "Example Show",
             Some(2020),
-            &TmdbProvider::from(tmdb),
+            &ScraperProvider::from(tmdb),
         )
         .await?;
 
@@ -938,7 +944,7 @@ async fn automatic_candidate_search_expands_only_the_best_result()
             &fixture.item_id,
             "Example Movie",
             Some(2020),
-            &TmdbProvider::from(tmdb),
+            &ScraperProvider::from(tmdb),
         )
         .await?;
 
@@ -1031,7 +1037,7 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     );
     let metadata = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
-        TmdbProvider::from(tmdb),
+        ScraperProvider::from(tmdb),
         Some(selection),
     );
     let scan_jobs = luxd::application::scanner::ScanJobService::new(fixture.database.clone());
@@ -1081,8 +1087,14 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     let person_key = people["actors"][0]["personKey"]
         .as_str()
         .ok_or("background person key missing")?;
-    let person_nfo =
-        canonical_person_directory(&fixture.config.config_dir, person_key)?.join("person.nfo");
+    let person_nfo = lux_person_directory(
+        &fixture.config.config_dir,
+        people["actors"][0]["name"]
+            .as_str()
+            .ok_or("background actor name missing")?,
+        person_key,
+    )?
+    .join("person.nfo");
     assert!(
         tokio::fs::read_to_string(person_nfo)
             .await?

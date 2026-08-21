@@ -85,7 +85,7 @@ use crate::{
         },
         thumbnails::ThumbnailService,
         tmdb::{TmdbClient, TmdbError},
-        tmdb_plugin::{TmdbPluginClient, TmdbProvider},
+        tmdb_plugin::{ScraperProvider, TmdbPluginClient},
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
         webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
@@ -153,7 +153,7 @@ pub struct AppState {
     danmaku: Option<DanmakuService>,
     plugins: Option<PluginService>,
     scraper_resolver: Option<ScraperResolver>,
-    tmdb: Option<TmdbProvider>,
+    tmdb: Option<ScraperProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
@@ -220,7 +220,7 @@ impl AppState {
             config_dir.clone(),
             network_proxy_url.clone(),
         );
-        let tmdb = TmdbProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
+        let tmdb = ScraperProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
         let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
         let collections = Some(
             CollectionService::with_resolver(
@@ -369,7 +369,7 @@ impl AppState {
         let Some(database) = self.database.clone() else {
             return self;
         };
-        let tmdb = TmdbProvider::from(
+        let tmdb = ScraperProvider::from(
             tmdb.with_cache_dir(
                 self.config_dir
                     .clone()
@@ -440,16 +440,7 @@ impl AppState {
         let Some(service) = self.people.clone() else {
             return;
         };
-        tokio::spawn(async move {
-            match service.rebuild_person_credit_index().await {
-                Ok(rebuilt_items) => {
-                    tracing::info!(rebuilt_items, "person credit index rebuild completed");
-                }
-                Err(error) => {
-                    tracing::error!(%error, "person credit index rebuild failed");
-                }
-            }
-        });
+        service.schedule_person_index_rebuild();
     }
 
     pub async fn resume_scan_jobs(&self) {
@@ -664,6 +655,18 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/library-cover-jobs/{job_id}",
             get(admin_get_library_cover_job),
+        )
+        .route(
+            "/api/v1/admin/people/index-rebuild",
+            get(admin_list_people_index_rebuild),
+        )
+        .route(
+            "/api/v1/admin/people/index-rebuild/{library_id}",
+            post(admin_queue_people_index_rebuild),
+        )
+        .route(
+            "/api/v1/admin/people/index-rebuild/{library_id}/cancel",
+            post(admin_cancel_people_index_rebuild),
         )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
         .route(
@@ -3769,18 +3772,16 @@ async fn emby_update_item(
         Err(PeopleError::InvalidComponent(_)) => return StatusCode::BAD_REQUEST.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let fields = emby_detail_fields(query.fields.as_deref());
-    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
-    emby_item_response(
-        &state,
-        principal,
-        &item_id,
-        user.can_download,
-        fields.as_deref(),
-        compatibility,
-    )
-    .await
+    match people.find_person(&library_ids, "Actor", &item_id).await {
+        Ok(Some(person)) => Json(emby_person_json_with_fields(
+            person,
+            &state.server_id,
+            emby_detail_fields(query.fields.as_deref()).as_deref(),
+        ))
+        .into_response(),
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn emby_user_item(
@@ -14589,6 +14590,240 @@ async fn admin_list_audit(
     }
 }
 
+async fn admin_list_people_index_rebuild(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "人物索引服务尚未就绪",
+        )
+        .into_response();
+    };
+    let total = match people.count_person_index_rebuild_jobs().await {
+        Ok(total) => total,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "人物索引任务暂时不可用",
+            )
+            .into_response();
+        }
+    };
+    match people.list_person_index_rebuild_jobs(offset, limit).await {
+        Ok(jobs) => Json(json!({
+            "jobs": jobs.iter().map(people_index_rebuild_job_json).collect::<Vec<_>>(),
+            "total": total,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(_) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "人物索引任务暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+async fn admin_queue_people_index_rebuild(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在",
+        )
+        .into_response();
+    };
+    let library_id = library_id.to_string();
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "人物索引服务尚未就绪",
+        )
+        .into_response();
+    };
+    match people.queue_person_index_rebuild(&library_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Ok(Some(job)) = people.get_person_index_rebuild_job(&library_id).await
+                && job.status == "RUNNING"
+            {
+                return api_error(
+                    &headers,
+                    StatusCode::CONFLICT,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "人物索引重建正在运行",
+                )
+                .into_response();
+            }
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在或未启用",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "人物索引任务暂时不可用",
+            )
+            .into_response();
+        }
+    }
+    let job = match people.get_person_index_rebuild_job(&library_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) | Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "人物索引任务暂时不可用",
+            )
+            .into_response();
+        }
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "PEOPLE_INDEX_REBUILD_QUEUED",
+        Some("library"),
+        Some(&library_id),
+        "{}",
+    )
+    .await;
+    state.rebuild_people_index().await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": people_index_rebuild_job_json(&job) })),
+    )
+        .into_response()
+}
+
+async fn admin_cancel_people_index_rebuild(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在",
+        )
+        .into_response();
+    };
+    let library_id = library_id.to_string();
+    let Some(people) = state.people.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "人物索引服务尚未就绪",
+        )
+        .into_response();
+    };
+    match people.cancel_person_index_rebuild(&library_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                "没有可取消的人物索引重建任务",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "人物索引任务暂时不可用",
+            )
+            .into_response();
+        }
+    }
+    let job = match people.get_person_index_rebuild_job(&library_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) | Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "人物索引任务暂时不可用",
+            )
+            .into_response();
+        }
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "PEOPLE_INDEX_REBUILD_CANCEL_REQUESTED",
+        Some("library"),
+        Some(&library_id),
+        "{}",
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": people_index_rebuild_job_json(&job) })),
+    )
+        .into_response()
+}
+
+fn people_index_rebuild_job_json(job: &crate::storage::StoredPersonIndexRebuildJob) -> Value {
+    json!({
+        "libraryId": job.library_id,
+        "status": job.status,
+        "cursorId": job.cursor_id,
+        "processedCount": job.processed_count,
+        "totalCount": job.total_count,
+        "cancelRequested": job.cancel_requested,
+    })
+}
+
 async fn admin_list_logs(
     headers: HeaderMap,
     Query(query): Query<MetadataCandidateQuery>,
@@ -16469,7 +16704,7 @@ async fn admin_search_item_candidates(
     };
     let tmdb = if let Some(resolver) = state.scraper_resolver.as_ref() {
         match resolver.for_item(&item_id).await {
-            Ok(Some(scraper)) => TmdbProvider::from_scraper(scraper),
+            Ok(Some(scraper)) => ScraperProvider::from_scraper(scraper),
             Ok(None) => fallback_tmdb,
             Err(error) => {
                 return api_error(
@@ -16922,6 +17157,7 @@ fn metadata_reidentify_job_json(
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
         "libraryId": job.library_id,
+        "jobScope": job.job_scope,
         "pendingCount": job.pending_count,
         "items": job.items.iter().map(|item| json!({
             "jobId": item.job_id,
@@ -16950,6 +17186,7 @@ fn metadata_reidentify_job_summary_json(
         "finishedAt": job.finished_at,
         "cancelRequested": job.cancel_requested,
         "libraryId": job.library_id,
+        "jobScope": job.job_scope,
         "pendingCount": job.pending_count,
     })
 }
@@ -16990,6 +17227,13 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
             StatusCode::CONFLICT,
             lux::ApiErrorCode::InvalidRequest,
             "该批量元数据匹配任务当前不可取消",
+        )
+        .into_response(),
+        MetadataReidentifyError::LibraryJobAlreadyActive(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "已有整库元数据任务正在运行，请等待完成或先取消该任务",
         )
         .into_response(),
         MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => {

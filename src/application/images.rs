@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
+    time::sleep,
 };
 use uuid::Uuid;
 
@@ -21,13 +22,15 @@ use crate::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperResolver,
         },
         tmdb::TmdbError,
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
     },
     network::client_builder_from_env_or,
     storage::{Database, ItemImageMetadata, StorageError},
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+const IMAGE_DOWNLOAD_MAX_RETRIES: u32 = 2;
+const IMAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
     let path = path.to_owned();
@@ -238,12 +241,18 @@ impl ImageWriteService {
             if !in_metadata && !in_media_root {
                 return Err(ImageWriteError::PathOutsideRoot(canonical_path));
             }
-            fs::remove_file(&canonical_path)
-                .await
-                .map_err(|source| ImageWriteError::Io {
-                    path: canonical_path,
-                    source,
-                })?;
+            if !self
+                .database
+                .item_image_path_is_shared(&image.local_path, &image.id)
+                .await?
+            {
+                fs::remove_file(&canonical_path)
+                    .await
+                    .map_err(|source| ImageWriteError::Io {
+                        path: canonical_path,
+                        source,
+                    })?;
+            }
         }
         if !self.database.delete_item_image(item_id, image_id).await? {
             return Err(ImageWriteError::ItemNotFound);
@@ -348,12 +357,7 @@ impl ImageWriteService {
             ));
         }
 
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| ImageWriteError::Download(error.to_string()))?;
+        let response = self.fetch_image(&url).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(ImageWriteError::UpstreamStatus {
@@ -453,6 +457,31 @@ impl ImageWriteService {
             file_size,
             content_tag,
         })
+    }
+
+    async fn fetch_image(&self, url: &Url) -> Result<reqwest::Response, ImageWriteError> {
+        let mut retry_count = 0;
+        loop {
+            let response = self.http.get(url.clone()).send().await;
+            match response {
+                Ok(response)
+                    if retry_count < IMAGE_DOWNLOAD_MAX_RETRIES
+                        && retryable_image_status(response.status().as_u16()) =>
+                {
+                    retry_count += 1;
+                    sleep(IMAGE_RETRY_DELAY * retry_count).await;
+                }
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if retry_count < IMAGE_DOWNLOAD_MAX_RETRIES
+                        && (error.is_timeout() || error.is_connect()) =>
+                {
+                    retry_count += 1;
+                    sleep(IMAGE_RETRY_DELAY * retry_count).await;
+                }
+                Err(error) => return Err(ImageWriteError::Download(error.to_string())),
+            }
+        }
     }
 
     async fn metadata_image_directory(
@@ -616,7 +645,7 @@ impl ImageWriteService {
 #[derive(Clone)]
 pub struct ImageCandidateService {
     database: Database,
-    tmdb: TmdbProvider,
+    tmdb: ScraperProvider,
     resolver: Option<ScraperResolver>,
 }
 
@@ -635,7 +664,7 @@ pub struct ImageCandidate {
 impl ImageCandidateService {
     pub fn new<T>(database: Database, tmdb: T) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             database,
@@ -646,7 +675,7 @@ impl ImageCandidateService {
 
     pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             database,
@@ -748,7 +777,10 @@ impl ImageCandidateService {
             .collect())
     }
 
-    async fn provider_for_item(&self, item_id: &str) -> Result<TmdbProvider, ImageCandidateError> {
+    async fn provider_for_item(
+        &self,
+        item_id: &str,
+    ) -> Result<ScraperProvider, ImageCandidateError> {
         let Some(resolver) = &self.resolver else {
             return Ok(self.tmdb.clone());
         };
@@ -758,7 +790,7 @@ impl ImageCandidateService {
             .map_err(ImageCandidateError::Scraper)
             .map(|client| {
                 client
-                    .map(TmdbProvider::from_scraper)
+                    .map(ScraperProvider::from_scraper)
                     .unwrap_or_else(|| self.tmdb.clone())
             })
     }
@@ -1545,9 +1577,22 @@ fn is_allowed_scraper_image_url(value: &str) -> bool {
         && url.fragment().is_none()
 }
 
+fn retryable_image_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_scraper_image_url, is_allowed_tmdb_image_url};
+    use super::{is_allowed_scraper_image_url, is_allowed_tmdb_image_url, retryable_image_status};
+
+    #[test]
+    fn image_retries_only_transient_upstream_statuses() {
+        assert!(retryable_image_status(429));
+        assert!(retryable_image_status(500));
+        assert!(retryable_image_status(503));
+        assert!(!retryable_image_status(200));
+        assert!(!retryable_image_status(404));
+    }
 
     #[test]
     fn selected_image_urls_are_limited_to_tmdb_image_paths() {

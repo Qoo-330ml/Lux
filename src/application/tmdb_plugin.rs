@@ -760,16 +760,13 @@ fn image_path(value: Option<&Value>) -> Option<Value> {
     (!path.is_empty()).then(|| Value::String(format!("/{path}")))
 }
 
-/// Provider-neutral application boundary. `TmdbProvider` remains as a source
-/// compatibility alias for callers that still use the old name.
+/// Provider-neutral application boundary for the selected metadata scraper.
 #[derive(Clone)]
 pub enum ScraperProvider {
     Direct(TmdbClient),
     Plugin(TmdbPluginClient),
     Generic(ScraperPluginClient),
 }
-
-pub type TmdbProvider = ScraperProvider;
 
 impl From<TmdbClient> for ScraperProvider {
     fn from(client: TmdbClient) -> Self {

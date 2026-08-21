@@ -3,7 +3,7 @@ use luxd::{
     api::{AppState, app_with_state},
     application::{
         libraries::LibraryService,
-        metadata_paths::{canonical_person_directory, library_item_directory},
+        metadata_paths::{library_item_directory, lux_person_directory},
         people::{ActorCredit, PeopleService, PersonMetadata},
         scanner::LibraryScanner,
         setup::SetupService,
@@ -13,7 +13,8 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use serde_json::json;
+use reqwest::header::{COOKIE, HeaderMap, SET_COOKIE};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 const PNG_1X1: &[u8] = &[
@@ -25,6 +26,134 @@ const PNG_1X1: &[u8] = &[
 ];
 
 const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+
+#[tokio::test]
+async fn rebuilding_people_does_not_clear_index_when_metadata_library_root_is_missing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('item-metadata-root-missing', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    service
+        .persist_item_actors(
+            "item-metadata-root-missing",
+            "tmdb",
+            &[ActorCredit {
+                id: "101".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    let before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-metadata-root-missing'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(before, 1);
+
+    tokio::fs::remove_dir_all(config.config_dir.join("metadata/library")).await?;
+
+    assert_eq!(service.rebuild_person_credit_index().await?, 0);
+    let after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-metadata-root-missing'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebuilding_people_clears_index_for_missing_item_metadata_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    for item_id in ["item-metadata-missing", "item-metadata-kept"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+    let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    for item_id in ["item-metadata-missing", "item-metadata-kept"] {
+        service
+            .persist_item_actors(
+                item_id,
+                "tmdb",
+                &[ActorCredit {
+                    id: if item_id == "item-metadata-missing" {
+                        "101"
+                    } else {
+                        "102"
+                    }
+                    .to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员".to_owned(),
+                    character: Some("角色".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                    person: None,
+                }],
+            )
+            .await?;
+    }
+
+    tokio::fs::remove_dir_all(library_item_directory(
+        &config.config_dir,
+        "item-metadata-missing",
+    )?)
+    .await?;
+
+    assert_eq!(service.rebuild_person_credit_index().await?, 2);
+    let missing_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-metadata-missing'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let kept_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-metadata-kept'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(missing_count, 0);
+    assert_eq!(kept_count, 1);
+    Ok(())
+}
 
 #[tokio::test]
 async fn emby_persons_lists_library_actors_with_shared_admin_key()
@@ -426,8 +555,8 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         .and_then(|actors| actors.iter().find(|actor| actor["id"] == "104"))
         .and_then(|actor| actor["personKey"].as_str())
         .ok_or("missing updated person key")?;
-    let person_nfo =
-        canonical_person_directory(&temp_dir.path().join("config"), person_key)?.join("person.nfo");
+    let person_nfo = lux_person_directory(&temp_dir.path().join("config"), "演员丁", person_key)?
+        .join("person.nfo");
     let person_nfo_body = tokio::fs::read_to_string(person_nfo).await?;
     assert!(person_nfo_body.contains("<name>演员丁</name>"));
     assert!(person_nfo_body.contains("<biography>演员丁简介</biography>"));
@@ -567,7 +696,12 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(lux_person_update_body["taglines"], json!(["编辑标语"]));
 
     let edited_person_nfo = tokio::fs::read_to_string(
-        canonical_person_directory(&temp_dir.path().join("config"), person_key)?.join("person.nfo"),
+        lux_person_directory(
+            &temp_dir.path().join("config"),
+            "演员丁（已编辑）",
+            person_key,
+        )?
+        .join("person.nfo"),
     )
     .await?;
     assert!(edited_person_nfo.contains("<name>演员丁（已编辑）</name>"));
@@ -598,4 +732,133 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
 
     server.abort();
     Ok(())
+}
+
+#[tokio::test]
+async fn people_index_rebuild_admin_api_supports_csrf_pagination_cancel_and_requeue()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{address}");
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "admin", "password": "correct password"}))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookies = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+
+    let initial = client
+        .get(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(initial.status(), reqwest::StatusCode::OK);
+    assert_eq!(initial.json::<Value>().await?["jobs"], json!([]));
+
+    let missing_csrf = client
+        .post(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild/{}",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let queued = client
+        .post(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild/{}",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(queued.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(queued.json::<Value>().await?["job"]["status"], "QUEUED");
+
+    let listed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild?page=1&pageSize=1"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let listed_body = listed.json::<Value>().await?;
+    assert_eq!(listed_body["total"], 1);
+    assert_eq!(listed_body["jobs"][0]["libraryId"], library.id.to_string());
+    assert_eq!(listed_body["jobs"][0]["status"], "QUEUED");
+
+    let cancelled = client
+        .post(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild/{}/cancel",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(cancelled.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        cancelled.json::<Value>().await?["job"]["status"],
+        "CANCELLED"
+    );
+
+    let requeued = client
+        .post(format!(
+            "{base_url}/api/v1/admin/people/index-rebuild/{}",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(requeued.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(requeued.json::<Value>().await?["job"]["status"], "QUEUED");
+
+    server.abort();
+    Ok(())
+}
+
+fn cookie_pair(headers: &HeaderMap) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .find_map(|value| value.strip_prefix(&format!("{name}=")))
+        .unwrap_or_default()
+        .to_owned()
 }

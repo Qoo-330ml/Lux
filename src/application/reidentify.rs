@@ -1,10 +1,15 @@
 use std::{
+    collections::{HashMap, HashSet},
     fmt,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::{Mutex as AsyncMutex, Semaphore},
+    task::JoinSet,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -16,7 +21,7 @@ use crate::{
             MetadataSelectionService,
         },
         scraper::{ScraperError, ScraperResolver},
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
         webhooks::{WebhookEventType, WebhookService},
     },
     observability::resources::ResourceMetrics,
@@ -24,7 +29,9 @@ use crate::{
 };
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
+const METADATA_GLOBAL_WORKER_LIMIT: usize = 8;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
+const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
 const AUTO_MATCH_MIN_MARGIN: f64 = 5.0;
 
@@ -50,17 +57,82 @@ pub struct MetadataReidentifyService {
     database: Database,
     candidates: MetadataCandidateService,
     selection: Option<MetadataSelectionService>,
-    tmdb: TmdbProvider,
+    tmdb: ScraperProvider,
     resolver: Option<ScraperResolver>,
     admin_events: AdminEventHub,
     resources: ResourceMetrics,
     webhooks: Option<WebhookService>,
+    progress_events: MetadataProgressEventGate,
+    worker_permits: Arc<Semaphore>,
+    running_jobs: MetadataJobOwners,
+    library_job_creation: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone, Default)]
+struct MetadataProgressEventGate {
+    last_published: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl MetadataProgressEventGate {
+    fn should_publish(&self, job_id: &str) -> bool {
+        let now = Instant::now();
+        let Ok(mut last_published) = self.last_published.lock() else {
+            return true;
+        };
+        if last_published
+            .get(job_id)
+            .is_some_and(|last| now.duration_since(*last) < METADATA_PROGRESS_EVENT_INTERVAL)
+        {
+            return false;
+        }
+        last_published.insert(job_id.to_owned(), now);
+        true
+    }
+
+    fn clear(&self, job_id: &str) {
+        if let Ok(mut last_published) = self.last_published.lock() {
+            last_published.remove(job_id);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct MetadataJobOwners {
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl MetadataJobOwners {
+    fn claim(&self, job_id: &str) -> Option<MetadataJobOwnerGuard> {
+        let Ok(mut active) = self.active.lock() else {
+            return None;
+        };
+        if !active.insert(job_id.to_owned()) {
+            return None;
+        }
+        Some(MetadataJobOwnerGuard {
+            job_id: job_id.to_owned(),
+            active: Arc::clone(&self.active),
+        })
+    }
+}
+
+struct MetadataJobOwnerGuard {
+    job_id: String,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for MetadataJobOwnerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.job_id);
+        }
+    }
 }
 
 impl MetadataReidentifyService {
     pub fn new<T>(database: Database, tmdb: T) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             candidates: MetadataCandidateService::new(database.clone()),
@@ -71,12 +143,16 @@ impl MetadataReidentifyService {
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
             webhooks: None,
+            progress_events: MetadataProgressEventGate::default(),
+            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
     pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self::with_resolver_and_selection(database, tmdb, resolver, None)
     }
@@ -87,7 +163,7 @@ impl MetadataReidentifyService {
         selection: Option<MetadataSelectionService>,
     ) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             candidates: MetadataCandidateService::new(database.clone()),
@@ -98,6 +174,10 @@ impl MetadataReidentifyService {
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
             webhooks: None,
+            progress_events: MetadataProgressEventGate::default(),
+            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -108,7 +188,7 @@ impl MetadataReidentifyService {
         selection: Option<MetadataSelectionService>,
     ) -> Self
     where
-        T: Into<TmdbProvider>,
+        T: Into<ScraperProvider>,
     {
         Self {
             candidates: MetadataCandidateService::new(database.clone()),
@@ -119,6 +199,10 @@ impl MetadataReidentifyService {
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
             webhooks: None,
+            progress_events: MetadataProgressEventGate::default(),
+            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            running_jobs: MetadataJobOwners::default(),
+            library_job_creation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -233,6 +317,14 @@ impl MetadataReidentifyService {
         if !library.is_enabled {
             return Err(MetadataReidentifyError::ItemNotFound(library_id.to_owned()));
         }
+        let _creation_guard = self.library_job_creation.lock().await;
+        if let Some(job_id) = self
+            .database
+            .active_library_metadata_reidentify_job_id()
+            .await?
+        {
+            return Err(MetadataReidentifyError::LibraryJobAlreadyActive(job_id));
+        }
         let mut item_ids = Vec::new();
         let mut offset = 0_i64;
         loop {
@@ -255,13 +347,16 @@ impl MetadataReidentifyService {
         }
         let job_id = Uuid::now_v7().to_string();
         self.database
-            .create_metadata_reidentify_library_job(&job_id, &item_ids, mode.as_str())
+            .create_metadata_reidentify_library_job(&job_id, library_id, &item_ids, mode.as_str())
             .await?;
         self.admin_events.publish(AdminEventScope::Jobs);
         self.get_job(&job_id).await
     }
 
     pub async fn run(&self, job_id: &str) {
+        let Some(_owner) = self.running_jobs.claim(job_id) else {
+            return;
+        };
         let Ok(Some(job)) = self.database.find_metadata_reidentify_job(job_id).await else {
             return;
         };
@@ -276,6 +371,20 @@ impl MetadataReidentifyService {
                 .database
                 .finish_metadata_reidentify_job(job_id, "CANCELLED", None)
                 .await;
+            self.publish_job_finished(job_id);
+            return;
+        }
+        if job.status == "RUNNING"
+            && self
+                .database
+                .requeue_running_metadata_reidentify_items(job_id)
+                .await
+                .is_err()
+        {
+            tracing::error!(
+                job_id,
+                "metadata refresh could not requeue interrupted items"
+            );
             return;
         }
         if job.status == "QUEUED"
@@ -309,10 +418,11 @@ impl MetadataReidentifyService {
         let mut workers = JoinSet::new();
         let mut last_concurrency = None;
         loop {
-            let concurrency = self
-                .resources
-                .background_concurrency(METADATA_MATCH_CONCURRENCY)
-                .await;
+            let concurrency = metadata_worker_concurrency(
+                self.resources
+                    .background_concurrency(METADATA_MATCH_CONCURRENCY)
+                    .await,
+            );
             if last_concurrency != Some(concurrency) {
                 tracing::info!(
                     job_id,
@@ -323,6 +433,11 @@ impl MetadataReidentifyService {
             }
             let mut queue_exhausted = false;
             while workers.len() < concurrency {
+                let Ok(worker_permit) = Arc::clone(&self.worker_permits).acquire_owned().await
+                else {
+                    queue_exhausted = true;
+                    break;
+                };
                 if self
                     .database
                     .metadata_reidentify_job_cancel_requested(job_id)
@@ -348,6 +463,7 @@ impl MetadataReidentifyService {
                 let service = self.clone();
                 let job_id = job_id.to_owned();
                 workers.spawn(async move {
+                    let _worker_permit = worker_permit;
                     service.process_item(&job_id, &item_id, mode).await;
                 });
             }
@@ -443,7 +559,7 @@ impl MetadataReidentifyService {
             )
             .await;
         }
-        self.admin_events.publish(AdminEventScope::Jobs);
+        self.publish_job_finished(job_id);
     }
 
     async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
@@ -505,8 +621,7 @@ impl MetadataReidentifyService {
                         None,
                     )
                     .await;
-                self.admin_events.publish(AdminEventScope::Jobs);
-                self.admin_events.publish(AdminEventScope::Metadata);
+                self.publish_job_progress(job_id);
                 if !matches!(mode, MetadataRefreshMode::Reidentify) {
                     self.publish_webhook(
                         WebhookEventType::MetadataUpdated,
@@ -537,8 +652,7 @@ impl MetadataReidentifyService {
                         "metadata refresh item result could not be recorded"
                     );
                 }
-                self.admin_events.publish(AdminEventScope::Jobs);
-                self.admin_events.publish(AdminEventScope::Metadata);
+                self.publish_job_progress(job_id);
             }
             Err(error) => {
                 let code = error.code();
@@ -555,8 +669,7 @@ impl MetadataReidentifyService {
                         "metadata refresh item result could not be recorded"
                     );
                 }
-                self.admin_events.publish(AdminEventScope::Jobs);
-                self.admin_events.publish(AdminEventScope::Metadata);
+                self.publish_job_progress(job_id);
             }
         }
     }
@@ -576,11 +689,22 @@ impl MetadataReidentifyService {
         }
     }
 
+    fn publish_job_progress(&self, job_id: &str) {
+        if self.progress_events.should_publish(job_id) {
+            self.admin_events.publish(AdminEventScope::Jobs);
+        }
+    }
+
+    fn publish_job_finished(&self, job_id: &str) {
+        self.progress_events.clear(job_id);
+        self.admin_events.publish(AdminEventScope::Jobs);
+    }
+
     async fn provider_for_item_with_requirement(
         &self,
         item_id: &str,
         require_selected_scraper: bool,
-    ) -> Result<Option<TmdbProvider>, ScraperError> {
+    ) -> Result<Option<ScraperProvider>, ScraperError> {
         let Some(resolver) = &self.resolver else {
             return Ok(Some(self.tmdb.clone()));
         };
@@ -590,7 +714,7 @@ impl MetadataReidentifyService {
         }
         Ok(Some(
             client
-                .map(TmdbProvider::from_scraper)
+                .map(ScraperProvider::from_scraper)
                 .unwrap_or_else(|| self.tmdb.clone()),
         ))
     }
@@ -600,7 +724,7 @@ impl MetadataReidentifyService {
         item_id: &str,
         item: &crate::storage::StoredMediaMetadata,
         mode: MetadataRefreshMode,
-        provider: &TmdbProvider,
+        provider: &ScraperProvider,
     ) -> Result<i64, MetadataReidentifyError> {
         let page = self
             .candidates
@@ -689,6 +813,7 @@ impl MetadataReidentifyService {
             items: items.into_iter().map(metadata_reidentify_item).collect(),
             cancel_requested: job.cancel_requested,
             library_id: job.library_id,
+            job_scope: job.job_scope,
             pending_count: job.pending_count,
         })
     }
@@ -719,8 +844,25 @@ impl MetadataReidentifyService {
         if !matches!(
             job.status.as_str(),
             "FAILED" | "CANCELLED" | "COMPLETED_WITH_ISSUES" | "DEFERRED"
-        ) || !self.database.retry_metadata_reidentify_job(job_id).await?
-        {
+        ) {
+            return Err(MetadataReidentifyError::JobNotRetryable);
+        }
+        let retried = if job.job_scope == "LIBRARY" {
+            let _creation_guard = self.library_job_creation.lock().await;
+            if let Some(active_job_id) = self
+                .database
+                .active_library_metadata_reidentify_job_id()
+                .await?
+            {
+                return Err(MetadataReidentifyError::LibraryJobAlreadyActive(
+                    active_job_id,
+                ));
+            }
+            self.database.retry_metadata_reidentify_job(job_id).await?
+        } else {
+            self.database.retry_metadata_reidentify_job(job_id).await?
+        };
+        if !retried {
             return Err(MetadataReidentifyError::JobNotRetryable);
         }
         self.admin_events.publish(AdminEventScope::Jobs);
@@ -749,6 +891,7 @@ pub struct MetadataReidentifyJob {
     pub items: Vec<MetadataReidentifyItem>,
     pub cancel_requested: bool,
     pub library_id: Option<String>,
+    pub job_scope: String,
     pub pending_count: i64,
 }
 
@@ -771,6 +914,7 @@ pub enum MetadataReidentifyError {
     JobNotFound,
     JobNotRetryable,
     JobNotCancelable,
+    LibraryJobAlreadyActive(String),
     Candidate(MetadataCandidateError),
     Scraper(ScraperError),
     Selection(MetadataSelectionError),
@@ -789,6 +933,7 @@ impl MetadataReidentifyError {
             Self::JobNotFound => "JOB_NOT_FOUND",
             Self::JobNotRetryable => "JOB_NOT_RETRYABLE",
             Self::JobNotCancelable => "JOB_NOT_CANCELABLE",
+            Self::LibraryJobAlreadyActive(_) => "LIBRARY_JOB_ALREADY_ACTIVE",
             Self::Candidate(MetadataCandidateError::Tmdb(_)) => "TMDB_UNAVAILABLE",
             Self::Candidate(MetadataCandidateError::InvalidSearch) => "INVALID_SEARCH",
             Self::Candidate(MetadataCandidateError::ItemNotFound) => "ITEM_NOT_FOUND",
@@ -823,6 +968,12 @@ impl fmt::Display for MetadataReidentifyError {
             }
             Self::JobNotCancelable => {
                 formatter.write_str("metadata reidentify job is not cancelable")
+            }
+            Self::LibraryJobAlreadyActive(job_id) => {
+                write!(
+                    formatter,
+                    "a full-library metadata job is already active: {job_id}"
+                )
             }
             Self::Candidate(error) => error.fmt(formatter),
             Self::Scraper(error) => error.fmt(formatter),
@@ -893,13 +1044,17 @@ fn metadata_reidentify_item(item: StoredMetadataReidentifyItem) -> MetadataReide
     }
 }
 
+fn metadata_worker_concurrency(recommended: usize) -> usize {
+    recommended.clamp(1, METADATA_GLOBAL_WORKER_LIMIT)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
 
     use super::{
         AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, MetadataCandidatePage, MetadataCandidateView,
-        best_automatic_candidate,
+        best_automatic_candidate, metadata_worker_concurrency,
     };
 
     fn candidate(id: &str, score: f64) -> MetadataCandidateView {
@@ -972,5 +1127,12 @@ mod tests {
         };
 
         assert!(best_automatic_candidate(&page).is_none());
+    }
+
+    #[test]
+    fn metadata_worker_concurrency_is_bounded_without_overthrottling() {
+        assert_eq!(metadata_worker_concurrency(16), 8);
+        assert_eq!(metadata_worker_concurrency(2), 2);
+        assert_eq!(metadata_worker_concurrency(0), 1);
     }
 }

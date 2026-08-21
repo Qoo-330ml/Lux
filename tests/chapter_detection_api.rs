@@ -228,6 +228,30 @@ async fn chapter_detection_http_api_enforces_admin_csrf_and_persists_jobs()
         manual_run.json::<Value>().await?["taskType"],
         "CHAPTER_DETECTION"
     );
+    for _ in 0..100 {
+        let active_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chapter_detection_jobs
+             WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await?;
+        if active_jobs == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let active_jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chapter_detection_jobs
+         WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        active_jobs, 0,
+        "scheduled chapter detection should finish first"
+    );
 
     let started = client
         .post(format!(

@@ -9,7 +9,7 @@ use luxd::{
         reidentify::MetadataReidentifyService,
         scanner::{IncrementalScanChange, ScanJobError, ScanJobService},
         tmdb::{TmdbClient, TmdbClientConfig},
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
         watch::ChangeKind,
         webhooks::WebhookService,
     },
@@ -993,7 +993,7 @@ async fn incremental_scan_only_queues_metadata_when_library_switch_is_enabled()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
 
     let disabled_path = "Disabled.Movie.2024.mkv";
     tokio::fs::write(root.join(disabled_path), b"disabled").await?;

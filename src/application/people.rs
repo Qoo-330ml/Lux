@@ -4,6 +4,7 @@ use std::{
     fmt::Write as _,
     io::Cursor,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     io::AsyncWriteExt,
+    sync::Mutex as AsyncMutex,
     time::{Duration, sleep},
 };
 use uuid::Uuid;
@@ -31,7 +33,8 @@ use crate::application::metadata_paths::{
 };
 use crate::storage::{
     Database, NewPersonCredit, PersonListOptions, PersonMatchCandidateRestore,
-    StoredCanonicalPerson, StoredPersonCredit, StoredPersonMatchCandidate,
+    StoredCanonicalPerson, StoredPersonCredit, StoredPersonIndexRebuildJob,
+    StoredPersonMatchCandidate,
 };
 
 const LEGACY_PEOPLE_DIR: &str = "people";
@@ -56,6 +59,7 @@ const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
 const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 const PERSON_INDEX_REBUILD_BATCH_SIZE: i64 = 100;
+const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 1;
 const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
     "name",
     "biography",
@@ -478,6 +482,42 @@ pub struct PeopleService {
     config_dir: PathBuf,
     client: Client,
     database: Option<Database>,
+    rebuild_lock: Arc<AsyncMutex<()>>,
+    rebuild_coordinator: PersonIndexRebuildCoordinator,
+}
+
+#[derive(Clone, Default)]
+struct PersonIndexRebuildCoordinator {
+    state: Arc<AsyncMutex<PersonIndexRebuildCoordinatorState>>,
+}
+
+#[derive(Default)]
+struct PersonIndexRebuildCoordinatorState {
+    running: bool,
+    pending: bool,
+}
+
+impl PersonIndexRebuildCoordinator {
+    async fn begin(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.running {
+            state.pending = true;
+            return false;
+        }
+        state.running = true;
+        true
+    }
+
+    async fn finish(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.pending {
+            state.pending = false;
+            true
+        } else {
+            state.running = false;
+            false
+        }
+    }
 }
 
 impl PeopleService {
@@ -506,6 +546,8 @@ impl PeopleService {
             config_dir,
             client,
             database: None,
+            rebuild_lock: Arc::new(AsyncMutex::new(())),
+            rebuild_coordinator: PersonIndexRebuildCoordinator::default(),
         }
     }
 
@@ -910,7 +952,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits(item_id, &credits)
+                .replace_person_credits_with_fingerprint(
+                    item_id,
+                    &credits,
+                    relation.source_fingerprint.as_deref(),
+                )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
         }
@@ -2303,6 +2349,12 @@ impl PeopleService {
         let mut initials = match fs::read_dir(&root).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(path) = self
+                    .find_person_manifest_path_from_index(person_id, display_name)
+                    .await?
+                {
+                    return Ok(path);
+                }
                 return lux_person_directory(&self.config_dir, display_name, person_id)
                     .map_err(PeopleError::from)
                     .map(|path| path.join(PERSON_MANIFEST));
@@ -2352,12 +2404,96 @@ impl PeopleService {
                 }
             }
         }
+        if let Some(path) = self
+            .find_person_manifest_path_from_index(person_id, display_name)
+            .await?
+        {
+            return Ok(path);
+        }
         lux_person_directory(&self.config_dir, display_name, person_id)
             .map_err(PeopleError::from)
             .map(|path| path.join(PERSON_MANIFEST))
     }
 
+    async fn find_person_manifest_path_from_index(
+        &self,
+        person_id: &str,
+        display_name: &str,
+    ) -> Result<Option<PathBuf>, PeopleError> {
+        let index_root = people_index_directory(&self.config_dir);
+        let mut entries = match fs::read_dir(&index_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: index_root,
+                    source,
+                });
+            }
+        };
+        let direct_name = format!("{person_id}.json");
+        let provider_name_suffix = format!("-{person_id}.json");
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: index_root.clone(),
+                source,
+            })?
+        {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if file_name != direct_name && !file_name.ends_with(&provider_name_suffix) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(bytes) = read_people_file(&path).await? else {
+                continue;
+            };
+            let Ok(index) = serde_json::from_slice::<StoredPersonIndex>(&bytes) else {
+                continue;
+            };
+            let Some(person_key) = index
+                .person_key
+                .as_deref()
+                .filter(|person_key| person_key.starts_with("lux-"))
+            else {
+                continue;
+            };
+            return lux_person_directory(&self.config_dir, display_name, person_key)
+                .map(|path| Some(path.join(PERSON_MANIFEST)))
+                .map_err(PeopleError::from);
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn schedule_person_index_rebuild(&self) {
+        let service = self.clone();
+        let coordinator = self.rebuild_coordinator.clone();
+        tokio::spawn(async move {
+            if !coordinator.begin().await {
+                return;
+            }
+            loop {
+                match service.rebuild_person_credit_index().await {
+                    Ok(rebuilt_items) => {
+                        tracing::info!(rebuilt_items, "person credit index rebuild completed");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "person credit index rebuild failed");
+                    }
+                }
+                if !coordinator.finish().await {
+                    break;
+                }
+            }
+        });
+    }
+
     pub async fn rebuild_person_credit_index(&self) -> Result<usize, PeopleError> {
+        let _rebuild_guard = self.rebuild_lock.lock().await;
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
                 "people database index is unavailable".to_owned(),
@@ -2384,45 +2520,224 @@ impl PeopleService {
         if replayed_decisions > 0 {
             tracing::info!(replayed_decisions, "person decision operations replayed");
         }
+        let library_metadata_root = metadata_root(&self.config_dir).join("library");
+        match fs::metadata(&library_metadata_root).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(PeopleError::Io {
+                    path: library_metadata_root,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "metadata library root is not a directory",
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %library_metadata_root.display(),
+                    "skipping people index rebuild because metadata library root is missing"
+                );
+                return Ok(0);
+            }
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: library_metadata_root,
+                    source,
+                });
+            }
+        }
         let restored_relations = self.restore_person_relation_snapshots(database).await?;
         if restored_relations > 0 {
             tracing::info!(restored_relations, "people relation snapshots restored");
         }
-        let library_ids = database
-            .list_enabled_library_ids()
+        let jobs = database
+            .sync_person_index_rebuild_jobs(PERSON_INDEX_REBUILD_SCHEMA_VERSION)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
         let mut rebuilt_items = 0;
-        for library_id in library_ids {
-            let mut offset = 0;
-            loop {
-                let item_ids = database
-                    .list_media_item_ids_for_library(
-                        &library_id,
-                        offset,
-                        PERSON_INDEX_REBUILD_BATCH_SIZE,
-                    )
-                    .await
-                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
-                if item_ids.is_empty() {
-                    break;
+        for job in jobs {
+            let run_token = Uuid::now_v7().to_string();
+            let force_rebuild = job.cursor_id.is_none() && job.processed_count == 0;
+            if !database
+                .claim_person_index_rebuild_job(&job.library_id, &run_token)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+            {
+                continue;
+            }
+            match self
+                .run_person_index_rebuild_job(database, &job, &run_token, force_rebuild)
+                .await
+            {
+                Ok(processed) => {
+                    database
+                        .finish_person_index_rebuild_job(
+                            &job.library_id,
+                            &run_token,
+                            "COMPLETED",
+                            None,
+                        )
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                    rebuilt_items += processed;
                 }
-                for item_id in &item_ids {
-                    match self.rebuild_item_person_credit_index(item_id).await {
-                        Ok(()) => rebuilt_items += 1,
-                        Err(PeopleError::Serialization(message)) => {
-                            tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                offset += item_ids.len() as i64;
-                if item_ids.len() < PERSON_INDEX_REBUILD_BATCH_SIZE as usize {
-                    break;
+                Err(error) => {
+                    let detail = error.to_string();
+                    let _ = database
+                        .finish_person_index_rebuild_job(
+                            &job.library_id,
+                            &run_token,
+                            "FAILED",
+                            Some(&detail),
+                        )
+                        .await;
+                    return Err(error);
                 }
             }
         }
         Ok(rebuilt_items)
+    }
+
+    pub(crate) async fn queue_person_index_rebuild(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .request_person_index_rebuild_job(library_id, PERSON_INDEX_REBUILD_SCHEMA_VERSION)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub(crate) async fn cancel_person_index_rebuild(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .request_person_index_rebuild_job_cancel(library_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub(crate) async fn list_person_index_rebuild_jobs(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredPersonIndexRebuildJob>, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .list_person_index_rebuild_jobs(offset, limit)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub(crate) async fn get_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+    ) -> Result<Option<StoredPersonIndexRebuildJob>, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .get_person_index_rebuild_job(library_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub(crate) async fn count_person_index_rebuild_jobs(&self) -> Result<i64, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .count_person_index_rebuild_jobs()
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    async fn run_person_index_rebuild_job(
+        &self,
+        database: &Database,
+        job: &StoredPersonIndexRebuildJob,
+        run_token: &str,
+        force_rebuild: bool,
+    ) -> Result<usize, PeopleError> {
+        let total_count = database
+            .count_person_index_items(&job.library_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let mut cursor_id = job.cursor_id.clone();
+        let mut processed_count = job.processed_count;
+        let initial_processed_count = processed_count;
+        loop {
+            if database
+                .person_index_rebuild_job_cancel_requested(&job.library_id, run_token)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+            {
+                break;
+            }
+            let item_ids = database
+                .list_person_index_item_ids(
+                    &job.library_id,
+                    cursor_id.as_deref(),
+                    PERSON_INDEX_REBUILD_BATCH_SIZE,
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            if item_ids.is_empty() {
+                break;
+            }
+            for item_id in &item_ids {
+                match self
+                    .rebuild_item_person_credit_index(item_id, force_rebuild)
+                    .await
+                {
+                    Ok(()) => processed_count += 1,
+                    Err(PeopleError::Serialization(message)) => {
+                        tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
+                        processed_count += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+                cursor_id = Some(item_id.clone());
+            }
+            if let Some(cursor_id) = cursor_id.as_deref()
+                && database
+                    .update_person_index_rebuild_progress(
+                        &job.library_id,
+                        run_token,
+                        cursor_id,
+                        processed_count,
+                        total_count,
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?
+                    .is_none()
+            {
+                break;
+            }
+            if item_ids.len() < PERSON_INDEX_REBUILD_BATCH_SIZE as usize {
+                break;
+            }
+        }
+        Ok(processed_count.saturating_sub(initial_processed_count) as usize)
     }
 
     async fn restore_legacy_person_directories(
@@ -2808,7 +3123,11 @@ impl PeopleService {
                     .person_credits_from_relation(database, &relation)
                     .await?;
                 database
-                    .replace_person_credits(&source_locator.item_id, &credits)
+                    .replace_person_credits_with_fingerprint(
+                        &source_locator.item_id,
+                        &credits,
+                        relation.source_fingerprint.as_deref(),
+                    )
                     .await
                     .map_err(|error| PeopleError::Storage(error.to_string()))?;
                 restored += 1;
@@ -2817,7 +3136,11 @@ impl PeopleService {
         Ok(restored)
     }
 
-    async fn rebuild_item_person_credit_index(&self, item_id: &str) -> Result<(), PeopleError> {
+    async fn rebuild_item_person_credit_index(
+        &self,
+        item_id: &str,
+        force_rebuild: bool,
+    ) -> Result<(), PeopleError> {
         let new_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
@@ -2834,15 +3157,37 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
-        let credits = match relation.as_ref() {
-            Some(relation) => {
-                self.person_credits_from_relation(database, relation)
-                    .await?
+        let Some(relation) = relation else {
+            let cleared = database
+                .clear_person_credits(item_id)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            if cleared > 0 {
+                tracing::debug!(
+                    item_id,
+                    cleared,
+                    "cleared person credits because relation snapshot is missing"
+                );
             }
-            None => Vec::new(),
+            return Ok(());
         };
+        if !force_rebuild
+            && database
+                .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+        {
+            return Ok(());
+        }
+        let credits = self
+            .person_credits_from_relation(database, &relation)
+            .await?;
         database
-            .replace_person_credits(item_id, &credits)
+            .replace_person_credits_with_fingerprint(
+                item_id,
+                &credits,
+                relation.source_fingerprint.as_deref(),
+            )
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))
     }
@@ -2982,8 +3327,15 @@ impl PeopleService {
                 "people index storage is unavailable".to_owned(),
             ));
         };
+        let manifest_person_id = database
+            .find_person_credits_for_libraries(library_ids, "Actor", person_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?
+            .into_iter()
+            .find_map(|credit| credit.lux_person_id)
+            .unwrap_or_else(|| person_id.to_owned());
         let manifest_path = self
-            .find_person_manifest_path(person_id, &update.name)
+            .find_person_manifest_path(&manifest_person_id, &update.name)
             .await?;
         let (locked_fields, existing_metadata) = match read_people_file(&manifest_path).await? {
             Some(bytes) => {
@@ -3049,7 +3401,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits(&item_id, &credits)
+                .replace_person_credits_with_fingerprint(
+                    &item_id,
+                    &credits,
+                    relation.source_fingerprint.as_deref(),
+                )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
             updated = true;
@@ -5108,7 +5464,7 @@ mod tests {
 
     use super::{
         ActorCredit, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PeopleError, PeopleService,
-        PersonIdentity, PersonManifest, PersonMetadata,
+        PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest, PersonMetadata,
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
@@ -5127,6 +5483,17 @@ mod tests {
         0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
         0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
+
+    #[tokio::test]
+    async fn person_index_rebuild_requests_coalesce_while_a_run_is_active() {
+        let coordinator = PersonIndexRebuildCoordinator::default();
+
+        assert!(coordinator.begin().await);
+        assert!(!coordinator.begin().await);
+        assert!(coordinator.finish().await);
+        assert!(!coordinator.finish().await);
+        assert!(coordinator.begin().await);
+    }
 
     #[test]
     fn birthday_matching_accepts_format_variants_but_rejects_full_date_conflicts() {

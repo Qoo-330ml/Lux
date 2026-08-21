@@ -10,15 +10,16 @@ use axum::{Json, Router, extract::State as AxumState, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
+        admin_events::{AdminEventHub, AdminEventScope},
         candidates::MetadataSelectionService,
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
-        reidentify::{MetadataRefreshMode, MetadataReidentifyService},
+        reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
         webhooks::WebhookService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
@@ -124,7 +125,7 @@ async fn setup_movie_library_with_parent_folder()
     Ok((temp_dir, database, library.id.to_string(), folder_id))
 }
 
-fn unreachable_tmdb_provider() -> Result<TmdbProvider, Box<dyn std::error::Error>> {
+fn unreachable_tmdb_provider() -> Result<ScraperProvider, Box<dyn std::error::Error>> {
     let tmdb = TmdbClient::new(TmdbClientConfig {
         base_url: "http://127.0.0.1:1".to_owned(),
         read_access_token: Some("stub-token".to_owned()),
@@ -135,7 +136,7 @@ fn unreachable_tmdb_provider() -> Result<TmdbProvider, Box<dyn std::error::Error
         retry_jitter: Duration::ZERO,
         ..TmdbClientConfig::default()
     })?;
-    Ok(TmdbProvider::from(tmdb))
+    Ok(ScraperProvider::from(tmdb))
 }
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
@@ -605,7 +606,7 @@ async fn item_metadata_refresh_includes_series_children() -> Result<(), Box<dyn 
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
     let job = metadata
         .create_item_refresh_job(&series_id, MetadataRefreshMode::FillMissing)
         .await?;
@@ -713,7 +714,7 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
         .await?;
     let metadata = MetadataReidentifyService::with_selection(
         database.clone(),
-        TmdbProvider::from(tmdb),
+        ScraperProvider::from(tmdb),
         Some(selection),
     )
     .with_webhooks(webhooks);
@@ -805,14 +806,28 @@ async fn library_metadata_job_processes_items_concurrently()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let admin_events = AdminEventHub::new();
+    let mut event_receiver = admin_events.subscribe();
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb))
+        .with_admin_events(admin_events);
     let job = metadata.create_library_job(&library.id.to_string()).await?;
+    assert_eq!(event_receiver.recv().await, Ok(AdminEventScope::Jobs));
     metadata.run(&job.id).await;
 
     let completed = metadata.get_job(&job.id).await?;
     assert_eq!(completed.total_count, 24);
     assert_eq!(completed.status, "COMPLETED");
     assert!(tracker.maximum.load(Ordering::SeqCst) > 1);
+    let mut progress_events = Vec::new();
+    while let Ok(scope) = event_receiver.try_recv() {
+        progress_events.push(scope);
+    }
+    let job_progress_events = progress_events
+        .iter()
+        .filter(|scope| **scope == AdminEventScope::Jobs)
+        .count();
+    assert!((1..=3).contains(&job_progress_events));
+    assert!(!progress_events.contains(&AdminEventScope::Metadata));
     tmdb_server.abort();
     Ok(())
 }
@@ -821,11 +836,100 @@ async fn library_metadata_job_processes_items_concurrently()
 async fn library_metadata_job_excludes_parent_folders() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, database, library_id, _folder_id) =
         setup_movie_library_with_parent_folder().await?;
-    let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
 
     let job = metadata.create_library_job(&library_id).await?;
 
     assert_eq!(job.total_count, 1);
+    assert_eq!(job.library_id.as_deref(), Some(library_id.as_str()));
+    assert_eq!(job.job_scope, "LIBRARY");
+    let stored_scope: String =
+        sqlx::query_scalar("SELECT job_scope FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored_scope, "LIBRARY");
+    Ok(())
+}
+
+#[tokio::test]
+async fn retrying_library_metadata_job_rejects_another_active_library_job()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata.create_library_job(&library_id).await?;
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'FAILED', finished_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_jobs (
+            id, status, total_count, mode, library_id, job_scope
+         ) VALUES ('active-library-job', 'RUNNING', 1, 'REIDENTIFY', ?, 'LIBRARY')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+
+    let error = metadata
+        .retry_job(&job.id)
+        .await
+        .expect_err("an active library job should block retry");
+    assert!(matches!(
+        error,
+        MetadataReidentifyError::LibraryJobAlreadyActive(id)
+            if id == "active-library-job"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_metadata_job_persists_item_scope_and_library_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+
+    let job = metadata.create_job(vec![folder_id]).await?;
+
+    assert_eq!(job.job_scope, "ITEMS");
+    assert_eq!(job.library_id.as_deref(), Some(_library_id.as_str()));
+    let stored: (Option<String>, String) =
+        sqlx::query_as("SELECT library_id, job_scope FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored, (Some(_library_id), "ITEMS".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_metadata_job_rejects_any_second_active_library_job()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let other_library = LibraryService::new(database.clone())
+        .create_library("Other Movies", LibraryKind::Movie, false)
+        .await?;
+    let metadata = MetadataReidentifyService::new(database, unreachable_tmdb_provider()?);
+
+    let first = metadata.create_library_job(&library_id).await?;
+    let second = metadata
+        .create_library_job(&other_library.id.to_string())
+        .await;
+
+    assert!(matches!(
+        second,
+        Err(luxd::application::reidentify::MetadataReidentifyError::LibraryJobAlreadyActive(
+            job_id
+        )) if job_id == first.id
+    ));
     Ok(())
 }
 
@@ -842,6 +946,31 @@ async fn metadata_job_skips_explicit_parent_folder_without_failing()
     let finished = metadata.get_job(&job.id).await?;
     assert_eq!(finished.status, "COMPLETED");
     assert_eq!(finished.processed_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_job_requeues_running_items_after_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata.create_job(vec![folder_id]).await?;
+    sqlx::query("UPDATE metadata_reidentify_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE metadata_reidentify_job_items SET status = 'RUNNING' WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.processed_count, 1);
+    assert_eq!(completed.items[0].status, "COMPLETED");
     Ok(())
 }
 

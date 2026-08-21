@@ -32,7 +32,9 @@ use crate::{
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
-        plugin_store::{PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex},
+        plugin_store::{
+            PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex, is_newer_version,
+        },
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
         schedule::{
             DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE,
@@ -333,7 +335,7 @@ impl PluginService {
                 let mut view = self.dynamic_view(plugin, installed, enabled).await?;
                 view.latest_version = Some(entry.version.clone());
                 view.update_available =
-                    installed && plugin_version_is_newer(&plugin.manifest.version, &entry.version);
+                    installed && is_newer_version(&entry.version, &plugin.manifest.version);
                 views.push(view);
             } else {
                 views.push(remote_plugin_view(entry, installed, enabled));
@@ -390,7 +392,7 @@ impl PluginService {
                 .into_iter()
                 .find(|entry| entry.id == plugin_id)
                 .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
-            self.install_remote_package(&entry).await?;
+            self.install_remote_package(&entry, false).await?;
         }
         self.database.install_plugin(&plugin_id).await?;
         let current_catalog = self.catalog_snapshot().await;
@@ -454,11 +456,10 @@ impl PluginService {
         let plugin = catalog
             .get(&plugin_id)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
-        if !plugin_version_is_newer(&plugin.manifest.version, &entry.version) {
+        if !is_newer_version(&entry.version, &plugin.manifest.version) {
             return Err(PluginServiceError::NoUpdate);
         }
-        self.supervisor.stop(&plugin_id).await;
-        self.install_remote_package(&entry).await?;
+        self.install_remote_package(&entry, true).await?;
         let current_catalog = self.catalog_snapshot().await;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
@@ -1629,6 +1630,7 @@ impl PluginService {
     async fn install_remote_package(
         &self,
         entry: &PluginStoreEntry,
+        stop_running: bool,
     ) -> Result<(), PluginServiceError> {
         let Some(store) = self.store.as_ref() else {
             return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
@@ -1658,6 +1660,9 @@ impl PluginService {
         if validation_catalog.get(&entry.id).is_none() {
             let _ = fs::remove_dir_all(&validation_dir).await;
             return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
+        }
+        if stop_running {
+            self.supervisor.stop(&entry.id).await;
         }
         let destination = plugin_dir.join(format!("{}-{}.zip", entry.id, entry.version));
         let staged_destination =
@@ -2021,35 +2026,6 @@ fn has_environment_value(name: &str) -> bool {
 
 fn is_tmdb_plugin_id(plugin_id: &str) -> bool {
     plugin_id == TMDB_PLUGIN_ID || plugin_id == TMDB_DYNAMIC_PLUGIN_ID
-}
-
-fn plugin_version_is_newer(current: &str, latest: &str) -> bool {
-    if current == latest {
-        return false;
-    }
-    let current_parts = current
-        .split('.')
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>();
-    let latest_parts = latest
-        .split('.')
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>();
-    match (current_parts, latest_parts) {
-        (Ok(current_parts), Ok(latest_parts)) => {
-            let length = current_parts.len().max(latest_parts.len());
-            (0..length)
-                .map(|index| {
-                    (
-                        current_parts.get(index).copied().unwrap_or(0),
-                        latest_parts.get(index).copied().unwrap_or(0),
-                    )
-                })
-                .find(|(current_part, latest_part)| current_part != latest_part)
-                .is_some_and(|(current_part, latest_part)| latest_part > current_part)
-        }
-        _ => latest > current,
-    }
 }
 
 fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) -> PluginView {
@@ -2752,19 +2728,22 @@ async fn tmdb_config_values(config_dir: &std::path::Path) -> serde_json::Map<Str
 
 #[cfg(test)]
 mod plugin_update_tests {
-    use super::plugin_version_is_newer;
+    use super::super::plugin_store::is_newer_version;
 
     #[test]
     fn compares_numeric_plugin_versions_without_lexical_ordering() {
-        assert!(plugin_version_is_newer("0.1.0", "0.2.0"));
-        assert!(plugin_version_is_newer("0.9.0", "0.10.0"));
-        assert!(!plugin_version_is_newer("1.0.1", "1.0.0"));
-        assert!(!plugin_version_is_newer("1.0.0", "1.0.0"));
+        assert!(is_newer_version("0.2.0", "0.1.0"));
+        assert!(is_newer_version("0.10.0", "0.9.0"));
+        assert!(!is_newer_version("1.0.0", "1.0.1"));
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
     }
 
     #[test]
-    fn treats_a_changed_non_numeric_version_as_an_update_candidate() {
-        assert!(plugin_version_is_newer("build-a", "build-b"));
-        assert!(!plugin_version_is_newer("build-a", "build-a"));
+    fn compares_semver_prereleases_and_rejects_non_semver_versions() {
+        assert!(is_newer_version("1.0.0", "1.0.0-rc.1"));
+        assert!(!is_newer_version("1.0.0-rc.1", "1.0.0"));
+        assert!(!is_newer_version("1.0.0+build.2", "1.0.0+build.1"));
+        assert!(!is_newer_version("build-b", "build-a"));
+        assert!(!is_newer_version("1.0.1", "01.0.0"));
     }
 }

@@ -15,7 +15,7 @@ use luxd::{
         scanner::LibraryScanner,
         setup::SetupService,
         tmdb::{TmdbClient, TmdbClientConfig},
-        tmdb_plugin::TmdbProvider,
+        tmdb_plugin::ScraperProvider,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -118,7 +118,7 @@ async fn metadata_job_can_be_cancelled_while_running() -> Result<(), Box<dyn std
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
     let job = metadata.create_library_job(&library.id.to_string()).await?;
     let job_id = job.id.clone();
     let runner = metadata.clone();
@@ -211,7 +211,7 @@ async fn metadata_job_reduces_workers_when_home_latency_is_degraded()
     })?;
     let resources = luxd::observability::resources::ResourceMetrics::new();
     resources.record_home_latency(Duration::from_millis(400));
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb))
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb))
         .with_resource_metrics(resources);
     let job = metadata.create_library_job(&library.id.to_string()).await?;
     metadata.run(&job.id).await;
@@ -261,7 +261,7 @@ async fn admin_can_request_metadata_job_cancellation() -> Result<(), Box<dyn std
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), TmdbProvider::from(tmdb));
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
     let job = metadata.create_job(vec![item_id]).await?;
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;

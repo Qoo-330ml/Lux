@@ -148,34 +148,6 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
         Some(2)
     );
 
-    fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 9\n")?;
-    let unmarked_thumbnail_jobs = service
-        .create_jobs(
-            &[library.id],
-            StrmProbeOptions {
-                concurrency: 2,
-                include_ready: false,
-                write_sidecars: false,
-                media_info_enabled: false,
-                thumbnail_enabled: true,
-                thumbnail_position_percent: 50,
-            },
-        )
-        .await?;
-    service.run(&unmarked_thumbnail_jobs[0].id).await?;
-    assert_eq!(
-        service.get(&unmarked_thumbnail_jobs[0].id).await?.status,
-        "COMPLETED"
-    );
-    assert!(!movie_dir.join("Plugin.Movie.2024-thumb.jpg").exists());
-
-    sqlx::query(
-        "UPDATE media_items
-         SET thumbnail_fallback_required = 1
-         WHERE id = (SELECT item_id FROM media_sources)",
-    )
-    .execute(database.pool())
-    .await?;
     fs::write(
         &fake_ffmpeg,
         "#!/bin/sh\nprintf '\\377\\330\\377fake-thumb\\377\\331'\n",
@@ -204,18 +176,25 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     let thumbnail_path = movie_dir.join("Plugin.Movie.2024-thumb.jpg");
     let thumbnail = fs::read(&thumbnail_path)?;
     assert_eq!(thumbnail, b"\xff\xd8\xfffake-thumb\xff\xd9");
-    let image: (String, String, i64) = sqlx::query_as(
-        "SELECT local_path, source, file_size FROM item_images
-         WHERE item_id = (SELECT item_id FROM media_sources) AND image_type = 'THUMB'",
+    let images: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT image_type, local_path, source, file_size FROM item_images
+         WHERE item_id = (SELECT item_id FROM media_sources)
+         ORDER BY image_type",
     )
-    .fetch_one(database.pool())
+    .fetch_all(database.pool())
     .await?;
+    assert_eq!(images.len(), 2);
+    assert_eq!(images[0].0, "POSTER");
+    assert_eq!(images[1].0, "THUMB");
     assert_eq!(
-        fs::canonicalize(&image.0)?,
+        fs::canonicalize(&images[0].1)?,
         fs::canonicalize(&thumbnail_path)?
     );
-    assert_eq!(image.1, "STRM_FFMPEG");
-    assert_eq!(image.2, i64::try_from(thumbnail.len())?);
+    assert_eq!(images[0].1, images[1].1);
+    assert_eq!(images[0].2, "STRM_FFMPEG");
+    assert_eq!(images[1].2, "STRM_FFMPEG");
+    assert_eq!(images[0].3, i64::try_from(thumbnail.len())?);
+    assert_eq!(images[1].3, i64::try_from(thumbnail.len())?);
 
     fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 9\n")?;
     let skip_thumbnail_jobs = service
