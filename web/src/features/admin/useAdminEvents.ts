@@ -49,7 +49,6 @@ const queryKeysByScope: Record<Exclude<AdminEventScope, "all">, QueryKey[]> = {
     ["admin", "logs"],
   ],
   metadata: [
-    ["admin", "metadata-jobs"],
     ["admin", "logs"],
   ],
   settings: [
