@@ -286,8 +286,6 @@ export type AdminPlugin = {
   description: string;
   category: string;
   version?: string | null;
-  availableVersion?: string | null;
-  updateAvailable?: boolean;
   runtime?: string | null;
   capabilities?: string[];
   status?: string;
