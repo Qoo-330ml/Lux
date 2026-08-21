@@ -8,7 +8,6 @@ pub const TMDB_TOKEN_FILE: &str = "tmdb_read_access_token";
 pub const TMDB_API_KEY_FILE: &str = "tmdb_api_key";
 pub const TMDB_SETTINGS_FILE: &str = "tmdb_settings.json";
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
-pub const DANMAKU_PROVIDER_URL_FILE: &str = "danmaku_provider_url";
 
 pub const TMDB_DEFAULT_PREFERRED_LANGUAGE: &str = "zh-CN";
 pub const TMDB_DEFAULT_API_BASE_URL: &str = "https://api.themoviedb.org";
@@ -330,10 +329,6 @@ pub fn read_network_proxy_url(config_dir: &Path) -> Option<String> {
     read_secret(config_dir.join(NETWORK_PROXY_URL_FILE))
 }
 
-pub fn read_danmaku_provider_url(config_dir: &Path) -> Option<String> {
-    read_secret(config_dir.join(DANMAKU_PROVIDER_URL_FILE))
-}
-
 fn read_secret(path: impl AsRef<Path>) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -357,26 +352,11 @@ pub async fn read_network_proxy_url_async(config_dir: &Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub async fn read_danmaku_provider_url_async(config_dir: &Path) -> Option<String> {
-    fs::read_to_string(config_dir.join(DANMAKU_PROVIDER_URL_FILE))
-        .await
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
 pub async fn write_network_proxy_url(
     config_dir: &Path,
     proxy_url: Option<&str>,
 ) -> std::io::Result<()> {
     write_secret_file(config_dir, NETWORK_PROXY_URL_FILE, proxy_url).await
-}
-
-pub async fn write_danmaku_provider_url(
-    config_dir: &Path,
-    provider_url: Option<&str>,
-) -> std::io::Result<()> {
-    write_secret_file(config_dir, DANMAKU_PROVIDER_URL_FILE, provider_url).await
 }
 
 async fn write_secret_file(

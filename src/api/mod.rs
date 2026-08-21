@@ -343,13 +343,9 @@ impl AppState {
             scheduled_tasks: Some(scheduled_tasks),
             webhooks,
             danmaku: Some(
-                DanmakuService::new(
-                    database.clone(),
-                    config_dir.clone(),
-                    network_proxy_url.clone(),
-                )
-                .with_plugins(plugins.clone())
-                .with_resource_metrics(resources.clone()),
+                DanmakuService::new(database.clone())
+                    .with_plugins(plugins.clone())
+                    .with_resource_metrics(resources.clone()),
             ),
             plugins: Some(plugins.clone()),
             scraper_resolver: Some(scraper_resolver),
@@ -18374,15 +18370,15 @@ fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
 
 fn danmaku_service_error(headers: &HeaderMap, error: DanmakuServiceError) -> Response {
     match error {
-        DanmakuServiceError::InvalidConcurrency
-        | DanmakuServiceError::InvalidProviderUrl(_)
-        | DanmakuServiceError::ProviderNotConfigured => api_error(
-            headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "弹幕匹配配置无效或尚未配置",
-        )
-        .into_response(),
+        DanmakuServiceError::InvalidConcurrency | DanmakuServiceError::ProviderNotConfigured => {
+            api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "弹幕匹配配置无效或尚未配置",
+            )
+            .into_response()
+        }
         DanmakuServiceError::AlreadyActive => api_error(
             headers,
             StatusCode::CONFLICT,

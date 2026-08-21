@@ -20,12 +20,20 @@ use tokio::{
 async fn danmaku_plugin_process_matches_and_returns_xml() -> Result<(), Box<dyn std::error::Error>>
 {
     let app = Router::new()
+        .route("/api/v2/match", post(|| async { StatusCode::NOT_FOUND }))
         .route(
-            "/api/v2/match",
-            post(|Json(body): Json<serde_json::Value>| async move {
-                assert_eq!(body["fileName"], "Demo.S01E01.mkv");
+            "/api/v2/search/episodes",
+            get(|| async {
                 Json(json!({
-                    "matches": [{"animeId": 12, "episodeId": 34}]
+                    "animes": [{
+                        "animeId": 12,
+                        "animeTitle": "Demo",
+                        "episodes": [{
+                            "episodeId": 34,
+                            "episodeNumber": 1,
+                            "episodeTitle": "S01E01"
+                        }]
+                    }]
                 }))
             }),
         )
