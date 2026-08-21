@@ -409,7 +409,7 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 83);
+    assert_eq!(database.schema_version().await?, 84);
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master
          WHERE type = 'table' AND name IN ('filesystem_entries', 'media_items', 'media_sources', 'media_streams')
