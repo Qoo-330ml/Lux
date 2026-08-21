@@ -93,6 +93,62 @@ async fn new_libraries_enable_realtime_indexing_by_default()
 }
 
 #[tokio::test]
+async fn new_libraries_register_safe_default_schedules() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let service = LibraryService::new(database.clone());
+
+    let without_scraper = service
+        .create_library("Local movies", LibraryKind::Movie, false)
+        .await?;
+    let with_scraper = service
+        .create_library_with_scraper(
+            "Online movies",
+            LibraryKind::Movie,
+            false,
+            Some("tmdb"),
+            false,
+        )
+        .await?;
+
+    let schedules: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT task_type, cron_or_interval, is_enabled
+         FROM scheduled_task_configs
+         WHERE owner_type = 'LIBRARY' AND owner_id = ?
+         ORDER BY task_type",
+    )
+    .bind(without_scraper.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        schedules,
+        vec![
+            ("METADATA_PARSE".to_owned(), None, 0),
+            (
+                "RECONCILIATION_SCAN".to_owned(),
+                Some("0 3 * * 0".to_owned()),
+                1
+            ),
+        ]
+    );
+
+    let online_metadata: (Option<String>, i64) = sqlx::query_as(
+        "SELECT cron_or_interval, is_enabled
+         FROM scheduled_task_configs
+         WHERE owner_type = 'LIBRARY' AND owner_id = ? AND task_type = 'METADATA_PARSE'",
+    )
+    .bind(with_scraper.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(online_metadata, (Some("0 4 * * 0".to_owned()), 1));
+    Ok(())
+}
+
+#[tokio::test]
 async fn chapter_sources_are_only_allowed_for_series_or_mixed_libraries()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

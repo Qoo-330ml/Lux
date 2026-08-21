@@ -60,6 +60,29 @@ High@5.1 (`avc1.640033`) 探测，避免 4K 错误使用 High@4.0 (`avc1.640028`
 
 ## 当前状态
 
+### Emby 迁移插件（LUX-190 / LUX-191+）
+
+`org.lux.emby-migration` 已实现为独立进程插件，Lux 宿主已实现后台任务、用户映射、媒体匹配、UserData
+导入、首次登录密码验证、幂等记录和管理员报告接口。当前仍未在本机连接到受控 Emby 实例，因此真实
+版本字段和完整事件端点尚未完成现场验证；不把本地 fixture 或聚合 UserData 当作真实事件证据。
+
+| 能力 | 当前状态 | 说明 |
+|---|---|---|
+| `ITEM_STATE` | 已实现，真实版本待验证 | 已看、播放位置、播放次数、最近播放时间和收藏 |
+| `EVENT_HISTORY` | 未声明 | 当前插件不伪造事件；只有公开 API 返回真实事件时才允许升级 |
+| 用户资料/权限 | 已实现，真实版本待验证 | 用户名、显示名、启用状态和按匹配条目推导的媒体库访问权限 |
+| 密码迁移 | 已实现，真实版本待验证 | 不读取密码哈希；首次 Lux 登录时向 Emby 验证一次原密码 |
+
+Emby 官方源码中的 `SqliteUserDataRepository` 只持久化 `played`、`playCount`、`isFavorite`、
+`playbackPositionTicks` 和 `lastPlayedDate` 等条目聚合状态，没有公开事件流字段；官方 Session API
+描述的是当前会话列表，不是历史播放事件。因此当前能力保持 `ITEM_STATE`，直到受控实例证明存在可用的
+公开原始事件端点：
+
+- https://github.com/MediaBrowser/Emby/blob/master/Emby.Server.Implementations/Data/SqliteUserDataRepository.cs
+- https://github.com/MediaBrowser/Emby/blob/master/MediaBrowser.Api/Session/SessionsService.cs
+
+迁移插件不属于 Emby 客户端兼容承诺，不改变 Emby 兼容 DTO 或目标客户端矩阵。
+
 ### Lux 原生出站 Webhook
 
 Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`），用于发送媒体、扫描、元数据、后台任务
