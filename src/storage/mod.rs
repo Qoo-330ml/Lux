@@ -13,6 +13,8 @@ use sqlx::{
 use tokio::fs;
 use uuid::Uuid;
 
+mod emby_migration;
+
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
 
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
