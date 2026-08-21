@@ -1904,6 +1904,7 @@ services:
 | LUX-188 | migrations/、migrations-postgres/、src/storage/mod.rs、src/application/people.rs、src/api/mod.rs、tests/people_api.rs、docs/ |
 | LUX-189 | src/application/watch.rs、src/application/reidentify.rs、src/application/images.rs、src/storage/mod.rs、migrations/、migrations-postgres/、web/src/features/admin/、web/src/react.css、tests/、web/tests/、docs/ |
 | LUX-190 | docs/LUX-DEVELOPMENT.md、docs/LUX-190-PLAN.md、docs/decisions/022-emby-migration-plugin.md、docs/COMPATIBILITY.md |
+| LUX-191+ | src/application/emby_migration*.rs、src/storage/emby_migration.rs、src/api/mod.rs、src/auth/users.rs、migrations/、migrations-postgres/、docs/LUX-191-PLAN.md |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4306,6 +4307,16 @@ UserData、用户权限和历史播放事件字段。只做规格、协议草案
 - 不读取 Emby 数据库、日志文件或未公开内部表。
 - 不实现 Emby 密码哈希导入；密码迁移只保留首次登录验证方案。
 - 不新增 migration、Rust 代码、Web 代码或插件包。
+
+#### LUX-191+：Emby → Lux 迁移实现
+
+正式实现作为 LUX-190 之后的连续任务，包含独立 `org.lux.emby-migration` 插件、Lux 宿主后台迁移任务、
+用户/媒体映射、UserData 状态导入、首次登录密码验证、管理员报告和播放历史查询接口。当前实现只声明
+`ITEM_STATE`；只有受控 Emby 实例证明存在公开原始播放事件端点后，才可增加 `EVENT_HISTORY`。
+
+验证：参见 `docs/LUX-191-PLAN.md` 和 `docs/COMPATIBILITY.md`。
+
+依赖：LUX-190。
 
 ## 26. 风险与缓解
 

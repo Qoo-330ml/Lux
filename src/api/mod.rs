@@ -757,6 +757,18 @@ pub fn app_with_state(state: AppState) -> Router {
             post(admin_retry_emby_migration),
         )
         .route(
+            "/api/v1/admin/emby-migration/{job_id}/users",
+            get(admin_list_emby_migration_users),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/{job_id}/matches",
+            get(admin_list_emby_migration_matches),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/{job_id}/imports",
+            get(admin_list_emby_migration_imports),
+        )
+        .route(
             "/api/v1/admin/users",
             get(admin_list_users).post(admin_create_user),
         )
@@ -1054,6 +1066,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/items/{item_id}/progress", post(lux_post_progress))
         .route("/api/v1/items/{item_id}/favorite", put(lux_set_favorite))
         .route("/api/v1/items/{item_id}/played", put(lux_set_played))
+        .route("/api/v1/playback-history", get(lux_list_playback_history))
         .route(
             "/api/v1/items/{item_id}/metadata",
             get(lux_get_metadata).patch(lux_update_metadata),
@@ -4849,6 +4862,44 @@ async fn lux_get_playback(
         "lastEventAt": active_session.as_ref().map(|value| value.last_event_at),
     }))
     .into_response()
+}
+
+async fn lux_list_playback_history(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.emby_migration.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service
+        .list_playback_history(&user.id.to_string(), offset, limit)
+        .await
+    {
+        Ok(events) => Json(json!({
+            "events": events,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => emby_migration_error(&headers, error),
+    }
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -17731,6 +17782,110 @@ fn emby_migration_error(headers: &HeaderMap, error: EmbyMigrationServiceError) -
         }
     };
     api_error(headers, status, lux::ApiErrorCode::InvalidRequest, message).into_response()
+}
+
+async fn admin_list_emby_migration_users(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_emby_migration_report(
+        headers,
+        job_id,
+        query,
+        state,
+        EmbyMigrationReportKind::Users,
+    )
+    .await
+}
+
+async fn admin_list_emby_migration_matches(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_emby_migration_report(
+        headers,
+        job_id,
+        query,
+        state,
+        EmbyMigrationReportKind::Matches,
+    )
+    .await
+}
+
+async fn admin_list_emby_migration_imports(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_emby_migration_report(
+        headers,
+        job_id,
+        query,
+        state,
+        EmbyMigrationReportKind::Imports,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum EmbyMigrationReportKind {
+    Users,
+    Matches,
+    Imports,
+}
+
+async fn admin_list_emby_migration_report(
+    headers: HeaderMap,
+    job_id: String,
+    query: AdminJobsQuery,
+    state: AppState,
+    kind: EmbyMigrationReportKind,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.emby_migration.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = match kind {
+        EmbyMigrationReportKind::Users => service
+            .list_user_links(&job_id, offset, limit)
+            .await
+            .map(|items| json!({ "users": items })),
+        EmbyMigrationReportKind::Matches => service
+            .list_item_matches(&job_id, offset, limit)
+            .await
+            .map(|items| json!({ "matches": items })),
+        EmbyMigrationReportKind::Imports => service
+            .list_import_records(&job_id, offset, limit)
+            .await
+            .map(|items| json!({ "imports": items })),
+    };
+    match result {
+        Ok(mut response) => {
+            response["page"] = json!(offset / limit + 1);
+            response["pageSize"] = json!(limit);
+            Json(response).into_response()
+        }
+        Err(error) => emby_migration_error(&headers, error),
+    }
 }
 
 #[derive(Deserialize)]

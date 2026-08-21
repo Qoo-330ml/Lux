@@ -68,6 +68,30 @@ pub(crate) struct StoredPlaybackHistoryEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyMigrationItemMatch {
+    pub job_id: String,
+    pub emby_item_id: String,
+    pub emby_item_type: String,
+    pub lux_item_id: Option<String>,
+    pub match_method: String,
+    pub confidence: Option<i64>,
+    pub status: String,
+    pub detail_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyMigrationImportRecord {
+    pub job_id: String,
+    pub emby_user_id: String,
+    pub emby_item_id: String,
+    pub lux_user_id: String,
+    pub lux_item_id: String,
+    pub state_hash: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredMigrationMediaIdentity {
     pub id: String,
     pub item_type: String,
@@ -386,6 +410,39 @@ impl Database {
         .map_err(storage_error)
     }
 
+    pub(crate) async fn list_emby_migration_user_links(
+        &self,
+        job_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredEmbyMigrationUserLink>, StorageError> {
+        self.query(
+            "SELECT job_id, emby_user_id, emby_username, lux_user_id, status, error
+             FROM emby_migration_user_links
+             WHERE job_id = ?
+             ORDER BY emby_username, emby_user_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredEmbyMigrationUserLink {
+                    job_id: row.get("job_id"),
+                    emby_user_id: row.get("emby_user_id"),
+                    emby_username: row.get("emby_username"),
+                    lux_user_id: row.get("lux_user_id"),
+                    status: row.get("status"),
+                    error: row.get("error"),
+                })
+                .collect()
+        })
+        .map_err(storage_error)
+    }
+
     pub(crate) async fn list_migration_media_identities(
         &self,
         after_id: Option<&str>,
@@ -458,6 +515,42 @@ impl Database {
         .map_err(storage_error)
     }
 
+    pub(crate) async fn list_emby_migration_item_matches(
+        &self,
+        job_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredEmbyMigrationItemMatch>, StorageError> {
+        self.query(
+            "SELECT job_id, emby_item_id, emby_item_type, lux_item_id,
+                    match_method, confidence, status, detail_json
+             FROM emby_migration_item_matches
+             WHERE job_id = ?
+             ORDER BY emby_item_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredEmbyMigrationItemMatch {
+                    job_id: row.get("job_id"),
+                    emby_item_id: row.get("emby_item_id"),
+                    emby_item_type: row.get("emby_item_type"),
+                    lux_item_id: row.get("lux_item_id"),
+                    match_method: row.get("match_method"),
+                    confidence: row.get("confidence"),
+                    status: row.get("status"),
+                    detail_json: row.get("detail_json"),
+                })
+                .collect()
+        })
+        .map_err(storage_error)
+    }
+
     pub(crate) async fn upsert_emby_migration_import_record(
         &self,
         job_id: &str,
@@ -493,6 +586,42 @@ impl Database {
         .execute(self.pool())
         .await
         .map(|_| ())
+        .map_err(storage_error)
+    }
+
+    pub(crate) async fn list_emby_migration_import_records(
+        &self,
+        job_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredEmbyMigrationImportRecord>, StorageError> {
+        self.query(
+            "SELECT job_id, emby_user_id, emby_item_id, lux_user_id, lux_item_id,
+                    state_hash, status, error
+             FROM emby_migration_import_records
+             WHERE job_id = ?
+             ORDER BY emby_user_id, emby_item_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredEmbyMigrationImportRecord {
+                    job_id: row.get("job_id"),
+                    emby_user_id: row.get("emby_user_id"),
+                    emby_item_id: row.get("emby_item_id"),
+                    lux_user_id: row.get("lux_user_id"),
+                    lux_item_id: row.get("lux_item_id"),
+                    state_hash: row.get("state_hash"),
+                    status: row.get("status"),
+                    error: row.get("error"),
+                })
+                .collect()
+        })
         .map_err(storage_error)
     }
 
@@ -565,6 +694,9 @@ impl Database {
         .map_err(storage_error)
     }
 
+    // Reserved for a future EVENT_HISTORY-capable source plugin. ITEM_STATE imports
+    // intentionally never synthesize rows in this table.
+    #[allow(dead_code)]
     pub(crate) async fn insert_playback_history_event(
         &self,
         event: &StoredPlaybackHistoryEvent,
@@ -588,6 +720,43 @@ impl Database {
         .execute(self.pool())
         .await
         .map(|result| result.rows_affected() == 1)
+        .map_err(storage_error)
+    }
+
+    pub(crate) async fn list_playback_history_events(
+        &self,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredPlaybackHistoryEvent>, StorageError> {
+        self.query(
+            "SELECT id, user_id, item_id, event_type, position_ticks, duration_ticks,
+                    occurred_at, source, source_event_key
+             FROM playback_history_events
+             WHERE user_id = ?
+             ORDER BY occurred_at DESC, id DESC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredPlaybackHistoryEvent {
+                    id: row.get("id"),
+                    user_id: row.get("user_id"),
+                    item_id: row.get("item_id"),
+                    event_type: row.get("event_type"),
+                    position_ticks: row.get("position_ticks"),
+                    duration_ticks: row.get("duration_ticks"),
+                    occurred_at: row.get("occurred_at"),
+                    source: row.get("source"),
+                    source_event_key: row.get("source_event_key"),
+                })
+                .collect()
+        })
         .map_err(storage_error)
     }
 

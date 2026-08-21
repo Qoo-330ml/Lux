@@ -16,8 +16,9 @@ use crate::{
     application::plugins::PluginServiceError,
     auth::users::{UserStore, UserStoreError, UserUpdate},
     storage::{
-        Database, StorageError, StoredEmbyMigrationJob, StoredEmbyMigrationSource,
-        StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity,
+        Database, StorageError, StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch,
+        StoredEmbyMigrationJob, StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding,
+        StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity, StoredPlaybackHistoryEvent,
     },
 };
 
@@ -53,6 +54,116 @@ pub struct MigrationJobView {
     pub failed_count: i64,
     pub cancel_requested: bool,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationUserLinkView {
+    pub job_id: String,
+    pub emby_user_id: String,
+    pub emby_username: String,
+    pub lux_user_id: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+impl From<StoredEmbyMigrationUserLink> for MigrationUserLinkView {
+    fn from(link: StoredEmbyMigrationUserLink) -> Self {
+        Self {
+            job_id: link.job_id,
+            emby_user_id: link.emby_user_id,
+            emby_username: link.emby_username,
+            lux_user_id: link.lux_user_id,
+            status: link.status,
+            error: link.error,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationItemMatchView {
+    pub job_id: String,
+    pub emby_item_id: String,
+    pub emby_item_type: String,
+    pub lux_item_id: Option<String>,
+    pub match_method: String,
+    pub confidence: Option<i64>,
+    pub status: String,
+    pub detail: serde_json::Value,
+}
+
+impl From<StoredEmbyMigrationItemMatch> for MigrationItemMatchView {
+    fn from(item: StoredEmbyMigrationItemMatch) -> Self {
+        Self {
+            job_id: item.job_id,
+            emby_item_id: item.emby_item_id,
+            emby_item_type: item.emby_item_type,
+            lux_item_id: item.lux_item_id,
+            match_method: item.match_method,
+            confidence: item.confidence,
+            status: item.status,
+            detail: serde_json::from_str(&item.detail_json).unwrap_or_else(|_| json!({})),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationImportRecordView {
+    pub job_id: String,
+    pub emby_user_id: String,
+    pub emby_item_id: String,
+    pub lux_user_id: String,
+    pub lux_item_id: String,
+    pub state_hash: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+impl From<StoredEmbyMigrationImportRecord> for MigrationImportRecordView {
+    fn from(record: StoredEmbyMigrationImportRecord) -> Self {
+        Self {
+            job_id: record.job_id,
+            emby_user_id: record.emby_user_id,
+            emby_item_id: record.emby_item_id,
+            lux_user_id: record.lux_user_id,
+            lux_item_id: record.lux_item_id,
+            state_hash: record.state_hash,
+            status: record.status,
+            error: record.error,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackHistoryEventView {
+    pub id: String,
+    pub user_id: String,
+    pub item_id: String,
+    pub event_type: String,
+    pub position_ticks: i64,
+    pub duration_ticks: Option<i64>,
+    pub occurred_at: i64,
+    pub source: String,
+    pub source_event_key: String,
+}
+
+impl From<StoredPlaybackHistoryEvent> for PlaybackHistoryEventView {
+    fn from(event: StoredPlaybackHistoryEvent) -> Self {
+        Self {
+            id: event.id,
+            user_id: event.user_id,
+            item_id: event.item_id,
+            event_type: event.event_type,
+            position_ticks: event.position_ticks,
+            duration_ticks: event.duration_ticks,
+            occurred_at: event.occurred_at,
+            source: event.source,
+            source_event_key: event.source_event_key,
+        }
+    }
 }
 
 impl From<StoredEmbyMigrationJob> for MigrationJobView {
@@ -228,6 +339,78 @@ impl EmbyMigrationService {
 
     pub async fn count_jobs(&self) -> Result<i64, EmbyMigrationServiceError> {
         Ok(self.database.count_emby_migration_jobs().await?)
+    }
+
+    pub async fn list_user_links(
+        &self,
+        job_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<MigrationUserLinkView>, EmbyMigrationServiceError> {
+        Ok(self
+            .database
+            .list_emby_migration_user_links(
+                job_id,
+                offset.max(0),
+                limit.clamp(1, MAX_JOB_PAGE_SIZE),
+            )
+            .await?
+            .into_iter()
+            .map(MigrationUserLinkView::from)
+            .collect())
+    }
+
+    pub async fn list_item_matches(
+        &self,
+        job_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<MigrationItemMatchView>, EmbyMigrationServiceError> {
+        Ok(self
+            .database
+            .list_emby_migration_item_matches(
+                job_id,
+                offset.max(0),
+                limit.clamp(1, MAX_JOB_PAGE_SIZE),
+            )
+            .await?
+            .into_iter()
+            .map(MigrationItemMatchView::from)
+            .collect())
+    }
+
+    pub async fn list_import_records(
+        &self,
+        job_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<MigrationImportRecordView>, EmbyMigrationServiceError> {
+        Ok(self
+            .database
+            .list_emby_migration_import_records(
+                job_id,
+                offset.max(0),
+                limit.clamp(1, MAX_JOB_PAGE_SIZE),
+            )
+            .await?
+            .into_iter()
+            .map(MigrationImportRecordView::from)
+            .collect())
+    }
+
+    pub async fn list_playback_history(
+        &self,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<PlaybackHistoryEventView>, EmbyMigrationServiceError> {
+        Ok(self
+            .database
+            .list_playback_history_events(user_id, offset.max(0), limit.clamp(1, MAX_JOB_PAGE_SIZE))
+            .await?
+            .into_iter()
+            .map(PlaybackHistoryEventView::from)
+            .collect())
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<bool, EmbyMigrationServiceError> {
