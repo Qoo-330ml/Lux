@@ -80,7 +80,9 @@ use crate::{
         scraper::ScraperResolver,
         settings::{read_network_proxy_url_async, write_network_proxy_url},
         strm_probe::{StrmProbeError, StrmProbeService},
-        strm_target::{StrmTargetKind, classify_strm_target},
+        strm_target::{
+            StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
+        },
         thumbnails::ThumbnailService,
         tmdb::{TmdbClient, TmdbError},
         tmdb_plugin::{TmdbPluginClient, TmdbProvider},
@@ -6211,17 +6213,20 @@ fn emby_media_source_json_with_resolver_and_chapters(
     strm_resolver_available: bool,
     include_chapters: bool,
 ) -> Value {
-    let is_remote = source.source_kind == "STRM_URL"
-        && source
+    let strm_target_kind = (source.source_kind == "STRM_URL").then(|| {
+        source
             .external_url
             .as_deref()
-            .is_some_and(is_http_strm_target);
+            .map(classify_strm_target)
+            .map_or(StrmTargetKind::Empty, |target| target.kind)
+    });
+    let is_remote = matches!(strm_target_kind, Some(StrmTargetKind::Url));
+    let is_local_strm_target = matches!(strm_target_kind, Some(StrmTargetKind::Path));
     let is_resolver_target = strm_resolver_available
-        && source.source_kind == "STRM_URL"
-        && source
-            .external_url
-            .as_deref()
-            .is_some_and(|target| !is_http_strm_target(target));
+        && matches!(
+            strm_target_kind,
+            Some(StrmTargetKind::Smb | StrmTargetKind::Ftp)
+        );
     let stream_suffix = source
         .container
         .as_deref()
@@ -6230,16 +6235,18 @@ fn emby_media_source_json_with_resolver_and_chapters(
         })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
-    let direct_stream_url = if source.source_kind == "LOCAL_FILE" || is_resolver_target {
-        Some(format!(
-            "/Videos/{item_id}/{}/stream{stream_suffix}",
-            source.id
-        ))
-    } else {
-        None
-    };
+    let direct_stream_url =
+        if source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_resolver_target {
+            Some(format!(
+                "/Videos/{item_id}/{}/stream{stream_suffix}",
+                source.id
+            ))
+        } else {
+            None
+        };
     let is_remote_playback = is_remote || is_resolver_target;
-    let is_playable = source.source_kind == "LOCAL_FILE" || is_remote_playback;
+    let is_playable =
+        source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_remote_playback;
     let default_audio_stream_index = source
         .streams
         .iter()
@@ -9865,32 +9872,52 @@ async fn serve_media_file(
         let Some(external_url) = source.external_url else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        let location = if is_http_strm_target(&external_url) {
-            external_url
-        } else {
-            let Some(plugins) = state.plugins.as_ref() else {
-                return StatusCode::NOT_IMPLEMENTED.into_response();
-            };
-            match plugins.resolve_strm_target(&external_url).await {
-                Ok(Some(url)) => url,
-                Ok(None) => return StatusCode::NOT_IMPLEMENTED.into_response(),
-                Err(PluginServiceError::InvalidResponse) => {
-                    return StatusCode::BAD_GATEWAY.into_response();
-                }
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        match classify_strm_target(&external_url).kind {
+            StrmTargetKind::Url => {
+                return redirect_strm_playback(&external_url);
             }
+            StrmTargetKind::Path => {
+                let path = match canonical_local_strm_target(
+                    &source.root_path,
+                    &source.relative_path,
+                    &external_url,
+                )
+                .await
+                {
+                    Ok(path) => path,
+                    Err(StrmLocalPathError::Missing) => {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    Err(StrmLocalPathError::Forbidden) => {
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
+                };
+                if path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("strm"))
+                {
+                    return StatusCode::NOT_IMPLEMENTED.into_response();
+                }
+                return serve_media_path(headers, method, &path).await;
+            }
+            StrmTargetKind::Smb | StrmTargetKind::Ftp => {}
+            StrmTargetKind::Empty | StrmTargetKind::Unsupported => {
+                return StatusCode::NOT_IMPLEMENTED.into_response();
+            }
+        }
+        let Some(plugins) = state.plugins.as_ref() else {
+            return StatusCode::NOT_IMPLEMENTED.into_response();
         };
-        let Some(location) = normalize_strm_http_location(&location) else {
-            return StatusCode::BAD_GATEWAY.into_response();
+        let location = match plugins.resolve_strm_target(&external_url).await {
+            Ok(Some(url)) => url,
+            Ok(None) => return StatusCode::NOT_IMPLEMENTED.into_response(),
+            Err(PluginServiceError::InvalidResponse) => {
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
-        return match Response::builder()
-            .status(StatusCode::TEMPORARY_REDIRECT)
-            .header("Location", location)
-            .body(Body::empty())
-        {
-            Ok(response) => response,
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+        return redirect_strm_playback(&location);
     }
     if source.source_kind != "LOCAL_FILE" {
         return StatusCode::NOT_IMPLEMENTED.into_response();
@@ -9903,11 +9930,26 @@ async fn serve_media_file(
     serve_media_path(headers, method, &path).await
 }
 
+fn redirect_strm_playback(location: &str) -> Response {
+    let Some(location) = normalize_strm_http_location(location) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    match Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header("Location", location)
+        .body(Body::empty())
+    {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 fn download_error_response(error: DownloadError) -> Response {
     let status = match error {
         DownloadError::ItemNotFound => StatusCode::NOT_FOUND,
         DownloadError::PathOutsideRoot(_) => StatusCode::FORBIDDEN,
         DownloadError::InvalidFileName(_)
+        | DownloadError::UnsupportedStrmTarget
         | DownloadError::RemoteUrl(
             crate::application::remote_url_policy::RemoteMediaUrlError::Invalid
             | crate::application::remote_url_policy::RemoteMediaUrlError::BlockedHost,
@@ -19252,7 +19294,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_targets_use_a_protected_lux_stream_entrypoint() {
+    fn local_path_targets_use_a_protected_lux_stream_entrypoint() {
         let source = CatalogSource {
             id: "source-1".to_owned(),
             source_kind: "STRM_URL".to_owned(),
@@ -19271,8 +19313,8 @@ mod tests {
 
         let body = emby_media_source_json_with_resolver("item-1", &source, false, true);
 
-        assert_eq!(body["Protocol"], "Http");
-        assert_eq!(body["IsRemote"], true);
+        assert_eq!(body["Protocol"], "File");
+        assert_eq!(body["IsRemote"], false);
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(
             body["DirectStreamUrl"],

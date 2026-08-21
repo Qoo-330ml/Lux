@@ -43,6 +43,7 @@ use crate::{
             read_tmdb_settings, tmdb_api_base_url_options, tmdb_language_options,
             write_tmdb_api_key, write_tmdb_settings,
         },
+        strm_target::{StrmTargetKind, classify_strm_target},
     },
     domain::ids::LibraryId,
     storage::{Database, StorageError},
@@ -884,6 +885,12 @@ impl PluginService {
         &self,
         target: &str,
     ) -> Result<Option<String>, PluginServiceError> {
+        if !matches!(
+            classify_strm_target(target).kind,
+            StrmTargetKind::Smb | StrmTargetKind::Ftp
+        ) {
+            return Ok(None);
+        }
         let mut first_error = None;
         for plugin_id in self.available_strm_resolver_ids().await? {
             let request = StrmResolveRpcRequest {

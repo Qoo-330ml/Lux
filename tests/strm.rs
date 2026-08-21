@@ -34,9 +34,11 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     tokio::fs::write(root.join("Empty.Movie.2025.strm"), b"\n \n").await?;
     tokio::fs::write(
         root.join("Path.Movie.2026.strm"),
-        "/media/cloud-library/movie (4K).mp4\nignored\n",
+        "targets/movie (4K).target\nignored\n",
     )
     .await?;
+    tokio::fs::create_dir_all(root.join("targets")).await?;
+    tokio::fs::write(root.join("targets/movie (4K).target"), b"local path media").await?;
     tokio::fs::write(
         root.join("Opaque.Movie.2027.strm"),
         "media-provider://library/item/7\n",
@@ -73,10 +75,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         .find(|row| row.0 == "Path Movie")
         .ok_or("missing path source")?;
     assert_eq!(path.1, "STRM_URL");
-    assert_eq!(
-        path.2.as_deref(),
-        Some("/media/cloud-library/movie (4K).mp4")
-    );
+    assert_eq!(path.2.as_deref(), Some("targets/movie (4K).target"));
     assert_eq!(path.3.as_deref(), Some("PATH"));
     let opaque = stored
         .iter()
@@ -208,8 +207,11 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     let path_body = path_playback.json::<Value>().await?;
     assert_eq!(path_body["MediaSources"][0]["Protocol"], "File");
     assert_eq!(path_body["MediaSources"][0]["IsRemote"], false);
-    assert_eq!(path_body["MediaSources"][0]["SupportsDirectPlay"], false);
-    assert!(path_body["MediaSources"][0]["DirectStreamUrl"].is_null());
+    assert_eq!(path_body["MediaSources"][0]["SupportsDirectPlay"], true);
+    assert_eq!(
+        path_body["MediaSources"][0]["DirectStreamUrl"],
+        format!("/Videos/{path_item_id}/{path_source_id}/stream")
+    );
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -260,7 +262,8 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         ])
         .send()
         .await?;
-    assert_eq!(path_stream.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(path_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(path_stream.bytes().await?, "local path media");
 
     let unmatched_video_path = no_redirect_client
         .get(format!(

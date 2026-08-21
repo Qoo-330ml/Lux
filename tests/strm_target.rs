@@ -35,11 +35,23 @@ fn classifies_windows_and_unc_paths_as_paths() {
 }
 
 #[test]
-fn keeps_other_schemes_opaque() {
-    let target = classify_strm_target("magnet:?xt=urn:btih:example");
+fn classifies_smb_and_ftp_targets() {
+    assert_eq!(
+        classify_strm_target("smb://nas/media/movie.mkv").kind,
+        StrmTargetKind::Smb
+    );
+    assert_eq!(
+        classify_strm_target("FTP://example.com/movie.mkv").kind,
+        StrmTargetKind::Ftp
+    );
+}
 
-    assert_eq!(target.kind, StrmTargetKind::Opaque);
-    assert_eq!(target.value.as_deref(), Some("magnet:?xt=urn:btih:example"));
+#[test]
+fn keeps_other_schemes_unsupported() {
+    let target = classify_strm_target("rtsp://camera.example/live");
+
+    assert_eq!(target.kind, StrmTargetKind::Unsupported);
+    assert_eq!(target.value.as_deref(), Some("rtsp://camera.example/live"));
 }
 
 #[test]
