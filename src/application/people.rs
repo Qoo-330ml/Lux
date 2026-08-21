@@ -4,6 +4,7 @@ use std::{
     fmt::Write as _,
     io::Cursor,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     io::AsyncWriteExt,
+    sync::Mutex as AsyncMutex,
     time::{Duration, sleep},
 };
 use uuid::Uuid;
@@ -480,6 +482,42 @@ pub struct PeopleService {
     config_dir: PathBuf,
     client: Client,
     database: Option<Database>,
+    rebuild_lock: Arc<AsyncMutex<()>>,
+    rebuild_coordinator: PersonIndexRebuildCoordinator,
+}
+
+#[derive(Clone, Default)]
+struct PersonIndexRebuildCoordinator {
+    state: Arc<AsyncMutex<PersonIndexRebuildCoordinatorState>>,
+}
+
+#[derive(Default)]
+struct PersonIndexRebuildCoordinatorState {
+    running: bool,
+    pending: bool,
+}
+
+impl PersonIndexRebuildCoordinator {
+    async fn begin(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.running {
+            state.pending = true;
+            return false;
+        }
+        state.running = true;
+        true
+    }
+
+    async fn finish(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.pending {
+            state.pending = false;
+            true
+        } else {
+            state.running = false;
+            false
+        }
+    }
 }
 
 impl PeopleService {
@@ -508,6 +546,8 @@ impl PeopleService {
             config_dir,
             client,
             database: None,
+            rebuild_lock: Arc::new(AsyncMutex::new(())),
+            rebuild_coordinator: PersonIndexRebuildCoordinator::default(),
         }
     }
 
@@ -2429,7 +2469,31 @@ impl PeopleService {
         Ok(None)
     }
 
+    pub(crate) fn schedule_person_index_rebuild(&self) {
+        let service = self.clone();
+        let coordinator = self.rebuild_coordinator.clone();
+        tokio::spawn(async move {
+            if !coordinator.begin().await {
+                return;
+            }
+            loop {
+                match service.rebuild_person_credit_index().await {
+                    Ok(rebuilt_items) => {
+                        tracing::info!(rebuilt_items, "person credit index rebuild completed");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "person credit index rebuild failed");
+                    }
+                }
+                if !coordinator.finish().await {
+                    break;
+                }
+            }
+        });
+    }
+
     pub async fn rebuild_person_credit_index(&self) -> Result<usize, PeopleError> {
+        let _rebuild_guard = self.rebuild_lock.lock().await;
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
                 "people database index is unavailable".to_owned(),
@@ -5400,7 +5464,7 @@ mod tests {
 
     use super::{
         ActorCredit, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PeopleError, PeopleService,
-        PersonIdentity, PersonManifest, PersonMetadata,
+        PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest, PersonMetadata,
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
@@ -5419,6 +5483,17 @@ mod tests {
         0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
         0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
+
+    #[tokio::test]
+    async fn person_index_rebuild_requests_coalesce_while_a_run_is_active() {
+        let coordinator = PersonIndexRebuildCoordinator::default();
+
+        assert!(coordinator.begin().await);
+        assert!(!coordinator.begin().await);
+        assert!(coordinator.finish().await);
+        assert!(!coordinator.finish().await);
+        assert!(coordinator.begin().await);
+    }
 
     #[test]
     fn birthday_matching_accepts_format_variants_but_rejects_full_date_conflicts() {

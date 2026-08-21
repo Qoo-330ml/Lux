@@ -440,16 +440,7 @@ impl AppState {
         let Some(service) = self.people.clone() else {
             return;
         };
-        tokio::spawn(async move {
-            match service.rebuild_person_credit_index().await {
-                Ok(rebuilt_items) => {
-                    tracing::info!(rebuilt_items, "person credit index rebuild completed");
-                }
-                Err(error) => {
-                    tracing::error!(%error, "person credit index rebuild failed");
-                }
-            }
-        });
+        service.schedule_person_index_rebuild();
     }
 
     pub async fn resume_scan_jobs(&self) {

@@ -12,6 +12,7 @@
 - worker 领取时生成不可复用的 `run_token`。所有进度和终态更新必须匹配任务 ID 与 token。
 - 条目按 `media_items.id` keyset 分页，过滤可见的电影、剧集、季和集。
 - 条目状态只在成功替换关系事务中写入；来源指纹为空时永远不跳过。
+- 进程内重复触发只合并为 pending 标记，实际重建协调器保持单个运行器；数据库任务仍按媒体库独立领取。
 - 管理 API 使用统一 `{ error: { code, message, requestId } }` 错误合同。
 
 ## Implementation slices
