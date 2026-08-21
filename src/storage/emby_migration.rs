@@ -26,6 +26,26 @@ pub(crate) struct StoredEmbyMigrationJob {
     pub error: Option<String>,
 }
 
+pub(crate) struct NewEmbyMigrationJob<'a> {
+    pub id: &'a str,
+    pub created_by_user_id: &'a str,
+    pub source_label: &'a str,
+    pub source_base_url: &'a str,
+    pub secret_ref: &'a str,
+    pub dry_run: bool,
+    pub merge_policy: &'a str,
+}
+
+pub(crate) struct EmbyMigrationJobProgress<'a> {
+    pub id: &'a str,
+    pub cursor_json: &'a str,
+    pub processed_count: i64,
+    pub total_count: i64,
+    pub matched_count: i64,
+    pub skipped_count: i64,
+    pub failed_count: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredEmbyMigrationUserLink {
     pub job_id: String,
@@ -79,6 +99,17 @@ pub(crate) struct StoredEmbyMigrationItemMatch {
     pub detail_json: String,
 }
 
+pub(crate) struct NewEmbyMigrationItemMatch<'a> {
+    pub job_id: &'a str,
+    pub emby_item_id: &'a str,
+    pub emby_item_type: &'a str,
+    pub lux_item_id: Option<&'a str>,
+    pub match_method: &'a str,
+    pub confidence: Option<i64>,
+    pub status: &'a str,
+    pub detail_json: &'a str,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredEmbyMigrationImportRecord {
     pub job_id: String,
@@ -89,6 +120,27 @@ pub(crate) struct StoredEmbyMigrationImportRecord {
     pub state_hash: String,
     pub status: String,
     pub error: Option<String>,
+}
+
+pub(crate) struct NewEmbyMigrationImportRecord<'a> {
+    pub job_id: &'a str,
+    pub emby_user_id: &'a str,
+    pub emby_item_id: &'a str,
+    pub lux_user_id: &'a str,
+    pub lux_item_id: &'a str,
+    pub state_hash: &'a str,
+    pub status: &'a str,
+    pub error: Option<&'a str>,
+}
+
+pub(crate) struct NewImportedUserItemState<'a> {
+    pub user_id: &'a str,
+    pub item_id: &'a str,
+    pub position_ticks: i64,
+    pub is_played: bool,
+    pub is_favorite: bool,
+    pub play_count: i64,
+    pub last_played_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,13 +280,7 @@ impl Database {
 
     pub(crate) async fn insert_emby_migration_job(
         &self,
-        id: &str,
-        created_by_user_id: &str,
-        source_label: &str,
-        source_base_url: &str,
-        secret_ref: &str,
-        dry_run: bool,
-        merge_policy: &str,
+        job: &NewEmbyMigrationJob<'_>,
     ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO emby_migration_jobs (
@@ -242,13 +288,13 @@ impl Database {
                  secret_ref, status, phase, dry_run, merge_policy
              ) VALUES (?, 'org.lux.emby-migration', ?, ?, ?, ?, 'PENDING', 'TESTING', ?, ?)",
         )
-        .bind(id)
-        .bind(created_by_user_id)
-        .bind(source_label)
-        .bind(source_base_url)
-        .bind(secret_ref)
-        .bind(if dry_run { 1_i64 } else { 0_i64 })
-        .bind(merge_policy)
+        .bind(job.id)
+        .bind(job.created_by_user_id)
+        .bind(job.source_label)
+        .bind(job.source_base_url)
+        .bind(job.secret_ref)
+        .bind(if job.dry_run { 1_i64 } else { 0_i64 })
+        .bind(job.merge_policy)
         .execute(self.pool())
         .await
         .map(|_| ())
@@ -340,13 +386,7 @@ impl Database {
 
     pub(crate) async fn update_emby_migration_job_progress(
         &self,
-        id: &str,
-        cursor_json: &str,
-        processed_count: i64,
-        total_count: i64,
-        matched_count: i64,
-        skipped_count: i64,
-        failed_count: i64,
+        progress: &EmbyMigrationJobProgress<'_>,
     ) -> Result<bool, StorageError> {
         self.query(
             "UPDATE emby_migration_jobs
@@ -354,13 +394,13 @@ impl Database {
                  skipped_count = ?, failed_count = ?, updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
-        .bind(cursor_json)
-        .bind(processed_count)
-        .bind(total_count)
-        .bind(matched_count)
-        .bind(skipped_count)
-        .bind(failed_count)
-        .bind(id)
+        .bind(progress.cursor_json)
+        .bind(progress.processed_count)
+        .bind(progress.total_count)
+        .bind(progress.matched_count)
+        .bind(progress.skipped_count)
+        .bind(progress.failed_count)
+        .bind(progress.id)
         .execute(self.pool())
         .await
         .map(|result| result.rows_affected() == 1)
@@ -478,14 +518,7 @@ impl Database {
 
     pub(crate) async fn upsert_emby_migration_item_match(
         &self,
-        job_id: &str,
-        emby_item_id: &str,
-        emby_item_type: &str,
-        lux_item_id: Option<&str>,
-        match_method: &str,
-        confidence: Option<i64>,
-        status: &str,
-        detail_json: &str,
+        item_match: &NewEmbyMigrationItemMatch<'_>,
     ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO emby_migration_item_matches (
@@ -501,14 +534,14 @@ impl Database {
                  detail_json = excluded.detail_json,
                  updated_at = unixepoch()",
         )
-        .bind(job_id)
-        .bind(emby_item_id)
-        .bind(emby_item_type)
-        .bind(lux_item_id)
-        .bind(match_method)
-        .bind(confidence)
-        .bind(status)
-        .bind(detail_json)
+        .bind(item_match.job_id)
+        .bind(item_match.emby_item_id)
+        .bind(item_match.emby_item_type)
+        .bind(item_match.lux_item_id)
+        .bind(item_match.match_method)
+        .bind(item_match.confidence)
+        .bind(item_match.status)
+        .bind(item_match.detail_json)
         .execute(self.pool())
         .await
         .map(|_| ())
@@ -553,14 +586,7 @@ impl Database {
 
     pub(crate) async fn upsert_emby_migration_import_record(
         &self,
-        job_id: &str,
-        emby_user_id: &str,
-        emby_item_id: &str,
-        lux_user_id: &str,
-        lux_item_id: &str,
-        state_hash: &str,
-        status: &str,
-        error: Option<&str>,
+        record: &NewEmbyMigrationImportRecord<'_>,
     ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO emby_migration_import_records (
@@ -575,14 +601,14 @@ impl Database {
                  error = excluded.error,
                  imported_at = unixepoch()",
         )
-        .bind(job_id)
-        .bind(emby_user_id)
-        .bind(emby_item_id)
-        .bind(lux_user_id)
-        .bind(lux_item_id)
-        .bind(state_hash)
-        .bind(status)
-        .bind(error)
+        .bind(record.job_id)
+        .bind(record.emby_user_id)
+        .bind(record.emby_item_id)
+        .bind(record.lux_user_id)
+        .bind(record.lux_item_id)
+        .bind(record.state_hash)
+        .bind(record.status)
+        .bind(record.error)
         .execute(self.pool())
         .await
         .map(|_| ())
@@ -654,13 +680,7 @@ impl Database {
 
     pub(crate) async fn upsert_imported_user_item_state(
         &self,
-        user_id: &str,
-        item_id: &str,
-        position_ticks: i64,
-        is_played: bool,
-        is_favorite: bool,
-        play_count: i64,
-        last_played_at: Option<i64>,
+        state: &NewImportedUserItemState<'_>,
     ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO user_item_state (
@@ -681,13 +701,13 @@ impl Database {
                        OR COALESCE(last_played_at, -1) != COALESCE(excluded.last_played_at, -1)
                      THEN 1 ELSE 0 END",
         )
-        .bind(user_id)
-        .bind(item_id)
-        .bind(position_ticks)
-        .bind(if is_played { 1_i64 } else { 0_i64 })
-        .bind(if is_favorite { 1_i64 } else { 0_i64 })
-        .bind(play_count)
-        .bind(last_played_at)
+        .bind(state.user_id)
+        .bind(state.item_id)
+        .bind(state.position_ticks)
+        .bind(if state.is_played { 1_i64 } else { 0_i64 })
+        .bind(if state.is_favorite { 1_i64 } else { 0_i64 })
+        .bind(state.play_count)
+        .bind(state.last_played_at)
         .execute(self.pool())
         .await
         .map(|_| ())
@@ -849,7 +869,15 @@ mod tests {
         let (user_id, item_id) = insert_test_user_and_item(&database).await?;
 
         database
-            .upsert_imported_user_item_state(&user_id, &item_id, 120, true, true, 3, Some(200))
+            .upsert_imported_user_item_state(&NewImportedUserItemState {
+                user_id: &user_id,
+                item_id: &item_id,
+                position_ticks: 120,
+                is_played: true,
+                is_favorite: true,
+                play_count: 3,
+                last_played_at: Some(200),
+            })
             .await?;
         let state = database
             .find_user_item_state_for_migration(&user_id, &item_id)
@@ -890,15 +918,15 @@ mod tests {
         let job_id = Uuid::now_v7().to_string();
 
         database
-            .insert_emby_migration_job(
-                &job_id,
-                &user_id,
-                "Test Emby",
-                "https://emby.example.test/",
-                "emby-migration/test",
-                true,
-                "MERGE",
-            )
+            .insert_emby_migration_job(&NewEmbyMigrationJob {
+                id: &job_id,
+                created_by_user_id: &user_id,
+                source_label: "Test Emby",
+                source_base_url: "https://emby.example.test/",
+                secret_ref: "emby-migration/test",
+                dry_run: true,
+                merge_policy: "MERGE",
+            })
             .await?;
         assert!(
             database
@@ -912,7 +940,15 @@ mod tests {
         );
         assert!(
             database
-                .update_emby_migration_job_progress(&job_id, r#"{"page":1}"#, 5, 10, 4, 1, 0)
+                .update_emby_migration_job_progress(&EmbyMigrationJobProgress {
+                    id: &job_id,
+                    cursor_json: r#"{"page":1}"#,
+                    processed_count: 5,
+                    total_count: 10,
+                    matched_count: 4,
+                    skipped_count: 1,
+                    failed_count: 0,
+                })
                 .await?
         );
         assert!(database.request_emby_migration_cancel(&job_id).await?);

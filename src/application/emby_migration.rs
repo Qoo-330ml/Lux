@@ -92,18 +92,13 @@ impl EmbyMigrationSource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MigrationMergePolicy {
+    #[default]
     Merge,
     Overwrite,
     Skip,
-}
-
-impl Default for MigrationMergePolicy {
-    fn default() -> Self {
-        Self::Merge
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

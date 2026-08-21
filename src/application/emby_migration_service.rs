@@ -16,9 +16,11 @@ use crate::{
     application::plugins::PluginServiceError,
     auth::users::{UserStore, UserStoreError, UserUpdate},
     storage::{
-        Database, StorageError, StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch,
-        StoredEmbyMigrationJob, StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding,
-        StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity, StoredPlaybackHistoryEvent,
+        Database, EmbyMigrationJobProgress, NewEmbyMigrationImportRecord,
+        NewEmbyMigrationItemMatch, NewEmbyMigrationJob, NewImportedUserItemState, StorageError,
+        StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob,
+        StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink,
+        StoredMigrationMediaIdentity, StoredPlaybackHistoryEvent,
     },
 };
 
@@ -294,15 +296,15 @@ impl EmbyMigrationService {
         }
         if let Err(error) = self
             .database
-            .insert_emby_migration_job(
-                &job_id,
+            .insert_emby_migration_job(&NewEmbyMigrationJob {
+                id: &job_id,
                 created_by_user_id,
-                &source_label,
-                &source_base_url,
-                &secret_ref,
-                request.dry_run,
-                merge_policy_name(request.merge_policy),
-            )
+                source_label: &source_label,
+                source_base_url: &source_base_url,
+                secret_ref: &secret_ref,
+                dry_run: request.dry_run,
+                merge_policy: merge_policy_name(request.merge_policy),
+            })
             .await
         {
             let _ = self.remove_secret(&secret_ref).await;
@@ -641,16 +643,16 @@ impl EmbyMigrationService {
                     }))
                     .unwrap_or_else(|_| "{}".to_owned());
                     self.database
-                        .upsert_emby_migration_item_match(
+                        .upsert_emby_migration_item_match(&NewEmbyMigrationItemMatch {
                             job_id,
-                            &item.id,
-                            &item.item_type,
-                            outcome.lux_item_id.as_deref(),
-                            outcome.method,
-                            outcome.confidence,
-                            outcome.status,
-                            &detail,
-                        )
+                            emby_item_id: &item.id,
+                            emby_item_type: &item.item_type,
+                            lux_item_id: outcome.lux_item_id.as_deref(),
+                            match_method: outcome.method,
+                            confidence: outcome.confidence,
+                            status: outcome.status,
+                            detail_json: &detail,
+                        })
                         .await?;
                     let Some(lux_item_id) = outcome.lux_item_id else {
                         skipped += 1;
@@ -688,44 +690,44 @@ impl EmbyMigrationService {
                     )
                     .ok_or(EmbyMigrationServiceError::InvalidState)?;
                     self.database
-                        .upsert_imported_user_item_state(
-                            lux_user_id,
-                            &lux_item_id,
-                            merged.position_ticks,
-                            merged.is_played,
-                            merged.is_favorite,
-                            merged.play_count,
-                            merged.last_played_at,
-                        )
+                        .upsert_imported_user_item_state(&NewImportedUserItemState {
+                            user_id: lux_user_id,
+                            item_id: &lux_item_id,
+                            position_ticks: merged.position_ticks,
+                            is_played: merged.is_played,
+                            is_favorite: merged.is_favorite,
+                            play_count: merged.play_count,
+                            last_played_at: merged.last_played_at,
+                        })
                         .await?;
                     let state_hash = hex_sha256(&user_data)?;
                     self.database
-                        .upsert_emby_migration_import_record(
+                        .upsert_emby_migration_import_record(&NewEmbyMigrationImportRecord {
                             job_id,
-                            &user.id,
-                            &item.id,
+                            emby_user_id: &user.id,
+                            emby_item_id: &item.id,
                             lux_user_id,
-                            &lux_item_id,
-                            &state_hash,
-                            "IMPORTED",
-                            None,
-                        )
+                            lux_item_id: &lux_item_id,
+                            state_hash: &state_hash,
+                            status: "IMPORTED",
+                            error: None,
+                        })
                         .await?;
                 }
                 self.database
-                    .update_emby_migration_job_progress(
-                        job_id,
-                        &serde_json::to_string(&json!({
+                    .update_emby_migration_job_progress(&EmbyMigrationJobProgress {
+                        id: job_id,
+                        cursor_json: &serde_json::to_string(&json!({
                             "userId": user.id,
                             "startIndex": page.start_index,
                         }))
                         .unwrap_or_else(|_| "{}".to_owned()),
-                        processed,
-                        total,
-                        matched,
-                        skipped,
-                        failed,
-                    )
+                        processed_count: processed,
+                        total_count: total,
+                        matched_count: matched,
+                        skipped_count: skipped,
+                        failed_count: failed,
+                    })
                     .await?;
                 let Some(next_start_index) = page.next_start_index else {
                     break;
@@ -754,9 +756,15 @@ impl EmbyMigrationService {
             .update_emby_migration_job_status(job_id, "RUNNING", "FINALIZING", None)
             .await?;
         self.database
-            .update_emby_migration_job_progress(
-                job_id, "{}", processed, total, matched, skipped, failed,
-            )
+            .update_emby_migration_job_progress(&EmbyMigrationJobProgress {
+                id: job_id,
+                cursor_json: "{}",
+                processed_count: processed,
+                total_count: total,
+                matched_count: matched,
+                skipped_count: skipped,
+                failed_count: failed,
+            })
             .await?;
         self.database
             .update_emby_migration_job_status(job_id, "COMPLETED", "FINALIZING", None)

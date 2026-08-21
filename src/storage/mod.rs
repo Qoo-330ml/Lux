@@ -15,9 +15,11 @@ use uuid::Uuid;
 
 mod emby_migration;
 pub(crate) use emby_migration::{
-    StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob,
-    StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink,
-    StoredMigrationMediaIdentity, StoredPlaybackHistoryEvent,
+    EmbyMigrationJobProgress, NewEmbyMigrationImportRecord, NewEmbyMigrationItemMatch,
+    NewEmbyMigrationJob, NewImportedUserItemState, StoredEmbyMigrationImportRecord,
+    StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob, StoredEmbyMigrationSource,
+    StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity,
+    StoredPlaybackHistoryEvent,
 };
 
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
