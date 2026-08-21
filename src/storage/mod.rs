@@ -1388,6 +1388,18 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) async fn clear_person_credits(&self, item_id: &str) -> Result<u64, StorageError> {
+        self.query("DELETE FROM person_credits WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn resolve_or_create_canonical_person(
         &self,
         display_name: &str,

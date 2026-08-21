@@ -27,6 +27,134 @@ const PNG_1X1: &[u8] = &[
 const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
 
 #[tokio::test]
+async fn rebuilding_people_does_not_clear_index_when_metadata_library_root_is_missing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('item-metadata-root-missing', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    service
+        .persist_item_actors(
+            "item-metadata-root-missing",
+            "tmdb",
+            &[ActorCredit {
+                id: "101".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    let before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-metadata-root-missing'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(before, 1);
+
+    tokio::fs::remove_dir_all(config.config_dir.join("metadata/library")).await?;
+
+    assert_eq!(service.rebuild_person_credit_index().await?, 0);
+    let after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-metadata-root-missing'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebuilding_people_clears_index_for_missing_item_metadata_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    for item_id in ["item-metadata-missing", "item-metadata-kept"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+    let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    for item_id in ["item-metadata-missing", "item-metadata-kept"] {
+        service
+            .persist_item_actors(
+                item_id,
+                "tmdb",
+                &[ActorCredit {
+                    id: if item_id == "item-metadata-missing" {
+                        "101"
+                    } else {
+                        "102"
+                    }
+                    .to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员".to_owned(),
+                    character: Some("角色".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                    person: None,
+                }],
+            )
+            .await?;
+    }
+
+    tokio::fs::remove_dir_all(library_item_directory(
+        &config.config_dir,
+        "item-metadata-missing",
+    )?)
+    .await?;
+
+    assert_eq!(service.rebuild_person_credit_index().await?, 2);
+    let missing_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-metadata-missing'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let kept_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-metadata-kept'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(missing_count, 0);
+    assert_eq!(kept_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn emby_persons_lists_library_actors_with_shared_admin_key()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -2384,6 +2384,32 @@ impl PeopleService {
         if replayed_decisions > 0 {
             tracing::info!(replayed_decisions, "person decision operations replayed");
         }
+        let library_metadata_root = metadata_root(&self.config_dir).join("library");
+        match fs::metadata(&library_metadata_root).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(PeopleError::Io {
+                    path: library_metadata_root,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "metadata library root is not a directory",
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %library_metadata_root.display(),
+                    "skipping people index rebuild because metadata library root is missing"
+                );
+                return Ok(0);
+            }
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: library_metadata_root,
+                    source,
+                });
+            }
+        }
         let restored_relations = self.restore_person_relation_snapshots(database).await?;
         if restored_relations > 0 {
             tracing::info!(restored_relations, "people relation snapshots restored");
@@ -2834,13 +2860,23 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
-        let credits = match relation.as_ref() {
-            Some(relation) => {
-                self.person_credits_from_relation(database, relation)
-                    .await?
+        let Some(relation) = relation else {
+            let cleared = database
+                .clear_person_credits(item_id)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            if cleared > 0 {
+                tracing::debug!(
+                    item_id,
+                    cleared,
+                    "cleared person credits because relation snapshot is missing"
+                );
             }
-            None => Vec::new(),
+            return Ok(());
         };
+        let credits = self
+            .person_credits_from_relation(database, &relation)
+            .await?;
         database
             .replace_person_credits(item_id, &credits)
             .await
