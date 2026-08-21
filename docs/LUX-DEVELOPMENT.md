@@ -1738,24 +1738,43 @@ services:
 
 ## 22. Emby 数据迁移
 
-迁移是后续增强，不阻塞首版。
+迁移是后续增强，不阻塞首版。该能力以独立插件 `org.lux.emby-migration`
+提供，方向固定为 Emby → Lux，永远不实现 Lux → Emby。
 
 优先迁移：
 
-- 一个或多个用户的已看状态。
-- 播放位置。
-- 收藏。
+- 一个或多个用户的用户资料、启用/禁用状态和媒体库访问权限。
+- 已看状态、播放位置、播放次数、最近播放时间和收藏。
+- 如果当前 Emby 版本通过公开 API 提供原始播放事件，则迁移按时间排序的播放历史事件；
+  不得用条目聚合状态伪造历史事件。
 
 策略：
 
 - 不直接读取或修改 Emby 内部数据库。
-- 通过用户拥有权限的 Emby API 导出。
+- 通过管理员 API key 调用公开 Emby API；插件只运行在独立受监督进程中。
+- API key 由 Lux 宿主保存为敏感 secret，插件调用时临时接收，不进入普通 API 响应、日志或插件包。
+- 用户不需要手动逐个创建 Lux 账户；插件按规范化用户名自动创建并绑定用户。
+- Emby 密码不能从公开 API 读取。Lux 创建待迁移密码账户，用户首次登录时由插件向 Emby
+  验证原密码，成功后只在 Lux 本地写入新的 Argon2 哈希；原密码不持久化。
+- Emby 管理员不因迁移自动获得 Lux 管理员权限。
 - 使用 TMDb ID、其他 provider ID，其次规范化标题+年份映射 Lux item。
 - 不能唯一匹配的记录输出报告，不自动猜测。
-- 管理员显式映射 Emby 用户到 Lux 用户。
-- 导入幂等，可 dry-run。
+- 媒体库、用户和条目映射不唯一时进入报告；可在预览阶段修正后再执行。
+- 默认采用合并策略：播放次数取较大值，播放状态按较新的最近播放时间合并，收藏和已看状态合并；
+  同时提供覆盖和跳过选项。
+- 导入幂等，可 dry-run，可取消、重试和从检查点恢复。
+- 迁移任务、用户映射、条目匹配、导入记录和（若可用）播放事件均必须持久化；历史播放事件
+  不得塞入 `user_item_state` 聚合表。
 
 本地 NFO 和图片通过扫描自然继承，不需要迁移工具复制。
+
+公开 Emby API 的历史能力必须在 LUX-190 阶段用受控实例和脱敏 fixture 验证。插件和宿主必须
+声明能力等级：`ITEM_STATE` 表示只能迁移条目状态，`EVENT_HISTORY` 表示返回真实原始事件。
+若源端不支持 `EVENT_HISTORY`，迁移结果明确显示“历史时间线不可用”，但不阻塞其他状态导入。
+
+迁移插件不得连接未经管理员确认的任意地址。Emby 基础地址只接受 HTTP(S)、禁止凭据/查询参数/片段；
+宿主执行超时、响应大小、重定向、解析结果和出站网络策略校验。管理员显式允许局域网 Emby 时，
+才允许访问私网地址。
 
 ---
 
@@ -1884,6 +1903,7 @@ services:
 | LUX-186 | src/application/plugins.rs、src/api/lux/mod.rs、src/api/mod.rs、tests/plugins.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 | LUX-188 | migrations/、migrations-postgres/、src/storage/mod.rs、src/application/people.rs、src/api/mod.rs、tests/people_api.rs、docs/ |
 | LUX-189 | src/application/watch.rs、src/application/reidentify.rs、src/application/images.rs、src/storage/mod.rs、migrations/、migrations-postgres/、web/src/features/admin/、web/src/react.css、tests/、web/tests/、docs/ |
+| LUX-190 | docs/LUX-DEVELOPMENT.md、docs/LUX-190-PLAN.md、docs/decisions/022-emby-migration-plugin.md、docs/COMPATIBILITY.md |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4259,6 +4279,33 @@ API：
 验证：参见 `docs/LUX-189-PLAN.md`。
 
 依赖：LUX-153、LUX-162、LUX-172、LUX-187、LUX-188。
+
+#### LUX-190：Emby 迁移插件边界与可行性验证
+
+范围：冻结 `org.lux.emby-migration` 的单向 Emby → Lux 边界，确认公开 Emby API 可提供的用户、媒体
+UserData、用户权限和历史播放事件字段。只做规格、协议草案、脱敏 fixture 和验证记录，不实现数据库、
+运行时、后台任务、Web 页面或插件包。
+
+验收：
+
+- [ ] 规格明确只允许 Emby → Lux，不定义反向迁移合同。
+- [ ] 规格明确 API key、用户密码和完整外部 URL 的存储、传输、日志规则。
+- [ ] 保存至少一组脱敏的 Emby 用户、电影、剧集、分集和 UserData 响应 fixture。
+- [ ] 用受控 Emby 实例验证并记录用户资料、禁用状态、媒体库权限、已看、播放位置、播放次数、
+      最近播放时间和收藏的字段来源。
+- [ ] 明确记录当前测试实例是否提供原始播放事件；不能提供时记录为 `ITEM_STATE`，不伪造事件。
+- [ ] 定义 `ITEM_STATE` 与 `EVENT_HISTORY` 两级插件能力，以及源端不支持历史事件时的结果语义。
+- [ ] ADR-022 与 `COMPATIBILITY.md` 记录协议边界和验证结果。
+
+验证：参见 `docs/LUX-190-PLAN.md`。
+
+依赖：LUX-189。
+
+明确不做：
+
+- 不读取 Emby 数据库、日志文件或未公开内部表。
+- 不实现 Emby 密码哈希导入；密码迁移只保留首次登录验证方案。
+- 不新增 migration、Rust 代码、Web 代码或插件包。
 
 ## 26. 风险与缓解
 
