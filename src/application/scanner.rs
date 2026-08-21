@@ -49,8 +49,9 @@ use crate::{
 };
 
 const FILE_BATCH_SIZE: usize = 500;
-pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 25;
+pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 100;
 const DISCOVERY_BATCH_SIZE: usize = 16;
+const MOVIE_PREPARATION_CONCURRENCY: usize = 8;
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -180,6 +181,7 @@ impl LibraryScanner {
                     .list_filesystem_entries_for_paths(&root.id, &relative_paths)
                     .await?;
                 let mut pending_new_files = Vec::with_capacity(FILE_BATCH_SIZE);
+                let mut new_paths = Vec::new();
                 for path in files {
                     if let Some((entry_id, quick_report)) = self
                         .scan_movie_file_if_unchanged(
@@ -200,21 +202,7 @@ impl LibraryScanner {
                             .to_str()
                             .ok_or(ScannerError::NonUtf8Path)?;
                         if !existing_entries.contains_key(relative_path) {
-                            if let Some(file) =
-                                self.prepare_new_movie_file(&root_path, &path).await?
-                            {
-                                pending_new_files.push(file);
-                                if pending_new_files.len() == FILE_BATCH_SIZE {
-                                    self.flush_new_movie_files(
-                                        &library_id_text,
-                                        &root,
-                                        &generation,
-                                        &mut pending_new_files,
-                                        &mut report,
-                                    )
-                                    .await?;
-                                }
-                            }
+                            new_paths.push(path);
                         } else {
                             report.merge(
                                 self.scan_movie_file(
@@ -227,6 +215,24 @@ impl LibraryScanner {
                                 .await?,
                             );
                         }
+                    }
+                }
+                for file in self
+                    .prepare_new_movie_files(&root_path, &new_paths)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                {
+                    pending_new_files.push(file);
+                    if pending_new_files.len() == FILE_BATCH_SIZE {
+                        self.flush_new_movie_files(
+                            &library_id_text,
+                            &root,
+                            &generation,
+                            &mut pending_new_files,
+                            &mut report,
+                        )
+                        .await?;
                     }
                 }
                 self.flush_new_movie_files(
@@ -1184,13 +1190,34 @@ impl LibraryScanner {
         root_path: &Path,
         path: &Path,
     ) -> Result<Option<NewMovieFile>, ScannerError> {
+        self.prepare_new_movie_file_with_folder_provider_ids(root_path, path, None)
+            .await
+    }
+
+    async fn prepare_new_movie_file_with_folder_provider_ids(
+        &self,
+        root_path: &Path,
+        path: &Path,
+        folder_provider_ids: Option<&BTreeMap<String, String>>,
+    ) -> Result<Option<NewMovieFile>, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
         };
         let Some(parsed_name) = parse_movie_filename(file_name) else {
             return Ok(None);
         };
-        let provider_ids = movie_provider_ids(path, &parsed_name.provider_ids);
+        let provider_ids = match folder_provider_ids {
+            Some(folder_provider_ids) => {
+                let mut provider_ids = parsed_name.provider_ids.clone();
+                for (provider, provider_id) in folder_provider_ids {
+                    provider_ids
+                        .entry(provider.clone())
+                        .or_insert_with(|| provider_id.clone());
+                }
+                provider_ids
+            }
+            None => movie_provider_ids(path, &parsed_name.provider_ids),
+        };
         let provider_ids_json = provider_ids_json(&provider_ids);
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
@@ -1253,6 +1280,53 @@ impl LibraryScanner {
             container,
             external_url: external_url.map(str::to_owned),
         }))
+    }
+
+    async fn prepare_new_movie_files(
+        &self,
+        root_path: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Vec<Option<NewMovieFile>>, ScannerError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut folder_provider_ids = HashMap::<PathBuf, BTreeMap<String, String>>::new();
+        for path in paths {
+            let directory = path.parent().unwrap_or(root_path).to_owned();
+            folder_provider_ids
+                .entry(directory)
+                .or_insert_with(|| movie_folder_provider_ids(path));
+        }
+
+        let mut tasks: JoinSet<Result<(usize, Option<NewMovieFile>), ScannerError>> =
+            JoinSet::new();
+        let mut results = Vec::with_capacity(paths.len());
+        for (index, path) in paths.iter().cloned().enumerate() {
+            if tasks.len() >= MOVIE_PREPARATION_CONCURRENCY {
+                collect_movie_preparation_task(&mut tasks, &mut results).await?;
+            }
+            let scanner = self.clone();
+            let root_path = root_path.to_owned();
+            let folder_provider_ids = folder_provider_ids
+                .get(path.parent().unwrap_or(root_path.as_path()))
+                .cloned()
+                .unwrap_or_default();
+            tasks.spawn(async move {
+                let prepared = scanner
+                    .prepare_new_movie_file_with_folder_provider_ids(
+                        &root_path,
+                        &path,
+                        Some(&folder_provider_ids),
+                    )
+                    .await?;
+                Ok((index, prepared))
+            });
+        }
+        while !tasks.is_empty() {
+            collect_movie_preparation_task(&mut tasks, &mut results).await?;
+        }
+        results.sort_unstable_by_key(|(index, _)| *index);
+        Ok(results.into_iter().map(|(_, prepared)| prepared).collect())
     }
 
     async fn flush_new_movie_files(
@@ -3685,6 +3759,29 @@ async fn join_movie_preparation(
     }
 }
 
+async fn collect_movie_preparation_task(
+    tasks: &mut JoinSet<Result<(usize, Option<NewMovieFile>), ScannerError>>,
+    results: &mut Vec<(usize, Option<NewMovieFile>)>,
+) -> Result<(), ScannerError> {
+    let result = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<movie-preparation-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<movie-preparation-task>"),
+                source: std::io::Error::other("movie preparation task set is empty"),
+            });
+        }
+    };
+    results.push(result);
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanJob {
     pub id: String,
@@ -3981,19 +4078,23 @@ fn movie_provider_ids(
     file_provider_ids: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut provider_ids = file_provider_ids.clone();
+    for (provider, provider_id) in movie_folder_provider_ids(path) {
+        provider_ids.entry(provider).or_insert(provider_id);
+    }
+    provider_ids
+}
+
+fn movie_folder_provider_ids(path: &Path) -> BTreeMap<String, String> {
     let Some(folder_name) = path
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
     else {
-        return provider_ids;
+        return BTreeMap::new();
     };
-    if let Some(folder) = parse_media_name(folder_name, MediaKind::Movie) {
-        for (provider, provider_id) in folder.provider_ids {
-            provider_ids.entry(provider).or_insert(provider_id);
-        }
-    }
-    provider_ids
+    parse_media_name(folder_name, MediaKind::Movie)
+        .map(|folder| folder.provider_ids)
+        .unwrap_or_default()
 }
 
 fn provider_ids_json(provider_ids: &BTreeMap<String, String>) -> Option<String> {
