@@ -10,6 +10,7 @@ use axum::{Json, Router, extract::State as AxumState, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
+        admin_events::{AdminEventHub, AdminEventScope},
         candidates::MetadataSelectionService,
         images::ImageWriteService,
         libraries::LibraryService,
@@ -805,14 +806,28 @@ async fn library_metadata_job_processes_items_concurrently()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
+    let admin_events = AdminEventHub::new();
+    let mut event_receiver = admin_events.subscribe();
+    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb))
+        .with_admin_events(admin_events);
     let job = metadata.create_library_job(&library.id.to_string()).await?;
+    assert_eq!(event_receiver.recv().await, Ok(AdminEventScope::Jobs));
     metadata.run(&job.id).await;
 
     let completed = metadata.get_job(&job.id).await?;
     assert_eq!(completed.total_count, 24);
     assert_eq!(completed.status, "COMPLETED");
     assert!(tracker.maximum.load(Ordering::SeqCst) > 1);
+    let mut progress_events = Vec::new();
+    while let Ok(scope) = event_receiver.try_recv() {
+        progress_events.push(scope);
+    }
+    let job_progress_events = progress_events
+        .iter()
+        .filter(|scope| **scope == AdminEventScope::Jobs)
+        .count();
+    assert!((1..=3).contains(&job_progress_events));
+    assert!(!progress_events.contains(&AdminEventScope::Metadata));
     tmdb_server.abort();
     Ok(())
 }
@@ -842,6 +857,31 @@ async fn metadata_job_skips_explicit_parent_folder_without_failing()
     let finished = metadata.get_job(&job.id).await?;
     assert_eq!(finished.status, "COMPLETED");
     assert_eq!(finished.processed_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_job_requeues_running_items_after_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata.create_job(vec![folder_id]).await?;
+    sqlx::query("UPDATE metadata_reidentify_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE metadata_reidentify_job_items SET status = 'RUNNING' WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.processed_count, 1);
+    assert_eq!(completed.items[0].status, "COMPLETED");
     Ok(())
 }
 

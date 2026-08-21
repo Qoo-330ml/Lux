@@ -6616,6 +6616,25 @@ impl Database {
         Ok(affected)
     }
 
+    pub(crate) async fn requeue_running_metadata_reidentify_items(
+        &self,
+        job_id: &str,
+    ) -> Result<u64, StorageError> {
+        self.query(
+            "UPDATE metadata_reidentify_job_items
+             SET status = 'PENDING', error = NULL, updated_at = unixepoch()
+             WHERE job_id = ? AND status = 'RUNNING'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn finish_metadata_reidentify_job(
         &self,
         job_id: &str,
