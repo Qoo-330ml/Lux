@@ -1,6 +1,6 @@
 #[cfg(unix)]
 #[tokio::test]
-async fn path_strm_playback_uses_a_generic_resolver_plugin()
+async fn smb_strm_playback_uses_a_protocol_resolver_plugin()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -71,7 +71,7 @@ fi
     tokio::fs::create_dir_all(&root).await?;
     tokio::fs::write(
         root.join("Path.Movie.2026.strm"),
-        "/cloud/library/movie.mp4\n",
+        "smb://nas/media/movie.mp4\n",
     )
     .await?;
     LibraryService::new(database.clone())

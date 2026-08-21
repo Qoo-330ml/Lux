@@ -10,6 +10,9 @@ use tokio::{fs, io::AsyncReadExt};
 
 use crate::{
     application::remote_url_policy::{RemoteMediaUrlError, validate_and_resolve_remote_media_url},
+    application::strm_target::{
+        StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
+    },
     network::{NetworkProxyError, client_builder_from_env_or},
     storage::{Database, StorageError},
 };
@@ -101,16 +104,58 @@ impl DownloadService {
             .ok_or_else(|| DownloadError::InvalidFileName(media_path.clone()))?
             .to_owned();
         if source.source_kind == "STRM_URL" {
-            let strm_url = read_strm_url(&media_path).await?;
-            let (url, address) = validate_and_resolve_remote_media_url(&strm_url)
-                .await
-                .map_err(DownloadError::RemoteUrl)?;
-            let file_name = remote_file_name(&url).unwrap_or(file_name);
-            Ok(DownloadArtifact::Remote {
-                url,
-                address,
-                file_name,
-            })
+            let strm_target = read_strm_target(&media_path).await?;
+            match classify_strm_target(&strm_target).kind {
+                StrmTargetKind::Path => {
+                    let target_path = canonical_local_strm_target(
+                        &source.root_path,
+                        &source.relative_path,
+                        &strm_target,
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        StrmLocalPathError::Missing => DownloadError::ItemNotFound,
+                        StrmLocalPathError::Forbidden => {
+                            DownloadError::PathOutsideRoot(media_path.clone())
+                        }
+                    })?;
+                    if target_path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("strm"))
+                    {
+                        return Err(DownloadError::UnsupportedStrmTarget);
+                    }
+                    let target_metadata = fs::metadata(&target_path).await?;
+                    if !target_metadata.is_file() {
+                        return Err(DownloadError::ItemNotFound);
+                    }
+                    let file_name = target_path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .ok_or_else(|| DownloadError::InvalidFileName(target_path.clone()))?
+                        .to_owned();
+                    Ok(DownloadArtifact::LocalFile {
+                        path: target_path,
+                        file_name,
+                    })
+                }
+                StrmTargetKind::Url => {
+                    let (url, address) = validate_and_resolve_remote_media_url(&strm_target)
+                        .await
+                        .map_err(DownloadError::RemoteUrl)?;
+                    let file_name = remote_file_name(&url).unwrap_or(file_name);
+                    Ok(DownloadArtifact::Remote {
+                        url,
+                        address,
+                        file_name,
+                    })
+                }
+                StrmTargetKind::Smb
+                | StrmTargetKind::Ftp
+                | StrmTargetKind::Empty
+                | StrmTargetKind::Unsupported => Err(DownloadError::UnsupportedStrmTarget),
+            }
         } else {
             Ok(DownloadArtifact::LocalFile {
                 path: media_path,
@@ -154,7 +199,7 @@ impl DownloadService {
     }
 }
 
-async fn read_strm_url(path: &Path) -> Result<String, DownloadError> {
+async fn read_strm_target(path: &Path) -> Result<String, DownloadError> {
     let file = fs::File::open(path).await?;
     let mut contents = Vec::new();
     file.take(MAX_STRM_BYTES + 1)
@@ -233,6 +278,7 @@ pub enum DownloadError {
     ProxyConfiguration(NetworkProxyError),
     ClientBuild(String),
     RemoteUrl(RemoteMediaUrlError),
+    UnsupportedStrmTarget,
     RemoteRequest,
 }
 
@@ -263,6 +309,7 @@ impl fmt::Display for DownloadError {
                     formatter.write_str("STRM remote host could not be resolved")
                 }
             },
+            Self::UnsupportedStrmTarget => formatter.write_str("STRM target is not downloadable"),
             Self::RemoteRequest => formatter.write_str("STRM remote request failed"),
         }
     }

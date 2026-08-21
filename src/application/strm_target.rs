@@ -13,6 +13,44 @@ pub struct StrmTarget {
     pub value: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrmLocalPathError {
+    Missing,
+    Forbidden,
+}
+
+pub async fn canonical_local_strm_target(
+    root_path: &str,
+    strm_relative_path: &str,
+    target: &str,
+) -> Result<std::path::PathBuf, StrmLocalPathError> {
+    let root = tokio::fs::canonicalize(root_path)
+        .await
+        .map_err(|_| StrmLocalPathError::Missing)?;
+    let strm_path = tokio::fs::canonicalize(root.join(strm_relative_path))
+        .await
+        .map_err(|_| StrmLocalPathError::Missing)?;
+    if !strm_path.starts_with(&root) || strm_path == root {
+        return Err(StrmLocalPathError::Forbidden);
+    }
+    let target_path = std::path::Path::new(target);
+    let requested = if target_path.is_absolute() {
+        target_path.to_owned()
+    } else {
+        strm_path
+            .parent()
+            .unwrap_or(root.as_path())
+            .join(target_path)
+    };
+    let path = tokio::fs::canonicalize(requested)
+        .await
+        .map_err(|_| StrmLocalPathError::Missing)?;
+    if !path.starts_with(&root) || path == root {
+        return Err(StrmLocalPathError::Forbidden);
+    }
+    Ok(path)
+}
+
 pub fn classify_strm_target(contents: &str) -> StrmTarget {
     let value = contents.lines().find_map(normalize_target_line);
     let Some(value) = value else {
@@ -92,7 +130,9 @@ fn has_uri_scheme(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{StrmTargetKind, classify_strm_target};
+    use super::{
+        StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
+    };
 
     #[test]
     fn classifies_http_paths_and_other_schemes() {
@@ -153,5 +193,46 @@ mod tests {
                 value: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn resolves_relative_targets_from_the_strm_directory_and_stays_in_root() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let root = temp_dir.path().join("library");
+        let nested = root.join("nested");
+        tokio::fs::create_dir_all(&nested)
+            .await
+            .expect("nested directory should be created");
+        tokio::fs::write(root.join("movie.mkv"), b"movie")
+            .await
+            .expect("media file should be created");
+        tokio::fs::write(nested.join("movie.strm"), b"../movie.mkv")
+            .await
+            .expect("strm file should be created");
+
+        let resolved = canonical_local_strm_target(
+            root.to_str().expect("root should be utf8"),
+            "nested/movie.strm",
+            "../movie.mkv",
+        )
+        .await;
+        assert_eq!(
+            resolved.expect("relative target should resolve"),
+            root.join("movie.mkv")
+                .canonicalize()
+                .expect("path should canonicalize")
+        );
+
+        let outside = temp_dir.path().join("outside.mkv");
+        tokio::fs::write(&outside, b"outside")
+            .await
+            .expect("outside file should be created");
+        let outside_target = canonical_local_strm_target(
+            root.to_str().expect("root should be utf8"),
+            "nested/movie.strm",
+            outside.to_str().expect("outside path should be utf8"),
+        )
+        .await;
+        assert_eq!(outside_target, Err(StrmLocalPathError::Forbidden));
     }
 }
