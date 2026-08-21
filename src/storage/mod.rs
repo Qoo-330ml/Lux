@@ -14,6 +14,10 @@ use tokio::fs;
 use uuid::Uuid;
 
 mod emby_migration;
+pub(crate) use emby_migration::{
+    StoredEmbyMigrationJob, StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding,
+    StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity,
+};
 
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
 

@@ -85,6 +85,18 @@ impl UserStore {
             .transpose()
     }
 
+    pub async fn find_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<UserRecord>, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        self.database
+            .find_user_by_username(&username_normalized)
+            .await?
+            .map(user_record)
+            .transpose()
+    }
+
     pub async fn update_user(
         &self,
         user_id: &str,

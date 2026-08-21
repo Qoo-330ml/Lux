@@ -100,6 +100,12 @@ pub enum MigrationMergePolicy {
     Skip,
 }
 
+impl Default for MigrationMergePolicy {
+    fn default() -> Self {
+        Self::Merge
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HistoryCapability {
@@ -153,7 +159,7 @@ pub struct MigrationItem {
     pub user_data: Option<MigrationUserData>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MigrationUserData {
     pub playback_position_ticks: i64,
