@@ -415,7 +415,7 @@ describe("AdminPluginsPage plugin cards", () => {
         { key: "concurrency", label: "并发数", type: "number", required: true, sensitive: false, defaultValue: 2, minimum: 1, maximum: 64 },
         { key: "existingInfoPolicy", label: "已有媒体信息处理方式", type: "select", required: false, sensitive: false, defaultValue: "SKIP", options: [{ value: "SKIP", label: "跳过已有媒体信息" }, { value: "OVERWRITE", label: "覆盖已有媒体信息" }] },
         { key: "mediaInfoEnabled", label: "提取媒体信息", type: "toggle", required: false, sensitive: false, defaultValue: true, description: "使用 ffprobe 提取媒体轨道信息。" },
-        { key: "thumbnailEnabled", label: "补全 STRM 缩略图", type: "toggle", required: false, sensitive: false, defaultValue: false, description: "仅为缺失或无效的 STRM 缩略图使用 ffmpeg 截图。" },
+        { key: "thumbnailEnabled", label: "补全 STRM 缩略图", type: "toggle", required: false, sensitive: false, defaultValue: false, description: "为缺少有效主图的 STRM 使用 ffmpeg 截图，并同时作为海报和缩略图。" },
         { key: "thumbnailPositionPercent", label: "缩略图位置", type: "number", required: false, sensitive: false, defaultValue: 30, minimum: 1, maximum: 99, description: "按视频时长百分比截图。" },
         { key: "writeSidecars", label: "写入 mediainfo.json", type: "toggle", required: false, sensitive: false },
         { key: "schedule", label: "执行计划", type: "text", required: true, sensitive: false, defaultValue: "0 3 * * *" },

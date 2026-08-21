@@ -509,7 +509,7 @@ impl StrmProbeService {
             );
         }
         let thumbnail_needed = thumbnail_enabled
-            && source.thumbnail_fallback_required
+            && source.poster_fallback_required
             && usable_strm_thumbnail(&path, &source.root_path, source.thumbnail_path.as_deref())
                 .await
                 .is_none();
@@ -684,34 +684,36 @@ impl StrmProbeService {
                 i64::try_from(thumbnail.len()).map_err(|_| StrmProbeError::WorkerFailed)?;
             let content_tag = hex_sha256(thumbnail);
             let dimensions = read_image_dimensions_from_bytes(thumbnail).await;
-            if self
-                .database
-                .upsert_item_image(
-                    &outcome.item_id,
-                    "THUMB",
-                    &target,
-                    ItemImageMetadata {
-                        file_size,
-                        width: dimensions.map(|(width, _)| width),
-                        height: dimensions.map(|(_, height)| height),
-                        content_tag: &content_tag,
-                        source: "STRM_FFMPEG",
-                    },
-                )
-                .await
-                .is_err()
-            {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "thumbnail registration failed",
+            for image_type in ["POSTER", "THUMB"] {
+                if self
+                    .database
+                    .upsert_item_image(
+                        &outcome.item_id,
+                        image_type,
+                        &target,
+                        ItemImageMetadata {
+                            file_size,
+                            width: dimensions.map(|(width, _)| width),
+                            height: dimensions.map(|(_, height)| height),
+                            content_tag: &content_tag,
+                            source: "STRM_FFMPEG",
+                        },
                     )
-                    .await?;
-                return Ok(1);
+                    .await
+                    .is_err()
+                {
+                    self.database
+                        .mark_media_probe_failed(
+                            &outcome.source_id,
+                            "FAILED",
+                            "thumbnail registration failed",
+                        )
+                        .await?;
+                    return Ok(1);
+                }
             }
             self.database
-                .set_thumbnail_fallback_required(&outcome.item_id, false)
+                .set_poster_fallback_required(&outcome.item_id, false)
                 .await
                 .map_err(StrmProbeError::Storage)?;
         }

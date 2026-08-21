@@ -238,12 +238,18 @@ impl ImageWriteService {
             if !in_metadata && !in_media_root {
                 return Err(ImageWriteError::PathOutsideRoot(canonical_path));
             }
-            fs::remove_file(&canonical_path)
-                .await
-                .map_err(|source| ImageWriteError::Io {
-                    path: canonical_path,
-                    source,
-                })?;
+            if !self
+                .database
+                .item_image_path_is_shared(&image.local_path, &image.id)
+                .await?
+            {
+                fs::remove_file(&canonical_path)
+                    .await
+                    .map_err(|source| ImageWriteError::Io {
+                        path: canonical_path,
+                        source,
+                    })?;
+            }
         }
         if !self.database.delete_item_image(item_id, image_id).await? {
             return Err(ImageWriteError::ItemNotFound);

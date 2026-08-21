@@ -7,7 +7,7 @@
 在现有 org.lux.strm-media-info 插件中增加 STRM 缩略图补全能力，同时保持媒体信息提取和缩略图补全两个功能彼此独立：
 
 - mediaInfoEnabled：使用 ffprobe 提取并保存媒体信息 JSON。
-- thumbnailEnabled：使用 ffmpeg 从外部媒体地址截图，并保存为 STRM 的 *-thumb.jpg。
+- thumbnailEnabled：使用 ffmpeg 从外部媒体地址截图，并保存为 STRM 的 *-thumb.jpg；同一文件同时登记为 `POSTER` 和 `THUMB`。
 
 两个开关都由插件配置控制，缩略图开关默认关闭。缩略图功能只处理 .strm 媒体源，不改变本地视频缩略图任务。
 
@@ -136,7 +136,7 @@ STRM 任务记录两个开关和 `thumbnailPositionPercent` 的快照，确保�
 - 已有有效缩略图时跳过 ffmpeg。
 - 外部地址覆盖私网地址、域名、路径和普通字符串时不被地址类型拦截。
 - ffprobe、ffmpeg 超时或输出无效时任务失败且不留下临时文件。
-- 生成的 JPEG 正确写入 *-thumb.jpg 并登记到 item_images。
+- 生成的 JPEG 正确写入 *-thumb.jpg，并以同一 local_path 登记两条 `item_images` 记录：`POSTER` 和 `THUMB`。
 
 ### 验证命令
 
@@ -150,5 +150,5 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 ## 9. 已确认行为
 
 1. duration 无法获取时，按方案标记失败，不回退到视频开头截图。
-2. thumbnailEnabled 只补全缺失缩略图，不覆盖已有缩略图。
+2. thumbnailEnabled 只补全缺少有效主图的 STRM，不覆盖已有有效 `THUMB`；生成结果同时登记为 `POSTER` 和 `THUMB`，不覆盖已有图片文件。
 3. `thumbnailPositionPercent` 缺失时使用 30，超出 1-99 时拒绝配置。

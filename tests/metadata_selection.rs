@@ -211,7 +211,7 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     .await?;
     assert_eq!(image_count, 3);
     let fallback_required: i64 =
-        sqlx::query_scalar("SELECT thumbnail_fallback_required FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT poster_fallback_required FROM media_items WHERE id = ?")
             .bind(&item_id)
             .fetch_one(fixture.database.pool())
             .await?;
@@ -263,11 +263,11 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
         PNG_1X1
     );
     let fallback_required: i64 =
-        sqlx::query_scalar("SELECT thumbnail_fallback_required FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT poster_fallback_required FROM media_items WHERE id = ?")
             .bind(&fixture.item_id)
             .fetch_one(fixture.database.pool())
             .await?;
-    assert_eq!(fallback_required, 1);
+    assert_eq!(fallback_required, 0);
 
     image_server.abort();
     Ok(())

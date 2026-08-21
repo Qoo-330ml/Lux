@@ -1384,8 +1384,11 @@ impl MetadataSelectionService {
                 }
             }
         }
-        let has_thumbnail =
-            image_types.contains(&"THUMB") || self.images.has_local_image(item_id, "THUMB").await?;
+        let has_primary_artwork = image_types
+            .iter()
+            .any(|image_type| matches!(*image_type, "POSTER" | "THUMB"))
+            || self.images.has_local_image(item_id, "POSTER").await?
+            || self.images.has_local_image(item_id, "THUMB").await?;
         let actor_count = self
             .people
             .persist_item_actors(item_id, &candidate.provider, &payload.actors)
@@ -1421,7 +1424,7 @@ impl MetadataSelectionService {
                 metadata_fingerprint: &nfo_report.fingerprint,
                 provenance_json: &state.provenance_json(),
                 locked_fields_json: &state.locked_fields_json(),
-                thumbnail_fallback_required: !has_thumbnail,
+                poster_fallback_required: !has_primary_artwork,
                 keep_pending,
             })
             .await?;

@@ -31,7 +31,8 @@ use crate::application::metadata_paths::{
 };
 use crate::storage::{
     Database, NewPersonCredit, PersonListOptions, PersonMatchCandidateRestore,
-    StoredCanonicalPerson, StoredPersonCredit, StoredPersonMatchCandidate,
+    StoredCanonicalPerson, StoredPersonCredit, StoredPersonIndexRebuildJob,
+    StoredPersonMatchCandidate,
 };
 
 const LEGACY_PEOPLE_DIR: &str = "people";
@@ -56,6 +57,7 @@ const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
 const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 const PERSON_INDEX_REBUILD_BATCH_SIZE: i64 = 100;
+const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 1;
 const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
     "name",
     "biography",
@@ -910,7 +912,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits(item_id, &credits)
+                .replace_person_credits_with_fingerprint(
+                    item_id,
+                    &credits,
+                    relation.source_fingerprint.as_deref(),
+                )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
         }
@@ -2414,41 +2420,168 @@ impl PeopleService {
         if restored_relations > 0 {
             tracing::info!(restored_relations, "people relation snapshots restored");
         }
-        let library_ids = database
-            .list_enabled_library_ids()
+        let jobs = database
+            .sync_person_index_rebuild_jobs(PERSON_INDEX_REBUILD_SCHEMA_VERSION)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
         let mut rebuilt_items = 0;
-        for library_id in library_ids {
-            let mut offset = 0;
-            loop {
-                let item_ids = database
-                    .list_media_item_ids_for_library(
-                        &library_id,
-                        offset,
-                        PERSON_INDEX_REBUILD_BATCH_SIZE,
-                    )
-                    .await
-                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
-                if item_ids.is_empty() {
-                    break;
+        for job in jobs {
+            let run_token = Uuid::now_v7().to_string();
+            if !database
+                .claim_person_index_rebuild_job(&job.library_id, &run_token)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+            {
+                continue;
+            }
+            match self
+                .run_person_index_rebuild_job(database, &job, &run_token)
+                .await
+            {
+                Ok(processed) => {
+                    database
+                        .finish_person_index_rebuild_job(
+                            &job.library_id,
+                            &run_token,
+                            "COMPLETED",
+                            None,
+                        )
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                    rebuilt_items += processed;
                 }
-                for item_id in &item_ids {
-                    match self.rebuild_item_person_credit_index(item_id).await {
-                        Ok(()) => rebuilt_items += 1,
-                        Err(PeopleError::Serialization(message)) => {
-                            tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                offset += item_ids.len() as i64;
-                if item_ids.len() < PERSON_INDEX_REBUILD_BATCH_SIZE as usize {
-                    break;
+                Err(error) => {
+                    let detail = error.to_string();
+                    let _ = database
+                        .finish_person_index_rebuild_job(
+                            &job.library_id,
+                            &run_token,
+                            "FAILED",
+                            Some(&detail),
+                        )
+                        .await;
+                    return Err(error);
                 }
             }
         }
         Ok(rebuilt_items)
+    }
+
+    pub async fn queue_person_index_rebuild(&self, library_id: &str) -> Result<bool, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .request_person_index_rebuild_job(library_id, PERSON_INDEX_REBUILD_SCHEMA_VERSION)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub async fn cancel_person_index_rebuild(&self, library_id: &str) -> Result<bool, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .request_person_index_rebuild_job_cancel(library_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub async fn list_person_index_rebuild_jobs(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredPersonIndexRebuildJob>, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .list_person_index_rebuild_jobs(offset, limit)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    pub async fn count_person_index_rebuild_jobs(&self) -> Result<i64, PeopleError> {
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        database
+            .count_person_index_rebuild_jobs()
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))
+    }
+
+    async fn run_person_index_rebuild_job(
+        &self,
+        database: &Database,
+        job: &StoredPersonIndexRebuildJob,
+        run_token: &str,
+    ) -> Result<usize, PeopleError> {
+        let total_count = database
+            .count_person_index_items(&job.library_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let mut cursor_id = job.cursor_id.clone();
+        let mut processed_count = job.processed_count;
+        let initial_processed_count = processed_count;
+        loop {
+            if database
+                .person_index_rebuild_job_cancel_requested(&job.library_id, run_token)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+            {
+                break;
+            }
+            let item_ids = database
+                .list_person_index_item_ids(
+                    &job.library_id,
+                    cursor_id.as_deref(),
+                    PERSON_INDEX_REBUILD_BATCH_SIZE,
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            if item_ids.is_empty() {
+                break;
+            }
+            for item_id in &item_ids {
+                match self.rebuild_item_person_credit_index(item_id).await {
+                    Ok(()) => processed_count += 1,
+                    Err(PeopleError::Serialization(message)) => {
+                        tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
+                        processed_count += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+                cursor_id = Some(item_id.clone());
+            }
+            if let Some(cursor_id) = cursor_id.as_deref()
+                && database
+                    .update_person_index_rebuild_progress(
+                        &job.library_id,
+                        run_token,
+                        cursor_id,
+                        processed_count,
+                        total_count,
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?
+                    .is_none()
+            {
+                break;
+            }
+            if item_ids.len() < PERSON_INDEX_REBUILD_BATCH_SIZE as usize {
+                break;
+            }
+        }
+        Ok(processed_count.saturating_sub(initial_processed_count) as usize)
     }
 
     async fn restore_legacy_person_directories(
@@ -2834,7 +2967,11 @@ impl PeopleService {
                     .person_credits_from_relation(database, &relation)
                     .await?;
                 database
-                    .replace_person_credits(&source_locator.item_id, &credits)
+                    .replace_person_credits_with_fingerprint(
+                        &source_locator.item_id,
+                        &credits,
+                        relation.source_fingerprint.as_deref(),
+                    )
                     .await
                     .map_err(|error| PeopleError::Storage(error.to_string()))?;
                 restored += 1;
@@ -2874,11 +3011,22 @@ impl PeopleService {
             }
             return Ok(());
         };
+        if database
+            .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?
+        {
+            return Ok(());
+        }
         let credits = self
             .person_credits_from_relation(database, &relation)
             .await?;
         database
-            .replace_person_credits(item_id, &credits)
+            .replace_person_credits_with_fingerprint(
+                item_id,
+                &credits,
+                relation.source_fingerprint.as_deref(),
+            )
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))
     }
@@ -3085,7 +3233,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits(&item_id, &credits)
+                .replace_person_credits_with_fingerprint(
+                    &item_id,
+                    &credits,
+                    relation.source_fingerprint.as_deref(),
+                )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
             updated = true;

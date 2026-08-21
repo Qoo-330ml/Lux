@@ -3189,8 +3189,8 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 重启后恢复 PENDING/RUNNING 状态。探测结果保存到 `media_sources`/`media_streams`，旁车写回使用同目录
 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。缩略图只针对 STRM，使用同目录
 `*-thumb.jpg`；截图前先用 `ffprobe` 获取 duration，再调用 `ffmpeg` 在 `thumbnailPositionPercent` 指定的百分比位置输出一张受限尺寸的
-JPEG。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生库；缩略图只补全缺失或无效文件，不
-覆盖已有缩略图。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
+JPEG，并将该文件同时登记为 `POSTER` 和 `THUMB`。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生库；截图只补全缺少有效主图的 STRM，不
+覆盖已有有效缩略图。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
 
 STRM 截图采用“本地/在线主图优先、视频截图兜底”的顺序：数据库按媒体条目持久化
 `poster_fallback_required` 标记。新增 STRM 没有本地 `POSTER` 或 `THUMB` 时设置该标记为 true；
