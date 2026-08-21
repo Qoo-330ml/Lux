@@ -58,6 +58,7 @@ use crate::{
         },
         collections::{CollectionError, CollectionService},
         directory_browser::{DirectoryBrowserError, list_directories},
+        emby_migration::{EmbyMigrationPluginClient, EmbyMigrationSource, MigrationInputError},
         images::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
             ImageWriteService, normalize_image_type, read_image_dimensions,
@@ -708,6 +709,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/plugin-store",
             get(admin_plugin_store).put(admin_update_plugin_store),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/test",
+            post(admin_test_emby_migration),
         )
         .route(
             "/api/v1/admin/users",
@@ -17457,6 +17462,42 @@ async fn admin_plugin_store(headers: HeaderMap, State(state): State<AppState>) -
         "defaultUrl": crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL,
     }))
     .into_response()
+}
+
+async fn admin_test_emby_migration(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(source): Json<EmbyMigrationSource>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if let Err(error) = source.validate() {
+        let message = match error {
+            MigrationInputError::PrivateNetworkNotAllowed => {
+                "Emby 地址属于局域网或保留地址，请明确允许局域网连接"
+            }
+            MigrationInputError::InvalidSecret => "Emby API key 无效",
+            MigrationInputError::InvalidSourceUrl | MigrationInputError::InvalidIdentifier => {
+                "Emby 地址无效"
+            }
+        };
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            message,
+        )
+        .into_response();
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let client = EmbyMigrationPluginClient::new(plugins.clone());
+    match client.test_connection(&source).await {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => plugin_error(&headers, error),
+    }
 }
 
 #[derive(Deserialize)]

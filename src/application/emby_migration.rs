@@ -107,7 +107,7 @@ pub enum HistoryCapability {
     EventHistory,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MigrationConnectionInfo {
     pub server_name: Option<String>,
