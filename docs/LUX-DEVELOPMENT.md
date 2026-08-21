@@ -1880,6 +1880,7 @@ services:
 | LUX-184 | web/public/media-capability-probe.html、web/public/media-capability-probe.js、web/tests/、docs/ |
 | LUX-185 | web/src/features/player/、web/public/hevc/、web/tests/、web/package.json、web/pnpm-lock.yaml、web/vite.config.ts、docs/ |
 | LUX-186 | src/application/plugins.rs、src/api/lux/mod.rs、src/api/mod.rs、tests/plugins.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
+| LUX-188 | migrations/、migrations-postgres/、src/storage/mod.rs、src/application/people.rs、src/api/mod.rs、tests/people_api.rs、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3191,12 +3192,14 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 JPEG。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生库；缩略图只补全缺失或无效文件，不
 覆盖已有缩略图。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
 
-STRM 缩略图采用“刮削器优先、视频截图兜底”的顺序：数据库按媒体条目持久化
-`thumbnail_fallback_required` 标记，默认值为 false。元数据刮削成功获得 THUMB 图片时清除该标记；
-刮削任务已完成但没有获得 THUMB 图片时才将标记设为 true。STRM 缩略图阶段只处理该标记为 true
-且没有有效缩略图的 STRM 来源；未完成刮削的条目不得提前读取远程视频。FFmpeg 截图成功后清除
-标记并将图片来源登记为 `STRM_FFMPEG`。后续刮削器获得真实 THUMB 图片时允许替换
-`STRM_FFMPEG` 兜底图，并再次将图片来源登记为刮削器。
+STRM 截图采用“本地/在线主图优先、视频截图兜底”的顺序：数据库按媒体条目持久化
+`poster_fallback_required` 标记。新增 STRM 没有本地 `POSTER` 或 `THUMB` 时设置该标记为 true；
+媒体库未配置刮削器、所选刮削器没有候选、候选没有可用主图时，都保留该标记。发现本地
+`POSTER`/`THUMB` 或刮削器成功写入任一主图时清除该标记。STRM 截图阶段只处理该标记为 true
+且没有有效 `THUMB` 的 STRM 来源，不要求先找到在线条目。FFmpeg 截图成功后写入同目录
+`*-thumb.jpg`，并用同一文件同时登记 `POSTER` 和 `THUMB`，来源为 `STRM_FFMPEG`。后续刮削器
+获得真实海报或缩略图时可以按图片类型替换对应兜底记录；删除其中一个记录时不能删除仍被另一
+记录引用的共享文件。
 
 插件启用后，宿主自动登记一个全局 `STRM_MEDIA_INFO` 计划任务；任务读取同一份插件配置，首次
 执行在后台完成，后续按 `schedule` cron 表达式重复执行。管理员可以在“任务与日志”中直接修改该任务的
@@ -3225,7 +3228,7 @@ STRM 来源的后台探测任务；这条事件驱动路径不替代全局计划
 - [ ] 服务重启可以恢复 PENDING/RUNNING 任务；取消不会领取新源，失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
 - [ ] `mediaInfoEnabled` 和 `thumbnailEnabled` 可以独立生效；缩略图缺失时先由 ffprobe 获取 duration，再由 ffmpeg 在 `thumbnailPositionPercent` 指定的位置生成同目录 `*-thumb.jpg`，默认位置为 30%，已有有效缩略图不会被覆盖。
-- [ ] STRM 缩略图遵循刮削器优先顺序：刮削器获得 THUMB 时不调用 ffmpeg，刮削完成且没有 THUMB 时持久化 `thumbnail_fallback_required`，ffmpeg 只消费该标记；截图成功后清除标记，后续刮削器获得图片时可替换 `STRM_FFMPEG` 兜底图。
+- [ ] STRM 截图遵循本地/在线主图优先顺序：没有刮削器、刮削器无候选或候选没有主图时持久化 `poster_fallback_required`；ffmpeg 不要求在线匹配成功，只消费该标记和缺失图条件；截图成功后将同一文件登记为 `POSTER` 与 `THUMB` 并清除标记，后续刮削器获得图片时可按类型替换 `STRM_FFMPEG` 兜底图。
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后仍可恢复。
 - [ ] 实时增量扫描完成后，所选媒体库中新入库或发生变化的 `.strm` 来源自动创建定向 STRM 探测任务；定向任务只处理本次增量扫描影响的来源，并支持重启恢复、取消和失败重试。
 - [ ] 定向 STRM 探测与全局定时探测共用并发、插件配置和任务持久化边界；定时任务仍保留并继续负责全库补漏，两个任务不能并发占用同一媒体库。
@@ -4155,6 +4158,54 @@ API：
 - 使用真实浏览器检查插件页面的更新状态、键盘操作、网络请求和无错误控制台。
 
 依赖：LUX-162、LUX-171。
+
+#### LUX-188：可恢复的人物索引重建任务
+
+范围：将人物出演关系索引重建从一次性的启动扫描改为按媒体库持久化、可恢复、可取消的后台任务。
+任务使用稳定 `media_items.id` 游标进行 keyset 分页，前台请求继续读取已有索引，不等待整库重建。
+服务重启时遗留的 `RUNNING` 任务重新排队；同一媒体库同一时间只能有一个 worker 领取任务。
+
+每个条目保存关系来源指纹和关系 schema 版本。只有当前指纹与已保存的非空指纹相同，且 schema 版本
+一致时才跳过重建；没有指纹的条目必须重新读取关系文件。关系文件缺失时清理旧数据库关系，但不把
+缺失文件标记为已处理，避免文件稍后恢复后永久跳过。
+
+任务使用一次性 `runToken` 保护进度、完成和失败写入，防止旧 worker 在任务取消并重新排队后覆盖新一轮任务。
+取消中的任务在当前批次结束后变为 `CANCELLED`；管理员重新执行时清除取消标记、游标和进度并重新排队。
+
+API：
+
+- `GET /api/v1/admin/people/index-rebuild?page=1&pageSize=20` 返回分页任务状态。
+- `POST /api/v1/admin/people/index-rebuild/{libraryId}` 为指定启用媒体库排队或重新排队任务。
+- `POST /api/v1/admin/people/index-rebuild/{libraryId}/cancel` 请求取消任务。
+- 上述接口只允许管理员；GET 不要求 CSRF，POST 要求现有 CSRF/API Key 管理员鉴权。
+
+索引只在 EXPLAIN 证明现有索引不足时增加；keyset 查询使用 `(library_id, id)` 可见条目索引，人物详情
+查询使用 `(person_type, provider, person_id, item_id)` 组合索引。所有 worker batch 和事务保持有界。
+
+验收：
+
+- [ ] 从空 SQLite 和 PostgreSQL 数据库执行迁移成功，任务表、条目状态表和必要索引存在。
+- [ ] keyset 分页在条目增删时不重复、不跳过，且不使用 `OFFSET`。
+- [ ] `RUNNING` 任务重启后重新排队；并发领取只能成功一次。
+- [ ] 运行中和排队任务均可取消；取消后可重新排队，旧 worker 不能覆盖新任务状态。
+- [ ] 非空指纹未变化时跳过；指纹变化、缺失或关系 schema 变化时重建。
+- [ ] 缺失关系文件清理旧索引但不写入可跳过的空指纹状态。
+- [ ] 管理 API 分页、鉴权、CSRF、排队、取消和重试行为有集成测试。
+- [ ] Rust 专项测试、格式化、Clippy 和 ARM 本机 `uname -m` 通过；不得以本机 ARM 结果宣称 NAS/x86 性能。
+
+验证：
+
+- `cargo test --locked --test people_api --lib storage`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `uname -m`
+
+依赖：LUX-164、LUX-172、LUX-187。
+
+明确不做：
+
+- 不改变人物资源目录合同、Emby 人物 DTO 或现有人物查询语义。
+- 不在用户请求中执行整库扫描，不增加无限 worker，不读取整份 metadata 目录作为查询方案。
 
 ## 26. 风险与缓解
 
