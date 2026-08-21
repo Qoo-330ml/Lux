@@ -36,6 +36,24 @@ pub(crate) struct StoredEmbyMigrationUserLink {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyMigrationSource {
+    pub source_base_url: String,
+    pub secret_ref: String,
+    pub source_label: String,
+    pub history_capability: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyMigrationUserBinding {
+    pub lux_user_id: String,
+    pub source_base_url: String,
+    pub secret_ref: Option<String>,
+    pub emby_user_id: String,
+    pub emby_username: String,
+    pub password_pending: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredPlaybackHistoryEvent {
     pub id: String,
     pub user_id: String,
@@ -61,6 +79,128 @@ pub(crate) struct StoredMigrationMediaIdentity {
 }
 
 impl Database {
+    pub(crate) async fn upsert_emby_migration_source(
+        &self,
+        source: &StoredEmbyMigrationSource,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO emby_migration_sources (
+                 source_base_url, secret_ref, source_label, history_capability
+             ) VALUES (?, ?, ?, ?)
+             ON CONFLICT(source_base_url) DO UPDATE SET
+                 secret_ref = excluded.secret_ref,
+                 source_label = excluded.source_label,
+                 history_capability = excluded.history_capability,
+                 updated_at = unixepoch()",
+        )
+        .bind(&source.source_base_url)
+        .bind(&source.secret_ref)
+        .bind(&source.source_label)
+        .bind(&source.history_capability)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(storage_error)
+    }
+
+    pub(crate) async fn find_emby_migration_source(
+        &self,
+        source_base_url: &str,
+    ) -> Result<Option<StoredEmbyMigrationSource>, StorageError> {
+        self.query(
+            "SELECT source_base_url, secret_ref, source_label, history_capability
+             FROM emby_migration_sources WHERE source_base_url = ?",
+        )
+        .bind(source_base_url)
+        .fetch_optional(self.pool())
+        .await
+        .map(|row| {
+            row.map(|row| StoredEmbyMigrationSource {
+                source_base_url: row.get("source_base_url"),
+                secret_ref: row.get("secret_ref"),
+                source_label: row.get("source_label"),
+                history_capability: row.get("history_capability"),
+            })
+        })
+        .map_err(storage_error)
+    }
+
+    pub(crate) async fn upsert_emby_migration_user_binding(
+        &self,
+        binding: &StoredEmbyMigrationUserBinding,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO emby_migration_user_bindings (
+                 lux_user_id, source_base_url, secret_ref, emby_user_id,
+                 emby_username, password_pending
+             ) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(lux_user_id) DO UPDATE SET
+                 source_base_url = excluded.source_base_url,
+                 secret_ref = excluded.secret_ref,
+                 emby_user_id = excluded.emby_user_id,
+                 emby_username = excluded.emby_username,
+                 password_pending = excluded.password_pending,
+                 updated_at = unixepoch()",
+        )
+        .bind(&binding.lux_user_id)
+        .bind(&binding.source_base_url)
+        .bind(&binding.secret_ref)
+        .bind(&binding.emby_user_id)
+        .bind(&binding.emby_username)
+        .bind(if binding.password_pending {
+            1_i64
+        } else {
+            0_i64
+        })
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(storage_error)
+    }
+
+    pub(crate) async fn find_emby_migration_user_binding_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<StoredEmbyMigrationUserBinding>, StorageError> {
+        self.query(
+            "SELECT lux_user_id, source_base_url, secret_ref, emby_user_id,
+                    emby_username, password_pending
+             FROM emby_migration_user_bindings
+             WHERE emby_username = ? AND password_pending = 1
+             LIMIT 1",
+        )
+        .bind(username)
+        .fetch_optional(self.pool())
+        .await
+        .map(|row| {
+            row.map(|row| StoredEmbyMigrationUserBinding {
+                lux_user_id: row.get("lux_user_id"),
+                source_base_url: row.get("source_base_url"),
+                secret_ref: row.get("secret_ref"),
+                emby_user_id: row.get("emby_user_id"),
+                emby_username: row.get("emby_username"),
+                password_pending: row.get::<i64, _>("password_pending") != 0,
+            })
+        })
+        .map_err(storage_error)
+    }
+
+    pub(crate) async fn mark_emby_migration_password_ready(
+        &self,
+        lux_user_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE emby_migration_user_bindings
+             SET password_pending = 0, updated_at = unixepoch()
+             WHERE lux_user_id = ? AND password_pending = 1",
+        )
+        .bind(lux_user_id)
+        .execute(self.pool())
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(storage_error)
+    }
+
     pub(crate) async fn insert_emby_migration_job(
         &self,
         id: &str,
