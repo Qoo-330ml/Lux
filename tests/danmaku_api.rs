@@ -25,7 +25,7 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn settings_redact_provider_url_and_emby_can_read_xml_sidecar()
+async fn emby_can_read_xml_sidecar_without_danmaku_settings()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let config_dir = directory.path().join("config");
@@ -79,31 +79,6 @@ async fn settings_redact_provider_url_and_emby_can_read_xml_sidecar()
     let session = cookie_value(login.headers(), "lux_session");
     let csrf = cookie_value(login.headers(), "lux_csrf");
     let cookies = format!("lux_session={session}; lux_csrf={csrf}");
-
-    let patch = client
-        .patch(format!("{base_url}/api/v1/admin/settings"))
-        .header(COOKIE, &cookies)
-        .header("x-csrf-token", &csrf)
-        .json(&json!({
-            "danmaku": {"providerBaseUrl": "https://danmu.example/secret-token"}
-        }))
-        .send()
-        .await?;
-    assert_eq!(patch.status(), reqwest::StatusCode::OK);
-    let settings: Value = patch.json().await?;
-    assert_eq!(settings["danmaku"]["configured"], true);
-    assert!(
-        !settings["danmaku"]["url"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("secret-token")
-    );
-    assert_eq!(
-        tokio::fs::read_to_string(config_dir.join("danmaku_provider_url"))
-            .await?
-            .trim(),
-        "https://danmu.example/secret-token"
-    );
 
     let emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))

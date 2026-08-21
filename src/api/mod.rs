@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::{
     COMMIT, VERSION,
-    application::danmaku::{DanmakuService, DanmakuServiceError, validate_provider_base_url},
+    application::danmaku::{DanmakuService, DanmakuServiceError},
     application::database_setup::{DatabaseSetupError, DatabaseSetupService},
     application::deletion::{MediaDeleteError, MediaDeleteService},
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
@@ -78,10 +78,7 @@ use crate::{
         schedule::validate_cron,
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::ScraperResolver,
-        settings::{
-            read_danmaku_provider_url_async, read_network_proxy_url_async,
-            write_danmaku_provider_url, write_network_proxy_url,
-        },
+        settings::{read_network_proxy_url_async, write_network_proxy_url},
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{StrmTargetKind, classify_strm_target},
         thumbnails::ThumbnailService,
@@ -11118,53 +11115,14 @@ async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Re
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let network_proxy = network_proxy_settings(&state).await;
-    let danmaku = danmaku_settings(&state).await;
     Json(json!({
         "serverName": server_name,
         "resumePlayedPercent": played_percent,
         "resumeMinTicks": minimum_ticks,
         "mediaStrategy": media_strategy,
         "networkProxy": network_proxy,
-        "danmaku": danmaku,
     }))
     .into_response()
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DanmakuSettingsResponse {
-    configured: bool,
-    url: Option<String>,
-    source: &'static str,
-    restart_required: bool,
-}
-
-async fn danmaku_settings(state: &AppState) -> DanmakuSettingsResponse {
-    let Some(config_dir) = state.config_dir.as_deref() else {
-        return DanmakuSettingsResponse {
-            configured: false,
-            url: None,
-            source: "none",
-            restart_required: false,
-        };
-    };
-    if let Some(value) = read_danmaku_provider_url_async(config_dir).await {
-        let url = validate_provider_base_url(&value)
-            .ok()
-            .map(|value| value.redacted().to_owned());
-        return DanmakuSettingsResponse {
-            configured: url.is_some(),
-            url,
-            source: "settings",
-            restart_required: false,
-        };
-    }
-    DanmakuSettingsResponse {
-        configured: false,
-        url: None,
-        source: "none",
-        restart_required: false,
-    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -11592,17 +11550,6 @@ async fn admin_update_settings(
         return response;
     }
     let requested_proxy = request.extra.get("networkProxyUrl").cloned();
-    let requested_danmaku = request
-        .extra
-        .get("danmakuProviderUrl")
-        .cloned()
-        .or_else(|| {
-            request
-                .extra
-                .get("danmaku")
-                .and_then(|value| value.get("providerBaseUrl"))
-                .cloned()
-        });
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -11698,45 +11645,6 @@ async fn admin_update_settings(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     }
-    if let Some(requested_danmaku) = requested_danmaku {
-        let Some(config_dir) = state.config_dir.as_deref() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        let provider_url = match requested_danmaku {
-            Value::Null => None,
-            Value::String(value) => {
-                let value = value.trim();
-                if value.is_empty() {
-                    None
-                } else if validate_provider_base_url(value).is_err() {
-                    return api_error(
-                        &headers,
-                        StatusCode::BAD_REQUEST,
-                        lux::ApiErrorCode::InvalidRequest,
-                        "弹幕接口地址无效",
-                    )
-                    .into_response();
-                } else {
-                    Some(value.to_owned())
-                }
-            }
-            _ => {
-                return api_error(
-                    &headers,
-                    StatusCode::BAD_REQUEST,
-                    lux::ApiErrorCode::InvalidRequest,
-                    "弹幕接口地址无效",
-                )
-                .into_response();
-            }
-        };
-        if write_danmaku_provider_url(config_dir, provider_url.as_deref())
-            .await
-            .is_err()
-        {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    }
     match database
         .set_server_settings(percent, minimum_ticks, &media_strategy_json)
         .await
@@ -11760,7 +11668,6 @@ async fn admin_update_settings(
                 "resumeMinTicks": minimum_ticks,
                 "mediaStrategy": media_strategy,
                 "networkProxy": network_proxy_settings(&state).await,
-                "danmaku": danmaku_settings(&state).await,
             }))
             .into_response()
         }
