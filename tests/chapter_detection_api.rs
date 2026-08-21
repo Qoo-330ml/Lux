@@ -194,6 +194,41 @@ async fn chapter_detection_http_api_enforces_admin_csrf_and_persists_jobs()
         .await?;
     assert_eq!(configured.status(), reqwest::StatusCode::OK);
 
+    let scheduled = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "CHAPTER_DETECTION",
+            "schedule": "0 2 * * 0"
+        }))
+        .send()
+        .await?;
+    assert_eq!(scheduled.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        scheduled.json::<Value>().await?["scheduledTask"]["schedule"],
+        "0 2 * * 0"
+    );
+
+    let manual_run = client
+        .post(format!("{base_url}/api/v1/admin/scheduled-tasks/run"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "CHAPTER_DETECTION"
+        }))
+        .send()
+        .await?;
+    assert_eq!(manual_run.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        manual_run.json::<Value>().await?["taskType"],
+        "CHAPTER_DETECTION"
+    );
+
     let started = client
         .post(format!(
             "{base_url}/api/v1/admin/libraries/{library_id}/chapter-detection"

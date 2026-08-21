@@ -837,7 +837,7 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
-    let (base_url, server, _) = start_server(config).await?;
+    let (base_url, server, database) = start_server(config).await?;
     let client = reqwest::Client::new();
 
     let setup = client
@@ -1069,6 +1069,59 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .and_then(|items| items.iter().find(|item| item["id"] == library_id))
         .ok_or("missing library after schedule update")?;
     assert_eq!(library["metadataSchedule"], Value::Null);
+
+    let manual_run = client
+        .post(format!("{base_url}/api/v1/admin/scheduled-tasks/run"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "RECONCILIATION_SCAN"
+        }))
+        .send()
+        .await?;
+    assert_eq!(manual_run.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        manual_run.json::<Value>().await?["taskType"],
+        "RECONCILIATION_SCAN"
+    );
+
+    let activity = client
+        .get(format!("{base_url}/api/v1/admin/task-activity"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(activity.status(), reqwest::StatusCode::OK);
+    assert!(activity.json::<Value>().await?["activities"].is_array());
+
+    sqlx::query(
+        "INSERT INTO scheduled_task_configs (
+            owner_type, owner_id, task_type, task_name, task_description,
+            source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
+         ) VALUES ('LIBRARY', ?, 'AUTO_LIBRARY_COVER', '自动生成媒体库封面',
+            '生成媒体库自动封面。', 'SYSTEM', NULL, NULL, 0, '{}')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    let cover_schedule = client
+        .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "ownerType": "LIBRARY",
+            "ownerId": library_id,
+            "taskType": "AUTO_LIBRARY_COVER",
+            "schedule": "0 1 * * *"
+        }))
+        .send()
+        .await?;
+    assert_eq!(cover_schedule.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        cover_schedule.json::<Value>().await?["scheduledTask"]["schedule"],
+        "0 1 * * *"
+    );
 
     server.abort();
     Ok(())

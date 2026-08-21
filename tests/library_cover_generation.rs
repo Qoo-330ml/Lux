@@ -135,6 +135,20 @@ async fn auto_cover_waits_for_nine_posters_then_runs_only_once()
         covers.run_manually(library.id).await?,
         AutoLibraryCoverResult::Generated
     );
+    let cover_jobs: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT is_manual, status, processed_count, total_count
+         FROM library_cover_jobs WHERE library_id = ? ORDER BY created_at, id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        cover_jobs,
+        vec![
+            (0, "COMPLETED".to_owned(), 1, 1),
+            (1, "COMPLETED".to_owned(), 1, 1),
+        ]
+    );
 
     let manual_png = png_1x1()?;
     let manual = covers.store(library.id, "image/png", &manual_png).await?;
@@ -167,7 +181,7 @@ async fn auto_cover_waits_for_nine_posters_then_runs_only_once()
     .bind(library.id.to_string())
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(task, (None, 0, r#"{"oneShot":true}"#.to_owned()));
+    assert_eq!(task, (None, 0, r#"{}"#.to_owned()));
     Ok(())
 }
 

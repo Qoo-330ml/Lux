@@ -510,6 +510,20 @@ export type AdminJob = {
   scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "IDLE" | string;
 };
 
+export type AdminTaskActivity = {
+  id: string;
+  kind: "scan" | "metadata" | "strm" | "chapter" | "danmaku" | "cover" | string;
+  taskType: string;
+  libraryId?: string | null;
+  status: "PENDING" | "QUEUED" | "RUNNING" | string;
+  processedCount?: number;
+  totalCount?: number | null;
+  cancelRequested?: boolean;
+  currentItem?: string | null;
+  scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "IDLE" | string;
+  createdAt?: string | number;
+};
+
 export type AdminScheduledTask = {
   id?: string;
   ownerType: "GLOBAL" | "LIBRARY" | string;
@@ -599,6 +613,20 @@ export type AdminDanmakuMatchJob = {
   cancelRequested?: boolean;
   error?: string | null;
   createdAt?: string | number;
+  finishedAt?: string | number | null;
+};
+
+export type AdminLibraryCoverJob = {
+  id: string;
+  libraryId: string;
+  isManual: boolean;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  processedCount: number;
+  totalCount: number;
+  error?: string | null;
+  createdAt?: string | number;
+  updatedAt?: string | number;
+  startedAt?: string | number | null;
   finishedAt?: string | number | null;
 };
 

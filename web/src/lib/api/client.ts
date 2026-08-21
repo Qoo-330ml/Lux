@@ -5,12 +5,14 @@ import type {
   AdminHealth,
   AdminImage,
   AdminJob,
+  AdminTaskActivity,
   AdminScheduledTask,
   AdminScheduledTaskPage,
   AdminMetadataReidentifyJob,
   AdminStrmProbeJob,
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
+  AdminLibraryCoverJob,
   AdminLibrary,
   AdminRoot,
   AdminSettings,
@@ -737,6 +739,23 @@ export class LuxApiClient {
     return this.request<{ jobs?: AdminJob[] }>(`/api/v1/admin/jobs?${params}`);
   }
 
+  adminTaskActivity() {
+    return this.request<{ activities?: AdminTaskActivity[] }>(
+      "/api/v1/admin/task-activity",
+    );
+  }
+
+  runAdminScheduledTask(input: {
+    ownerType: "GLOBAL" | "LIBRARY";
+    ownerId: string;
+    taskType: string;
+  }) {
+    return this.request<{ status: string; taskType: string; run?: Record<string, unknown> }>(
+      "/api/v1/admin/scheduled-tasks/run",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
   adminScheduledTasks(page = 1) {
     return this.request<AdminScheduledTaskPage>(
       `/api/v1/admin/scheduled-tasks?page=${page}&pageSize=100`,
@@ -813,6 +832,14 @@ export class LuxApiClient {
     if (status) params.set("status", status);
     return this.request<{ jobs?: AdminDanmakuMatchJob[] }>(
       `/api/v1/admin/danmaku/match-jobs?${params}`,
+    );
+  }
+
+  adminLibraryCoverJobs(status?: string) {
+    const params = new URLSearchParams({ page: "1", pageSize: "50" });
+    if (status) params.set("status", status);
+    return this.request<{ jobs?: AdminLibraryCoverJob[] }>(
+      `/api/v1/admin/library-cover-jobs?${params}`,
     );
   }
 

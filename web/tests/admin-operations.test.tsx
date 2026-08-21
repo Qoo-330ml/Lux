@@ -464,7 +464,7 @@ describe("AdminOperationsPage", () => {
         isEnabled: true,
       },
     });
-    const runPlugin = vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
+    const runScheduledTask = vi.spyOn(api, "runAdminScheduledTask").mockResolvedValue({ status: "ACCEPTED", taskType: "STRM_MEDIA_INFO" });
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({
       scheduledTasks: [{
         id: "GLOBAL:global:STRM_MEDIA_INFO",
@@ -508,38 +508,19 @@ describe("AdminOperationsPage", () => {
     });
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行STRM 媒体信息扫描"]')?.click());
     await act(async () => {
-      await vi.waitFor(() => expect(runPlugin).toHaveBeenCalledWith("org.lux.strm-media-info"));
+      await vi.waitFor(() => expect(runScheduledTask).toHaveBeenCalledWith({
+        ownerType: "GLOBAL",
+        ownerId: "global",
+        taskType: "STRM_MEDIA_INFO",
+      }));
     });
   });
 
-  it("runs a registered task immediately with its task-specific worker", async () => {
+  it("runs every registered task immediately through the common task worker", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
-    const startScan = vi.spyOn(api, "startAdminScan").mockResolvedValue({
-      job: {
-        id: "scan-job-1",
-        libraryId: "library-1",
-        jobType: "RECONCILE_LIBRARY",
-        status: "PENDING",
-      },
-    });
-    const startMetadataRefresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
-      totalCount: 2,
-      mode: "FILL_MISSING",
-      job: {
-        id: "metadata-job-1",
-        status: "QUEUED",
-        mode: "FILL_MISSING",
-        processedCount: 0,
-        totalCount: 2,
-        createdAt: 1_700_000_000,
-      },
-    });
-    const runAutoLibraryCover = vi.spyOn(api, "runAutoLibraryCover").mockResolvedValue({
-      status: "QUEUED",
-      taskType: "AUTO_LIBRARY_COVER",
-    });
+    const runScheduledTask = vi.spyOn(api, "runAdminScheduledTask").mockImplementation(async (input) => ({ status: "ACCEPTED", taskType: input.taskType }));
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({
       scheduledTasks: [
         {
@@ -591,19 +572,19 @@ describe("AdminOperationsPage", () => {
 
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行全量校验媒体库"]')?.click());
     await act(async () => {
-      await vi.waitFor(() => expect(startScan).toHaveBeenCalledWith("library-1"));
+      await vi.waitFor(() => expect(runScheduledTask).toHaveBeenCalledWith({ ownerType: "LIBRARY", ownerId: "library-1", taskType: "RECONCILIATION_SCAN" }));
     });
 
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行元数据刮削"]')?.click());
     await act(async () => {
-      await vi.waitFor(() => expect(startMetadataRefresh).toHaveBeenCalledWith("library-1", "FILL_MISSING"));
+      await vi.waitFor(() => expect(runScheduledTask).toHaveBeenCalledWith({ ownerType: "LIBRARY", ownerId: "library-1", taskType: "METADATA_PARSE" }));
     });
 
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行自动生成媒体库封面"]')?.click());
     await act(async () => {
-      await vi.waitFor(() => expect(runAutoLibraryCover).toHaveBeenCalledWith("library-1"));
+      await vi.waitFor(() => expect(runScheduledTask).toHaveBeenCalledWith({ ownerType: "LIBRARY", ownerId: "library-1", taskType: "AUTO_LIBRARY_COVER" }));
     });
-    expect(container.querySelector<HTMLButtonElement>('button[aria-label="编辑自动生成媒体库封面"]')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="编辑自动生成媒体库封面"]')).not.toBeNull();
   });
 
   function renderPage() {
@@ -628,6 +609,9 @@ describe("AdminOperationsPage", () => {
     }
     if (!vi.isMockFunction(api.adminDanmakuMatchJobs)) {
       vi.spyOn(api, "adminDanmakuMatchJobs").mockResolvedValue({ jobs: [] });
+    }
+    if (!vi.isMockFunction(api.adminLibraryCoverJobs)) {
+      vi.spyOn(api, "adminLibraryCoverJobs").mockResolvedValue({ jobs: [] });
     }
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

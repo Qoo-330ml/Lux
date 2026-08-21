@@ -2982,15 +2982,198 @@ impl Database {
              ) VALUES (
                 'LIBRARY', ?, 'AUTO_LIBRARY_COVER',
                 '自动生成媒体库封面',
-                '首次达到至少 9 张海报后，随机选择 9 张海报生成带媒体库名称的旋转堆叠封面；自动仅执行一次，管理员可手动重跑。',
-                'SYSTEM', NULL, NULL, 0, '{\"oneShot\":true}'
-             ) ON CONFLICT(owner_type, owner_id, task_type) DO NOTHING
+                '首次达到至少 9 张海报后，随机选择 9 张海报生成带媒体库名称的旋转堆叠封面；管理员可手动执行或按计划重跑。',
+                'SYSTEM', NULL, NULL, 0, '{}'
+             ) ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                task_name = excluded.task_name,
+                task_description = excluded.task_description,
+                source_type = excluded.source_type,
+                resource_limit_json = excluded.resource_limit_json,
+                updated_at = unixepoch()
              ",
         )
         .bind(library_id)
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn create_library_cover_job(
+        &self,
+        id: &str,
+        library_id: &str,
+        is_manual: bool,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "INSERT INTO library_cover_jobs (id, library_id, is_manual, status)
+             VALUES (?, ?, ?, 'PENDING')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(database_flag(is_manual))
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_library_cover_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredLibraryCoverJob>, StorageError> {
+        self.query(
+            "SELECT id, library_id, is_manual, status, processed_count, total_count,
+                    error, created_at, updated_at, started_at, finished_at
+             FROM library_cover_jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_library_cover_job))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_library_cover_jobs(
+        &self,
+        status: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredLibraryCoverJob>, StorageError> {
+        let limit = limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE);
+        let query = if status.is_some() {
+            self.query(
+                "SELECT id, library_id, is_manual, status, processed_count, total_count,
+                        error, created_at, updated_at, started_at, finished_at
+                 FROM library_cover_jobs WHERE status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status)
+            .bind(limit)
+            .bind(offset.max(0))
+        } else {
+            self.query(
+                "SELECT id, library_id, is_manual, status, processed_count, total_count,
+                        error, created_at, updated_at, started_at, finished_at
+                 FROM library_cover_jobs
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset.max(0))
+        };
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.into_iter().map(stored_library_cover_job).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_active_library_cover_job_ids(
+        &self,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id FROM library_cover_jobs
+             WHERE status IN ('PENDING', 'RUNNING') ORDER BY created_at, id LIMIT 10000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn has_active_library_cover_job(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                SELECT 1 FROM library_cover_jobs
+                WHERE library_id = ? AND status IN ('PENDING', 'RUNNING')
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_library_cover_job(&self, id: &str) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE library_cover_jobs
+             SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'PENDING'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_library_cover_job_progress(
+        &self,
+        id: &str,
+        processed_count: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE library_cover_jobs
+             SET processed_count = ?, updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING'",
+        )
+        .bind(processed_count)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_library_cover_job(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE library_cover_jobs
+             SET status = ?, error = ?, processed_count = CASE
+                    WHEN ? = 'COMPLETED' THEN total_count ELSE processed_count END,
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(status)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -15104,6 +15287,37 @@ pub(crate) struct NewChapterDetectionJobItem<'a> {
     pub(crate) source_fingerprint: &'a [u8],
     pub(crate) input_fingerprint: &'a [u8],
     pub(crate) is_context: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredLibraryCoverJob {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) is_manual: bool,
+    pub(crate) status: String,
+    pub(crate) processed_count: i64,
+    pub(crate) total_count: i64,
+    pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
+}
+
+fn stored_library_cover_job(row: sqlx::any::AnyRow) -> StoredLibraryCoverJob {
+    StoredLibraryCoverJob {
+        id: row.get("id"),
+        library_id: row.get("library_id"),
+        is_manual: row.get::<i64, _>("is_manual") != 0,
+        status: row.get("status"),
+        processed_count: row.get("processed_count"),
+        total_count: row.get("total_count"),
+        error: row.get("error"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
+    }
 }
 
 pub(crate) struct NewMediaChapterMarker {

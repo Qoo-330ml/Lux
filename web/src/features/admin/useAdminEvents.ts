@@ -24,6 +24,8 @@ const queryKeysByScope: Record<Exclude<AdminEventScope, "all">, QueryKey[]> = {
     ["admin", "strm-probe-jobs"],
     ["admin", "chapter-detection-jobs"],
     ["admin", "danmaku-match-jobs"],
+    ["admin", "library-cover-jobs"],
+    ["admin", "task-activity"],
     ["admin", "scheduled-tasks"],
     ["admin", "dashboard"],
     ["admin", "logs"],

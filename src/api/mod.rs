@@ -75,7 +75,8 @@ use crate::{
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
-        scheduled_tasks::ScheduledTaskService,
+        schedule::validate_cron,
+        scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::ScraperResolver,
         settings::{
             read_danmaku_provider_url_async, read_network_proxy_url_async,
@@ -299,7 +300,8 @@ impl AppState {
             metadata_reidentify.clone(),
             probe.clone(),
             thumbnails.clone(),
-        );
+        )
+        .with_library_covers(library_covers.clone());
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -535,6 +537,24 @@ impl AppState {
         }
     }
 
+    pub async fn resume_library_cover_jobs(&self) {
+        let Some(service) = self.library_covers.clone() else {
+            return;
+        };
+        let Ok(job_ids) = service.active_job_ids().await else {
+            tracing::error!("failed to discover active library cover jobs during startup");
+            return;
+        };
+        for job_id in job_ids {
+            let worker = service.clone();
+            tokio::spawn(async move {
+                if let Err(error) = worker.run_job(&job_id).await {
+                    tracing::error!(job_id = %job_id, %error, "resumed library cover job stopped");
+                }
+            });
+        }
+    }
+
     pub async fn start_scheduled_tasks(&self) {
         if let Some(plugins) = self.plugins.as_ref()
             && let Err(error) = plugins.sync_media_info_scheduled_task().await
@@ -640,6 +660,14 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/libraries/{library_id}/cover/auto",
             post(admin_run_auto_library_cover),
+        )
+        .route(
+            "/api/v1/admin/library-cover-jobs",
+            get(admin_list_library_cover_jobs),
+        )
+        .route(
+            "/api/v1/admin/library-cover-jobs/{job_id}",
+            get(admin_get_library_cover_job),
         )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
         .route(
@@ -870,6 +898,11 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/admin/scheduled-tasks",
             get(admin_list_scheduled_tasks).put(admin_upsert_scheduled_task),
         )
+        .route(
+            "/api/v1/admin/scheduled-tasks/run",
+            post(admin_run_scheduled_task),
+        )
+        .route("/api/v1/admin/task-activity", get(admin_list_task_activity))
         .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
@@ -8346,7 +8379,10 @@ async fn lux_library_cover(
             | LibraryCoverError::Render(_)
             | LibraryCoverError::RenderPanicked
             | LibraryCoverError::GeneratedCoverRace
-            | LibraryCoverError::GenerationUnavailable,
+            | LibraryCoverError::GenerationUnavailable
+            | LibraryCoverError::TaskNotRegistered
+            | LibraryCoverError::JobNotFound
+            | LibraryCoverError::AlreadyActive,
         ) => {
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -13187,7 +13223,244 @@ struct AdminScheduledTaskRequest {
     is_enabled: Option<bool>,
 }
 
-const SCHEDULE_TASK_TYPES: [&str; 2] = ["RECONCILIATION_SCAN", "METADATA_PARSE"];
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminScheduledTaskRunRequest {
+    owner_type: String,
+    owner_id: String,
+    task_type: String,
+}
+
+const SCHEDULE_TASK_TYPES: [&str; 4] = [
+    "RECONCILIATION_SCAN",
+    "METADATA_PARSE",
+    "CHAPTER_DETECTION",
+    "AUTO_LIBRARY_COVER",
+];
+
+async fn admin_run_scheduled_task(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<AdminScheduledTaskRunRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(scheduled_tasks) = state.scheduled_tasks.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let owner_type = request.owner_type.trim();
+    let owner_id = request.owner_id.trim();
+    let task_type = request.task_type.trim();
+    match scheduled_tasks
+        .run_task(owner_type, owner_id, task_type)
+        .await
+    {
+        Ok(run) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "ACCEPTED",
+                "taskType": run.task_type(),
+                "run": scheduled_task_run_json(&run),
+            })),
+        )
+            .into_response(),
+        Err(error) => scheduled_task_error(&headers, error),
+    }
+}
+
+fn scheduled_task_run_json(run: &ScheduledTaskRun) -> Value {
+    match run {
+        ScheduledTaskRun::Reconciliation { job } => json!({ "jobId": job.id }),
+        ScheduledTaskRun::Metadata { job } => json!({ "jobId": job.id }),
+        ScheduledTaskRun::StrmMediaInfo {
+            operation_id, jobs, ..
+        } => json!({
+            "operationId": operation_id,
+            "jobIds": jobs.iter().map(|job| job.id.clone()).collect::<Vec<_>>(),
+        }),
+        ScheduledTaskRun::ChapterDetection { job } => json!({ "jobId": job.id }),
+        ScheduledTaskRun::AutoLibraryCover { job } => {
+            json!({ "jobId": job.id, "libraryId": job.library_id })
+        }
+    }
+}
+
+fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskError) -> Response {
+    let (status, code, message) = match error {
+        ScheduledTaskError::InvalidOwner
+        | ScheduledTaskError::UnsupportedTask
+        | ScheduledTaskError::NotRegistered => (
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "注册任务不存在",
+        ),
+        ScheduledTaskError::Disabled => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务当前不可执行",
+        ),
+        ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))
+        | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive)
+        | ScheduledTaskError::Chapter(ChapterDetectionError::AlreadyActive)
+        | ScheduledTaskError::Cover(LibraryCoverError::AlreadyActive) => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "同类任务已有运行中的作业",
+        ),
+        ScheduledTaskError::ServiceUnavailable
+        | ScheduledTaskError::Scan(_)
+        | ScheduledTaskError::Metadata(_)
+        | ScheduledTaskError::Strm(_)
+        | ScheduledTaskError::Chapter(_)
+        | ScheduledTaskError::Cover(_)
+        | ScheduledTaskError::Storage(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "注册任务暂时无法执行",
+        ),
+    };
+    api_error(headers, status, code, message).into_response()
+}
+
+async fn admin_list_task_activity(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut activities = Vec::new();
+    for status in ["PENDING", "RUNNING"] {
+        let scan_jobs = match database.list_scan_jobs(Some(status), 0, 100).await {
+            Ok(jobs) => jobs,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        activities.extend(scan_jobs.iter().map(|job| {
+            json!({
+                "id": job.id,
+                "kind": "scan",
+                "taskType": job.job_type,
+                "libraryId": job.library_id,
+                "status": job.status,
+                "processedCount": job.processed_count,
+                "totalCount": job.total_count,
+                "cancelRequested": job.cancel_requested,
+                "currentItem": job.current_item,
+                "scanPhase": job.scan_phase,
+            })
+        }));
+
+        let metadata_status = if status == "PENDING" {
+            "QUEUED"
+        } else {
+            status
+        };
+        let metadata_jobs = match database
+            .list_metadata_reidentify_jobs(Some(metadata_status), 0, 100)
+            .await
+        {
+            Ok(jobs) => jobs,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        activities.extend(metadata_jobs.iter().map(|job| {
+            json!({
+                "id": job.id,
+                "kind": "metadata",
+                "taskType": job.mode,
+                "libraryId": job.library_id,
+                "status": job.status,
+                "processedCount": job.processed_count,
+                "totalCount": job.total_count,
+                "cancelRequested": job.cancel_requested,
+            })
+        }));
+
+        let strm_jobs = match database.list_strm_probe_jobs(Some(status), 0, 100).await {
+            Ok(jobs) => jobs,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        activities.extend(strm_jobs.iter().map(|job| {
+            json!({
+                "id": job.id,
+                "kind": "strm",
+                "taskType": "STRM_MEDIA_INFO",
+                "libraryId": job.library_id,
+                "status": job.status,
+                "processedCount": job.processed_count,
+                "totalCount": job.total_count,
+                "cancelRequested": job.cancel_requested,
+            })
+        }));
+
+        let chapter_jobs = match database
+            .list_chapter_detection_jobs(Some(status), 0, 100)
+            .await
+        {
+            Ok(jobs) => jobs,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        activities.extend(chapter_jobs.iter().map(|job| {
+            json!({
+                "id": job.id,
+                "kind": "chapter",
+                "taskType": "CHAPTER_DETECTION",
+                "libraryId": job.library_id,
+                "status": job.status,
+                "processedCount": job.processed_count,
+                "totalCount": job.total_count,
+                "cancelRequested": job.cancel_requested,
+            })
+        }));
+
+        let danmaku_jobs = match database.list_danmaku_match_jobs(Some(status), 0, 100).await {
+            Ok(jobs) => jobs,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        activities.extend(danmaku_jobs.iter().map(|job| {
+            json!({
+                "id": job.id,
+                "kind": "danmaku",
+                "taskType": "DANMAKU_MATCH",
+                "libraryId": job.library_id,
+                "status": job.status,
+                "processedCount": job.processed_count,
+                "totalCount": job.total_count,
+                "cancelRequested": job.cancel_requested,
+            })
+        }));
+
+        let library_cover_jobs = match database.list_library_cover_jobs(Some(status), 0, 100).await
+        {
+            Ok(jobs) => jobs,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        activities.extend(library_cover_jobs.iter().map(|job| {
+            json!({
+                "id": job.id,
+                "kind": "cover",
+                "taskType": "AUTO_LIBRARY_COVER",
+                "libraryId": job.library_id,
+                "status": job.status,
+                "processedCount": job.processed_count,
+                "totalCount": job.total_count,
+            })
+        }));
+    }
+    activities.sort_by(|left, right| {
+        right["status"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(left["status"].as_str().unwrap_or_default())
+            .then_with(|| {
+                left["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["id"].as_str().unwrap_or_default())
+            })
+    });
+    Json(json!({ "activities": activities })).into_response()
+}
 
 async fn admin_list_scheduled_tasks(
     headers: HeaderMap,
@@ -13417,10 +13690,138 @@ async fn admin_upsert_scheduled_task(
     } else {
         None
     };
+    if let Some(schedule) = schedule.as_deref()
+        && validate_cron(schedule).is_err()
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "Cron 执行计划无效",
+        )
+        .into_response();
+    }
     let mut settings = LibrarySettingsPatch::default();
     match task_type.as_str() {
         "RECONCILIATION_SCAN" => settings.reconciliation_schedule = Some(schedule),
         "METADATA_PARSE" => settings.metadata_schedule = Some(schedule),
+        "AUTO_LIBRARY_COVER" => {
+            let task = match database
+                .upsert_scheduled_task_config(
+                    "LIBRARY",
+                    &library_id.to_string(),
+                    &task_type,
+                    schedule.as_deref(),
+                    enabled,
+                )
+                .await
+            {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::NOT_FOUND,
+                        lux::ApiErrorCode::NotFound,
+                        "任务尚未注册",
+                    )
+                    .into_response();
+                }
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let target_id = format!("{}:{}", library_id, task_type);
+            record_audit_event(
+                &state,
+                &headers,
+                "SCHEDULE_UPDATED",
+                Some("scheduled_task"),
+                Some(&target_id),
+                "{}",
+            )
+            .await;
+            return (
+                StatusCode::OK,
+                Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
+            )
+                .into_response();
+        }
+        "CHAPTER_DETECTION" => {
+            let Some(schedule) = schedule.as_deref() else {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "片头片尾检测任务必须保留 Cron 执行计划",
+                )
+                .into_response();
+            };
+            let plugin_id = match database
+                .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
+                .await
+            {
+                Ok(Some(task)) => match task.plugin_id {
+                    Some(plugin_id) => plugin_id,
+                    None => {
+                        return api_error(
+                            &headers,
+                            StatusCode::NOT_FOUND,
+                            lux::ApiErrorCode::NotFound,
+                            "片头片尾检测任务插件未注册",
+                        )
+                        .into_response();
+                    }
+                },
+                Ok(None) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::NOT_FOUND,
+                        lux::ApiErrorCode::NotFound,
+                        "片头片尾检测任务插件未注册",
+                    )
+                    .into_response();
+                }
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let Some(plugins) = state.plugins.as_ref() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            if let Err(error) = plugins
+                .update_chapter_detector_schedule(&plugin_id, schedule)
+                .await
+            {
+                return plugin_error(&headers, error);
+            }
+            let task = match database
+                .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
+                .await
+            {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::NOT_FOUND,
+                        lux::ApiErrorCode::NotFound,
+                        "任务尚未注册",
+                    )
+                    .into_response();
+                }
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let target_id = format!("{}:{}", library_id, task_type);
+            record_audit_event(
+                &state,
+                &headers,
+                "SCHEDULE_UPDATED",
+                Some("scheduled_task"),
+                Some(&target_id),
+                "{}",
+            )
+            .await;
+            return (
+                StatusCode::OK,
+                Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
+            )
+                .into_response();
+        }
         _ => {
             return api_error(
                 &headers,
@@ -17562,6 +17963,72 @@ async fn admin_update_library_cover(
     }
 }
 
+async fn admin_list_library_cover_jobs(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let status = query.status.as_deref().map(str::to_ascii_uppercase);
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED"
+        )
+    }) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务状态无效",
+        )
+        .into_response();
+    }
+    let Some(service) = state.library_covers.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.list(status.as_deref(), offset, limit).await {
+        Ok(jobs) => Json(json!({
+            "jobs": jobs,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => library_cover_error(&headers, error),
+    }
+}
+
+async fn admin_get_library_cover_job(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(service) = state.library_covers.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.get(&job_id).await {
+        Ok(job) => Json(json!({ "job": job })).into_response(),
+        Err(error) => library_cover_error(&headers, error),
+    }
+}
+
 async fn admin_run_auto_library_cover(
     headers: HeaderMap,
     Path(library_id): Path<String>,
@@ -17606,11 +18073,15 @@ async fn admin_run_auto_library_cover(
     let Some(covers) = state.library_covers.clone() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let worker_library_id = library_id;
+    let job = match covers.create_manual_job(library_id).await {
+        Ok(job) => job,
+        Err(error) => return library_cover_error(&headers, error),
+    };
+    let job_id = job.id.clone();
     tokio::spawn(async move {
-        match covers.run_manually(worker_library_id).await {
+        match covers.run_job(&job_id).await {
             Ok(crate::application::library_covers::AutoLibraryCoverResult::Generated) => {
-                tracing::info!(library_id = %worker_library_id, "manual automatic library cover generation completed");
+                tracing::info!(job_id = %job_id, "manual automatic library cover generation completed");
             }
             Ok(
                 crate::application::library_covers::AutoLibraryCoverResult::ExistingCover
@@ -17618,10 +18089,10 @@ async fn admin_run_auto_library_cover(
                 | crate::application::library_covers::AutoLibraryCoverResult::TaskNotRegistered
                 | crate::application::library_covers::AutoLibraryCoverResult::AlreadyHandled,
             ) => {
-                tracing::info!(library_id = %worker_library_id, "manual automatic library cover generation skipped");
+                tracing::info!(job_id = %job_id, "manual automatic library cover generation skipped");
             }
             Err(error) => {
-                tracing::warn!(library_id = %worker_library_id, %error, "manual automatic library cover generation failed");
+                tracing::warn!(job_id = %job_id, %error, "manual automatic library cover generation failed");
             }
         }
     });
@@ -17639,6 +18110,7 @@ async fn admin_run_auto_library_cover(
         Json(json!({
             "status": "QUEUED",
             "taskType": crate::application::library_covers::AUTO_LIBRARY_COVER_TASK_TYPE,
+            "job": job,
         })),
     )
         .into_response()
@@ -17821,6 +18293,20 @@ fn library_cover_error(headers: &HeaderMap, error: LibraryCoverError) -> Respons
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
             "媒体库不存在",
+        )
+        .into_response(),
+        LibraryCoverError::TaskNotRegistered | LibraryCoverError::JobNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "自动媒体库封面任务不存在",
+        )
+        .into_response(),
+        LibraryCoverError::AlreadyActive => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "自动媒体库封面任务已有运行中的作业",
         )
         .into_response(),
         LibraryCoverError::InvalidPath => api_error(

@@ -936,6 +936,33 @@ impl PluginService {
         self.sync_media_info_scheduled_task().await
     }
 
+    pub async fn update_chapter_detector_schedule(
+        &self,
+        plugin_id: &str,
+        schedule: &str,
+    ) -> Result<(), PluginServiceError> {
+        let schedule = schedule.trim();
+        validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_chapter_detector_plugin(plugin) {
+            return Err(PluginServiceError::InvalidConfig);
+        }
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let mut values = merge_default_config_values(
+            &fields,
+            normalize_plugin_config(&plugin_id, self.read_plugin_config(&plugin_id).await?),
+        );
+        values.insert("schedule".to_owned(), Value::String(schedule.to_owned()));
+        let values = validate_config_values(&fields, &values)?;
+        chapter_detector_settings_from_values(&plugin_id, &fields, &values)?;
+        self.write_plugin_config(&plugin_id, &values).await?;
+        self.sync_chapter_detection_scheduled_tasks().await
+    }
+
     pub async fn media_info_settings(&self) -> Result<MediaInfoSettings, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
         let plugin = catalog

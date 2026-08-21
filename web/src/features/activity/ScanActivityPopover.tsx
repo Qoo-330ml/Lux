@@ -4,13 +4,19 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminJob } from "../../lib/api/types";
-
-const ACTIVE_STATUSES = ["RUNNING", "PENDING"] as const;
+import type { AdminTaskActivity } from "../../lib/api/types";
 
 const JOB_TYPE_LABELS: Record<string, string> = {
   RECONCILE_LIBRARY: "全量校验",
+  RECONCILIATION_SCAN: "全量校验",
   INCREMENTAL_SCAN: "实时扫描",
+  FILL_MISSING: "元数据刮削",
+  FULL_REFRESH: "元数据完整刷新",
+  REIDENTIFY: "元数据匹配",
+  STRM_MEDIA_INFO: "STRM 媒体信息",
+  CHAPTER_DETECTION: "片头片尾检测",
+  DANMAKU_MATCH: "弹幕匹配",
+  AUTO_LIBRARY_COVER: "媒体库封面",
 };
 
 const PHASE_LABELS: Record<string, string> = {
@@ -23,15 +29,9 @@ const PHASE_LABELS: Record<string, string> = {
 export function ScanActivityPopover() {
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
-  const running = useQuery({
-    queryKey: queryKeys.adminJobs("RUNNING"),
-    queryFn: () => api.adminJobs("RUNNING"),
-    refetchInterval: 5_000,
-    refetchIntervalInBackground: false,
-  });
-  const pending = useQuery({
-    queryKey: queryKeys.adminJobs("PENDING"),
-    queryFn: () => api.adminJobs("PENDING"),
+  const activity = useQuery({
+    queryKey: queryKeys.adminTaskActivity,
+    queryFn: () => api.adminTaskActivity(),
     refetchInterval: 5_000,
     refetchIntervalInBackground: false,
   });
@@ -41,18 +41,17 @@ export function ScanActivityPopover() {
     staleTime: 60_000,
   });
   const cancel = useMutation({
-    mutationFn: (jobId: string) => api.cancelAdminJob(jobId),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "jobs"] }),
+    mutationFn: (job: AdminTaskActivity) => cancelTask(job),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminTaskActivity }),
   });
   const jobs = useMemo(() => {
-    const active = [
-      ...(running.data?.jobs ?? []),
-      ...(pending.data?.jobs ?? []),
-    ].filter((job) => ACTIVE_STATUSES.includes(job.status as "RUNNING" | "PENDING"));
+    const active = (activity.data?.activities ?? []).filter((job) =>
+      job.status === "RUNNING" || job.status === "PENDING" || job.status === "QUEUED",
+    );
     return active.sort(compareJobs);
-  }, [pending.data?.jobs, running.data?.jobs]);
+  }, [activity.data?.activities]);
   const primary = jobs[0];
-  const busy = running.isPending || pending.isPending;
+  const busy = activity.isPending;
 
   if (!primary && !busy) return null;
 
@@ -61,16 +60,16 @@ export function ScanActivityPopover() {
       <button
         className={primary ? "lux-scan-activity-trigger is-active" : "lux-scan-activity-trigger"}
         type="button"
-        aria-label={primary ? `后台扫描活动：${libraryLabel(primary, libraries.data?.libraries)}，${activityLabel(primary)}` : "后台扫描活动"}
+        aria-label={primary ? `后台任务活动：${libraryLabel(primary, libraries.data?.libraries)}，${activityLabel(primary)}` : "后台任务活动"}
         aria-expanded={open}
-        title="后台扫描活动"
+        title="后台任务活动"
         onClick={() => setOpen((value) => !value)}
       >
         <Activity size={18} />
         {primary ? <span className="lux-scan-activity-dot" aria-hidden="true" /> : null}
       </button>
       {open ? (
-        <div className="lux-scan-activity-popover" role="dialog" aria-label="后台扫描活动">
+        <div className="lux-scan-activity-popover" role="dialog" aria-label="后台任务活动">
           <div className="lux-scan-activity-heading">
             <span><FileClock size={16} /> 正在处理</span>
             <strong>{jobs.length || 0}</strong>
@@ -89,15 +88,15 @@ export function ScanActivityPopover() {
                   </div>
                   <div className="lux-scan-activity-actions">
                     <Link to="/admin/jobs" onClick={() => setOpen(false)}>任务与日志</Link>
-                    <button type="button" aria-label={`取消${activityLabel(job)}`} disabled={cancel.isPending || job.cancelRequested} onClick={() => cancel.mutate(job.id)}>
+                    {job.kind === "cover" ? null : <button type="button" aria-label={`取消${activityLabel(job)}`} disabled={cancel.isPending || job.cancelRequested} onClick={() => cancel.mutate(job)}>
                       <StopCircle size={14} /> {job.cancelRequested ? "停止中" : "取消"}
-                    </button>
+                    </button>}
                   </div>
                 </article>
               ))}
             </div>
           ) : (
-            <p className="lux-scan-activity-empty">正在读取后台活动</p>
+            <p className="lux-scan-activity-empty">正在读取后台任务活动</p>
           )}
         </div>
       ) : null}
@@ -105,29 +104,41 @@ export function ScanActivityPopover() {
   );
 }
 
-function activityLabel(job: AdminJob) {
-  return JOB_TYPE_LABELS[job.jobType] ?? "扫描任务";
+function activityLabel(job: AdminTaskActivity) {
+  return JOB_TYPE_LABELS[job.taskType] ?? "后台任务";
 }
 
-function libraryLabel(job: AdminJob, libraries?: Array<{ id: string; name: string }>) {
+function libraryLabel(job: AdminTaskActivity, libraries?: Array<{ id: string; name: string }>) {
   return libraries?.find((library) => library.id === job.libraryId)?.name ?? "未知媒体库";
 }
 
-function phaseLabel(job: AdminJob) {
+function phaseLabel(job: AdminTaskActivity) {
+  if (job.kind === "cover") return job.status === "RUNNING" ? "生成封面" : "等待执行";
   return PHASE_LABELS[job.scanPhase ?? "IDLE"] ?? "处理中";
 }
 
-function progressValue(job: AdminJob) {
+function progressValue(job: AdminTaskActivity) {
   if (!job.totalCount || job.totalCount <= 0) return null;
   return Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100));
 }
 
-function progressLabel(job: AdminJob) {
+function progressLabel(job: AdminTaskActivity) {
   const total = job.totalCount ?? 0;
   return total > 0 ? `${job.processedCount ?? 0}/${total}` : "发现中";
 }
 
-function compareJobs(left: AdminJob, right: AdminJob) {
+function compareJobs(left: AdminTaskActivity, right: AdminTaskActivity) {
   const status = Number(right.status === "RUNNING") - Number(left.status === "RUNNING");
   return status || String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? ""));
+}
+
+function cancelTask(job: AdminTaskActivity) {
+  switch (job.kind) {
+    case "scan": return api.cancelAdminJob(job.id);
+    case "metadata": return api.cancelMetadataReidentify(job.id);
+    case "strm": return api.cancelStrmProbeJob(job.id);
+    case "chapter": return api.cancelChapterDetection(job.id);
+    case "danmaku": return api.cancelDanmakuMatch(job.id);
+    default: return Promise.reject(new Error("该任务暂不支持取消"));
+  }
 }

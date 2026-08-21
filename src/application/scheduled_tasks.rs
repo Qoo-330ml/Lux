@@ -14,6 +14,9 @@ use crate::{
             ChapterDetectionError, ChapterDetectionJob, ChapterDetectionOptions,
             ChapterDetectionService,
         },
+        library_covers::{
+            AUTO_LIBRARY_COVER_TASK_TYPE, LibraryCoverError, LibraryCoverJob, LibraryCoverService,
+        },
         plugins::PluginService,
         probe::MediaProbeService,
         reidentify::{
@@ -47,6 +50,7 @@ pub struct ScheduledTaskService {
     metadata_reidentify: Option<MetadataReidentifyService>,
     probe: Option<MediaProbeService>,
     thumbnails: Option<ThumbnailService>,
+    library_covers: Option<LibraryCoverService>,
     cursors: Arc<Mutex<HashMap<String, TaskCursor>>>,
 }
 
@@ -70,6 +74,9 @@ pub enum ScheduledTaskRun {
     ChapterDetection {
         job: ChapterDetectionJob,
     },
+    AutoLibraryCover {
+        job: LibraryCoverJob,
+    },
 }
 
 impl ScheduledTaskRun {
@@ -79,6 +86,7 @@ impl ScheduledTaskRun {
             Self::Metadata { .. } => METADATA_TASK_TYPE,
             Self::StrmMediaInfo { .. } => STRM_MEDIA_INFO_TASK_TYPE,
             Self::ChapterDetection { .. } => CHAPTER_DETECTION_TASK_TYPE,
+            Self::AutoLibraryCover { .. } => AUTO_LIBRARY_COVER_TASK_TYPE,
         }
     }
 }
@@ -94,6 +102,7 @@ pub enum ScheduledTaskError {
     Metadata(MetadataReidentifyError),
     Strm(StrmProbeError),
     Chapter(ChapterDetectionError),
+    Cover(LibraryCoverError),
     Storage(StorageError),
 }
 
@@ -111,6 +120,7 @@ impl fmt::Display for ScheduledTaskError {
             Self::Metadata(error) => error.fmt(formatter),
             Self::Strm(error) => error.fmt(formatter),
             Self::Chapter(error) => error.fmt(formatter),
+            Self::Cover(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -140,6 +150,7 @@ impl ScheduledTaskService {
             metadata_reidentify: None,
             probe: None,
             thumbnails: None,
+            library_covers: None,
             cursors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -155,6 +166,11 @@ impl ScheduledTaskService {
         self.metadata_reidentify = metadata_reidentify;
         self.probe = probe;
         self.thumbnails = thumbnails;
+        self
+    }
+
+    pub fn with_library_covers(mut self, library_covers: Option<LibraryCoverService>) -> Self {
+        self.library_covers = library_covers;
         self
     }
 
@@ -265,7 +281,10 @@ impl ScheduledTaskService {
         if owner_type == "LIBRARY"
             && !matches!(
                 task_type.as_str(),
-                RECONCILIATION_TASK_TYPE | METADATA_TASK_TYPE | CHAPTER_DETECTION_TASK_TYPE
+                RECONCILIATION_TASK_TYPE
+                    | METADATA_TASK_TYPE
+                    | CHAPTER_DETECTION_TASK_TYPE
+                    | AUTO_LIBRARY_COVER_TASK_TYPE
             )
         {
             return Err(ScheduledTaskError::UnsupportedTask);
@@ -275,10 +294,6 @@ impl ScheduledTaskService {
             .find_scheduled_task_config(&owner_type, owner_id, &task_type)
             .await?
             .ok_or(ScheduledTaskError::NotRegistered)?;
-        if !task.is_enabled {
-            return Err(ScheduledTaskError::Disabled);
-        }
-
         match (owner_type.as_str(), task_type.as_str()) {
             ("LIBRARY", RECONCILIATION_TASK_TYPE) => self.run_reconciliation(owner_id).await,
             ("LIBRARY", METADATA_TASK_TYPE) => self.run_metadata(owner_id).await,
@@ -286,6 +301,9 @@ impl ScheduledTaskService {
             ("LIBRARY", CHAPTER_DETECTION_TASK_TYPE) => {
                 self.run_chapter_detection(owner_id, task.plugin_id.as_deref())
                     .await
+            }
+            ("LIBRARY", AUTO_LIBRARY_COVER_TASK_TYPE) => {
+                self.run_auto_library_cover(owner_id).await
             }
             _ => Err(ScheduledTaskError::UnsupportedTask),
         }
@@ -417,6 +435,35 @@ impl ScheduledTaskService {
         });
         Ok(ScheduledTaskRun::ChapterDetection { job })
     }
+
+    async fn run_auto_library_cover(
+        &self,
+        library_id: &str,
+    ) -> Result<ScheduledTaskRun, ScheduledTaskError> {
+        let service = self
+            .library_covers
+            .as_ref()
+            .ok_or(ScheduledTaskError::ServiceUnavailable)?;
+        let library_id = library_id
+            .parse::<LibraryId>()
+            .map_err(|_| ScheduledTaskError::InvalidOwner)?;
+        let job = service
+            .create_manual_job(library_id)
+            .await
+            .map_err(ScheduledTaskError::Cover)?;
+        let worker = service.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = worker.run_job(&job_id).await {
+                tracing::warn!(
+                    job_id = %job_id,
+                    %error,
+                    "scheduled library cover generation stopped"
+                );
+            }
+        });
+        Ok(ScheduledTaskRun::AutoLibraryCover { job })
+    }
 }
 
 fn scheduler_schedule(task: &StoredScheduledTaskConfig) -> Option<CronSchedule> {
@@ -427,6 +474,7 @@ fn scheduler_schedule(task: &StoredScheduledTaskConfig) -> Option<CronSchedule> 
                 | METADATA_TASK_TYPE
                 | STRM_MEDIA_INFO_TASK_TYPE
                 | CHAPTER_DETECTION_TASK_TYPE
+                | AUTO_LIBRARY_COVER_TASK_TYPE
         )
     {
         return None;

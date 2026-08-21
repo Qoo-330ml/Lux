@@ -17,12 +17,13 @@ use imageproc::{
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use tokio::{fs, sync::Semaphore};
+use uuid::Uuid;
 
 use crate::{
     application::images::{ImageWriteError, write_image_atomically},
     domain::ids::LibraryId,
     library::LibraryKind,
-    storage::{Database, StorageError},
+    storage::{Database, StorageError, StoredLibraryCoverJob},
 };
 
 pub const MAX_LIBRARY_COVER_BYTES: u64 = 5 * 1024 * 1024;
@@ -67,11 +68,6 @@ impl LibraryCoverService {
         &self,
         library_id: LibraryId,
     ) -> Result<AutoLibraryCoverResult, LibraryCoverError> {
-        let _permit = self
-            .generation_lock
-            .acquire()
-            .await
-            .map_err(|_| LibraryCoverError::GenerationUnavailable)?;
         let library_id_text = library_id.to_string();
         let library = self
             .database
@@ -103,60 +99,128 @@ impl LibraryCoverService {
         {
             return Ok(AutoLibraryCoverResult::ExistingCover);
         }
+        let job = self.create_job(library_id, false).await?;
+        self.run_job(&job.id).await
+    }
 
-        let font_bytes = self.load_font_bytes().await?;
-        let library_subtitle = library_kind_subtitle(&library.kind);
-        let library_name = library.name;
-        let bytes = tokio::task::spawn_blocking(move || {
-            render_auto_library_cover(&library_name, library_subtitle, &poster_bytes, &font_bytes)
-        })
-        .await
-        .map_err(|_| LibraryCoverError::RenderPanicked)??;
+    pub async fn create_manual_job(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<LibraryCoverJob, LibraryCoverError> {
+        self.create_job(library_id, true).await
+    }
 
-        if self
-            .database
+    async fn create_job(
+        &self,
+        library_id: LibraryId,
+        is_manual: bool,
+    ) -> Result<LibraryCoverJob, LibraryCoverError> {
+        let library_id_text = library_id.to_string();
+        self.database
             .find_library(&library_id_text)
             .await?
-            .is_some_and(|library| library.cover_image_path.is_some())
+            .ok_or(LibraryCoverError::LibraryNotFound)?;
+        if is_manual
+            && self
+                .database
+                .find_scheduled_task_config(
+                    "LIBRARY",
+                    &library_id_text,
+                    AUTO_LIBRARY_COVER_TASK_TYPE,
+                )
+                .await?
+                .is_none()
         {
-            return Ok(AutoLibraryCoverResult::ExistingCover);
+            return Err(LibraryCoverError::TaskNotRegistered);
         }
-        match self.store_generated(library_id, &bytes, false).await {
-            Ok(_) => Ok(AutoLibraryCoverResult::Generated),
-            Err(LibraryCoverError::GeneratedCoverRace) => Ok(AutoLibraryCoverResult::ExistingCover),
-            Err(error) => Err(error),
+        if !self
+            .database
+            .has_active_library_cover_job(&library_id_text)
+            .await?
+        {
+            let id = Uuid::now_v7().to_string();
+            if self
+                .database
+                .create_library_cover_job(&id, &library_id_text, is_manual)
+                .await?
+            {
+                return self.get(&id).await;
+            }
         }
+        Err(LibraryCoverError::AlreadyActive)
     }
 
     pub async fn run_manually(
         &self,
         library_id: LibraryId,
     ) -> Result<AutoLibraryCoverResult, LibraryCoverError> {
+        let job = self.create_manual_job(library_id).await?;
+        self.run_job(&job.id).await
+    }
+
+    pub async fn run_job(&self, job_id: &str) -> Result<AutoLibraryCoverResult, LibraryCoverError> {
+        let job = self
+            .database
+            .find_library_cover_job(job_id)
+            .await?
+            .ok_or(LibraryCoverError::JobNotFound)?;
+        if job.status == "PENDING" && !self.database.claim_library_cover_job(job_id).await? {
+            return Ok(AutoLibraryCoverResult::AlreadyHandled);
+        }
+        if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
+            return Ok(AutoLibraryCoverResult::AlreadyHandled);
+        }
+        let result = self.run_generation(&job).await;
+        match result {
+            Ok(value) => {
+                self.database
+                    .update_library_cover_job_progress(job_id, 1)
+                    .await?;
+                self.database
+                    .finish_library_cover_job(job_id, "COMPLETED", None)
+                    .await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let error_code = library_cover_error_code(&error);
+                let _ = self
+                    .database
+                    .finish_library_cover_job(job_id, "FAILED", Some(error_code))
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn run_generation(
+        &self,
+        job: &StoredLibraryCoverJob,
+    ) -> Result<AutoLibraryCoverResult, LibraryCoverError> {
         let _permit = self
             .generation_lock
             .acquire()
             .await
             .map_err(|_| LibraryCoverError::GenerationUnavailable)?;
-        let library_id_text = library_id.to_string();
+        let library_id = job
+            .library_id
+            .parse::<LibraryId>()
+            .map_err(|_| LibraryCoverError::LibraryNotFound)?;
+        let library_id_text = job.library_id.clone();
         let library = self
             .database
             .find_library(&library_id_text)
             .await?
             .ok_or(LibraryCoverError::LibraryNotFound)?;
-        if library
-            .cover_image_path
-            .as_deref()
-            .is_some_and(|path| path != format!("{library_id_text}-auto.jpg"))
-        {
+        if job.is_manual {
+            if library
+                .cover_image_path
+                .as_deref()
+                .is_some_and(|path| path != format!("{library_id_text}-auto.jpg"))
+            {
+                return Ok(AutoLibraryCoverResult::ExistingCover);
+            }
+        } else if library.cover_image_path.is_some() {
             return Ok(AutoLibraryCoverResult::ExistingCover);
-        }
-        if self
-            .database
-            .find_scheduled_task_config("LIBRARY", &library_id_text, AUTO_LIBRARY_COVER_TASK_TYPE)
-            .await?
-            .is_none()
-        {
-            return Ok(AutoLibraryCoverResult::TaskNotRegistered);
         }
 
         let poster_bytes = self.load_posters(&library_id_text).await?;
@@ -172,11 +236,41 @@ impl LibraryCoverService {
         .await
         .map_err(|_| LibraryCoverError::RenderPanicked)??;
 
-        match self.store_generated(library_id, &bytes, true).await {
+        match self
+            .store_generated(library_id, &bytes, job.is_manual)
+            .await
+        {
             Ok(_) => Ok(AutoLibraryCoverResult::Generated),
             Err(LibraryCoverError::GeneratedCoverRace) => Ok(AutoLibraryCoverResult::ExistingCover),
             Err(error) => Err(error),
         }
+    }
+
+    pub async fn get(&self, job_id: &str) -> Result<LibraryCoverJob, LibraryCoverError> {
+        self.database
+            .find_library_cover_job(job_id)
+            .await?
+            .map(library_cover_job)
+            .ok_or(LibraryCoverError::JobNotFound)
+    }
+
+    pub async fn list(
+        &self,
+        status: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<LibraryCoverJob>, LibraryCoverError> {
+        Ok(self
+            .database
+            .list_library_cover_jobs(status, offset, limit)
+            .await?
+            .into_iter()
+            .map(library_cover_job)
+            .collect())
+    }
+
+    pub async fn active_job_ids(&self) -> Result<Vec<String>, LibraryCoverError> {
+        Ok(self.database.list_active_library_cover_job_ids().await?)
     }
 
     async fn load_posters(&self, library_id: &str) -> Result<Vec<Vec<u8>>, LibraryCoverError> {
@@ -426,6 +520,58 @@ pub enum AutoLibraryCoverResult {
     Generated,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCoverJob {
+    pub id: String,
+    pub library_id: String,
+    pub is_manual: bool,
+    pub status: String,
+    pub processed_count: i64,
+    pub total_count: i64,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
+fn library_cover_job(job: StoredLibraryCoverJob) -> LibraryCoverJob {
+    LibraryCoverJob {
+        id: job.id,
+        library_id: job.library_id,
+        is_manual: job.is_manual,
+        status: job.status,
+        processed_count: job.processed_count,
+        total_count: job.total_count,
+        error: job.error,
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+    }
+}
+
+fn library_cover_error_code(error: &LibraryCoverError) -> &'static str {
+    match error {
+        LibraryCoverError::UnsupportedContentType(_)
+        | LibraryCoverError::InvalidContent { .. }
+        | LibraryCoverError::TooLarge { .. } => "INVALID_COVER_IMAGE",
+        LibraryCoverError::InvalidPath => "INVALID_COVER_PATH",
+        LibraryCoverError::LibraryNotFound => "LIBRARY_NOT_FOUND",
+        LibraryCoverError::TaskNotRegistered => "TASK_NOT_REGISTERED",
+        LibraryCoverError::JobNotFound => "JOB_NOT_FOUND",
+        LibraryCoverError::AlreadyActive => "ALREADY_ACTIVE",
+        LibraryCoverError::FontNotFound => "COVER_FONT_NOT_FOUND",
+        LibraryCoverError::Render(_)
+        | LibraryCoverError::RenderPanicked
+        | LibraryCoverError::GeneratedCoverRace => "COVER_RENDER_FAILED",
+        LibraryCoverError::GenerationUnavailable => "GENERATION_UNAVAILABLE",
+        LibraryCoverError::Io { .. } | LibraryCoverError::ImageWrite(_) => "COVER_WRITE_FAILED",
+        LibraryCoverError::Storage(_) => "STORAGE_ERROR",
+    }
+}
+
 #[derive(Debug)]
 pub enum LibraryCoverError {
     UnsupportedContentType(String),
@@ -443,6 +589,9 @@ pub enum LibraryCoverError {
     RenderPanicked,
     GeneratedCoverRace,
     GenerationUnavailable,
+    TaskNotRegistered,
+    JobNotFound,
+    AlreadyActive,
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -480,6 +629,13 @@ impl fmt::Display for LibraryCoverError {
             Self::GenerationUnavailable => {
                 formatter.write_str("library cover generation is unavailable")
             }
+            Self::TaskNotRegistered => {
+                formatter.write_str("automatic library cover task is not registered")
+            }
+            Self::JobNotFound => formatter.write_str("library cover job was not found"),
+            Self::AlreadyActive => {
+                formatter.write_str("library cover generation is already running")
+            }
             Self::Io { path, source } => {
                 write!(formatter, "library cover '{}': {source}", path.display())
             }
@@ -504,7 +660,10 @@ impl std::error::Error for LibraryCoverError {
             | Self::Render(_)
             | Self::RenderPanicked
             | Self::GeneratedCoverRace
-            | Self::GenerationUnavailable => None,
+            | Self::GenerationUnavailable
+            | Self::TaskNotRegistered
+            | Self::JobNotFound
+            | Self::AlreadyActive => None,
         }
     }
 }

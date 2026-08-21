@@ -25,6 +25,7 @@ import type {
   AdminAuditEvent,
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
+  AdminLibraryCoverJob,
   AdminJob,
   AdminMetadataReidentifyJob,
   AdminScheduledTask,
@@ -38,7 +39,8 @@ type OperationsJob =
   | (AdminMetadataReidentifyJob & { kind: "metadata"; jobType: string; libraryId?: string | null })
   | (AdminStrmProbeJob & { kind: "strm"; jobType: string; libraryId?: string | null })
   | (AdminChapterDetectionJob & { kind: "chapter"; jobType: string; libraryId?: string | null })
-  | (AdminDanmakuMatchJob & { kind: "danmaku"; jobType: string; libraryId?: string | null });
+  | (AdminDanmakuMatchJob & { kind: "danmaku"; jobType: string; libraryId?: string | null })
+  | (AdminLibraryCoverJob & { kind: "cover"; jobType: string; libraryId?: string | null });
 
 const JOB_STATUS_LABELS: Record<string, string> = {
   PENDING: "等待中",
@@ -166,6 +168,11 @@ export function AdminOperationsPage() {
     queryFn: () => api.adminDanmakuMatchJobs(status || undefined),
     refetchInterval: 5_000,
   });
+  const libraryCoverJobs = useQuery({
+    queryKey: queryKeys.adminLibraryCoverJobs(status),
+    queryFn: () => api.adminLibraryCoverJobs(status || undefined),
+    refetchInterval: 5_000,
+  });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
   const cancel = useMutation({
     mutationFn: (jobId: string) => api.cancelAdminJob(jobId),
@@ -230,6 +237,11 @@ export function AdminOperationsPage() {
       kind: "danmaku",
       jobType: "DANMAKU_MATCH",
     })),
+    ...(libraryCoverJobs.data?.jobs ?? []).map((job): OperationsJob => ({
+      ...job,
+      kind: "cover",
+      jobType: "AUTO_LIBRARY_COVER",
+    })),
   ].sort(compareOperationsJobs);
   const registeredTasks = tasks.data?.scheduledTasks ?? [];
   const logItems = useMemo(() => {
@@ -241,11 +253,11 @@ export function AdminOperationsPage() {
     });
   }, [logLevel, logSearch, logs.data?.events]);
 
-  if (tasks.isPending || libraries.isPending || jobs.isPending || metadataJobs.isPending || strmJobs.isPending || chapterJobs.isPending || danmakuJobs.isPending || logs.isPending) {
+  if (tasks.isPending || libraries.isPending || jobs.isPending || metadataJobs.isPending || strmJobs.isPending || chapterJobs.isPending || danmakuJobs.isPending || libraryCoverJobs.isPending || logs.isPending) {
     return <AdminOperationsState label="正在读取注册任务、运行记录与日志…" />;
   }
-  if (tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || logs.error) {
-    return <AdminOperationsState label={(tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || logs.error)?.message || "任务数据加载失败"} error />;
+  if (tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error || logs.error) {
+    return <AdminOperationsState label={(tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error || logs.error)?.message || "任务数据加载失败"} error />;
   }
 
   const runningCount = jobItems.filter((job) => isActiveJob(job.status)).length;
@@ -314,8 +326,8 @@ export function AdminOperationsPage() {
           libraryNames={libraryNames}
           status={status}
           onStatusChange={setStatus}
-          onCancel={(job) => job.kind === "metadata" ? cancelMetadata.mutate(job.id) : job.kind === "strm" ? cancelStrm.mutate(job.id) : job.kind === "chapter" ? cancelChapter.mutate(job.id) : job.kind === "danmaku" ? cancelDanmaku.mutate(job.id) : cancel.mutate(job.id)}
-          onRetry={(job) => job.kind === "metadata" ? retryMetadata.mutate(job.id) : job.kind === "strm" ? retryStrm.mutate(job.id) : job.kind === "chapter" ? retryChapter.mutate(job.id) : job.kind === "danmaku" ? retryDanmaku.mutate(job.id) : retry.mutate(job.id)}
+          onCancel={(job) => job.kind === "cover" ? undefined : job.kind === "metadata" ? cancelMetadata.mutate(job.id) : job.kind === "strm" ? cancelStrm.mutate(job.id) : job.kind === "chapter" ? cancelChapter.mutate(job.id) : job.kind === "danmaku" ? cancelDanmaku.mutate(job.id) : cancel.mutate(job.id)}
+          onRetry={(job) => job.kind === "cover" ? undefined : job.kind === "metadata" ? retryMetadata.mutate(job.id) : job.kind === "strm" ? retryStrm.mutate(job.id) : job.kind === "chapter" ? retryChapter.mutate(job.id) : job.kind === "danmaku" ? retryDanmaku.mutate(job.id) : retry.mutate(job.id)}
           busy={cancel.isPending || cancelMetadata.isPending || cancelStrm.isPending || cancelChapter.isPending || cancelDanmaku.isPending || retry.isPending || retryMetadata.isPending || retryStrm.isPending || retryChapter.isPending || retryDanmaku.isPending}
         />
       ) : null}
@@ -357,7 +369,7 @@ function RegisteredTasksSection({
 }) {
   return (
     <section className="lux-admin-panel lux-operations-section" aria-labelledby="registered-tasks-title">
-      <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">任务注册</span><h2 id="registered-tasks-title">已注册任务</h2><p>这里显示由 Lux 系统或插件注册的计划任务。实时增量扫描由文件系统监听触发，不在此配置。</p></div><span className="lux-operations-source-note">注册项自动持久化</span></div>
+      <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">任务注册</span><h2 id="registered-tasks-title">已注册任务</h2><p>每个注册任务都可以立即执行，也可以配置 Cron 定时计划。实时增量扫描仍由文件系统监听触发。</p></div><span className="lux-operations-source-note">注册项自动持久化</span></div>
       {tasks.length === 0 ? <RegisteredTasksEmpty /> : <div className="lux-registered-task-list">{tasks.map((task) => <RegisteredTaskRow key={task.id ?? `${task.ownerType}:${task.ownerId}:${task.taskType}`} task={task} onSaved={onRefresh} />)}</div>}
       {tasks.length > 0 && total > pageSize ? <Pagination page={page} pageSize={pageSize} total={total} onPageChange={onPageChange} /> : null}
     </section>
@@ -373,7 +385,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
   const [editing, setEditing] = useState(false);
   const [schedule, setSchedule] = useState(task.schedule ?? "");
   const [enabled, setEnabled] = useState(task.isEnabled);
-  const pluginSchedule = isPluginScheduledTask(task);
+  const pluginSchedule = isExternallyScheduledTask(task);
   const update = useMutation({
     mutationFn: () => api.updateAdminScheduledTask({
       ownerType: task.ownerType === "GLOBAL" ? "GLOBAL" : "LIBRARY",
@@ -396,6 +408,8 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraryCoverJobs() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminTaskActivity });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLogs });
       onSaved();
     },
@@ -535,7 +549,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
   const [detailsOpen, setDetailsOpen] = useState(false);
   const progress = job.totalCount && job.totalCount > 0 ? Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100)) : null;
   const active = isActiveJob(job.status);
-  const cancelling = active && Boolean(job.cancelRequested);
+  const cancelling = active && job.kind !== "cover" && Boolean(job.cancelRequested);
   const discovering = active && job.kind === "scan" && job.discoveryCompleted === false;
   const jobContext = job.kind === "strm"
     ? "STRM 媒体信息任务"
@@ -543,8 +557,10 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
       ? "片头片尾检测任务"
       : job.kind === "danmaku"
         ? "弹幕匹配任务"
-        : job.kind === "metadata" ? "元数据任务" : "扫描任务";
-  const retryable = job.status === "FAILED" || job.status === "CANCELLED" || job.status === "COMPLETED_WITH_ISSUES" || job.status === "DEFERRED";
+        : job.kind === "cover"
+          ? "媒体库封面任务"
+          : job.kind === "metadata" ? "元数据任务" : "扫描任务";
+  const retryable = job.kind !== "cover" && (job.status === "FAILED" || job.status === "CANCELLED" || job.status === "COMPLETED_WITH_ISSUES" || job.status === "DEFERRED");
   const error = formatJobError(job.error);
   const libraryLabel = job.libraryId ? libraryNames.get(job.libraryId) ?? job.libraryId : "";
   const pendingCount = job.kind === "metadata" ? job.pendingCount ?? 0 : 0;
@@ -573,7 +589,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
     </div>
     <div className="lux-admin-job-actions">
       {error && job.kind === "metadata" ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}${jobLabel}问题详情`} onClick={() => setDetailsOpen((open) => !open)}>详情<ChevronDown size={14} /></button> : null}
-      {active ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></button> : null}
+      {active && job.kind !== "cover" ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></button> : null}
       {retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}
     </div>
   </article>;
@@ -592,42 +608,24 @@ function taskLabel(taskType: string) {
 }
 
 function isRunnableTask(task: AdminScheduledTask) {
-  return isPluginScheduledTask(task)
+  return isExternallyScheduledTask(task)
     || (task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE", "CHAPTER_DETECTION", "AUTO_LIBRARY_COVER"].includes(task.taskType));
 }
 
 function isSchedulableTask(task: AdminScheduledTask) {
-  return isPluginScheduledTask(task)
-    || (task.ownerType === "LIBRARY" && ["RECONCILIATION_SCAN", "METADATA_PARSE"].includes(task.taskType));
+  return isRunnableTask(task);
 }
 
-function isPluginScheduledTask(task: AdminScheduledTask) {
-  return task.ownerType === "GLOBAL" && task.taskType === "STRM_MEDIA_INFO";
+function isExternallyScheduledTask(task: AdminScheduledTask) {
+  return task.taskType === "STRM_MEDIA_INFO" || task.taskType === "CHAPTER_DETECTION";
 }
 
 async function runRegisteredTask(task: AdminScheduledTask) {
-  if (isPluginScheduledTask(task)) {
-    if (!task.pluginId) return Promise.reject(new Error("该插件任务缺少插件标识"));
-    await api.runAdminPlugin(task.pluginId);
-    return;
-  }
-  if (task.taskType === "RECONCILIATION_SCAN") {
-    await api.startAdminScan(task.ownerId);
-    return;
-  }
-  if (task.taskType === "METADATA_PARSE") {
-    await api.startLibraryMetadataRefresh(task.ownerId, "FILL_MISSING");
-    return;
-  }
-  if (task.taskType === "CHAPTER_DETECTION") {
-    await api.startChapterDetection(task.ownerId);
-    return;
-  }
-  if (task.taskType === "AUTO_LIBRARY_COVER") {
-    await api.runAutoLibraryCover(task.ownerId);
-    return;
-  }
-  return Promise.reject(new Error("该任务暂不支持立即执行"));
+  await api.runAdminScheduledTask({
+    ownerType: task.ownerType === "GLOBAL" ? "GLOBAL" : "LIBRARY",
+    ownerId: task.ownerType === "GLOBAL" ? "global" : task.ownerId,
+    taskType: task.taskType,
+  });
 }
 
 function formatJobType(jobType: string) {

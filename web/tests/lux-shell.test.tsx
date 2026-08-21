@@ -356,19 +356,20 @@ describe("LuxShell user control", () => {
   });
 
   it("shows active scan progress for admins without leaking paths or query strings", async () => {
-    vi.spyOn(api, "adminJobs").mockImplementation(async (status?: string) => ({
-      jobs: status === "RUNNING" ? [{
+    vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
+      activities: [{
         id: "scan-1",
+        kind: "scan",
         libraryId: "library-1",
-        jobType: "RECONCILE_LIBRARY",
+        taskType: "RECONCILE_LIBRARY",
         status: "RUNNING",
         processedCount: 12,
         totalCount: 40,
         currentItem: "Safe.Movie.mkv",
         scanPhase: "INDEXING",
         createdAt: 1,
-      }] : [],
-    }));
+      }],
+    });
     vi.spyOn(api, "adminLibraries").mockResolvedValue({
       libraries: [{
         id: "library-1",
