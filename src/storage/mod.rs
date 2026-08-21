@@ -2856,10 +2856,17 @@ impl Database {
             "SELECT DISTINCT pc.item_id
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                AND pc.person_type = ?
-               AND pc.person_id = ?
+               AND (
+                   pc.person_id = ?
+                   OR pc.lux_person_id = ?
+                   OR pi.person_id = ?
+               )
              ORDER BY pc.item_id"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -2868,6 +2875,8 @@ impl Database {
         }
         let rows = statement
             .bind(person_type)
+            .bind(person_id)
+            .bind(person_id)
             .bind(person_id)
             .fetch_all(&self.pool)
             .await
@@ -2900,8 +2909,11 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let person_group =
-            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
+        let person_group = "COALESCE(
+            NULLIF(pc.lux_person_id, ''),
+            NULLIF(pi.person_id, ''),
+            pc.provider || ':' || pc.person_id
+        )";
         let person_sort_order = person_sort_order(options.sort_by, options.descending);
         let recursive_clause = if options.recursive {
             String::new()
@@ -2913,6 +2925,9 @@ impl Database {
                  SELECT {person_group}
                  FROM person_credits pc
                  JOIN media_items mi ON mi.id = pc.item_id
+                 LEFT JOIN person_identities pi
+                   ON pi.provider = pc.provider
+                  AND pi.provider_id = pc.person_id
                  WHERE mi.library_id IN ({placeholders})
                    AND mi.removed_at IS NULL
                    {recursive_clause}
@@ -2959,6 +2974,9 @@ impl Database {
                     MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                {recursive_clause}
@@ -3004,8 +3022,11 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let person_group =
-            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
+        let person_group = "COALESCE(
+            NULLIF(pc.lux_person_id, ''),
+            NULLIF(pi.person_id, ''),
+            pc.provider || ':' || pc.person_id
+        )";
         let query = format!(
             "SELECT MIN(pc.item_id) AS item_id,
                     MIN(pc.person_id) AS person_id,
@@ -3028,10 +3049,17 @@ impl Database {
                     MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                AND pc.person_type = ?
-               AND (pc.person_id = ? OR pc.lux_person_id = ?)
+               AND (
+                   pc.person_id = ?
+                   OR pc.lux_person_id = ?
+                   OR pi.person_id = ?
+               )
              GROUP BY {person_group}
              ORDER BY CASE WHEN MIN(pc.provider) = '' THEN 1 ELSE 0 END,
                       MIN(pc.provider) ASC,
@@ -3043,6 +3071,7 @@ impl Database {
         }
         let rows = statement
             .bind(person_type)
+            .bind(person_id)
             .bind(person_id)
             .bind(person_id)
             .fetch_all(&self.pool)
@@ -3069,8 +3098,11 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let person_group =
-            "COALESCE(NULLIF(pc.lux_person_id, ''), pc.provider || ':' || pc.person_id)";
+        let person_group = "COALESCE(
+            NULLIF(pc.lux_person_id, ''),
+            NULLIF(pi.person_id, ''),
+            pc.provider || ':' || pc.person_id
+        )";
         let query = format!(
             "SELECT MIN(pc.item_id) AS item_id,
                     MIN(pc.person_id) AS person_id,
@@ -3093,6 +3125,9 @@ impl Database {
                     MIN(pc.taglines_json) AS taglines_json
              FROM person_credits pc
              JOIN media_items mi ON mi.id = pc.item_id
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
                AND pc.person_type = ?

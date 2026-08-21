@@ -3781,18 +3781,16 @@ async fn emby_update_item(
         Err(PeopleError::InvalidComponent(_)) => return StatusCode::BAD_REQUEST.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let fields = emby_detail_fields(query.fields.as_deref());
-    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
-    emby_item_response(
-        &state,
-        principal,
-        &item_id,
-        user.can_download,
-        fields.as_deref(),
-        compatibility,
-    )
-    .await
+    match people.find_person(&library_ids, "Actor", &item_id).await {
+        Ok(Some(person)) => Json(emby_person_json_with_fields(
+            person,
+            &state.server_id,
+            emby_detail_fields(query.fields.as_deref()).as_deref(),
+        ))
+        .into_response(),
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn emby_user_item(

@@ -21,7 +21,7 @@ use luxd::{
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
-        metadata_paths::{canonical_person_directory, library_item_directory, people_directory},
+        metadata_paths::{library_item_directory, lux_person_directory, people_directory},
         people::PeopleService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
@@ -405,13 +405,19 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let people_file =
         library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
     let people: Value = serde_json::from_slice(&tokio::fs::read(people_file).await?)?;
-    assert_eq!(people["schemaVersion"], 2);
+    assert_eq!(people["schemaVersion"], 4);
     assert_eq!(people["actors"][0]["name"], "演员甲");
     assert_eq!(people["actors"][0]["provider"], "tmdb");
     let person_key = people["actors"][0]["personKey"]
         .as_str()
         .ok_or("missing canonical person key")?;
-    let person_dir = canonical_person_directory(&fixture.config.config_dir, person_key)?;
+    let person_dir = lux_person_directory(
+        &fixture.config.config_dir,
+        people["actors"][0]["name"]
+            .as_str()
+            .ok_or("missing actor name")?,
+        person_key,
+    )?;
     assert!(person_dir.join("person.nfo").exists());
 
     let detail = client
@@ -1081,8 +1087,14 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     let person_key = people["actors"][0]["personKey"]
         .as_str()
         .ok_or("background person key missing")?;
-    let person_nfo =
-        canonical_person_directory(&fixture.config.config_dir, person_key)?.join("person.nfo");
+    let person_nfo = lux_person_directory(
+        &fixture.config.config_dir,
+        people["actors"][0]["name"]
+            .as_str()
+            .ok_or("background actor name missing")?,
+        person_key,
+    )?
+    .join("person.nfo");
     assert!(
         tokio::fs::read_to_string(person_nfo)
             .await?

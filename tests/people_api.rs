@@ -3,7 +3,7 @@ use luxd::{
     api::{AppState, app_with_state},
     application::{
         libraries::LibraryService,
-        metadata_paths::{canonical_person_directory, library_item_directory},
+        metadata_paths::{library_item_directory, lux_person_directory},
         people::{ActorCredit, PeopleService, PersonMetadata},
         scanner::LibraryScanner,
         setup::SetupService,
@@ -555,8 +555,8 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
         .and_then(|actors| actors.iter().find(|actor| actor["id"] == "104"))
         .and_then(|actor| actor["personKey"].as_str())
         .ok_or("missing updated person key")?;
-    let person_nfo =
-        canonical_person_directory(&temp_dir.path().join("config"), person_key)?.join("person.nfo");
+    let person_nfo = lux_person_directory(&temp_dir.path().join("config"), "演员丁", person_key)?
+        .join("person.nfo");
     let person_nfo_body = tokio::fs::read_to_string(person_nfo).await?;
     assert!(person_nfo_body.contains("<name>演员丁</name>"));
     assert!(person_nfo_body.contains("<biography>演员丁简介</biography>"));
@@ -696,7 +696,12 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(lux_person_update_body["taglines"], json!(["编辑标语"]));
 
     let edited_person_nfo = tokio::fs::read_to_string(
-        canonical_person_directory(&temp_dir.path().join("config"), person_key)?.join("person.nfo"),
+        lux_person_directory(
+            &temp_dir.path().join("config"),
+            "演员丁（已编辑）",
+            person_key,
+        )?
+        .join("person.nfo"),
     )
     .await?;
     assert!(edited_person_nfo.contains("<name>演员丁（已编辑）</name>"));

@@ -2309,6 +2309,12 @@ impl PeopleService {
         let mut initials = match fs::read_dir(&root).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(path) = self
+                    .find_person_manifest_path_from_index(person_id, display_name)
+                    .await?
+                {
+                    return Ok(path);
+                }
                 return lux_person_directory(&self.config_dir, display_name, person_id)
                     .map_err(PeopleError::from)
                     .map(|path| path.join(PERSON_MANIFEST));
@@ -2358,9 +2364,69 @@ impl PeopleService {
                 }
             }
         }
+        if let Some(path) = self
+            .find_person_manifest_path_from_index(person_id, display_name)
+            .await?
+        {
+            return Ok(path);
+        }
         lux_person_directory(&self.config_dir, display_name, person_id)
             .map_err(PeopleError::from)
             .map(|path| path.join(PERSON_MANIFEST))
+    }
+
+    async fn find_person_manifest_path_from_index(
+        &self,
+        person_id: &str,
+        display_name: &str,
+    ) -> Result<Option<PathBuf>, PeopleError> {
+        let index_root = people_index_directory(&self.config_dir);
+        let mut entries = match fs::read_dir(&index_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: index_root,
+                    source,
+                });
+            }
+        };
+        let direct_name = format!("{person_id}.json");
+        let provider_name_suffix = format!("-{person_id}.json");
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: index_root.clone(),
+                source,
+            })?
+        {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if file_name != direct_name && !file_name.ends_with(&provider_name_suffix) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(bytes) = read_people_file(&path).await? else {
+                continue;
+            };
+            let Ok(index) = serde_json::from_slice::<StoredPersonIndex>(&bytes) else {
+                continue;
+            };
+            let Some(person_key) = index
+                .person_key
+                .as_deref()
+                .filter(|person_key| person_key.starts_with("lux-"))
+            else {
+                continue;
+            };
+            return lux_person_directory(&self.config_dir, display_name, person_key)
+                .map(|path| Some(path.join(PERSON_MANIFEST)))
+                .map_err(PeopleError::from);
+        }
+        Ok(None)
     }
 
     pub async fn rebuild_person_credit_index(&self) -> Result<usize, PeopleError> {
@@ -3197,8 +3263,15 @@ impl PeopleService {
                 "people index storage is unavailable".to_owned(),
             ));
         };
+        let manifest_person_id = database
+            .find_person_credits_for_libraries(library_ids, "Actor", person_id)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?
+            .into_iter()
+            .find_map(|credit| credit.lux_person_id)
+            .unwrap_or_else(|| person_id.to_owned());
         let manifest_path = self
-            .find_person_manifest_path(person_id, &update.name)
+            .find_person_manifest_path(&manifest_person_id, &update.name)
             .await?;
         let (locked_fields, existing_metadata) = match read_people_file(&manifest_path).await? {
             Some(bytes) => {
