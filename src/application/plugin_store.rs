@@ -611,6 +611,16 @@ mod tests {
     }
 
     #[test]
+    fn compares_plugin_versions_without_treating_downgrades_as_updates() {
+        assert!(is_newer_version("1.1.0", "1.0.9"));
+        assert!(is_newer_version("2.0.0", "1.99.99"));
+        assert!(is_newer_version("1.0.0", "1.0.0-rc.1"));
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "1.1.0"));
+        assert!(!is_newer_version("not-semver", "1.0.0"));
+    }
+
+    #[test]
     fn selects_the_package_for_the_running_platform_and_architecture() {
         let (platform, arch) = current_platform_and_arch();
         let entry = PluginStoreEntry {
