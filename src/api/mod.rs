@@ -7398,21 +7398,8 @@ async fn auth_login(
         )
         .into_response();
     }
-    let session = match auth.login(&request.username, &request.password).await {
-        Ok(Some(session)) => {
-            state.login_rate_limiter.record_success(&login_key).await;
-            session
-        }
-        Ok(None) => {
-            state.login_rate_limiter.record_failure(&login_key).await;
-            return api_error(
-                &headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::InvalidCredentials,
-                "用户名或密码错误",
-            )
-            .into_response();
-        }
+    let mut session = match auth.login(&request.username, &request.password).await {
+        Ok(session) => session,
         Err(_) => {
             return api_error(
                 &headers,
@@ -7423,6 +7410,40 @@ async fn auth_login(
             .into_response();
         }
     };
+    if session.is_none()
+        && let Some(migration) = state.emby_migration.clone()
+    {
+        match migration
+            .authenticate_pending_user(&request.username, &request.password)
+            .await
+        {
+            Ok(true) => match auth.login(&request.username, &request.password).await {
+                Ok(reauthenticated) => session = reauthenticated,
+                Err(_) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        lux::ApiErrorCode::DatabaseUnavailable,
+                        "登录暂时不可用",
+                    )
+                    .into_response();
+                }
+            },
+            Ok(false) => {}
+            Err(_) => {}
+        }
+    }
+    let Some(session) = session else {
+        state.login_rate_limiter.record_failure(&login_key).await;
+        return api_error(
+            &headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::InvalidCredentials,
+            "用户名或密码错误",
+        )
+        .into_response();
+    };
+    state.login_rate_limiter.record_success(&login_key).await;
     if state.remote_access.is_remote(
         header_str(&headers, "x-lux-peer-ip"),
         header_str(&headers, "x-forwarded-for"),

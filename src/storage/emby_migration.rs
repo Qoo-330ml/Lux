@@ -166,7 +166,7 @@ impl Database {
             "SELECT lux_user_id, source_base_url, secret_ref, emby_user_id,
                     emby_username, password_pending
              FROM emby_migration_user_bindings
-             WHERE emby_username = ? AND password_pending = 1
+             WHERE LOWER(emby_username) = LOWER(?) AND password_pending = 1
              LIMIT 1",
         )
         .bind(username)
@@ -734,6 +734,41 @@ mod tests {
         assert_eq!(job.matched_count, 4);
         assert_eq!(job.skipped_count, 1);
         assert!(job.cancel_requested);
+
+        database
+            .upsert_emby_migration_source(&StoredEmbyMigrationSource {
+                source_base_url: "https://emby.example.test/".to_owned(),
+                secret_ref: "emby-migration/test.json".to_owned(),
+                source_label: "emby.example.test".to_owned(),
+                history_capability: "ITEM_STATE".to_owned(),
+            })
+            .await?;
+        database
+            .upsert_emby_migration_user_binding(&StoredEmbyMigrationUserBinding {
+                lux_user_id: user_id.clone(),
+                source_base_url: "https://emby.example.test/".to_owned(),
+                secret_ref: Some("emby-migration/test.json".to_owned()),
+                emby_user_id: "emby-user".to_owned(),
+                emby_username: "Alice".to_owned(),
+                password_pending: true,
+            })
+            .await?;
+        let binding = database
+            .find_emby_migration_user_binding_by_username("alice")
+            .await?
+            .expect("binding lookup should be case insensitive");
+        assert_eq!(binding.emby_user_id, "emby-user");
+        assert!(
+            database
+                .mark_emby_migration_password_ready(&user_id)
+                .await?
+        );
+        assert!(
+            database
+                .find_emby_migration_user_binding_by_username("alice")
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 }

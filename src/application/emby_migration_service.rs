@@ -256,6 +256,57 @@ impl EmbyMigrationService {
         Ok(self.plugin.test_connection(source).await?)
     }
 
+    pub async fn authenticate_pending_user(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<bool, EmbyMigrationServiceError> {
+        let Some(binding) = self
+            .database
+            .find_emby_migration_user_binding_by_username(username)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let secret_ref = if let Some(secret_ref) = binding.secret_ref.clone() {
+            secret_ref
+        } else {
+            self.database
+                .find_emby_migration_source(&binding.source_base_url)
+                .await?
+                .ok_or(EmbyMigrationServiceError::InvalidState)?
+                .secret_ref
+        };
+        let path = self.config_dir.join("plugin-secrets").join(secret_ref);
+        let contents = fs::read(path).await?;
+        let source: EmbyMigrationSource = serde_json::from_slice(&contents)
+            .map_err(|_| EmbyMigrationServiceError::InvalidState)?;
+        let authenticated = self
+            .plugin
+            .authenticate_user(&source, username, password)
+            .await?;
+        if !authenticated.authenticated
+            || authenticated.user_id.as_deref() != Some(binding.emby_user_id.as_str())
+        {
+            return Ok(false);
+        }
+        let user_store = UserStore::new(self.database.clone()).map_err(UserStoreError::from)?;
+        user_store
+            .update_user(
+                &binding.lux_user_id,
+                UserUpdate {
+                    password: Some(password),
+                    ..UserUpdate::default()
+                },
+            )
+            .await?
+            .ok_or(EmbyMigrationServiceError::NotFound)?;
+        self.database
+            .mark_emby_migration_password_ready(&binding.lux_user_id)
+            .await?;
+        Ok(true)
+    }
+
     pub fn spawn(self: Arc<Self>, job_id: String) {
         tokio::spawn(async move {
             if let Err(error) = self.run(&job_id).await {
