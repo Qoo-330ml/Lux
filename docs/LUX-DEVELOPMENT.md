@@ -3557,7 +3557,7 @@ stdout 日志并在启动阶段报告降级原因。
 
 #### LUX-159：持久化 `.strm` 原始目标分类
 
-范围：在不破坏现有 `STRM_URL`/`external_url` URL 兼容行为的前提下，为 `.strm` 增加可空的
+范围：在不破坏现有 `STRM_URL`/`external_url` URL 兼容行为的前提下，使用已有的可空
 `strm_target_kind` 持久化字段。扫描器在新增、重扫和文件内容变化时保存 `URL`、`PATH`、
 `OPAQUE` 或 `EMPTY` 分类；旧记录分类为空时由播放表面按原始目标执行同一纯词法回退。
 
@@ -3567,13 +3567,13 @@ URL 型目标继续提供外部 HTTP 直播放行；本地路径型目标生成 
 
 验收：
 
-- [ ] SQLite 和 PostgreSQL 空数据库迁移成功，旧数据库可增加可空 `strm_target_kind` 字段。
-- [ ] 电影、剧集和未解析 `.strm` 扫描均保存首个非空目标及其分类；重扫会更新分类和目标。
+- [x] SQLite 和 PostgreSQL 空数据库迁移成功，旧数据库可增加可空 `strm_target_kind` 字段。
+- [x] 电影、剧集和未解析 `.strm` 扫描均保存首个非空目标及其分类；重扫会更新分类和目标。
 - [x] URL 型 `PlaybackInfo`/视频请求保持现有兼容行为；本地路径通过受保护的视频入口读取实际
       文件，SMB/FTP 仅在解析器成功后播放，其他目标不伪造直链，也不会把 `.strm` 文件当作媒体返回。
 - [x] 后台 STRM 探测继续使用原始目标；仅 HTTP/HTTPS、本地路径、SMB 和 FTP 进入探测，不因分类
       而在扫描或播放请求中发起网络访问。
-- [ ] 通过专项 Rust 测试、格式化、Clippy，并记录 ARM 本机 `uname -m`。
+- [x] 通过专项 Rust 测试、格式化、Clippy，并记录 ARM 本机 `uname -m`；本机为 `arm64`。
 
 验证：`cargo test --locked --test strm --test strm_target`、`cargo fmt --all -- --check`、
 `cargo clippy --locked --all-targets --all-features -- -D warnings`。

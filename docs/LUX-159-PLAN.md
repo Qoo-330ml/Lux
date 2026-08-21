@@ -15,7 +15,7 @@
 
 ## 范围
 
-- SQLite 和 PostgreSQL 新增可空 `media_sources.strm_target_kind` 字段，兼容旧数据迁移。
+- 使用现有 SQLite/PostgreSQL `media_sources.strm_target_kind` 字段及其兼容迁移；本次不新增 schema 值，SMB/FTP 和不支持协议继续保存为 `OPAQUE`。
 - 电影、剧集和未解析文件扫描在新增、重扫和内容变化时同步保存分类。
 - Emby `MediaSource` 与视频端点使用分类结果保护 URL 直播放行。
 - STRM 后台探测继续把原始目标交给受监督插件；只允许 HTTP/HTTPS、本地路径、SMB 和 FTP 进入探测，不在扫描或播放请求中解析目标。
@@ -39,10 +39,9 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 
 - `docs/LUX-DEVELOPMENT.md`
 - `docs/LUX-159-PLAN.md`
-- `migrations/0048_strm_target_kinds.sql`
-- `migrations-postgres/0004_strm_target_kinds.sql`
 - `src/application/scanner.rs`
 - `src/application/strm_target.rs`
 - `src/api/mod.rs`
-- `src/storage/mod.rs`
+- `src/application/downloads.rs`
+- `src/application/strm_probe_policy.rs`
 - `tests/strm.rs`
