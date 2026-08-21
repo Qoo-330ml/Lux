@@ -98,6 +98,58 @@ async fn metadata_job_scope_migration_adds_explicit_scope_and_summary_indexes()
 }
 
 #[tokio::test]
+async fn empty_sqlite_database_creates_people_index_tables_and_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name IN (
+             'person_index_rebuild_jobs',
+             'person_index_item_state',
+             'person_credits'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(tables, 3);
+    let indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name IN (
+             'idx_person_index_rebuild_jobs_status',
+             'idx_person_credits_person_item',
+             'idx_media_items_people_visible'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexes, 3);
+
+    database.close().await;
+
+    let database = Database::connect(&config).await?;
+    sqlx::query("DROP INDEX idx_media_items_people_visible")
+        .execute(database.pool())
+        .await?;
+    database.close().await;
+
+    let database = Database::connect(&config).await?;
+    let restored_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_media_items_people_visible'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restored_indexes, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn sqlite_media_item_search_triggers_follow_rebuilt_table()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

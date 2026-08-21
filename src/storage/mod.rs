@@ -14411,6 +14411,17 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
         source,
     })?;
     if has_legacy_unique == 0 {
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_media_items_people_visible
+             ON media_items(library_id, id)
+             WHERE removed_at IS NULL",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.to_path_buf(),
+            source,
+        })?;
         return Ok(());
     }
 
@@ -14502,6 +14513,9 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
              ON media_items(series_id, removed_at)",
             "CREATE INDEX idx_media_items_library_type_visible
              ON media_items(library_id, item_type, id)
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_people_visible
+             ON media_items(library_id, id)
              WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
@@ -16649,6 +16663,20 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create metadata candidates table");
+        sqlx::query(
+            "CREATE INDEX idx_metadata_reidentify_items_status
+             ON metadata_reidentify_job_items(job_id, status, item_id)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata job item index");
+        sqlx::query(
+            "CREATE INDEX idx_metadata_candidates_item
+             ON metadata_candidates(item_id, status)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create metadata candidate index");
         for (id, created_at) in [("older", 1_i64), ("newer", 2_i64)] {
             sqlx::query(
                 "INSERT INTO metadata_reidentify_jobs (
@@ -16699,6 +16727,57 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, "newer");
         assert_eq!(jobs[0].pending_count, 1);
+
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             WITH selected_jobs AS (
+                 SELECT id
+                 FROM metadata_reidentify_jobs
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1 OFFSET 0
+             ), pending_counts AS (
+                 SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
+                 FROM metadata_reidentify_job_items job_items
+                 JOIN selected_jobs ON selected_jobs.id = job_items.job_id
+                 JOIN metadata_candidates candidates
+                   ON candidates.item_id = job_items.item_id
+                  AND candidates.status = 'PENDING'
+                 GROUP BY job_items.job_id
+             )
+             SELECT selected_jobs.id, pending_counts.pending_count
+             FROM selected_jobs
+             LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("explain metadata summary query");
+        let plan_details = plan
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            plan_details.iter().any(|detail| detail
+                .contains("USING COVERING INDEX idx_metadata_reidentify_items_status")),
+            "metadata summary should seek selected job items by job_id: {plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("USING COVERING INDEX idx_metadata_candidates_item")),
+            "metadata summary should seek candidates by item_id: {plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .all(|detail| !detail.contains("SCAN metadata_reidentify_job_items")),
+            "metadata summary must not scan all job items: {plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .all(|detail| !detail.contains("SCAN metadata_candidates")),
+            "metadata summary must not scan all candidates: {plan_details:?}"
+        );
         database.close().await;
     }
 

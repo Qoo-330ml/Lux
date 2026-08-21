@@ -52,6 +52,9 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 uname -m
 ```
 
+当前记录（2026-08-21）：SQLite 空库迁移、人物索引任务专项测试和 ARM 本机检查已完成；本机
+PostgreSQL daemon 不可用，因此 PostgreSQL 空库迁移保留为未实测，不将其标记为通过。
+
 ## Boundaries
 
 - Do not change the existing person resource layout or DTO contract.

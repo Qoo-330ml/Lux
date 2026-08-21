@@ -4187,7 +4187,8 @@ API：
 
 验收：
 
-- [ ] 从空 SQLite 和 PostgreSQL 数据库执行迁移成功，任务表、条目状态表和必要索引存在。
+- [x] 从空 SQLite 数据库执行迁移成功，任务表、条目状态表和必要索引存在。
+- [ ] 从空 PostgreSQL 数据库执行迁移成功；本机 PostgreSQL daemon 不可用，尚未实测。
 - [ ] keyset 分页在条目增删时不重复、不跳过，且不使用 `OFFSET`。
 - [ ] `RUNNING` 任务重启后重新排队；并发领取只能成功一次。
 - [ ] 运行中和排队任务均可取消；取消后可重新排队，旧 worker 不能覆盖新任务状态。
@@ -4225,10 +4226,11 @@ API：
 
 - [x] watcher 初始化不运行在 Tokio 核心 worker，初始化线程数量有界，现有根路径取消/重concile 行为不变。
 - [x] metadata worker 总量有界，重复启动同一任务被拒绝，重启遗留 `RUNNING` 条目重新进入 `PENDING`。
-- [ ] metadata 任务摘要不逐行扫描明细表，迁移从空 SQLite/PostgreSQL 数据库成功执行。
+- [x] metadata 任务摘要不逐行扫描明细表；SQLite 空库迁移成功。
+- [ ] PostgreSQL 空库迁移成功；本机 PostgreSQL daemon 不可用，尚未实测。
 - [x] metadata 进度事件每个任务最多每秒发布一次，最终状态立即发布，前端不会重复失效同一查询。
 - [x] 管理操作页加载态、错误态和无数据态均有 Web 测试；图片重试不重试永久错误。
-- [ ] Rust/Web 测试、格式化、Clippy 和 ARM 本机 `uname -m` 记录完成。
+- [x] Rust/Web 测试、格式化、Clippy 和 ARM 本机 `uname -m` 记录完成。
 
 验证：参见 `docs/LUX-189-PLAN.md`。
 

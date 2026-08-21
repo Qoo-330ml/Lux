@@ -72,3 +72,7 @@ pnpm --dir web test
 pnpm --dir web build
 uname -m
 ```
+
+补充回归：SQLite `EXPLAIN QUERY PLAN` 确认任务摘要先分页选择任务，再通过任务明细和候选索引
+聚合选中任务；空 SQLite 库迁移已验证。PostgreSQL 空库迁移因本机 daemon 不可用而未实测，不能
+据此宣称 PostgreSQL 兼容性已完成。
