@@ -749,6 +749,285 @@ impl Database {
             })
     }
 
+    pub(crate) async fn sync_person_index_rebuild_jobs(
+        &self,
+        schema_version: i64,
+    ) -> Result<Vec<StoredPersonIndexRebuildJob>, StorageError> {
+        for library_id in self.list_enabled_library_ids().await? {
+            self.query(
+                "INSERT INTO person_index_rebuild_jobs (library_id, schema_version)
+                 VALUES (?, ?)
+                 ON CONFLICT(library_id) DO UPDATE SET
+                    schema_version = excluded.schema_version,
+                    status = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 'QUEUED'
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                            THEN 'QUEUED'
+                        ELSE person_index_rebuild_jobs.status
+                    END,
+                    cursor_id = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN NULL
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                            THEN person_index_rebuild_jobs.cursor_id
+                        ELSE person_index_rebuild_jobs.cursor_id
+                    END,
+                    processed_count = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.processed_count
+                    END,
+                    total_count = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.total_count
+                    END,
+                    cancel_requested = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN 0
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                            THEN 0
+                        ELSE person_index_rebuild_jobs.cancel_requested
+                    END,
+                    run_token = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN NULL
+                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                            THEN NULL
+                        ELSE person_index_rebuild_jobs.run_token
+                    END,
+                    error = CASE
+                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                            THEN NULL
+                        ELSE person_index_rebuild_jobs.error
+                    END,
+                    updated_at = unixepoch()",
+            )
+            .bind(&library_id)
+            .bind(schema_version)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        self.list_person_index_rebuild_jobs(0, 500).await
+    }
+
+    pub(crate) async fn list_person_index_rebuild_jobs(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredPersonIndexRebuildJob>, StorageError> {
+        self.query(
+            "SELECT library_id, status, cursor_id, processed_count, total_count,
+                    cancel_requested
+             FROM person_index_rebuild_jobs
+             ORDER BY library_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(stored_person_index_rebuild_job)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn count_person_index_rebuild_jobs(&self) -> Result<i64, StorageError> {
+        self.query_scalar("SELECT COUNT(*) FROM person_index_rebuild_jobs")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn request_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+        schema_version: i64,
+    ) -> Result<bool, StorageError> {
+        let enabled = self
+            .query_scalar::<i64>("SELECT 1 FROM libraries WHERE id = ? AND is_enabled = 1 LIMIT 1")
+            .bind(library_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if !enabled {
+            return Ok(false);
+        }
+        self.query(
+            "INSERT INTO person_index_rebuild_jobs (
+                library_id, status, cursor_id, processed_count, total_count,
+                cancel_requested, schema_version, run_token, error,
+                created_at, updated_at, started_at, finished_at
+             ) VALUES (?, 'QUEUED', NULL, 0, 0, 0, ?, NULL, NULL,
+                       unixepoch(), unixepoch(), NULL, NULL)
+             ON CONFLICT(library_id) DO UPDATE SET
+                status = 'QUEUED', cursor_id = NULL, processed_count = 0,
+                total_count = 0, cancel_requested = 0, schema_version = excluded.schema_version,
+                run_token = NULL, error = NULL, updated_at = unixepoch(),
+                started_at = NULL, finished_at = NULL",
+        )
+        .bind(library_id)
+        .bind(schema_version)
+        .execute(&self.pool)
+        .await
+        .map(|_| true)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+        run_token: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET status = 'RUNNING', run_token = ?, started_at = unixepoch(),
+                     updated_at = unixepoch()
+                 WHERE library_id = ? AND status = 'QUEUED' AND cancel_requested = 0",
+            )
+            .bind(run_token)
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn request_person_index_rebuild_job_cancel(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET status = CASE WHEN status = 'QUEUED' THEN 'CANCELLED' ELSE status END,
+                     cancel_requested = CASE WHEN status = 'QUEUED' THEN 0 ELSE 1 END,
+                     run_token = CASE WHEN status = 'QUEUED' THEN NULL ELSE run_token END,
+                     finished_at = CASE WHEN status = 'QUEUED' THEN unixepoch() ELSE finished_at END,
+                     updated_at = unixepoch()
+                 WHERE library_id = ? AND status IN ('QUEUED', 'RUNNING')",
+            )
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn person_index_rebuild_job_cancel_requested(
+        &self,
+        library_id: &str,
+        run_token: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT cancel_requested FROM person_index_rebuild_jobs
+             WHERE library_id = ? AND status = 'RUNNING' AND run_token = ?",
+        )
+        .bind(library_id)
+        .bind(run_token)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value: Option<i64>| value == Some(1))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_person_index_rebuild_progress(
+        &self,
+        library_id: &str,
+        run_token: &str,
+        cursor_id: &str,
+        processed_count: i64,
+        total_count: i64,
+    ) -> Result<Option<()>, StorageError> {
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET cursor_id = ?, processed_count = ?, total_count = ?,
+                     updated_at = unixepoch()
+                 WHERE library_id = ? AND status = 'RUNNING' AND run_token = ?",
+            )
+            .bind(cursor_id)
+            .bind(processed_count)
+            .bind(total_count)
+            .bind(library_id)
+            .bind(run_token)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((result.rows_affected() == 1).then_some(()))
+    }
+
+    pub(crate) async fn finish_person_index_rebuild_job(
+        &self,
+        library_id: &str,
+        run_token: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        if !matches!(status, "COMPLETED" | "CANCELLED" | "FAILED") {
+            return Err(StorageError::Conflict(
+                "invalid person index rebuild status".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE person_index_rebuild_jobs
+                 SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                     error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                     run_token = NULL, finished_at = unixepoch(), updated_at = unixepoch()
+                 WHERE library_id = ? AND status = 'RUNNING' AND run_token = ?",
+            )
+            .bind(status)
+            .bind(error)
+            .bind(library_id)
+            .bind(run_token)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn create_notification_destination(
         &self,
         destination: NewNotificationDestination<'_>,
@@ -1315,6 +1594,16 @@ impl Database {
         item_id: &str,
         credits: &[NewPersonCredit],
     ) -> Result<(), StorageError> {
+        self.replace_person_credits_with_fingerprint(item_id, credits, None)
+            .await
+    }
+
+    pub(crate) async fn replace_person_credits_with_fingerprint(
+        &self,
+        item_id: &str,
+        credits: &[NewPersonCredit],
+        source_fingerprint: Option<&str>,
+    ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
             .begin()
@@ -1378,6 +1667,23 @@ impl Database {
                 source,
             })?;
         }
+        self.query(
+            "INSERT INTO person_index_item_state (
+                item_id, source_fingerprint, relation_schema_version, updated_at
+             ) VALUES (?, ?, 2, unixepoch())
+             ON CONFLICT(item_id) DO UPDATE SET
+                source_fingerprint = excluded.source_fingerprint,
+                relation_schema_version = excluded.relation_schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(item_id)
+        .bind(source_fingerprint)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         transaction
             .commit()
             .await
@@ -2890,6 +3196,84 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn list_person_index_item_ids(
+        &self,
+        library_id: &str,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let sql = if after_id.is_some() {
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+               AND id > ?
+             ORDER BY id LIMIT ?"
+        } else {
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+             ORDER BY id LIMIT ?"
+        };
+        let mut query = self.query_scalar::<String>(sql).bind(library_id);
+        if let Some(after_id) = after_id {
+            query = query.bind(after_id);
+        }
+        query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn count_person_index_items(
+        &self,
+        library_id: &str,
+    ) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn person_index_item_state_is_current(
+        &self,
+        item_id: &str,
+        source_fingerprint: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let Some(source_fingerprint) = source_fingerprint else {
+            return Ok(false);
+        };
+        let row = self
+            .query(
+                "SELECT source_fingerprint, relation_schema_version
+                 FROM person_index_item_state WHERE item_id = ?",
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(row.is_some_and(|row| {
+            row.get::<Option<String>, _>("source_fingerprint")
+                .as_deref()
+                == Some(source_fingerprint)
+                && row.get::<i64, _>("relation_schema_version") == 2
+        }))
     }
 
     pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
@@ -8061,6 +8445,31 @@ impl Database {
                     source,
                 })?;
         }
+        let strm_item_ids = source_rows
+            .iter()
+            .filter(|(index, _, _)| files[*index].source_kind == "STRM_URL")
+            .map(|(_, item_id, _)| item_id)
+            .collect::<HashSet<_>>();
+        for item_id in strm_item_ids {
+            self.query(
+                "UPDATE media_items
+                 SET poster_fallback_required = 1
+                 WHERE id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM item_images
+                       WHERE item_id = media_items.id
+                         AND image_type IN ('POSTER', 'THUMB')
+                         AND image_index = 0
+                   )",
+            )
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -9006,7 +9415,7 @@ impl Database {
                  provider_ids_json = ?,
                  identification_status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
-                 thumbnail_fallback_required = ?
+                 poster_fallback_required = ?
              WHERE id = ? AND removed_at IS NULL",
         )
         .bind(update.title)
@@ -9026,7 +9435,7 @@ impl Database {
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
-        .bind(database_flag(update.thumbnail_fallback_required))
+        .bind(database_flag(update.poster_fallback_required))
         .bind(update.item_id)
         .execute(&mut *transaction)
         .await
@@ -10740,6 +11149,7 @@ impl Database {
         &self,
         source: NewMediaSource<'_>,
     ) -> Result<(), StorageError> {
+        let is_strm = source.source_kind == "STRM_URL";
         self.query(
             "INSERT INTO media_sources (
                 id, item_id, source_kind, filesystem_entry_id,
@@ -10764,7 +11174,28 @@ impl Database {
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        if is_strm {
+            self.query(
+                "UPDATE media_items
+                 SET poster_fallback_required = 1
+                 WHERE id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM item_images
+                       WHERE item_id = media_items.id
+                         AND image_type IN ('POSTER', 'THUMB')
+                         AND image_index = 0
+                   )",
+            )
+            .bind(source.item_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn list_media_sources_for_library_page(
@@ -11472,7 +11903,7 @@ impl Database {
         let rows = if let Some(after_source_id) = after_source_id {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
-                        mi.thumbnail_fallback_required,
+                        mi.poster_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -11502,7 +11933,7 @@ impl Database {
         } else {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
-                        mi.thumbnail_fallback_required,
+                        mi.poster_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -11534,8 +11965,7 @@ impl Database {
                 .map(|row| StoredStrmMediaSource {
                     source_id: row.get("source_id"),
                     item_id: row.get("item_id"),
-                    thumbnail_fallback_required: row.get::<i64, _>("thumbnail_fallback_required")
-                        != 0,
+                    poster_fallback_required: row.get::<i64, _>("poster_fallback_required") != 0,
                     has_media_info: row.get::<i64, _>("has_media_info") != 0,
                     external_url: row.get("external_url"),
                     root_path: row.get("root_path"),
@@ -11580,7 +12010,7 @@ impl Database {
         let rows = if let Some(after_source_id) = after_source_id {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
-                        mi.thumbnail_fallback_required,
+                        mi.poster_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -11622,7 +12052,7 @@ impl Database {
         } else {
             self.query(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
-                        mi.thumbnail_fallback_required,
+                        mi.poster_fallback_required,
                         CASE WHEN EXISTS (
                             SELECT 1 FROM media_streams mt
                             WHERE mt.media_source_id = ms.id
@@ -11666,8 +12096,7 @@ impl Database {
                 .map(|row| StoredStrmMediaSource {
                     source_id: row.get("source_id"),
                     item_id: row.get("item_id"),
-                    thumbnail_fallback_required: row.get::<i64, _>("thumbnail_fallback_required")
-                        != 0,
+                    poster_fallback_required: row.get::<i64, _>("poster_fallback_required") != 0,
                     has_media_info: row.get::<i64, _>("has_media_info") != 0,
                     external_url: row.get("external_url"),
                     root_path: row.get("root_path"),
@@ -13145,14 +13574,14 @@ impl Database {
         })
     }
 
-    pub(crate) async fn set_thumbnail_fallback_required(
+    pub(crate) async fn set_poster_fallback_required(
         &self,
         item_id: &str,
         required: bool,
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_items
-             SET thumbnail_fallback_required = ?
+             SET poster_fallback_required = ?
              WHERE id = ?",
         )
         .bind(database_flag(required))
@@ -13372,6 +13801,28 @@ impl Database {
         .bind(image_type)
         .fetch_optional(&self.pool)
         .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn item_image_path_is_shared(
+        &self,
+        local_path: &str,
+        image_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM item_images
+                 WHERE local_path = ? AND id <> ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(local_path)
+        .bind(image_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -13853,7 +14304,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 status TEXT,
                 original_language TEXT,
                 has_available_source INTEGER NOT NULL DEFAULT 0 CHECK (has_available_source IN (0, 1)),
-                thumbnail_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (thumbnail_fallback_required IN (0, 1)),
+                poster_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (poster_fallback_required IN (0, 1)),
                 nfo_metadata_json TEXT,
                 nfo_metadata_fingerprint BLOB
             )",
@@ -13863,7 +14314,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
                 locked_fields_json, identification_status, added_at, removed_at,
                 metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
-                original_language, has_available_source, thumbnail_fallback_required,
+                original_language, has_available_source, poster_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
              )
              SELECT
@@ -13872,7 +14323,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
                 locked_fields_json, identification_status, added_at, removed_at,
                 metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
-                original_language, has_available_source, thumbnail_fallback_required,
+                original_language, has_available_source, poster_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
              FROM media_items",
             "DROP TABLE media_items",
@@ -14669,6 +15120,27 @@ fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredPersonIndexRebuildJob {
+    pub(crate) library_id: String,
+    pub(crate) status: String,
+    pub(crate) cursor_id: Option<String>,
+    pub(crate) processed_count: i64,
+    pub(crate) total_count: i64,
+    pub(crate) cancel_requested: bool,
+}
+
+fn stored_person_index_rebuild_job(row: sqlx::any::AnyRow) -> StoredPersonIndexRebuildJob {
+    StoredPersonIndexRebuildJob {
+        library_id: row.get("library_id"),
+        status: row.get("status"),
+        cursor_id: row.get("cursor_id"),
+        processed_count: row.get("processed_count"),
+        total_count: row.get("total_count"),
+        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredCollectionRefresh {
     pub(crate) collection_item_id: String,
     pub(crate) member_count: usize,
@@ -15377,7 +15849,7 @@ pub(crate) struct StoredThumbnailSource {
 pub(crate) struct StoredStrmMediaSource {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
-    pub(crate) thumbnail_fallback_required: bool,
+    pub(crate) poster_fallback_required: bool,
     pub(crate) has_media_info: bool,
     pub(crate) external_url: Option<String>,
     pub(crate) root_path: String,
@@ -15681,7 +16153,7 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
-    pub(crate) thumbnail_fallback_required: bool,
+    pub(crate) poster_fallback_required: bool,
     pub(crate) keep_pending: bool,
 }
 
@@ -17090,6 +17562,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn person_index_rebuild_tasks_are_token_guarded_and_requeueable() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("People", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+
+        let jobs = database
+            .sync_person_index_rebuild_jobs(1)
+            .await
+            .expect("sync jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "QUEUED");
+        assert!(
+            database
+                .claim_person_index_rebuild_job(&library_id, "run-a")
+                .await
+                .expect("claim first run")
+        );
+        assert!(
+            !database
+                .claim_person_index_rebuild_job(&library_id, "run-b")
+                .await
+                .expect("reject duplicate claim")
+        );
+        assert!(
+            database
+                .request_person_index_rebuild_job_cancel(&library_id)
+                .await
+                .expect("request cancellation")
+        );
+        assert!(
+            database
+                .request_person_index_rebuild_job(&library_id, 1)
+                .await
+                .expect("requeue job")
+        );
+        assert!(
+            !database
+                .finish_person_index_rebuild_job(&library_id, "run-a", "COMPLETED", None)
+                .await
+                .expect("ignore stale completion")
+        );
+        assert!(
+            database
+                .claim_person_index_rebuild_job(&library_id, "run-b")
+                .await
+                .expect("claim requeued run")
+        );
+        assert!(
+            database
+                .update_person_index_rebuild_progress(&library_id, "run-a", "item-a", 1, 2)
+                .await
+                .expect("ignore stale progress")
+                .is_none()
+        );
+        assert!(
+            database
+                .update_person_index_rebuild_progress(&library_id, "run-b", "item-b", 2, 2)
+                .await
+                .expect("update progress")
+                .is_some()
+        );
+        assert!(
+            database
+                .finish_person_index_rebuild_job(&library_id, "run-b", "COMPLETED", None)
+                .await
+                .expect("finish current run")
+        );
+        let jobs = database
+            .list_person_index_rebuild_jobs(0, 20)
+            .await
+            .expect("list jobs");
+        assert_eq!(jobs[0].status, "COMPLETED");
+        assert_eq!(jobs[0].processed_count, 2);
+    }
+
+    #[tokio::test]
+    async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("People", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        for item_id in ["item-a", "item-b", "item-c"] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await
+            .expect("media item");
+        }
+        let first_page = database
+            .list_person_index_item_ids(&library_id, None, 2)
+            .await
+            .expect("first keyset page");
+        assert_eq!(first_page, ["item-a", "item-b"]);
+        let second_page = database
+            .list_person_index_item_ids(&library_id, first_page.last().map(String::as_str), 2)
+            .await
+            .expect("second keyset page");
+        assert_eq!(second_page, ["item-c"]);
+
+        database
+            .replace_person_credits_with_fingerprint("item-a", &[], Some("fingerprint-a"))
+            .await
+            .expect("store fingerprint");
+        assert!(
+            database
+                .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+                .await
+                .expect("same fingerprint")
+        );
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-a", None)
+                .await
+                .expect("missing fingerprint must not be current")
+        );
+        assert!(
+            !database
+                .person_index_item_state_is_current("item-a", Some("fingerprint-b"))
+                .await
+                .expect("changed fingerprint")
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires a local PostgreSQL instance"]
     async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
         let temp_dir = tempfile::tempdir().expect("temporary directory");
@@ -17158,7 +17776,7 @@ mod tests {
             metadata_fingerprint: &[],
             provenance_json: "{}",
             locked_fields_json: "[]",
-            thumbnail_fallback_required: false,
+            poster_fallback_required: false,
             keep_pending,
         };
 
