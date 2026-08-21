@@ -19,4 +19,4 @@ CREATE INDEX idx_metadata_reidentify_items_item_job
     ON metadata_reidentify_job_items(item_id, job_id);
 
 CREATE INDEX idx_metadata_reidentify_jobs_scope_status
-    ON metadata_reidentify_jobs(library_id, job_scope, status, created_at DESC, id DESC);
+    ON metadata_reidentify_jobs(job_scope, status, created_at DESC, id DESC);
