@@ -15,6 +15,7 @@ pub(crate) struct StoredEmbyMigrationJob {
     pub phase: String,
     pub dry_run: bool,
     pub merge_policy: String,
+    pub history_capability: String,
     pub cursor_json: String,
     pub processed_count: i64,
     pub total_count: i64,
@@ -238,7 +239,7 @@ impl Database {
             "SELECT id, plugin_id, created_by_user_id, source_label, source_base_url,
                     secret_ref, status, phase, dry_run, merge_policy, cursor_json,
                     processed_count, total_count, matched_count, skipped_count, failed_count,
-                    cancel_requested, error
+                    cancel_requested, error, history_capability
              FROM emby_migration_jobs WHERE id = ?",
         )
         .bind(id)
@@ -257,7 +258,7 @@ impl Database {
             "SELECT id, plugin_id, created_by_user_id, source_label, source_base_url,
                     secret_ref, status, phase, dry_run, merge_policy, cursor_json,
                     processed_count, total_count, matched_count, skipped_count, failed_count,
-                    cancel_requested, error
+                    cancel_requested, error, history_capability
              FROM emby_migration_jobs
              ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
@@ -288,6 +289,24 @@ impl Database {
         .bind(error)
         .bind(status)
         .bind(status)
+        .bind(id)
+        .execute(self.pool())
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(storage_error)
+    }
+
+    pub(crate) async fn update_emby_migration_job_history_capability(
+        &self,
+        id: &str,
+        history_capability: &str,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE emby_migration_jobs
+             SET history_capability = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(history_capability)
         .bind(id)
         .execute(self.pool())
         .await
@@ -592,6 +611,7 @@ fn stored_migration_job(row: sqlx::any::AnyRow) -> StoredEmbyMigrationJob {
         phase: row.get("phase"),
         dry_run: row.get::<i64, _>("dry_run") != 0,
         merge_policy: row.get("merge_policy"),
+        history_capability: row.get("history_capability"),
         cursor_json: row.get("cursor_json"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),
@@ -718,6 +738,11 @@ mod tests {
         );
         assert!(
             database
+                .update_emby_migration_job_history_capability(&job_id, "EVENT_HISTORY")
+                .await?
+        );
+        assert!(
+            database
                 .update_emby_migration_job_progress(&job_id, r#"{"page":1}"#, 5, 10, 4, 1, 0)
                 .await?
         );
@@ -729,6 +754,7 @@ mod tests {
             .expect("migration job should be stored");
         assert_eq!(job.status, "RUNNING");
         assert_eq!(job.phase, "ITEMS");
+        assert_eq!(job.history_capability, "EVENT_HISTORY");
         assert_eq!(job.processed_count, 5);
         assert_eq!(job.total_count, 10);
         assert_eq!(job.matched_count, 4);

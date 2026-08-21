@@ -45,6 +45,7 @@ pub struct MigrationJobView {
     pub phase: String,
     pub dry_run: bool,
     pub merge_policy: String,
+    pub history_capability: String,
     pub processed_count: i64,
     pub total_count: i64,
     pub matched_count: i64,
@@ -64,6 +65,7 @@ impl From<StoredEmbyMigrationJob> for MigrationJobView {
             phase: job.phase,
             dry_run: job.dry_run,
             merge_policy: job.merge_policy,
+            history_capability: job.history_capability,
             processed_count: job.processed_count,
             total_count: job.total_count,
             matched_count: job.matched_count,
@@ -381,6 +383,12 @@ impl EmbyMigrationService {
                 history_capability: history_capability_name(connection.history_capability)
                     .to_owned(),
             })
+            .await?;
+        self.database
+            .update_emby_migration_job_history_capability(
+                job_id,
+                history_capability_name(connection.history_capability),
+            )
             .await?;
         if self.is_cancelled(job_id).await? {
             return self.cancelled(job_id, "TESTING").await;
