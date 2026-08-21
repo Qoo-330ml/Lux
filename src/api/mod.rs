@@ -351,6 +351,7 @@ impl AppState {
                     config_dir.clone(),
                     network_proxy_url.clone(),
                 )
+                .with_plugins(plugins.clone())
                 .with_resource_metrics(resources.clone()),
             ),
             plugins: Some(plugins.clone()),

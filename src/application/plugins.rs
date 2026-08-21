@@ -20,11 +20,13 @@ use crate::{
             CHAPTER_FINGERPRINT_POINT_DURATION_TICKS, CHAPTER_FINGERPRINT_SAMPLE_RATE,
             CHAPTER_LOOKUP_CAPABILITY, CHAPTER_LOOKUP_METHOD,
             CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, ChapterDetectRpcRequest, ChapterDetectRpcResult,
-            ChapterLookupRpcRequest, ChapterLookupRpcResult, IP_LOCATION_CAPABILITY,
-            IpLocationRpcRequest, IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
-            MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD,
-            NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
-            PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_CATEGORY_SCRAPER, PLUGIN_TYPE_CHAPTER_DETECTOR,
+            ChapterLookupRpcRequest, ChapterLookupRpcResult, DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult,
+            DanmakuMatchStatus, IP_LOCATION_CAPABILITY, IpLocationRpcRequest, IpLocationRpcResult,
+            MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult, MediaProbeRpcStreamType,
+            NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD, NotificationSendRpcResult,
+            PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
+            PLUGIN_CATEGORY_SCRAPER, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU,
             PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
             PluginConfigField, PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
@@ -54,6 +56,7 @@ const THEINTRODB_CHAPTER_SOURCE_ID: &str = "org.lux.theintrodb-chapter-source";
 pub const MEDIA_INFO_LEGACY_PLUGIN_ID: &str = "org.lux.media-info";
 pub const IP_HIOFD_PLUGIN_ID: &str = "org.lux.ip-hiofd";
 pub const IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
+pub const DANMAKU_PLUGIN_ID: &str = "org.lux.danmaku";
 const CONFIG_SOURCE_CUSTOM: &str = "CUSTOM";
 const CONFIG_SOURCE_ENVIRONMENT: &str = "ENVIRONMENT";
 const CONFIG_SOURCE_READ_ACCESS_TOKEN: &str = "READ_ACCESS_TOKEN";
@@ -713,6 +716,91 @@ impl PluginService {
         self.call(scraper_id, method, params).await
     }
 
+    pub async fn match_danmaku(
+        &self,
+        file_name: &str,
+    ) -> Result<DanmakuMatchRpcResult, PluginServiceError> {
+        if file_name.trim().is_empty()
+            || file_name.chars().count() > 1024
+            || file_name.chars().any(char::is_control)
+            || file_name.contains(['/', '\\'])
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(DANMAKU_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(DANMAKU_PLUGIN_ID.to_owned()))?;
+        if !is_danmaku_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        let (installed, enabled) = self.plugin_state(DANMAKU_PLUGIN_ID).await?;
+        if !installed || !enabled {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        let view = self.dynamic_view(plugin, installed, enabled).await?;
+        if !view.available {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        let value = self
+            .supervisor
+            .call_isolated(
+                DANMAKU_PLUGIN_ID,
+                DANMAKU_MATCH_METHOD,
+                serde_json::to_value(DanmakuMatchRpcRequest {
+                    file_name: file_name.to_owned(),
+                })
+                .map_err(|_| PluginServiceError::InvalidResponse)?,
+            )
+            .await
+            .map_err(PluginServiceError::Runtime)?;
+        if serde_json::to_vec(&value)
+            .ok()
+            .is_none_or(|bytes| bytes.len() > 4 * 1024 * 1024)
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        let result: DanmakuMatchRpcResult =
+            serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
+        match result.status {
+            DanmakuMatchStatus::Matched
+                if result.episode_id.is_some() && result.xml_base64.is_some() =>
+            {
+                Ok(result)
+            }
+            DanmakuMatchStatus::NoMatch
+                if result.episode_id.is_none() && result.xml_base64.is_none() =>
+            {
+                Ok(result)
+            }
+            _ => Err(PluginServiceError::InvalidResponse),
+        }
+    }
+
+    pub async fn has_available_danmaku(&self) -> Result<bool, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let Some(plugin) = catalog.get(DANMAKU_PLUGIN_ID) else {
+            return Ok(false);
+        };
+        if !is_danmaku_plugin(plugin) {
+            return Ok(false);
+        }
+        let (installed, enabled) = self.plugin_state(DANMAKU_PLUGIN_ID).await?;
+        if !installed || !enabled {
+            return Ok(false);
+        }
+        Ok(self
+            .dynamic_view(plugin, installed, enabled)
+            .await?
+            .available)
+    }
+
     pub async fn has_available_strm_resolver(&self) -> Result<bool, PluginServiceError> {
         Ok(!self.available_strm_resolver_ids().await?.is_empty())
     }
@@ -895,6 +983,7 @@ impl PluginService {
             values.remove("libraryIds");
         }
         let values = validate_config_values(&fields, &values)?;
+        validate_dynamic_plugin_config(&plugin_id, &values)?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             media_info_schedule(&values)?;
         } else if is_chapter_detector_plugin(plugin) {
@@ -1685,7 +1774,8 @@ impl PluginService {
             config_source != CONFIG_SOURCE_NONE
         } else {
             config_fields.is_empty()
-                || validate_config_values(&config_fields, &config_values).is_ok()
+                || (validate_config_values(&config_fields, &config_values).is_ok()
+                    && validate_dynamic_plugin_config(&plugin.manifest.id, &config_values).is_ok())
         };
         let enabled = installed && enabled && !disabled_by_other_ip_provider;
         let available = enabled && configured;
@@ -1809,6 +1899,22 @@ fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> M
         }
     }
     values
+}
+
+fn validate_dynamic_plugin_config(
+    plugin_id: &str,
+    values: &Map<String, Value>,
+) -> Result<(), PluginServiceError> {
+    if plugin_id != DANMAKU_PLUGIN_ID {
+        return Ok(());
+    }
+    let provider_url = values
+        .get("providerBaseUrl")
+        .and_then(Value::as_str)
+        .ok_or(PluginServiceError::InvalidConfig)?;
+    crate::application::danmaku::validate_provider_base_url(provider_url)
+        .map(|_| ())
+        .map_err(|_| PluginServiceError::InvalidConfig)
 }
 
 fn media_info_schedule(values: &Map<String, Value>) -> Result<String, PluginServiceError> {
@@ -2384,6 +2490,16 @@ fn is_strm_resolver_plugin(plugin: &DiscoveredPlugin) -> bool {
             .capabilities
             .iter()
             .any(|capability| capability == STRM_RESOLVE_CAPABILITY)
+}
+
+fn is_danmaku_plugin(plugin: &DiscoveredPlugin) -> bool {
+    plugin.manifest.plugin_type == PLUGIN_TYPE_DANMAKU
+        && plugin.manifest.category == PLUGIN_CATEGORY_MEDIA
+        && plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == DANMAKU_MATCH_CAPABILITY)
 }
 
 fn is_chapter_detector_plugin(plugin: &DiscoveredPlugin) -> bool {

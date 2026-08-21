@@ -53,3 +53,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "luxd"
 path = "src/main.rs"
+
+[[bin]]
+name = "lux-plugin-danmaku"
+path = "src/bin/lux-plugin-danmaku.rs"

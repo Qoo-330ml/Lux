@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::{events::Event, reader::Reader};
 use reqwest::{Client, StatusCode, Url};
 use serde::Serialize;
@@ -19,6 +20,8 @@ use uuid::Uuid;
 use crate::{
     application::{
         media_matching::{MediaKind, normalize_title, parse_media_name},
+        plugin_protocol::DanmakuMatchStatus,
+        plugins::{PluginService, PluginServiceError},
         settings::{read_danmaku_provider_url_async, read_network_proxy_url_async},
     },
     domain::ids::LibraryId,
@@ -652,6 +655,7 @@ pub struct DanmakuService {
     database: Database,
     config_dir: PathBuf,
     proxy_url: Option<String>,
+    plugins: Option<PluginService>,
     resources: ResourceMetrics,
 }
 
@@ -661,8 +665,14 @@ impl DanmakuService {
             database,
             config_dir,
             proxy_url,
+            plugins: None,
             resources: ResourceMetrics::new(),
         }
+    }
+
+    pub fn with_plugins(mut self, plugins: PluginService) -> Self {
+        self.plugins = Some(plugins);
+        self
     }
 
     pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
@@ -691,11 +701,21 @@ impl DanmakuService {
         {
             return Err(DanmakuServiceError::AlreadyActive);
         }
-        let provider_url = read_danmaku_provider_url_async(&self.config_dir)
-            .await
-            .ok_or(DanmakuServiceError::ProviderNotConfigured)?;
-        validate_provider_base_url(&provider_url)
-            .map_err(DanmakuServiceError::InvalidProviderUrl)?;
+        if let Some(plugins) = &self.plugins {
+            if !plugins
+                .has_available_danmaku()
+                .await
+                .map_err(|_| DanmakuServiceError::ProviderNotConfigured)?
+            {
+                return Err(DanmakuServiceError::ProviderNotConfigured);
+            }
+        } else {
+            let provider_url = read_danmaku_provider_url_async(&self.config_dir)
+                .await
+                .ok_or(DanmakuServiceError::ProviderNotConfigured)?;
+            validate_provider_base_url(&provider_url)
+                .map_err(DanmakuServiceError::InvalidProviderUrl)?;
+        }
         let id = Uuid::now_v7().to_string();
         self.database
             .create_danmaku_match_job(NewDanmakuMatchJob {
@@ -812,27 +832,39 @@ impl DanmakuService {
     }
 
     async fn run_claimed(&self, job: StoredDanmakuMatchJob) -> Result<(), DanmakuServiceError> {
-        let provider_url = match read_danmaku_provider_url_async(&self.config_dir).await {
-            Some(value) => value,
-            None => {
-                self.database
-                    .finish_danmaku_match_job(&job.id, "FAILED", Some("PROVIDER_NOT_CONFIGURED"))
-                    .await?;
-                return Ok(());
+        let provider = if self.plugins.is_none() {
+            let provider_url = match read_danmaku_provider_url_async(&self.config_dir).await {
+                Some(value) => value,
+                None => {
+                    self.database
+                        .finish_danmaku_match_job(
+                            &job.id,
+                            "FAILED",
+                            Some("PROVIDER_NOT_CONFIGURED"),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let proxy_url = match self.proxy_url.as_deref() {
+                Some(value) => Some(value.to_owned()),
+                None => read_network_proxy_url_async(&self.config_dir).await,
+            };
+            match DanmakuProviderClient::new(&provider_url, proxy_url.as_deref()) {
+                Ok(provider) => Some(Arc::new(provider)),
+                Err(error) => {
+                    self.database
+                        .finish_danmaku_match_job(
+                            &job.id,
+                            "FAILED",
+                            Some(provider_error_code(&error)),
+                        )
+                        .await?;
+                    return Ok(());
+                }
             }
-        };
-        let proxy_url = match self.proxy_url.as_deref() {
-            Some(value) => Some(value.to_owned()),
-            None => read_network_proxy_url_async(&self.config_dir).await,
-        };
-        let provider = match DanmakuProviderClient::new(&provider_url, proxy_url.as_deref()) {
-            Ok(provider) => Arc::new(provider),
-            Err(error) => {
-                self.database
-                    .finish_danmaku_match_job(&job.id, "FAILED", Some(provider_error_code(&error)))
-                    .await?;
-                return Ok(());
-            }
+        } else {
+            None
         };
         self.database
             .reset_running_danmaku_match_items(&job.id)
@@ -875,6 +907,7 @@ impl DanmakuService {
                 };
                 let database = self.database.clone();
                 let provider = provider.clone();
+                let plugins = self.plugins.clone();
                 let overwrite = job.overwrite;
                 workers.spawn(async move {
                     if !database.claim_danmaku_match_item(&item.id).await? {
@@ -887,9 +920,19 @@ impl DanmakuService {
                             "media source is no longer available",
                         )));
                     };
-                    Ok(Some(
-                        process_danmaku_source(source, provider, overwrite, item.id).await,
-                    ))
+                    let result = match plugins {
+                        Some(plugins) => {
+                            process_danmaku_source_with_plugin(source, plugins, overwrite, item.id)
+                                .await
+                        }
+                        None => {
+                            let Some(provider) = provider else {
+                                return Ok(None);
+                            };
+                            process_danmaku_source(source, provider, overwrite, item.id).await
+                        }
+                    };
+                    Ok(Some(result))
                 });
             }
             while !workers.is_empty() {
@@ -1227,6 +1270,151 @@ async fn process_danmaku_source(
     }
 }
 
+async fn process_danmaku_source_with_plugin(
+    source: StoredDanmakuSource,
+    plugins: PluginService,
+    overwrite: bool,
+    item_id: String,
+) -> WorkerResult {
+    let (media_path, target_path) = match safe_danmaku_source_paths(&source).await {
+        Ok(paths) => paths,
+        Err(_) => {
+            return WorkerResult::failed(
+                item_id,
+                "INVALID_SOURCE_PATH",
+                "media source path is invalid",
+            );
+        }
+    };
+    let relative_path = match danmaku_sidecar_path(Path::new(&source.relative_path)) {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(_) => {
+            return WorkerResult::failed(
+                item_id,
+                "INVALID_SOURCE_PATH",
+                "media source path is invalid",
+            );
+        }
+    };
+    if let Ok(metadata) = fs::symlink_metadata(&target_path).await {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return WorkerResult::failed(
+                item_id,
+                "INVALID_SIDECAR",
+                "danmaku sidecar is not a regular file",
+            );
+        }
+        match read_danmaku_file(&target_path).await {
+            Ok(bytes) if !overwrite && validate_danmaku_xml(&bytes).is_ok() => {
+                return WorkerResult {
+                    item_id,
+                    status: "SKIPPED",
+                    success: false,
+                    skipped: true,
+                    provider_anime_id: None,
+                    provider_episode_id: None,
+                    error_code: None,
+                    error_message: None,
+                    track: Some(TrackWrite {
+                        id: Uuid::now_v7().to_string(),
+                        media_source_id: source.source_id,
+                        relative_path,
+                        provider: None,
+                        provider_anime_id: None,
+                        provider_episode_id: None,
+                        fingerprint: fingerprint(&bytes),
+                    }),
+                };
+            }
+            Ok(_) if !overwrite => {
+                return WorkerResult::failed(
+                    item_id,
+                    "INVALID_SIDECAR",
+                    "existing danmaku sidecar is invalid",
+                );
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let Some(file_name) = media_path.file_name().and_then(|name| name.to_str()) else {
+        return WorkerResult::failed(item_id, "INVALID_SOURCE_PATH", "media filename is invalid");
+    };
+    let matched = match plugins.match_danmaku(file_name).await {
+        Ok(value) => value,
+        Err(error) => {
+            return WorkerResult::failed(
+                item_id,
+                danmaku_plugin_error_code(&error),
+                "danmaku plugin request failed",
+            );
+        }
+    };
+    if matched.status == DanmakuMatchStatus::NoMatch {
+        return WorkerResult::failed(item_id, "NO_MATCH", "danmaku plugin returned no match");
+    }
+    let Some(episode_id) = matched.episode_id.clone() else {
+        return WorkerResult::failed(
+            item_id,
+            "PLUGIN_INVALID_RESPONSE",
+            "danmaku plugin response has no episode",
+        );
+    };
+    let Some(xml_base64) = matched.xml_base64.as_deref() else {
+        return WorkerResult::failed(
+            item_id,
+            "PLUGIN_INVALID_RESPONSE",
+            "danmaku plugin response has no XML",
+        );
+    };
+    let xml = match BASE64.decode(xml_base64) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return WorkerResult::failed(
+                item_id,
+                "PLUGIN_INVALID_RESPONSE",
+                "danmaku plugin XML is not valid base64",
+            );
+        }
+    };
+    if validate_danmaku_xml(&xml).is_err() {
+        return WorkerResult::failed(
+            item_id,
+            "PLUGIN_INVALID_RESPONSE",
+            "danmaku plugin XML is invalid",
+        );
+    }
+    if atomic_write_danmaku_xml(&target_path, &xml, overwrite)
+        .await
+        .is_err()
+    {
+        return WorkerResult::failed(
+            item_id,
+            "WRITE_FAILED",
+            "danmaku sidecar could not be written",
+        );
+    }
+    let fingerprint = fingerprint(&xml);
+    WorkerResult {
+        item_id,
+        status: "WRITTEN",
+        success: true,
+        skipped: false,
+        provider_anime_id: matched.anime_id.clone(),
+        provider_episode_id: Some(episode_id.clone()),
+        error_code: None,
+        error_message: None,
+        track: Some(TrackWrite {
+            id: Uuid::now_v7().to_string(),
+            media_source_id: source.source_id,
+            relative_path,
+            provider: matched.provider,
+            provider_anime_id: matched.anime_id,
+            provider_episode_id: Some(episode_id),
+            fingerprint,
+        }),
+    }
+}
+
 async fn safe_danmaku_source_paths(source: &StoredDanmakuSource) -> Result<(PathBuf, PathBuf), ()> {
     let relative = Path::new(&source.relative_path);
     if relative.is_absolute()
@@ -1291,6 +1479,21 @@ fn provider_error_code(error: &DanmakuProviderError) -> &'static str {
         DanmakuProviderError::ResponseTooLarge => "PROVIDER_RESPONSE_TOO_LARGE",
         DanmakuProviderError::InvalidResponse => "PROVIDER_INVALID_RESPONSE",
         DanmakuProviderError::InvalidXml(_) => "PROVIDER_INVALID_XML",
+    }
+}
+
+fn danmaku_plugin_error_code(error: &PluginServiceError) -> &'static str {
+    match error {
+        PluginServiceError::UnknownPlugin(_) | PluginServiceError::Unavailable(_) => {
+            "PLUGIN_UNAVAILABLE"
+        }
+        PluginServiceError::InvalidConfig => "PLUGIN_NOT_CONFIGURED",
+        PluginServiceError::InvalidResponse => "PLUGIN_INVALID_RESPONSE",
+        PluginServiceError::Runtime(_) => "PLUGIN_RUNTIME_ERROR",
+        PluginServiceError::ConfigIo(_) => "PLUGIN_CONFIG_ERROR",
+        PluginServiceError::NoUpdate
+        | PluginServiceError::Store(_)
+        | PluginServiceError::Storage(_) => "PLUGIN_ERROR",
     }
 }
 
