@@ -1,9 +1,11 @@
 use luxd::application::plugin_protocol::{
     CHAPTER_DETECT_CAPABILITY, CHAPTER_LOOKUP_CAPABILITY, ChapterDetectMarkerType,
     ChapterDetectRpcRequest, ChapterDetectRpcResult, ChapterFingerprintRpcEpisode,
-    ChapterLookupRpcEpisode, ChapterLookupRpcRequest, IP_LOCATION_CAPABILITY, IpLocationRpcResult,
-    MediaProbeRpcResult, PLUGIN_API_VERSION, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
-    PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_IP_LOCATION,
+    ChapterLookupRpcEpisode, ChapterLookupRpcRequest, DANMAKU_MATCH_CAPABILITY,
+    DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult, DanmakuMatchStatus,
+    IP_LOCATION_CAPABILITY, IpLocationRpcResult, MediaProbeRpcResult, PLUGIN_API_VERSION,
+    PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK, PLUGIN_FORMAT_VERSION,
+    PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_IP_LOCATION,
     PLUGIN_TYPE_STRM_RESOLVER, PluginManifest, PluginRequest, STRM_RESOLVE_CAPABILITY,
     StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
 };
@@ -118,6 +120,49 @@ fn accepts_a_media_probe_plugin_manifest() {
     );
     assert_eq!(manifest.config_fields[1].input_type, "number");
     assert_eq!(manifest.config_fields[1].default_value, Some(json!(2)));
+}
+
+#[test]
+fn accepts_a_danmaku_plugin_manifest_and_path_free_match_contract() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.danmaku",
+        "name": "Danmaku provider",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_DANMAKU,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "capabilities": [DANMAKU_MATCH_CAPABILITY],
+        "permissions": {"network": ["danmaku.example"]},
+        "files": []
+    }))
+    .expect("danmaku manifest should validate");
+
+    let request = DanmakuMatchRpcRequest {
+        file_name: "Show.S01E02.1080p.mkv".to_owned(),
+    };
+    let request_value = serde_json::to_value(request).expect("danmaku request should serialize");
+    assert_eq!(request_value, json!({"fileName": "Show.S01E02.1080p.mkv"}));
+    assert!(request_value.get("path").is_none());
+    assert!(request_value.get("url").is_none());
+    let mut request_with_path = request_value;
+    request_with_path["path"] = json!("/media/Show.S01E02.1080p.mkv");
+    assert!(serde_json::from_value::<DanmakuMatchRpcRequest>(request_with_path).is_err());
+
+    let result: DanmakuMatchRpcResult = serde_json::from_value(json!({
+        "status": "MATCHED",
+        "provider": "dandanplay",
+        "animeId": "anime-1",
+        "episodeId": "episode-2",
+        "xmlBase64": "PD94bWwgdmVyc2lvbj0iMS4wIj8+"
+    }))
+    .expect("danmaku result should deserialize");
+    assert_eq!(manifest.plugin_type, PLUGIN_TYPE_DANMAKU);
+    assert_eq!(manifest.capabilities, vec![DANMAKU_MATCH_CAPABILITY]);
+    assert_eq!(DANMAKU_MATCH_METHOD, "danmaku.match");
+    assert_eq!(result.status, DanmakuMatchStatus::Matched);
+    assert_eq!(result.episode_id.as_deref(), Some("episode-2"));
 }
 
 #[test]

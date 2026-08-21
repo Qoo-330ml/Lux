@@ -1856,7 +1856,7 @@ services:
 | LUX-144 | src/application/settings.rs、src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、src/bin/lux-plugin-tmdb.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-145 | src/application/thumbnails.rs、src/application/scanner.rs、src/storage/、src/api/mod.rs、tests/thumbnails.rs、docs/ |
 | LUX-146 | src/application/plugin_protocol.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/application/strm_probe.rs、src/application/strm_probe_policy.rs、src/application/probe.rs、src/storage/、src/api/mod.rs、src/bin/lux-plugin-strm-media-info.rs、src/bin/lux-plugin-pack.rs、migrations/、scripts/、tests/、docs/ |
-| LUX-150 | src/application/danmaku.rs、src/storage/、src/api/mod.rs、migrations/、tests/、docs/ |
+| LUX-150 | src/application/danmaku.rs、src/application/plugin_protocol.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/storage/、src/api/mod.rs、src/bin/lux-plugin-danmaku.rs、plugins/org.lux.danmaku/、migrations/、scripts/、tests/、docs/ |
 | LUX-151 | src/application/ip_location.rs、src/api/mod.rs、tests/、web/src/features/admin/、web/src/lib/api/、docs/ |
 | LUX-153 | src/application/admin_events.rs、src/api/mod.rs、tests/admin_events.rs、web/src/features/admin/、web/tests/、docs/ |
 | LUX-154 | src/application/scanner.rs、src/storage/mod.rs、migrations/、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
@@ -3253,11 +3253,26 @@ STRM 来源的后台探测任务；这条事件驱动路径不替代全局计划
 
 ---
 
-#### LUX-150：Lux 弹幕兼容插件与后台匹配
+#### LUX-150：独立弹幕插件与后台匹配
 
-范围：将 Emby 弹幕插件的能力重写为 Lux 内置弹幕服务。管理员配置 Dandanplay 兼容 API 基地址，或配置 `huangxd-/danmu_api` 的 API 基地址；Lux 在后台匹配已索引的本地视频，将有效 Bilibili 标准 XML 原子写回视频同目录、同 basename 的 `.xml` 旁车，并通过独立 Emby 兼容弹幕端点提供给支持弹幕接口的第三方客户端。
+范围：将 Emby 弹幕插件的能力重写为 Lux Plugin SDK v1 的独立进程插件，固定插件 ID 为
+`org.lux.danmaku`。插件负责弹幕配置、上游网络访问、`danmu_api` 的匹配/回退、搜索和评论
+获取、Bilibili 标准 XML 的大小与格式校验，以及单项匹配结果和错误分类。主进程只负责插件
+生命周期、已索引本地视频的安全分页、通用任务日志/进度/取消/重试/重启恢复、媒体库 ACL、
+受限的旁车写入能力和 Emby 兼容弹幕端点。
 
-`danmu_api` 的 `POST /api/v2/match` 是可选的优先路径；不支持该接口时回退到 Dandanplay 兼容搜索、详情和评论接口。基地址可以包含部署 token 路径，必须保留路径但在配置响应、日志、审计和错误中脱敏。XML 旁车只登记相对路径，SQLite 保存索引和任务状态，不保存整份 XML。
+插件声明 `type: "danmaku"`、`category: "MEDIA"`、`danmaku.match` 能力和统一 RPC 方法
+`danmaku.match`。主进程向插件发送已经过路径和媒体库 ACL 校验的本地视频描述及任务选项，
+插件返回结构化匹配状态和受大小限制的 XML；插件不得接收或执行用户直接提供的上游 URL，
+不得访问主进程配置目录以外的凭据。管理员配置 Dandanplay 兼容 API 基地址，或配置
+`huangxd-/danmu_api` 的 API 基地址，配置由插件 manifest 声明并通过插件配置界面保存。
+基地址可以包含部署 token 路径，必须保留路径但在配置响应、日志、审计和错误中脱敏。
+XML 旁车只登记相对路径，SQLite 保存索引和任务状态，不保存整份 XML。
+
+`danmu_api` 的 `POST /api/v2/match` 是插件内部的可选优先路径；不支持该接口时由插件回退到
+Dandanplay 兼容搜索、详情和评论接口。插件负责并发请求、超时、响应大小限制、XML 校验和
+错误分类；主进程不得保留一份直接请求弹幕上游的实现。主进程对插件返回的 XML 仍执行最终
+大小和路径安全校验，并通过临时文件加原子重命名写入旁车。
 
 管理员通过 `POST /api/v1/admin/libraries/{libraryId}/danmaku/match` 创建持久化任务，支持分页列表、详情、取消、失败重试、服务重启恢复、并发上限和默认不覆盖已有 XML。任务只领取已索引的本地视频源；`.strm`、用户请求中的整库扫描、弹幕实时发送和上游任意 URL 均不进入范围。
 
@@ -3266,8 +3281,10 @@ Emby 兼容层提供 `/api/danmu/{itemId}`、`/api/danmu/{itemId}/raw`，并保�
 验收：
 
 - [ ] 从空数据库执行迁移成功；扫描后的同名有效 XML 可以登记、读取，删除或损坏旁车会标记索引状态而不删除媒体。
-- [ ] 管理员可以保存、清除和查看脱敏的弹幕地址；HTTP/HTTPS、token 路径、控制字符、凭据和 fragment 校验符合安全策略。
-- [ ] `/api/v2/match` 成功响应可以得到 episode 并取得 XML；不支持 `match` 时搜索/详情回退可工作；无匹配、非 XML、超大响应、超时不会写旁车。
+- [ ] Plugin SDK 能校验弹幕插件 manifest、`MEDIA` 分类和 `danmaku.match` 能力；插件提供 `plugin.hello`、`plugin.health`、`danmaku.match` 和 `plugin.shutdown`。
+- [ ] 管理员可以通过插件配置界面保存、清除和查看脱敏的弹幕地址；HTTP/HTTPS、token 路径、控制字符、凭据和 fragment 校验符合安全策略，主进程不再保存弹幕专用配置模型。
+- [ ] 插件的 `/api/v2/match` 成功路径可以得到 episode 并取得 XML；不支持 `match` 时插件内的搜索/详情回退可工作；无匹配、非 XML、超大响应、超时不会写旁车。
+- [ ] 主进程不会直接访问弹幕上游；插件进程故障、超时或单项错误只标记当前任务项，不使主进程退出或终止整批任务。
 - [ ] 成功结果写入视频同名 `.xml`；默认不覆盖已有 XML；中断或权限失败不会留下半个目标文件。
 - [ ] 后台任务支持分页、进度、取消、失败重试和重启恢复；取消不再领取新项，单项失败不终止任务。
 - [ ] Emby 弹幕读取端点返回正确 Content-Type/XML，执行 ACL，并覆盖至少一个真实支持弹幕接口的客户端请求序列。
@@ -3280,12 +3297,12 @@ Emby 兼容层提供 `/api/danmu/{itemId}`、`/api/danmu/{itemId}/raw`，并保�
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 
-依赖：LUX-033、LUX-041、LUX-064、LUX-072、LUX-080、LUX-090。
+依赖：LUX-033、LUX-041、LUX-064、LUX-072、LUX-080、LUX-090、LUX-142、LUX-146。
 
 明确不做：
 
 - 不把弹幕 XML 当作普通字幕，不新增 Emby 标准字幕类型或强制客户端显示。
-- 不执行用户输入的上游 URL，不做代理播放，不保存完整 XML 到 SQLite，不在 Web 播放器中渲染弹幕。
+- 插件不执行用户输入的上游 URL，不授予插件任意文件系统权限；不做代理播放，不保存完整 XML 到 SQLite，不在 Web 播放器中渲染弹幕。
 - 不生成 ASS、不做颜色/位置转换、不实现弹幕发送、实时推送或计划任务。
 
 #### LUX-151：播放会话 IP 归属地
