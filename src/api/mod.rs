@@ -1485,6 +1485,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/System/Ping", get(emby_ping).post(emby_ping))
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
+        .route("/Users/authenticatebyname", post(emby_authenticate))
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))
@@ -1809,8 +1810,12 @@ struct EmbyAuthenticateRequest {
 async fn emby_authenticate(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(request): Json<EmbyAuthenticateRequest>,
+    body: Bytes,
 ) -> Response {
+    let request = match parse_emby_authenticate_request(&headers, &body) {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
     let Some(auth) = state.emby_auth.clone() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -1863,6 +1868,38 @@ async fn emby_authenticate(
             StatusCode::UNAUTHORIZED.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn parse_emby_authenticate_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<EmbyAuthenticateRequest, StatusCode> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default();
+
+    match content_type {
+        "application/json" => serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST),
+        "application/x-www-form-urlencoded" => {
+            let mut username = None;
+            let mut password = None;
+            for (key, value) in url::form_urlencoded::parse(body) {
+                match key.as_ref() {
+                    "Username" => username = Some(value.into_owned()),
+                    "Pw" => password = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+            Ok(EmbyAuthenticateRequest {
+                username: username.ok_or(StatusCode::BAD_REQUEST)?,
+                password: password.ok_or(StatusCode::BAD_REQUEST)?,
+            })
+        }
+        _ => Err(StatusCode::UNSUPPORTED_MEDIA_TYPE),
     }
 }
 
