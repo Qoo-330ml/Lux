@@ -19,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::fs;
@@ -1935,7 +1935,12 @@ struct EmbyPersonsQuery {
     start_index: Option<i64>,
     #[serde(rename = "Limit", alias = "limit", default)]
     limit: Option<i64>,
-    #[serde(rename = "Recursive", alias = "recursive", default)]
+    #[serde(
+        rename = "Recursive",
+        alias = "recursive",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     recursive: Option<bool>,
     #[serde(rename = "SortBy", alias = "sortBy", default)]
     sort_by: Option<String>,
@@ -2169,9 +2174,17 @@ struct EmbyItemsQuery {
     start_index: Option<i64>,
     #[serde(rename = "Limit", default)]
     limit: Option<i64>,
-    #[serde(rename = "IsPlayed", default)]
+    #[serde(
+        rename = "IsPlayed",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     is_played: Option<bool>,
-    #[serde(rename = "IsFavorite", default)]
+    #[serde(
+        rename = "IsFavorite",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     is_favorite: Option<bool>,
     #[serde(rename = "Years", default)]
     years: Option<String>,
@@ -2181,11 +2194,23 @@ struct EmbyItemsQuery {
     sort_order: Option<String>,
     #[serde(rename = "Fields", default)]
     fields: Option<String>,
-    #[serde(rename = "GroupItems", default)]
+    #[serde(
+        rename = "GroupItems",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     group_items: Option<bool>,
-    #[serde(rename = "EnableTotalRecordCount", default)]
+    #[serde(
+        rename = "EnableTotalRecordCount",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     enable_total_record_count: Option<bool>,
-    #[serde(rename = "Recursive", default)]
+    #[serde(
+        rename = "Recursive",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     recursive: Option<bool>,
 }
 
@@ -2204,8 +2229,24 @@ struct EmbyItemCountsQuery {
     api_key: Option<String>,
     #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
     user_id: Option<String>,
-    #[serde(rename = "IsFavorite", alias = "isFavorite", default)]
+    #[serde(
+        rename = "IsFavorite",
+        alias = "isFavorite",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     is_favorite: Option<bool>,
+}
+
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 fn emby_fields_include(fields: Option<&str>, field: &str) -> bool {

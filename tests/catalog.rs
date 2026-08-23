@@ -447,6 +447,39 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         "mkv"
     );
 
+    let empty_optional_favorite = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={}&IncludeItemTypes=Movie&Recursive=true&Limit=50&StartIndex=0&IsFavorite=",
+            admin.id, library.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(empty_optional_favorite.status(), reqwest::StatusCode::OK);
+    let empty_optional_favorite_body: Value = empty_optional_favorite.json().await?;
+    assert_eq!(empty_optional_favorite_body["TotalRecordCount"], 2);
+
+    let latest_with_empty_optional_favorite = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items/Latest?ParentId={}&Limit=16&IsFavorite=",
+            admin.id, library.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        latest_with_empty_optional_favorite.status(),
+        reqwest::StatusCode::OK
+    );
+    let latest_with_empty_optional_favorite_body: Value =
+        latest_with_empty_optional_favorite.json().await?;
+    assert_eq!(
+        latest_with_empty_optional_favorite_body
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
     let emby_people_page = client
         .get(format!(
             "{base_url}/Users/{}/Items?ParentId={}&Limit=1&Fields=People",
