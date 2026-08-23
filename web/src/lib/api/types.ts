@@ -369,12 +369,6 @@ export type AdminUser = LuxUser & {
   isAdmin: boolean;
 };
 
-export type EmbyMigrationSource = {
-  baseUrl: string;
-  apiKey: string;
-  allowPrivateNetwork: boolean;
-};
-
 export type AdminEmbyMigrationConnection = {
   serverName?: string | null;
   productName?: string | null;

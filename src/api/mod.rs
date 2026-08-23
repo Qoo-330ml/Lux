@@ -58,7 +58,6 @@ use crate::{
         },
         collections::{CollectionError, CollectionService},
         directory_browser::{DirectoryBrowserError, list_directories},
-        emby_migration::{EmbyMigrationPluginClient, EmbyMigrationSource, MigrationInputError},
         emby_migration_service::{
             CreateMigrationRequest, EmbyMigrationService, EmbyMigrationServiceError,
         },
@@ -17656,39 +17655,16 @@ async fn admin_plugin_store(headers: HeaderMap, State(state): State<AppState>) -
     .into_response()
 }
 
-async fn admin_test_emby_migration(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-    Json(source): Json<EmbyMigrationSource>,
-) -> Response {
+async fn admin_test_emby_migration(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    if let Err(error) = source.validate() {
-        let message = match error {
-            MigrationInputError::PrivateNetworkNotAllowed => {
-                "Emby 地址属于局域网或保留地址，请明确允许局域网连接"
-            }
-            MigrationInputError::InvalidSecret => "Emby API key 无效",
-            MigrationInputError::InvalidSourceUrl | MigrationInputError::InvalidIdentifier => {
-                "Emby 地址无效"
-            }
-        };
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            message,
-        )
-        .into_response();
-    }
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(service) = state.emby_migration.clone() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let client = EmbyMigrationPluginClient::new(plugins.clone());
-    match client.test_connection(&source).await {
+    match service.test_connection().await {
         Ok(info) => Json(info).into_response(),
-        Err(error) => plugin_error(&headers, error),
+        Err(error) => emby_migration_error(&headers, error),
     }
 }
 
@@ -18261,7 +18237,8 @@ async fn admin_update_plugin_config(
         )
         .into_response();
     };
-    let api_key = request.api_key.as_deref().map(str::trim);
+    let api_key_value = request.api_key.clone();
+    let api_key = api_key_value.as_deref().map(str::trim);
     let result = if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID
         || plugin_id == crate::application::plugins::TMDB_DYNAMIC_PLUGIN_ID
     {
@@ -18280,9 +18257,16 @@ async fn admin_update_plugin_config(
             )
             .await
     } else {
-        plugins
-            .update_dynamic_config(&plugin_id, request.values)
-            .await
+        let mut values = request.values;
+        if plugin_id == crate::application::plugins::EMBY_MIGRATION_PLUGIN_ID {
+            if let Some(api_key) = api_key_value.as_ref() {
+                values.insert(
+                    "apiKey".to_owned(),
+                    Value::String(api_key.trim().to_owned()),
+                );
+            }
+        }
+        plugins.update_dynamic_config(&plugin_id, values).await
     };
     match result {
         Ok(plugin) => {
@@ -18885,6 +18869,15 @@ async fn admin_delete_library(
     };
     match libraries.delete_library(library_id).await {
         Ok(()) => {
+            if let Some(plugins) = state.plugins.as_ref()
+                && let Err(error) = plugins.prune_media_info_library_ids().await
+            {
+                tracing::error!(
+                    library_id = %library_id,
+                    %error,
+                    "library deleted but STRM media-info plugin configuration could not be pruned"
+                );
+            }
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }

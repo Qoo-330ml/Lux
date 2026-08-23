@@ -20,7 +20,7 @@ describe("AdminEmbyMigrationPage", () => {
     vi.restoreAllMocks();
   });
 
-  it("tests the source, starts a dry run, and shows the migration capability warning", async () => {
+  it("uses the Emby plugin settings, starts a dry run, and shows the migration capability warning", async () => {
     const testSource = vi.spyOn(api, "testAdminEmbyMigration").mockResolvedValue({
       serverName: "家庭 Emby",
       productName: "Emby Server",
@@ -65,28 +65,21 @@ describe("AdminEmbyMigrationPage", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("Emby 迁移"));
     });
-    const baseUrl = container.querySelector<HTMLInputElement>("#emby-migration-base-url");
-    const apiKey = container.querySelector<HTMLInputElement>("#emby-migration-api-key");
-    expect(baseUrl).not.toBeNull();
-    expect(apiKey?.type).toBe("password");
+    expect(container.querySelector("#emby-migration-base-url")).toBeNull();
+    expect(container.querySelector("#emby-migration-api-key")).toBeNull();
+    expect(container.querySelector<HTMLAnchorElement>('a[href="/admin/plugins"]')).not.toBeNull();
     act(() => {
-      if (baseUrl && apiKey) {
-        baseUrl.value = "http://emby.local:8096";
-        baseUrl.dispatchEvent(new Event("input", { bubbles: true }));
-        apiKey.value = "test-key";
-        apiKey.dispatchEvent(new Event("input", { bubbles: true }));
-      }
       container.querySelector<HTMLButtonElement>('button[aria-label="测试 Emby 连接"]')?.click();
     });
     await act(async () => {
-      await vi.waitFor(() => expect(testSource).toHaveBeenCalled());
+      await vi.waitFor(() => expect(testSource).toHaveBeenCalledWith());
     });
     expect(container.textContent).toContain("家庭 Emby");
     expect(container.textContent).toContain("完整历史播放时间线不可用");
 
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="开始 Emby 迁移"]')?.click());
     await act(async () => {
-      await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true })));
+      await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith({ dryRun: true, mergePolicy: "MERGE" }));
     });
     expect(container.textContent).toContain("预览任务已创建");
   });

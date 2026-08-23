@@ -55,7 +55,6 @@ import type {
   SetupDatabaseStatus,
   MetadataRefreshMode,
   UserPlaybackSettings,
-  EmbyMigrationSource,
 } from "./types";
 
 const csrfCookie = "lux_csrf";
@@ -462,15 +461,14 @@ export class LuxApiClient {
     return this.request<AdminDashboard>("/api/v1/admin/dashboard");
   }
 
-  testAdminEmbyMigration(source: EmbyMigrationSource) {
+  testAdminEmbyMigration() {
     return this.request<AdminEmbyMigrationConnection>("/api/v1/admin/emby-migration/test", {
       method: "POST",
-      body: JSON.stringify(source),
+      body: JSON.stringify({}),
     });
   }
 
   createAdminEmbyMigration(input: {
-    source: EmbyMigrationSource;
     dryRun: boolean;
     mergePolicy: "MERGE" | "OVERWRITE" | "SKIP";
   }) {

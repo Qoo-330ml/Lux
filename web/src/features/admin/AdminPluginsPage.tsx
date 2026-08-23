@@ -148,11 +148,16 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const [thumbnailPositionPercent, setThumbnailPositionPercent] = useState(30);
   const [writeSidecars, setWriteSidecars] = useState(true);
   const [schedule, setSchedule] = useState("0 3 * * *");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
   const closeRef = useRef<HTMLButtonElement>(null);
   const uninstallCancelRef = useRef<HTMLButtonElement>(null);
   const isMediaInfo = plugin.id === "org.lux.strm-media-info";
+  const isMigration = plugin.id === "org.lux.emby-migration";
   const isChapterSource = plugin.capabilities?.some((capability) => capability === "chapters.detect" || capability === "chapters.lookup") === true;
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
+  const baseUrlField = plugin.configFields.find((field) => field.key === "baseUrl");
+  const privateNetworkField = plugin.configFields.find((field) => field.key === "allowPrivateNetwork");
   const preferredLanguageField = plugin.configFields.find((field) => field.key === "preferredLanguage");
   const fallbackEnabledField = plugin.configFields.find((field) => field.key === "languageFallbackEnabled");
   const titleAliasReplacementField = plugin.configFields.find((field) => field.key === "titleAliasReplacementEnabled");
@@ -175,7 +180,13 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const toggleBlockedByProvider = plugin.unavailableReason === "OTHER_IP_LOCATION_PLUGIN_INSTALLED";
   const closeDialog = useCallback(() => setOpen(false), []);
   const save = useMutation({
-    mutationFn: () => isMediaInfo
+    mutationFn: () => isMigration
+      ? api.updateAdminPluginConfig(plugin.id, {
+          baseUrl: baseUrl.trim(),
+          ...(apiKeyDirty ? { apiKey } : {}),
+          allowPrivateNetwork,
+        })
+      : isMediaInfo
       ? api.updateAdminPluginConfig(plugin.id, {
           libraryIds,
           concurrency,
@@ -281,6 +292,8 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setThumbnailPositionPercent(configuredThumbnailPositionPercent);
     setWriteSidecars(values.writeSidecars !== false);
     setSchedule(typeof values.schedule === "string" ? values.schedule : String(scheduleField?.defaultValue ?? "0 3 * * *"));
+    setBaseUrl(typeof values.baseUrl === "string" ? values.baseUrl : "");
+    setAllowPrivateNetwork(values.allowPrivateNetwork === true);
     setApiKey("");
     setApiKeyDirty(false);
   }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
@@ -323,7 +336,11 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
               <button ref={closeRef} className="lux-icon-button lux-admin-plugin-dialog-close" type="button" aria-label={`关闭 ${plugin.name}配置`} onClick={closeDialog}><X size={17} /></button>
             </div>
             <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
-              {isMediaInfo ? <>
+              {isMigration ? <>
+                {baseUrlField ? <label htmlFor={"plugin-config-" + plugin.id + "-base-url"}>{baseUrlField.label}<input id={"plugin-config-" + plugin.id + "-base-url"} type="url" required={baseUrlField.required} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="http://emby.local:8096" autoComplete="url" /><small>{baseUrlField.description}</small></label> : null}
+                {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" required={configField.required && !plugin.configured} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空保留已保存的 API Key" autoComplete="new-password" /><small>{configField.description}</small></label> : null}
+                {privateNetworkField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={allowPrivateNetwork} onChange={(event) => setAllowPrivateNetwork(event.target.checked)} /> <span><strong>{privateNetworkField.label}</strong><small>{privateNetworkField.description}</small></span></label> : null}
+              </> : isMediaInfo ? <>
                 {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-library-ids"} multiple value={libraryIds} options={libraryIdsField.options ?? []} onChange={setLibraryIds} aria-label={libraryIdsField.label} /><small>{libraryIdsField.description}</small></label> : null}
                 {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
                 {introWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-intro-window"}>{introWindowField.label}<input id={"plugin-config-" + plugin.id + "-intro-window"} type="number" min={introWindowField.minimum ?? 15} max={introWindowField.maximum ?? 300} value={introWindowSeconds} onChange={(event) => setIntroWindowSeconds(Number(event.target.value))} /><small>{introWindowField.description}</small></label> : null}

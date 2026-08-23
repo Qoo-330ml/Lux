@@ -301,6 +301,88 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
 }
 
 #[tokio::test]
+async fn deleting_library_removes_it_from_strm_media_info_plugin_config()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let (base_url, server, _) = start_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(
+            &json!({ "username": "Admin", "displayName": "Admin", "password": "correct password" }),
+        )
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "STRM", "kind": "MIXED" }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let library_id = created.json::<Value>().await?["library"]["id"]
+        .as_str()
+        .ok_or("missing library ID")?
+        .to_owned();
+
+    let remaining = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "STRM 2", "kind": "MIXED" }))
+        .send()
+        .await?;
+    assert_eq!(remaining.status(), reqwest::StatusCode::CREATED);
+    let remaining_library_id = remaining.json::<Value>().await?["library"]["id"]
+        .as_str()
+        .ok_or("missing remaining library ID")?
+        .to_owned();
+
+    let plugin_config_dir = config_dir.join("plugin-config");
+    tokio::fs::create_dir_all(&plugin_config_dir).await?;
+    tokio::fs::write(
+        plugin_config_dir.join("org.lux.strm-media-info.json"),
+        serde_json::to_vec(&json!({
+            "libraryIds": [library_id, remaining_library_id],
+            "concurrency": 1,
+            "mediaInfoEnabled": true,
+            "thumbnailEnabled": false,
+            "thumbnailPositionPercent": 30,
+            "existingInfoPolicy": "SKIP",
+            "writeSidecars": false,
+            "schedule": "0 3 * * *"
+        }))?,
+    )
+    .await?;
+
+    let deleted = client
+        .delete(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let config_values: Value = serde_json::from_slice(
+        &tokio::fs::read(plugin_config_dir.join("org.lux.strm-media-info.json")).await?,
+    )?;
+    assert_eq!(config_values["libraryIds"], json!([remaining_library_id]));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_browse_server_directories_with_bounded_pagination()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -188,6 +188,31 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(container.querySelector('[role="dialog"]')).toBeNull();
   });
 
+  it("renders Emby connection details in the migration plugin settings", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.emby-migration",
+      name: "Emby 迁移助手",
+      category: "MIGRATION",
+      configValues: { baseUrl: "http://emby.local:8096", allowPrivateNetwork: false },
+      configFields: [
+        { key: "baseUrl", label: "Emby 地址", type: "text", required: true, sensitive: false },
+        { key: "apiKey", label: "Emby API Key", type: "password", required: true, sensitive: true },
+        { key: "allowPrivateNetwork", label: "允许连接局域网地址", type: "toggle", required: false, sensitive: false, defaultValue: false },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 Emby 迁移助手"]')?.click();
+    });
+
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.querySelector<HTMLInputElement>('[id$="-base-url"]')?.value).toBe("http://emby.local:8096");
+    expect(dialog?.querySelector<HTMLInputElement>('[id$="-api-key"]')?.type).toBe("password");
+    expect(dialog?.textContent).toContain("允许连接局域网地址");
+  });
+
   it("renders TMDb language preference, fallback switch, and ordered multi-select", async () => {
     currentPlugin = {
       ...configuredPlugin,
