@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,7 +11,7 @@ use sqlx::{
     any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
 };
-use tokio::fs;
+use tokio::{fs, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
 
 mod emby_migration;
@@ -70,6 +71,7 @@ pub struct Database {
     path: PathBuf,
     server_id: String,
     backend: DatabaseBackend,
+    person_credits_write_lock: Arc<AsyncMutex<()>>,
 }
 
 impl Database {
@@ -168,6 +170,7 @@ impl Database {
             path,
             server_id,
             backend,
+            person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         })
     }
 
@@ -1639,6 +1642,7 @@ impl Database {
         credits: &[NewPersonCredit],
         source_fingerprint: Option<&str>,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.person_credits_write_lock.lock().await;
         let mut transaction = self
             .pool
             .begin()
@@ -1655,7 +1659,19 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let mut seen_keys = HashSet::with_capacity(credits.len());
+        let mut duplicates_skipped = 0;
         for credit in credits {
+            let key = (
+                credit.person_id.as_str(),
+                credit.person_type.as_str(),
+                credit.provider.as_str(),
+                credit.role.as_str(),
+            );
+            if !seen_keys.insert(key) {
+                duplicates_skipped += 1;
+                continue;
+            }
             let provider_ids_json = serde_json::to_string(&credit.provider_ids)
                 .map_err(|source| StorageError::Serialization(source.to_string()))?;
             let genres_json = serde_json::to_string(&credit.genres)
@@ -1673,7 +1689,23 @@ impl Database {
                     place_of_birth, provider_ids_json, genres_json, tags_json,
                     production_locations_json, premiere_date, production_year, taglines_json
                     , lux_person_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (item_id, person_type, provider, person_id, role) DO UPDATE SET
+                    person_name = excluded.person_name,
+                    sort_order = excluded.sort_order,
+                    biography = excluded.biography,
+                    birthday = excluded.birthday,
+                    deathday = excluded.deathday,
+                    known_for_department = excluded.known_for_department,
+                    place_of_birth = excluded.place_of_birth,
+                    provider_ids_json = excluded.provider_ids_json,
+                    genres_json = excluded.genres_json,
+                    tags_json = excluded.tags_json,
+                    production_locations_json = excluded.production_locations_json,
+                    premiere_date = excluded.premiere_date,
+                    production_year = excluded.production_year,
+                    taglines_json = excluded.taglines_json,
+                    lux_person_id = excluded.lux_person_id",
             )
             .bind(item_id)
             .bind(&credit.person_id)
@@ -1701,6 +1733,13 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        }
+        if duplicates_skipped > 0 {
+            tracing::debug!(
+                item_id,
+                duplicates_skipped,
+                "deduplicated person credits before indexing"
+            );
         }
         self.query(
             "INSERT INTO person_index_item_state (
@@ -16727,6 +16766,7 @@ mod tests {
             path: PathBuf::from("metadata-summary-test.db"),
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
+            person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         };
         let jobs = database
             .list_metadata_reidentify_jobs(None, 0, 1)
@@ -16848,6 +16888,27 @@ mod tests {
                         taglines: Vec::new(),
                     },
                     NewPersonCredit {
+                        person_id: "1".to_owned(),
+                        lux_person_id: Some("lux-000001".to_owned()),
+                        person_type: "Actor".to_owned(),
+                        person_name: "重复演员甲".to_owned(),
+                        provider: "tmdb".to_owned(),
+                        role: "角色甲".to_owned(),
+                        sort_order: 0,
+                        biography: None,
+                        birthday: None,
+                        deathday: None,
+                        known_for_department: None,
+                        place_of_birth: None,
+                        provider_ids: BTreeMap::new(),
+                        genres: Vec::new(),
+                        tags: Vec::new(),
+                        production_locations: Vec::new(),
+                        premiere_date: None,
+                        production_year: None,
+                        taglines: Vec::new(),
+                    },
+                    NewPersonCredit {
                         person_id: "9".to_owned(),
                         lux_person_id: Some("lux-000001".to_owned()),
                         person_type: "Actor".to_owned(),
@@ -16893,6 +16954,21 @@ mod tests {
             )
             .await
             .expect("person credits");
+        let stored_credit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-credits'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("stored person credit count");
+        assert_eq!(stored_credit_count, 3);
+        let stored_name: String = sqlx::query_scalar(
+            "SELECT person_name FROM person_credits
+             WHERE item_id = 'item-credits' AND person_id = '1' AND provider = 'tmdb'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("stored first duplicate");
+        assert_eq!(stored_name, "演员甲");
         let (credits, total) = database
             .list_person_credits_for_library(
                 &library_id,
@@ -17686,6 +17762,7 @@ mod tests {
             path: PathBuf::from("query-only-test.db"),
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
+            person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         };
         assert!(database.probe_write().await.is_err());
         database.close().await;
@@ -17741,6 +17818,7 @@ mod tests {
             path: PathBuf::from("metadata-order-test.db"),
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
+            person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         };
 
         assert_eq!(
@@ -17825,6 +17903,7 @@ mod tests {
             path: PathBuf::from("metadata-reconcile-test.db"),
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
+            person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         };
 
         let reconciled = database
