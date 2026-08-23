@@ -106,6 +106,7 @@ export type MediaActor = {
   provider?: string | null;
   name: string;
   character?: string | null;
+  isFavorite?: boolean;
   imageUrl?: string | null;
   biography?: string | null;
   birthday?: string | null;

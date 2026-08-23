@@ -289,6 +289,13 @@ export class LuxApiClient {
     return this.request<PersonDetail>(`/api/v1/people/${encodeURIComponent(personId)}`);
   }
 
+  setPersonFavorite(personId: string, favorite: boolean) {
+    return this.request<void>(`/api/v1/people/${encodeURIComponent(personId)}/favorite`, {
+      method: "PUT",
+      body: JSON.stringify({ favorite }),
+    });
+  }
+
   updatePerson(
     personId: string,
     input: {

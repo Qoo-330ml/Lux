@@ -122,6 +122,34 @@ describe("person detail", () => {
     expect(biography?.textContent).not.toContain("<br>");
   });
 
+  it("toggles the current user's actor favorite", async () => {
+    vi.spyOn(api, "person").mockResolvedValue({ id: "person-favorite", name: "演员丁", isFavorite: false });
+    const setPersonFavorite = vi.spyOn(api, "setPersonFavorite").mockResolvedValue(undefined);
+    root = createRoot(container!);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/people/person-favorite"]}>
+            <Routes>
+              <Route path="people/:personId" element={<PersonDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const favorite = container?.querySelector<HTMLButtonElement>("[aria-label='收藏演员']");
+    expect(favorite?.getAttribute("aria-pressed")).toBe("false");
+    await act(async () => favorite?.click());
+    expect(setPersonFavorite).toHaveBeenCalledWith("person-favorite", true);
+    expect(container?.querySelector<HTMLButtonElement>("[aria-label='取消收藏演员']")?.getAttribute("aria-pressed")).toBe("true");
+  });
+
   it("lets a server manager edit and save person metadata", async () => {
     vi.spyOn(api, "person").mockResolvedValue({ id: "person-3", name: "演员丙", biography: "旧简介" });
     const updatePerson = vi.spyOn(api, "updatePerson").mockResolvedValue({
