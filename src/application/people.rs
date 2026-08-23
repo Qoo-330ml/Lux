@@ -455,6 +455,7 @@ pub struct ActorView {
     pub provider: Option<String>,
     pub name: String,
     pub character: Option<String>,
+    pub is_favorite: bool,
     pub date_created: Option<i64>,
     pub image_url: Option<String>,
     pub biography: Option<String>,
@@ -1424,6 +1425,7 @@ impl PeopleService {
                 provider,
                 name: actor.name,
                 character: actor.character,
+                is_favorite: false,
                 date_created: None,
                 image_url,
                 biography: actor
@@ -3703,6 +3705,7 @@ impl PeopleService {
                 provider,
                 name: credit.person_name,
                 character: (!credit.role.is_empty()).then_some(credit.role),
+                is_favorite: false,
                 date_created: Some(credit.date_created),
                 image_url,
                 biography: metadata.biography,

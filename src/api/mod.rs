@@ -1024,6 +1024,10 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_get_person).patch(lux_update_person),
         )
         .route(
+            "/api/v1/people/{person_id}/favorite",
+            put(lux_set_person_favorite),
+        )
+        .route(
             "/api/v1/people/{person_id}/image",
             get(lux_get_person_image),
         )
@@ -10925,8 +10929,20 @@ async fn lux_get_person(
     let Some(people) = state.people.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     match people.find_person(&library_ids, "Actor", &person_id).await {
-        Ok(Some(person)) => Json(person).into_response(),
+        Ok(Some(mut person)) => {
+            person.is_favorite = match database
+                .find_user_person_favorite(&user.id.to_string(), &person.id)
+                .await
+            {
+                Ok(is_favorite) => is_favorite,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            Json(person).into_response()
+        }
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
@@ -10941,6 +10957,51 @@ async fn lux_get_person(
             "数据库暂时不可用",
         )
         .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn lux_set_person_favorite(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<LuxFavoriteRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let person = match people.find_person(&library_ids, "Actor", &person_id).await {
+        Ok(Some(person)) => person,
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .set_user_person_favorite(&user.id.to_string(), &person.id, request.favorite)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
