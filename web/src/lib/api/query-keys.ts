@@ -43,6 +43,11 @@ export const queryKeys = {
   adminLogs: ["admin", "logs"] as const,
   adminSettings: ["admin", "settings"] as const,
   adminApiKey: ["admin", "api-key"] as const,
+  adminEmbyMigrations: (page = 1) => ["admin", "emby-migrations", page] as const,
+  adminEmbyMigration: (jobId: string) => ["admin", "emby-migration", jobId] as const,
+  adminEmbyMigrationUsers: (jobId: string, page = 1) => ["admin", "emby-migration", jobId, "users", page] as const,
+  adminEmbyMigrationMatches: (jobId: string, page = 1) => ["admin", "emby-migration", jobId, "matches", page] as const,
+  adminEmbyMigrationImports: (jobId: string, page = 1) => ["admin", "emby-migration", jobId, "imports", page] as const,
   adminItemImages: (itemId: string) => ["admin", "item-images", itemId] as const,
 };
 

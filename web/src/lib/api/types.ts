@@ -369,6 +369,77 @@ export type AdminUser = LuxUser & {
   isAdmin: boolean;
 };
 
+export type EmbyMigrationSource = {
+  baseUrl: string;
+  apiKey: string;
+  allowPrivateNetwork: boolean;
+};
+
+export type AdminEmbyMigrationConnection = {
+  serverName?: string | null;
+  productName?: string | null;
+  version?: string | null;
+  serverId?: string | null;
+  historyCapability: "ITEM_STATE" | "EVENT_HISTORY" | string;
+};
+
+export type AdminEmbyMigrationJob = {
+  id: string;
+  sourceLabel: string;
+  sourceBaseUrl: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED" | string;
+  phase: "TESTING" | "USERS" | "ITEMS" | "IMPORTING" | "FINALIZING" | string;
+  dryRun: boolean;
+  mergePolicy: "MERGE" | "OVERWRITE" | "SKIP" | string;
+  historyCapability: "ITEM_STATE" | "EVENT_HISTORY" | string;
+  processedCount: number;
+  totalCount: number;
+  matchedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  cancelRequested: boolean;
+  error?: string | null;
+};
+
+export type AdminEmbyMigrationUserLink = {
+  jobId: string;
+  embyUserId: string;
+  embyUsername: string;
+  luxUserId?: string | null;
+  status: string;
+  error?: string | null;
+};
+
+export type AdminEmbyMigrationMatch = {
+  jobId: string;
+  embyItemId: string;
+  embyItemType: string;
+  luxItemId?: string | null;
+  matchMethod: string;
+  confidence?: number | null;
+  status: string;
+  detail: Record<string, unknown>;
+};
+
+export type AdminEmbyMigrationImport = {
+  jobId: string;
+  embyUserId: string;
+  embyItemId: string;
+  luxUserId: string;
+  luxItemId: string;
+  stateHash: string;
+  status: string;
+  error?: string | null;
+};
+
+export type AdminEmbyMigrationPage<T> = {
+  page?: number;
+  pageSize?: number;
+  users?: T[];
+  matches?: T[];
+  imports?: T[];
+};
+
 export type AdminHealth = {
   status: "ok" | "degraded" | string;
   schemaVersion: number;
