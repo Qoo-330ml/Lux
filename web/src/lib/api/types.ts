@@ -377,6 +377,8 @@ export type AdminHealth = {
     cpu: {
       available: boolean;
       source: string;
+      usageCores: number | null;
+      capacityCores: number | null;
       usagePercent: number | null;
       limitCores: number | null;
     };
