@@ -1469,6 +1469,8 @@ Web 使用 HttpOnly、Secure（HTTPS 下）、SameSite Cookie。改变状态的 
 - GET /api/v1/items/{id}/playback
 - POST /api/v1/items/{id}/progress
 - PUT /api/v1/items/{id}/favorite
+- GET /api/v1/people/{personId}
+- PUT /api/v1/people/{personId}/favorite
 
 Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，并进行签名或不可伪造编码。
 
@@ -1909,6 +1911,7 @@ services:
 | LUX-189 | src/application/watch.rs、src/application/reidentify.rs、src/application/images.rs、src/storage/mod.rs、migrations/、migrations-postgres/、web/src/features/admin/、web/src/react.css、tests/、web/tests/、docs/ |
 | LUX-190 | docs/LUX-DEVELOPMENT.md、docs/LUX-190-PLAN.md、docs/decisions/022-emby-migration-plugin.md、docs/COMPATIBILITY.md |
 | LUX-191+ | src/application/emby_migration*.rs、src/storage/emby_migration.rs、src/api/mod.rs、src/auth/users.rs、migrations/、migrations-postgres/、docs/LUX-191-PLAN.md |
+| LUX-193 | migrations/、migrations-postgres/、src/storage/mod.rs、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/、tests/people_api.rs、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4321,6 +4324,32 @@ UserData、用户权限和历史播放事件字段。只做规格、协议草案
 验证：参见 `docs/LUX-191-PLAN.md` 和 `docs/COMPATIBILITY.md`。
 
 依赖：LUX-190。
+
+#### LUX-193：演员收藏
+
+范围：为 Lux Web 的演员/人物详情增加按用户隔离的收藏状态。演员收藏与媒体条目的
+`user_item_state` 分开存储，不改变 Emby 人物 DTO 和 Emby 兼容收藏接口。
+
+API：
+
+- `GET /api/v1/people/{personId}` 在人物 DTO 中返回 `isFavorite`。
+- `PUT /api/v1/people/{personId}/favorite` 接收 `{ "favorite": true|false }`，成功返回
+  `204 No Content`。
+- 修改接口需要登录和现有 CSRF 校验；人物不在当前用户可访问媒体库中时返回 `404`，避免越权探测。
+
+验收：
+
+- [ ] 从空 SQLite 和 PostgreSQL 数据库执行迁移成功。
+- [ ] 人物详情能读出当前用户的收藏状态。
+- [ ] 收藏、取消收藏、重复请求和不同用户隔离有 Rust 集成测试。
+- [ ] Web 人物详情提供可访问的收藏切换按钮，并在成功后刷新人物状态。
+- [ ] Web API 客户端和人物详情组件有自动化测试。
+- [ ] Rust/Web 基线检查通过。
+
+明确不做：
+
+- 不把演员收藏混入 Emby `FavoriteItems` 或媒体条目的 `user_item_state`。
+- 不在本任务增加演员收藏列表页面；后续如需要，单独设计分页列表接口和页面。
 
 ## 26. 风险与缓解
 
