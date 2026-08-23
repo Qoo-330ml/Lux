@@ -111,6 +111,39 @@ pub(crate) struct NewEmbyMigrationItemMatch<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyMigrationPersonFavorite {
+    pub job_id: String,
+    pub emby_user_id: String,
+    pub emby_person_id: String,
+    pub emby_person_name: String,
+    pub lux_user_id: Option<String>,
+    pub lux_person_id: Option<String>,
+    pub provider_ids_json: String,
+    pub match_method: String,
+    pub confidence: Option<i64>,
+    pub status: String,
+    pub state_hash: String,
+    pub detail_json: String,
+    pub error: Option<String>,
+}
+
+pub(crate) struct NewEmbyMigrationPersonFavorite<'a> {
+    pub job_id: &'a str,
+    pub emby_user_id: &'a str,
+    pub emby_person_id: &'a str,
+    pub emby_person_name: &'a str,
+    pub lux_user_id: Option<&'a str>,
+    pub lux_person_id: Option<&'a str>,
+    pub provider_ids_json: &'a str,
+    pub match_method: &'a str,
+    pub confidence: Option<i64>,
+    pub status: &'a str,
+    pub state_hash: &'a str,
+    pub detail_json: &'a str,
+    pub error: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredEmbyMigrationImportRecord {
     pub job_id: String,
     pub emby_user_id: String,
@@ -584,6 +617,90 @@ impl Database {
         .map_err(storage_error)
     }
 
+    pub(crate) async fn upsert_emby_migration_person_favorite(
+        &self,
+        record: &NewEmbyMigrationPersonFavorite<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO emby_migration_person_favorites (
+                 job_id, emby_user_id, emby_person_id, emby_person_name,
+                 lux_user_id, lux_person_id, provider_ids_json, match_method,
+                 confidence, status, state_hash, detail_json, error
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(job_id, emby_user_id, emby_person_id) DO UPDATE SET
+                 emby_person_name = excluded.emby_person_name,
+                 lux_user_id = excluded.lux_user_id,
+                 lux_person_id = excluded.lux_person_id,
+                 provider_ids_json = excluded.provider_ids_json,
+                 match_method = excluded.match_method,
+                 confidence = excluded.confidence,
+                 status = excluded.status,
+                 state_hash = excluded.state_hash,
+                 detail_json = excluded.detail_json,
+                 error = excluded.error,
+                 updated_at = unixepoch()",
+        )
+        .bind(record.job_id)
+        .bind(record.emby_user_id)
+        .bind(record.emby_person_id)
+        .bind(record.emby_person_name)
+        .bind(record.lux_user_id)
+        .bind(record.lux_person_id)
+        .bind(record.provider_ids_json)
+        .bind(record.match_method)
+        .bind(record.confidence)
+        .bind(record.status)
+        .bind(record.state_hash)
+        .bind(record.detail_json)
+        .bind(record.error)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(storage_error)
+    }
+
+    pub(crate) async fn list_emby_migration_person_favorites(
+        &self,
+        job_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredEmbyMigrationPersonFavorite>, StorageError> {
+        self.query(
+            "SELECT job_id, emby_user_id, emby_person_id, emby_person_name,
+                    lux_user_id, lux_person_id, provider_ids_json, match_method,
+                    confidence, status, state_hash, detail_json, error
+             FROM emby_migration_person_favorites
+             WHERE job_id = ?
+             ORDER BY emby_user_id, emby_person_name, emby_person_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredEmbyMigrationPersonFavorite {
+                    job_id: row.get("job_id"),
+                    emby_user_id: row.get("emby_user_id"),
+                    emby_person_id: row.get("emby_person_id"),
+                    emby_person_name: row.get("emby_person_name"),
+                    lux_user_id: row.get("lux_user_id"),
+                    lux_person_id: row.get("lux_person_id"),
+                    provider_ids_json: row.get("provider_ids_json"),
+                    match_method: row.get("match_method"),
+                    confidence: row.get("confidence"),
+                    status: row.get("status"),
+                    state_hash: row.get("state_hash"),
+                    detail_json: row.get("detail_json"),
+                    error: row.get("error"),
+                })
+                .collect()
+        })
+        .map_err(storage_error)
+    }
+
     pub(crate) async fn upsert_emby_migration_import_record(
         &self,
         record: &NewEmbyMigrationImportRecord<'_>,
@@ -907,6 +1024,51 @@ mod tests {
             .fetch_one(database.pool())
             .await?;
         assert_eq!(event_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn person_favorite_report_is_upserted_and_paginated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (user_id, _item_id) = insert_test_user_and_item(&database).await?;
+        let job_id = Uuid::now_v7().to_string();
+        database
+            .insert_emby_migration_job(&NewEmbyMigrationJob {
+                id: &job_id,
+                created_by_user_id: &user_id,
+                source_label: "Test Emby",
+                source_base_url: "https://emby.example.test/",
+                secret_ref: "emby-migration/test",
+                dry_run: true,
+                merge_policy: "MERGE",
+            })
+            .await?;
+
+        database
+            .upsert_emby_migration_person_favorite(&NewEmbyMigrationPersonFavorite {
+                job_id: &job_id,
+                emby_user_id: "emby-user",
+                emby_person_id: "person-1",
+                emby_person_name: "演员甲",
+                lux_user_id: Some(&user_id),
+                lux_person_id: None,
+                provider_ids_json: r#"{"tmdb":"123"}"#,
+                match_method: "TMDB_ID",
+                confidence: Some(100),
+                status: "MATCHED",
+                state_hash: "hash-1",
+                detail_json: r#"{"sourceType":"Person"}"#,
+                error: None,
+            })
+            .await?;
+        let records = database
+            .list_emby_migration_person_favorites(&job_id, 0, 10)
+            .await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].emby_person_name, "演员甲");
+        assert_eq!(records[0].provider_ids_json, r#"{"tmdb":"123"}"#);
+        assert_eq!(records[0].status, "MATCHED");
         Ok(())
     }
 

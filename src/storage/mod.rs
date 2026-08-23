@@ -17,10 +17,10 @@ use uuid::Uuid;
 mod emby_migration;
 pub(crate) use emby_migration::{
     EmbyMigrationJobProgress, NewEmbyMigrationImportRecord, NewEmbyMigrationItemMatch,
-    NewEmbyMigrationJob, NewImportedUserItemState, StoredEmbyMigrationImportRecord,
-    StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob, StoredEmbyMigrationSource,
-    StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity,
-    StoredPlaybackHistoryEvent,
+    NewEmbyMigrationJob, NewEmbyMigrationPersonFavorite, NewImportedUserItemState,
+    StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob,
+    StoredEmbyMigrationPersonFavorite, StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding,
+    StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity, StoredPlaybackHistoryEvent,
 };
 
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
@@ -1994,7 +1994,7 @@ impl Database {
                  FROM people p
                  LEFT JOIN person_credits pc
                    ON pc.lux_person_id = p.id AND pc.person_type = 'Actor'
-                 WHERE p.status = 'ACTIVE'
+                 WHERE p.status = 'ACTIVE' AND p.normalized_name = ?
                  ORDER BY p.id, pc.birthday",
             )
             .bind(normalized_name)
@@ -4372,6 +4372,54 @@ impl Database {
                 version: row.get("version"),
             })
         })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_user_person_favorite(
+        &self,
+        user_id: &str,
+        person_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT COALESCE((
+                 SELECT is_favorite
+                 FROM user_person_state
+                 WHERE user_id = ? AND person_id = ?
+             ), 0)",
+        )
+        .bind(user_id)
+        .bind(person_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_user_person_favorite(
+        &self,
+        user_id: &str,
+        person_id: &str,
+        favorite: bool,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_person_state (user_id, person_id, is_favorite)
+             VALUES (?, ?, ?)
+             ON CONFLICT(user_id, person_id) DO UPDATE SET
+                 is_favorite = excluded.is_favorite,
+                 updated_at = unixepoch()",
+        )
+        .bind(user_id)
+        .bind(person_id)
+        .bind(database_flag(favorite))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

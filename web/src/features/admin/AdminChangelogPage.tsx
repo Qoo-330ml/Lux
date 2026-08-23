@@ -16,7 +16,7 @@ type ChangelogRelease = {
 export const changelogReleases: ChangelogRelease[] = [
   {
     version: "0.2.8",
-    date: "2026-08-23",
+    date: "2026-08-24",
     sections: [
       { kind: "added", items: [
         "增加独立弹幕匹配插件 org.lux.danmaku，支持管理员配置弹幕 API，并为媒体库创建异步匹配任务、查询任务详情、取消和重试。",
@@ -28,6 +28,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "增加 Emby 迁移插件边界与宿主任务服务，支持用户资料、收藏、已看状态、播放进度、播放次数和最近播放时间导入。",
         "Emby 迁移助手插件设置支持统一保存 Emby 地址、API Key 和局域网访问权限，迁移页面可直接读取已配置来源。",
         "增加 Emby DisplayPreferences 兼容接口，支持 Infuse 等客户端在登录后读取显示偏好。",
+        "增加用户级人物收藏功能，支持在人物详情页收藏或取消收藏人物，并在 Emby 人物数据中返回当前用户的收藏状态。",
       ] },
       { kind: "fixed", items: [
         "修复管理台操作页遗漏章节检测、弹幕匹配和 STRM 探测任务状态及操作入口的问题。",
@@ -54,6 +55,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "仪表盘资源指标统一按容器 cgroup 和 /media 文件系统统计，明确区分指标来源与不可用状态。",
         "Emby 迁移页面不再从请求体接收连接凭据，连接测试和迁移任务统一使用插件配置，并保留迁移任务的受控密钥引用。",
         "人物关系恢复增加隔离区和后续重试流程，避免不匹配快照污染人物索引，同时保留可恢复的原始关系数据。",
+        "Emby 迁移报告增加人物收藏结果分页和类型化展示，避免不同报告记录混用导致管理页显示错误。",
       ] },
     ],
   },

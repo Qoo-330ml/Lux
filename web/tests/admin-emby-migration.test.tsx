@@ -29,8 +29,7 @@ describe("EmbyMigrationPluginConfig", () => {
       serverId: "server-1",
       historyCapability: "ITEM_STATE",
     });
-    const createJob = vi.spyOn(api, "createAdminEmbyMigration").mockResolvedValue({
-      job: {
+    const migrationJob = {
         id: "job-1",
         sourceLabel: "emby.local",
         sourceBaseUrl: "http://emby.local:8096/",
@@ -46,8 +45,13 @@ describe("EmbyMigrationPluginConfig", () => {
         failedCount: 0,
         cancelRequested: false,
         error: null,
-      },
-    });
+    } as const;
+    const createJob = vi.spyOn(api, "createAdminEmbyMigration").mockResolvedValue({ job: migrationJob });
+    vi.spyOn(api, "adminEmbyMigration").mockResolvedValue({ job: migrationJob });
+    vi.spyOn(api, "adminEmbyMigrationUsers").mockResolvedValue({ users: [], page: 1, pageSize: 50 });
+    vi.spyOn(api, "adminEmbyMigrationMatches").mockResolvedValue({ matches: [], page: 1, pageSize: 50 });
+    vi.spyOn(api, "adminEmbyMigrationImports").mockResolvedValue({ imports: [], page: 1, pageSize: 50 });
+    vi.spyOn(api, "adminEmbyMigrationPersonFavorites").mockResolvedValue({ personFavorites: [], page: 1, pageSize: 50 });
     vi.spyOn(api, "updateAdminPluginConfig").mockResolvedValue({ plugin: {} as AdminPlugin });
     vi.spyOn(api, "adminEmbyMigrations").mockResolvedValue({ jobs: [], total: 0, page: 1, pageSize: 20 });
     const plugin: AdminPlugin = {
@@ -106,5 +110,15 @@ describe("EmbyMigrationPluginConfig", () => {
       await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith({ dryRun: true, mergePolicy: "MERGE" }));
     });
     expect(container.textContent).toContain("预览任务已创建");
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("任务详情"));
+    });
+    act(() => {
+      const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes("人物收藏"));
+      button?.click();
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(api.adminEmbyMigrationPersonFavorites).toHaveBeenCalledWith("job-1", 1));
+    });
   });
 });

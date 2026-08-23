@@ -1,4 +1,4 @@
-import { ArrowLeft, Cake, MapPin, UserRound } from "lucide-react";
+import { ArrowLeft, Cake, Heart, MapPin, UserRound } from "lucide-react";
 import { Fragment, type FormEvent, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -38,6 +38,8 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
   const [draft, setDraft] = useState<PersonDraft>();
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string>();
+  const [favoriteSaving, setFavoriteSaving] = useState(false);
+  const [favoriteError, setFavoriteError] = useState<string>();
 
   if (person.isPending) {
     return <section className="lux-page-state" aria-busy="true"><p>正在加载人物详情…</p></section>;
@@ -69,6 +71,22 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
     setEditing(false);
     setDraft(undefined);
     setSaveError(undefined);
+  }
+
+  async function toggleFavorite() {
+    const favorite = !Boolean(detail.isFavorite);
+    setFavoriteSaving(true);
+    setFavoriteError(undefined);
+    try {
+      await api.setPersonFavorite(personId, favorite);
+      queryClient.setQueryData<PersonDetail>(queryKeys.person(personId), (current) =>
+        current ? { ...current, isFavorite: favorite } : current,
+      );
+    } catch (cause) {
+      setFavoriteError(cause instanceof Error ? cause.message : "演员收藏状态保存失败，请重试。");
+    } finally {
+      setFavoriteSaving(false);
+    }
   }
 
   async function save(event: FormEvent<HTMLFormElement>) {
@@ -116,9 +134,13 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
           <p className="lux-eyebrow">人物资料</p>
           <div className="lux-person-title-row">
             {editing && draft ? <input id="person-name" className="lux-person-title-input" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} aria-label="人物姓名" /> : <h1>{detail.name}</h1>}
+            <button className="lux-button lux-button-secondary" type="button" aria-label={detail.isFavorite ? "取消收藏演员" : "收藏演员"} aria-pressed={Boolean(detail.isFavorite)} onClick={() => void toggleFavorite()} disabled={favoriteSaving}>
+              <Heart size={16} fill={detail.isFavorite ? "currentColor" : "none"} /> {favoriteSaving ? "保存中…" : detail.isFavorite ? "已收藏" : "收藏演员"}
+            </button>
             {canEdit && !editing ? <button className="lux-button lux-button-secondary lux-person-edit-button" type="button" aria-label="编辑人物资料" onClick={startEditing}>编辑资料</button> : null}
             {canEdit && editing ? <div className="lux-person-edit-actions"><button className="lux-button lux-button-primary" type="submit" form="person-editor" aria-label="保存人物资料" disabled={saving}>{saving ? "保存中…" : "保存"}</button><button className="lux-button lux-button-secondary" type="button" onClick={cancelEditing} disabled={saving}>取消</button></div> : null}
           </div>
+          {favoriteError ? <p className="lux-error-copy" role="alert">{favoriteError}</p> : null}
           {detail.character ? <p className="lux-person-detail-role">饰演：{detail.character}</p> : null}
           {editing && draft ? <PersonEditor draft={draft} setDraft={setDraft} onSubmit={save} error={saveError} /> : <>
           <dl className="lux-person-facts">

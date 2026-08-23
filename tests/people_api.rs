@@ -28,6 +28,153 @@ const PNG_1X1: &[u8] = &[
 const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
 
 #[tokio::test]
+async fn lux_person_favorites_are_user_scoped_and_require_person_acl_and_csrf()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let viewer = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let denied = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user("denied", "Denied", "denied password", false)
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('item-person-favorite', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(viewer.id.to_string())
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    PeopleService::new(config.config_dir.clone())
+        .with_database(database.clone())
+        .persist_item_actors(
+            "item-person-favorite",
+            "tmdb",
+            &[ActorCredit {
+                id: "101".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config, database, setup, web_auth, emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{address}");
+
+    let viewer_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "viewer", "password": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_cookie = cookie_pair(viewer_login.headers());
+    let viewer_csrf = cookie_value(viewer_login.headers(), "lux_csrf");
+    let initial = client
+        .get(format!("{base_url}/api/v1/people/101"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(initial.status(), reqwest::StatusCode::OK);
+    assert_eq!(initial.json::<Value>().await?["isFavorite"], false);
+
+    let missing_csrf = client
+        .put(format!("{base_url}/api/v1/people/101/favorite"))
+        .header(COOKIE, &viewer_cookie)
+        .json(&json!({ "favorite": true }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    for _ in 0..2 {
+        let favorite = client
+            .put(format!("{base_url}/api/v1/people/101/favorite"))
+            .header(COOKIE, &viewer_cookie)
+            .header("x-csrf-token", &viewer_csrf)
+            .json(&json!({ "favorite": true }))
+            .send()
+            .await?;
+        assert_eq!(favorite.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+    let favorited = client
+        .get(format!("{base_url}/api/v1/people/101"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(favorited.status(), reqwest::StatusCode::OK);
+    assert_eq!(favorited.json::<Value>().await?["isFavorite"], true);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_person = client
+        .get(format!("{base_url}/api/v1/people/101"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(admin_person.status(), reqwest::StatusCode::OK);
+    assert_eq!(admin_person.json::<Value>().await?["isFavorite"], false);
+
+    let denied_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "denied", "password": "denied password" }))
+        .send()
+        .await?;
+    let denied_cookie = cookie_pair(denied_login.headers());
+    let denied_person = client
+        .get(format!("{base_url}/api/v1/people/101"))
+        .header(COOKIE, &denied_cookie)
+        .send()
+        .await?;
+    assert_eq!(denied_person.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let unfavorite = client
+        .put(format!("{base_url}/api/v1/people/101/favorite"))
+        .header(COOKIE, &viewer_cookie)
+        .header("x-csrf-token", &viewer_csrf)
+        .json(&json!({ "favorite": false }))
+        .send()
+        .await?;
+    assert_eq!(unfavorite.status(), reqwest::StatusCode::NO_CONTENT);
+
+    server.abort();
+    let _ = (admin, denied);
+    Ok(())
+}
+
+#[tokio::test]
 async fn rebuilding_people_does_not_clear_index_when_metadata_library_root_is_missing()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

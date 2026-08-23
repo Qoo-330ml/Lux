@@ -7,7 +7,8 @@ use url::Url;
 use super::{
     plugin_protocol::{
         MIGRATION_AUTHENTICATE_USER_METHOD, MIGRATION_LIST_ITEMS_METHOD,
-        MIGRATION_LIST_USERS_METHOD, MIGRATION_TEST_METHOD, MIGRATION_USER_STATE_METHOD,
+        MIGRATION_LIST_USERS_METHOD, MIGRATION_PERSON_FAVORITES_METHOD, MIGRATION_TEST_METHOD,
+        MIGRATION_USER_STATE_METHOD,
     },
     plugins::{EMBY_MIGRATION_PLUGIN_ID, PluginService, PluginServiceError},
 };
@@ -284,6 +285,25 @@ impl EmbyMigrationPluginClient {
     ) -> Result<MigrationItemPage, PluginServiceError> {
         self.call_with(
             MIGRATION_USER_STATE_METHOD,
+            serde_json::json!({
+                "source": source,
+                "userId": validate_id(user_id)?,
+                "startIndex": start_index,
+                "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
+            }),
+        )
+        .await
+    }
+
+    pub async fn person_favorites(
+        &self,
+        source: &EmbyMigrationSource,
+        user_id: &str,
+        start_index: u32,
+        limit: u32,
+    ) -> Result<MigrationItemPage, PluginServiceError> {
+        self.call_with(
+            MIGRATION_PERSON_FAVORITES_METHOD,
             serde_json::json!({
                 "source": source,
                 "userId": validate_id(user_id)?,

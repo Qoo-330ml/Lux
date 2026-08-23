@@ -106,6 +106,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - Redia 兼容兜底：`GET /Items?Ids=<MediaSourceId>` 在没有同名 ItemId 时会解析到该媒体源所属条目；未知 ID 仍返回空结果，不会回退到媒体库第一条。`/Videos/{ItemId}/original.strm`（含 `/emby` 和大小写路径变体）复用 Emby 播放逻辑并对 STRM 返回 307 直连；其他未注册 `/Videos/...` 路径返回 404，不再落入 Web 前端 fallback 返回 HTML。标准客户端仍应使用 ItemId 和 `/Items/{ItemId}/PlaybackInfo`。
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
 - Web 的“已实现”仅表示代码路径和服务端静态集成已完成；当前 Chrome smoke 覆盖登录、筛选、播放、收藏、账户会话和管理流程，不等同于所有浏览器/编码格式兼容。
+- LUX-193 的演员收藏属于 Lux Web 自有 API 和人物详情能力，不扩展 Emby `Persons` DTO 或 Emby `FavoriteItems` 语义；演员收藏的目标客户端兼容性尚未单独实测。
 - LUX-121 兼容补齐：Emby `Views` 返回媒体库类型、`ChildCount` 和标准 `ImageTags.Primary`；条目详情同时返回本地徽标的 `ImageTags.Logo`，并通过 `/Items/{itemId}/Images/Logo` 提供标准图片读取；媒体库封面支持 `/Items/{libraryId}/Images/Primary` 及带索引、HEAD、ETag 和 ACL。尚待 VidHub UI 重新实测确认。
 - 2026-08-17 混合媒体库兼容修复：普通 Emby 客户端继续在混合库 DTO 中收到 `CollectionType: "mixed"`；VidHub 的认证设备收到历史兼容的 `CollectionType: null`，同时保留电影/剧集条目列表和 `TypeOptions`。原因是 VidHub 可连接服务器但会丢弃带 `mixed` 集合类型的库；`tests/mixed_library_api.rs` 覆盖两种客户端的分流。
 - Emby `GET /Library/VirtualFolders` 现返回接近官方 `VirtualFolderInfo` 的完整结构：`Id`、`Guid`、`ItemId` 使用同一个稳定媒体库 ID，`LibraryOptions` 包含 `PathInfos`、按电影/剧集类型拆分的 `TypeOptions`、Lux 当前图片策略、NFO 本地元数据策略、字幕语言和播放恢复阈值。Lux 没有等价 Emby 刮削器时，metadata/image fetcher 数组保持为空；尚未以目标第三方客户端真实 UI 复测该管理端点。

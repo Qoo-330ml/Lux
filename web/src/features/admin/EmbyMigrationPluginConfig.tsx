@@ -8,16 +8,19 @@ import type {
   AdminEmbyMigrationImport,
   AdminEmbyMigrationJob,
   AdminEmbyMigrationMatch,
+  AdminEmbyMigrationPersonFavorite,
   AdminEmbyMigrationUserLink,
 } from "../../lib/api/types";
 
-type ReportTab = "users" | "matches" | "imports";
+type ReportTab = "users" | "matches" | "imports" | "personFavorites";
+type MigrationReportEntry = AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport | AdminEmbyMigrationPersonFavorite;
 type MigrationReportData = {
   page?: number;
   pageSize?: number;
-  users?: AdminEmbyMigrationUserLink[] | (AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport)[];
-  matches?: AdminEmbyMigrationMatch[] | (AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport)[];
-  imports?: AdminEmbyMigrationImport[] | (AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport)[];
+  users?: MigrationReportEntry[];
+  matches?: MigrationReportEntry[];
+  imports?: MigrationReportEntry[];
+  personFavorites?: MigrationReportEntry[];
 };
 
 const pageSize = 50;
@@ -80,7 +83,7 @@ function MigrationWorkspace() {
   const [connection, setConnection] = useState<Awaited<ReturnType<typeof api.testAdminEmbyMigration>> | null>(null);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [tab, setTab] = useState<ReportTab>("users");
-  const [reportPage, setReportPage] = useState<Record<ReportTab, number>>({ users: 1, matches: 1, imports: 1 });
+  const [reportPage, setReportPage] = useState<Record<ReportTab, number>>({ users: 1, matches: 1, imports: 1, personFavorites: 1 });
 
   const jobs = useQuery({
     queryKey: queryKeys.adminEmbyMigrations(),
@@ -109,7 +112,7 @@ function MigrationWorkspace() {
     onSuccess: ({ job: created }) => {
       setSelectedJobId(created.id);
       setTab("users");
-      setReportPage({ users: 1, matches: 1, imports: 1 });
+      setReportPage({ users: 1, matches: 1, imports: 1, personFavorites: 1 });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminEmbyMigrations() });
     },
   });
@@ -195,9 +198,10 @@ function useMigrationReport(jobId: string | null, tab: ReportTab, page: number) 
   return useQuery<MigrationReportData>({
     queryKey: jobId ? reportKey(tab, jobId, page) : ["admin", "emby-migration-report", "none", tab, page],
     queryFn: (): Promise<MigrationReportData> => {
-      if (!jobId) return Promise.resolve({ page, pageSize, users: [], matches: [], imports: [] });
+      if (!jobId) return Promise.resolve({ page, pageSize, users: [], matches: [], imports: [], personFavorites: [] });
       if (tab === "users") return api.adminEmbyMigrationUsers(jobId, page);
       if (tab === "matches") return api.adminEmbyMigrationMatches(jobId, page);
+      if (tab === "personFavorites") return api.adminEmbyMigrationPersonFavorites(jobId, page);
       return api.adminEmbyMigrationImports(jobId, page);
     },
     enabled: Boolean(jobId),
@@ -208,6 +212,7 @@ function useMigrationReport(jobId: string | null, tab: ReportTab, page: number) 
 function reportKey(tab: ReportTab, jobId: string, page: number) {
   if (tab === "users") return queryKeys.adminEmbyMigrationUsers(jobId, page);
   if (tab === "matches") return queryKeys.adminEmbyMigrationMatches(jobId, page);
+  if (tab === "personFavorites") return queryKeys.adminEmbyMigrationPersonFavorites(jobId, page);
   return queryKeys.adminEmbyMigrationImports(jobId, page);
 }
 
@@ -252,6 +257,7 @@ function MigrationDetails({
           <ReportTabButton active={tab === "users"} onClick={() => onTabChange("users")}>用户关联</ReportTabButton>
           <ReportTabButton active={tab === "matches"} onClick={() => onTabChange("matches")}>媒体匹配</ReportTabButton>
           <ReportTabButton active={tab === "imports"} onClick={() => onTabChange("imports")}>导入结果</ReportTabButton>
+          <ReportTabButton active={tab === "personFavorites"} onClick={() => onTabChange("personFavorites")}>人物收藏</ReportTabButton>
         </div>
         {report.isPending ? <LoadingState label="正在读取报告…" /> : report.error ? <InlineError message={report.error.message} /> : <ReportContent tab={tab} data={report.data} page={reportPageFrom(report.data)} onPageChange={onPageChange} />}
       </div>
@@ -260,13 +266,13 @@ function MigrationDetails({
 }
 
 function ReportContent({ tab, data, page, onPageChange }: { tab: ReportTab; data: unknown; page: number; onPageChange: (page: number) => void }) {
-  const entries = tab === "users" ? ((data as { users?: AdminEmbyMigrationUserLink[] })?.users ?? []) : tab === "matches" ? ((data as { matches?: AdminEmbyMigrationMatch[] })?.matches ?? []) : ((data as { imports?: AdminEmbyMigrationImport[] })?.imports ?? []);
+  const entries = tab === "users" ? ((data as { users?: AdminEmbyMigrationUserLink[] })?.users ?? []) : tab === "matches" ? ((data as { matches?: AdminEmbyMigrationMatch[] })?.matches ?? []) : tab === "imports" ? ((data as { imports?: AdminEmbyMigrationImport[] })?.imports ?? []) : ((data as { personFavorites?: AdminEmbyMigrationPersonFavorite[] })?.personFavorites ?? []);
   const response = data as { page?: number; pageSize?: number };
   const currentPage = response.page ?? page;
   const hasNext = entries.length >= (response.pageSize ?? pageSize);
   if (!entries.length) return <EmptyState label="此报告暂无记录" detail="任务运行后，这里会显示可核对的迁移结果。" />;
   return <>
-    <div className="lux-emby-report-table">{tab === "users" ? entries.map((entry, index) => <UserReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationUserLink} />) : tab === "matches" ? entries.map((entry, index) => <MatchReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationMatch} />) : entries.map((entry, index) => <ImportReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationImport} />)}</div>
+    <div className="lux-emby-report-table">{tab === "users" ? entries.map((entry, index) => <UserReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationUserLink} />) : tab === "matches" ? entries.map((entry, index) => <MatchReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationMatch} />) : tab === "imports" ? entries.map((entry, index) => <ImportReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationImport} />) : entries.map((entry, index) => <PersonFavoriteReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationPersonFavorite} />)}</div>
     <div className="lux-emby-pagination"><button className="lux-button lux-button-secondary" type="button" disabled={currentPage <= 1} onClick={() => onPageChange(currentPage - 1)}>上一页</button><span>第 {currentPage} 页</span><button className="lux-button lux-button-secondary" type="button" disabled={!hasNext} onClick={() => onPageChange(currentPage + 1)}>下一页</button></div>
   </>;
 }
@@ -274,6 +280,7 @@ function ReportContent({ tab, data, page, onPageChange }: { tab: ReportTab; data
 function UserReportRow({ entry }: { entry: AdminEmbyMigrationUserLink }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyUsername}</strong><small>Emby ID：{entry.embyUserId}</small></div><ReportStatus status={entry.status} /><span>{entry.luxUserId ? `Lux 用户：${entry.luxUserId}` : entry.error ?? "未关联"}</span></div>; }
 function MatchReportRow({ entry }: { entry: AdminEmbyMigrationMatch }) { return <div className="lux-emby-report-row"><div><strong>{entry.detail.title ? String(entry.detail.title) : entry.embyItemId}</strong><small>{entry.embyItemType} · {entry.matchMethod}{entry.confidence == null ? "" : ` · ${entry.confidence}%`}</small></div><ReportStatus status={entry.status} /><span>{entry.luxItemId ? `Lux 媒体：${entry.luxItemId}` : safeDetail(entry.detail)}</span></div>; }
 function ImportReportRow({ entry }: { entry: AdminEmbyMigrationImport }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyItemId}</strong><small>Emby 用户：{entry.embyUserId}</small></div><ReportStatus status={entry.status} /><span>{entry.error ?? "状态已写入 Lux"}</span></div>; }
+function PersonFavoriteReportRow({ entry }: { entry: AdminEmbyMigrationPersonFavorite }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyPersonName}</strong><small>Emby 用户：{entry.embyUserId} · Person ID：{entry.embyPersonId}</small></div><ReportStatus status={entry.status} /><span>{entry.luxPersonId ? `Lux 人物：${entry.luxPersonId}` : `${entry.matchMethod}${entry.confidence == null ? "" : ` · ${entry.confidence}%`} · ${entry.error ?? "未匹配"}`}</span></div>; }
 
 function ConnectionResult({ connection }: { connection: Awaited<ReturnType<typeof api.testAdminEmbyMigration>> }) { return <div className="lux-emby-connection-result"><CheckCircle2 size={18} /><div><strong>{connection.serverName || "Emby 服务器"}</strong><span>{[connection.productName, connection.version, connection.serverId ? `Server ID：${connection.serverId}` : null].filter(Boolean).join(" · ")}</span></div></div>; }
 function CapabilityNotice({ capability }: { capability?: string }) { if (!capability) return null; const eventHistory = capability === "EVENT_HISTORY"; return <section className={`lux-emby-capability ${eventHistory ? "is-ok" : "is-warning"}`}><div className="lux-emby-capability-icon">{eventHistory ? <CheckCircle2 size={19} /> : <AlertTriangle size={19} />}</div><div><strong>{eventHistory ? "Emby 历史事件可用" : "完整历史播放时间线不可用"}</strong><p>{eventHistory ? "将按用户和媒体导入可获得的播放事件及进度。" : "Emby API 当前只能提供每个用户-媒体的聚合状态：已看、播放位置、播放次数、最近播放时间和收藏。旧的逐次播放事件（例如每次看到第几集的几分几秒）无法恢复。"}</p></div><CircleHelp size={17} aria-label="能力说明" /></section>; }
