@@ -206,6 +206,43 @@ async fn supervises_a_plugin_process_over_json_lines() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn removes_a_plugin_process_after_natural_exit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use luxd::application::plugin_runtime::PluginSupervisor;
+
+    let root = tempdir().expect("temp dir should be created");
+    let plugin = root.path().join("example");
+    fs::create_dir_all(plugin.join("binaries")).expect("plugin directory should be created");
+    let entrypoint = plugin.join("binaries/plugin");
+    fs::write(
+        &entrypoint,
+        b"#!/bin/sh
+IFS= read -r line || exit 1
+id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')
+printf '{\"id\":\"%s\",\"result\":{\"ok\":true}}\\n' \"$id\"
+",
+    )
+    .expect("plugin process should be written");
+    fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700))
+        .expect("plugin process should be executable");
+    write_manifest(&plugin, "binaries/plugin");
+    write_trusted_keys(root.path());
+
+    let catalog = PluginCatalog::discover(root.path());
+    let supervisor = PluginSupervisor::new(catalog);
+    let result = supervisor
+        .call("org.lux.example", "plugin.health", json!({}))
+        .await
+        .expect("plugin call should succeed");
+
+    assert_eq!(result["ok"], true);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!supervisor.status("org.lux.example").await.running);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn multiplexes_concurrent_plugin_calls_and_matches_out_of_order_responses() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -4,7 +4,10 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -13,7 +16,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, RwLock, Semaphore, oneshot},
-    time::timeout,
+    time::{Instant, timeout_at},
 };
 use uuid::Uuid;
 use zip::ZipArchive;
@@ -233,9 +236,12 @@ impl PluginSupervisor {
             .ok_or_else(|| PluginRuntimeError::UnknownPlugin(plugin_id.to_owned()))?;
         let process = {
             let mut processes = self.processes.lock().await;
-            if let Some(process) = processes.get(plugin_id) {
-                process.clone()
+            if let Some(process) = processes.get(plugin_id).cloned()
+                && !process.is_terminated()
+            {
+                process
             } else {
+                processes.remove(plugin_id);
                 let process = match spawn_process(
                     &plugin,
                     allow_config_access
@@ -262,6 +268,7 @@ impl PluginSupervisor {
                     .is_some_and(|current| Arc::ptr_eq(current, &process))
                 {
                     processes.remove(plugin_id);
+                    process.stop().await;
                 }
             }
             self.record_error(plugin_id, error).await;
@@ -311,7 +318,17 @@ impl PluginSupervisor {
     }
 
     pub async fn status(&self, plugin_id: &str) -> PluginRuntimeStatus {
-        let running = self.processes.lock().await.contains_key(plugin_id);
+        let running = {
+            let mut processes = self.processes.lock().await;
+            match processes.get(plugin_id).cloned() {
+                None => false,
+                Some(process) if process.is_terminated() => {
+                    processes.remove(plugin_id);
+                    false
+                }
+                Some(_) => true,
+            }
+        };
         let last_error = self.last_errors.lock().await.get(plugin_id).cloned();
         PluginRuntimeStatus {
             running,
@@ -363,6 +380,7 @@ struct PluginProcess {
     stdin: Mutex<BufWriter<ChildStdin>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value, PluginRuntimeError>>>>,
     inflight: Semaphore,
+    terminated: AtomicBool,
 }
 
 impl Drop for PluginProcess {
@@ -380,22 +398,53 @@ impl PluginProcess {
         params: serde_json::Value,
         call_timeout: Duration,
     ) -> Result<serde_json::Value, PluginRuntimeError> {
-        let permit = timeout(call_timeout, self.inflight.acquire())
-            .await
-            .map_err(|_| PluginRuntimeError::Timeout)?
-            .map_err(|_| PluginRuntimeError::Exited)?;
-        {
+        let deadline = Instant::now() + call_timeout;
+        let permit = match timeout_at(deadline, self.inflight.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(PluginRuntimeError::Exited),
+            Err(_) => {
+                self.stop().await;
+                return Err(PluginRuntimeError::Timeout);
+            }
+        };
+        let child_status = timeout_at(deadline, async {
             let mut child = self.child.lock().await;
-            if child.try_wait().map_err(PluginRuntimeError::Io)?.is_some() {
+            child.try_wait().map_err(PluginRuntimeError::Io)
+        })
+        .await;
+        match child_status {
+            Ok(Ok(Some(_))) => {
+                self.terminated.store(true, Ordering::Release);
+                drop(permit);
                 return Err(PluginRuntimeError::Exited);
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                drop(permit);
+                self.stop().await;
+                return Err(error);
+            }
+            Err(_) => {
+                drop(permit);
+                self.stop().await;
+                return Err(PluginRuntimeError::Timeout);
             }
         }
         let request = PluginRequest::new(Uuid::now_v7().to_string(), method, params);
         let request_id = request.id.clone();
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(request_id.clone(), sender);
+        if timeout_at(deadline, async {
+            self.pending.lock().await.insert(request_id.clone(), sender);
+        })
+        .await
+        .is_err()
+        {
+            drop(permit);
+            self.stop().await;
+            return Err(PluginRuntimeError::Timeout);
+        }
 
-        let write_result = async {
+        let write_result = timeout_at(deadline, async {
             let mut line = serde_json::to_vec(&request).map_err(PluginRuntimeError::Json)?;
             line.push(b'\n');
             let mut stdin = self.stdin.lock().await;
@@ -404,15 +453,19 @@ impl PluginProcess {
                 .await
                 .map_err(PluginRuntimeError::Io)?;
             stdin.flush().await.map_err(PluginRuntimeError::Io)
-        }
+        })
         .await;
-        if let Err(error) = write_result {
+        if let Err(error) = match write_result {
+            Ok(result) => result,
+            Err(_) => Err(PluginRuntimeError::Timeout),
+        } {
             self.pending.lock().await.remove(&request_id);
+            drop(permit);
             self.stop().await;
             return Err(error);
         }
 
-        let result = match timeout(call_timeout, receiver).await {
+        let result = match timeout_at(deadline, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(PluginRuntimeError::Exited),
             Err(_) => {
@@ -477,6 +530,7 @@ impl PluginProcess {
     }
 
     async fn fail_pending(&self, message: String) {
+        self.terminated.store(true, Ordering::Release);
         let pending = std::mem::take(&mut *self.pending.lock().await);
         for sender in pending.into_values() {
             let _ = sender.send(Err(PluginRuntimeError::Protocol(message.clone())));
@@ -489,8 +543,13 @@ impl PluginProcess {
     }
 
     async fn stop(&self) {
+        self.terminated.store(true, Ordering::Release);
         self.fail_pending("plugin process stopped".to_owned()).await;
         self.kill_child().await;
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
     }
 }
 
@@ -554,6 +613,7 @@ fn spawn_process(
         stdin: Mutex::new(BufWriter::new(stdin)),
         pending: Mutex::new(HashMap::new()),
         inflight: Semaphore::new(MAX_PLUGIN_INFLIGHT),
+        terminated: AtomicBool::new(false),
     });
     let weak = Arc::downgrade(&process);
     tokio::spawn(PluginProcess::read_responses(weak, BufReader::new(stdout)));
