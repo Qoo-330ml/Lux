@@ -546,6 +546,7 @@ HTTP handler 不写 SQL，不执行文件扫描，不直接调用 TMDb。handler
 ### 7.2 并发与背压
 
 - HTTP 请求、文件扫描、ffprobe、TMDb、图片下载和 NFO 回写使用不同并发配额。
+- 元数据任务最多使用 16 路有界 worker；同一插件进程通过 request ID 多路复用 pending RPC，允许不同媒体条目的请求并行执行。
 - 所有通道使用有界容量。
 - 同一路径事件以路径为键合并。
 - 同一媒体条目同一时刻最多有一个元数据匹配或写回任务。
@@ -1184,6 +1185,7 @@ locked local value
 - TMDb 插件配置还包括首选语言、语言回退开关和有序回退语言列表；这些非敏感值保存在 `/config/tmdb_settings.json`，可通过管理员插件配置 API 返回，凭据仍不可返回。
 - 主进程的元数据匹配、候选搜索、图片候选和合集请求统一通过媒体库所选刮削器协议；主进程不得直接访问第三方元数据 API。
 - 插件内部使用统一 HTTP client、超时、16 并发配额、每秒 32 次请求限流、重试和 User-Agent。
+- 插件 stdin/stdout RPC 支持有界多路复用；响应按 request ID 分发并允许乱序返回，插件进程故障或超时会结束其全部 pending 请求。
 - 404、429、5xx、网络超时分类处理。
 - 搜索候选短期缓存，详情较长时间缓存。
 - 响应 schema 验证后进入领域层。
@@ -3112,7 +3114,7 @@ services:
 - `assets/`：图标等非执行资源。
 - `signature.json`：历史包可带的签名算法、签发者和签名值；新包不生成。
 
-插件进程通过 JSON-RPC over stdin/stdout 提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.credits`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。所有刮削调用使用 provider-neutral 的 `itemType`、`providerId`、`ProviderIds` 与完整图片 URL；插件不能直接访问 Lux SQLite、媒体根目录或内部任务对象；元数据写回、图片下载和 Emby API 输出由 Lux 负责。
+插件进程通过支持 request ID 多路复用的 JSON-RPC over stdin/stdout 提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.bundle`、`metadata.images`、`metadata.credits`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。响应允许乱序返回，宿主按 ID 分发并设置有界 pending 数量；插件不能直接访问 Lux SQLite、媒体根目录或内部任务对象；元数据写回、图片下载和 Emby API 输出由 Lux 负责。
 
 验收：
 
