@@ -36,6 +36,7 @@ pub const MIGRATION_TEST_METHOD: &str = "migration.test";
 pub const MIGRATION_LIST_USERS_METHOD: &str = "migration.list_users";
 pub const MIGRATION_LIST_ITEMS_METHOD: &str = "migration.list_items";
 pub const MIGRATION_USER_STATE_METHOD: &str = "migration.user_state";
+pub const MIGRATION_PERSON_FAVORITES_METHOD: &str = "migration.person_favorites";
 pub const MIGRATION_AUTHENTICATE_USER_METHOD: &str = "migration.authenticate_user";
 pub const CHAPTER_FINGERPRINT_SAMPLE_RATE: u32 = 11_025;
 pub const CHAPTER_FINGERPRINT_POINT_DURATION_TICKS: i64 = 1_238_095;

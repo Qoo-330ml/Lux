@@ -41,7 +41,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 87);
+    assert_eq!(database.schema_version().await?, 88);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -61,7 +61,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 87);
+    assert_eq!(second_database.schema_version().await?, 88);
     second_database.close().await;
     Ok(())
 }
@@ -82,6 +82,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         "emby_migration_item_matches",
         "emby_migration_import_records",
         "emby_migration_user_bindings",
+        "emby_migration_person_favorites",
         "playback_history_events",
     ] {
         let exists: i64 = sqlx::query_scalar(
@@ -94,7 +95,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 87);
+    assert_eq!(database.schema_version().await?, 88);
     database.close().await;
     Ok(())
 }
@@ -221,7 +222,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 87);
+    assert_eq!(database.schema_version().await?, 88);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -403,7 +404,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 87);
+    assert_eq!(database.schema_version().await?, 88);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

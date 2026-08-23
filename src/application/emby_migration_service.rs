@@ -17,8 +17,9 @@ use crate::{
     auth::users::{UserStore, UserStoreError, UserUpdate},
     storage::{
         Database, EmbyMigrationJobProgress, NewEmbyMigrationImportRecord,
-        NewEmbyMigrationItemMatch, NewEmbyMigrationJob, NewImportedUserItemState, StorageError,
-        StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob,
+        NewEmbyMigrationItemMatch, NewEmbyMigrationJob, NewEmbyMigrationPersonFavorite,
+        NewImportedUserItemState, StorageError, StoredEmbyMigrationImportRecord,
+        StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob, StoredEmbyMigrationPersonFavorite,
         StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink,
         StoredMigrationMediaIdentity, StoredPlaybackHistoryEvent,
     },
@@ -120,6 +121,45 @@ pub struct MigrationImportRecordView {
     pub state_hash: String,
     pub status: String,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationPersonFavoriteView {
+    pub job_id: String,
+    pub emby_user_id: String,
+    pub emby_person_id: String,
+    pub emby_person_name: String,
+    pub lux_user_id: Option<String>,
+    pub lux_person_id: Option<String>,
+    pub provider_ids: serde_json::Value,
+    pub match_method: String,
+    pub confidence: Option<i64>,
+    pub status: String,
+    pub state_hash: String,
+    pub detail: serde_json::Value,
+    pub error: Option<String>,
+}
+
+impl From<StoredEmbyMigrationPersonFavorite> for MigrationPersonFavoriteView {
+    fn from(record: StoredEmbyMigrationPersonFavorite) -> Self {
+        Self {
+            job_id: record.job_id,
+            emby_user_id: record.emby_user_id,
+            emby_person_id: record.emby_person_id,
+            emby_person_name: record.emby_person_name,
+            lux_user_id: record.lux_user_id,
+            lux_person_id: record.lux_person_id,
+            provider_ids: serde_json::from_str(&record.provider_ids_json)
+                .unwrap_or_else(|_| json!({})),
+            match_method: record.match_method,
+            confidence: record.confidence,
+            status: record.status,
+            state_hash: record.state_hash,
+            detail: serde_json::from_str(&record.detail_json).unwrap_or_else(|_| json!({})),
+            error: record.error,
+        }
+    }
 }
 
 impl From<StoredEmbyMigrationImportRecord> for MigrationImportRecordView {
@@ -397,6 +437,25 @@ impl EmbyMigrationService {
             .await?
             .into_iter()
             .map(MigrationImportRecordView::from)
+            .collect())
+    }
+
+    pub async fn list_person_favorite_records(
+        &self,
+        job_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<MigrationPersonFavoriteView>, EmbyMigrationServiceError> {
+        Ok(self
+            .database
+            .list_emby_migration_person_favorites(
+                job_id,
+                offset.max(0),
+                limit.clamp(1, MAX_JOB_PAGE_SIZE),
+            )
+            .await?
+            .into_iter()
+            .map(MigrationPersonFavoriteView::from)
             .collect())
     }
 
@@ -751,6 +810,125 @@ impl EmbyMigrationService {
                     }
                 }
             }
+
+            let mut start_index = 0_u32;
+            loop {
+                if self.is_cancelled(job_id).await? {
+                    return self.cancelled(job_id, "ITEMS").await;
+                }
+                let page = match self
+                    .plugin
+                    .person_favorites(&source, &user.id, start_index, 500)
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        self.fail_job(job_id, "ITEMS", &error.to_string()).await?;
+                        return Err(error.into());
+                    }
+                };
+                if let Some(page_total) = page.total_record_count {
+                    total = total.max(page_total as i64);
+                }
+                for person in page.items {
+                    if person.item_type != "Person" {
+                        continue;
+                    }
+                    let user_data = person.user_data.clone().unwrap_or(MigrationUserData {
+                        playback_position_ticks: 0,
+                        played: false,
+                        is_favorite: true,
+                        play_count: 0,
+                        last_played_date: None,
+                    });
+                    if !user_data.is_favorite {
+                        continue;
+                    }
+                    processed += 1;
+                    let outcome = self.match_person(&person).await?;
+                    let provider_ids_json = serde_json::to_string(&person.provider_ids)
+                        .unwrap_or_else(|_| "{}".to_owned());
+                    let detail_json = serde_json::to_string(&json!({
+                        "sourceName": person.name,
+                        "sourceType": "Person",
+                        "providerIds": person.provider_ids,
+                        "matchMethod": outcome.method,
+                    }))
+                    .unwrap_or_else(|_| "{}".to_owned());
+                    let state_hash = hex_sha256(&user_data)?;
+                    let mut status = outcome.status;
+                    let mut error = None;
+                    if outcome.lux_person_id.is_some() {
+                        matched += 1;
+                        if !job.dry_run {
+                            if let Some(lux_user_id) = lux_user_id.as_deref() {
+                                if migration_merge_policy(&job.merge_policy)
+                                    == MigrationMergePolicy::Skip
+                                {
+                                    status = "SKIPPED";
+                                } else {
+                                    self.database
+                                        .set_user_person_favorite(
+                                            lux_user_id,
+                                            outcome
+                                                .lux_person_id
+                                                .as_deref()
+                                                .ok_or(EmbyMigrationServiceError::InvalidState)?,
+                                            true,
+                                        )
+                                        .await?;
+                                    status = "IMPORTED";
+                                }
+                            } else {
+                                status = "SKIPPED";
+                                error = Some("no Lux user mapping".to_owned());
+                            }
+                        }
+                    } else {
+                        skipped += 1;
+                    }
+                    self.database
+                        .upsert_emby_migration_person_favorite(&NewEmbyMigrationPersonFavorite {
+                            job_id,
+                            emby_user_id: &user.id,
+                            emby_person_id: &person.id,
+                            emby_person_name: &person.name,
+                            lux_user_id: lux_user_id.as_deref(),
+                            lux_person_id: outcome.lux_person_id.as_deref(),
+                            provider_ids_json: &provider_ids_json,
+                            match_method: outcome.method,
+                            confidence: outcome.confidence,
+                            status,
+                            state_hash: &state_hash,
+                            detail_json: &detail_json,
+                            error: error.as_deref(),
+                        })
+                        .await?;
+                }
+                self.database
+                    .update_emby_migration_job_progress(&EmbyMigrationJobProgress {
+                        id: job_id,
+                        cursor_json: &serde_json::to_string(&json!({
+                            "kind": "PERSON_FAVORITES",
+                            "userId": user.id,
+                            "startIndex": page.start_index,
+                        }))
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                        processed_count: processed,
+                        total_count: total,
+                        matched_count: matched,
+                        skipped_count: skipped,
+                        failed_count: failed,
+                    })
+                    .await?;
+                let Some(next_start_index) = page.next_start_index else {
+                    break;
+                };
+                if next_start_index <= start_index {
+                    break;
+                }
+                start_index = next_start_index;
+            }
         }
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "FINALIZING", None)
@@ -885,6 +1063,77 @@ impl EmbyMigrationService {
         Ok(identities)
     }
 
+    async fn match_person(
+        &self,
+        person: &MigrationItem,
+    ) -> Result<PersonMatchOutcome, EmbyMigrationServiceError> {
+        let mut provider_matches = Vec::<(String, bool)>::new();
+        for (source_key, source_value) in &person.provider_ids {
+            let provider = normalize_person_provider(source_key);
+            if let Some(target) = self
+                .database
+                .find_canonical_person_by_identity(&provider, source_value)
+                .await?
+            {
+                provider_matches.push((target.id, provider.eq_ignore_ascii_case("tmdb")));
+            }
+        }
+        provider_matches.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        provider_matches.dedup_by(|left, right| {
+            if left.0 == right.0 {
+                left.1 |= right.1;
+                true
+            } else {
+                false
+            }
+        });
+        if provider_matches.len() == 1 {
+            let (lux_person_id, is_tmdb) = provider_matches
+                .pop()
+                .ok_or(EmbyMigrationServiceError::InvalidState)?;
+            return Ok(PersonMatchOutcome {
+                lux_person_id: Some(lux_person_id),
+                method: if is_tmdb { "TMDB_ID" } else { "PROVIDER_ID" },
+                confidence: Some(100),
+                status: "MATCHED",
+            });
+        }
+        if provider_matches.len() > 1 {
+            return Ok(PersonMatchOutcome {
+                lux_person_id: None,
+                method: "CONFLICT",
+                confidence: None,
+                status: "CONFLICT",
+            });
+        }
+
+        let normalized_name = normalize_person_name(&person.name);
+        if normalized_name.is_empty() {
+            return Ok(PersonMatchOutcome::unmatched());
+        }
+        let matches = self
+            .database
+            .list_canonical_people_by_normalized_name(&normalized_name)
+            .await?;
+        if matches.len() == 1 {
+            return Ok(PersonMatchOutcome {
+                lux_person_id: Some(matches[0].id.clone()),
+                method: "NAME",
+                confidence: Some(90),
+                status: "MATCHED",
+            });
+        }
+        if matches.len() > 1 {
+            return Ok(PersonMatchOutcome {
+                lux_person_id: None,
+                method: "CONFLICT",
+                confidence: None,
+                status: "CONFLICT",
+            });
+        }
+        Ok(PersonMatchOutcome::unmatched())
+    }
+
     async fn is_cancelled(&self, job_id: &str) -> Result<bool, EmbyMigrationServiceError> {
         Ok(self
             .database
@@ -918,6 +1167,24 @@ struct MatchOutcome {
     method: &'static str,
     confidence: Option<i64>,
     status: &'static str,
+}
+
+struct PersonMatchOutcome {
+    lux_person_id: Option<String>,
+    method: &'static str,
+    confidence: Option<i64>,
+    status: &'static str,
+}
+
+impl PersonMatchOutcome {
+    fn unmatched() -> Self {
+        Self {
+            lux_person_id: None,
+            method: "UNMATCHED",
+            confidence: None,
+            status: "UNMATCHED",
+        }
+    }
 }
 
 fn match_item(item: &MigrationItem, identities: &[StoredMigrationMediaIdentity]) -> MatchOutcome {
@@ -1038,6 +1305,24 @@ fn normalize_title(value: &str) -> String {
         .chars()
         .flat_map(char::to_lowercase)
         .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn normalize_person_provider(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "tmdb" => "tmdb".to_owned(),
+        "imdb" => "imdb".to_owned(),
+        "tvdb" => "tvdb".to_owned(),
+        value => value.to_owned(),
+    }
+}
+
+fn normalize_person_name(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 

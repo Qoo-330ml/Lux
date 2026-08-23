@@ -17,10 +17,10 @@ use uuid::Uuid;
 mod emby_migration;
 pub(crate) use emby_migration::{
     EmbyMigrationJobProgress, NewEmbyMigrationImportRecord, NewEmbyMigrationItemMatch,
-    NewEmbyMigrationJob, NewImportedUserItemState, StoredEmbyMigrationImportRecord,
-    StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob, StoredEmbyMigrationSource,
-    StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity,
-    StoredPlaybackHistoryEvent,
+    NewEmbyMigrationJob, NewEmbyMigrationPersonFavorite, NewImportedUserItemState,
+    StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob,
+    StoredEmbyMigrationPersonFavorite, StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding,
+    StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity, StoredPlaybackHistoryEvent,
 };
 
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
@@ -1994,7 +1994,7 @@ impl Database {
                  FROM people p
                  LEFT JOIN person_credits pc
                    ON pc.lux_person_id = p.id AND pc.person_type = 'Actor'
-                 WHERE p.status = 'ACTIVE'
+                 WHERE p.status = 'ACTIVE' AND p.normalized_name = ?
                  ORDER BY p.id, pc.birthday",
             )
             .bind(normalized_name)
