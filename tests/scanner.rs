@@ -153,6 +153,14 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(unavailable, 0);
+    let removed_at: Option<i64> = sqlx::query_scalar(
+        "SELECT removed_at FROM media_items WHERE id = (
+             SELECT item_id FROM media_sources LIMIT 1
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(removed_at.is_some());
 
     tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
     scanner.scan_movie_library(library.id).await?;
@@ -164,6 +172,14 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(available_after_restore, 1);
+    let restored_removed_at: Option<i64> = sqlx::query_scalar(
+        "SELECT removed_at FROM media_items WHERE id = (
+             SELECT item_id FROM media_sources LIMIT 1
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(restored_removed_at.is_none());
 
     let item_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type <> 'FOLDER'")

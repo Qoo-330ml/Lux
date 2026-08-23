@@ -884,6 +884,7 @@ impl LibraryScanner {
             .find_media_item_by_identity(item.identity_key)
             .await?
         {
+            self.database.restore_media_item(&existing.id).await?;
             self.database
                 .update_unconfirmed_hierarchy_item(
                     &existing.id,
@@ -906,6 +907,7 @@ impl LibraryScanner {
                 .adopt_media_item_identity(&existing.id, item.identity_key)
                 .await?
         {
+            self.database.restore_media_item(&existing.id).await?;
             self.database
                 .update_unconfirmed_hierarchy_item(
                     &existing.id,

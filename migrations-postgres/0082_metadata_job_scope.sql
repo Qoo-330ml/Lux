@@ -1,8 +1,8 @@
 ALTER TABLE metadata_reidentify_jobs
-    ADD COLUMN library_id TEXT REFERENCES libraries(id) ON DELETE SET NULL;
+    ADD COLUMN IF NOT EXISTS library_id TEXT REFERENCES libraries(id) ON DELETE SET NULL;
 
 ALTER TABLE metadata_reidentify_jobs
-    ADD COLUMN job_scope TEXT NOT NULL DEFAULT 'ITEMS'
+    ADD COLUMN IF NOT EXISTS job_scope TEXT NOT NULL DEFAULT 'ITEMS'
         CHECK (job_scope IN ('ITEMS', 'LIBRARY'));
 
 UPDATE metadata_reidentify_jobs AS jobs
@@ -15,7 +15,7 @@ SET library_id = (
     HAVING COUNT(DISTINCT media_items.library_id) = 1
 );
 
-CREATE INDEX idx_metadata_reidentify_items_item_job
+CREATE INDEX IF NOT EXISTS idx_metadata_reidentify_items_item_job
     ON metadata_reidentify_job_items(item_id, job_id);
 
 CREATE INDEX idx_metadata_reidentify_jobs_scope_status

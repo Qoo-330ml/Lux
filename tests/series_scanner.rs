@@ -126,6 +126,67 @@ async fn series_scan_builds_stable_series_season_episode_hierarchy()
 }
 
 #[tokio::test]
+async fn series_scan_soft_deletes_missing_hierarchy_and_restores_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    let episode_path = root.join("Example Show/Season 01/Example.Show.S01E01.mkv");
+    create_file(&episode_path).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_series_library(library.id).await?;
+
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? ORDER BY item_type, id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 3);
+
+    tokio::fs::remove_file(&episode_path).await?;
+    scanner.scan_series_library(library.id).await?;
+    let removed_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE library_id = ? AND removed_at IS NOT NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_count, 3);
+
+    create_file(&episode_path).await?;
+    scanner.scan_series_library(library.id).await?;
+    let restored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE library_id = ? AND removed_at IS NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restored_count, 3);
+    let item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE library_id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(item_count, 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn series_scan_repairs_existing_grouped_hierarchy() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

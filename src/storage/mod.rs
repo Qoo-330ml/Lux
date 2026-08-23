@@ -7541,7 +7541,9 @@ impl Database {
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        self.restore_media_items_for_filesystem_entry(entry.entry_id)
+            .await
     }
 
     pub(crate) async fn update_filesystem_entry_inode(
@@ -7633,6 +7635,45 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
+            let restore_query = format!(
+                "UPDATE media_items
+                 SET removed_at = NULL
+                 WHERE id IN (
+                     SELECT item_id FROM media_sources
+                     WHERE filesystem_entry_id IN ({placeholders})
+                     UNION
+                     SELECT parent_id
+                     FROM media_items
+                     WHERE id IN (
+                         SELECT item_id FROM media_sources
+                         WHERE filesystem_entry_id IN ({placeholders})
+                     )
+                     UNION
+                     SELECT series_id
+                     FROM media_items
+                     WHERE id IN (
+                         SELECT item_id FROM media_sources
+                         WHERE filesystem_entry_id IN ({placeholders})
+                     )
+                 )"
+            );
+            let mut restore_statement = self.query(sqlx::AssertSqlSafe(restore_query));
+            for entry_id in chunk {
+                restore_statement = restore_statement.bind(entry_id);
+            }
+            for entry_id in chunk {
+                restore_statement = restore_statement.bind(entry_id);
+            }
+            for entry_id in chunk {
+                restore_statement = restore_statement.bind(entry_id);
+            }
+            restore_statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()
@@ -7668,7 +7709,8 @@ impl Database {
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        self.restore_media_items_for_filesystem_entry(id).await
     }
 
     pub(crate) async fn mark_filesystem_entry_seen(
@@ -7689,7 +7731,55 @@ impl Database {
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
+        })?;
+        self.restore_media_items_for_filesystem_entry(id).await
+    }
+
+    async fn restore_media_items_for_filesystem_entry(
+        &self,
+        filesystem_entry_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_items
+             SET removed_at = NULL
+             WHERE id IN (
+                 SELECT item_id FROM media_sources WHERE filesystem_entry_id = ?
+                 UNION
+                 SELECT parent_id
+                 FROM media_items
+                 WHERE id IN (
+                     SELECT item_id FROM media_sources WHERE filesystem_entry_id = ?
+                 )
+                 UNION
+                 SELECT series_id
+                 FROM media_items
+                 WHERE id IN (
+                     SELECT item_id FROM media_sources WHERE filesystem_entry_id = ?
+                 )
+             )",
+        )
+        .bind(filesystem_entry_id)
+        .bind(filesystem_entry_id)
+        .bind(filesystem_entry_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
         })
+    }
+
+    pub(crate) async fn restore_media_item(&self, item_id: &str) -> Result<(), StorageError> {
+        self.query("UPDATE media_items SET removed_at = NULL WHERE id = ?")
+            .bind(item_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn mark_missing_filesystem_entries(
@@ -7697,20 +7787,95 @@ impl Database {
         library_root_id: &str,
         generation: &str,
     ) -> Result<u64, StorageError> {
-        self.query(
-            "UPDATE filesystem_entries
-             SET is_missing = 1, updated_at = unixepoch()
-             WHERE library_root_id = ? AND last_seen_generation != ? AND is_missing = 0",
-        )
-        .bind(library_root_id)
-        .bind(generation)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let missing_entries = self
+            .query(
+                "UPDATE filesystem_entries
+                 SET is_missing = 1, updated_at = unixepoch()
+                 WHERE library_root_id = ? AND last_seen_generation != ? AND is_missing = 0",
+            )
+            .bind(library_root_id)
+            .bind(generation)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+
+        let library_id = self
+            .query_scalar::<String>("SELECT library_id FROM library_roots WHERE id = ?")
+            .bind(library_root_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if let Some(library_id) = library_id {
+            for item_type in ["MOVIE", "EPISODE", "UNRESOLVED", "SEASON", "SERIES"] {
+                let child_predicate = if matches!(item_type, "SEASON" | "SERIES") {
+                    "AND NOT EXISTS (
+                        SELECT 1
+                        FROM media_items child
+                        WHERE child.removed_at IS NULL
+                          AND (child.parent_id = media_items.id OR child.series_id = media_items.id)
+                    )"
+                } else {
+                    ""
+                };
+                let source_predicate = if matches!(item_type, "SEASON" | "SERIES") {
+                    ""
+                } else {
+                    "AND EXISTS (
+                        SELECT 1
+                        FROM media_sources existing_source
+                        WHERE existing_source.item_id = media_items.id
+                    )"
+                };
+                let query = format!(
+                    "UPDATE media_items
+                     SET removed_at = unixepoch()
+                     WHERE library_id = ?
+                       AND item_type = ?
+                       AND removed_at IS NULL
+                       {source_predicate}
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM media_sources ms
+                           JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                           WHERE ms.item_id = media_items.id
+                             AND fe.is_missing = 0
+                       )
+                       {child_predicate}"
+                );
+                self.query(sqlx::AssertSqlSafe(query))
+                    .bind(&library_id)
+                    .bind(item_type)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(missing_entries)
     }
 
     pub(crate) async fn reset_media_probe_for_filesystem_entry(
@@ -8136,10 +8301,11 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT id, sort_title, production_year
+                "SELECT id, sort_title, production_year, removed_at
                  FROM media_items
                  WHERE library_id = ? AND item_type = 'MOVIE'
-                   AND removed_at IS NULL AND sort_title IN ({placeholders})"
+                   AND sort_title IN ({placeholders})
+                 ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
             for sort_title in chunk {
@@ -8171,7 +8337,9 @@ impl Database {
                             path: self.path.clone(),
                             source,
                         })?;
-                movie_items.insert((sort_title, production_year), id);
+                movie_items
+                    .entry((sort_title, production_year))
+                    .or_insert(id);
             }
         }
         Ok(movie_items)
@@ -8544,7 +8712,7 @@ impl Database {
         for (item_id, parent_id) in &parent_updates {
             if !new_item_ids.contains(item_id) {
                 self.query(
-                    "UPDATE media_items SET parent_id = ?
+                    "UPDATE media_items SET parent_id = ?, removed_at = NULL
                      WHERE id = ? AND item_type = 'MOVIE'",
                 )
                 .bind(parent_id.as_deref())

@@ -1680,9 +1680,9 @@ impl PluginService {
         // fresh catalog. This matters for updates: a discovery failure must leave
         // the old package available for the next attempt.
         let catalog = PluginCatalog::discover(&plugin_dir);
-        if !catalog
+        if catalog
             .get(&entry.id)
-            .is_some_and(|plugin| plugin.manifest.version == entry.version)
+            .is_none_or(|plugin| plugin.manifest.version != entry.version)
         {
             let _ = fs::remove_file(&destination).await;
             let _ = fs::remove_dir_all(&validation_dir).await;

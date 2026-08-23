@@ -1,4 +1,4 @@
-CREATE TABLE person_index_rebuild_jobs (
+CREATE TABLE IF NOT EXISTS person_index_rebuild_jobs (
     library_id TEXT PRIMARY KEY NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'QUEUED'
         CHECK (status IN ('QUEUED', 'RUNNING', 'COMPLETED', 'CANCELLED', 'FAILED')),
@@ -15,5 +15,8 @@ CREATE TABLE person_index_rebuild_jobs (
     finished_at BIGINT
 );
 
-CREATE INDEX idx_person_index_rebuild_jobs_status
+ALTER TABLE person_index_rebuild_jobs
+    ADD COLUMN IF NOT EXISTS run_token TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_person_index_rebuild_jobs_status_v2
     ON person_index_rebuild_jobs(status, updated_at DESC, library_id);

@@ -9,6 +9,8 @@
 - 根路径 `readdir/stat` 失败时只标记该根不可用，不把已有文件批量标记 missing。
 - 已标记不可用的根每次扫描先重新检查目录；恢复后清除 unavailable 状态。
 - 只有本轮成功完整遍历的根才调用 `mark_missing_filesystem_entries`。
+- 成功标记 missing 后，若媒体项已没有任何可用来源，则使用 `removed_at` 软删除该媒体项；空的季和剧集父项也一并软删除。
+- 文件恢复并被重新发现时，扫描器清除 `removed_at`，保留原媒体项的元数据、播放进度和收藏关系。
 - 实时事件不参与删除判断，完整 generation 仍是 missing 的唯一来源。
 
 ## 增量任务
@@ -28,5 +30,5 @@
 
 ## 明确不做
 
-- 不实现 missing 宽限期和 purge 任务。
+- 不执行物理删除或独立 purge 任务；`removed_at` 软删除保留恢复所需的历史记录。
 - 不实现 PollWatcher 回退；实时监听仍由 LUX-042 提供，定时 reconcile 负责兜底。
