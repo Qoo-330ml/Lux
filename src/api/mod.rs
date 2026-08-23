@@ -1482,6 +1482,10 @@ fn emby_routes() -> Router<AppState> {
         .route("/System/Info/Public", get(emby_public_system_info))
         .route("/System/Info", get(emby_system_info))
         .route("/System/Ping", get(emby_ping).post(emby_ping))
+        .route(
+            "/DisplayPreferences/{display_preferences_id}",
+            get(emby_display_preferences),
+        )
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/authenticatebyname", post(emby_authenticate))
@@ -1733,6 +1737,58 @@ async fn emby_system_info(
         "HasPendingRestart": false,
         "IsShuttingDown": false,
         "HttpServerPortNumber": 8097
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct EmbyDisplayPreferencesQuery {
+    #[serde(flatten)]
+    auth: EmbyTokenQuery,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    user_id: Option<String>,
+    #[serde(rename = "Client", alias = "client", default)]
+    client: Option<String>,
+}
+
+async fn emby_display_preferences(
+    headers: HeaderMap,
+    Path(display_preferences_id): Path<String>,
+    Query(query): Query<EmbyDisplayPreferencesQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user_with_query(&headers, &state, &query.auth).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let requested_user_id = query.user_id.unwrap_or_else(|| user.id.to_string());
+    if let Err(status) = ensure_emby_user_scope(&user, &requested_user_id) {
+        return status.into_response();
+    }
+    let Some(client) = query
+        .client
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    Json(json!({
+        "Id": display_preferences_id,
+        "ViewType": "Poster",
+        "SortBy": "SortName",
+        "IndexBy": serde_json::Value::Null,
+        "RememberIndexing": false,
+        "PrimaryImageHeight": 250,
+        "PrimaryImageWidth": 250,
+        "CustomPrefs": {},
+        "ScrollDirection": "Horizontal",
+        "ShowBackdrop": true,
+        "RememberSorting": false,
+        "SortOrder": "Ascending",
+        "ShowSidebar": false,
+        "Client": client,
     }))
     .into_response()
 }

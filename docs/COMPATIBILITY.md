@@ -95,6 +95,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - 媒体库实时监听默认开启。复制到已配置根路径中的新视频会进入局部 `INCREMENTAL_SCAN`，只处理该事件路径，通常在几秒内进入索引；旧版 `realtimeWatchEnabled` 请求字段不会关闭监听。
 - LUX-000 至 LUX-003：仅完成仓库工程检查，尚未连接任何真实客户端。
 - LUX-023：已完成根路径/`/emby` 前缀的 System/Ping 本地协议 shape 测试；`GET/POST /System/Ping` 按 Emby OpenAPI 兼容为无需认证的空 200，并完成 VidHub/SenPlayer 真实登录前置探针。
+- 2026-08-23 Infuse 8.5.5726（macOS arm64）连接探针发现：登录成功后请求 `/DisplayPreferences/usersettings?userId=:userId&client=:client`，此前因路由缺失落入 Web 首页 HTML，导致 JSON 解码失败；现已补齐带认证的 `GET /DisplayPreferences/{displayPreferencesId}`，根路径和 `/emby` 前缀均有自动协议回归。完整 Infuse 媒体库、播放和状态流程仍待部署后复测。
 - LUX-024：已完成 Users/Public、AuthenticateByName、Sessions/Logout 的本地协议 shape 和 token 脱敏测试；VidHub 真实登录通过；SenPlayer 认证响应解析失败的历史缺口已补充更完整的 `User`/`SessionInfo` shape，并补齐认证后 `GET /Users/:userId` 用户详情路由；P0 真实 UI 复测已通过。
 - Emby `GET /Items/Counts` 现已支持根路径和 `/emby` 前缀，执行 Emby token/API key 鉴权、用户媒体库 ACL，并支持 `UserId` 与 `IsFavorite` 过滤；`tests/emby_counts.rs` 覆盖协议响应。尚未以 Filmly 或 CapyPlayer 真实 UI 复测，不据此宣称客户端兼容。
 - 2026-08-23 AfuseKt `2.9.8.6-fix`（Android）HAR 显示其媒体库首页请求会发送空值 `IsFavorite=`；此前 `/Users/{userId}/Items` 和 `/Items/Latest` 因此返回 400，导致库条目与最新资源不显示。Emby 查询现在将空的可选布尔值按未提供处理，`tests/catalog.rs` 已加入 Items/Latest 回归；修复后的真实客户端复测待部署后进行。该客户端请求的 `/Genres` 仍属于规范明确未实现的端点。
