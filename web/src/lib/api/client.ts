@@ -17,6 +17,12 @@ import type {
   AdminRoot,
   AdminSettings,
   AdminSettingsPatch,
+  AdminEmbyMigrationConnection,
+  AdminEmbyMigrationImport,
+  AdminEmbyMigrationJob,
+  AdminEmbyMigrationMatch,
+  AdminEmbyMigrationPage,
+  AdminEmbyMigrationUserLink,
   AdminApiKey,
   NetworkProxyDiagnostics,
   AdminUser,
@@ -49,6 +55,7 @@ import type {
   SetupDatabaseStatus,
   MetadataRefreshMode,
   UserPlaybackSettings,
+  EmbyMigrationSource,
 } from "./types";
 
 const csrfCookie = "lux_csrf";
@@ -453,6 +460,68 @@ export class LuxApiClient {
 
   adminDashboard() {
     return this.request<AdminDashboard>("/api/v1/admin/dashboard");
+  }
+
+  testAdminEmbyMigration(source: EmbyMigrationSource) {
+    return this.request<AdminEmbyMigrationConnection>("/api/v1/admin/emby-migration/test", {
+      method: "POST",
+      body: JSON.stringify(source),
+    });
+  }
+
+  createAdminEmbyMigration(input: {
+    source: EmbyMigrationSource;
+    dryRun: boolean;
+    mergePolicy: "MERGE" | "OVERWRITE" | "SKIP";
+  }) {
+    return this.request<{ job: AdminEmbyMigrationJob }>("/api/v1/admin/emby-migration", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  adminEmbyMigrations(page = 1) {
+    return this.request<{ jobs?: AdminEmbyMigrationJob[]; total?: number; page?: number; pageSize?: number }>(
+      `/api/v1/admin/emby-migration?page=${page}&pageSize=20`,
+    );
+  }
+
+  adminEmbyMigration(jobId: string) {
+    return this.request<{ job: AdminEmbyMigrationJob }>(
+      `/api/v1/admin/emby-migration/${encodeURIComponent(jobId)}`,
+    );
+  }
+
+  cancelAdminEmbyMigration(jobId: string) {
+    return this.request<{ cancelRequested: boolean }>(
+      `/api/v1/admin/emby-migration/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
+    );
+  }
+
+  retryAdminEmbyMigration(jobId: string) {
+    return this.request<{ jobId: string; status: string }>(
+      `/api/v1/admin/emby-migration/${encodeURIComponent(jobId)}/retry`,
+      { method: "POST" },
+    );
+  }
+
+  adminEmbyMigrationUsers(jobId: string, page = 1) {
+    return this.request<AdminEmbyMigrationPage<AdminEmbyMigrationUserLink>>(
+      `/api/v1/admin/emby-migration/${encodeURIComponent(jobId)}/users?page=${page}&pageSize=50`,
+    );
+  }
+
+  adminEmbyMigrationMatches(jobId: string, page = 1) {
+    return this.request<AdminEmbyMigrationPage<AdminEmbyMigrationMatch>>(
+      `/api/v1/admin/emby-migration/${encodeURIComponent(jobId)}/matches?page=${page}&pageSize=50`,
+    );
+  }
+
+  adminEmbyMigrationImports(jobId: string, page = 1) {
+    return this.request<AdminEmbyMigrationPage<AdminEmbyMigrationImport>>(
+      `/api/v1/admin/emby-migration/${encodeURIComponent(jobId)}/imports?page=${page}&pageSize=50`,
+    );
   }
 
   adminLibraries() {

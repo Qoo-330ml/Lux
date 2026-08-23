@@ -60,6 +60,24 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
     assert_eq!(public_body[0]["Id"], admin.id.to_string());
     assert_eq!(public_body[0]["HasPassword"], true);
 
+    let afuse_login = client
+        .post(format!(
+            "http://{address}/emby/Users/authenticatebyname"
+        ))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="AfuseKt", Device="iPhone", DeviceId="afuse-device", Version="2.9.8.6-fix""#,
+        )
+        .form(&[
+            ("Username", "ADMIN"),
+            ("Pw", "correct password"),
+            ("appName", "AfuseKt"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(afuse_login.status(), reqwest::StatusCode::OK);
+    assert!(afuse_login.json::<serde_json::Value>().await?["AccessToken"].is_string());
+
     let login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(

@@ -13,6 +13,15 @@ use sqlx::{
 use tokio::fs;
 use uuid::Uuid;
 
+mod emby_migration;
+pub(crate) use emby_migration::{
+    EmbyMigrationJobProgress, NewEmbyMigrationImportRecord, NewEmbyMigrationItemMatch,
+    NewEmbyMigrationJob, NewImportedUserItemState, StoredEmbyMigrationImportRecord,
+    StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob, StoredEmbyMigrationSource,
+    StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity,
+    StoredPlaybackHistoryEvent,
+};
+
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
 
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();

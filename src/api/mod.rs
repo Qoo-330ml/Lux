@@ -58,6 +58,10 @@ use crate::{
         },
         collections::{CollectionError, CollectionService},
         directory_browser::{DirectoryBrowserError, list_directories},
+        emby_migration::{EmbyMigrationPluginClient, EmbyMigrationSource, MigrationInputError},
+        emby_migration_service::{
+            CreateMigrationRequest, EmbyMigrationService, EmbyMigrationServiceError,
+        },
         images::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
             ImageWriteService, normalize_image_type, read_image_dimensions,
@@ -152,6 +156,7 @@ pub struct AppState {
     webhooks: Option<WebhookService>,
     danmaku: Option<DanmakuService>,
     plugins: Option<PluginService>,
+    emby_migration: Option<Arc<EmbyMigrationService>>,
     scraper_resolver: Option<ScraperResolver>,
     tmdb: Option<ScraperProvider>,
     collections: Option<CollectionService>,
@@ -220,6 +225,11 @@ impl AppState {
             config_dir.clone(),
             network_proxy_url.clone(),
         );
+        let emby_migration = Some(Arc::new(EmbyMigrationService::new(
+            database.clone(),
+            plugins.clone(),
+            config_dir.clone(),
+        )));
         let tmdb = ScraperProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
         let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
         let collections = Some(
@@ -350,6 +360,7 @@ impl AppState {
                     .with_resource_metrics(resources.clone()),
             ),
             plugins: Some(plugins.clone()),
+            emby_migration,
             scraper_resolver: Some(scraper_resolver),
             tmdb: Some(tmdb),
             collections,
@@ -582,6 +593,22 @@ impl AppState {
         }
     }
 
+    pub async fn resume_emby_migration_jobs(&self) {
+        let Some(service) = self.emby_migration.clone() else {
+            return;
+        };
+        let Ok(jobs) = service.list_jobs(0, 100).await else {
+            tracing::error!("failed to discover active Emby migration jobs during startup");
+            return;
+        };
+        for job in jobs {
+            if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
+                continue;
+            }
+            service.clone().spawn(job.id);
+        }
+    }
+
     pub fn require_database_selection(mut self) -> Self {
         self.database_selection_required = true;
         self
@@ -708,6 +735,38 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/v1/admin/plugin-store",
             get(admin_plugin_store).put(admin_update_plugin_store),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/test",
+            post(admin_test_emby_migration),
+        )
+        .route(
+            "/api/v1/admin/emby-migration",
+            get(admin_list_emby_migrations).post(admin_create_emby_migration),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/{job_id}",
+            get(admin_get_emby_migration),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/{job_id}/cancel",
+            post(admin_cancel_emby_migration),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/{job_id}/retry",
+            post(admin_retry_emby_migration),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/{job_id}/users",
+            get(admin_list_emby_migration_users),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/{job_id}/matches",
+            get(admin_list_emby_migration_matches),
+        )
+        .route(
+            "/api/v1/admin/emby-migration/{job_id}/imports",
+            get(admin_list_emby_migration_imports),
         )
         .route(
             "/api/v1/admin/users",
@@ -1007,6 +1066,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/v1/items/{item_id}/progress", post(lux_post_progress))
         .route("/api/v1/items/{item_id}/favorite", put(lux_set_favorite))
         .route("/api/v1/items/{item_id}/played", put(lux_set_played))
+        .route("/api/v1/playback-history", get(lux_list_playback_history))
         .route(
             "/api/v1/items/{item_id}/metadata",
             get(lux_get_metadata).patch(lux_update_metadata),
@@ -1425,6 +1485,7 @@ fn emby_routes() -> Router<AppState> {
         .route("/System/Ping", get(emby_ping).post(emby_ping))
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
+        .route("/Users/authenticatebyname", post(emby_authenticate))
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))
@@ -1749,8 +1810,12 @@ struct EmbyAuthenticateRequest {
 async fn emby_authenticate(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(request): Json<EmbyAuthenticateRequest>,
+    body: Bytes,
 ) -> Response {
+    let request = match parse_emby_authenticate_request(&headers, &body) {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
     let Some(auth) = state.emby_auth.clone() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -1803,6 +1868,38 @@ async fn emby_authenticate(
             StatusCode::UNAUTHORIZED.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn parse_emby_authenticate_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<EmbyAuthenticateRequest, StatusCode> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default();
+
+    match content_type {
+        "application/json" => serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST),
+        "application/x-www-form-urlencoded" => {
+            let mut username = None;
+            let mut password = None;
+            for (key, value) in url::form_urlencoded::parse(body) {
+                match key.as_ref() {
+                    "Username" => username = Some(value.into_owned()),
+                    "Pw" => password = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+            Ok(EmbyAuthenticateRequest {
+                username: username.ok_or(StatusCode::BAD_REQUEST)?,
+                password: password.ok_or(StatusCode::BAD_REQUEST)?,
+            })
+        }
+        _ => Err(StatusCode::UNSUPPORTED_MEDIA_TYPE),
     }
 }
 
@@ -4804,6 +4901,44 @@ async fn lux_get_playback(
     .into_response()
 }
 
+async fn lux_list_playback_history(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.emby_migration.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service
+        .list_playback_history(&user.id.to_string(), offset, limit)
+        .await
+    {
+        Ok(events) => Json(json!({
+            "events": events,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => emby_migration_error(&headers, error),
+    }
+}
+
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum LuxPlaybackState {
@@ -7351,21 +7486,8 @@ async fn auth_login(
         )
         .into_response();
     }
-    let session = match auth.login(&request.username, &request.password).await {
-        Ok(Some(session)) => {
-            state.login_rate_limiter.record_success(&login_key).await;
-            session
-        }
-        Ok(None) => {
-            state.login_rate_limiter.record_failure(&login_key).await;
-            return api_error(
-                &headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::InvalidCredentials,
-                "用户名或密码错误",
-            )
-            .into_response();
-        }
+    let mut session = match auth.login(&request.username, &request.password).await {
+        Ok(session) => session,
         Err(_) => {
             return api_error(
                 &headers,
@@ -7376,6 +7498,40 @@ async fn auth_login(
             .into_response();
         }
     };
+    if session.is_none()
+        && let Some(migration) = state.emby_migration.clone()
+    {
+        match migration
+            .authenticate_pending_user(&request.username, &request.password)
+            .await
+        {
+            Ok(true) => match auth.login(&request.username, &request.password).await {
+                Ok(reauthenticated) => session = reauthenticated,
+                Err(_) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        lux::ApiErrorCode::DatabaseUnavailable,
+                        "登录暂时不可用",
+                    )
+                    .into_response();
+                }
+            },
+            Ok(false) => {}
+            Err(_) => {}
+        }
+    }
+    let Some(session) = session else {
+        state.login_rate_limiter.record_failure(&login_key).await;
+        return api_error(
+            &headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::InvalidCredentials,
+            "用户名或密码错误",
+        )
+        .into_response();
+    };
+    state.login_rate_limiter.record_success(&login_key).await;
     if state.remote_access.is_remote(
         header_str(&headers, "x-lux-peer-ip"),
         header_str(&headers, "x-forwarded-for"),
@@ -17457,6 +17613,316 @@ async fn admin_plugin_store(headers: HeaderMap, State(state): State<AppState>) -
         "defaultUrl": crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL,
     }))
     .into_response()
+}
+
+async fn admin_test_emby_migration(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(source): Json<EmbyMigrationSource>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if let Err(error) = source.validate() {
+        let message = match error {
+            MigrationInputError::PrivateNetworkNotAllowed => {
+                "Emby 地址属于局域网或保留地址，请明确允许局域网连接"
+            }
+            MigrationInputError::InvalidSecret => "Emby API key 无效",
+            MigrationInputError::InvalidSourceUrl | MigrationInputError::InvalidIdentifier => {
+                "Emby 地址无效"
+            }
+        };
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            message,
+        )
+        .into_response();
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let client = EmbyMigrationPluginClient::new(plugins.clone());
+    match client.test_connection(&source).await {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
+async fn admin_create_emby_migration(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<CreateMigrationRequest>,
+) -> Response {
+    let actor = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.emby_migration.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.create_job(&actor.id.to_string(), request).await {
+        Ok(job) => {
+            let job_id = job.id.clone();
+            service.clone().spawn(job_id.clone());
+            record_audit_event(
+                &state,
+                &headers,
+                "EMBY_MIGRATION_CREATED",
+                Some("emby_migration_job"),
+                Some(&job_id),
+                "{}",
+            )
+            .await;
+            (StatusCode::ACCEPTED, Json(json!({ "job": job }))).into_response()
+        }
+        Err(error) => emby_migration_error(&headers, error),
+    }
+}
+
+async fn admin_list_emby_migrations(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.emby_migration.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let jobs = match service.list_jobs(offset, limit).await {
+        Ok(jobs) => jobs,
+        Err(error) => return emby_migration_error(&headers, error),
+    };
+    let total = match service.count_jobs().await {
+        Ok(total) => total,
+        Err(error) => return emby_migration_error(&headers, error),
+    };
+    Json(json!({
+        "jobs": jobs,
+        "total": total,
+        "page": offset / limit + 1,
+        "pageSize": limit,
+    }))
+    .into_response()
+}
+
+async fn admin_get_emby_migration(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(service) = state.emby_migration.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.get_job(&job_id).await {
+        Ok(job) => Json(json!({ "job": job })).into_response(),
+        Err(error) => emby_migration_error(&headers, error),
+    }
+}
+
+async fn admin_cancel_emby_migration(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.emby_migration.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.cancel_job(&job_id).await {
+        Ok(true) => Json(json!({ "cancelRequested": true })).into_response(),
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "迁移任务不存在或已经结束",
+        )
+        .into_response(),
+        Err(error) => emby_migration_error(&headers, error),
+    }
+}
+
+async fn admin_retry_emby_migration(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.emby_migration.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.resume_job(&job_id).await {
+        Ok(true) => {
+            service.clone().spawn(job_id.clone());
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "jobId": job_id, "status": "ACCEPTED" })),
+            )
+                .into_response()
+        }
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "迁移任务不能恢复",
+        )
+        .into_response(),
+        Err(error) => emby_migration_error(&headers, error),
+    }
+}
+
+fn emby_migration_error(headers: &HeaderMap, error: EmbyMigrationServiceError) -> Response {
+    let (status, message) = match error {
+        EmbyMigrationServiceError::InvalidInput(_) => {
+            (StatusCode::BAD_REQUEST, "Emby 迁移参数无效")
+        }
+        EmbyMigrationServiceError::NotFound => (StatusCode::NOT_FOUND, "迁移任务不存在"),
+        EmbyMigrationServiceError::InvalidState => {
+            (StatusCode::CONFLICT, "迁移任务状态不允许此操作")
+        }
+        EmbyMigrationServiceError::Plugin(
+            crate::application::plugins::PluginServiceError::InvalidConfig,
+        ) => (StatusCode::BAD_REQUEST, "Emby 迁移插件配置无效"),
+        EmbyMigrationServiceError::Plugin(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "Emby 迁移插件暂时不可用")
+        }
+        EmbyMigrationServiceError::Storage(_)
+        | EmbyMigrationServiceError::User(_)
+        | EmbyMigrationServiceError::Io(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "Emby 迁移服务暂时不可用")
+        }
+    };
+    api_error(headers, status, lux::ApiErrorCode::InvalidRequest, message).into_response()
+}
+
+async fn admin_list_emby_migration_users(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_emby_migration_report(
+        headers,
+        job_id,
+        query,
+        state,
+        EmbyMigrationReportKind::Users,
+    )
+    .await
+}
+
+async fn admin_list_emby_migration_matches(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_emby_migration_report(
+        headers,
+        job_id,
+        query,
+        state,
+        EmbyMigrationReportKind::Matches,
+    )
+    .await
+}
+
+async fn admin_list_emby_migration_imports(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_emby_migration_report(
+        headers,
+        job_id,
+        query,
+        state,
+        EmbyMigrationReportKind::Imports,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum EmbyMigrationReportKind {
+    Users,
+    Matches,
+    Imports,
+}
+
+async fn admin_list_emby_migration_report(
+    headers: HeaderMap,
+    job_id: String,
+    query: AdminJobsQuery,
+    state: AppState,
+    kind: EmbyMigrationReportKind,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.emby_migration.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = match kind {
+        EmbyMigrationReportKind::Users => service
+            .list_user_links(&job_id, offset, limit)
+            .await
+            .map(|items| json!({ "users": items })),
+        EmbyMigrationReportKind::Matches => service
+            .list_item_matches(&job_id, offset, limit)
+            .await
+            .map(|items| json!({ "matches": items })),
+        EmbyMigrationReportKind::Imports => service
+            .list_import_records(&job_id, offset, limit)
+            .await
+            .map(|items| json!({ "imports": items })),
+    };
+    match result {
+        Ok(mut response) => {
+            response["page"] = json!(offset / limit + 1);
+            response["pageSize"] = json!(limit);
+            Json(response).into_response()
+        }
+        Err(error) => emby_migration_error(&headers, error),
+    }
 }
 
 #[derive(Deserialize)]

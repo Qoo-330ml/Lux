@@ -22,11 +22,12 @@ use crate::{
             CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, ChapterDetectRpcRequest, ChapterDetectRpcResult,
             ChapterLookupRpcRequest, ChapterLookupRpcResult, DANMAKU_MATCH_CAPABILITY,
             DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult,
-            DanmakuMatchStatus, IP_LOCATION_CAPABILITY, IpLocationRpcRequest, IpLocationRpcResult,
-            MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult, MediaProbeRpcStreamType,
-            NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD, NotificationSendRpcResult,
-            PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
-            PLUGIN_CATEGORY_SCRAPER, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU,
+            DanmakuMatchStatus, EMBY_MIGRATION_CAPABILITY, IP_LOCATION_CAPABILITY,
+            IpLocationRpcRequest, IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
+            MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD,
+            NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_MIGRATION,
+            PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_CATEGORY_SCRAPER,
+            PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION,
             PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
             PluginConfigField, PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
@@ -60,6 +61,7 @@ pub const MEDIA_INFO_LEGACY_PLUGIN_ID: &str = "org.lux.media-info";
 pub const IP_HIOFD_PLUGIN_ID: &str = "org.lux.ip-hiofd";
 pub const IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
 pub const DANMAKU_PLUGIN_ID: &str = "org.lux.danmaku";
+pub const EMBY_MIGRATION_PLUGIN_ID: &str = "org.lux.emby-migration";
 const CONFIG_SOURCE_CUSTOM: &str = "CUSTOM";
 const CONFIG_SOURCE_ENVIRONMENT: &str = "ENVIRONMENT";
 const CONFIG_SOURCE_READ_ACCESS_TOKEN: &str = "READ_ACCESS_TOKEN";
@@ -632,6 +634,40 @@ impl PluginService {
             return Err(PluginServiceError::InvalidResponse);
         }
         serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)
+    }
+
+    pub async fn call_migration(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog.get(EMBY_MIGRATION_PLUGIN_ID).ok_or_else(|| {
+            PluginServiceError::UnknownPlugin(EMBY_MIGRATION_PLUGIN_ID.to_owned())
+        })?;
+        if !is_data_migration_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(
+                EMBY_MIGRATION_PLUGIN_ID.to_owned(),
+            ));
+        }
+        let (installed, enabled) = self.plugin_state(EMBY_MIGRATION_PLUGIN_ID).await?;
+        if !installed || !enabled {
+            return Err(PluginServiceError::Unavailable(
+                EMBY_MIGRATION_PLUGIN_ID.to_owned(),
+            ));
+        }
+        let value = self
+            .supervisor
+            .call_without_config_access(EMBY_MIGRATION_PLUGIN_ID, method, params)
+            .await
+            .map_err(PluginServiceError::Runtime)?;
+        if serde_json::to_vec(&value)
+            .ok()
+            .is_none_or(|bytes| bytes.len() > 4 * 1024 * 1024)
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        Ok(value)
     }
 
     pub async fn validate_notification_provider(
@@ -2510,6 +2546,16 @@ fn is_notification_plugin(plugin: &DiscoveredPlugin) -> bool {
             .capabilities
             .iter()
             .any(|capability| capability == NOTIFICATION_SEND_CAPABILITY)
+}
+
+fn is_data_migration_plugin(plugin: &DiscoveredPlugin) -> bool {
+    plugin.manifest.plugin_type == PLUGIN_TYPE_DATA_MIGRATION
+        && plugin.manifest.category == PLUGIN_CATEGORY_MIGRATION
+        && plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == EMBY_MIGRATION_CAPABILITY)
 }
 
 fn validate_chapter_detect_request(

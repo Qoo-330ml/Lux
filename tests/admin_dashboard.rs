@@ -151,6 +151,16 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(body["stats"]["userCount"], 1);
     assert!(body["health"]["runtime"]["seconds"].is_number());
     assert_eq!(body["health"]["resources"]["cpu"]["source"], "cgroup");
+    assert!(
+        body["health"]["resources"]["cpu"]
+            .get("capacityCores")
+            .is_some()
+    );
+    assert!(
+        body["health"]["resources"]["cpu"]
+            .get("usageCores")
+            .is_some()
+    );
     assert_eq!(
         body["health"]["resources"]["mediaStorage"]["path"],
         "/media"

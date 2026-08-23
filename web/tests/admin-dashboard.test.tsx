@@ -19,7 +19,7 @@ const dashboard: AdminDashboard = {
     schemaVersion: 37,
     runtime: { seconds: 90_061 },
     resources: {
-      cpu: { available: true, source: "cgroup", usagePercent: 37.5, limitCores: 2 },
+      cpu: { available: true, source: "cgroup", usageCores: 0.75, capacityCores: 2, usagePercent: 37.5, limitCores: 2 },
       memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: 4_294_967_296, usagePercent: 25 },
       mediaStorage: { available: true, source: "container-filesystem", path: "/media", totalBytes: 107_374_182_400, usedBytes: 10_737_418_240, availableBytes: 96_636_764_160, usagePercent: 10 },
     },
@@ -147,7 +147,7 @@ describe("AdminDashboardPage", () => {
     expect(overview?.querySelector('[data-overview-value="运行时长"]')?.textContent).toBe("运行时长：1天 1时 1分 1秒");
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-value")).toHaveLength(6);
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-icon")).toHaveLength(0);
-    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["42", "7", "3", "37.5%", "1.0 GiB / 4.0 GiB", "10.0 GiB / 100.0 GiB"]);
+    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["42", "7", "3", "0.8 / 2.0 核（37.5%）", "1.0 GiB / 4.0 GiB（25.0%）", "10.0 GiB / 100.0 GiB"]);
     expect(overview?.querySelector(".lux-admin-overview-device")).toBeNull();
     expect(overview?.querySelectorAll(".lux-admin-overview-info-icon")).toHaveLength(0);
     expect(overview?.textContent).toContain("存储空间");
@@ -216,7 +216,7 @@ describe("AdminDashboardPage", () => {
       health: {
         ...dashboard.health,
         resources: {
-          cpu: { available: false, source: "cgroup", usagePercent: null, limitCores: null },
+          cpu: { available: false, source: "cgroup", usageCores: null, capacityCores: null, usagePercent: null, limitCores: null },
           memory: { available: false, source: "cgroup", usedBytes: null, limitBytes: null, usagePercent: null },
           mediaStorage: { available: false, source: "container-filesystem", path: "/media", totalBytes: null, usedBytes: null, availableBytes: null, usagePercent: null },
         },
@@ -241,6 +241,41 @@ describe("AdminDashboardPage", () => {
     });
     const values = [...container.querySelectorAll(".lux-admin-overview-metric-value")].map((value) => value.textContent);
     expect(values.slice(3)).toEqual(["不可用", "不可用", "不可用"]);
+  });
+
+  it("formats CPU against available cores and keeps unlimited memory concise", async () => {
+    const unlimitedDashboard: AdminDashboard = {
+      ...dashboard,
+      health: {
+        ...dashboard.health,
+        resources: {
+          ...dashboard.health.resources,
+          cpu: { available: true, source: "cgroup", usageCores: 1.8, capacityCores: 8, usagePercent: 22.5, limitCores: null },
+          memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: null, usagePercent: null },
+        },
+      },
+    };
+    vi.spyOn(api, "adminDashboard").mockResolvedValue(unlimitedDashboard);
+    vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminDashboardPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-card")).not.toBeNull());
+    });
+    const values = [...container.querySelectorAll(".lux-admin-overview-metric-value")].map((value) => value.textContent);
+    expect(values.slice(3)).toEqual(["1.8 / 8.0 核（22.5%）", "1.0 GiB", "10.0 GiB / 100.0 GiB"]);
+    expect(container.textContent).not.toContain("容器可见容量");
+    expect(container.textContent).not.toContain("未设置容器上限");
   });
 
   it("labels PostgreSQL without displaying SQLite journal details", async () => {

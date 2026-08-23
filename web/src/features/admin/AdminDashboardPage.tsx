@@ -187,14 +187,16 @@ function formatRuntime(seconds: number | null | undefined) {
 
 function formatCpu(cpu: AdminDashboard["health"]["resources"]["cpu"]) {
   if (!cpu.available) return "不可用";
-  if (cpu.usagePercent === null) return "采样中";
-  return `${cpu.usagePercent.toFixed(1)}%`;
+  if (cpu.usageCores === null || cpu.capacityCores === null || cpu.usagePercent === null) return "采样中";
+  return `${cpu.usageCores.toFixed(1)} / ${cpu.capacityCores.toFixed(1)} 核（${cpu.usagePercent.toFixed(1)}%）`;
 }
 
 function formatMemory(memory: AdminDashboard["health"]["resources"]["memory"]) {
   if (!memory.available || memory.usedBytes === null) return "不可用";
   const used = formatBytes(memory.usedBytes);
-  return memory.limitBytes === null ? used : `${used} / ${formatBytes(memory.limitBytes)}`;
+  return memory.limitBytes === null || memory.usagePercent === null
+    ? used
+    : `${used} / ${formatBytes(memory.limitBytes)}（${memory.usagePercent.toFixed(1)}%）`;
 }
 
 function formatStorage(storage: AdminDashboard["health"]["resources"]["mediaStorage"]) {

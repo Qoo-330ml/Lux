@@ -725,7 +725,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     assert_eq!(first["metadataSchedule"], "*/5 * * * *");
     assert_eq!(first["scanConcurrency"], 4);
     assert_eq!(first["probeConcurrency"], 3);
-    assert_eq!(second["reconciliationSchedule"], Value::Null);
+    assert_eq!(second["reconciliationSchedule"], "0 3 * * 0");
     assert_eq!(second["scanConcurrency"], 7);
     assert_eq!(first["mediaStrategy"]["imageLanguage"], "ja");
 

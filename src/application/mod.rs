@@ -9,6 +9,8 @@ pub mod database_setup;
 pub mod deletion;
 pub mod directory_browser;
 pub mod downloads;
+pub mod emby_migration;
+pub mod emby_migration_service;
 pub mod home;
 pub mod identification;
 pub mod images;

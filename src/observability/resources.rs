@@ -108,6 +108,10 @@ pub struct ResourceSnapshot {
 pub struct CpuSnapshot {
     pub available: bool,
     pub source: &'static str,
+    #[serde(rename = "usageCores")]
+    pub usage_cores: Option<f64>,
+    #[serde(rename = "capacityCores")]
+    pub capacity_cores: Option<f64>,
     #[serde(rename = "usagePercent")]
     pub usage_percent: Option<f64>,
     #[serde(rename = "limitCores")]
@@ -152,11 +156,19 @@ async fn cpu_snapshot(previous_sample: Arc<Mutex<Option<CpuSample>>>) -> CpuSnap
         return CpuSnapshot {
             available: false,
             source: "cgroup",
+            usage_cores: None,
+            capacity_cores: None,
             usage_percent: None,
             limit_cores: None,
         };
     };
 
+    let capacity_cores = select_cpu_capacity(
+        limit_cores,
+        std::thread::available_parallelism()
+            .ok()
+            .map(|value| value.get()),
+    );
     let observed_at = Instant::now();
     let previous = previous_sample.lock().ok().and_then(|mut sample| {
         sample.replace(CpuSample {
@@ -164,26 +176,28 @@ async fn cpu_snapshot(previous_sample: Arc<Mutex<Option<CpuSample>>>) -> CpuSnap
             observed_at,
         })
     });
+    let usage_cores = previous.and_then(|sample| {
+        let elapsed_usec = observed_at.checked_duration_since(sample.observed_at)?;
+        let elapsed_usec = u64::try_from(elapsed_usec.as_micros()).ok()?;
+        calculate_cpu_usage_cores(usage_usec.saturating_sub(sample.usage_usec), elapsed_usec)
+    });
     let usage_percent = previous.and_then(|sample| {
         let elapsed_usec = observed_at.checked_duration_since(sample.observed_at)?;
         let elapsed_usec = u64::try_from(elapsed_usec.as_micros()).ok()?;
+        let capacity = capacity_cores.filter(|capacity| *capacity > 0.0)?;
         calculate_cpu_usage_percent(
             usage_usec.saturating_sub(sample.usage_usec),
             elapsed_usec,
-            limit_cores.unwrap_or(1.0),
+            capacity,
         )
-        .map(|percent| {
-            if limit_cores.is_some() {
-                percent.min(100.0)
-            } else {
-                percent
-            }
-        })
+        .map(|percent| percent.min(100.0))
     });
 
     CpuSnapshot {
         available: true,
         source: "cgroup",
+        usage_cores,
+        capacity_cores,
         usage_percent,
         limit_cores,
     }
@@ -408,6 +422,17 @@ fn calculate_cpu_usage_percent(
     Some(delta_usage_usec as f64 * 100.0 / elapsed_usec as f64 / capacity_cores)
 }
 
+fn calculate_cpu_usage_cores(delta_usage_usec: u64, elapsed_usec: u64) -> Option<f64> {
+    if elapsed_usec == 0 {
+        return None;
+    }
+    Some(delta_usage_usec as f64 / elapsed_usec as f64)
+}
+
+fn select_cpu_capacity(limit_cores: Option<f64>, visible_cores: Option<usize>) -> Option<f64> {
+    limit_cores.or_else(|| visible_cores.map(|cores| cores as f64))
+}
+
 fn memory_usage_percent(used_bytes: u64, limit_bytes: Option<u64>) -> Option<f64> {
     let limit_bytes = limit_bytes.filter(|limit| *limit > 0)?;
     Some((used_bytes as f64 * 100.0 / limit_bytes as f64).min(100.0))
@@ -447,8 +472,9 @@ pub fn recommended_background_concurrency(
 #[cfg(test)]
 mod tests {
     use super::{
-        ResourceMetrics, calculate_cpu_usage_percent, memory_usage_percent, parse_cgroup_limit,
-        parse_media_storage_values, process_is_member, recommended_background_concurrency,
+        ResourceMetrics, calculate_cpu_usage_cores, calculate_cpu_usage_percent,
+        memory_usage_percent, parse_cgroup_limit, parse_media_storage_values, process_is_member,
+        recommended_background_concurrency, select_cpu_capacity,
     };
     use std::time::Duration;
 
@@ -468,6 +494,18 @@ mod tests {
             calculate_cpu_usage_percent(2_000_000, 1_000_000, 2.0),
             Some(100.0)
         );
+    }
+
+    #[test]
+    fn cpu_usage_reports_consumed_cores_for_dashboard_display() {
+        assert_eq!(calculate_cpu_usage_cores(1_800_000, 1_000_000), Some(1.8));
+    }
+
+    #[test]
+    fn cpu_capacity_prefers_a_cgroup_limit_over_visible_cores() {
+        assert_eq!(select_cpu_capacity(Some(2.0), Some(8)), Some(2.0));
+        assert_eq!(select_cpu_capacity(None, Some(8)), Some(8.0));
+        assert_eq!(select_cpu_capacity(None, None), None);
     }
 
     #[test]

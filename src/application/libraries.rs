@@ -5,7 +5,9 @@ use std::{
 };
 
 use crate::{
-    application::schedule::validate_cron,
+    application::schedule::{
+        DEFAULT_METADATA_SCHEDULE, DEFAULT_RECONCILIATION_SCHEDULE, validate_cron,
+    },
     domain::ids::{LibraryId, LibraryRootId},
     library::{
         LibraryKind, LibraryRecord, LibraryRootRecord, RootOverlap, RootPathError,
@@ -88,8 +90,8 @@ impl LibraryService {
                 scraper_id: scraper_id.as_deref(),
                 realtime_watch_enabled: true,
                 realtime_metadata_auto_match_enabled,
-                reconciliation_schedule: None,
-                metadata_schedule: None,
+                reconciliation_schedule: Some(DEFAULT_RECONCILIATION_SCHEDULE),
+                metadata_schedule: scraper_id.is_some().then_some(DEFAULT_METADATA_SCHEDULE),
                 scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
                 probe_concurrency: DEFAULT_PROBE_CONCURRENCY,
                 chapter_source_id: chapter_source_id.as_deref(),

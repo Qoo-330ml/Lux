@@ -2,6 +2,8 @@ use std::fmt;
 
 use time::OffsetDateTime;
 
+pub const DEFAULT_RECONCILIATION_SCHEDULE: &str = "0 3 * * 0";
+pub const DEFAULT_METADATA_SCHEDULE: &str = "0 4 * * 0";
 pub const DEFAULT_STRM_MEDIA_INFO_SCHEDULE: &str = "0 3 * * *";
 pub const STRM_MEDIA_INFO_TASK_TYPE: &str = "STRM_MEDIA_INFO";
 pub const DEFAULT_CHAPTER_DETECTION_SCHEDULE: &str = "0 4 * * 0";
