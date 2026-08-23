@@ -23,7 +23,6 @@ const AdminLibrariesPage = lazy(() => import("../features/admin/AdminLibrariesPa
 const AdminPluginsPage = lazy(() => import("../features/admin/AdminPluginsPage").then(({ AdminPluginsPage }) => ({ default: AdminPluginsPage })));
 const AdminNotificationsPage = lazy(() => import("../features/admin/AdminNotificationsPage").then(({ AdminNotificationsPage }) => ({ default: AdminNotificationsPage })));
 const AdminUsersPage = lazy(() => import("../features/admin/AdminUsersPage").then(({ AdminUsersPage }) => ({ default: AdminUsersPage })));
-const AdminEmbyMigrationPage = lazy(() => import("../features/admin/AdminEmbyMigrationPage").then(({ AdminEmbyMigrationPage }) => ({ default: AdminEmbyMigrationPage })));
 const AdminOperationsPage = lazy(() => import("../features/admin/AdminOperationsPage").then(({ AdminOperationsPage }) => ({ default: AdminOperationsPage })));
 const AdminSettingsPage = lazy(() => import("../features/admin/AdminSettingsPage").then(({ AdminSettingsPage }) => ({ default: AdminSettingsPage })));
 const AdminChangelogPage = lazy(() => import("../features/admin/AdminChangelogPage").then(({ AdminChangelogPage }) => ({ default: AdminChangelogPage })));
@@ -86,7 +85,6 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
             <Route path="plugins" element={<AdminPluginsPage />} />
             <Route path="notifications" element={<AdminNotificationsPage />} />
             <Route path="users" element={<AdminUsersPage />} />
-            <Route path="emby-migration" element={<AdminEmbyMigrationPage />} />
             <Route path="jobs" element={<AdminOperationsPage />} />
             <Route path="settings" element={<AdminSettingsPage />} />
             <Route path="changelog" element={<AdminChangelogPage />} />

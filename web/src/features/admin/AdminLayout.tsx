@@ -1,4 +1,4 @@
-import { Activity, ArrowRightLeft, BellRing, BookOpen, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
+import { Activity, BellRing, BookOpen, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useAdminEvents } from "./useAdminEvents";
 
@@ -8,7 +8,6 @@ export const adminNav = [
   { to: "/admin/plugins", label: "插件库", icon: PackageOpen },
   { to: "/admin/notifications", label: "通知", icon: BellRing },
   { to: "/admin/users", label: "用户与权限", icon: Users },
-  { to: "/admin/emby-migration", label: "Emby 迁移", icon: ArrowRightLeft },
   { to: "/admin/jobs", label: "任务与日志", icon: FileClock },
   { to: "/admin/settings", label: "服务器设置", icon: Settings2 },
   { to: "/admin/changelog", label: "更新日志", icon: BookOpen },

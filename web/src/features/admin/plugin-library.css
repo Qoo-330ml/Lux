@@ -318,6 +318,14 @@
   box-shadow: 0 28px 80px rgba(0, 0, 0, .5);
 }
 
+.lux-admin-plugin-migration-dialog {
+  width: min(100%, 1080px);
+}
+
+.lux-admin-plugin-migration-dialog .lux-emby-migration-workspace {
+  padding-bottom: 0;
+}
+
 .lux-admin-plugin-dialog-heading {
   display: flex;
   align-items: flex-start;
