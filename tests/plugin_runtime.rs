@@ -206,6 +206,55 @@ async fn supervises_a_plugin_process_over_json_lines() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn multiplexes_concurrent_plugin_calls_and_matches_out_of_order_responses() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use luxd::application::plugin_runtime::PluginSupervisor;
+
+    let root = tempdir().expect("temp dir should be created");
+    let plugin = root.path().join("example");
+    fs::create_dir_all(plugin.join("binaries")).expect("plugin directory should be created");
+    let entrypoint = plugin.join("binaries/plugin");
+    fs::write(
+        &entrypoint,
+        b"#!/bin/sh
+first=
+while IFS= read -r line; do
+  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')
+  marker=$(printf '%s' \"$line\" | sed -n 's/.*\"n\":\\([0-9]*\\).*/\\1/p')
+  if [ -z \"$first\" ]; then
+    first=$id
+    first_marker=$marker
+  else
+    printf '{\"id\":\"%s\",\"result\":{\"marker\":\"%s\"}}\\n' \"$id\" \"$marker\"
+    printf '{\"id\":\"%s\",\"result\":{\"marker\":\"%s\"}}\\n' \"$first\" \"$first_marker\"
+    first=
+    first_marker=
+  fi
+done
+",
+    )
+    .expect("plugin process should be written");
+    fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700))
+        .expect("plugin process should be executable");
+    write_manifest(&plugin, "binaries/plugin");
+    write_trusted_keys(root.path());
+
+    let catalog = PluginCatalog::discover(root.path());
+    let supervisor = PluginSupervisor::new(catalog);
+    let first = supervisor.call("org.lux.example", "plugin.health", json!({"n": 1}));
+    let second = supervisor.call("org.lux.example", "plugin.health", json!({"n": 2}));
+    let (first, second) = tokio::join!(first, second);
+
+    let first = first.expect("first concurrent call should succeed");
+    let second = second.expect("second concurrent call should succeed");
+    assert_eq!(first["marker"], "1");
+    assert_eq!(second["marker"], "2");
+    supervisor.stop_all().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn supervises_a_plugin_process_when_catalog_paths_are_relative()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt;
