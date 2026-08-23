@@ -1762,7 +1762,7 @@ impl PluginService {
         // Keep the previous archives until the newly moved archive is visible in a
         // fresh catalog. This matters for updates: a discovery failure must leave
         // the old package available for the next attempt.
-        let catalog = PluginCatalog::discover(&plugin_dir);
+        let catalog = PluginCatalog::discover_prefer(&plugin_dir, &entry.id, &entry.version);
         if !catalog
             .get(&entry.id)
             .is_some_and(|plugin| plugin.manifest.version == entry.version)

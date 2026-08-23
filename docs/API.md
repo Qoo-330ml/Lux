@@ -125,6 +125,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /Users/AuthenticateByName`：读取 `Username`/`Pw`，解析 `Authorization`、`X-Emby-Authorization` 或 `X-Emby-Authentication` 中的 `Client`、`Device`、`DeviceId`、`Version`，返回 `AccessToken`、`ServerId`，以及包含 `ServerId`、`Configuration`、`Policy` 等兼容字段的 `User` 和 `SessionInfo`。
 - `POST /Sessions/Logout`：接受 `X-Emby-Token` 或 `api_key`，撤销对应 token，成功返回 204。
 - `System/Info`：需要有效的 `X-Emby-Token` 或 `api_key`；`System/Info/Public` 和 `System/Ping` 不要求认证。
+- `GET /DisplayPreferences/{displayPreferencesId}`：需要有效 Emby token/API Key，并接受 `userId` 与 `client`；当前返回 Emby 兼容的默认显示偏好，支持根路径和 `/emby` 前缀。
 
 Emby access token 与 Web session 完全分离。access token 是高熵随机值，只在认证响应中返回；数据库只保存 SHA-256 哈希以及设备元数据。认证失败响应不区分“用户不存在”和“密码错误”。
 

@@ -5,12 +5,13 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AdminEmbyMigrationPage } from "../src/features/admin/AdminEmbyMigrationPage";
+import { EmbyMigrationPluginConfig } from "../src/features/admin/EmbyMigrationPluginConfig";
 import { api } from "../src/lib/api/client";
+import type { AdminPlugin } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-describe("AdminEmbyMigrationPage", () => {
+describe("EmbyMigrationPluginConfig", () => {
   let container: HTMLDivElement;
   let root: Root;
 
@@ -20,7 +21,7 @@ describe("AdminEmbyMigrationPage", () => {
     vi.restoreAllMocks();
   });
 
-  it("uses the Emby plugin settings, starts a dry run, and shows the migration capability warning", async () => {
+  it("keeps the full migration workspace inside the plugin configuration", async () => {
     const testSource = vi.spyOn(api, "testAdminEmbyMigration").mockResolvedValue({
       serverName: "家庭 Emby",
       productName: "Emby Server",
@@ -47,7 +48,32 @@ describe("AdminEmbyMigrationPage", () => {
         error: null,
       },
     });
+    vi.spyOn(api, "updateAdminPluginConfig").mockResolvedValue({ plugin: {} as AdminPlugin });
     vi.spyOn(api, "adminEmbyMigrations").mockResolvedValue({ jobs: [], total: 0, page: 1, pageSize: 20 });
+    const plugin: AdminPlugin = {
+      id: "org.lux.emby-migration",
+      name: "Emby 迁移助手",
+      description: "仅支持 Emby 到 Lux。",
+      category: "MIGRATION",
+      version: "1.0.0",
+      runtime: "process",
+      capabilities: ["migration.emby"],
+      status: "READY",
+      running: true,
+      lastError: null,
+      installed: true,
+      enabled: true,
+      configured: true,
+      available: true,
+      configurable: true,
+      configFields: [
+        { key: "baseUrl", label: "Emby 地址", type: "text", required: true, sensitive: false },
+        { key: "apiKey", label: "Emby API Key", type: "password", required: true, sensitive: true },
+        { key: "allowPrivateNetwork", label: "允许连接局域网地址", type: "toggle", required: false, sensitive: false },
+      ],
+      configValues: { baseUrl: "http://emby.local:8096", allowPrivateNetwork: false },
+      configSource: "PLUGIN_CONFIG",
+    };
 
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -55,19 +81,17 @@ describe("AdminEmbyMigrationPage", () => {
     act(() => {
       root.render(
         <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-          <MemoryRouter>
-            <AdminEmbyMigrationPage />
-          </MemoryRouter>
+          <MemoryRouter><EmbyMigrationPluginConfig plugin={plugin} /></MemoryRouter>
         </QueryClientProvider>,
       );
     });
 
     await act(async () => {
-      await vi.waitFor(() => expect(container.textContent).toContain("Emby 迁移"));
+      await vi.waitFor(() => expect(container.textContent).toContain("连接设置"));
     });
+    expect(container.querySelector("#emby-plugin-base-url")).not.toBeNull();
+    expect(container.querySelector("#emby-plugin-api-key")).not.toBeNull();
     expect(container.querySelector("#emby-migration-base-url")).toBeNull();
-    expect(container.querySelector("#emby-migration-api-key")).toBeNull();
-    expect(container.querySelector<HTMLAnchorElement>('a[href="/admin/plugins"]')).not.toBeNull();
     act(() => {
       container.querySelector<HTMLButtonElement>('button[aria-label="测试 Emby 连接"]')?.click();
     });

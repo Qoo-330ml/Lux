@@ -121,6 +121,30 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
         .await?;
     assert_eq!(info_with_query_token.status(), reqwest::StatusCode::OK);
 
+    let user_id = login_body["User"]["Id"]
+        .as_str()
+        .ok_or("missing logged-in user id")?;
+    for path in [
+        "/DisplayPreferences/usersettings",
+        "/emby/DisplayPreferences/usersettings",
+    ] {
+        let response = client
+            .get(format!("http://{address}{path}"))
+            .query(&[("userId", user_id), ("client", "Infuse")])
+            .header("X-Emby-Token", &token)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let preferences: serde_json::Value = response.json().await?;
+        assert_eq!(preferences["Id"], "usersettings");
+        assert_eq!(preferences["Client"], "Infuse");
+        assert_eq!(preferences["SortBy"], "SortName");
+        assert_eq!(preferences["SortOrder"], "Ascending");
+        assert_eq!(preferences["ShowBackdrop"], true);
+        assert!(preferences["CustomPrefs"].is_object());
+    }
+
     assert_eq!(login_body["User"]["ServerName"], "客厅 Lux");
     let public_users = client
         .get(format!("http://{address}/Users/Public"))

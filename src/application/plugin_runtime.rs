@@ -51,6 +51,14 @@ pub struct PluginCatalog {
 
 impl PluginCatalog {
     pub fn discover(plugin_dir: &Path) -> Self {
+        Self::discover_with_preference(plugin_dir, None)
+    }
+
+    pub fn discover_prefer(plugin_dir: &Path, plugin_id: &str, plugin_version: &str) -> Self {
+        Self::discover_with_preference(plugin_dir, Some((plugin_id, plugin_version)))
+    }
+
+    fn discover_with_preference(plugin_dir: &Path, preferred_plugin: Option<(&str, &str)>) -> Self {
         let mut catalog = Self::default();
         let entries = match fs::read_dir(plugin_dir) {
             Ok(entries) => entries,
@@ -85,6 +93,25 @@ impl PluginCatalog {
             match result {
                 Ok(plugin) if ids.insert(plugin.manifest.id.clone()) => {
                     catalog.plugins.push(plugin)
+                }
+                Ok(plugin)
+                    if preferred_plugin.is_some_and(|(id, version)| {
+                        plugin.manifest.id == id && plugin.manifest.version == version
+                    }) =>
+                {
+                    if let Some(index) = catalog
+                        .plugins
+                        .iter()
+                        .position(|existing| existing.manifest.id == plugin.manifest.id)
+                    {
+                        let previous = std::mem::replace(&mut catalog.plugins[index], plugin);
+                        catalog.failures.push(PluginDiscoveryFailure {
+                            source_path: previous.source_path,
+                            message: format!("duplicate plugin id: {}", previous.manifest.id),
+                        });
+                    } else {
+                        catalog.plugins.push(plugin);
+                    }
                 }
                 Ok(plugin) => catalog.failures.push(PluginDiscoveryFailure {
                     source_path,

@@ -11,12 +11,12 @@ fn test_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[7_u8; 32])
 }
 
-fn signed_manifest_value(entrypoint: &str) -> Value {
+fn signed_manifest_value_with_version(entrypoint: &str, version: &str) -> Value {
     let mut value = json!({
         "formatVersion": 1,
         "id": "org.lux.example",
         "name": "Example plugin",
-        "version": "1.0.0",
+        "version": version,
         "apiVersion": 1,
         "runtime": {"kind": "process", "entrypoint": entrypoint},
         "type": "metadata",
@@ -34,8 +34,17 @@ fn signed_manifest_value(entrypoint: &str) -> Value {
     value
 }
 
+fn signed_manifest_value(entrypoint: &str) -> Value {
+    signed_manifest_value_with_version(entrypoint, "1.0.0")
+}
+
 fn manifest_bytes(entrypoint: &str) -> Vec<u8> {
     serde_json::to_vec_pretty(&signed_manifest_value(entrypoint))
+        .expect("manifest should serialize")
+}
+
+fn manifest_bytes_with_version(entrypoint: &str, version: &str) -> Vec<u8> {
+    serde_json::to_vec_pretty(&signed_manifest_value_with_version(entrypoint, version))
         .expect("manifest should serialize")
 }
 
@@ -124,6 +133,42 @@ fn discovers_a_zip_plugin_package_and_extracts_its_entrypoint() {
             .root_path
             .ends_with(".extracted/org.lux.example-1.0.0")
     );
+}
+
+#[test]
+fn prefers_the_requested_new_version_when_old_and_new_packages_coexist() {
+    let root = tempdir().expect("temp dir should be created");
+    let old = root.path().join("old");
+    fs::create_dir_all(old.join("binaries")).expect("old plugin directory should be created");
+    fs::write(old.join("binaries/plugin"), b"old").expect("old entrypoint should be written");
+    fs::write(
+        old.join("manifest.json"),
+        manifest_bytes_with_version("binaries/plugin", "1.0.0"),
+    )
+    .expect("old manifest should be written");
+
+    let archive_path = root.path().join("org.lux.example-1.1.0.zip");
+    let file = fs::File::create(&archive_path).expect("archive should be created");
+    let mut archive = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    archive
+        .start_file("manifest.json", options)
+        .expect("manifest entry should be created");
+    archive
+        .write_all(&manifest_bytes_with_version("binaries/plugin", "1.1.0"))
+        .expect("manifest should be written");
+    archive
+        .start_file("binaries/plugin", options)
+        .expect("entrypoint entry should be created");
+    archive
+        .write_all(b"new")
+        .expect("entrypoint should be written");
+    archive.finish().expect("archive should finish");
+
+    let catalog = PluginCatalog::discover_prefer(root.path(), "org.lux.example", "1.1.0");
+
+    assert_eq!(catalog.plugins.len(), 1);
+    assert_eq!(catalog.plugins[0].manifest.version, "1.1.0");
 }
 
 #[test]

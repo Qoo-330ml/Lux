@@ -1,9 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, CircleHelp, CloudDownload, LoaderCircle, RefreshCw, ShieldCheck, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleHelp, CloudDownload, LoaderCircle, RefreshCw, Save, ShieldCheck, XCircle } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type {
+  AdminPlugin,
   AdminEmbyMigrationImport,
   AdminEmbyMigrationJob,
   AdminEmbyMigrationMatch,
@@ -21,7 +22,58 @@ type MigrationReportData = {
 
 const pageSize = 50;
 
-export function AdminEmbyMigrationPage() {
+export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
+  const queryClient = useQueryClient();
+  const [baseUrl, setBaseUrl] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeyDirty, setApiKeyDirty] = useState(false);
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
+  const baseUrlField = plugin.configFields.find((field) => field.key === "baseUrl");
+  const apiKeyField = plugin.configFields.find((field) => field.key === "apiKey");
+  const privateNetworkField = plugin.configFields.find((field) => field.key === "allowPrivateNetwork");
+  const save = useMutation({
+    mutationFn: () => api.updateAdminPluginConfig(plugin.id, {
+      baseUrl: baseUrl.trim(),
+      ...(apiKeyDirty ? { apiKey } : {}),
+      allowPrivateNetwork,
+    }),
+    onSuccess: () => {
+      setApiKey("");
+      setApiKeyDirty(false);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
+    },
+  });
+
+  useEffect(() => {
+    const values = plugin.configValues ?? {};
+    setBaseUrl(typeof values.baseUrl === "string" ? values.baseUrl : "");
+    setAllowPrivateNetwork(values.allowPrivateNetwork === true);
+    setApiKey("");
+    setApiKeyDirty(false);
+  }, [plugin.configValues]);
+
+  return (
+    <div className="lux-emby-migration-plugin-config">
+      <section className="lux-emby-plugin-settings-panel" aria-labelledby="emby-plugin-settings-heading">
+        <PanelHeading headingId="emby-plugin-settings-heading" icon={<ShieldCheck size={19} />} title="连接设置" description="地址和 API Key 只在此插件配置中管理，迁移页面不再单独出现。" />
+        <form className="lux-emby-plugin-settings-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
+          {baseUrlField ? <label htmlFor="emby-plugin-base-url">{baseUrlField.label}<input id="emby-plugin-base-url" type="url" required={baseUrlField.required} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="http://emby.local:8096" autoComplete="url" /><small>{baseUrlField.description}</small></label> : null}
+          {apiKeyField ? <label htmlFor="emby-plugin-api-key">{apiKeyField.label}<input id="emby-plugin-api-key" type="password" required={apiKeyField.required && !plugin.configured} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空保留已保存的 API Key" autoComplete="new-password" /><small>{apiKeyField.description}</small></label> : null}
+          {privateNetworkField ? <label className="lux-admin-toggle lux-emby-private-toggle"><input type="checkbox" checked={allowPrivateNetwork} onChange={(event) => setAllowPrivateNetwork(event.target.checked)} /><span><strong>{privateNetworkField.label}</strong><small>{privateNetworkField.description}</small></span></label> : null}
+          <div className="lux-emby-plugin-settings-actions">
+            <button className="lux-button lux-button-primary" type="submit" disabled={save.isPending}><Save size={15} /> {save.isPending ? "保存中…" : "保存连接设置"}</button>
+            <span>连接凭据由 Emby 迁移插件配置管理。</span>
+          </div>
+          {save.error ? <InlineError message={save.error.message} /> : null}
+        </form>
+      </section>
+      <MigrationWorkspace />
+    </div>
+  );
+}
+
+function MigrationWorkspace() {
   const queryClient = useQueryClient();
   const [dryRun, setDryRun] = useState(true);
   const [mergePolicy, setMergePolicy] = useState<"MERGE" | "OVERWRITE" | "SKIP">("MERGE");
@@ -77,21 +129,11 @@ export function AdminEmbyMigrationPage() {
   const canStart = Boolean(connection && !createJob.isPending);
 
   return (
-    <div className="lux-admin-page lux-emby-migration-page">
-      <header className="lux-emby-migration-heading">
-        <div>
-          <span className="lux-admin-eyebrow">只读来源 · Emby → Lux</span>
-          <h1>Emby 迁移</h1>
-          <p>把 Emby 的用户、收藏和聚合播放状态安全导入 Lux。迁移任务不会向 Emby 写入任何数据。</p>
-        </div>
-        <ShieldCheck size={30} aria-hidden="true" />
-      </header>
-
+    <div className="lux-emby-migration-workspace">
       <section className="lux-admin-panel lux-emby-migration-panel" aria-labelledby="emby-connection-heading">
-        <PanelHeading headingId="emby-connection-heading" icon={<CloudDownload size={19} />} title="连接 Emby" description="Emby 地址、API Key 和局域网访问权限由迁移插件统一保存。" />
+        <PanelHeading headingId="emby-connection-heading" icon={<CloudDownload size={19} />} title="测试连接" description="使用上方插件配置中已保存的 Emby 连接信息。" />
         <div className="lux-emby-plugin-settings-notice">
-          <p>请先在插件库中打开“Emby 迁移助手”的设置，保存连接信息后再测试。</p>
-          <a className="lux-button lux-button-secondary" href="/admin/plugins">前往插件库配置</a>
+          <p>保存连接设置后，先测试读取权限和历史播放能力，再创建预览或正式迁移任务。</p>
           <button className="lux-button lux-button-secondary" type="button" aria-label="测试 Emby 连接" disabled={testConnection.isPending} onClick={() => testConnection.mutate()}>
             {testConnection.isPending ? <LoaderCircle size={16} className="lux-spin" /> : <RefreshCw size={16} />}
             {testConnection.isPending ? "测试中…" : "测试连接"}

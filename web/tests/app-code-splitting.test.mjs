@@ -13,4 +13,5 @@ test("authenticated routes defer non-home page bundles", () => {
   assert.match(appSource, /lazy\(\(\) => import\("\.\.\/features\/admin\/AdminLayout"\)\.then/);
   assert.doesNotMatch(appSource, /import \{ AdminDashboardPage \} from/);
   assert.doesNotMatch(appSource, /import \{ MediaDetailPage \} from/);
+  assert.doesNotMatch(appSource, /path="emby-migration"/);
 });
