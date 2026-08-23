@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2, CircleHelp, CloudDownload, LoaderCircle, RefreshCw, ShieldCheck, XCircle } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type {
@@ -8,7 +8,6 @@ import type {
   AdminEmbyMigrationJob,
   AdminEmbyMigrationMatch,
   AdminEmbyMigrationUserLink,
-  EmbyMigrationSource,
 } from "../../lib/api/types";
 
 type ReportTab = "users" | "matches" | "imports";
@@ -24,9 +23,6 @@ const pageSize = 50;
 
 export function AdminEmbyMigrationPage() {
   const queryClient = useQueryClient();
-  const baseUrlInput = useRef<HTMLInputElement>(null);
-  const apiKeyInput = useRef<HTMLInputElement>(null);
-  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
   const [dryRun, setDryRun] = useState(true);
   const [mergePolicy, setMergePolicy] = useState<"MERGE" | "OVERWRITE" | "SKIP">("MERGE");
   const [connection, setConnection] = useState<Awaited<ReturnType<typeof api.testAdminEmbyMigration>> | null>(null);
@@ -52,18 +48,12 @@ export function AdminEmbyMigrationPage() {
     if (!selectedJobId && jobs.data?.jobs?.[0]) setSelectedJobId(jobs.data.jobs[0].id);
   }, [jobs.data?.jobs, selectedJobId]);
 
-  const readSource = (): EmbyMigrationSource => ({
-    baseUrl: baseUrlInput.current?.value.trim() ?? "",
-    apiKey: apiKeyInput.current?.value ?? "",
-    allowPrivateNetwork,
-  });
-
   const testConnection = useMutation({
-    mutationFn: () => api.testAdminEmbyMigration(readSource()),
+    mutationFn: () => api.testAdminEmbyMigration(),
     onSuccess: setConnection,
   });
   const createJob = useMutation({
-    mutationFn: () => api.createAdminEmbyMigration({ source: readSource(), dryRun, mergePolicy }),
+    mutationFn: () => api.createAdminEmbyMigration({ dryRun, mergePolicy }),
     onSuccess: ({ job: created }) => {
       setSelectedJobId(created.id);
       setTab("users");
@@ -98,20 +88,10 @@ export function AdminEmbyMigrationPage() {
       </header>
 
       <section className="lux-admin-panel lux-emby-migration-panel" aria-labelledby="emby-connection-heading">
-        <PanelHeading headingId="emby-connection-heading" icon={<CloudDownload size={19} />} title="连接 Emby" description="API Key 仅用于本次测试和迁移，关闭页面后不会保留。" />
-        <div className="lux-emby-migration-form">
-          <label>
-            <span>Emby 地址</span>
-            <input ref={baseUrlInput} id="emby-migration-base-url" type="url" autoComplete="url" placeholder="http://emby.local:8096" defaultValue="" onInput={() => setConnection(null)} />
-          </label>
-          <label>
-            <span>API Key</span>
-            <input ref={apiKeyInput} id="emby-migration-api-key" type="password" autoComplete="new-password" placeholder="粘贴 Emby API Key" defaultValue="" onInput={() => setConnection(null)} />
-          </label>
-          <label className="lux-admin-toggle lux-emby-private-toggle">
-            <input type="checkbox" checked={allowPrivateNetwork} onChange={(event) => setAllowPrivateNetwork(event.target.checked)} />
-            <span>允许连接局域网地址</span>
-          </label>
+        <PanelHeading headingId="emby-connection-heading" icon={<CloudDownload size={19} />} title="连接 Emby" description="Emby 地址、API Key 和局域网访问权限由迁移插件统一保存。" />
+        <div className="lux-emby-plugin-settings-notice">
+          <p>请先在插件库中打开“Emby 迁移助手”的设置，保存连接信息后再测试。</p>
+          <a className="lux-button lux-button-secondary" href="/admin/plugins">前往插件库配置</a>
           <button className="lux-button lux-button-secondary" type="button" aria-label="测试 Emby 连接" disabled={testConnection.isPending} onClick={() => testConnection.mutate()}>
             {testConnection.isPending ? <LoaderCircle size={16} className="lux-spin" /> : <RefreshCw size={16} />}
             {testConnection.isPending ? "测试中…" : "测试连接"}

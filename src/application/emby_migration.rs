@@ -9,7 +9,7 @@ use super::{
         MIGRATION_AUTHENTICATE_USER_METHOD, MIGRATION_LIST_ITEMS_METHOD,
         MIGRATION_LIST_USERS_METHOD, MIGRATION_TEST_METHOD, MIGRATION_USER_STATE_METHOD,
     },
-    plugins::{PluginService, PluginServiceError},
+    plugins::{EMBY_MIGRATION_PLUGIN_ID, PluginService, PluginServiceError},
 };
 
 const MAX_SOURCE_URL_LENGTH: usize = 2048;
@@ -231,6 +231,14 @@ impl EmbyMigrationPluginClient {
         Self { plugins }
     }
 
+    pub async fn configured_source(&self) -> Result<EmbyMigrationSource, PluginServiceError> {
+        let values = self
+            .plugins
+            .plugin_config_values(EMBY_MIGRATION_PLUGIN_ID)
+            .await?;
+        emby_migration_source_from_values(&values)
+    }
+
     pub async fn test_connection(
         &self,
         source: &EmbyMigrationSource,
@@ -332,6 +340,33 @@ impl EmbyMigrationPluginClient {
     }
 }
 
+fn emby_migration_source_from_values(
+    values: &serde_json::Map<String, Value>,
+) -> Result<EmbyMigrationSource, PluginServiceError> {
+    let source = EmbyMigrationSource {
+        base_url: values
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .ok_or(PluginServiceError::InvalidConfig)?
+            .trim()
+            .to_owned(),
+        api_key: values
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .ok_or(PluginServiceError::InvalidConfig)?
+            .trim()
+            .to_owned(),
+        allow_private_network: values
+            .get("allowPrivateNetwork")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    source
+        .validate()
+        .map_err(|_| PluginServiceError::InvalidConfig)?;
+    Ok(source)
+}
+
 fn validate_id(value: &str) -> Result<String, PluginServiceError> {
     if value.is_empty()
         || value.len() > MAX_ID_LENGTH
@@ -374,6 +409,38 @@ fn is_private_or_reserved(address: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_source_uses_plugin_values_and_private_network_flag() {
+        let source = emby_migration_source_from_values(
+            serde_json::json!({
+                "baseUrl": "http://emby.local:8096",
+                "apiKey": "secret",
+                "allowPrivateNetwork": true,
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("configured source should validate");
+
+        assert_eq!(source.base_url, "http://emby.local:8096");
+        assert_eq!(source.api_key, "secret");
+        assert!(source.allow_private_network);
+    }
+
+    #[test]
+    fn configured_source_rejects_missing_plugin_credentials() {
+        let error = emby_migration_source_from_values(
+            serde_json::json!({
+                "baseUrl": "http://emby.local:8096",
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect_err("missing API key should be invalid");
+
+        assert!(matches!(error, PluginServiceError::InvalidConfig));
+    }
 
     #[test]
     fn source_validation_rejects_credentials_and_query_secrets() {

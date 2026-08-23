@@ -441,6 +441,33 @@ impl PluginService {
         Ok(())
     }
 
+    pub async fn prune_media_info_library_ids(&self) -> Result<(), PluginServiceError> {
+        let mut values = self.read_plugin_config(MEDIA_INFO_PLUGIN_ID).await?;
+        let Some(library_ids) = values.get_mut("libraryIds").and_then(Value::as_array_mut) else {
+            return Ok(());
+        };
+        let valid_library_ids = self
+            .database
+            .list_libraries()
+            .await?
+            .into_iter()
+            .filter(|library| library.is_enabled)
+            .map(|library| library.id)
+            .collect::<HashSet<_>>();
+        let before = library_ids.len();
+        library_ids.retain(|value| {
+            value
+                .as_str()
+                .is_some_and(|library_id| valid_library_ids.contains(library_id))
+        });
+        if library_ids.len() == before {
+            return Ok(());
+        }
+        self.write_plugin_config(MEDIA_INFO_PLUGIN_ID, &values)
+            .await?;
+        self.sync_media_info_scheduled_task().await
+    }
+
     pub async fn update(&self, plugin_id: &str) -> Result<PluginView, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
@@ -1021,7 +1048,9 @@ impl PluginService {
             .get(&plugin_id)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
-        let values = merge_default_config_values(&fields, values);
+        let mut stored_values = self.read_plugin_config(&plugin_id).await?;
+        stored_values.extend(values);
+        let values = merge_default_config_values(&fields, stored_values);
         let mut values = normalize_plugin_config(&plugin_id, values);
         if is_chapter_detector_plugin(plugin) {
             values.remove("libraryIds");
@@ -1041,6 +1070,24 @@ impl PluginService {
         }
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
+    }
+
+    pub async fn plugin_config_values(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Map<String, Value>, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let values =
+            merge_default_config_values(&fields, self.read_plugin_config(&plugin_id).await?);
+        let values = validate_config_values(&fields, &values)?;
+        validate_dynamic_plugin_config(&plugin_id, &values)?;
+        Ok(values)
     }
 
     pub async fn update_media_info_schedule(
@@ -2200,10 +2247,10 @@ fn validate_config_values(
         };
         match field.input_type.as_str() {
             "text" | "password" => {
-                if value
-                    .as_str()
-                    .is_none_or(|value| value.chars().count() > 4096)
-                {
+                let Some(value) = value.as_str() else {
+                    return Err(PluginServiceError::InvalidConfig);
+                };
+                if value.chars().count() > 4096 || (field.required && value.trim().is_empty()) {
                     return Err(PluginServiceError::InvalidConfig);
                 }
             }

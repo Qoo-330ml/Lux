@@ -31,7 +31,6 @@ const MAX_JOB_PAGE_SIZE: i64 = 100;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateMigrationRequest {
-    pub source: EmbyMigrationSource,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -272,7 +271,8 @@ impl EmbyMigrationService {
         created_by_user_id: &str,
         request: CreateMigrationRequest,
     ) -> Result<MigrationJobView, EmbyMigrationServiceError> {
-        let source_url = request.source.validate()?;
+        let source = self.plugin.configured_source().await?;
+        let source_url = source.validate()?;
         let source_base_url = source_url.to_string();
         let source_label = source_url
             .host_str()
@@ -283,7 +283,7 @@ impl EmbyMigrationService {
         }
         let job_id = Uuid::now_v7().to_string();
         let secret_ref = format!("emby-migration/{job_id}.json");
-        self.write_secret(&secret_ref, &request.source).await?;
+        self.write_secret(&secret_ref, &source).await?;
         let source = StoredEmbyMigrationSource {
             source_base_url: source_base_url.clone(),
             secret_ref: secret_ref.clone(),
@@ -438,9 +438,9 @@ impl EmbyMigrationService {
 
     pub async fn test_connection(
         &self,
-        source: &EmbyMigrationSource,
     ) -> Result<MigrationConnectionInfo, EmbyMigrationServiceError> {
-        Ok(self.plugin.test_connection(source).await?)
+        let source = self.plugin.configured_source().await?;
+        Ok(self.plugin.test_connection(&source).await?)
     }
 
     pub async fn authenticate_pending_user(

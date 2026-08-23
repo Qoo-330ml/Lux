@@ -758,6 +758,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-emby-migration-form label:not(.lux-admin-toggle), .lux-emby-migration-settings > label:not(.lux-admin-toggle) { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
 .lux-emby-migration-form input, .lux-emby-migration-settings select { min-width: 0; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
 .lux-emby-migration-form input:focus, .lux-emby-migration-settings select:focus { border-color: color-mix(in srgb, var(--lux-accent) 58%, var(--lux-line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--lux-accent) 14%, transparent); }
+.lux-emby-plugin-settings-notice { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.lux-emby-plugin-settings-notice p { flex: 1 1 360px; margin: 0; color: var(--lux-muted); font-size: .76rem; line-height: 1.5; }
 .lux-emby-private-toggle { justify-content: flex-start; }
 .lux-emby-migration-settings { display: grid; grid-template-columns: minmax(240px, 1.4fr) minmax(220px, .9fr) auto; align-items: end; gap: 18px; }
 .lux-emby-dry-run { align-items: flex-start; white-space: normal; }

@@ -20,17 +20,16 @@ describe("LuxApiClient Emby migration methods", () => {
     });
 
     const client = new LuxApiClient();
-    const source = { baseUrl: "http://emby.example.test:8096", apiKey: "secret", allowPrivateNetwork: false };
-    await expect(client.testAdminEmbyMigration(source)).resolves.toMatchObject({ serverName: "Home Emby" });
-    await expect(client.createAdminEmbyMigration({ source, dryRun: true, mergePolicy: "MERGE" })).resolves.toMatchObject({ job: { id: "job-1" } });
+    await expect(client.testAdminEmbyMigration()).resolves.toMatchObject({ serverName: "Home Emby" });
+    await expect(client.createAdminEmbyMigration({ dryRun: true, mergePolicy: "MERGE" })).resolves.toMatchObject({ job: { id: "job-1" } });
     await client.adminEmbyMigrationUsers("job-1", 2);
 
     const calls = fetchMock.mock.calls;
     expect(calls[0]?.[0]).toBe("/api/v1/admin/emby-migration/test");
-    expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual(source);
+    expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual({});
     expect(calls[1]?.[0]).toBe("/api/v1/admin/emby-migration");
     expect((calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
-    expect(JSON.parse(String(calls[1]?.[1]?.body))).toEqual({ source, dryRun: true, mergePolicy: "MERGE" });
+    expect(JSON.parse(String(calls[1]?.[1]?.body))).toEqual({ dryRun: true, mergePolicy: "MERGE" });
     expect(calls[2]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/users?page=2&pageSize=50");
   });
 });
