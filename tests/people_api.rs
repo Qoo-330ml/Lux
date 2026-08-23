@@ -156,6 +156,114 @@ async fn rebuilding_people_clears_index_for_missing_item_metadata_directory()
 }
 
 #[tokio::test]
+async fn rebuilding_people_quarantines_unmatched_relation_and_retries_it_after_source_restore()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Example Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2024.mkv"), b"movie").await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let source_entry_id: String = sqlx::query_scalar(
+        "SELECT filesystem_entry_id FROM media_sources WHERE item_id = ? LIMIT 1",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    let original_fingerprint: Vec<u8> =
+        sqlx::query_scalar("SELECT fingerprint FROM filesystem_entries WHERE id = ?")
+            .bind(&source_entry_id)
+            .fetch_one(database.pool())
+            .await?;
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people
+        .persist_item_actors(
+            &item_id,
+            "tmdb",
+            &[ActorCredit {
+                id: "101".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    let relation_path = library_item_directory(&config.config_dir, &item_id)?.join("people.json");
+    assert!(relation_path.exists());
+    sqlx::query("UPDATE filesystem_entries SET fingerprint = ? WHERE id = ?")
+        .bind(b"changed-fingerprint".to_vec())
+        .bind(&source_entry_id)
+        .execute(database.pool())
+        .await?;
+
+    people.rebuild_person_credit_index().await?;
+    assert!(!relation_path.exists());
+    let quarantine_root = config
+        .config_dir
+        .join("metadata/quarantine/people-relations");
+    let mut quarantined = tokio::fs::read_dir(&quarantine_root).await?;
+    assert!(quarantined.next_entry().await?.is_some());
+    let quarantined_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(quarantined_count, 0);
+
+    sqlx::query("UPDATE filesystem_entries SET fingerprint = ? WHERE id = ?")
+        .bind(original_fingerprint)
+        .bind(&source_entry_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE person_index_rebuild_jobs
+         SET status = 'QUEUED', cursor_id = NULL, processed_count = 0,
+             total_count = 0, cancel_requested = 0, run_token = NULL, error = NULL
+         WHERE library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    people.rebuild_person_credit_index().await?;
+    assert!(relation_path.exists());
+    let restored_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(restored_count, 1);
+    let mut remaining = tokio::fs::read_dir(&quarantine_root).await?;
+    assert!(remaining.next_entry().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn emby_persons_lists_library_actors_with_shared_admin_key()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

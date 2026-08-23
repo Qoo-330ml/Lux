@@ -52,6 +52,7 @@ const PENDING_PROFILE_IMAGE: &str = "profileImage";
 const PENDING_PERSON_INDEX: &str = "personIndex";
 const PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const PERSON_MATCH_SNAPSHOT_DIR: &str = "matches";
+const PEOPLE_RELATION_QUARANTINE_DIR: &str = "people-relations";
 const PERSON_DECISION_OPERATION_SCHEMA_VERSION: u32 = 1;
 const PERSON_DECISION_OPERATION_DIR: &str = "operations";
 const MAX_ACTORS: usize = 12;
@@ -2546,6 +2547,15 @@ impl PeopleService {
                 });
             }
         }
+        let retried_relations = self
+            .retry_quarantined_person_relation_snapshots(database)
+            .await?;
+        if retried_relations > 0 {
+            tracing::info!(
+                retried_relations,
+                "quarantined people relation snapshots returned to the active metadata tree"
+            );
+        }
         let restored_relations = self.restore_person_relation_snapshots(database).await?;
         if restored_relations > 0 {
             tracing::info!(restored_relations, "people relation snapshots restored");
@@ -2596,6 +2606,81 @@ impl PeopleService {
             }
         }
         Ok(rebuilt_items)
+    }
+
+    async fn retry_quarantined_person_relation_snapshots(
+        &self,
+        database: &Database,
+    ) -> Result<usize, PeopleError> {
+        let root = metadata_root(&self.config_dir)
+            .join("quarantine")
+            .join(PEOPLE_RELATION_QUARANTINE_DIR);
+        let mut entries = match fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(PeopleError::Io { path: root, source });
+            }
+        };
+        let mut restored = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: root.clone(),
+                source,
+            })?
+        {
+            let quarantined_path = entry.path();
+            if quarantined_path
+                .extension()
+                .and_then(|value| value.to_str())
+                != Some("json")
+                || safe_metadata(&quarantined_path)
+                    .await?
+                    .is_none_or(|metadata| !metadata.is_file())
+            {
+                continue;
+            }
+            let relation = match read_relation(&quarantined_path).await {
+                Ok(Some(relation)) => relation,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %quarantined_path.display(),
+                        %error,
+                        "skipping invalid quarantined people relation snapshot"
+                    );
+                    continue;
+                }
+            };
+            let Some(source_locator) = self.find_matching_media_source(database, &relation).await?
+            else {
+                continue;
+            };
+            let active_path = library_item_directory(&self.config_dir, &source_locator.item_id)
+                .map_err(PeopleError::from)?
+                .join("people.json");
+            if safe_metadata(&active_path).await?.is_some() {
+                continue;
+            }
+            let active_dir = active_path.parent().ok_or_else(|| PeopleError::Io {
+                path: active_path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "people relation path has no parent",
+                ),
+            })?;
+            create_private_dir(active_dir).await?;
+            fs::rename(&quarantined_path, &active_path)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: active_path,
+                    source,
+                })?;
+            restored += 1;
+        }
+        Ok(restored)
     }
 
     pub(crate) async fn queue_person_index_rebuild(
@@ -3045,6 +3130,7 @@ impl PeopleService {
             }
         };
         let mut restored = 0;
+        let mut quarantined = 0;
         while let Some(shard) = shards
             .next_entry()
             .await
@@ -3079,44 +3165,17 @@ impl PeopleService {
                         continue;
                     }
                 };
-                let (Some(source_root), Some(source_relative_path)) = (
-                    relation.source_root.as_deref(),
-                    relation.source_relative_path.as_deref(),
-                ) else {
-                    continue;
-                };
-                let source_locator = database
-                    .find_item_by_source_locator(source_root, source_relative_path)
-                    .await
-                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
-                let source_locator = match source_locator {
-                    Some(locator) if relation_source_snapshot_matches(&relation, &locator) => {
-                        Some(locator)
-                    }
-                    Some(_) | None => {
-                        if let Some(fingerprint) = relation
-                            .media_fingerprint
-                            .as_deref()
-                            .and_then(decode_fingerprint)
-                        {
-                            let mut candidates = database
-                                .find_items_by_source_fingerprint(&fingerprint)
-                                .await
-                                .map_err(|error| PeopleError::Storage(error.to_string()))?;
-                            candidates.retain(|candidate| {
-                                relation_media_snapshot_matches(&relation, candidate)
-                            });
-                            (candidates.len() == 1).then(|| candidates.remove(0))
-                        } else {
-                            None
-                        }
-                    }
-                };
+                let source_locator = self.find_matching_media_source(database, &relation).await?;
                 let Some(source_locator) = source_locator else {
-                    tracing::warn!(
-                        path = %relation_path.display(),
-                        "skipping people relation without a unique matching media source"
-                    );
+                    if relation.source_root.is_none() || relation.source_relative_path.is_none() {
+                        continue;
+                    }
+                    if self
+                        .quarantine_person_relation_snapshot(&relation_path)
+                        .await?
+                    {
+                        quarantined += 1;
+                    }
                     continue;
                 };
                 let credits = self
@@ -3133,7 +3192,75 @@ impl PeopleService {
                 restored += 1;
             }
         }
+        if quarantined > 0 {
+            tracing::info!(
+                quarantined,
+                "people relation snapshots moved to quarantine for later retry"
+            );
+        }
         Ok(restored)
+    }
+
+    async fn find_matching_media_source(
+        &self,
+        database: &Database,
+        relation: &StoredPeopleRelation,
+    ) -> Result<Option<crate::storage::StoredItemSourceLocator>, PeopleError> {
+        let (Some(source_root), Some(source_relative_path)) = (
+            relation.source_root.as_deref(),
+            relation.source_relative_path.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let source_locator = database
+            .find_item_by_source_locator(source_root, source_relative_path)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        match source_locator {
+            Some(locator) if relation_source_snapshot_matches(relation, &locator) => {
+                Ok(Some(locator))
+            }
+            Some(_) | None => {
+                let Some(fingerprint) = relation
+                    .media_fingerprint
+                    .as_deref()
+                    .and_then(decode_fingerprint)
+                else {
+                    return Ok(None);
+                };
+                let mut candidates = database
+                    .find_items_by_source_fingerprint(&fingerprint)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                candidates.retain(|candidate| relation_media_snapshot_matches(relation, candidate));
+                Ok((candidates.len() == 1).then(|| candidates.remove(0)))
+            }
+        }
+    }
+
+    async fn quarantine_person_relation_snapshot(
+        &self,
+        relation_path: &Path,
+    ) -> Result<bool, PeopleError> {
+        if safe_metadata(relation_path)
+            .await?
+            .is_none_or(|metadata| !metadata.is_file())
+        {
+            return Ok(false);
+        }
+        let quarantine_root = metadata_root(&self.config_dir)
+            .join("quarantine")
+            .join(PEOPLE_RELATION_QUARANTINE_DIR);
+        create_private_dir(&quarantine_root).await?;
+        let target = quarantine_root.join(format!("relation-{}.json", Uuid::now_v7()));
+        fs::rename(relation_path, &target)
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: target.clone(),
+                source,
+            })?;
+        restrict_permissions(&target, false).await?;
+        Ok(true)
     }
 
     async fn rebuild_item_person_credit_index(
