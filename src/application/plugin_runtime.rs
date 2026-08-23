@@ -262,12 +262,19 @@ impl PluginSupervisor {
         let result = process.call(method, params, self.call_timeout).await;
         if let Err(error) = &result {
             if is_process_failure(error) {
-                let mut processes = self.processes.lock().await;
-                if processes
-                    .get(plugin_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &process))
-                {
-                    processes.remove(plugin_id);
+                let should_stop = {
+                    let mut processes = self.processes.lock().await;
+                    if processes
+                        .get(plugin_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &process))
+                    {
+                        processes.remove(plugin_id);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_stop {
                     process.stop().await;
                 }
             }
