@@ -13,13 +13,14 @@ import type {
 } from "../../lib/api/types";
 
 type ReportTab = "users" | "matches" | "imports" | "personFavorites";
+type MigrationReportEntry = AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport | AdminEmbyMigrationPersonFavorite;
 type MigrationReportData = {
   page?: number;
   pageSize?: number;
-  users?: AdminEmbyMigrationUserLink[] | (AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport)[];
-  matches?: AdminEmbyMigrationMatch[] | (AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport)[];
-  imports?: AdminEmbyMigrationImport[] | (AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport)[];
-  personFavorites?: AdminEmbyMigrationPersonFavorite[] | (AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport | AdminEmbyMigrationPersonFavorite)[];
+  users?: MigrationReportEntry[];
+  matches?: MigrationReportEntry[];
+  imports?: MigrationReportEntry[];
+  personFavorites?: MigrationReportEntry[];
 };
 
 const pageSize = 50;
