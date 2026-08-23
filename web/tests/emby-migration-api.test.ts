@@ -12,6 +12,7 @@ describe("LuxApiClient Emby migration methods", () => {
       if (path.endsWith("/test")) return new Response(JSON.stringify({ serverName: "Home Emby", historyCapability: "ITEM_STATE" }), { status: 200 });
       if (path === "/api/v1/admin/emby-migration") return new Response(JSON.stringify({ job: { id: "job-1" } }), { status: 202 });
       if (path.includes("/users?")) return new Response(JSON.stringify({ users: [], page: 1, pageSize: 50 }), { status: 200 });
+      if (path.includes("/person-favorites?")) return new Response(JSON.stringify({ personFavorites: [], page: 1, pageSize: 50 }), { status: 200 });
       return new Response(JSON.stringify({}), { status: 200 });
     });
     Object.defineProperty(globalThis, "document", {
@@ -23,6 +24,7 @@ describe("LuxApiClient Emby migration methods", () => {
     await expect(client.testAdminEmbyMigration()).resolves.toMatchObject({ serverName: "Home Emby" });
     await expect(client.createAdminEmbyMigration({ dryRun: true, mergePolicy: "MERGE" })).resolves.toMatchObject({ job: { id: "job-1" } });
     await client.adminEmbyMigrationUsers("job-1", 2);
+    await client.adminEmbyMigrationPersonFavorites("job-1", 3);
 
     const calls = fetchMock.mock.calls;
     expect(calls[0]?.[0]).toBe("/api/v1/admin/emby-migration/test");
@@ -31,5 +33,6 @@ describe("LuxApiClient Emby migration methods", () => {
     expect((calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
     expect(JSON.parse(String(calls[1]?.[1]?.body))).toEqual({ dryRun: true, mergePolicy: "MERGE" });
     expect(calls[2]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/users?page=2&pageSize=50");
+    expect(calls[3]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/person-favorites?page=3&pageSize=50");
   });
 });

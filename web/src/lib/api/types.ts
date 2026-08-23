@@ -427,12 +427,29 @@ export type AdminEmbyMigrationImport = {
   error?: string | null;
 };
 
+export type AdminEmbyMigrationPersonFavorite = {
+  jobId: string;
+  embyUserId: string;
+  embyPersonId: string;
+  embyPersonName: string;
+  luxUserId?: string | null;
+  luxPersonId?: string | null;
+  providerIds: Record<string, string>;
+  matchMethod: string;
+  confidence?: number | null;
+  status: string;
+  stateHash: string;
+  detail: Record<string, unknown>;
+  error?: string | null;
+};
+
 export type AdminEmbyMigrationPage<T> = {
   page?: number;
   pageSize?: number;
   users?: T[];
   matches?: T[];
   imports?: T[];
+  personFavorites?: T[];
 };
 
 export type AdminHealth = {

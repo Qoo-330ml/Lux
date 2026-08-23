@@ -22,6 +22,7 @@ import type {
   AdminEmbyMigrationJob,
   AdminEmbyMigrationMatch,
   AdminEmbyMigrationPage,
+  AdminEmbyMigrationPersonFavorite,
   AdminEmbyMigrationUserLink,
   AdminApiKey,
   NetworkProxyDiagnostics,
@@ -526,6 +527,12 @@ export class LuxApiClient {
   adminEmbyMigrationImports(jobId: string, page = 1) {
     return this.request<AdminEmbyMigrationPage<AdminEmbyMigrationImport>>(
       `/api/v1/admin/emby-migration/${encodeURIComponent(jobId)}/imports?page=${page}&pageSize=50`,
+    );
+  }
+
+  adminEmbyMigrationPersonFavorites(jobId: string, page = 1) {
+    return this.request<AdminEmbyMigrationPage<AdminEmbyMigrationPersonFavorite>>(
+      `/api/v1/admin/emby-migration/${encodeURIComponent(jobId)}/person-favorites?page=${page}&pageSize=50`,
     );
   }
 

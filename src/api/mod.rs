@@ -768,6 +768,10 @@ pub fn app_with_state(state: AppState) -> Router {
             get(admin_list_emby_migration_imports),
         )
         .route(
+            "/api/v1/admin/emby-migration/{job_id}/person-favorites",
+            get(admin_list_emby_migration_person_favorites),
+        )
+        .route(
             "/api/v1/admin/users",
             get(admin_list_users).post(admin_create_user),
         )
@@ -18003,11 +18007,28 @@ async fn admin_list_emby_migration_imports(
     .await
 }
 
+async fn admin_list_emby_migration_person_favorites(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    admin_list_emby_migration_report(
+        headers,
+        job_id,
+        query,
+        state,
+        EmbyMigrationReportKind::PersonFavorites,
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum EmbyMigrationReportKind {
     Users,
     Matches,
     Imports,
+    PersonFavorites,
 }
 
 async fn admin_list_emby_migration_report(
@@ -18048,6 +18069,10 @@ async fn admin_list_emby_migration_report(
             .list_import_records(&job_id, offset, limit)
             .await
             .map(|items| json!({ "imports": items })),
+        EmbyMigrationReportKind::PersonFavorites => service
+            .list_person_favorite_records(&job_id, offset, limit)
+            .await
+            .map(|items| json!({ "personFavorites": items })),
     };
     match result {
         Ok(mut response) => {

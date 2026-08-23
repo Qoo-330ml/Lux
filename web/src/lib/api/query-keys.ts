@@ -48,6 +48,7 @@ export const queryKeys = {
   adminEmbyMigrationUsers: (jobId: string, page = 1) => ["admin", "emby-migration", jobId, "users", page] as const,
   adminEmbyMigrationMatches: (jobId: string, page = 1) => ["admin", "emby-migration", jobId, "matches", page] as const,
   adminEmbyMigrationImports: (jobId: string, page = 1) => ["admin", "emby-migration", jobId, "imports", page] as const,
+  adminEmbyMigrationPersonFavorites: (jobId: string, page = 1) => ["admin", "emby-migration", jobId, "person-favorites", page] as const,
   adminItemImages: (itemId: string) => ["admin", "item-images", itemId] as const,
 };
 
