@@ -82,6 +82,7 @@ use crate::{
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::ScraperResolver,
         settings::{read_network_proxy_url_async, write_network_proxy_url},
+        strm_playback::StrmPlaybackResolver,
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{
             StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
@@ -144,6 +145,7 @@ pub struct AppState {
     metadata_selection: Option<MetadataSelectionService>,
     metadata_writes: Option<MetadataWriteService>,
     downloads: Option<DownloadService>,
+    strm_playback: Option<StrmPlaybackResolver>,
     metadata_reidentify: Option<MetadataReidentifyService>,
     deletion: Option<MediaDeleteService>,
     probe: Option<MediaProbeService>,
@@ -341,6 +343,7 @@ impl AppState {
             metadata_writes: Some(MetadataWriteService::new(database.clone())),
             downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
                 .ok(),
+            strm_playback: StrmPlaybackResolver::new(network_proxy_url.clone()).ok(),
             metadata_reidentify,
             deletion: Some(match webhooks.clone() {
                 Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
@@ -6482,15 +6485,18 @@ fn emby_media_source_json_with_resolver_and_chapters(
         })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
-    let direct_stream_url =
-        if source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_resolver_target {
-            Some(format!(
-                "/Videos/{item_id}/{}/stream{stream_suffix}",
-                source.id
-            ))
-        } else {
-            None
-        };
+    let direct_stream_url = if source.source_kind == "LOCAL_FILE"
+        || is_local_strm_target
+        || is_remote
+        || is_resolver_target
+    {
+        Some(format!(
+            "/Videos/{item_id}/{}/stream{stream_suffix}",
+            source.id
+        ))
+    } else {
+        None
+    };
     let is_remote_playback = is_remote || is_resolver_target;
     let is_playable =
         source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_remote_playback;
@@ -10150,7 +10156,17 @@ async fn serve_media_file(
         };
         match classify_strm_target(&external_url).kind {
             StrmTargetKind::Url => {
-                return redirect_strm_playback(&external_url);
+                let Some(resolver) = state.strm_playback.as_ref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                let location = match resolver.resolve(&external_url).await {
+                    Ok(location) => location,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to resolve STRM playback target");
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                };
+                return redirect_strm_playback(location.as_str());
             }
             StrmTargetKind::Path => {
                 let path = match canonical_local_strm_target(
@@ -20234,7 +20250,10 @@ mod tests {
         assert_eq!(body["Size"], 1_234_567);
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(body["SupportsDirectStream"], true);
-        assert!(body["DirectStreamUrl"].is_null());
+        assert_eq!(
+            body["DirectStreamUrl"],
+            "/Videos/item-1/source-1/stream.mkv"
+        );
         assert_eq!(body["DefaultAudioStreamIndex"], -1);
         assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);

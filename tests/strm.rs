@@ -8,10 +8,19 @@ use luxd::{
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+async fn respond_once(listener: &TcpListener, response: &str) -> std::io::Result<()> {
+    let (mut stream, _) = listener.accept().await?;
+    let mut request = [0_u8; 4096];
+    let _ = stream.read(&mut request).await?;
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
 #[tokio::test]
-async fn strm_sources_store_first_non_empty_line_without_network_access()
+async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_side()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -26,9 +35,13 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_address = proxy_listener.local_addr()?;
+    let remote_target =
+        "http://media.example.test/video/剧集?id=7&title=第1集&token=secret".to_owned();
     tokio::fs::write(
         root.join("Remote.Movie.2024.strm"),
-        "\u{feff}\n  \n https://media.example.test/video/剧集?id=7&title=第1集&token=secret \nignored\n",
+        format!("\u{feff}\n  \n {remote_target} \nignored\n"),
     )
     .await?;
     tokio::fs::write(root.join("Empty.Movie.2025.strm"), b"\n \n").await?;
@@ -66,10 +79,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         .ok_or("missing remote source")?;
     assert_eq!(remote.1, "STRM_URL");
     assert_eq!(remote.3.as_deref(), Some("URL"));
-    assert_eq!(
-        remote.2.as_deref(),
-        Some("https://media.example.test/video/剧集?id=7&title=第1集&token=secret")
-    );
+    assert_eq!(remote.2.as_deref(), Some(remote_target.as_str()));
     let path = stored
         .iter()
         .find(|row| row.0 == "Path Movie")
@@ -112,13 +122,29 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
             .await?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(
+    let app = app_with_state(AppState::ready_with_proxy(
         config,
         database.clone(),
         setup,
         auth,
         emby_auth,
+        Some(format!("http://{proxy_address}")),
     ));
+    let proxy_server = tokio::spawn(async move {
+        for _ in 0..3 {
+            respond_once(
+                &proxy_listener,
+                "HTTP/1.1 302 Found\r\nLocation: /resolved.mkv\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await?;
+            respond_once(
+                &proxy_listener,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/1\r\nContent-Type: video/x-matroska\r\n\r\nx",
+            )
+            .await?;
+        }
+        Ok::<(), std::io::Error>(())
+    });
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -179,7 +205,10 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         popcorn_playback_body["MediaSources"][0]["SupportsDirectPlay"],
         true
     );
-    assert!(popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"].is_null());
+    assert_eq!(
+        popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"],
+        format!("/Videos/{remote_item_id}/{remote_source_id}/stream")
+    );
 
     let playback = client
         .get(format!(
@@ -194,7 +223,10 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     assert_eq!(body["MediaSources"][0]["IsRemote"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
-    assert!(body["MediaSources"][0]["DirectStreamUrl"].is_null());
+    assert_eq!(
+        body["MediaSources"][0]["DirectStreamUrl"],
+        format!("/Videos/{remote_item_id}/{remote_source_id}/stream")
+    );
 
     let path_playback = client
         .get(format!(
@@ -228,7 +260,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     );
     assert_eq!(
         senplayer_stream.headers()[reqwest::header::LOCATION],
-        "https://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
+        "http://media.example.test/resolved.mkv"
     );
 
     let duplicate_source_query_stream = no_redirect_client
@@ -249,7 +281,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     );
     assert_eq!(
         duplicate_source_query_stream.headers()[reqwest::header::LOCATION],
-        "https://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
+        "http://media.example.test/resolved.mkv"
     );
 
     let path_stream = no_redirect_client
@@ -281,7 +313,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     );
     assert_eq!(
         unmatched_video_path.headers()[reqwest::header::LOCATION],
-        "https://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
+        "http://media.example.test/resolved.mkv"
     );
 
     let missing_source_video_path = no_redirect_client
@@ -319,7 +351,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
     );
     assert_eq!(
         source_id_body["Items"][0]["MediaSources"][0]["Path"],
-        "https://media.example.test/video/剧集?id=7&title=第1集&token=secret"
+        remote_target
     );
     tokio::fs::write(
         root.join("Path.Movie.2026.strm"),
@@ -341,6 +373,7 @@ async fn strm_sources_store_first_non_empty_line_without_network_access()
         Some("https://media.example.test/path-movie.mkv")
     );
     assert_eq!(updated_path.1.as_deref(), Some("URL"));
+    proxy_server.await??;
     server.abort();
     Ok(())
 }

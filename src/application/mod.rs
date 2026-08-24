@@ -40,6 +40,7 @@ pub mod scheduled_tasks;
 pub mod scraper;
 pub mod settings;
 pub mod setup;
+pub mod strm_playback;
 pub mod strm_probe;
 pub mod strm_probe_policy;
 pub mod strm_target;
