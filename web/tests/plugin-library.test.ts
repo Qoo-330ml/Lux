@@ -188,6 +188,75 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(container.querySelector('[role="dialog"]')).toBeNull();
   });
 
+  it("renders and saves danmaku provider, library scope, and title matching settings", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.danmaku",
+      name: "弹幕匹配",
+      category: "MEDIA",
+      configured: true,
+      configValues: {
+        libraryIds: ["library-1"],
+        matchOriginalFilename: true,
+        matchSimplifiedTraditionalTitles: true,
+        matchEnglishTitle: false,
+      },
+      configFields: [
+        {
+          key: "providerBaseUrl",
+          label: "弹幕 API 地址",
+          type: "text",
+          required: true,
+          sensitive: true,
+          description: "Dandanplay 兼容 API 基地址。",
+        },
+        {
+          key: "libraryIds",
+          label: "媒体库",
+          type: "select",
+          required: false,
+          sensitive: false,
+          multiple: true,
+          options: [{ value: "library-1", label: "番剧" }],
+          description: "只对选中的媒体库执行弹幕匹配。",
+        },
+        { key: "matchOriginalFilename", label: "使用原始文件名", type: "toggle", required: false, sensitive: false, defaultValue: true },
+        { key: "matchSimplifiedTraditionalTitles", label: "尝试简繁标题", type: "toggle", required: false, sensitive: false, defaultValue: true },
+        { key: "matchEnglishTitle", label: "尝试英文标题", type: "toggle", required: false, sensitive: false, defaultValue: false },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 弹幕匹配"]')?.click();
+    });
+
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.querySelector<HTMLInputElement>('[id$="-provider-base-url"]')).toBeTruthy();
+    expect(dialog?.textContent).toContain("只对选中的媒体库执行弹幕匹配");
+    expect(dialog?.textContent).toContain("尝试简繁标题");
+    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(3);
+
+    const providerInput = dialog?.querySelector<HTMLInputElement>('[id$="-provider-base-url"]');
+    await act(async () => {
+      if (providerInput) {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(providerInput, "https://danmu.example/api");
+        providerInput.dispatchEvent(new Event("input", { bubbles: true }));
+        providerInput.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      dialog?.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')[2]?.click();
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+    });
+
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.danmaku", expect.objectContaining({
+      providerBaseUrl: "https://danmu.example/api",
+      libraryIds: ["library-1"],
+      matchOriginalFilename: true,
+      matchSimplifiedTraditionalTitles: true,
+      matchEnglishTitle: true,
+    }));
+  });
+
   it("renders Emby connection details in the migration plugin settings", async () => {
     currentPlugin = {
       ...configuredPlugin,
