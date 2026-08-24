@@ -49,7 +49,38 @@ describe("EmbyMigrationPluginConfig", () => {
     const createJob = vi.spyOn(api, "createAdminEmbyMigration").mockResolvedValue({ job: migrationJob });
     vi.spyOn(api, "adminEmbyMigration").mockResolvedValue({ job: migrationJob });
     vi.spyOn(api, "adminEmbyMigrationUsers").mockResolvedValue({ users: [], page: 1, pageSize: 50 });
-    vi.spyOn(api, "adminEmbyMigrationMatches").mockResolvedValue({ matches: [], page: 1, pageSize: 50 });
+    vi.spyOn(api, "adminEmbyMigrationMatches").mockResolvedValue({
+      matches: [
+        {
+          jobId: "job-1",
+          embyItemId: "emby-episode-1",
+          embyItemType: "Episode",
+          luxItemId: "lux-episode-1",
+          matchMethod: "EPISODE_KEY",
+          confidence: 95,
+          status: "MATCHED",
+          detail: {
+            title: "第十集",
+            luxTitle: "第十集",
+            luxSeriesTitle: "西游记",
+            luxSeasonNumber: 2,
+            luxEpisodeNumber: 10,
+          },
+        },
+        {
+          jobId: "job-1",
+          embyItemId: "emby-movie-1",
+          embyItemType: "Movie",
+          luxItemId: "lux-movie-1",
+          matchMethod: "TMDB_ID",
+          confidence: 100,
+          status: "MATCHED",
+          detail: { title: "星际穿越", luxTitle: "星际穿越" },
+        },
+      ],
+      page: 1,
+      pageSize: 50,
+    });
     vi.spyOn(api, "adminEmbyMigrationImports").mockResolvedValue({ imports: [], page: 1, pageSize: 50 });
     vi.spyOn(api, "adminEmbyMigrationPersonFavorites").mockResolvedValue({ personFavorites: [], page: 1, pageSize: 50 });
     vi.spyOn(api, "updateAdminPluginConfig").mockResolvedValue({ plugin: {} as AdminPlugin });
@@ -113,6 +144,16 @@ describe("EmbyMigrationPluginConfig", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("任务详情"));
     });
+    act(() => {
+      const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes("媒体匹配"));
+      button?.click();
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("Lux 媒体：西游记 · 第 2 季 · 第 10 集 · 第十集"));
+    });
+    expect(container.textContent).toContain("Lux 媒体：西游记 · 第 2 季 · 第 10 集 · 第十集");
+    expect(container.textContent).toContain("Lux 媒体：星际穿越");
+    expect(container.textContent).not.toContain("Lux 媒体：lux-episode-1");
     act(() => {
       const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes("人物收藏"));
       button?.click();

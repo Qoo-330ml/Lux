@@ -82,6 +82,7 @@ use crate::{
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::ScraperResolver,
         settings::{read_network_proxy_url_async, write_network_proxy_url},
+        strm_playback::StrmPlaybackResolver,
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{
             StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
@@ -144,6 +145,7 @@ pub struct AppState {
     metadata_selection: Option<MetadataSelectionService>,
     metadata_writes: Option<MetadataWriteService>,
     downloads: Option<DownloadService>,
+    strm_playback: Option<StrmPlaybackResolver>,
     metadata_reidentify: Option<MetadataReidentifyService>,
     deletion: Option<MediaDeleteService>,
     probe: Option<MediaProbeService>,
@@ -341,6 +343,7 @@ impl AppState {
             metadata_writes: Some(MetadataWriteService::new(database.clone())),
             downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
                 .ok(),
+            strm_playback: StrmPlaybackResolver::new(network_proxy_url.clone()).ok(),
             metadata_reidentify,
             deletion: Some(match webhooks.clone() {
                 Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
@@ -1023,6 +1026,11 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_list_library_items),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route("/api/v1/people", get(lux_search_people))
+        .route(
+            "/api/v1/people/{person_id}/items",
+            get(lux_get_person_items),
+        )
         .route(
             "/api/v1/people/{person_id}",
             get(lux_get_person).patch(lux_update_person),
@@ -2385,6 +2393,7 @@ fn catalog_filter_from_values(
         item_types,
         excluded_item_types: Vec::new(),
         item_ids: None,
+        person_id: None,
         media_source_ids: None,
         years,
         is_played,
@@ -3044,6 +3053,7 @@ async fn emby_group_latest_page(
             item_types: vec!["SERIES".to_owned()],
             excluded_item_types: Vec::new(),
             item_ids: Some(series_ids.clone()),
+            person_id: None,
             media_source_ids: None,
             years: Vec::new(),
             is_played: None,
@@ -6475,15 +6485,18 @@ fn emby_media_source_json_with_resolver_and_chapters(
         })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
-    let direct_stream_url =
-        if source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_resolver_target {
-            Some(format!(
-                "/Videos/{item_id}/{}/stream{stream_suffix}",
-                source.id
-            ))
-        } else {
-            None
-        };
+    let direct_stream_url = if source.source_kind == "LOCAL_FILE"
+        || is_local_strm_target
+        || is_remote
+        || is_resolver_target
+    {
+        Some(format!(
+            "/Videos/{item_id}/{}/stream{stream_suffix}",
+            source.id
+        ))
+    } else {
+        None
+    };
     let is_remote_playback = is_remote || is_resolver_target;
     let is_playable =
         source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_remote_playback;
@@ -8296,6 +8309,14 @@ async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), R
 #[serde(rename_all = "camelCase")]
 struct LuxSearchQuery {
     #[serde(alias = "query")]
+    q: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LuxPeopleSearchQuery {
     q: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
@@ -10135,7 +10156,17 @@ async fn serve_media_file(
         };
         match classify_strm_target(&external_url).kind {
             StrmTargetKind::Url => {
-                return redirect_strm_playback(&external_url);
+                let Some(resolver) = state.strm_playback.as_ref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                let location = match resolver.resolve(&external_url).await {
+                    Ok(location) => location,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to resolve STRM playback target");
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                };
+                return redirect_strm_playback(location.as_str());
             }
             StrmTargetKind::Path => {
                 let path = match canonical_local_strm_target(
@@ -10901,6 +10932,161 @@ fn lux_user_data_json(state: Option<&crate::storage::StoredUserItemState>) -> Va
         "isFavorite": state.map(|value| value.is_favorite).unwrap_or(false),
         "isPlayed": state.map(|value| value.is_played).unwrap_or(false),
     })
+}
+
+async fn lux_search_people(
+    headers: HeaderMap,
+    Query(query): Query<LuxPeopleSearchQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(raw_query) = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物搜索关键词不能为空",
+        )
+        .into_response();
+    };
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match people
+        .search_actors(&library_ids, raw_query, offset, limit)
+        .await
+    {
+        Ok((actors, total)) => Json(json!({
+            "items": actors,
+            "total": total,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(PeopleError::InvalidComponent(_)) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物搜索关键词无效",
+        )
+        .into_response(),
+        Err(PeopleError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn lux_get_person_items(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let person = match people.find_person(&library_ids, "Actor", &person_id).await {
+        Ok(Some(person)) => person,
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "人物不存在",
+            )
+            .into_response();
+        }
+        Err(PeopleError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let filter = CatalogFilter {
+        item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+        person_id: Some(person.lookup_id),
+        sort_by: CatalogSort::PremiereDate,
+        descending: true,
+        ..CatalogFilter::default()
+    };
+    match catalog
+        .list_all_items_filtered(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &filter,
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 async fn lux_get_person_image(
@@ -19020,6 +19206,15 @@ async fn admin_delete_library(
                     "library deleted but STRM media-info plugin configuration could not be pruned"
                 );
             }
+            if let Some(plugins) = state.plugins.as_ref()
+                && let Err(error) = plugins.prune_danmaku_library_ids().await
+            {
+                tracing::error!(
+                    library_id = %library_id,
+                    %error,
+                    "library deleted but danmaku plugin configuration could not be pruned"
+                );
+            }
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }
@@ -19321,6 +19516,13 @@ fn danmaku_service_error(headers: &HeaderMap, error: DanmakuServiceError) -> Res
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
             "弹幕匹配对象不存在",
+        )
+        .into_response(),
+        DanmakuServiceError::LibraryNotSelected => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "该媒体库未在弹幕插件配置中启用",
         )
         .into_response(),
         DanmakuServiceError::NotRetryable => api_error(
@@ -20048,7 +20250,10 @@ mod tests {
         assert_eq!(body["Size"], 1_234_567);
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(body["SupportsDirectStream"], true);
-        assert!(body["DirectStreamUrl"].is_null());
+        assert_eq!(
+            body["DirectStreamUrl"],
+            "/Videos/item-1/source-1/stream.mkv"
+        );
         assert_eq!(body["DefaultAudioStreamIndex"], -1);
         assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);

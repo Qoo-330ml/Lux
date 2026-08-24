@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     application::emby_migration::{
         EmbyMigrationPluginClient, EmbyMigrationSource, HistoryCapability, MigrationConnectionInfo,
-        MigrationInputError, MigrationItem, MigrationMergePolicy, MigrationUser, MigrationUserData,
-        StoredItemState, merge_item_state,
+        MigrationInputError, MigrationItem, MigrationItemPage, MigrationMergePolicy, MigrationUser,
+        MigrationUserData, StoredItemState, merge_item_state,
     },
     application::plugins::PluginServiceError,
     auth::users::{UserStore, UserStoreError, UserUpdate},
@@ -666,7 +666,7 @@ impl EmbyMigrationService {
         let mut processed = job.processed_count;
         let mut matched = job.matched_count;
         let mut skipped = job.skipped_count;
-        let failed = job.failed_count;
+        let mut failed = job.failed_count;
         let mut total = job.total_count.max(users.len() as i64);
         for (user, lux_user_id) in user_links {
             let mut start_index = 0_u32;
@@ -675,17 +675,28 @@ impl EmbyMigrationService {
                 if self.is_cancelled(job_id).await? {
                     return self.cancelled(job_id, "ITEMS").await;
                 }
-                let page = match self
-                    .plugin
-                    .user_state(&source, &user.id, start_index, 500)
-                    .await
-                {
-                    Ok(page) => page,
-                    Err(error) => {
-                        self.fail_job(job_id, "ITEMS", &error.to_string()).await?;
-                        return Err(error.into());
-                    }
-                };
+                let recovered_page = self
+                    .recover_migration_page(
+                        &source,
+                        &user.id,
+                        start_index,
+                        500,
+                        total,
+                        MigrationPageKind::UserState,
+                    )
+                    .await?;
+                if recovered_page.invalid_item_count > 0 {
+                    processed += recovered_page.invalid_item_count;
+                    failed += recovered_page.invalid_item_count;
+                    tracing::warn!(
+                        job_id = %job_id,
+                        user_id = %user.id,
+                        start_index,
+                        invalid_items = recovered_page.invalid_item_count,
+                        "skipping invalid Emby migration items and continuing"
+                    );
+                }
+                let page = recovered_page.page;
                 if let Some(page_total) = page.total_record_count {
                     total = total.max(page_total as i64);
                 }
@@ -695,12 +706,9 @@ impl EmbyMigrationService {
                     };
                     processed += 1;
                     let outcome = match_item(&item, &identities);
-                    let detail = serde_json::to_string(&json!({
-                        "sourceTitle": item.name,
-                        "sourceType": item.item_type,
-                        "productionYear": item.production_year,
-                    }))
-                    .unwrap_or_else(|_| "{}".to_owned());
+                    let detail =
+                        serde_json::to_string(&migration_item_detail(&item, &outcome, &identities))
+                            .unwrap_or_else(|_| "{}".to_owned());
                     self.database
                         .upsert_emby_migration_item_match(&NewEmbyMigrationItemMatch {
                             job_id,
@@ -816,17 +824,28 @@ impl EmbyMigrationService {
                 if self.is_cancelled(job_id).await? {
                     return self.cancelled(job_id, "ITEMS").await;
                 }
-                let page = match self
-                    .plugin
-                    .person_favorites(&source, &user.id, start_index, 500)
-                    .await
-                {
-                    Ok(page) => page,
-                    Err(error) => {
-                        self.fail_job(job_id, "ITEMS", &error.to_string()).await?;
-                        return Err(error.into());
-                    }
-                };
+                let recovered_page = self
+                    .recover_migration_page(
+                        &source,
+                        &user.id,
+                        start_index,
+                        500,
+                        total,
+                        MigrationPageKind::PersonFavorites,
+                    )
+                    .await?;
+                if recovered_page.invalid_item_count > 0 {
+                    processed += recovered_page.invalid_item_count;
+                    failed += recovered_page.invalid_item_count;
+                    tracing::warn!(
+                        job_id = %job_id,
+                        user_id = %user.id,
+                        start_index,
+                        invalid_items = recovered_page.invalid_item_count,
+                        "skipping invalid Emby migration items and continuing"
+                    );
+                }
+                let page = recovered_page.page;
                 if let Some(page_total) = page.total_record_count {
                     total = total.max(page_total as i64);
                 }
@@ -1063,6 +1082,58 @@ impl EmbyMigrationService {
         Ok(identities)
     }
 
+    async fn recover_migration_page(
+        &self,
+        source: &EmbyMigrationSource,
+        user_id: &str,
+        start_index: u32,
+        limit: u32,
+        known_total: i64,
+        kind: MigrationPageKind,
+    ) -> Result<RecoveredMigrationPage, EmbyMigrationServiceError> {
+        let mut pending_ranges = vec![(start_index, limit)];
+        let mut pages = Vec::new();
+        let mut invalid_item_count = 0_i64;
+
+        while let Some((range_start, range_limit)) = pending_ranges.pop() {
+            let result = match kind {
+                MigrationPageKind::UserState => {
+                    self.plugin
+                        .user_state(source, user_id, range_start, range_limit)
+                        .await
+                }
+                MigrationPageKind::PersonFavorites => {
+                    self.plugin
+                        .person_favorites(source, user_id, range_start, range_limit)
+                        .await
+                }
+            };
+            match result {
+                Ok(page) => pages.push((range_start, page)),
+                Err(PluginServiceError::InvalidResponse) if range_limit > 1 => {
+                    if let Some(((left_start, left_limit), (right_start, right_limit))) =
+                        split_migration_page_range(range_start, range_limit)
+                    {
+                        pending_ranges.push((right_start, right_limit));
+                        pending_ranges.push((left_start, left_limit));
+                    }
+                }
+                Err(PluginServiceError::InvalidResponse) => {
+                    invalid_item_count += 1;
+                    pages.push((range_start, empty_migration_page(range_start, known_total)));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(assemble_recovered_migration_page(
+            start_index,
+            limit,
+            pages,
+            invalid_item_count,
+        ))
+    }
+
     async fn match_person(
         &self,
         person: &MigrationItem,
@@ -1160,6 +1231,78 @@ impl EmbyMigrationService {
             .await?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum MigrationPageKind {
+    UserState,
+    PersonFavorites,
+}
+
+struct RecoveredMigrationPage {
+    page: MigrationItemPage,
+    invalid_item_count: i64,
+}
+
+fn assemble_recovered_migration_page(
+    start_index: u32,
+    requested_limit: u32,
+    mut pages: Vec<(u32, MigrationItemPage)>,
+    invalid_item_count: i64,
+) -> RecoveredMigrationPage {
+    pages.sort_unstable_by_key(|(page_start, _)| *page_start);
+    let total_record_count = pages.iter().find_map(|(_, page)| page.total_record_count);
+    let requested_end = start_index.saturating_add(requested_limit);
+    let next_start_index = match total_record_count {
+        Some(total) => (requested_end < total).then_some(requested_end),
+        None => pages
+            .iter()
+            .filter_map(|(_, page)| page.next_start_index)
+            .max(),
+    };
+    let history_capability = pages
+        .first()
+        .map(|(_, page)| page.history_capability)
+        .unwrap_or(HistoryCapability::ItemState);
+    let items = pages.into_iter().flat_map(|(_, page)| page.items).collect();
+
+    RecoveredMigrationPage {
+        page: MigrationItemPage {
+            items,
+            start_index,
+            total_record_count,
+            next_start_index,
+            history_capability,
+        },
+        invalid_item_count,
+    }
+}
+
+fn empty_migration_page(start_index: u32, known_total: i64) -> MigrationItemPage {
+    let total_record_count = u32::try_from(known_total).ok().filter(|total| *total > 0);
+    let next_start_index = total_record_count.and_then(|total| {
+        let next = start_index.saturating_add(1);
+        (next < total).then_some(next)
+    });
+    MigrationItemPage {
+        items: Vec::new(),
+        start_index,
+        total_record_count,
+        next_start_index,
+        history_capability: HistoryCapability::ItemState,
+    }
+}
+
+fn split_migration_page_range(start_index: u32, limit: u32) -> Option<((u32, u32), (u32, u32))> {
+    if limit <= 1 {
+        return None;
+    }
+    let left_limit = limit / 2;
+    let right_limit = limit - left_limit;
+    Some((
+        (start_index, left_limit),
+        (start_index.saturating_add(left_limit), right_limit),
+    ))
 }
 
 struct MatchOutcome {
@@ -1300,6 +1443,31 @@ fn unmatched(_reason: &str) -> MatchOutcome {
     }
 }
 
+fn migration_item_detail(
+    item: &MigrationItem,
+    outcome: &MatchOutcome,
+    identities: &[StoredMigrationMediaIdentity],
+) -> serde_json::Value {
+    let lux_identity = outcome
+        .lux_item_id
+        .as_deref()
+        .and_then(|id| identities.iter().find(|identity| identity.id == id));
+    let lux_series_identity = lux_identity
+        .and_then(|identity| identity.series_id.as_deref())
+        .and_then(|series_id| identities.iter().find(|identity| identity.id == series_id));
+
+    json!({
+        "sourceTitle": item.name,
+        "sourceType": item.item_type,
+        "productionYear": item.production_year,
+        "luxTitle": lux_identity.map(|identity| identity.title.as_str()),
+        "luxItemType": lux_identity.map(|identity| identity.item_type.as_str()),
+        "luxSeriesTitle": lux_series_identity.map(|identity| identity.title.as_str()),
+        "luxSeasonNumber": lux_identity.and_then(|identity| identity.season_number),
+        "luxEpisodeNumber": lux_identity.and_then(|identity| identity.episode_number),
+    })
+}
+
 fn normalize_title(value: &str) -> String {
     value
         .chars()
@@ -1427,6 +1595,124 @@ mod tests {
         let outcome = match_item(&item, &[identity("lux-1", "{}"), identity("lux-2", "{}")]);
         assert_eq!(outcome.lux_item_id, None);
         assert_eq!(outcome.status, "CONFLICT");
+    }
+
+    #[test]
+    fn migration_match_detail_includes_lux_series_context() {
+        let item = MigrationItem {
+            id: "emby-episode-1".to_owned(),
+            name: "第十集".to_owned(),
+            item_type: "Episode".to_owned(),
+            production_year: Some(1986),
+            provider_ids: BTreeMap::new(),
+            parent_id: None,
+            series_id: Some("emby-series-1".to_owned()),
+            season_id: Some("emby-season-2".to_owned()),
+            index_number: Some(10),
+            parent_index_number: Some(2),
+            user_data: None,
+        };
+        let identities = vec![
+            StoredMigrationMediaIdentity {
+                id: "lux-series-1".to_owned(),
+                item_type: "SERIES".to_owned(),
+                title: "西游记".to_owned(),
+                production_year: Some(1986),
+                provider_ids_json: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+            },
+            StoredMigrationMediaIdentity {
+                id: "lux-episode-1".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                title: "第十集".to_owned(),
+                production_year: Some(1986),
+                provider_ids_json: None,
+                series_id: Some("lux-series-1".to_owned()),
+                season_number: Some(2),
+                episode_number: Some(10),
+            },
+        ];
+        let outcome = MatchOutcome {
+            lux_item_id: Some("lux-episode-1".to_owned()),
+            method: "EPISODE_KEY",
+            confidence: Some(95),
+            status: "MATCHED",
+        };
+
+        let detail = migration_item_detail(&item, &outcome, &identities);
+
+        assert_eq!(detail["luxTitle"], "第十集");
+        assert_eq!(detail["luxSeriesTitle"], "西游记");
+        assert_eq!(detail["luxSeasonNumber"], 2);
+        assert_eq!(detail["luxEpisodeNumber"], 10);
+    }
+
+    #[test]
+    fn recovered_migration_page_keeps_items_and_advances_past_invalid_entries() {
+        let page = assemble_recovered_migration_page(
+            100,
+            4,
+            vec![
+                (
+                    100,
+                    migration_page_with_items(&["item-100", "item-101"], 100, 104),
+                ),
+                (103, migration_page_with_items(&["item-103"], 103, 104)),
+            ],
+            1,
+        );
+
+        assert_eq!(
+            page.page
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["item-100", "item-101", "item-103"]
+        );
+        assert_eq!(page.page.start_index, 100);
+        assert_eq!(page.page.next_start_index, None);
+        assert_eq!(page.invalid_item_count, 1);
+    }
+
+    #[test]
+    fn invalid_migration_page_ranges_split_until_single_item() {
+        assert_eq!(
+            split_migration_page_range(27_000, 500),
+            Some(((27_000, 250), (27_250, 250)))
+        );
+        assert_eq!(split_migration_page_range(27_360, 1), None);
+    }
+
+    fn migration_page_with_items(
+        ids: &[&str],
+        start_index: u32,
+        total_record_count: u32,
+    ) -> MigrationItemPage {
+        MigrationItemPage {
+            items: ids
+                .iter()
+                .map(|id| MigrationItem {
+                    id: (*id).to_owned(),
+                    name: (*id).to_owned(),
+                    item_type: "Movie".to_owned(),
+                    production_year: None,
+                    provider_ids: BTreeMap::new(),
+                    parent_id: None,
+                    series_id: None,
+                    season_id: None,
+                    index_number: None,
+                    parent_index_number: None,
+                    user_data: None,
+                })
+                .collect(),
+            start_index,
+            total_record_count: Some(total_record_count),
+            next_start_index: Some(start_index + ids.len() as u32),
+            history_capability: HistoryCapability::ItemState,
+        }
     }
 
     #[test]

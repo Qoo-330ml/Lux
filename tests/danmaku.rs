@@ -87,7 +87,7 @@ async fn database_migration_creates_danmaku_tables() -> Result<(), Box<dyn std::
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 88);
+    assert_eq!(database.schema_version().await?, 89);
     let active_job_index: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM sqlite_master
@@ -190,7 +190,13 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
             "type": "danmaku",
             "category": "MEDIA",
             "capabilities": ["danmaku.match"],
-            "configFields": [{"key": "providerBaseUrl", "label": "弹幕接口地址", "type": "text", "required": true, "sensitive": true}],
+            "configFields": [
+                {"key": "providerBaseUrl", "label": "弹幕接口地址", "type": "text", "required": true, "sensitive": true},
+                {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "optionsSource": "media-libraries", "defaultValue": []},
+                {"key": "matchOriginalFilename", "label": "使用原始文件名", "type": "toggle", "defaultValue": true},
+                {"key": "matchSimplifiedTraditionalTitles", "label": "尝试简繁标题", "type": "toggle", "defaultValue": true},
+                {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false}
+            ],
             "permissions": {"network": ["*"], "filesystem": []},
             "files": []
         }))?,
@@ -200,7 +206,8 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
     tokio::fs::write(
         config_dir.join("plugin-config/org.lux.danmaku.json"),
         serde_json::to_vec(&serde_json::json!({
-            "providerBaseUrl": format!("http://127.0.0.1:{}", address.port())
+            "providerBaseUrl": format!("http://127.0.0.1:{}", address.port()),
+            "libraryIds": [library.id.to_string()]
         }))?,
     )
     .await?;

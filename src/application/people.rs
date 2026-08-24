@@ -448,10 +448,18 @@ struct PersonManifestMetadataEvent {
     created_at: i64,
 }
 
+#[derive(Default)]
+struct PersonManifestRestoreReport {
+    restored: usize,
+    failed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActorView {
     pub id: String,
+    #[serde(skip)]
+    pub(crate) lookup_id: String,
     pub provider: Option<String>,
     pub name: String,
     pub character: Option<String>,
@@ -534,6 +542,16 @@ impl PeopleService {
     pub fn with_database(mut self, database: Database) -> Self {
         self.database = Some(database);
         self
+    }
+
+    async fn mark_person_manifest_restore_pending(&self) -> Result<(), PeopleError> {
+        if let Some(database) = &self.database {
+            database
+                .mark_person_manifest_restore_pending(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
@@ -1341,6 +1359,7 @@ impl PeopleService {
             manifest.checksum = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            self.mark_person_manifest_restore_pending().await?;
             write_atomically(&manifest_path, &bytes).await
         }
         .await;
@@ -1418,10 +1437,12 @@ impl PeopleService {
             .filter(|actor| !actor.name.trim().is_empty())
         {
             let id = actor_id_from_stored_actor(&actor);
+            let lookup_id = actor.lux_person_id.clone().unwrap_or_else(|| id.clone());
             let provider = actor_provider_from_stored_actor(&actor);
             let image_url = self.person_image_url(provider.as_deref(), &id).await;
             views.push(ActorView {
                 id,
+                lookup_id,
                 provider,
                 name: actor.name,
                 character: actor.character,
@@ -1585,6 +1606,7 @@ impl PeopleService {
                 .collect();
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            self.mark_person_manifest_restore_pending().await?;
             write_atomically(&manifest_path, &bytes).await?;
             Ok::<_, PeopleError>(locked_fields.iter().cloned().collect::<Vec<_>>())
         }
@@ -2334,6 +2356,7 @@ impl PeopleService {
             manifest.checksum = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            self.mark_person_manifest_restore_pending().await?;
             write_atomically(&manifest_path, &bytes).await
         }
         .await;
@@ -2502,13 +2525,33 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
-        let restored_legacy_people = self.restore_legacy_person_directories(database).await?;
-        if restored_legacy_people > 0 {
-            tracing::info!(restored_legacy_people, "legacy people directories migrated");
-        }
-        let restored_people = self.restore_person_manifests(database).await?;
-        if restored_people > 0 {
-            tracing::info!(restored_people, "canonical people manifests restored");
+        let should_restore_people = database
+            .person_manifest_restore_needed(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        if should_restore_people {
+            let restored_legacy_people = self.restore_legacy_person_directories(database).await?;
+            if restored_legacy_people > 0 {
+                tracing::info!(restored_legacy_people, "legacy people directories migrated");
+            }
+            let restore_report = self.restore_person_manifests(database).await?;
+            if restore_report.restored > 0 {
+                tracing::info!(
+                    restored_people = restore_report.restored,
+                    "canonical people manifests restored"
+                );
+            }
+            if restore_report.failed {
+                database
+                    .mark_person_manifest_restore_pending(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            } else {
+                database
+                    .mark_person_manifest_restore_completed(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            }
         }
         let restored_match_candidates = self
             .restore_person_match_candidate_snapshots(database)
@@ -2694,10 +2737,17 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
-        database
+        let queued = database
             .request_person_index_rebuild_job(library_id, PERSON_INDEX_REBUILD_SCHEMA_VERSION)
             .await
-            .map_err(|error| PeopleError::Storage(error.to_string()))
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        if queued {
+            database
+                .mark_person_manifest_restore_pending(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        }
+        Ok(queued)
     }
 
     pub(crate) async fn cancel_person_index_rebuild(
@@ -3031,18 +3081,26 @@ impl PeopleService {
         Ok(restored)
     }
 
-    async fn restore_person_manifests(&self, database: &Database) -> Result<usize, PeopleError> {
+    async fn restore_person_manifests(
+        &self,
+        database: &Database,
+    ) -> Result<PersonManifestRestoreReport, PeopleError> {
         let root = metadata_root(&self.config_dir)
             .join(LEGACY_PEOPLE_DIR)
             .join("person");
         let mut initials = match fs::read_dir(&root).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PersonManifestRestoreReport {
+                    failed: true,
+                    ..PersonManifestRestoreReport::default()
+                });
+            }
             Err(source) => {
                 return Err(PeopleError::Io { path: root, source });
             }
         };
-        let mut restored = 0;
+        let mut report = PersonManifestRestoreReport::default();
         while let Some(initial) = initials
             .next_entry()
             .await
@@ -3103,20 +3161,30 @@ impl PeopleService {
                     .iter()
                     .map(|identity| (identity.provider.as_str(), identity.id.as_str()))
                     .collect::<Vec<_>>();
-                if database
-                    .restore_canonical_person(
+                match database
+                    .restore_canonical_person_if_manifest_changed(
                         &manifest.lux_person_id,
                         &manifest.display_name,
                         &identities,
+                        &manifest.checksum,
+                        manifest.schema_version as i64,
                     )
                     .await
-                    .is_ok()
                 {
-                    restored += 1;
+                    Ok(true) => report.restored += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        report.failed = true;
+                        tracing::warn!(
+                            path = %manifest_path.display(),
+                            %error,
+                            "skipping conflicting person manifest"
+                        );
+                    }
                 }
             }
         }
-        Ok(restored)
+        Ok(report)
     }
 
     async fn restore_person_relation_snapshots(
@@ -3372,6 +3440,29 @@ impl PeopleService {
         };
         let (credits, total) = database
             .list_person_credits_for_libraries(library_ids, person_type, options)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        Ok((self.actor_views_from_credits(credits).await, total))
+    }
+
+    pub async fn search_actors(
+        &self,
+        library_ids: &[String],
+        query: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<ActorView>, i64), PeopleError> {
+        let query = query.trim();
+        if !is_valid_person_lookup(query) {
+            return Err(PeopleError::InvalidComponent(query.to_owned()));
+        }
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        let (credits, total) = database
+            .search_person_credits_for_libraries(library_ids, "Actor", query, offset, limit)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
         Ok((self.actor_views_from_credits(credits).await, total))
@@ -3663,6 +3754,10 @@ impl PeopleService {
     async fn actor_views_from_credits(&self, credits: Vec<StoredPersonCredit>) -> Vec<ActorView> {
         let mut views = Vec::with_capacity(credits.len());
         for credit in credits {
+            let lookup_id = credit
+                .lux_person_id
+                .clone()
+                .unwrap_or_else(|| credit.person_id.clone());
             let provider = (!credit.provider.is_empty()).then(|| credit.provider.clone());
             let image_url = if let Some(lux_person_id) = credit.lux_person_id.as_deref()
                 && matches!(self.profile_image(lux_person_id).await, Ok(Some(_)))
@@ -3702,6 +3797,7 @@ impl PeopleService {
                 .unwrap_or(stored_metadata);
             views.push(ActorView {
                 id: credit.person_id,
+                lookup_id,
                 provider,
                 name: credit.person_name,
                 character: (!credit.role.is_empty()).then_some(credit.role),
@@ -5625,6 +5721,64 @@ mod tests {
         assert!(coordinator.begin().await);
     }
 
+    #[tokio::test]
+    async fn restarting_people_recovery_skips_unchanged_manifests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let actor = ActorCredit {
+            id: "57975".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "华晨宇".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+        let identities = super::actor_identities(&actor, "tmdb");
+        let person_id = service
+            .resolve_person_key(&actor, &identities, None)
+            .await?
+            .ok_or("missing canonical person")?;
+        service
+            .persist_person_assets(&actor, "tmdb", "57975", Some(&person_id), &identities)
+            .await;
+
+        service.rebuild_person_credit_index().await?;
+        sqlx::query("UPDATE people SET updated_at = 1 WHERE id = ?")
+            .bind(&person_id)
+            .execute(database.pool())
+            .await?;
+
+        service.rebuild_person_credit_index().await?;
+        let updated_at: i64 = sqlx::query_scalar("SELECT updated_at FROM people WHERE id = ?")
+            .bind(&person_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(updated_at, 1);
+
+        service
+            .set_person_field_locks(&person_id, &["name".to_owned()], "{}")
+            .await?;
+        sqlx::query("UPDATE people SET updated_at = 1 WHERE id = ?")
+            .bind(&person_id)
+            .execute(database.pool())
+            .await?;
+        service.rebuild_person_credit_index().await?;
+        let updated_at: i64 = sqlx::query_scalar("SELECT updated_at FROM people WHERE id = ?")
+            .bind(&person_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert!(updated_at > 1);
+        Ok(())
+    }
+
     #[test]
     fn birthday_matching_accepts_format_variants_but_rejects_full_date_conflicts() {
         assert!(super::birthdays_compatible(
@@ -5818,7 +5972,7 @@ mod tests {
             .execute(database.pool())
             .await?;
         assert_eq!(
-            service.restore_person_manifests(&database).await?,
+            service.restore_person_manifests(&database).await?.restored,
             1,
             "manifest should restore one canonical person"
         );

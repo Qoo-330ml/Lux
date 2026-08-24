@@ -100,6 +100,14 @@ pub struct MediaInfoSettings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DanmakuSettings {
+    pub library_ids: Vec<String>,
+    pub match_original_filename: bool,
+    pub match_simplified_traditional_titles: bool,
+    pub match_english_title: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChapterDetectorSettings {
     pub concurrency: i64,
     pub intro_window_seconds: i64,
@@ -468,6 +476,31 @@ impl PluginService {
         self.sync_media_info_scheduled_task().await
     }
 
+    pub async fn prune_danmaku_library_ids(&self) -> Result<(), PluginServiceError> {
+        let mut values = self.read_plugin_config(DANMAKU_PLUGIN_ID).await?;
+        let Some(library_ids) = values.get_mut("libraryIds").and_then(Value::as_array_mut) else {
+            return Ok(());
+        };
+        let valid_library_ids = self
+            .database
+            .list_libraries()
+            .await?
+            .into_iter()
+            .filter(|library| library.is_enabled)
+            .map(|library| library.id)
+            .collect::<HashSet<_>>();
+        let before = library_ids.len();
+        library_ids.retain(|value| {
+            value
+                .as_str()
+                .is_some_and(|library_id| valid_library_ids.contains(library_id))
+        });
+        if library_ids.len() == before {
+            return Ok(());
+        }
+        self.write_plugin_config(DANMAKU_PLUGIN_ID, &values).await
+    }
+
     pub async fn update(&self, plugin_id: &str) -> Result<PluginView, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
@@ -785,10 +818,28 @@ impl PluginService {
         &self,
         file_name: &str,
     ) -> Result<DanmakuMatchRpcResult, PluginServiceError> {
+        self.match_danmaku_with_candidates(file_name, &[]).await
+    }
+
+    pub async fn match_danmaku_with_candidates(
+        &self,
+        file_name: &str,
+        alternate_file_names: &[String],
+    ) -> Result<DanmakuMatchRpcResult, PluginServiceError> {
         if file_name.trim().is_empty()
             || file_name.chars().count() > 1024
             || file_name.chars().any(char::is_control)
             || file_name.contains(['/', '\\'])
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        if alternate_file_names.len() > 8
+            || alternate_file_names.iter().any(|candidate| {
+                candidate.trim().is_empty()
+                    || candidate.chars().count() > 1024
+                    || candidate.chars().any(char::is_control)
+                    || candidate.contains(['/', '\\'])
+            })
         {
             return Err(PluginServiceError::InvalidResponse);
         }
@@ -820,6 +871,7 @@ impl PluginService {
                 DANMAKU_MATCH_METHOD,
                 serde_json::to_value(DanmakuMatchRpcRequest {
                     file_name: file_name.to_owned(),
+                    alternate_file_names: alternate_file_names.to_vec(),
                 })
                 .map_err(|_| PluginServiceError::InvalidResponse)?,
             )
@@ -1051,7 +1103,7 @@ impl PluginService {
         let mut stored_values = self.read_plugin_config(&plugin_id).await?;
         stored_values.extend(values);
         let values = merge_default_config_values(&fields, stored_values);
-        let mut values = normalize_plugin_config(&plugin_id, values);
+        let mut values = normalize_plugin_config_for_fields(&plugin_id, &fields, values);
         if is_chapter_detector_plugin(plugin) {
             values.remove("libraryIds");
         }
@@ -1083,11 +1135,52 @@ impl PluginService {
             .get(&plugin_id)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
-        let values =
-            merge_default_config_values(&fields, self.read_plugin_config(&plugin_id).await?);
+        let values = normalize_plugin_config_for_fields(
+            &plugin_id,
+            &fields,
+            merge_default_config_values(&fields, self.read_plugin_config(&plugin_id).await?),
+        );
         let values = validate_config_values(&fields, &values)?;
         validate_dynamic_plugin_config(&plugin_id, &values)?;
         Ok(values)
+    }
+
+    pub async fn danmaku_settings(&self) -> Result<DanmakuSettings, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(DANMAKU_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(DANMAKU_PLUGIN_ID.to_owned()))?;
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let values = normalize_plugin_config_for_fields(
+            DANMAKU_PLUGIN_ID,
+            &fields,
+            merge_default_config_values(&fields, self.read_plugin_config(DANMAKU_PLUGIN_ID).await?),
+        );
+        let values = validate_config_values(&fields, &values)?;
+        validate_dynamic_plugin_config(DANMAKU_PLUGIN_ID, &values)?;
+        let library_ids = values
+            .get("libraryIds")
+            .and_then(Value::as_array)
+            .ok_or(PluginServiceError::InvalidConfig)?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        Ok(DanmakuSettings {
+            library_ids,
+            match_original_filename: values
+                .get("matchOriginalFilename")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            match_simplified_traditional_titles: values
+                .get("matchSimplifiedTraditionalTitles")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            match_english_title: values
+                .get("matchEnglishTitle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
     }
 
     pub async fn update_media_info_schedule(
@@ -1863,7 +1956,11 @@ impl PluginService {
         if is_chapter_detector_plugin(plugin) {
             stored_values.remove("libraryIds");
         }
-        let config_values = merge_default_config_values(&config_fields, stored_values);
+        let config_values = normalize_plugin_config_for_fields(
+            &plugin.manifest.id,
+            &config_fields,
+            merge_default_config_values(&config_fields, stored_values),
+        );
         let public_config_values = public_config_values(&config_fields, &config_values);
         let configured = if is_tmdb_plugin_id(&plugin.manifest.id) {
             config_source != CONFIG_SOURCE_NONE
@@ -1992,6 +2089,29 @@ fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> M
                 json!(policy),
             );
         }
+    }
+    values
+}
+
+fn normalize_plugin_config_for_fields(
+    plugin_id: &str,
+    fields: &[PluginConfigField],
+    values: Map<String, Value>,
+) -> Map<String, Value> {
+    let mut values = normalize_plugin_config(plugin_id, values);
+    if plugin_id != DANMAKU_PLUGIN_ID {
+        return values;
+    }
+    let Some(field) = fields.iter().find(|field| field.key == "libraryIds") else {
+        return values;
+    };
+    let valid_ids = field
+        .options
+        .iter()
+        .map(|option| option.value.as_str())
+        .collect::<HashSet<_>>();
+    if let Some(Value::Array(ids)) = values.get_mut("libraryIds") {
+        ids.retain(|value| value.as_str().is_some_and(|id| valid_ids.contains(id)));
     }
     values
 }

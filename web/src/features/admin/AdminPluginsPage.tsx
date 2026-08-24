@@ -131,6 +131,8 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const [uninstallDialogOpen, setUninstallDialogOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [apiKeyDirty, setApiKeyDirty] = useState(false);
+  const [danmakuProviderBaseUrl, setDanmakuProviderBaseUrl] = useState("");
+  const [danmakuProviderBaseUrlDirty, setDanmakuProviderBaseUrlDirty] = useState(false);
   const [preferredLanguage, setPreferredLanguage] = useState("zh-CN");
   const [languageFallbackEnabled, setLanguageFallbackEnabled] = useState(false);
   const [titleAliasReplacementEnabled, setTitleAliasReplacementEnabled] = useState(false);
@@ -139,6 +141,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const [apiBaseUrlChoice, setApiBaseUrlChoice] = useState("official");
   const [customApiBaseUrl, setCustomApiBaseUrl] = useState("");
   const [libraryIds, setLibraryIds] = useState<string[]>([]);
+  const [matchOriginalFilename, setMatchOriginalFilename] = useState(true);
+  const [matchSimplifiedTraditionalTitles, setMatchSimplifiedTraditionalTitles] = useState(true);
+  const [matchEnglishTitle, setMatchEnglishTitle] = useState(false);
   const [concurrency, setConcurrency] = useState(2);
   const [introWindowSeconds, setIntroWindowSeconds] = useState(180);
   const [creditsWindowSeconds, setCreditsWindowSeconds] = useState(180);
@@ -151,10 +156,12 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const [schedule, setSchedule] = useState("0 3 * * *");
   const closeRef = useRef<HTMLButtonElement>(null);
   const uninstallCancelRef = useRef<HTMLButtonElement>(null);
+  const isDanmaku = plugin.id === "org.lux.danmaku";
   const isMediaInfo = plugin.id === "org.lux.strm-media-info";
   const isMigration = plugin.id === "org.lux.emby-migration";
   const isChapterSource = plugin.capabilities?.some((capability) => capability === "chapters.detect" || capability === "chapters.lookup") === true;
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
+  const danmakuProviderField = plugin.configFields.find((field) => field.key === "providerBaseUrl");
   const preferredLanguageField = plugin.configFields.find((field) => field.key === "preferredLanguage");
   const fallbackEnabledField = plugin.configFields.find((field) => field.key === "languageFallbackEnabled");
   const titleAliasReplacementField = plugin.configFields.find((field) => field.key === "titleAliasReplacementEnabled");
@@ -177,8 +184,16 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const toggleBlockedByProvider = plugin.unavailableReason === "OTHER_IP_LOCATION_PLUGIN_INSTALLED";
   const closeDialog = useCallback(() => setOpen(false), []);
   const save = useMutation({
-    mutationFn: () => isMediaInfo
+    mutationFn: () => isDanmaku
       ? api.updateAdminPluginConfig(plugin.id, {
+          ...(danmakuProviderBaseUrlDirty ? { providerBaseUrl: danmakuProviderBaseUrl.trim() } : {}),
+          libraryIds,
+          matchOriginalFilename,
+          matchSimplifiedTraditionalTitles,
+          matchEnglishTitle,
+        })
+      : isMediaInfo
+        ? api.updateAdminPluginConfig(plugin.id, {
           libraryIds,
           concurrency,
           existingInfoPolicy,
@@ -187,16 +202,16 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
           ...(thumbnailPositionPercentField ? { thumbnailPositionPercent } : {}),
           writeSidecars,
           ...(scheduleField ? { schedule: schedule.trim() } : {}),
-        })
-      : isChapterSource
-        ? api.updateAdminPluginConfig(plugin.id, {
+          })
+        : isChapterSource
+          ? api.updateAdminPluginConfig(plugin.id, {
             concurrency,
             ...(introWindowField ? { introWindowSeconds } : {}),
             ...(creditsWindowField ? { creditsWindowSeconds } : {}),
             ...(matchThresholdField ? { matchThreshold } : {}),
             ...(scheduleField ? { schedule: schedule.trim() } : {}),
-          })
-        : api.updateAdminPluginConfig(plugin.id, {
+            })
+          : api.updateAdminPluginConfig(plugin.id, {
           ...(apiKeyDirty ? { apiKey } : {}),
           preferredLanguage,
           languageFallbackEnabled,
@@ -209,6 +224,8 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
         }),
     onSuccess: () => {
       setApiKey("");
+      setDanmakuProviderBaseUrl("");
+      setDanmakuProviderBaseUrlDirty(false);
       closeDialog();
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
@@ -267,6 +284,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
       ? values.libraryIds.filter((value): value is string => typeof value === "string")
       : [];
     setLibraryIds(configuredLibraryIds);
+    setMatchOriginalFilename(values.matchOriginalFilename !== false);
+    setMatchSimplifiedTraditionalTitles(values.matchSimplifiedTraditionalTitles !== false);
+    setMatchEnglishTitle(values.matchEnglishTitle === true);
     setConcurrency(typeof values.concurrency === "number" ? values.concurrency : Number(concurrencyField?.defaultValue ?? 2));
     setIntroWindowSeconds(typeof values.introWindowSeconds === "number" ? values.introWindowSeconds : Number(introWindowField?.defaultValue ?? 180));
     setCreditsWindowSeconds(typeof values.creditsWindowSeconds === "number" ? values.creditsWindowSeconds : Number(creditsWindowField?.defaultValue ?? 180));
@@ -285,6 +305,8 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setSchedule(typeof values.schedule === "string" ? values.schedule : String(scheduleField?.defaultValue ?? "0 3 * * *"));
     setApiKey("");
     setApiKeyDirty(false);
+    setDanmakuProviderBaseUrl("");
+    setDanmakuProviderBaseUrlDirty(false);
   }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
 
   return (
@@ -325,7 +347,13 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
               <button ref={closeRef} className="lux-icon-button lux-admin-plugin-dialog-close" type="button" aria-label={`关闭 ${plugin.name}配置`} onClick={closeDialog}><X size={17} /></button>
             </div>
             {isMigration ? <EmbyMigrationPluginConfig plugin={plugin} /> : <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
-              {isMediaInfo ? <>
+              {isDanmaku ? <>
+                {danmakuProviderField ? <label htmlFor={"plugin-config-" + plugin.id + "-provider-base-url"}>{danmakuProviderField.label}<input id={"plugin-config-" + plugin.id + "-provider-base-url"} type="url" value={danmakuProviderBaseUrl} onChange={(event) => { setDanmakuProviderBaseUrl(event.target.value); setDanmakuProviderBaseUrlDirty(true); }} placeholder="留空保留已保存的地址" autoComplete="url" required={danmakuProviderField.required && !plugin.configured} /><small>{danmakuProviderField.description}</small></label> : null}
+                {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-library-ids"} multiple value={libraryIds} options={libraryIdsField.options ?? []} onChange={setLibraryIds} aria-label={libraryIdsField.label} /><small>{libraryIdsField.description}</small></label> : null}
+                <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={matchOriginalFilename} onChange={(event) => setMatchOriginalFilename(event.target.checked)} /> <span><strong>使用原始文件名</strong><small>优先使用视频文件名请求上游匹配接口。</small></span></label>
+                <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={matchSimplifiedTraditionalTitles} onChange={(event) => setMatchSimplifiedTraditionalTitles(event.target.checked)} /> <span><strong>尝试简繁标题</strong><small>没有匹配结果时，尝试已登记的本地标题候选。</small></span></label>
+                <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={matchEnglishTitle} onChange={(event) => setMatchEnglishTitle(event.target.checked)} /> <span><strong>尝试英文标题</strong><small>没有匹配结果时，尝试已登记的英文或原始标题。</small></span></label>
+              </> : isMediaInfo ? <>
                 {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-library-ids"} multiple value={libraryIds} options={libraryIdsField.options ?? []} onChange={setLibraryIds} aria-label={libraryIdsField.label} /><small>{libraryIdsField.description}</small></label> : null}
                 {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
                 {introWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-intro-window"}>{introWindowField.label}<input id={"plugin-config-" + plugin.id + "-intro-window"} type="number" min={introWindowField.minimum ?? 15} max={introWindowField.maximum ?? 300} value={introWindowSeconds} onChange={(event) => setIntroWindowSeconds(Number(event.target.value))} /><small>{introWindowField.description}</small></label> : null}
@@ -353,7 +381,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
                 {apiBaseUrlField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} options={apiBaseUrlField.options ?? []} disabled={!alternateApiEnabled} onChange={setApiBaseUrlChoice} aria-label={apiBaseUrlField.label} /><small>{apiBaseUrlField.description}</small></label> : null}
                 {apiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>自定义 API 地址<input id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>只填写 TMDb API 的基础地址，不要附带查询参数。</small></label> : null}
               </>}
-              <p>{configField?.description ?? "插件配置"} 当前：{availabilityLabel(plugin.configSource)}。</p>
+              <p>{danmakuProviderField?.description ?? configField?.description ?? "插件配置"} 当前：{availabilityLabel(plugin.configSource)}。</p>
               <div className="lux-admin-plugin-dialog-actions">
                 <button className="lux-button lux-button-secondary" type="button" onClick={closeDialog}>取消</button>
                 <button className="lux-button lux-button-primary" type="submit" disabled={save.isPending}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</button>

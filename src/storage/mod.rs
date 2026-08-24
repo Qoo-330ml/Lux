@@ -2804,6 +2804,123 @@ impl Database {
         Ok(stored)
     }
 
+    pub(crate) async fn person_manifest_restore_needed(
+        &self,
+        schema_version: i64,
+    ) -> Result<bool, StorageError> {
+        let status = self
+            .query_scalar::<String>(
+                "SELECT status FROM person_manifest_restore_state
+                 WHERE id = 1 AND schema_version = ?",
+            )
+            .bind(schema_version)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(status.as_deref() != Some("COMPLETED"))
+    }
+
+    pub(crate) async fn mark_person_manifest_restore_pending(
+        &self,
+        schema_version: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO person_manifest_restore_state (id, status, schema_version, updated_at)
+             VALUES (1, 'PENDING', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                schema_version = excluded.schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(schema_version)
+        .bind(current_unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) async fn mark_person_manifest_restore_completed(
+        &self,
+        schema_version: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO person_manifest_restore_state (id, status, schema_version, updated_at)
+             VALUES (1, 'COMPLETED', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                schema_version = excluded.schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(schema_version)
+        .bind(current_unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) async fn restore_canonical_person_if_manifest_changed(
+        &self,
+        person_id: &str,
+        display_name: &str,
+        identities: &[(&str, &str)],
+        manifest_checksum: &str,
+        manifest_schema_version: i64,
+    ) -> Result<bool, StorageError> {
+        let unchanged = self
+            .query_scalar::<String>(
+                "SELECT manifest_checksum FROM person_manifest_index_state
+                 WHERE person_id = ? AND manifest_checksum = ?
+                   AND manifest_schema_version = ?",
+            )
+            .bind(person_id)
+            .bind(manifest_checksum)
+            .bind(manifest_schema_version)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if unchanged {
+            return Ok(false);
+        }
+
+        self.restore_canonical_person(person_id, display_name, identities)
+            .await?;
+        self.query(
+            "INSERT INTO person_manifest_index_state (
+                person_id, manifest_checksum, manifest_schema_version, updated_at
+             ) VALUES (?, ?, ?, ?)
+             ON CONFLICT(person_id) DO UPDATE SET
+                manifest_checksum = excluded.manifest_checksum,
+                manifest_schema_version = excluded.manifest_schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(person_id)
+        .bind(manifest_checksum)
+        .bind(manifest_schema_version)
+        .bind(current_unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(true)
+    }
+
     pub(crate) async fn attach_canonical_person_identity(
         &self,
         person_id: &str,
@@ -3046,6 +3163,120 @@ impl Database {
             .bind(person_type)
             .bind(options.limit)
             .bind(options.offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(stored_person_credit)
+            .collect();
+        Ok((rows, total))
+    }
+
+    pub(crate) async fn search_person_credits_for_libraries(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        query: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredPersonCredit>, i64), StorageError> {
+        if library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like_query = format!("%{escaped}%");
+        let person_group = "COALESCE(
+            NULLIF(pc.lux_person_id, ''),
+            NULLIF(pi.person_id, ''),
+            pc.provider || ':' || pc.person_id
+        )";
+        let count_query = format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT {person_group}
+                 FROM person_credits pc
+                 JOIN media_items mi ON mi.id = pc.item_id
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN person_identities pi
+                   ON pi.provider = pc.provider
+                  AND pi.provider_id = pc.person_id
+                 WHERE mi.library_id IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   {CATALOG_VISIBLE_PREDICATE}
+                   AND pc.person_type = ?
+                   AND pc.person_name LIKE ? ESCAPE '\\'
+                 GROUP BY {person_group}
+             )"
+        );
+        let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        for library_id in library_ids {
+            count_statement = count_statement.bind(library_id);
+        }
+        let total = count_statement
+            .bind(person_type)
+            .bind(&like_query)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let list_query = format!(
+            "SELECT MIN(pc.item_id) AS item_id,
+                    MIN(pc.person_id) AS person_id,
+                    MIN(pc.lux_person_id) AS lux_person_id,
+                    MIN(pc.provider) AS provider,
+                    MIN(pc.person_name) AS person_name,
+                    MIN(pc.role) AS role,
+                    MIN(mi.added_at) AS date_created,
+                    MIN(pc.biography) AS biography,
+                    MIN(pc.birthday) AS birthday,
+                    MIN(pc.deathday) AS deathday,
+                    MIN(pc.known_for_department) AS known_for_department,
+                    MIN(pc.place_of_birth) AS place_of_birth,
+                    MIN(pc.provider_ids_json) AS provider_ids_json,
+                    MIN(pc.genres_json) AS genres_json,
+                    MIN(pc.tags_json) AS tags_json,
+                    MIN(pc.production_locations_json) AS production_locations_json,
+                    MIN(pc.premiere_date) AS premiere_date,
+                    MIN(pc.production_year) AS production_year,
+                    MIN(pc.taglines_json) AS taglines_json
+             FROM person_credits pc
+             JOIN media_items mi ON mi.id = pc.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
+             WHERE mi.library_id IN ({placeholders})
+               AND mi.removed_at IS NULL
+               {CATALOG_VISIBLE_PREDICATE}
+               AND pc.person_type = ?
+               AND pc.person_name LIKE ? ESCAPE '\\'
+             GROUP BY {person_group}
+             ORDER BY CASE WHEN LOWER(MIN(pc.person_name)) = LOWER(?) THEN 0 ELSE 1 END,
+                      LOWER(MIN(pc.person_name)) ASC,
+                      MIN(pc.provider) ASC,
+                      MIN(pc.person_id) ASC
+             LIMIT ? OFFSET ?"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(list_query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        let rows = statement
+            .bind(person_type)
+            .bind(&like_query)
+            .bind(query.trim())
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .bind(offset.max(0))
             .fetch_all(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -11595,9 +11826,13 @@ impl Database {
     ) -> Result<Option<StoredDanmakuSource>, StorageError> {
         self.query(
             "SELECT ms.id AS source_id, ms.item_id,
+                    mi.item_type, mi.title, mi.original_title,
+                    series.title AS series_title,
+                    series.original_title AS series_original_title,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
+             LEFT JOIN media_items series ON series.id = mi.series_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
@@ -11613,6 +11848,11 @@ impl Database {
                 source_id: row.get("source_id"),
                 root_path: row.get("root_path"),
                 relative_path: row.get("relative_path"),
+                item_type: row.get("item_type"),
+                title: row.get("title"),
+                original_title: row.get("original_title"),
+                series_title: row.get("series_title"),
+                series_original_title: row.get("series_original_title"),
             })
         })
         .map_err(|source| StorageError::Sqlx {
@@ -11891,10 +12131,15 @@ impl Database {
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
         self.query(
             "SELECT ji.id, ji.media_source_id,
+                    mi.item_type, mi.title, mi.original_title,
+                    series.title AS series_title,
+                    series.original_title AS series_original_title,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM danmaku_match_job_items ji
              LEFT JOIN media_sources ms
                ON ms.id = ji.media_source_id AND ms.source_kind = 'LOCAL_FILE'
+             LEFT JOIN media_items mi ON mi.id = ms.item_id
+             LEFT JOIN media_items series ON series.id = mi.series_id
              LEFT JOIN filesystem_entries fe
                ON fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
              LEFT JOIN library_roots lr ON lr.id = fe.library_root_id
@@ -11913,6 +12158,11 @@ impl Database {
                     media_source_id: row.get("media_source_id"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
+                    item_type: row.get("item_type"),
+                    title: row.get("title"),
+                    original_title: row.get("original_title"),
+                    series_title: row.get("series_title"),
+                    series_original_title: row.get("series_original_title"),
                 })
                 .collect()
         })
@@ -15764,6 +16014,7 @@ fn catalog_filter_where_clause<'a>(
     let user_id = filter.user_id;
     let item_types = filter.item_types;
     let item_ids = filter.item_ids;
+    let person_id = filter.person_id;
     let media_source_ids = filter.media_source_ids;
     let excluded_item_types = filter.excluded_item_types;
     let years = filter.years;
@@ -15823,6 +16074,58 @@ fn catalog_filter_where_clause<'a>(
         } else {
             where_clause.push_str(&format!(" AND ({})", id_predicates.join(" OR ")));
         }
+    }
+    if let Some(person_id) = person_id {
+        where_clause.push_str(
+            " AND EXISTS (
+                 SELECT 1
+                 FROM person_credits person_filter
+                 JOIN media_items credit_item ON credit_item.id = person_filter.item_id
+                 LEFT JOIN person_identities identity_filter
+                   ON identity_filter.provider = person_filter.provider
+                  AND identity_filter.provider_id = person_filter.person_id
+                 WHERE person_filter.person_type = ?
+                   AND (
+                       person_filter.person_id = ?
+                       OR person_filter.lux_person_id = ?
+                       OR identity_filter.person_id = ?
+                   )
+                   AND credit_item.removed_at IS NULL
+                   AND (
+                       credit_item.has_available_source = 1
+                       OR (
+                           credit_item.item_type IN ('SERIES', 'SEASON', 'BOX_SET', 'FOLDER')
+                           AND EXISTS (
+                               SELECT 1
+                               FROM media_items visible_credit_child
+                               WHERE visible_credit_child.removed_at IS NULL
+                                 AND visible_credit_child.has_available_source = 1
+                                 AND (
+                                     visible_credit_child.parent_id = credit_item.id
+                                     OR visible_credit_child.series_id = credit_item.id
+                                 )
+                           )
+                       )
+                   )
+                   AND (
+                       person_filter.item_id = mi.id
+                       OR credit_item.series_id = mi.id
+                       OR EXISTS (
+                           SELECT 1
+                           FROM media_items credit_parent
+                           WHERE credit_parent.id = credit_item.parent_id
+                             AND (
+                                 credit_parent.series_id = mi.id
+                                 OR credit_parent.parent_id = mi.id
+                             )
+                       )
+                   )
+             )",
+        );
+        binds.push(CatalogBind::Text("Actor"));
+        binds.push(CatalogBind::Text(person_id));
+        binds.push(CatalogBind::Text(person_id));
+        binds.push(CatalogBind::Text(person_id));
     }
     if !item_types.is_empty() {
         where_clause.push_str(&format!(
@@ -16011,6 +16314,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) item_types: &'a [String],
     pub(crate) excluded_item_types: &'a [String],
     pub(crate) item_ids: Option<&'a [String]>,
+    pub(crate) person_id: Option<&'a str>,
     pub(crate) media_source_ids: Option<&'a [String]>,
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
@@ -16068,6 +16372,11 @@ pub(crate) struct StoredDanmakuSource {
     pub(crate) source_id: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+    pub(crate) item_type: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) original_title: Option<String>,
+    pub(crate) series_title: Option<String>,
+    pub(crate) series_original_title: Option<String>,
 }
 
 pub(crate) struct NewDanmakuTrack<'a> {
@@ -16104,6 +16413,11 @@ pub(crate) struct StoredDanmakuMatchItem {
     pub(crate) media_source_id: String,
     pub(crate) root_path: Option<String>,
     pub(crate) relative_path: Option<String>,
+    pub(crate) item_type: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) original_title: Option<String>,
+    pub(crate) series_title: Option<String>,
+    pub(crate) series_original_title: Option<String>,
 }
 
 pub(crate) struct NewDanmakuMatchJob<'a> {
@@ -17531,6 +17845,7 @@ mod tests {
                 item_types: &item_types,
                 excluded_item_types: &empty,
                 item_ids: None,
+                person_id: None,
                 media_source_ids: None,
                 years: &empty_years,
                 is_played: None,

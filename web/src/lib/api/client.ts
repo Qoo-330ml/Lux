@@ -42,6 +42,7 @@ import type {
   Library,
   LibrariesResponse,
   LuxUser,
+  MediaActor,
   MediaItem,
   ItemMetadata,
   ItemImage,
@@ -282,12 +283,24 @@ export class LuxApiClient {
     return this.request<PageResponse<MediaItem>>(`/api/v1/search?${params}`);
   }
 
+  searchPeople(query: string, page = 1) {
+    const params = new URLSearchParams({ q: query, page: String(page), pageSize: "12" });
+    return this.request<PageResponse<MediaActor>>(`/api/v1/people?${params}`);
+  }
+
   item(itemId: string) {
     return this.request<MediaItem>(`/api/v1/items/${encodeURIComponent(itemId)}`);
   }
 
   person(personId: string) {
     return this.request<PersonDetail>(`/api/v1/people/${encodeURIComponent(personId)}`);
+  }
+
+  personItems(personId: string, page = 1) {
+    const params = new URLSearchParams({ page: String(page), pageSize: "24" });
+    return this.request<PageResponse<MediaItem>>(
+      `/api/v1/people/${encodeURIComponent(personId)}/items?${params}`,
+    );
   }
 
   setPersonFavorite(personId: string, favorite: boolean) {

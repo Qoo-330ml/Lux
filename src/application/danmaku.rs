@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use crate::{
     application::{
+        media_matching::{MediaKind, parse_media_name},
         plugin_protocol::DanmakuMatchStatus,
-        plugins::{PluginService, PluginServiceError},
+        plugins::{DanmakuSettings, PluginService, PluginServiceError},
     },
     domain::ids::LibraryId,
     observability::resources::ResourceMetrics,
@@ -387,6 +388,13 @@ impl DanmakuService {
         let Some(plugins) = &self.plugins else {
             return Err(DanmakuServiceError::ProviderNotConfigured);
         };
+        let settings = plugins
+            .danmaku_settings()
+            .await
+            .map_err(|_| DanmakuServiceError::ProviderNotConfigured)?;
+        if !settings.library_ids.iter().any(|id| id == &library_id) {
+            return Err(DanmakuServiceError::LibraryNotSelected);
+        }
         if !plugins
             .has_available_danmaku()
             .await
@@ -516,6 +524,21 @@ impl DanmakuService {
                 .await?;
             return Ok(());
         };
+        let settings = match plugins.danmaku_settings().await {
+            Ok(settings) => settings,
+            Err(_) => {
+                self.database
+                    .finish_danmaku_match_job(&job.id, "FAILED", Some("PLUGIN_NOT_CONFIGURED"))
+                    .await?;
+                return Ok(());
+            }
+        };
+        if !settings.library_ids.contains(&job.library_id) {
+            self.database
+                .finish_danmaku_match_job(&job.id, "FAILED", Some("LIBRARY_NOT_SELECTED"))
+                .await?;
+            return Ok(());
+        }
         self.database
             .reset_running_danmaku_match_items(&job.id)
             .await?;
@@ -552,11 +575,17 @@ impl DanmakuService {
                         source_id: item.media_source_id,
                         root_path,
                         relative_path,
+                        item_type: item.item_type.clone(),
+                        title: item.title.clone(),
+                        original_title: item.original_title.clone(),
+                        series_title: item.series_title.clone(),
+                        series_original_title: item.series_original_title.clone(),
                     }),
                     _ => None,
                 };
                 let database = self.database.clone();
                 let plugins = plugins.clone();
+                let settings = settings.clone();
                 let overwrite = job.overwrite;
                 workers.spawn(async move {
                     if !database.claim_danmaku_match_item(&item.id).await? {
@@ -569,9 +598,10 @@ impl DanmakuService {
                             "media source is no longer available",
                         )));
                     };
-                    let result =
-                        process_danmaku_source_with_plugin(source, plugins, overwrite, item.id)
-                            .await;
+                    let result = process_danmaku_source_with_plugin(
+                        source, plugins, settings, overwrite, item.id,
+                    )
+                    .await;
                     Ok(Some(result))
                 });
             }
@@ -706,6 +736,7 @@ fn danmaku_match_job(job: StoredDanmakuMatchJob) -> DanmakuMatchJob {
 pub enum DanmakuServiceError {
     InvalidConcurrency,
     LibraryNotFound,
+    LibraryNotSelected,
     SourceNotFound,
     ProviderNotConfigured,
     AlreadyActive,
@@ -720,6 +751,9 @@ impl fmt::Display for DanmakuServiceError {
         match self {
             Self::InvalidConcurrency => formatter.write_str("invalid danmaku match concurrency"),
             Self::LibraryNotFound => formatter.write_str("danmaku library was not found"),
+            Self::LibraryNotSelected => {
+                formatter.write_str("danmaku library is not selected in plugin configuration")
+            }
             Self::SourceNotFound => formatter.write_str("danmaku media source was not found"),
             Self::ProviderNotConfigured => {
                 formatter.write_str("danmaku provider is not configured")
@@ -788,6 +822,7 @@ impl WorkerResult {
 async fn process_danmaku_source_with_plugin(
     source: StoredDanmakuSource,
     plugins: PluginService,
+    settings: DanmakuSettings,
     overwrite: bool,
     item_id: String,
 ) -> WorkerResult {
@@ -854,7 +889,14 @@ async fn process_danmaku_source_with_plugin(
     let Some(file_name) = media_path.file_name().and_then(|name| name.to_str()) else {
         return WorkerResult::failed(item_id, "INVALID_SOURCE_PATH", "media filename is invalid");
     };
-    let matched = match plugins.match_danmaku(file_name).await {
+    let candidates = match_file_name_candidates(file_name, &source, &settings);
+    let Some((primary, alternate)) = candidates.split_first() else {
+        return WorkerResult::failed(item_id, "NO_MATCH", "no danmaku match title candidate");
+    };
+    let matched = match plugins
+        .match_danmaku_with_candidates(primary, alternate)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
             return WorkerResult::failed(
@@ -930,6 +972,57 @@ async fn process_danmaku_source_with_plugin(
     }
 }
 
+fn match_file_name_candidates(
+    file_name: &str,
+    source: &StoredDanmakuSource,
+    settings: &DanmakuSettings,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if settings.match_original_filename {
+        candidates.push(file_name.to_owned());
+    }
+    let title = if source.item_type.as_deref() == Some("EPISODE") {
+        source.series_title.as_deref().or(source.title.as_deref())
+    } else {
+        source.title.as_deref()
+    };
+    if settings.match_simplified_traditional_titles {
+        if let Some(title) = title {
+            candidates.push(title_with_episode_suffix(title, file_name));
+        }
+    }
+    if settings.match_english_title {
+        let title = if source.item_type.as_deref() == Some("EPISODE") {
+            source
+                .series_original_title
+                .as_deref()
+                .or(source.original_title.as_deref())
+        } else {
+            source.original_title.as_deref()
+        };
+        if let Some(title) = title {
+            candidates.push(title_with_episode_suffix(title, file_name));
+        }
+    }
+    candidates.retain(|candidate| !candidate.trim().is_empty());
+    candidates.dedup();
+    candidates
+}
+
+fn title_with_episode_suffix(title: &str, file_name: &str) -> String {
+    let Some(parsed) = parse_media_name(file_name, MediaKind::Episode) else {
+        return title.trim().to_owned();
+    };
+    let mut result = title.trim().to_owned();
+    if let Some(season) = parsed.season {
+        result.push_str(&format!(" S{season:02}"));
+    }
+    if let Some(episode) = parsed.episode {
+        result.push_str(&format!("E{episode:02}"));
+    }
+    result
+}
+
 async fn safe_danmaku_source_paths(source: &StoredDanmakuSource) -> Result<(PathBuf, PathBuf), ()> {
     let relative = Path::new(&source.relative_path);
     if relative.is_absolute()
@@ -999,12 +1092,43 @@ fn danmaku_plugin_error_code(error: &PluginServiceError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::effective_danmaku_concurrency;
+    use super::{effective_danmaku_concurrency, match_file_name_candidates};
+    use crate::application::plugins::DanmakuSettings;
+    use crate::storage::StoredDanmakuSource;
 
     #[test]
     fn worker_concurrency_has_a_memory_safe_ceiling() {
         assert_eq!(effective_danmaku_concurrency(1), 1);
         assert_eq!(effective_danmaku_concurrency(2), 2);
         assert_eq!(effective_danmaku_concurrency(64), 4);
+    }
+
+    #[test]
+    fn title_matching_candidates_follow_configured_order() {
+        let source = StoredDanmakuSource {
+            source_id: "source-1".to_owned(),
+            root_path: "/media".to_owned(),
+            relative_path: "Show/Episode 01.mkv".to_owned(),
+            item_type: Some("EPISODE".to_owned()),
+            title: Some("第 1 集".to_owned()),
+            original_title: Some("Episode 1".to_owned()),
+            series_title: Some("简体剧名".to_owned()),
+            series_original_title: Some("English Show".to_owned()),
+        };
+        let settings = DanmakuSettings {
+            library_ids: vec!["library-1".to_owned()],
+            match_original_filename: true,
+            match_simplified_traditional_titles: true,
+            match_english_title: true,
+        };
+
+        assert_eq!(
+            match_file_name_candidates("Original.S01E01.mkv", &source, &settings),
+            vec![
+                "Original.S01E01.mkv",
+                "简体剧名 S01E01",
+                "English Show S01E01"
+            ]
+        );
     }
 }

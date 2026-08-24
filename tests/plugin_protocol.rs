@@ -141,6 +141,7 @@ fn accepts_a_danmaku_plugin_manifest_and_path_free_match_contract() {
 
     let request = DanmakuMatchRpcRequest {
         file_name: "Show.S01E02.1080p.mkv".to_owned(),
+        alternate_file_names: Vec::new(),
     };
     let request_value = serde_json::to_value(request).expect("danmaku request should serialize");
     assert_eq!(request_value, json!({"fileName": "Show.S01E02.1080p.mkv"}));

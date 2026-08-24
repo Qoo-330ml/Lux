@@ -278,7 +278,7 @@ function ReportContent({ tab, data, page, onPageChange }: { tab: ReportTab; data
 }
 
 function UserReportRow({ entry }: { entry: AdminEmbyMigrationUserLink }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyUsername}</strong><small>Emby ID：{entry.embyUserId}</small></div><ReportStatus status={entry.status} /><span>{entry.luxUserId ? `Lux 用户：${entry.luxUserId}` : entry.error ?? "未关联"}</span></div>; }
-function MatchReportRow({ entry }: { entry: AdminEmbyMigrationMatch }) { return <div className="lux-emby-report-row"><div><strong>{entry.detail.title ? String(entry.detail.title) : entry.embyItemId}</strong><small>{entry.embyItemType} · {entry.matchMethod}{entry.confidence == null ? "" : ` · ${entry.confidence}%`}</small></div><ReportStatus status={entry.status} /><span>{entry.luxItemId ? `Lux 媒体：${entry.luxItemId}` : safeDetail(entry.detail)}</span></div>; }
+function MatchReportRow({ entry }: { entry: AdminEmbyMigrationMatch }) { return <div className="lux-emby-report-row"><div><strong>{entry.detail.title ? String(entry.detail.title) : entry.embyItemId}</strong><small>{entry.embyItemType} · {entry.matchMethod}{entry.confidence == null ? "" : ` · ${entry.confidence}%`}</small></div><ReportStatus status={entry.status} /><span>{entry.luxItemId ? `Lux 媒体：${luxMediaLabel(entry.detail, entry.luxItemId)}` : safeDetail(entry.detail)}</span></div>; }
 function ImportReportRow({ entry }: { entry: AdminEmbyMigrationImport }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyItemId}</strong><small>Emby 用户：{entry.embyUserId}</small></div><ReportStatus status={entry.status} /><span>{entry.error ?? "状态已写入 Lux"}</span></div>; }
 function PersonFavoriteReportRow({ entry }: { entry: AdminEmbyMigrationPersonFavorite }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyPersonName}</strong><small>Emby 用户：{entry.embyUserId} · Person ID：{entry.embyPersonId}</small></div><ReportStatus status={entry.status} /><span>{entry.luxPersonId ? `Lux 人物：${entry.luxPersonId}` : `${entry.matchMethod}${entry.confidence == null ? "" : ` · ${entry.confidence}%`} · ${entry.error ?? "未匹配"}`}</span></div>; }
 
@@ -296,4 +296,17 @@ function isActiveJob(job?: AdminEmbyMigrationJob | null) { return Boolean(job &&
 function statusLabel(status: string) { return ({ PENDING: "等待中", RUNNING: "进行中", COMPLETED: "已完成", CANCELLED: "已取消", FAILED: "失败" } as Record<string, string>)[status] ?? status; }
 function phaseLabel(phase: string) { return ({ TESTING: "连接测试", USERS: "读取用户", ITEMS: "匹配媒体", IMPORTING: "导入状态", FINALIZING: "收尾" } as Record<string, string>)[phase] ?? phase; }
 function safeDetail(detail: Record<string, unknown>) { const copy = Object.fromEntries(Object.entries(detail).filter(([key]) => !key.toLowerCase().includes("url") && !key.toLowerCase().includes("token"))); return JSON.stringify(copy); }
+function luxMediaLabel(detail: Record<string, unknown>, luxItemId: string) {
+  const title = detailText(detail.luxTitle);
+  const seriesTitle = detailText(detail.luxSeriesTitle);
+  const season = detailNumber(detail.luxSeasonNumber);
+  const episode = detailNumber(detail.luxEpisodeNumber);
+  const parts = [seriesTitle || title];
+  if (season != null) parts.push(`第 ${season} 季`);
+  if (episode != null) parts.push(`第 ${episode} 集`);
+  if (title && title !== seriesTitle && (season != null || episode != null)) parts.push(title);
+  return parts.filter(Boolean).join(" · ") || luxItemId;
+}
+function detailText(value: unknown) { return typeof value === "string" && value.trim() ? value.trim() : null; }
+function detailNumber(value: unknown) { return typeof value === "number" && Number.isFinite(value) ? value : null; }
 function reportPageFrom(data: unknown) { return (data as { page?: number } | undefined)?.page ?? 1; }

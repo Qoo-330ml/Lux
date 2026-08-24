@@ -23,6 +23,19 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
   });
 
+  it("requests paginated actor search and person works through the Lux API", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0, page: 2, pageSize: 12 }), { status: 200 }),
+    );
+    const client = new LuxApiClient();
+
+    await client.searchPeople("周星驰", 2);
+    await client.personItems("person/42", 3);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/people?q=%E5%91%A8%E6%98%9F%E9%A9%B0&page=2&pageSize=12");
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/people/person%2F42/items?page=3&pageSize=24");
+  });
+
   it("uploads an avatar as an image body instead of JSON", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ avatarUrl: "/api/v1/auth/avatar" }), { status: 200 }),

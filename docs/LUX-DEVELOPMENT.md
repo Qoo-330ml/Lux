@@ -123,7 +123,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 首版仅支持直接播放，不支持音视频转码、容器转换或字幕转换。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。
-- URL 型 `.strm` 在 `Path` 保留外部播放地址，`DirectStreamUrl` 缺省并由客户端经标准视频端点重定向；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
+- URL 型 `.strm` 在 `Path` 保留原始播放地址，并通过受保护的 Lux 视频端点播放；播放端点由 Lux 服务端请求首个 HTTP(S) 目标，有限跟随 HTTP 重定向并校验 `Location`，遇到 200/206 媒体响应时回退为原始地址，最终只向客户端返回可访问的 HTTP(S) 地址。Lux 不代理媒体字节，不写死任何 STRM 服务路径。服务端请求允许访问管理员已登记的内网目标，但必须有 URL 校验、重定向上限、连接/读取超时且不得记录含令牌的 URL；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
 - 浏览器无法原生播放的编码直接显示不支持，不提供转码兜底。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -195,10 +195,13 @@ Lux 的核心价值不是功能数量，而是：
 
 - 弹幕使用独立的 Lux 弹幕服务和 Emby 兼容弹幕路由，不伪装成普通字幕轨。
 - 管理员可以配置一个 Dandanplay 兼容 API 基地址，也可以配置 `huangxd-/danmu_api` 的 API 基地址；地址可包含部署 token 路径。
+- 管理员可以在弹幕插件配置中选择允许匹配的媒体库；未选择的媒体库不能创建弹幕匹配任务，空选择表示不匹配任何媒体库。
+- 弹幕匹配策略支持使用原始文件名、尝试本地已登记的简体/繁体标题、尝试本地已登记的英文/原始标题；按原始文件名、简繁标题、英文/原始标题的顺序逐个回退，仅在前一个候选没有匹配时请求下一个候选。
+- 弹幕文字的简繁转换由上游 `danmu_api` 的部署配置负责；Lux 不引入 OpenCC、不把简繁转换伪装成所有 Dandanplay 兼容服务都支持的请求参数，也不在首版筛选弹幕语言。
 - 后台匹配任务优先使用上游 `/api/v2/match`，不支持时回退到 Dandanplay 兼容的搜索、详情和弹幕接口。
 - 匹配成功的 XML 弹幕写回视频同目录、同 basename 的 `.xml` 旁车；使用临时文件、刷盘和原子重命名。
 - 只承诺支持弹幕接口的第三方客户端可以通过 Lux 的 Emby 接口读取；其他客户端是否识别 `.xml` 不属于 Lux 兼容承诺。
-- 首版不实现 Web 播放器弹幕、ASS 写回、弹幕转换、实时发送、代理播放或非弹幕客户端适配。
+- 首版不实现 Web 播放器弹幕、ASS 写回、Lux 侧弹幕文字转换、实时发送、代理播放或非弹幕客户端适配。
 
 ### 3.8 图片
 
@@ -1464,7 +1467,9 @@ Web 使用 HttpOnly、Secure（HTTPS 下）、SameSite Cookie。改变状态的 
 - GET /api/v1/libraries
 - GET /api/v1/libraries/{id}/items（支持 `metadataStatus=PENDING` 待确认筛选）
 - GET /api/v1/items/{id}
+- GET /api/v1/people
 - GET /api/v1/people/{personId}
+- GET /api/v1/people/{personId}/items
 - GET /api/v1/search
 - GET /api/v1/items/{id}/playback
 - POST /api/v1/items/{id}/progress
@@ -1530,6 +1535,8 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 账户设置可调整首页媒体库顺序；顺序按用户持久化到服务端，并同步用于 Web 与 Emby 兼容视图。
 - 媒体库列表：类型、年份、已看、收藏筛选；名称、最近添加、发行日期、评分排序。
 - 搜索结果。
+- 演员搜索结果可进入人物详情；人物详情显示当前用户有权限访问的全部参演电影和剧集，分
+  页加载并按发行日期倒序。分集出演关系聚合为所属剧集，同一剧集只展示一次。
 - 电影详情：海报、背景、简介、年份、时长、版本、字幕信息、播放、收藏。
 - 电影和剧集详情显示本地 NFO 或所选刮削器提供的主要演员；演员姓名和角色不要求存在 provider ID，
   无头像时显示姓名首字母占位。已确认的人物身份和头像使用规范人物资源，可由 TMDb、IMDb、豆瓣等
@@ -1913,6 +1920,7 @@ services:
 | LUX-190 | docs/LUX-DEVELOPMENT.md、docs/LUX-190-PLAN.md、docs/decisions/022-emby-migration-plugin.md、docs/COMPATIBILITY.md |
 | LUX-191+ | src/application/emby_migration*.rs、src/storage/emby_migration.rs、src/api/mod.rs、src/auth/users.rs、migrations/、migrations-postgres/、docs/LUX-191-PLAN.md |
 | LUX-193 | migrations/、migrations-postgres/、src/storage/mod.rs、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/、tests/people_api.rs、web/tests/、docs/ |
+| LUX-194 | src/application/catalog.rs、src/application/people.rs、src/storage/mod.rs、src/api/mod.rs、web/src/features/search/、web/src/features/detail/、web/src/lib/api/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3612,9 +3620,12 @@ stdout 日志并在启动阶段报告降级原因。
 `strm_target_kind` 持久化字段。扫描器在新增、重扫和文件内容变化时保存 `URL`、`PATH`、
 `OPAQUE` 或 `EMPTY` 分类；旧记录分类为空时由播放表面按原始目标执行同一纯词法回退。
 
-URL 型目标继续提供外部 HTTP 直播放行；本地路径型目标生成 Lux 受保护的视频入口并读取根目录
-内的实际文件；SMB/FTP 和空目标、不支持目标不会被伪造为直链。STRM 后台探测仍将原始目标交给
-受监督插件，不在普通扫描、播放或请求路径中访问 HTTP/SMB/FTP 目标。
+URL 型目标在 `PlaybackInfo` 中通过受保护的 Lux 视频入口播放；播放入口由 Lux 服务端请求原始
+HTTP(S) 目标，有限跟随并校验重定向，遇到 200/206 媒体响应后把当前可播放 URL 以 307 返回给
+客户端，不绑定具体 STRM 服务路径，也不代理媒体字节。本地路径型目标生成 Lux 受保护的视频
+入口并读取根目录内的实际文件；SMB/FTP 和空目标、不支持目标不会被伪造为直链。STRM 后台探测
+仍将原始目标交给受监督插件；普通扫描和 `PlaybackInfo` 不访问 HTTP/SMB/FTP 目标，URL 型视频
+请求只按上面的播放契约解析 HTTP(S) 响应和重定向。
 
 验收：
 
@@ -3622,8 +3633,8 @@ URL 型目标继续提供外部 HTTP 直播放行；本地路径型目标生成 
 - [x] 电影、剧集和未解析 `.strm` 扫描均保存首个非空目标及其分类；重扫会更新分类和目标。
 - [x] URL 型 `PlaybackInfo`/视频请求保持现有兼容行为；本地路径通过受保护的视频入口读取实际
       文件，SMB/FTP 仅在解析器成功后播放，其他目标不伪造直链，也不会把 `.strm` 文件当作媒体返回。
-- [x] 后台 STRM 探测继续使用原始目标；仅 HTTP/HTTPS、本地路径、SMB 和 FTP 进入探测，不因分类
-      而在扫描或播放请求中发起网络访问。
+- [x] 后台 STRM 探测继续使用原始目标；仅 HTTP/HTTPS、本地路径、SMB 和 FTP 进入探测。扫描和
+      `PlaybackInfo` 不因分类发起网络访问；URL 型视频请求按播放契约解析 HTTP(S) 响应。
 - [x] 通过专项 Rust 测试、格式化、Clippy，并记录 ARM 本机 `uname -m`；本机为 `arm64`。
 
 验证：`cargo test --locked --test strm --test strm_target`、`cargo fmt --all -- --check`、
@@ -3633,7 +3644,7 @@ URL 型目标继续提供外部 HTTP 直播放行；本地路径型目标生成 
 
 明确不做：
 
-- 不实现路径映射、外部解析器注册、目标转发、媒体字节代理或转码。
+- 不实现路径映射、外部解析器注册、媒体字节代理或转码；URL 型播放只解析响应和重定向地址。
 - 不绑定任何具体云盘、网盘或第三方工具。
 
 #### LUX-160：SMB/FTP `.strm` 目标解析与转发
@@ -4351,6 +4362,35 @@ API：
 
 - 不把演员收藏混入 Emby `FavoriteItems` 或媒体条目的 `user_item_state`。
 - 不在本任务增加演员收藏列表页面；后续如需要，单独设计分页列表接口和页面。
+
+#### LUX-194：演员搜索与人物参演作品
+
+范围：扩展 Lux Web 搜索，使用户可以按演员姓名搜索人物；人物详情显示当前用户有权限访问的全部
+参演电影和剧集。该能力只使用已持久化的 `person_credits` 关系，不调用 TMDb、不扫描 metadata
+目录，也不改变 Emby `/Persons` 的 DTO 合同。
+
+API：
+
+- `GET /api/v1/people?q={query}&page={page}&pageSize={pageSize}` 返回分页演员摘要。
+- `GET /api/v1/people/{personId}/items?page={page}&pageSize={pageSize}` 返回人物的分页参演作品。
+- 作品只返回 `MOVIE` 和 `SERIES`；分集出演关系聚合到所属剧集，同一剧集只返回一次。
+- 两个接口都严格执行当前用户的媒体库 ACL、启用状态、条目可用性和分页上限。
+- 人物搜索结果和人物作品结果不暴露媒体路径、完整外部 URL 或内部文件信息。
+
+Web 验收：
+
+- 搜索页显示人物结果和现有媒体标题搜索结果；点击人物结果进入人物详情。
+- 人物详情显示人物资料、头像和“参演作品”区域，作品使用现有媒体卡片和用户状态字段。
+- 作品列表分页加载；无作品、无头像、加载失败和无权限状态均有明确界面反馈。
+
+验证：
+
+- Rust 集成测试覆盖中文/英文人物搜索、同一人物去重、电影/剧集/分集聚合、分页和 ACL。
+- Web 单测覆盖搜索结果、人物详情作品加载和继续加载。
+- Playwright 覆盖搜索演员、进入人物详情和查看参演作品。
+- 运行 Rust/Web 基线检查，并记录 ARM64 验证。
+
+依赖：LUX-080、LUX-164、LUX-178、LUX-193。
 
 ## 26. 风险与缓解
 

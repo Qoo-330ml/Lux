@@ -15,9 +15,11 @@
 - 自定义地址支持 Dandanplay 兼容 API 基地址。
 - 自定义地址也支持 [`huangxd-/danmu_api`](https://github.com/huangxd-/danmu_api) 的 API 基地址。该项目兼容 Dandanplay 的搜索、详情和弹幕获取接口，并额外提供 `POST /api/v2/match`。
 - 基地址可以包含部署 token 路径，例如 `https://danmu.example/87654321`；Lux 必须保留该路径，不能把 token 写入日志或错误消息。
+- 插件配置持久化允许匹配的媒体库 ID，以及原始文件名、简繁标题、英文/原始标题三个匹配开关；空媒体库选择表示不匹配任何库。
+- 标题候选来自已索引的媒体标题和原始标题，Lux 不在请求路径调用 TMDb 或执行中文字符转换；上游 `danmu_api` 的简繁转换继续由其部署环境变量管理。
 - 匹配成功后写入视频旁边的同名 `.xml`，例如 `Episode 01.mkv` 对应 `Episode 01.xml`。
 - 只承诺支持弹幕接口的客户端；其他软件是否识别 `.xml` 属于客户端能力，不增加兼容层或转码兜底。
-- 不实现 Web 播放器弹幕、不实现 ASS 写回、不实现弹幕转换、不做代理播放、不实现弹幕发送或实时发布。
+- 不实现 Web 播放器弹幕、不实现 ASS 写回、不实现 Lux 侧弹幕文字转换、不做代理播放、不实现弹幕发送或实时发布。
 
 ## 外部协议适配
 
@@ -27,7 +29,7 @@
 
 请求上游时只使用固定的相对接口路径和受限参数：
 
-- `POST /api/v2/match`，请求体 `{ "fileName": "..." }`。这是 `danmu_api` 的自动匹配接口；成功响应中的 `matches[0].episodeId`、`animeId` 和标题用于后续取弹幕。
+- `POST /api/v2/match`，请求体至少包含 `{ "fileName": "..." }`。Lux 可以按配置顺序用多个候选文件名分别请求；这是 `danmu_api` 的自动匹配接口；成功响应中的 `matches[0].episodeId`、`animeId` 和标题用于后续取弹幕。
 - `GET /api/v2/search/anime?keyword=...`、`GET /api/v2/search/episodes?...` 和 `GET /api/v2/bangumi/{id}`，作为 Dandanplay 兼容搜索/详情回退。
 - `GET /api/v2/comment/{episodeId}?format=xml`，取得 Bilibili 标准 XML。
 
@@ -87,6 +89,7 @@ Emby 路由保持独立 DTO 和鉴权边界，新增只读兼容端点：
 Lux 自有管理接口增加：
 
 - `GET/PATCH /api/v1/admin/settings` 中的 `danmaku` 配置对象，响应只返回脱敏地址和是否已配置，不回显 URL 中的 token/query secret。
+- `GET/PUT /api/v1/admin/plugins/{pluginId}/config` 的弹幕插件配置包含 `providerBaseUrl`、`libraryIds`、`matchOriginalFilename`、`matchSimplifiedTraditionalTitles` 和 `matchEnglishTitle`；敏感地址不回显。
 - `POST /api/v1/admin/libraries/{libraryId}/danmaku/match`
 - `GET /api/v1/admin/danmaku/match-jobs`
 - `GET /api/v1/admin/danmaku/match-jobs/{jobId}`
@@ -104,6 +107,7 @@ Lux 自有管理接口增加：
 - [ ] Emby 兼容读取端点返回正确 XML、执行 ACL，并可被支持弹幕接口的客户端使用。（接口与 ACL 已测，真实客户端待测）
 - [x] 后台任务支持分页、进度、取消、失败重试和重启恢复；并发不超过配置上限。
 - [x] 未配置地址、无匹配、上游超时、非 XML、超大响应、旁车越权路径和只读目录都有稳定错误状态。
+- [x] 管理员可以选择弹幕媒体库和标题候选匹配开关；未选媒体库不能创建任务；匹配候选按配置顺序回退。
 - [x] 不新增 Web 播放器弹幕、ASS、转码、实时发送或非弹幕客户端适配。
 
 ## 预计实施切片
