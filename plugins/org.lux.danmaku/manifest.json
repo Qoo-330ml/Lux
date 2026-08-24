@@ -3,7 +3,7 @@
   "id": "org.lux.danmaku",
   "name": "弹幕匹配",
   "description": "匹配本地视频并获取 Bilibili 标准弹幕 XML",
-  "version": "1.0.0",
+  "version": "0.1.1",
   "apiVersion": 1,
   "runtime": {
     "kind": "process",

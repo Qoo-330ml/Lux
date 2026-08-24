@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 target=${1:-}
-version=${LUX_DANMAKU_PLUGIN_VERSION:-1.0.0}
+version=${LUX_DANMAKU_PLUGIN_VERSION:-0.1.1}
 
 if [[ -z "$target" ]]; then
   target=$(rustc -vV | sed -n 's/^host: //p')
