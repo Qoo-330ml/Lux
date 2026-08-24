@@ -103,7 +103,7 @@ Lux 的核心价值不是功能数量，而是：
 - 媒体库没有自定义封面时，首次扫描完成后若该库已有至少 9 个带 poster 的媒体条目，系统自动注册并执行一次 `AUTO_LIBRARY_COVER` 一次性任务；任务从库中随机选择 9 张 poster，按旋转堆叠布局生成封面，并将媒体库名称及类型英文副标题绘制在封面上（电影为 `Movies`，电视剧为 `Series`，混合媒体库为 `Mixed`）。该任务不会因后续扫描、海报数量变化或封面删除而自动再次运行，但管理员可以在“任务与日志”中手动执行它；手动执行只会重新生成自动封面，用户上传的封面始终优先。
 - 自动封面生成前后，只要管理员上传了自定义封面，就始终以自定义封面为准，自动生成不得覆盖或替换它。
 - 每个媒体库默认实时监听文件系统；新增、修改、重命名和删除事件只触发受影响路径的局部增量扫描。实时监听不是可关闭的媒体库开关；旧版 `realtime_watch_enabled` 字段仅作兼容保留并始终按开启处理。媒体库另有独立的 `realtime_metadata_auto_match_enabled` 开关，默认开启；关闭后，局部增量扫描仍只更新索引。开启时，局部增量扫描完成并确认有可用媒体条目时，按 `FILL_MISSING` 提交受影响条目的在线元数据补全任务。全量校验和元数据任务可独立配置计划；局部增量扫描由实时事件触发，不作为管理员可配置的计划任务。
-- 每个媒体库可选择一个已安装的元数据刮削器；未选择时仍读取本地 NFO 和图片，但不发起在线刮削请求。
+- 每个媒体库可以配置一组已安装的元数据刮削器并按顺序排序。首位固定为 `PRIMARY` 主刮削器；后续每项可标记为 `SUPPLEMENT` 补充、`BACKUP` 备用或 `BOTH` 补充兼备用。未配置时仍读取本地 NFO 和图片，但不发起在线刮削请求。`BACKUP` 只在此前的主匹配未确定媒体身份时按顺序尝试；`SUPPLEMENT` 在身份确定后只填充缺失的未锁定字段和缺失图片类型；后续来源不得覆盖本地 NFO、锁定字段或更高优先级来源。
 - 剧集库和混合库可各自选择一个已安装、已启用且可用的片头片尾数据源；未选择表示不为该库生成或输出片头片尾标记。
   片头片尾数据源必须声明 chapters.detect 或 chapters.lookup；电影库不能选择该来源。混合库只对其中的剧集/分集参与检测。
 - 管理员可在“全局策略”中设置媒体库的默认元数据、图像和字幕策略；媒体库可以继承全局默认值，也可以单独覆盖。
@@ -163,8 +163,8 @@ Lux 的核心价值不是功能数量，而是：
 ### 3.6 元数据匹配和重新匹配
 
 - 有明确 provider ID 时直接确认身份。
-- 没有 provider ID 时，可用规范化标题、年份、媒体类型和季集号通过媒体库所选刮削器搜索。
-- 匹配结果只保存当前媒体库所选刮削器对应的 provider ID；选择 TMDb 时保存 TMDb ID，选择其他刮削器时保存该刮削器返回的 ID。
+- 没有 provider ID 时，可用规范化标题、年份、媒体类型和季集号通过媒体库的主刮削器和按顺序启用的备用刮削器搜索；补充刮削器不得重新决定媒体身份。
+- 匹配结果保存实际成功来源的 scraper ID，并合并各 provider namespace 下的 provider ID；选择 TMDb 时保存 TMDb ID，选择其他刮削器时保存该刮削器返回的 ID。字段、图片和可合并列表数据同时记录实际来源。
 - 自动匹配必须达到高置信度阈值；信息不足或最高分未达到阈值时进入“待处理”。
 - “待处理”条目保留原始文件名和可播放能力，不因缺少在线元数据从库中消失。
 - 低置信度匹配保留为“待确认”状态，但不提供独立的元数据纠错控制台页面。
@@ -177,7 +177,7 @@ Lux 的核心价值不是功能数量，而是：
 - 重新匹配可选择仅补缺字段或刷新在线字段；无论哪种模式都不覆盖已锁定字段。
 - 成功编辑或匹配后，将 NFO 回写到媒体目录，将选中的 Lux 管理图片写入
   /config/metadata/library/<shard>/<item-id>/；媒体目录已有图片仍保留且优先。
-- 新建媒体库首次添加可用根路径并完成扫描后，若媒体库配置了刮削器，自动按高置信度选择最佳候选，写回元数据并按该媒体库的图像策略下载所需图片；用户无需逐条进入管理后台确认。
+- 新建媒体库首次添加可用根路径并完成扫描后，若媒体库配置了刮削器，自动按主/备用角色和高置信度选择最佳候选，再按补充角色补齐缺失元数据，写回元数据并按该媒体库的图像策略下载所需图片；用户无需逐条进入管理后台确认。
 - 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。
 - 媒体详情页或媒体卡片上的“扫描所在文件夹”只扫描该媒体现有媒体源所在的文件夹；媒体库管理页上的“扫描媒体库文件”才扫描整个媒体库。两者都只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削。
 - 管理员从媒体库入口手动执行“整库元数据匹配”时，使用与新库首次处理相同的自动选择、NFO 写回和图片下载流程；低置信度条目仍进入待处理队列。
@@ -210,8 +210,8 @@ Lux 的核心价值不是功能数量，而是：
 - 海报 poster。
 - 背景图 backdrop/fanart。
 - 本地图片发现、尺寸读取、缓存标签、HTTP 缓存和缩放接口兼容。
-- 缺失时从所选刮削器下载并写入 /config/metadata/library/<shard>/<item-id>/；匹配选择时按所属
-  媒体库启用的图片类型逐项取第一张可用图片，缺失类型跳过。扫描发现的媒体目录图片仍按本地优先
+- 缺失时从实际成功或补充刮削器下载并写入 /config/metadata/library/<shard>/<item-id>/；匹配选择时按所属
+  媒体库启用的图片类型逐项取第一张可用图片，后续补充来源只填充缺失类型，缺失类型跳过。扫描发现的媒体目录图片仍按本地优先
   规则登记和提供。
 
 首版不阻塞但数据模型需预留：
@@ -324,7 +324,7 @@ Lux 的核心价值不是功能数量，而是：
 - 首个独立插件为 `org.lux.tmdb`，由外部插件仓库发布。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
 - SDK v1 同时支持 `media_probe` 插件类型。`org.lux.strm-media-info` 只接收 Lux 宿主按单个任务提交的已校验 STRM 探测目标，按原始字符串调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
 - 只有已安装、已启用且可用的插件才能被媒体库选择或调度。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用外置 TMDb 插件自己的默认凭据；任何凭据都不返回 API 或写入日志。
-- 媒体库的 `scraperId` 为空表示不进行在线刮削、只使用本地元数据；插件安装状态与媒体库选择均持久化，服务重启后保持不变。
+- 媒体库的有序刮削器列表为空表示不进行在线刮削、只使用本地元数据；插件安装状态与媒体库选择、顺序和角色均持久化，服务重启后保持不变。对旧客户端继续返回首位 `scraperId`，新 Lux API 使用带有 `scraperId`、`position` 和 `role` 的有序列表。
 - 片头片尾插件的 `libraryIds` 不再是媒体库归属配置；旧配置只用于一次性迁移到对应媒体库的
   `chapterSourceId`，迁移后调度只读取媒体库字段。
 - 插件列表 API 必须分页并设置服务端上限。插件安装和媒体库刮削器选择必须经过管理员鉴权与 CSRF 校验。
@@ -833,6 +833,18 @@ pub async fn get_item(
 - probe_concurrency
 - last_scan_at
 
+#### library_scrapers
+
+- library_id
+- scraper_id
+- position：从 0 开始，位置 0 必须是 `PRIMARY`
+- role：`PRIMARY`、`SUPPLEMENT`、`BACKUP` 或 `BOTH`
+- created_at、updated_at
+- 唯一键 library_id + scraper_id 和 library_id + position
+
+`libraries.scraper_id` 作为旧 API/旧任务配置的兼容镜像，始终等于 position 0 的 scraper ID；新代码以
+`library_scrapers` 为事实来源。历史单值配置迁移为 position 0、`PRIMARY`。
+
 #### library_roots
 
 - id
@@ -1186,13 +1198,13 @@ locked local value
 - 服务端内置一个与 Emby 插件兼容的默认 TMDb API Key，因此首次引导不要求配置 TMDb；管理员填写的 API Key 优先于内置值。
 - 自定义 API Key 和历史 token 只保存在 /config 中的受限配置或 secrets 文件，不返回普通用户、插件 API 或日志。
 - TMDb 插件配置还包括首选语言、语言回退开关和有序回退语言列表；这些非敏感值保存在 `/config/tmdb_settings.json`，可通过管理员插件配置 API 返回，凭据仍不可返回。
-- 主进程的元数据匹配、候选搜索、图片候选和合集请求统一通过媒体库所选刮削器协议；主进程不得直接访问第三方元数据 API。
+- 主进程的元数据匹配、候选搜索、图片候选和合集请求统一通过媒体库有序刮削器协议；主进程不得直接访问第三方元数据 API。主刮削器和备用刮削器负责身份匹配，补充刮削器只对已确认条目请求缺失字段或图片能力。
 - 插件内部使用统一 HTTP client、超时、16 并发配额、每秒 32 次请求限流、重试和 User-Agent。
 - 插件 stdin/stdout RPC 支持有界多路复用；响应按 request ID 分发并允许乱序返回，插件进程故障或超时会结束其全部 pending 请求。
 - 404、429、5xx、网络超时分类处理。
 - 搜索候选短期缓存，详情较长时间缓存。
 - 响应 schema 验证后进入领域层。
-- 自动匹配和手动重新匹配共用候选模型；候选的 provider ID 和 provider 名称必须与所选刮削器一致。
+- 自动匹配和手动重新匹配共用候选模型；候选的 provider ID、provider 名称和实际 scraper 来源必须一致。补充候选不得静默改变已确认的媒体身份。
 - 电影和剧集候选同时携带 0-10 的来源评分；确认候选后保存评分及其刮削器来源，Lux Web 目录和详情海报在右上角显示“来源 + 评分”。
 
 ### 13.4 NFO 和图片写回
@@ -1226,11 +1238,11 @@ locked local value
 
 每个元数据任务持久化 `job_scope`（`ITEMS` 或 `LIBRARY`）和可选的 `library_id`；指定条目任务明确使用 `ITEMS`，同库条目仍记录其媒体库身份，整库任务明确使用 `LIBRARY` 和真实媒体库身份。历史任务默认按 `ITEMS` 处理，不根据条目数量推断范围。单进程内同一时刻只允许一个活动的整库元数据任务，服务重启后遗留的 `RUNNING` 条目重新进入 `PENDING`。
 
-媒体库级“整库元数据匹配”使用同一持久化队列，但默认以 `FILL_MISSING` 自动处理：逐条使用所属媒体库的刮削器搜索候选，达到高置信度时自动选择最佳候选，按媒体库图像策略下载图片并原子写回 NFO/图片；低置信度条目只保留候选并进入待处理状态。新建媒体库首次扫描完成后也自动提交该队列。
+媒体库级“整库元数据匹配”使用同一持久化队列，但默认以 `FILL_MISSING` 自动处理：逐条使用所属媒体库的主刮削器和按顺序启用的备用刮削器搜索候选，达到高置信度时自动选择最佳候选，再调用补充刮削器填充缺失的未锁定字段和图片，按媒体库图像策略下载图片并原子写回 NFO/图片；低置信度条目只保留候选并进入待处理状态。新建媒体库首次扫描完成后也自动提交该队列。
 
 实时增量扫描默认更新索引并为受影响条目提交 `FILL_MISSING` 元数据任务；媒体库关闭 `realtime_metadata_auto_match_enabled` 后才只更新索引，不再自动补全。不论开关状态，任务都只处理本次受影响且仍可用的媒体条目，不对整库重新刮削。NFO、图片和其他旁车文件的写回事件不得直接导致同一条目无限重复提交；已完整补全的条目由元数据任务跳过。
 
-全局元数据刷新使用同一持久化队列，模式为 `FILL_MISSING` 或 `FULL_REFRESH`。仅补全只写入缺失的未锁定 NFO 字段和图片；完整刮削刷新未锁定 NFO 字段并替换已有图片，但不覆盖锁定字段。未配置刮削器的条目跳过在线请求并保留本地结果。
+全局元数据刷新使用同一持久化队列，模式为 `FILL_MISSING` 或 `FULL_REFRESH`。仅补全只写入缺失的未锁定 NFO 字段和图片，并按补充刮削器角色补齐；完整刮削刷新主来源的未锁定在线字段，再由补充来源填充仍缺失的字段，但不覆盖锁定字段或更高优先级来源。未配置刮削器的条目跳过在线请求并保留本地结果。
 
 管理员也可以从首页或媒体库入口对整个媒体库发起批量元数据匹配或元数据刷新；服务端为一次操作创建一个持久化任务并立即返回。任务内部最多 16 路异步 worker 并行处理条目，条目状态、失败重试和短事务仍逐条记录，前端不得等待匹配完成。
 
@@ -1922,6 +1934,7 @@ services:
 | LUX-193 | migrations/、migrations-postgres/、src/storage/mod.rs、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/、tests/people_api.rs、web/tests/、docs/ |
 | LUX-194 | src/application/catalog.rs、src/application/people.rs、src/storage/mod.rs、src/api/mod.rs、web/src/features/search/、web/src/features/detail/、web/src/lib/api/、tests/、docs/ |
 | LUX-195 | src/application/scraper.rs、src/application/tmdb_plugin.rs、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/candidates.rs、src/application/reidentify.rs、src/application/images.rs、src/application/collections.rs、tests/、docs/ |
+| LUX-196 | migrations/、migrations-postgres/、src/library.rs、src/storage/mod.rs、src/application/libraries.rs、src/application/scraper.rs、src/application/candidates.rs、src/application/reidentify.rs、src/application/metadata.rs、src/api/mod.rs、web/src/features/admin/、tests/、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4418,6 +4431,43 @@ provider ID 统一按字符串和 provider namespace 处理，兼容 `tmdb:123`�
 - 更新 `docs/COMPATIBILITY.md` 和本任务 ADR，记录插件 ID、provider key、能力和 provider ID 规则。
 
 依赖：LUX-142、LUX-168、LUX-178、LUX-194。
+
+#### LUX-196：有序媒体库刮削器角色与补充策略
+
+范围：将媒体库的单个 `scraperId` 扩展为可排序的刮削器列表。首位固定为 `PRIMARY`；后续刮削器可分别配置为 `SUPPLEMENT`、`BACKUP` 或 `BOTH`。主/备用来源负责确认媒体身份，补充来源只填充缺失的未锁定字段和缺失图片类型。
+
+API 合同：
+
+- 新 Lux API 返回 `scrapers` 数组，每项包含 `scraperId`、`position` 和 `role`。
+- 旧版 `scraperId` 继续返回并表示 position 0 的主刮削器；旧版只提交 `scraperId` 时转换为单个 `PRIMARY` 项。
+- 创建和 PATCH 媒体库时，`scrapers` 的顺序和角色作为一个原子配置更新；空数组清除在线刮削。
+- 每个 scraper ID 只能出现一次；position 0 必须是 `PRIMARY`；所有选择都必须是已安装、已启用且可用的 metadata 插件。
+
+执行合同：
+
+- `PRIMARY` 和 `BACKUP` 按 position 顺序尝试，首个达到高置信度并拥有有效 provider ID 的来源确认媒体身份。
+- `SUPPLEMENT` 和 `BOTH` 只在身份确认后运行；它们按顺序仅补充缺失的未锁定字段、图片类型和可安全按 provider ID 去重的列表数据。
+- `BOTH` 在主来源失败时参加备用尝试，在主来源成功时参加补充尝试。
+- 后续来源不得覆盖本地 NFO、锁定字段、已有更高优先级来源或已确认的媒体身份；每个字段和图片记录实际 scraper 来源。
+- `FILL_MISSING` 只请求实际缺失的内容；`FULL_REFRESH` 允许刷新主来源的未锁定在线字段，再由补充来源补足仍缺失的内容。
+- 所有来源失败时保留本地可播放条目，并按现有任务错误/待确认语义记录结果；日志只能记录脱敏的 scraper ID、角色和错误码。
+
+验收：
+
+- [ ] SQLite 和 PostgreSQL 空库迁移成功，历史 `libraries.scraper_id` 自动迁移为 position 0 的 `PRIMARY`。
+- [ ] 管理员可以创建、编辑、排序和清除有序刮削器列表；旧 API 客户端仍能读取和提交单个 `scraperId`。
+- [ ] 主刮削器成功时，备用来源不被调用；主刮削器失败时，备用和 `BOTH` 按顺序接管。
+- [ ] 补充和 `BOTH` 来源只能填充缺失内容，不能覆盖本地、锁定或主来源字段；图片按类型补缺。
+- [ ] 第二来源成功后的 provider ID、字段来源和图片来源可在后续刷新中正确使用。
+- [ ] 非管理员不能查看或修改媒体库刮削器角色和顺序。
+
+验证：
+
+- Rust 单元/集成测试覆盖迁移、API 兼容、角色校验、备用接管、补充合并、来源追踪和图片补缺。
+- Web 单测覆盖拖拽排序、角色选择、首位主刮削器约束、不可用已选插件和保存失败。
+- 运行 Rust/Web 基线检查，并记录 ARM64 验证结果。
+
+依赖：LUX-140、LUX-142、LUX-168、LUX-195。
 
 ## 26. 风险与缓解
 
