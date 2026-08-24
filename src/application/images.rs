@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    net::IpAddr,
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
 };
@@ -552,7 +553,7 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
-        if !source.eq_ignore_ascii_case("TMDB") && !is_allowed_scraper_image_url(image_url) {
+        if !is_allowed_scraper_image_url(image_url) {
             return Err(ImageWriteError::InvalidUrl(
                 "scraper image URL must be a valid HTTPS URL".to_owned(),
             ));
@@ -1558,11 +1559,18 @@ fn is_allowed_scraper_image_url(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
-    url.scheme().eq_ignore_ascii_case("https")
+    let loopback_http = url.scheme().eq_ignore_ascii_case("http")
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    (url.scheme().eq_ignore_ascii_case("https") || loopback_http)
         && url.host_str().is_some_and(|host| !host.is_empty())
         && url.username().is_empty()
         && url.password().is_none()
-        && url.port().is_none()
+        && (url.port().is_none() || loopback_http)
         && !url.path().is_empty()
         && url.query().is_none()
         && url.fragment().is_none()
@@ -1614,6 +1622,16 @@ mod tests {
         ));
         assert!(!is_allowed_scraper_image_url(
             "https://user:pass@img.douban.example/poster.jpg"
+        ));
+    }
+
+    #[test]
+    fn scraper_image_urls_allow_only_loopback_http_for_local_stubs() {
+        assert!(is_allowed_scraper_image_url(
+            "http://127.0.0.1:8099/poster.jpg"
+        ));
+        assert!(!is_allowed_scraper_image_url(
+            "http://img.douban.example/poster.jpg"
         ));
     }
 }
