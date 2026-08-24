@@ -121,6 +121,84 @@ Lux 首版以直放为主，不提供音视频转码、HLS 转码或字幕格式
 
 其他客户端的个别协议兼容修复不等于完整兼容。若遇到问题，欢迎提 issue，并同时提供客户端版本、平台、脱敏后的请求路径、状态码和关键响应字段。
 
+## Emby 兼容接口
+
+以下接口由 Lux 的 Emby 兼容层提供。除特别说明外，根路径和 `/emby` 前缀均可使用，例如 `/Items` 与 `/emby/Items`。完整行为以目标客户端实际请求和 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) 为准。
+
+### 服务发现与认证
+
+- `GET /System/Info/Public`
+- `GET /System/Info`
+- `GET` / `POST /System/Ping`
+- `GET /DisplayPreferences/{id}`
+- `GET /Users/Public`
+- `POST /Users/AuthenticateByName`
+- `GET /Users/{userId}`
+- `POST /Sessions/Logout`
+
+兼容 Emby `Authorization`、`X-Emby-Token` 和 `api_key` 鉴权方式。
+
+### 媒体库、浏览与搜索
+
+- `GET /Library/VirtualFolders`
+- `GET /Users/{userId}/Items/Root`
+- `GET /Users/{userId}/Views`
+- `GET /Users/{userId}/Items`
+- `GET /Users/{userId}/Items/{itemId}`
+- `GET /Users/{userId}/Items/Latest`
+- `GET /Users/{userId}/Items/Resume`
+- `GET /Users/{userId}/Items/NextUp`
+- `GET /Items/Root`
+- `GET /Items`
+- `GET /Items/Counts`
+- `GET /Items/{itemId}`
+- `GET /Items/{itemId}/Children`
+- `GET /Search/Hints`
+- `GET /Shows/NextUp`
+- `GET /Shows/{seriesId}/Seasons`
+- `GET /Shows/{seriesId}/Episodes`
+
+### 人物、图片与元数据
+
+- `GET /Persons`
+- `GET /Persons/{personId}`
+- `GET` / `HEAD /Persons/{personId}/Images/{imageType}`
+- `GET` / `HEAD /Persons/{personId}/Images/{imageType}/{index}`
+- `GET` / `HEAD /Items/{itemId}/Images/{imageType}`
+- `GET` / `HEAD /Items/{itemId}/Images/{imageType}/{index}`
+- `POST /Items/{itemId}`：部分元数据更新场景
+- `POST /Items/{itemId}/Images/{imageType}`：人物头像上传场景
+
+### 播放、下载与字幕
+
+- `GET` / `POST /Items/{itemId}/PlaybackInfo`
+- `GET` / `HEAD /Videos/{itemId}/stream`
+- `GET` / `HEAD /Videos/{itemId}/stream.{container}`
+- `GET` / `HEAD /Videos/{itemId}/{mediaSourceId}/stream`
+- `GET` / `HEAD /Videos/{itemId}/{mediaSourceId}/stream.{container}`
+- `GET` / `HEAD /Videos/{itemId}/original.strm`
+- `GET` / `HEAD /Items/{itemId}/Download`
+- `GET` / `HEAD /Items/{itemId}/Subtitles/{streamIndex}/Stream`
+- `GET` / `HEAD /Videos/{itemId}/{mediaSourceId}/Subtitles/{streamIndex}/Stream`
+
+同时兼容部分客户端使用的小写 `/videos/...` 路径。当前以直放为主：本地媒体支持鉴权、Range 请求，`.strm` 远程地址返回直连重定向，不提供音视频转码、HLS 转码或字幕格式转换。
+
+### 播放状态与收藏
+
+- `GET /Sessions`
+- `POST /Sessions/Playing`
+- `POST /Sessions/Playing/Progress`
+- `POST /Sessions/Playing/Stopped`
+- `POST` / `DELETE /Users/{userId}/PlayedItems/{itemId}`
+- `POST` / `DELETE /Users/{userId}/FavoriteItems/{itemId}`
+
+### 弹幕扩展接口
+
+以下不是标准 Emby 核心接口，而是 Lux 为支持弹幕客户端提供的兼容扩展：
+
+- `GET /api/danmu/{itemId}`
+- `GET /api/danmu/{itemId}/raw`
+
 ## 已知限制
 
 - 首版只做直接播放，不做转码、HLS、容器转换或在线字幕下载。
