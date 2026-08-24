@@ -130,9 +130,7 @@ async fn danmaku_plugin_tries_alternate_file_names_after_no_match()
             get(|| async {
                 (
                     StatusCode::OK,
-                    [
-                        ("content-type", "application/xml"),
-                    ],
+                    [("content-type", "application/xml")],
                     "<i><d p=\"1,1,25,16777215,0,0,0,0\">alternate</d></i>",
                 )
             }),

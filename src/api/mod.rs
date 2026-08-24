@@ -19493,6 +19493,13 @@ fn danmaku_service_error(headers: &HeaderMap, error: DanmakuServiceError) -> Res
             "弹幕匹配对象不存在",
         )
         .into_response(),
+        DanmakuServiceError::LibraryNotSelected => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "该媒体库未在弹幕插件配置中启用",
+        )
+        .into_response(),
         DanmakuServiceError::NotRetryable => api_error(
             headers,
             StatusCode::CONFLICT,

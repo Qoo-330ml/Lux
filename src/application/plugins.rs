@@ -793,10 +793,28 @@ impl PluginService {
         &self,
         file_name: &str,
     ) -> Result<DanmakuMatchRpcResult, PluginServiceError> {
+        self.match_danmaku_with_candidates(file_name, &[]).await
+    }
+
+    pub async fn match_danmaku_with_candidates(
+        &self,
+        file_name: &str,
+        alternate_file_names: &[String],
+    ) -> Result<DanmakuMatchRpcResult, PluginServiceError> {
         if file_name.trim().is_empty()
             || file_name.chars().count() > 1024
             || file_name.chars().any(char::is_control)
             || file_name.contains(['/', '\\'])
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        if alternate_file_names.len() > 8
+            || alternate_file_names.iter().any(|candidate| {
+                candidate.trim().is_empty()
+                    || candidate.chars().count() > 1024
+                    || candidate.chars().any(char::is_control)
+                    || candidate.contains(['/', '\\'])
+            })
         {
             return Err(PluginServiceError::InvalidResponse);
         }
@@ -828,7 +846,7 @@ impl PluginService {
                 DANMAKU_MATCH_METHOD,
                 serde_json::to_value(DanmakuMatchRpcRequest {
                     file_name: file_name.to_owned(),
-                    alternate_file_names: Vec::new(),
+                    alternate_file_names: alternate_file_names.to_vec(),
                 })
                 .map_err(|_| PluginServiceError::InvalidResponse)?,
             )
@@ -1111,10 +1129,7 @@ impl PluginService {
         let values = normalize_plugin_config_for_fields(
             DANMAKU_PLUGIN_ID,
             &fields,
-            merge_default_config_values(
-                &fields,
-                self.read_plugin_config(DANMAKU_PLUGIN_ID).await?,
-            ),
+            merge_default_config_values(&fields, self.read_plugin_config(DANMAKU_PLUGIN_ID).await?),
         );
         let values = validate_config_values(&fields, &values)?;
         validate_dynamic_plugin_config(DANMAKU_PLUGIN_ID, &values)?;

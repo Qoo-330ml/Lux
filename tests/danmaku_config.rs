@@ -1,7 +1,11 @@
 use std::fs;
 
 use luxd::{
-    application::{libraries::LibraryService, plugins::PluginService},
+    application::{
+        danmaku::{DanmakuService, DanmakuServiceError},
+        libraries::LibraryService,
+        plugins::PluginService,
+    },
     config::Config,
     library::LibraryKind,
     storage::Database,
@@ -51,7 +55,10 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
     let library = LibraryService::new(database.clone())
         .create_library("番剧", LibraryKind::Series, false)
         .await?;
-    let plugins = PluginService::new(database, config_dir);
+    let other_library = LibraryService::new(database.clone())
+        .create_library("其他", LibraryKind::Movie, false)
+        .await?;
+    let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(PLUGIN_ID).await?;
 
     let page = plugins.list_installed(0, 20).await?;
@@ -65,10 +72,16 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
         .iter()
         .find(|field| field.key == "libraryIds")
         .ok_or("libraryIds field missing")?;
-    assert_eq!(library_field.options[0].value, library.id.to_string());
+    assert!(library_field
+        .options
+        .iter()
+        .any(|option| option.value == library.id.to_string()));
     assert_eq!(plugin.config_values["libraryIds"], json!([]));
     assert_eq!(plugin.config_values["matchOriginalFilename"], true);
-    assert_eq!(plugin.config_values["matchSimplifiedTraditionalTitles"], true);
+    assert_eq!(
+        plugin.config_values["matchSimplifiedTraditionalTitles"],
+        true
+    );
     assert_eq!(plugin.config_values["matchEnglishTitle"], false);
     assert!(!plugin.configured);
 
@@ -84,8 +97,14 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
     ]);
     let updated = plugins.update_dynamic_config(PLUGIN_ID, values).await?;
     assert!(updated.configured);
-    assert_eq!(updated.config_values["libraryIds"], json!([library.id.to_string()]));
-    assert_eq!(updated.config_values["matchSimplifiedTraditionalTitles"], false);
+    assert_eq!(
+        updated.config_values["libraryIds"],
+        json!([library.id.to_string()])
+    );
+    assert_eq!(
+        updated.config_values["matchSimplifiedTraditionalTitles"],
+        false
+    );
     assert_eq!(updated.config_values["matchEnglishTitle"], true);
 
     let settings = plugins.danmaku_settings().await?;
@@ -93,5 +112,12 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
     assert!(settings.match_original_filename);
     assert!(!settings.match_simplified_traditional_titles);
     assert!(settings.match_english_title);
+
+    let danmaku = DanmakuService::new(database).with_plugins(plugins);
+    let error = danmaku
+        .create_job(other_library.id, 2, false)
+        .await
+        .expect_err("unselected library must not accept a danmaku job");
+    assert!(matches!(error, DanmakuServiceError::LibraryNotSelected));
     Ok(())
 }

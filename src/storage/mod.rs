@@ -11824,9 +11824,13 @@ impl Database {
     ) -> Result<Option<StoredDanmakuSource>, StorageError> {
         self.query(
             "SELECT ms.id AS source_id, ms.item_id,
+                    mi.item_type, mi.title, mi.original_title,
+                    series.title AS series_title,
+                    series.original_title AS series_original_title,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
+             LEFT JOIN media_items series ON series.id = mi.series_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
@@ -11842,6 +11846,11 @@ impl Database {
                 source_id: row.get("source_id"),
                 root_path: row.get("root_path"),
                 relative_path: row.get("relative_path"),
+                item_type: row.get("item_type"),
+                title: row.get("title"),
+                original_title: row.get("original_title"),
+                series_title: row.get("series_title"),
+                series_original_title: row.get("series_original_title"),
             })
         })
         .map_err(|source| StorageError::Sqlx {
@@ -12120,10 +12129,15 @@ impl Database {
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
         self.query(
             "SELECT ji.id, ji.media_source_id,
+                    mi.item_type, mi.title, mi.original_title,
+                    series.title AS series_title,
+                    series.original_title AS series_original_title,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM danmaku_match_job_items ji
              LEFT JOIN media_sources ms
                ON ms.id = ji.media_source_id AND ms.source_kind = 'LOCAL_FILE'
+             LEFT JOIN media_items mi ON mi.id = ms.item_id
+             LEFT JOIN media_items series ON series.id = mi.series_id
              LEFT JOIN filesystem_entries fe
                ON fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
              LEFT JOIN library_roots lr ON lr.id = fe.library_root_id
@@ -12142,6 +12156,11 @@ impl Database {
                     media_source_id: row.get("media_source_id"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
+                    item_type: row.get("item_type"),
+                    title: row.get("title"),
+                    original_title: row.get("original_title"),
+                    series_title: row.get("series_title"),
+                    series_original_title: row.get("series_original_title"),
                 })
                 .collect()
         })
@@ -16334,6 +16353,11 @@ pub(crate) struct StoredDanmakuSource {
     pub(crate) source_id: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+    pub(crate) item_type: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) original_title: Option<String>,
+    pub(crate) series_title: Option<String>,
+    pub(crate) series_original_title: Option<String>,
 }
 
 pub(crate) struct NewDanmakuTrack<'a> {
@@ -16370,6 +16394,11 @@ pub(crate) struct StoredDanmakuMatchItem {
     pub(crate) media_source_id: String,
     pub(crate) root_path: Option<String>,
     pub(crate) relative_path: Option<String>,
+    pub(crate) item_type: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) original_title: Option<String>,
+    pub(crate) series_title: Option<String>,
+    pub(crate) series_original_title: Option<String>,
 }
 
 pub(crate) struct NewDanmakuMatchJob<'a> {
