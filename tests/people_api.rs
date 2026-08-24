@@ -140,16 +140,28 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
         .persist_item_actors(
             "movie-1",
             "tmdb",
-            &[ActorCredit {
-                id: "42".to_owned(),
-                provider: None,
-                identities: Vec::new(),
-                name: "演员甲".to_owned(),
-                character: Some("角色甲".to_owned()),
-                order: Some(0),
-                profile_url: None,
-                person: None,
-            }],
+            &[
+                ActorCredit {
+                    id: "42".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员甲".to_owned(),
+                    character: Some("角色甲".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                    person: None,
+                },
+                ActorCredit {
+                    id: "43".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "John Actor".to_owned(),
+                    character: Some("Supporting Role".to_owned()),
+                    order: Some(1),
+                    profile_url: None,
+                    person: None,
+                },
+            ],
         )
         .await?;
     for item_id in ["episode-1", "episode-2"] {
@@ -234,6 +246,18 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
     let search_body: Value = search.json().await?;
     assert_eq!(search_body["total"], 1);
     assert_eq!(search_body["items"][0]["id"], "42");
+
+    let english_search = client
+        .get(format!(
+            "{base_url}/api/v1/people?q=John&page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(english_search.status(), reqwest::StatusCode::OK);
+    let english_search_body: Value = english_search.json().await?;
+    assert_eq!(english_search_body["total"], 1);
+    assert_eq!(english_search_body["items"][0]["name"], "John Actor");
 
     let works = client
         .get(format!(

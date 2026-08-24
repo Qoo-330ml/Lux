@@ -97,4 +97,39 @@ describe("actor search and filmography", () => {
     expect(container?.textContent).toContain("演员甲剧集");
     expect(api.personItems).toHaveBeenCalledWith("42", 1);
   });
+
+  it("loads the next page when the actor has more than one page of works", async () => {
+    vi.spyOn(api, "person").mockResolvedValue({ id: "42", name: "演员甲" });
+    const personItems = vi.spyOn(api, "personItems").mockImplementation(async (_personId, page = 1) => ({
+      items: page === 1
+        ? [{ id: "movie-1", title: "演员甲电影", itemType: "MOVIE" }]
+        : [{ id: "series-2", title: "演员甲第二部剧集", itemType: "SERIES" }],
+      total: 25,
+      page,
+      pageSize: 24,
+    }));
+    root = createRoot(container!);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/people/42"]}>
+            <Routes><Route path="people/:personId" element={<PersonDetailPage />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const loadMore = container?.querySelector<HTMLButtonElement>(".lux-person-works-actions button");
+    expect(loadMore?.textContent).toContain("加载更多");
+    await act(async () => loadMore?.click());
+    await flushReact();
+    await flushReact();
+
+    expect(container?.textContent).toContain("演员甲第二部剧集");
+    expect(personItems).toHaveBeenNthCalledWith(2, "42", 2);
+  });
 });
