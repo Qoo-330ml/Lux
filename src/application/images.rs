@@ -644,7 +644,7 @@ impl ImageWriteService {
 #[derive(Clone)]
 pub struct ImageCandidateService {
     database: Database,
-    tmdb: ScraperProvider,
+    scraper: ScraperProvider,
     resolver: Option<ScraperResolver>,
 }
 
@@ -661,24 +661,24 @@ pub struct ImageCandidate {
 }
 
 impl ImageCandidateService {
-    pub fn new<T>(database: Database, tmdb: T) -> Self
+    pub fn new<T>(database: Database, scraper: T) -> Self
     where
         T: Into<ScraperProvider>,
     {
         Self {
             database,
-            tmdb: tmdb.into(),
+            scraper: scraper.into(),
             resolver: None,
         }
     }
 
-    pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
+    pub fn with_resolver<T>(database: Database, scraper: T, resolver: ScraperResolver) -> Self
     where
         T: Into<ScraperProvider>,
     {
         Self {
             database,
-            tmdb: tmdb.into(),
+            scraper: scraper.into(),
             resolver: Some(resolver),
         }
     }
@@ -717,7 +717,7 @@ impl ImageCandidateService {
             "EPISODE" => ScraperItemType::Episode,
             _ => return Ok(Vec::new()),
         };
-        let tmdb = self.provider_for_item(item_id).await?;
+        let scraper = self.provider_for_item(item_id).await?;
         let mut image_request = ScraperImageRequest::new(item_type, provider_id, language);
         image_request.season_number = identity
             .season_number
@@ -727,7 +727,7 @@ impl ImageCandidateService {
             .episode_number
             .map(|value| i32::try_from(value).map_err(|_| ImageCandidateError::InvalidItem))
             .transpose()?;
-        let images = tmdb
+        let images = scraper
             .images_generic(image_request)
             .await
             .map_err(ImageCandidateError::Scraper)?
@@ -781,7 +781,7 @@ impl ImageCandidateService {
         item_id: &str,
     ) -> Result<ScraperProvider, ImageCandidateError> {
         let Some(resolver) = &self.resolver else {
-            return Ok(self.tmdb.clone());
+            return Ok(self.scraper.clone());
         };
         resolver
             .for_item(item_id)
@@ -790,7 +790,7 @@ impl ImageCandidateService {
             .map(|client| {
                 client
                     .map(ScraperProvider::from_scraper)
-                    .unwrap_or_else(|| self.tmdb.clone())
+                    .unwrap_or_else(|| self.scraper.clone())
             })
     }
 }

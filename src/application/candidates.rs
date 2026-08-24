@@ -105,9 +105,9 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        tmdb: &ScraperProvider,
+        scraper: &ScraperProvider,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        self.search_and_store_with_mode(item_id, query, year, tmdb, CandidateSearchMode::Manual)
+        self.search_and_store_with_mode(item_id, query, year, scraper, CandidateSearchMode::Manual)
             .await
     }
 
@@ -116,10 +116,16 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        tmdb: &ScraperProvider,
+        scraper: &ScraperProvider,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        self.search_and_store_with_mode(item_id, query, year, tmdb, CandidateSearchMode::Automatic)
-            .await
+        self.search_and_store_with_mode(
+            item_id,
+            query,
+            year,
+            scraper,
+            CandidateSearchMode::Automatic,
+        )
+        .await
     }
 
     async fn search_and_store_with_mode(
@@ -127,7 +133,7 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        tmdb: &ScraperProvider,
+        scraper: &ScraperProvider,
         mode: CandidateSearchMode,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let current = self
@@ -140,7 +146,7 @@ impl MetadataCandidateService {
             "SERIES" => MediaKind::Series,
             "SEASON" | "EPISODE" => {
                 return self
-                    .search_child_and_store(item_id, query, year, &current, tmdb)
+                    .search_child_and_store(item_id, query, year, &current, scraper)
                     .await;
             }
             _ => return Err(MetadataCandidateError::InvalidSearch),
@@ -163,7 +169,7 @@ impl MetadataCandidateService {
             MediaKind::Series => crate::application::scraper::ScraperItemType::Series,
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
-        let direct_provider_id = selected_scraper_provider_id(&current, tmdb).filter(|_| {
+        let direct_provider_id = selected_scraper_provider_id(&current, scraper).filter(|_| {
             let same_title = crate::application::media_matching::normalize_title(query)
                 == crate::application::media_matching::normalize_title(&current.title);
             let same_year =
@@ -171,13 +177,13 @@ impl MetadataCandidateService {
             same_title && same_year
         });
         let (response, direct_details) = if let Some(provider_id) = direct_provider_id.as_deref() {
-            let details = tmdb
+            let details = scraper
                 .get_generic(ScraperGetRequest::new(item_type, provider_id, "zh-CN"))
                 .await
                 .map_err(MetadataCandidateError::Scraper)?;
             let mut provider_ids = details.provider_ids.clone();
             provider_ids
-                .entry(tmdb.provider_key().to_owned())
+                .entry(scraper.provider_key().to_owned())
                 .or_insert_with(|| provider_id.to_owned());
             (
                 ScraperSearchResponse {
@@ -197,7 +203,7 @@ impl MetadataCandidateService {
             )
         } else {
             (
-                search_generic(tmdb, item_type, query, year)
+                search_generic(scraper, item_type, query, year)
                     .await
                     .map_err(MetadataCandidateError::Scraper)?,
                 None,
@@ -214,7 +220,7 @@ impl MetadataCandidateService {
             results.truncate(2);
         }
         for (result_index, result) in results.into_iter().enumerate() {
-            let Some((provider, provider_id)) = tmdb.selected_provider_entry(&result) else {
+            let Some((provider, provider_id)) = scraper.selected_provider_entry(&result) else {
                 continue;
             };
             let provider = provider.to_owned();
@@ -223,7 +229,7 @@ impl MetadataCandidateService {
                 let score = search_result_score(&current, &result);
                 let mut provider_ids = result.provider_ids.clone();
                 provider_ids
-                    .entry(tmdb.provider_key().to_owned())
+                    .entry(scraper.provider_key().to_owned())
                     .or_insert_with(|| provider_id.clone());
                 self.store_candidate(
                     item_id,
@@ -275,13 +281,14 @@ impl MetadataCandidateService {
                     crate::application::scraper::ScraperItemType::Movie
                         | crate::application::scraper::ScraperItemType::Series
                 ) {
-                tmdb.bundle_generic(ScraperGetRequest::new(
-                    item_type,
-                    provider_id.clone(),
-                    "zh-CN",
-                ))
-                .await
-                .ok()
+                scraper
+                    .bundle_generic(ScraperGetRequest::new(
+                        item_type,
+                        provider_id.clone(),
+                        "zh-CN",
+                    ))
+                    .await
+                    .ok()
             } else {
                 None
             };
@@ -294,13 +301,14 @@ impl MetadataCandidateService {
                 crate::application::scraper::ScraperItemType::Movie
                     | crate::application::scraper::ScraperItemType::Series
             ) {
-                tmdb.get_generic(crate::application::scraper::ScraperGetRequest::new(
-                    item_type,
-                    provider_id.clone(),
-                    "zh-CN",
-                ))
-                .await
-                .ok()
+                scraper
+                    .get_generic(crate::application::scraper::ScraperGetRequest::new(
+                        item_type,
+                        provider_id.clone(),
+                        "zh-CN",
+                    ))
+                    .await
+                    .ok()
             } else {
                 None
             };
@@ -325,13 +333,14 @@ impl MetadataCandidateService {
             } else {
                 tokio::join!(
                     async {
-                        tmdb.images_generic(crate::application::scraper::ScraperImageRequest::new(
-                            item_type,
-                            provider_id.clone(),
-                            "zh-CN",
-                        ))
-                        .await
-                        .unwrap_or_default()
+                        scraper
+                            .images_generic(crate::application::scraper::ScraperImageRequest::new(
+                                item_type,
+                                provider_id.clone(),
+                                "zh-CN",
+                            ))
+                            .await
+                            .unwrap_or_default()
                     },
                     async {
                         if matches!(
@@ -339,48 +348,51 @@ impl MetadataCandidateService {
                             crate::application::scraper::ScraperItemType::Movie
                                 | crate::application::scraper::ScraperItemType::Series
                         ) {
-                            tmdb.credits_generic(
-                                crate::application::scraper::ScraperGetRequest::new(
-                                    item_type,
-                                    provider_id.clone(),
-                                    "zh-CN",
-                                ),
-                            )
-                            .await
-                            .unwrap_or_default()
+                            scraper
+                                .credits_generic(
+                                    crate::application::scraper::ScraperGetRequest::new(
+                                        item_type,
+                                        provider_id.clone(),
+                                        "zh-CN",
+                                    ),
+                                )
+                                .await
+                                .unwrap_or_default()
                         } else {
                             crate::application::scraper::ScraperCreditsResponse::default()
                         }
                     },
                     async {
                         if item_type == ScraperItemType::Movie {
-                            tmdb.external_ids_generic(ScraperGetRequest::new(
-                                item_type,
-                                provider_id.clone(),
-                                "zh-CN",
-                            ))
-                            .await
-                            .ok()
+                            scraper
+                                .external_ids_generic(ScraperGetRequest::new(
+                                    item_type,
+                                    provider_id.clone(),
+                                    "zh-CN",
+                                ))
+                                .await
+                                .ok()
                         } else {
                             None
                         }
                     },
                     async {
                         if item_type == ScraperItemType::Movie {
-                            tmdb.trailers_generic(ScraperGetRequest::new(
-                                item_type,
-                                provider_id.clone(),
-                                "zh-CN",
-                            ))
-                            .await
-                            .map(|response| {
-                                response
-                                    .trailers
-                                    .into_iter()
-                                    .filter_map(|trailer| trailer.url)
-                                    .collect()
-                            })
-                            .unwrap_or_default()
+                            scraper
+                                .trailers_generic(ScraperGetRequest::new(
+                                    item_type,
+                                    provider_id.clone(),
+                                    "zh-CN",
+                                ))
+                                .await
+                                .map(|response| {
+                                    response
+                                        .trailers
+                                        .into_iter()
+                                        .filter_map(|trailer| trailer.url)
+                                        .collect()
+                                })
+                                .unwrap_or_default()
                         } else {
                             Vec::new()
                         }
@@ -389,14 +401,14 @@ impl MetadataCandidateService {
             };
             let mut actors = generic_candidate_actors(&credits.cast);
             if matches!(mode, CandidateSearchMode::Manual) {
-                enrich_actor_metadata(tmdb, &mut actors).await;
+                enrich_actor_metadata(scraper, &mut actors).await;
             }
             let mut provider_ids = details
                 .as_ref()
                 .map(|value| value.provider_ids.clone())
                 .unwrap_or_default();
             provider_ids
-                .entry(tmdb.provider_key().to_owned())
+                .entry(scraper.provider_key().to_owned())
                 .or_insert_with(|| provider_id.clone());
             if let Some(external_ids) = external_ids {
                 provider_ids.extend(external_ids.provider_ids);
@@ -1980,7 +1992,7 @@ fn tmdb_candidate_actors(cast: &[TmdbCastMember]) -> Vec<ActorCredit> {
             }
             Some(ActorCredit {
                 id: member.id.to_string(),
-                provider: Some("tmdb".to_owned()),
+                provider: Some("scraper".to_owned()),
                 identities: Vec::new(),
                 name: name.to_owned(),
                 character: member

@@ -57,7 +57,7 @@ pub struct MetadataReidentifyService {
     database: Database,
     candidates: MetadataCandidateService,
     selection: Option<MetadataSelectionService>,
-    tmdb: ScraperProvider,
+    scraper: ScraperProvider,
     resolver: Option<ScraperResolver>,
     admin_events: AdminEventHub,
     resources: ResourceMetrics,
@@ -130,7 +130,7 @@ impl Drop for MetadataJobOwnerGuard {
 }
 
 impl MetadataReidentifyService {
-    pub fn new<T>(database: Database, tmdb: T) -> Self
+    pub fn new<T>(database: Database, scraper: T) -> Self
     where
         T: Into<ScraperProvider>,
     {
@@ -138,7 +138,7 @@ impl MetadataReidentifyService {
             candidates: MetadataCandidateService::new(database.clone()),
             selection: None,
             database,
-            tmdb: tmdb.into(),
+            scraper: scraper.into(),
             resolver: None,
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
@@ -150,16 +150,16 @@ impl MetadataReidentifyService {
         }
     }
 
-    pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
+    pub fn with_resolver<T>(database: Database, scraper: T, resolver: ScraperResolver) -> Self
     where
         T: Into<ScraperProvider>,
     {
-        Self::with_resolver_and_selection(database, tmdb, resolver, None)
+        Self::with_resolver_and_selection(database, scraper, resolver, None)
     }
 
     pub fn with_selection<T>(
         database: Database,
-        tmdb: T,
+        scraper: T,
         selection: Option<MetadataSelectionService>,
     ) -> Self
     where
@@ -169,7 +169,7 @@ impl MetadataReidentifyService {
             candidates: MetadataCandidateService::new(database.clone()),
             selection,
             database,
-            tmdb: tmdb.into(),
+            scraper: scraper.into(),
             resolver: None,
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
@@ -183,7 +183,7 @@ impl MetadataReidentifyService {
 
     pub fn with_resolver_and_selection<T>(
         database: Database,
-        tmdb: T,
+        scraper: T,
         resolver: ScraperResolver,
         selection: Option<MetadataSelectionService>,
     ) -> Self
@@ -194,7 +194,7 @@ impl MetadataReidentifyService {
             candidates: MetadataCandidateService::new(database.clone()),
             selection,
             database,
-            tmdb: tmdb.into(),
+            scraper: scraper.into(),
             resolver: Some(resolver),
             admin_events: AdminEventHub::new(),
             resources: ResourceMetrics::new(),
@@ -413,7 +413,7 @@ impl MetadataReidentifyService {
             _ => MetadataRefreshMode::Reidentify,
         };
         if matches!(mode, MetadataRefreshMode::FullRefresh) {
-            self.tmdb.clear_response_cache().await;
+            self.scraper.clear_response_cache().await;
         }
         let mut workers = JoinSet::new();
         let mut last_concurrency = None;
@@ -706,7 +706,7 @@ impl MetadataReidentifyService {
         require_selected_scraper: bool,
     ) -> Result<Option<ScraperProvider>, ScraperError> {
         let Some(resolver) = &self.resolver else {
-            return Ok(Some(self.tmdb.clone()));
+            return Ok(Some(self.scraper.clone()));
         };
         let client = resolver.for_item(item_id).await?;
         if require_selected_scraper && client.is_none() {
@@ -715,7 +715,7 @@ impl MetadataReidentifyService {
         Ok(Some(
             client
                 .map(ScraperProvider::from_scraper)
-                .unwrap_or_else(|| self.tmdb.clone()),
+                .unwrap_or_else(|| self.scraper.clone()),
         ))
     }
 

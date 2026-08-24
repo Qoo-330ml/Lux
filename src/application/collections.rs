@@ -14,31 +14,31 @@ use crate::{
 #[derive(Clone)]
 pub struct CollectionService {
     database: Database,
-    tmdb: ScraperProvider,
+    scraper: ScraperProvider,
     resolver: Option<ScraperResolver>,
     metadata_objects: Option<MetadataObjectStore>,
 }
 
 impl CollectionService {
-    pub fn new<T>(database: Database, tmdb: T) -> Self
+    pub fn new<T>(database: Database, scraper: T) -> Self
     where
         T: Into<ScraperProvider>,
     {
         Self {
             database,
-            tmdb: tmdb.into(),
+            scraper: scraper.into(),
             resolver: None,
             metadata_objects: None,
         }
     }
 
-    pub fn with_resolver<T>(database: Database, tmdb: T, resolver: ScraperResolver) -> Self
+    pub fn with_resolver<T>(database: Database, scraper: T, resolver: ScraperResolver) -> Self
     where
         T: Into<ScraperProvider>,
     {
         Self {
             database,
-            tmdb: tmdb.into(),
+            scraper: scraper.into(),
             resolver: Some(resolver),
             metadata_objects: None,
         }
@@ -56,9 +56,9 @@ impl CollectionService {
         let Some(identity) = self.database.find_movie_identity(item_id).await? else {
             return Err(CollectionError::MovieProviderIdMissing);
         };
-        let tmdb = self.provider_for_item(item_id).await?;
-        let provider_name = tmdb.provider_key().to_owned();
-        let movie = tmdb
+        let scraper = self.provider_for_item(item_id).await?;
+        let provider_name = scraper.provider_key().to_owned();
+        let movie = scraper
             .get_generic(ScraperGetRequest::new(
                 ScraperItemType::Movie,
                 identity.provider_id.clone(),
@@ -73,7 +73,7 @@ impl CollectionService {
             .provider_id
             .filter(|value| !value.trim().is_empty())
             .ok_or(CollectionError::InvalidProviderId)?;
-        let details = tmdb
+        let details = scraper
             .get_generic(ScraperGetRequest::new(
                 ScraperItemType::BoxSet,
                 collection_id.clone(),
@@ -137,7 +137,7 @@ impl CollectionService {
 
     async fn provider_for_item(&self, item_id: &str) -> Result<ScraperProvider, CollectionError> {
         let Some(resolver) = &self.resolver else {
-            return Ok(self.tmdb.clone());
+            return Ok(self.scraper.clone());
         };
         resolver
             .for_item(item_id)
@@ -146,7 +146,7 @@ impl CollectionService {
             .map(|client| {
                 client
                     .map(ScraperProvider::from_scraper)
-                    .unwrap_or_else(|| self.tmdb.clone())
+                    .unwrap_or_else(|| self.scraper.clone())
             })
     }
 }
