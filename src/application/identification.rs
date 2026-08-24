@@ -1,9 +1,9 @@
 use crate::application::{
     scraper::{
-        ScraperError, ScraperGetRequest, ScraperItemType, ScraperSearchRequest, ScraperSearchResult,
+        ScraperError, ScraperGetRequest, ScraperItemType, ScraperProvider, ScraperSearchRequest,
+        ScraperSearchResult,
     },
     tmdb::TmdbMovieSummary,
-    tmdb_plugin::ScraperProvider,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

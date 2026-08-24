@@ -80,7 +80,7 @@ use crate::{
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::validate_cron,
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
-        scraper::{ScraperPluginClient, ScraperResolver},
+        scraper::{ScraperPluginClient, ScraperProvider, ScraperResolver},
         settings::{read_network_proxy_url_async, write_network_proxy_url},
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{
@@ -88,7 +88,6 @@ use crate::{
         },
         thumbnails::ThumbnailService,
         tmdb::TmdbClient,
-        tmdb_plugin::ScraperProvider,
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
         webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
@@ -229,7 +228,7 @@ impl AppState {
             plugins.clone(),
             config_dir.clone(),
         )));
-        let scraper = ScraperProvider::Generic(ScraperPluginClient::new_with_provider_key(
+        let scraper = ScraperProvider::from_scraper(ScraperPluginClient::new_with_provider_key(
             plugins.clone(),
             TMDB_DYNAMIC_PLUGIN_ID,
             "tmdb",
@@ -18572,7 +18571,7 @@ async fn admin_update_plugin_config(
                 if let Some(scraper) = state.scraper.as_ref() {
                     if let Some(api_key) = api_key {
                         scraper
-                            .set_api_key((!api_key.is_empty()).then_some(api_key))
+                            .configure_api_key((!api_key.is_empty()).then_some(api_key))
                             .await;
                     }
                 }

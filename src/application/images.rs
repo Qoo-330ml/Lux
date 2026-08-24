@@ -20,9 +20,9 @@ use crate::{
         metadata::series_directory,
         metadata_paths::{library_item_directory, metadata_root},
         scraper::{
-            ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperResolver,
+            ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperProvider,
+            ScraperResolver,
         },
-        tmdb_plugin::ScraperProvider,
     },
     network::client_builder_from_env_or,
     storage::{Database, ItemImageMetadata, StorageError},

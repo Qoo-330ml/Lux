@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 
+// TMDb endpoint conversion lives here. The provider-neutral contract is in
+// application::scraper and is the only surface consumed by application services.
 use crate::application::{
     scraper::{
-        ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse, ScraperGetRequest,
-        ScraperImage, ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
-        ScraperMetadataBundle, ScraperPluginClient, ScraperSearchRequest, ScraperSearchResponse,
-        ScraperSearchResult, ScraperTrailer, ScraperTrailersResponse,
+        ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
+        ScraperFuture, ScraperGetRequest, ScraperImage, ScraperImageRequest, ScraperImagesResponse,
+        ScraperItemType, ScraperMetadata, ScraperMetadataBundle, ScraperProvider,
+        ScraperSearchRequest, ScraperSearchResponse, ScraperSearchResult, ScraperTrailer,
+        ScraperTrailersResponse,
     },
     tmdb::{
         TmdbClient, TmdbCollectionDetails, TmdbEpisodeDetails, TmdbImagesResponse,
@@ -14,131 +17,76 @@ use crate::application::{
     },
 };
 
-/// Provider-neutral application adapter. TMDb's typed endpoint models stay in the
-/// direct adapter helpers below; external plugins use the generic scraper RPC.
-#[derive(Clone)]
-pub enum ScraperProvider {
-    Direct(TmdbClient),
-    Generic(ScraperPluginClient),
-}
-
 impl From<TmdbClient> for ScraperProvider {
     fn from(client: TmdbClient) -> Self {
-        Self::Direct(client)
+        ScraperProvider::from_adapter(client)
     }
 }
 
-impl ScraperProvider {
-    pub fn plugin_id(&self) -> Option<&str> {
-        match self {
-            Self::Direct(_) => None,
-            Self::Generic(client) => Some(client.plugin_id()),
-        }
+impl ScraperAdapter for TmdbClient {
+    fn provider_key(&self) -> &str {
+        "tmdb"
     }
 
-    pub fn provider_key(&self) -> &str {
-        match self {
-            Self::Direct(_) => "tmdb",
-            Self::Generic(client) => client.provider_key(),
-        }
-    }
-
-    pub fn from_scraper(client: ScraperPluginClient) -> Self {
-        Self::Generic(client)
-    }
-
-    pub fn selected_provider_entry<'a>(
-        &self,
-        result: &'a ScraperSearchResult,
-    ) -> Option<(&'a str, &'a str)> {
-        result.selected_provider_entry(self.provider_key())
-    }
-}
-
-impl ScraperProvider {
-    pub async fn search_generic(
+    fn search(
         &self,
         request: ScraperSearchRequest,
-    ) -> Result<ScraperSearchResponse, ScraperError> {
-        match self {
-            Self::Direct(client) => direct_search_generic(client, request).await,
-            Self::Generic(client) => client.search(request).await,
-        }
+    ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+        Box::pin(direct_search_generic(self, request))
     }
 
-    pub async fn get_generic(
+    fn get(
         &self,
         request: ScraperGetRequest,
-    ) -> Result<ScraperMetadata, ScraperError> {
-        match self {
-            Self::Direct(client) => direct_get_generic(client, request).await,
-            Self::Generic(client) => client.get(request).await,
-        }
+    ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+        Box::pin(direct_get_generic(self, request))
     }
 
-    pub async fn bundle_generic(
+    fn bundle(
         &self,
-        request: ScraperGetRequest,
-    ) -> Result<ScraperMetadataBundle, ScraperError> {
-        match self {
-            Self::Direct(_) => Err(ScraperError::UnsupportedCapability(
-                "metadata.bundle".to_owned(),
-            )),
-            Self::Generic(client) => client.bundle(request).await,
-        }
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+        Box::pin(std::future::ready(Err(
+            ScraperError::UnsupportedCapability("metadata.bundle".to_owned()),
+        )))
     }
 
-    pub async fn images_generic(
+    fn images(
         &self,
         request: ScraperImageRequest,
-    ) -> Result<ScraperImagesResponse, ScraperError> {
-        match self {
-            Self::Direct(client) => direct_images_generic(client, request).await,
-            Self::Generic(client) => client.images(request).await,
-        }
+    ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+        Box::pin(direct_images_generic(self, request))
     }
 
-    pub async fn credits_generic(
+    fn credits(
         &self,
         request: ScraperGetRequest,
-    ) -> Result<ScraperCreditsResponse, ScraperError> {
-        match self {
-            Self::Direct(client) => direct_credits_generic(client, request).await,
-            Self::Generic(client) => client.credits(request).await,
-        }
+    ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+        Box::pin(direct_credits_generic(self, request))
     }
 
-    pub async fn external_ids_generic(
+    fn external_ids(
         &self,
         request: ScraperGetRequest,
-    ) -> Result<ScraperExternalIdsResponse, ScraperError> {
-        match self {
-            Self::Direct(client) => direct_external_ids_generic(client, request).await,
-            Self::Generic(client) => client.external_ids(request).await,
-        }
+    ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+        Box::pin(direct_external_ids_generic(self, request))
     }
 
-    pub async fn trailers_generic(
+    fn trailers(
         &self,
         request: ScraperGetRequest,
-    ) -> Result<ScraperTrailersResponse, ScraperError> {
-        match self {
-            Self::Direct(client) => direct_trailers_generic(client, request).await,
-            Self::Generic(client) => client.trailers(request).await,
-        }
+    ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+        Box::pin(direct_trailers_generic(self, request))
     }
 
-    pub async fn set_api_key(&self, api_key: Option<&str>) {
-        if let Self::Direct(client) = self {
-            client.set_api_key(api_key).await;
-        }
+    fn configure_api_key(&self, api_key: Option<String>) -> ScraperFuture<'_, ()> {
+        Box::pin(async move {
+            self.set_api_key(api_key.as_deref()).await;
+        })
     }
 
-    pub(crate) async fn clear_response_cache(&self) {
-        match self {
-            Self::Direct(client) => client.clear_response_cache().await,
-            Self::Generic(client) => client.clear_response_cache().await,
-        }
+    fn clear_response_cache(&self) -> ScraperFuture<'_, ()> {
+        Box::pin(self.clear_response_cache())
     }
 }
 

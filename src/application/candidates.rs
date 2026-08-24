@@ -16,9 +16,8 @@ use crate::{
         people::{ActorCredit, PeopleError},
         scraper::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
-            ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
+            ScraperProvider, ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
         },
-        tmdb_plugin::ScraperProvider,
     },
     storage::{
         Database, NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,

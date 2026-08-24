@@ -4,9 +4,9 @@ use crate::{
     application::{
         metadata_objects::{MetadataObjectError, MetadataObjectSnapshot, MetadataObjectStore},
         scraper::{
-            ScraperError, ScraperGetRequest, ScraperItemType, ScraperResolver, provider_id_for_key,
+            ScraperError, ScraperGetRequest, ScraperItemType, ScraperProvider, ScraperResolver,
+            provider_id_for_key,
         },
-        tmdb_plugin::ScraperProvider,
     },
     storage::{Database, NewCollection, StorageError},
 };

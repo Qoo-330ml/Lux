@@ -19,6 +19,8 @@ Lux 后续需要支持多个元数据来源。插件实现身份、元数据 pro
    `ScraperMetadata`、`ScraperMetadataBundle`、`ScraperImagesResponse` 和相关通用模型。
 2. TMDb endpoint façade 和 `Tmdb*` typed DTO 只保留在 TMDb adapter 内部；通用插件直接调用
    `metadata.search/get/bundle/images/credits/externalIds/trailers` RPC。
+   provider-neutral `ScraperAdapter`/`ScraperProvider` 位于 `application::scraper`；TMDb 模块只实现该
+   adapter，不向候选、图片、人物、合集和重新识别服务暴露 `TmdbClient` 类型。
 3. metadata 插件声明稳定的 `providerKey`。`pluginId` 只表示安装/运行时实现身份，不能作为媒体
    provider namespace 的替代品；旧插件缺少该字段时仅在兼容期间从插件 ID 推导。
 4. provider ID 在应用层按字符串处理，并以 provider key 命名空间定位。业务代码不得调用
@@ -59,3 +61,5 @@ namespace 可以在不改变数据库结构的情况下提供边界安全。
 - provider-neutral fixture 同时覆盖数字 ID、`tt/nm` ID 和任意字符串 ID。
 - 选中 provider 与多个外部 ID 并存时，候选和 NFO 只使用选中的 provider ID。
 - 图片、人物和合集 capability 缺失时不发起错误的 TMDb 请求。
+- `ScraperProvider` 的 adapter contract 迁移后，应用服务和测试只依赖 `application::scraper`；TMDb
+  配置入口保留为兼容 façade，不能改变通用 provider 选择。

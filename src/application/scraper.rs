@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +41,188 @@ impl ScraperItemType {
             Self::Episode => "Episode",
             Self::Person => "Person",
             Self::BoxSet => "BoxSet",
+        }
+    }
+}
+
+pub type ScraperFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Provider-neutral adapter contract used by application services.
+///
+/// Concrete providers own their endpoint models and implement this contract
+/// in their adapter module. The application layer only sees the scraper
+/// request/response models defined in this module.
+pub trait ScraperAdapter: Send + Sync {
+    fn provider_key(&self) -> &str;
+
+    fn plugin_id(&self) -> Option<&str> {
+        None
+    }
+
+    fn search(
+        &self,
+        request: ScraperSearchRequest,
+    ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>>;
+
+    fn get(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>>;
+
+    fn bundle(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>>;
+
+    fn images(
+        &self,
+        request: ScraperImageRequest,
+    ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>>;
+
+    fn credits(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>>;
+
+    fn external_ids(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>>;
+
+    fn trailers(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>>;
+
+    fn configure_api_key(&self, _api_key: Option<String>) -> ScraperFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn clear_response_cache(&self) -> ScraperFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// Provider-neutral handle shared by metadata application services.
+#[derive(Clone)]
+pub enum ScraperProvider {
+    Adapter(Arc<dyn ScraperAdapter>),
+    Generic(Box<ScraperPluginClient>),
+}
+
+impl ScraperProvider {
+    pub fn from_adapter<A>(adapter: A) -> Self
+    where
+        A: ScraperAdapter + 'static,
+    {
+        Self::Adapter(Arc::new(adapter))
+    }
+
+    pub fn from_scraper(client: ScraperPluginClient) -> Self {
+        Self::Generic(Box::new(client))
+    }
+
+    pub fn plugin_id(&self) -> Option<&str> {
+        match self {
+            Self::Adapter(adapter) => adapter.plugin_id(),
+            Self::Generic(client) => Some(client.plugin_id()),
+        }
+    }
+
+    pub fn provider_key(&self) -> &str {
+        match self {
+            Self::Adapter(adapter) => adapter.provider_key(),
+            Self::Generic(client) => client.provider_key(),
+        }
+    }
+
+    pub fn selected_provider_entry<'a>(
+        &self,
+        result: &'a ScraperSearchResult,
+    ) -> Option<(&'a str, &'a str)> {
+        result.selected_provider_entry(self.provider_key())
+    }
+
+    pub async fn search_generic(
+        &self,
+        request: ScraperSearchRequest,
+    ) -> Result<ScraperSearchResponse, ScraperError> {
+        match self {
+            Self::Adapter(adapter) => adapter.search(request).await,
+            Self::Generic(client) => client.search(request).await,
+        }
+    }
+
+    pub async fn get_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperMetadata, ScraperError> {
+        match self {
+            Self::Adapter(adapter) => adapter.get(request).await,
+            Self::Generic(client) => client.get(request).await,
+        }
+    }
+
+    pub async fn bundle_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperMetadataBundle, ScraperError> {
+        match self {
+            Self::Adapter(adapter) => adapter.bundle(request).await,
+            Self::Generic(client) => client.bundle(request).await,
+        }
+    }
+
+    pub async fn images_generic(
+        &self,
+        request: ScraperImageRequest,
+    ) -> Result<ScraperImagesResponse, ScraperError> {
+        match self {
+            Self::Adapter(adapter) => adapter.images(request).await,
+            Self::Generic(client) => client.images(request).await,
+        }
+    }
+
+    pub async fn credits_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperCreditsResponse, ScraperError> {
+        match self {
+            Self::Adapter(adapter) => adapter.credits(request).await,
+            Self::Generic(client) => client.credits(request).await,
+        }
+    }
+
+    pub async fn external_ids_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperExternalIdsResponse, ScraperError> {
+        match self {
+            Self::Adapter(adapter) => adapter.external_ids(request).await,
+            Self::Generic(client) => client.external_ids(request).await,
+        }
+    }
+
+    pub async fn trailers_generic(
+        &self,
+        request: ScraperGetRequest,
+    ) -> Result<ScraperTrailersResponse, ScraperError> {
+        match self {
+            Self::Adapter(adapter) => adapter.trailers(request).await,
+            Self::Generic(client) => client.trailers(request).await,
+        }
+    }
+
+    pub async fn configure_api_key(&self, api_key: Option<&str>) {
+        if let Self::Adapter(adapter) = self {
+            adapter.configure_api_key(api_key.map(str::to_owned)).await;
+        }
+    }
+
+    pub(crate) async fn clear_response_cache(&self) {
+        match self {
+            Self::Adapter(adapter) => adapter.clear_response_cache().await,
+            Self::Generic(client) => client.clear_response_cache().await,
         }
     }
 }
