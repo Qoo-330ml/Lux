@@ -934,7 +934,6 @@ impl MetadataReidentifyError {
             Self::JobNotRetryable => "JOB_NOT_RETRYABLE",
             Self::JobNotCancelable => "JOB_NOT_CANCELABLE",
             Self::LibraryJobAlreadyActive(_) => "LIBRARY_JOB_ALREADY_ACTIVE",
-            Self::Candidate(MetadataCandidateError::Tmdb(_)) => "TMDB_UNAVAILABLE",
             Self::Candidate(MetadataCandidateError::InvalidSearch) => "INVALID_SEARCH",
             Self::Candidate(MetadataCandidateError::ItemNotFound) => "ITEM_NOT_FOUND",
             Self::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => "CANDIDATE_ERROR",

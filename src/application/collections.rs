@@ -4,7 +4,6 @@ use crate::{
     application::{
         metadata_objects::{MetadataObjectError, MetadataObjectSnapshot, MetadataObjectStore},
         scraper::{ScraperError, ScraperGetRequest, ScraperItemType, ScraperResolver},
-        tmdb::TmdbError,
         tmdb_plugin::ScraperProvider,
     },
     storage::{Database, NewCollection, StorageError},
@@ -167,7 +166,6 @@ pub enum CollectionError {
     MovieProviderIdMissing,
     InvalidProviderId,
     NoCollection,
-    Tmdb(TmdbError),
     Scraper(ScraperError),
     Storage(StorageError),
     Metadata(MetadataObjectError),
@@ -179,7 +177,6 @@ impl fmt::Display for CollectionError {
             Self::MovieProviderIdMissing => formatter.write_str("movie has no scraper provider ID"),
             Self::InvalidProviderId => formatter.write_str("scraper provider ID is invalid"),
             Self::NoCollection => formatter.write_str("movie does not belong to a collection"),
-            Self::Tmdb(error) => error.fmt(formatter),
             Self::Scraper(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Metadata(error) => error.fmt(formatter),
@@ -188,12 +185,6 @@ impl fmt::Display for CollectionError {
 }
 
 impl std::error::Error for CollectionError {}
-
-impl From<TmdbError> for CollectionError {
-    fn from(error: TmdbError) -> Self {
-        Self::Tmdb(error)
-    }
-}
 
 impl From<StorageError> for CollectionError {
     fn from(error: StorageError) -> Self {

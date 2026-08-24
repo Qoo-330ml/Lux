@@ -18,7 +18,6 @@ use crate::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
             ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
         },
-        tmdb::TmdbError,
         tmdb_plugin::ScraperProvider,
     },
     storage::{
@@ -991,7 +990,6 @@ pub enum MetadataCandidateError {
     ItemNotFound,
     InvalidSearch,
     InvalidCandidateJson(String),
-    Tmdb(TmdbError),
     Scraper(crate::application::scraper::ScraperError),
     Storage(StorageError),
 }
@@ -1004,7 +1002,6 @@ impl fmt::Display for MetadataCandidateError {
             Self::InvalidCandidateJson(error) => {
                 write!(formatter, "candidate JSON is invalid: {error}")
             }
-            Self::Tmdb(error) => error.fmt(formatter),
             Self::Scraper(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }

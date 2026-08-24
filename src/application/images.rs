@@ -21,7 +21,6 @@ use crate::{
         scraper::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperResolver,
         },
-        tmdb::TmdbError,
         tmdb_plugin::ScraperProvider,
     },
     network::client_builder_from_env_or,
@@ -815,7 +814,6 @@ pub enum ImageCandidateError {
     InvalidImageType(String),
     InvalidLanguage,
     InvalidSource,
-    Tmdb(TmdbError),
     Scraper(ScraperError),
     Storage(StorageError),
 }
@@ -829,7 +827,6 @@ impl fmt::Display for ImageCandidateError {
             Self::InvalidImageType(_) => formatter.write_str("unsupported image type"),
             Self::InvalidLanguage => formatter.write_str("image language is invalid"),
             Self::InvalidSource => formatter.write_str("unsupported image source"),
-            Self::Tmdb(error) => error.fmt(formatter),
             Self::Scraper(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
@@ -837,12 +834,6 @@ impl fmt::Display for ImageCandidateError {
 }
 
 impl std::error::Error for ImageCandidateError {}
-
-impl From<TmdbError> for ImageCandidateError {
-    fn from(error: TmdbError) -> Self {
-        Self::Tmdb(error)
-    }
-}
 
 impl From<StorageError> for ImageCandidateError {
     fn from(error: StorageError) -> Self {

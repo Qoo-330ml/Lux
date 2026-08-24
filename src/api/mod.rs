@@ -88,7 +88,7 @@ use crate::{
             StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
         },
         thumbnails::ThumbnailService,
-        tmdb::{TmdbClient, TmdbError},
+        tmdb::TmdbClient,
         tmdb_plugin::{ScraperProvider, TmdbPluginClient},
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
@@ -12958,8 +12958,7 @@ async fn admin_refresh_collection(
         )
         .into_response(),
         Err(
-            CollectionError::Tmdb(_)
-            | CollectionError::Scraper(_)
+            CollectionError::Scraper(_)
             | CollectionError::Storage(_)
             | CollectionError::Metadata(_),
         ) => api_error(
@@ -17561,13 +17560,6 @@ fn image_candidate_error(headers: &HeaderMap, error: ImageCandidateError) -> Res
             "图片搜索请求无效",
         )
         .into_response(),
-        ImageCandidateError::Tmdb(_) => api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::Internal,
-            "刮削器暂时不可用",
-        )
-        .into_response(),
         ImageCandidateError::Scraper(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -17708,10 +17700,7 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
         MetadataReidentifyError::InvalidItemCount
         | MetadataReidentifyError::InvalidRefreshMode
         | MetadataReidentifyError::InvalidSearch
-        | MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidSearch)
-        | MetadataReidentifyError::Candidate(MetadataCandidateError::Tmdb(
-            TmdbError::InvalidRequest(_),
-        )) => api_error(
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidSearch) => api_error(
             headers,
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
@@ -17757,8 +17746,7 @@ fn metadata_reidentify_error(headers: &HeaderMap, error: MetadataReidentifyError
             )
             .into_response()
         }
-        MetadataReidentifyError::Candidate(MetadataCandidateError::Tmdb(_))
-        | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(_))
+        MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(_))
         | MetadataReidentifyError::Scraper(_)
         | MetadataReidentifyError::Selection(_)
         | MetadataReidentifyError::SelectionUnavailable
@@ -17779,8 +17767,6 @@ enum MetadataCandidateFailureKind {
     ItemNotFound,
     InvalidSearch,
     InvalidCandidateJson,
-    TmdbInvalidRequest,
-    TmdbUnavailable,
     ScraperUnavailable,
     StorageUnavailable,
 }
@@ -17791,8 +17777,6 @@ impl MetadataCandidateFailureKind {
             Self::ItemNotFound => "ITEM_NOT_FOUND",
             Self::InvalidSearch => "INVALID_SEARCH",
             Self::InvalidCandidateJson => "INVALID_CANDIDATE_JSON",
-            Self::TmdbInvalidRequest => "TMDB_INVALID_REQUEST",
-            Self::TmdbUnavailable => "TMDB_UNAVAILABLE",
             Self::ScraperUnavailable => "SCRAPER_UNAVAILABLE",
             Self::StorageUnavailable => "STORAGE_UNAVAILABLE",
         }
@@ -17806,10 +17790,6 @@ fn metadata_candidate_failure_kind(error: &MetadataCandidateError) -> MetadataCa
         MetadataCandidateError::InvalidCandidateJson(_) => {
             MetadataCandidateFailureKind::InvalidCandidateJson
         }
-        MetadataCandidateError::Tmdb(TmdbError::InvalidRequest(_)) => {
-            MetadataCandidateFailureKind::TmdbInvalidRequest
-        }
-        MetadataCandidateError::Tmdb(_) => MetadataCandidateFailureKind::TmdbUnavailable,
         MetadataCandidateError::Scraper(_) => MetadataCandidateFailureKind::ScraperUnavailable,
         MetadataCandidateError::Storage(_) => MetadataCandidateFailureKind::StorageUnavailable,
     }
@@ -17845,20 +17825,6 @@ fn metadata_candidate_error(headers: &HeaderMap, error: MetadataCandidateError) 
             StatusCode::INTERNAL_SERVER_ERROR,
             lux::ApiErrorCode::Internal,
             "候选数据损坏",
-        )
-        .into_response(),
-        MetadataCandidateError::Tmdb(TmdbError::InvalidRequest(_)) => api_error(
-            headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "刮削器搜索条件无效",
-        )
-        .into_response(),
-        MetadataCandidateError::Tmdb(_) => api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "刮削器暂时不可用，请稍后重试",
         )
         .into_response(),
         MetadataCandidateError::Scraper(_) => api_error(
@@ -19881,7 +19847,6 @@ mod tests {
     use crate::application::catalog::{CatalogChapter, CatalogSource, CatalogStream};
     use crate::application::scraper::ScraperError;
     use crate::application::setup::SetupService;
-    use crate::application::tmdb::TmdbError;
     use crate::config::Config;
     use crate::library::LibraryKind;
     use crate::network::RemoteAccessPolicy;
