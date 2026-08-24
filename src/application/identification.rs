@@ -1,6 +1,8 @@
 use crate::application::{
-    scraper::{ScraperGetRequest, ScraperItemType, ScraperSearchRequest, ScraperSearchResult},
-    tmdb::{TmdbError, TmdbMovieSummary},
+    scraper::{
+        ScraperError, ScraperGetRequest, ScraperItemType, ScraperSearchRequest, ScraperSearchResult,
+    },
+    tmdb::TmdbMovieSummary,
     tmdb_plugin::ScraperProvider,
 };
 
@@ -112,31 +114,19 @@ impl MovieIdentifier {
     pub async fn identify(
         &self,
         identity: &MovieIdentity,
-    ) -> Result<IdentificationDecision, TmdbError> {
-        let candidates = if let Some(provider_id) = identity.provider_id {
-            let details = self.client.movie_details(provider_id, "zh-CN").await?;
-            vec![TmdbMovieSummary {
-                id: details.id,
-                title: details.title,
-                original_title: details.original_title,
-                overview: details.overview,
-                release_date: details.release_date,
-                original_language: details.original_language,
-                vote_average: details.vote_average,
-            }]
-        } else {
-            self.client
-                .search_movies_with_english_fallback(&identity.title, identity.year)
-                .await?
-                .results
-        };
-        Ok(identify_movie(identity, &candidates))
+    ) -> Result<IdentificationDecision<ScraperSearchResult>, ScraperError> {
+        self.identify_scraper(&ScraperMovieIdentity {
+            title: identity.title.clone(),
+            year: identity.year,
+            provider_id: identity.provider_id.map(|value| value.to_string()),
+        })
+        .await
     }
 
     pub async fn identify_scraper(
         &self,
         identity: &ScraperMovieIdentity,
-    ) -> Result<IdentificationDecision<ScraperSearchResult>, TmdbError> {
+    ) -> Result<IdentificationDecision<ScraperSearchResult>, ScraperError> {
         let candidates = if let Some(provider_id) = &identity.provider_id {
             let details = self
                 .client
@@ -145,8 +135,7 @@ impl MovieIdentifier {
                     provider_id.clone(),
                     "zh-CN",
                 ))
-                .await
-                .map_err(|error| TmdbError::Transport(error.to_string()))?;
+                .await?;
             vec![ScraperSearchResult {
                 item_type: details.item_type,
                 title: details.title,
@@ -166,8 +155,7 @@ impl MovieIdentifier {
                     identity.year,
                     "zh-CN",
                 ))
-                .await
-                .map_err(|error| TmdbError::Transport(error.to_string()))?
+                .await?
                 .items
         };
         Ok(identify_scraper_movie(identity, &candidates))
