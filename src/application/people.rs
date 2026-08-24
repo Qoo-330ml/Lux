@@ -2733,10 +2733,17 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
-        database
+        let queued = database
             .request_person_index_rebuild_job(library_id, PERSON_INDEX_REBUILD_SCHEMA_VERSION)
             .await
-            .map_err(|error| PeopleError::Storage(error.to_string()))
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        if queued {
+            database
+                .mark_person_manifest_restore_pending(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        }
+        Ok(queued)
     }
 
     pub(crate) async fn cancel_person_index_rebuild(
