@@ -195,7 +195,7 @@ mod tests {
 
     use super::{
         PluginServiceError, ScraperError, ScraperSearchResult, decode_bundle_response,
-        provider_key_from_plugin_id, retryable_scraper_error,
+        provider_id_for_key, provider_key_from_plugin_id, retryable_scraper_error,
     };
     use crate::application::plugin_runtime::PluginRuntimeError;
     use serde_json::json;
@@ -232,6 +232,25 @@ mod tests {
         assert_eq!(provider_key_from_plugin_id("org.lux.imdb"), "imdb");
         assert_eq!(provider_key_from_plugin_id("org.example.douban"), "douban");
         assert_eq!(provider_key_from_plugin_id("tmdb"), "tmdb");
+    }
+
+    #[test]
+    fn selects_the_id_for_the_active_provider_namespace() {
+        let provider_ids = BTreeMap::from([
+            ("Tmdb".to_owned(), "123".to_owned()),
+            ("Imdb".to_owned(), "tt1234567".to_owned()),
+            ("Douban".to_owned(), "douban-456".to_owned()),
+        ]);
+
+        assert_eq!(
+            provider_id_for_key(&provider_ids, "imdb"),
+            Some("tt1234567")
+        );
+        assert_eq!(
+            provider_id_for_key(&provider_ids, "org.example.douban"),
+            Some("douban-456")
+        );
+        assert_eq!(provider_id_for_key(&provider_ids, "tvdb"), None);
     }
 
     #[test]
@@ -315,6 +334,25 @@ pub fn provider_key_from_plugin_id(plugin_id: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase()
+}
+
+pub fn provider_id_for_key<'a>(
+    provider_ids: &'a BTreeMap<String, String>,
+    provider_key: &str,
+) -> Option<&'a str> {
+    let provider_key = provider_key.trim();
+    if provider_key.is_empty() {
+        return None;
+    }
+    let short_provider = provider_key_from_plugin_id(provider_key);
+    provider_ids
+        .iter()
+        .find(|(provider, value)| {
+            !value.trim().is_empty()
+                && (provider.eq_ignore_ascii_case(provider_key)
+                    || provider.eq_ignore_ascii_case(&short_provider))
+        })
+        .map(|(_, value)| value.as_str())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

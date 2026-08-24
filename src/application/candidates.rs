@@ -16,7 +16,7 @@ use crate::{
         people::{ActorCredit, PeopleError},
         scraper::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
-            ScraperSearchResponse, ScraperSearchResult,
+            ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
         },
         tmdb::TmdbError,
         tmdb_plugin::ScraperProvider,
@@ -164,7 +164,7 @@ impl MetadataCandidateService {
             MediaKind::Series => crate::application::scraper::ScraperItemType::Series,
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
-        let direct_provider_id = tmdb_provider_id(&current).filter(|_| {
+        let direct_provider_id = selected_scraper_provider_id(&current, tmdb).filter(|_| {
             let same_title = crate::application::media_matching::normalize_title(query)
                 == crate::application::media_matching::normalize_title(&current.title);
             let same_year =
@@ -178,7 +178,7 @@ impl MetadataCandidateService {
                 .map_err(MetadataCandidateError::Scraper)?;
             let mut provider_ids = details.provider_ids.clone();
             provider_ids
-                .entry("Tmdb".to_owned())
+                .entry(tmdb.provider_key().to_owned())
                 .or_insert_with(|| provider_id.to_owned());
             (
                 ScraperSearchResponse {
@@ -224,7 +224,7 @@ impl MetadataCandidateService {
                 let score = search_result_score(&current, &result);
                 let mut provider_ids = result.provider_ids.clone();
                 provider_ids
-                    .entry("Tmdb".to_owned())
+                    .entry(tmdb.provider_key().to_owned())
                     .or_insert_with(|| provider_id.clone());
                 self.store_candidate(
                     item_id,
@@ -397,7 +397,7 @@ impl MetadataCandidateService {
                 .map(|value| value.provider_ids.clone())
                 .unwrap_or_default();
             provider_ids
-                .entry("Tmdb".to_owned())
+                .entry(tmdb.provider_key().to_owned())
                 .or_insert_with(|| provider_id.clone());
             if let Some(external_ids) = external_ids {
                 provider_ids.extend(external_ids.provider_ids);
@@ -844,28 +844,25 @@ fn selected_metadata_provider_id(metadata: &ScraperMetadata, provider: &str) -> 
         .map(str::to_owned)
 }
 
-fn tmdb_provider_id(current: &StoredMediaMetadata) -> Option<String> {
-    let scraper_id = current.scraper_id.as_deref()?.to_ascii_lowercase();
-    if !scraper_id.contains("tmdb") {
+fn selected_scraper_provider_id(
+    current: &StoredMediaMetadata,
+    scraper: &ScraperProvider,
+) -> Option<String> {
+    let selected_scraper = current.scraper_id.as_deref()?.trim();
+    let scraper_plugin_id = scraper.plugin_id()?;
+    if !selected_scraper.eq_ignore_ascii_case(scraper_plugin_id) {
         return None;
     }
     let raw = current.provider_ids_json.as_deref()?;
-    let Value::Object(provider_ids) = serde_json::from_str(raw).ok()? else {
-        return None;
-    };
-    provider_ids.into_iter().find_map(|(provider, value)| {
-        provider
-            .eq_ignore_ascii_case("tmdb")
-            .then(|| value.as_str().map(str::to_owned))
-            .flatten()
-            .filter(|value| {
-                !value.is_empty()
-                    && value.len() <= 128
-                    && value
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric())
-            })
-    })
+    let provider_ids = serde_json::from_str::<BTreeMap<String, String>>(raw).ok()?;
+    provider_id_for_key(&provider_ids, scraper.provider_key())
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().count() <= 128
+                && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
 }
 
 fn metadata_match_score(

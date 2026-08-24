@@ -45,6 +45,10 @@ impl TmdbPluginClient {
         self.scraper.provider_key()
     }
 
+    pub fn plugin_id(&self) -> &str {
+        self.scraper.plugin_id()
+    }
+
     pub(crate) async fn clear_response_cache(&self) {
         self.scraper.clear_response_cache().await;
     }
@@ -780,6 +784,14 @@ impl From<TmdbClient> for ScraperProvider {
 }
 
 impl ScraperProvider {
+    pub fn plugin_id(&self) -> Option<&str> {
+        match self {
+            Self::Direct(_) => None,
+            Self::Plugin(client) => Some(client.plugin_id()),
+            Self::Generic(client) => Some(client.plugin_id()),
+        }
+    }
+
     pub fn provider_key(&self) -> &str {
         match self {
             Self::Direct(_) => "tmdb",
