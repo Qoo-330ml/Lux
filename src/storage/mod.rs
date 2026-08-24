@@ -3210,6 +3210,7 @@ impl Database {
                   AND pi.provider_id = pc.person_id
                  WHERE mi.library_id IN ({placeholders})
                    AND mi.removed_at IS NULL
+                   {CATALOG_VISIBLE_PREDICATE}
                    AND pc.person_type = ?
                    AND pc.person_name LIKE ? ESCAPE '\\'
                  GROUP BY {person_group}
@@ -3256,6 +3257,7 @@ impl Database {
               AND pi.provider_id = pc.person_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
+               {CATALOG_VISIBLE_PREDICATE}
                AND pc.person_type = ?
                AND pc.person_name LIKE ? ESCAPE '\\'
              GROUP BY {person_group}
@@ -16088,6 +16090,8 @@ fn catalog_filter_where_clause<'a>(
                        OR person_filter.lux_person_id = ?
                        OR identity_filter.person_id = ?
                    )
+                   AND credit_item.removed_at IS NULL
+                   AND credit_item.has_available_source = 1
                    AND (
                        person_filter.item_id = mi.id
                        OR credit_item.series_id = mi.id

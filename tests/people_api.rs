@@ -105,6 +105,14 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
             None,
             Some("2022-01-01"),
         ),
+        (
+            "unavailable-movie",
+            "MOVIE",
+            "无源电影",
+            None,
+            None,
+            Some("2021-01-01"),
+        ),
     ] {
         sqlx::query(
             "INSERT INTO media_items (
@@ -123,6 +131,10 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
         .execute(database.pool())
         .await?;
     }
+    sqlx::query("UPDATE media_items SET has_available_source = 0 WHERE id = ?")
+        .bind("unavailable-movie")
+        .execute(database.pool())
+        .await?;
     PeopleService::new(config.config_dir.clone())
         .with_database(database.clone())
         .persist_item_actors(
@@ -169,6 +181,23 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
                 provider: None,
                 identities: Vec::new(),
                 name: "隐藏演员".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    PeopleService::new(config.config_dir.clone())
+        .with_database(database.clone())
+        .persist_item_actors(
+            "unavailable-movie",
+            "tmdb",
+            &[ActorCredit {
+                id: "100".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "无源演员".to_owned(),
                 character: None,
                 order: Some(0),
                 profile_url: None,
@@ -246,6 +275,26 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
         .await?;
     assert_eq!(denied_search.status(), reqwest::StatusCode::OK);
     assert_eq!(denied_search.json::<Value>().await?["total"], 0);
+
+    let unavailable_search = client
+        .get(format!(
+            "{base_url}/api/v1/people?q=无源演员&page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(unavailable_search.status(), reqwest::StatusCode::OK);
+    assert_eq!(unavailable_search.json::<Value>().await?["total"], 0);
+
+    let unavailable_items = client
+        .get(format!(
+            "{base_url}/api/v1/people/100/items?page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(unavailable_items.status(), reqwest::StatusCode::OK);
+    assert_eq!(unavailable_items.json::<Value>().await?["total"], 0);
 
     server.abort();
     Ok(())
