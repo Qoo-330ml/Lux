@@ -52,6 +52,12 @@ const configuredScraper: AdminPlugin = {
   configSource: "PLUGIN_DEFAULT",
 };
 
+const backupScraper: AdminPlugin = {
+  ...configuredScraper,
+  id: "org.lux.backup",
+  name: "备用元数据插件",
+};
+
 const mediaProbePlugin: AdminPlugin = {
   id: "org.lux.strm-media-info",
   name: "strm媒体信息提取",
@@ -588,6 +594,64 @@ describe("AdminLibrariesPage library cards", () => {
     await act(async () => scraperTrigger?.click());
 
     expect(document.body.textContent).not.toContain("strm媒体信息提取");
+  });
+
+  it("edits ordered scraper roles and keeps the primary role fixed", async () => {
+    vi.mocked(api.adminLibraries).mockResolvedValue({
+      libraries: [{
+        ...library,
+        scrapers: [
+          { scraperId: configuredScraper.id, position: 0, role: "PRIMARY" },
+          { scraperId: backupScraper.id, position: 1, role: "BACKUP" },
+        ],
+      }],
+    });
+    vi.mocked(api.adminPlugins).mockResolvedValue({ plugins: [configuredScraper, backupScraper] });
+    const update = vi.spyOn(api, "updateAdminLibrary").mockResolvedValue({ library });
+    await renderPage();
+
+    await act(async () => container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click());
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .find((button) => button.textContent?.includes("编辑"))?.click());
+
+    expect(container.textContent).toContain("TMDb 元数据插件");
+    expect(container.textContent).toContain("备用元数据插件");
+    const role = container.querySelector<HTMLButtonElement>("[aria-label='刮削器 备用元数据插件 角色']");
+    expect(role).toBeTruthy();
+    await act(async () => role?.click());
+    await act(async () => document.querySelector<HTMLButtonElement>("[data-value='SUPPLEMENT']")?.click());
+    expect(update).toHaveBeenCalledWith("library-1", {
+      scrapers: [
+        { scraperId: configuredScraper.id, role: "PRIMARY" },
+        { scraperId: backupScraper.id, role: "SUPPLEMENT" },
+      ],
+    });
+
+    const moveDown = container.querySelector<HTMLButtonElement>("[aria-label='下移刮削器 TMDb 元数据插件']");
+    expect(moveDown).toBeTruthy();
+    await act(async () => moveDown?.click());
+    expect(update).toHaveBeenLastCalledWith("library-1", {
+      scrapers: [
+        { scraperId: backupScraper.id, role: "PRIMARY" },
+        { scraperId: configuredScraper.id, role: "BACKUP" },
+      ],
+    });
+  });
+
+  it("shows a selected scraper that is no longer available", async () => {
+    vi.mocked(api.adminLibraries).mockResolvedValue({
+      libraries: [{
+        ...library,
+        scrapers: [{ scraperId: "org.lux.removed", position: 0, role: "PRIMARY" }],
+      }],
+    });
+    await renderPage();
+
+    await act(async () => container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click());
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .find((button) => button.textContent?.includes("编辑"))?.click());
+
+    expect(container.textContent).toContain("org.lux.removed（暂不可用）");
   });
 
   it("shows global image and subtitle defaults in the strategy view", async () => {

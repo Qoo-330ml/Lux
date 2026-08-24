@@ -19,11 +19,11 @@ import {
   X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminLibrary, AdminPlugin, ChapterSource, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
+import type { AdminLibrary, AdminLibraryScraper, AdminPlugin, ChapterSource, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
 import { DirectoryPicker } from "./DirectoryPicker";
 
 export function AdminLibrariesPage() {
@@ -38,7 +38,7 @@ export function AdminLibrariesPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
   const [kind, setKind] = useState("MOVIE");
-  const [scraperId, setScraperId] = useState("");
+  const [scrapers, setScrapers] = useState<AdminLibraryScraper[]>([]);
   const [chapterSourceId, setChapterSourceId] = useState("");
   const [createRealtimeMetadataAutoMatch, setCreateRealtimeMetadataAutoMatch] = useState(true);
   const [createRootPath, setCreateRootPath] = useState("");
@@ -92,11 +92,14 @@ export function AdminLibrariesPage() {
     setCreateRootPaths((current) => current.filter((item) => item !== path));
   }
   const create = useMutation({
-      mutationFn: async (values: { name: string; kind: string; scraperId: string | null; chapterSourceId: string | null; rootPaths: string[]; realtimeMetadataAutoMatchEnabled: boolean }) => {
+      mutationFn: async (values: { name: string; kind: string; scrapers: AdminLibraryScraper[]; chapterSourceId: string | null; rootPaths: string[]; realtimeMetadataAutoMatchEnabled: boolean }) => {
+      const scraperInput = values.scrapers.length > 0
+        ? { scrapers: values.scrapers.map(({ scraperId, role }) => ({ scraperId, role })) }
+        : { scraperId: null };
       const response = await api.createAdminLibrary({
         name: values.name,
         kind: values.kind,
-        scraperId: values.scraperId,
+        ...scraperInput,
         ...(values.chapterSourceId ? { chapterSourceId: values.chapterSourceId } : {}),
         realtimeMetadataAutoMatchEnabled: values.realtimeMetadataAutoMatchEnabled,
       });
@@ -112,7 +115,7 @@ export function AdminLibrariesPage() {
     },
     onSuccess: ({ rootErrors }) => {
       setName("");
-      setScraperId("");
+      setScrapers([]);
       setChapterSourceId("");
       setCreateRealtimeMetadataAutoMatch(true);
       setCreateRootPath("");
@@ -129,7 +132,7 @@ export function AdminLibrariesPage() {
   function openCreate() {
     setName("");
     setKind("MOVIE");
-    setScraperId("");
+    setScrapers([]);
     setChapterSourceId("");
     setCreateRealtimeMetadataAutoMatch(true);
     setCreateRootPath("");
@@ -158,7 +161,7 @@ export function AdminLibrariesPage() {
     create.mutate({
       name: name.trim(),
       kind,
-      scraperId: scraperId || null,
+      scrapers,
       chapterSourceId: supportsChapterSource(kind) ? chapterSourceId || null : null,
       rootPaths,
       realtimeMetadataAutoMatchEnabled: createRealtimeMetadataAutoMatch,
@@ -197,7 +200,7 @@ export function AdminLibrariesPage() {
           <form className="lux-admin-form lux-library-dialog-form" onSubmit={submit}>
             <label htmlFor="new-library-name">名称<input id="new-library-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：电影" /></label>
             <label htmlFor="new-library-kind">类型<LuxSelect id="new-library-kind" value={kind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setKind} aria-label="媒体库类型" /></label>
-            <ScraperSelect id="new-library-scraper" value={scraperId} plugins={pluginItems} onChange={setScraperId} />
+            <ScraperListEditor value={scrapers} plugins={pluginItems} onChange={setScrapers} />
             <ChapterSourceSelect id="new-library-chapter-source" kind={kind} value={chapterSourceId} sources={chapterSources.data.sources ?? []} onChange={setChapterSourceId} />
             <label className="lux-admin-toggle"><input type="checkbox" aria-label="新媒体库实时新增资源自动刮削" checked={createRealtimeMetadataAutoMatch} onChange={(event) => setCreateRealtimeMetadataAutoMatch(event.target.checked)} /><span>实时新增资源自动刮削</span></label>
             <p className="lux-library-create-root-help">开启后，实时索引完成会为受影响的新资源提交元数据和图片补全任务。</p>
@@ -350,7 +353,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
   const [rootPath, setRootPath] = useState("");
   const [rootError, setRootError] = useState("");
   const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
-  const [scraperId, setScraperId] = useState(library.scraperId ?? "");
+  const [scrapers, setScrapers] = useState(() => normalizeLibraryScrapers(library));
   const [chapterSourceId, setChapterSourceId] = useState(library.chapterSourceId ?? "");
   const [menuOpen, setMenuOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -394,9 +397,13 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
     setEditOpen(true);
     setEditName(library.name);
     setEditKind(library.kind);
+    setScrapers(normalizeLibraryScrapers(library));
     setChapterSourceId(library.chapterSourceId ?? "");
   };
-  const updateScraper = (value: string) => { setScraperId(value); update.mutate({ values: { scraperId: value || null } }); };
+  const updateScrapers = (value: AdminLibraryScraper[]) => {
+    setScrapers(value);
+    update.mutate({ values: { scrapers: value.map(({ scraperId, role }) => ({ scraperId, role })) } });
+  };
   const updateChapterSource = (value: string) => { setChapterSourceId(value); update.mutate({ values: { chapterSourceId: value || null } }); };
   const saveDetails = (event: FormEvent) => {
     event.preventDefault();
@@ -432,7 +439,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
           <div className="lux-library-dialog-scroll">
             <p className="lux-library-warning">如果更改了元数据或媒体图片下载的设置，只适用于之后添加到媒体库的新内容。要将更改应用于现有项目，您需要手动刷新其元数据。</p>
             <section className="lux-library-dialog-section"><div className="lux-library-dialog-section-heading"><h3>文件夹</h3><button className="lux-library-toolbar-button" type="button" onClick={() => document.getElementById(`library-root-path-${library.id}`)?.focus()}><Plus size={16} /> 添加</button></div>{library.roots.length === 0 ? <p className="lux-admin-muted">尚未配置根路径。</p> : <div className="lux-library-dialog-root-list">{library.roots.map((root) => <div className="lux-library-dialog-root-row" key={root.id}><span title={root.displayPath}>{root.displayPath}</span><button className="lux-library-dialog-icon" type="button" aria-label={`编辑路径 ${root.displayPath}`} disabled><Pencil size={17} /></button><button className="lux-library-dialog-icon" type="button" aria-label={`删除路径 ${root.displayPath}`} onClick={() => removeRoot.mutate(root.id)} disabled={removeRoot.isPending}><MinusCircle size={18} /></button></div>)}</div>}<div className="lux-library-root-form"><input id={`library-root-path-${library.id}`} value={rootPath} onChange={(event) => setRootPath(event.target.value)} placeholder="输入 Docker 内的媒体路径" aria-label={`${library.name} 新根路径`} /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setDirectoryPickerOpen(true)}><Folder size={17} /></button></div>{directoryPickerOpen ? <DirectoryPicker initialPath={rootPath.trim()} isSubmitting={addRoot.isPending} onClose={() => setDirectoryPickerOpen(false)} onSelect={(path) => { setRootPath(path); setRootError(""); addRoot.mutate(path); }} /> : null}{rootError ? <p className="lux-error-copy">{rootError}</p> : null}</section>
-            <form className="lux-library-dialog-section lux-library-settings-form" onSubmit={saveDetails}><h3>媒体库设置</h3><label htmlFor={`library-name-${library.id}`}>媒体库名称<input id={`library-name-${library.id}`} aria-label={`${library.name} 媒体库名称`} value={editName} onChange={(event) => setEditName(event.target.value)} /></label><label htmlFor={`library-kind-${library.id}`}>媒体库类型<LuxSelect id={`library-kind-${library.id}`} value={editKind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setEditKind} aria-label={`${library.name} 媒体库类型`} /></label><label className="lux-admin-toggle"><input type="checkbox" checked={library.isEnabled} onChange={(event) => update.mutate({ values: { isEnabled: event.target.checked } })} /><span>启用媒体库</span></label><label className="lux-admin-toggle"><input type="checkbox" aria-label={`${library.name} 实时新增资源自动刮削`} checked={library.realtimeMetadataAutoMatchEnabled} onChange={(event) => update.mutate({ values: { realtimeMetadataAutoMatchEnabled: event.target.checked } })} /><span>实时新增资源自动刮削</span></label><p className="lux-library-create-root-help">实时索引完成后，仅为本次受影响的媒体条目提交元数据和图片补全任务。</p><ScraperSelect id={`library-scraper-${library.id}`} value={scraperId} plugins={plugins} onChange={updateScraper} /><ChapterSourceSelect id={`library-chapter-source-${library.id}`} kind={editKind} value={chapterSourceId} sources={chapterSources} onChange={updateChapterSource} />{editError ? <p className="lux-error-copy">{editError}</p> : null}<div className="lux-library-dialog-actions"><button className="lux-library-toolbar-button is-primary" type="submit" disabled={update.isPending}><Save size={15} /> 保存修改</button><button className="lux-library-toolbar-button" type="button" onClick={() => setEditOpen(false)}>取消</button></div></form>
+            <form className="lux-library-dialog-section lux-library-settings-form" onSubmit={saveDetails}><h3>媒体库设置</h3><label htmlFor={`library-name-${library.id}`}>媒体库名称<input id={`library-name-${library.id}`} aria-label={`${library.name} 媒体库名称`} value={editName} onChange={(event) => setEditName(event.target.value)} /></label><label htmlFor={`library-kind-${library.id}`}>媒体库类型<LuxSelect id={`library-kind-${library.id}`} value={editKind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setEditKind} aria-label={`${library.name} 媒体库类型`} /></label><label className="lux-admin-toggle"><input type="checkbox" checked={library.isEnabled} onChange={(event) => update.mutate({ values: { isEnabled: event.target.checked } })} /><span>启用媒体库</span></label><label className="lux-admin-toggle"><input type="checkbox" aria-label={`${library.name} 实时新增资源自动刮削`} checked={library.realtimeMetadataAutoMatchEnabled} onChange={(event) => update.mutate({ values: { realtimeMetadataAutoMatchEnabled: event.target.checked } })} /><span>实时新增资源自动刮削</span></label><p className="lux-library-create-root-help">实时索引完成后，仅为本次受影响的媒体条目提交元数据和图片补全任务。</p><ScraperListEditor value={scrapers} plugins={plugins} onChange={updateScrapers} /><ChapterSourceSelect id={`library-chapter-source-${library.id}`} kind={editKind} value={chapterSourceId} sources={chapterSources} onChange={updateChapterSource} />{editError ? <p className="lux-error-copy">{editError}</p> : null}<div className="lux-library-dialog-actions"><button className="lux-library-toolbar-button is-primary" type="submit" disabled={update.isPending}><Save size={15} /> 保存修改</button><button className="lux-library-toolbar-button" type="button" onClick={() => setEditOpen(false)}>取消</button></div></form>
             {globalStrategy ? <LibraryStrategyOverride library={library} globalStrategy={globalStrategy} onSave={(value) => update.mutateAsync({ values: { mediaStrategy: value } })} /> : null}
             <section className="lux-library-dialog-section"><div className="lux-library-dialog-section-heading"><h3>媒体库图像</h3><span>JPEG、PNG、WebP，最大 5 MiB</span></div><div className="lux-library-cover-editor"><div className="lux-library-cover-preview">{library.coverImageUrl ? <img src={library.coverImageUrl} alt="" /> : <Image size={24} aria-hidden="true" />}</div><input ref={coverInputRef} className="lux-visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label={`${library.name} 封面图片`} onChange={selectCover} /><button className="lux-library-toolbar-button" type="button" onClick={() => coverInputRef.current?.click()} disabled={uploadCover.isPending}><Upload size={15} /> {uploadCover.isPending ? "上传中…" : library.coverImageUrl ? "替换封面" : "上传封面"}</button>{coverError ? <p className="lux-error-copy">{coverError}</p> : null}</div></section>
           </div>
@@ -502,6 +509,73 @@ function LibraryActionMenu({ library, onEdit, onRefresh, refreshing, onScan, onR
     { label: "复制", icon: Copy, disabled: true, title: "复制媒体库功能暂未启用" },
   ];
   return <div className="lux-library-action-menu" role="menu" aria-label={`${library.name} 操作`}><div className="lux-library-action-menu-heading">{library.coverImageUrl ? <img src={library.coverImageUrl} alt="" /> : <span><Database size={16} /></span>}<strong>{library.name}</strong></div>{actions.map(({ label, icon: Icon, onClick, disabled, title }, index) => <span key={label}>{index === 6 ? <i className="lux-library-action-divider" aria-hidden="true" /> : null}<button type="button" role="menuitem" onClick={onClick} disabled={disabled} title={title}><Icon size={18} /><span>{label}</span></button></span>)}</div>;
+}
+
+function normalizeLibraryScrapers(library: AdminLibrary): AdminLibraryScraper[] {
+  const configured = library.scrapers?.length
+    ? library.scrapers
+    : library.scraperId
+      ? [{ scraperId: library.scraperId, position: 0, role: "PRIMARY" }]
+      : [];
+  return configured
+    .slice()
+    .sort((left, right) => left.position - right.position)
+    .map((scraper, position) => ({
+      scraperId: scraper.scraperId,
+      position,
+      role: position === 0 ? "PRIMARY" : scraper.role === "PRIMARY" ? "BACKUP" : scraper.role,
+    }));
+}
+
+function ScraperListEditor({ value, plugins, onChange }: { value: AdminLibraryScraper[]; plugins: AdminPlugin[]; onChange: (value: AdminLibraryScraper[]) => void }) {
+  const [dragging, setDragging] = useState<number | null>(null);
+  const selected = new Set(value.map((scraper) => scraper.scraperId));
+  const availablePlugins = plugins.filter((plugin) => plugin.category.trim().toUpperCase() === "SCRAPER");
+  const options = availablePlugins
+    .filter((plugin) => plugin.available && !selected.has(plugin.id))
+    .map((plugin) => ({ value: plugin.id, label: plugin.name }));
+  const reorder = (from: number, to: number) => {
+    if (from === to || from < 0 || to < 0 || from >= value.length || to >= value.length) return;
+    const next = value.slice();
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    onChange(next.map((scraper, position) => ({ ...scraper, position, role: position === 0 ? "PRIMARY" : scraper.role === "PRIMARY" ? "BACKUP" : scraper.role })));
+  };
+  const add = (scraperId: string) => {
+    if (!scraperId || selected.has(scraperId)) return;
+    onChange([...value, { scraperId, position: value.length, role: value.length === 0 ? "PRIMARY" : "BACKUP" }]);
+  };
+  const updateRole = (position: number, role: string) => {
+    if (position === 0) return;
+    onChange(value.map((scraper, index) => index === position ? { ...scraper, role } : scraper));
+  };
+  const pluginName = (scraperId: string) => {
+    const plugin = plugins.find((item) => item.id === scraperId);
+    return plugin ? `${plugin.name}${plugin.available ? "" : "（暂不可用）"}` : `${scraperId}（暂不可用）`;
+  };
+  return <div className="lux-admin-scraper-field lux-admin-scraper-list-field">
+    <span>刮削器顺序</span>
+    <small>首位负责主匹配；后续来源可作为补充、备用或两者兼具。</small>
+    <LuxSelect id="library-scraper-add" value="" options={options} placeholder={value.length ? "添加刮削器" : "选择首个刮削器"} disabled={options.length === 0} onChange={add} aria-label="刮削器" />
+    {value.length > 0 ? <div className="lux-admin-scraper-list" aria-label="已选刮削器列表">
+      {value.map((scraper, index) => <div
+        className="lux-admin-scraper-row"
+        key={scraper.scraperId}
+        draggable
+        onDragStart={() => setDragging(index)}
+        onDragOver={(event: DragEvent<HTMLDivElement>) => event.preventDefault()}
+        onDrop={() => { if (dragging !== null) reorder(dragging, index); setDragging(null); }}
+      >
+        <span className="lux-admin-scraper-position">{index + 1}</span>
+        <span className="lux-admin-scraper-name" title={scraper.scraperId}>{pluginName(scraper.scraperId)}</span>
+        {index === 0 ? <span className="lux-admin-scraper-role">主刮削器</span> : <LuxSelect id={`library-scraper-role-${index}`} value={scraper.role} options={[{ value: "SUPPLEMENT", label: "补充" }, { value: "BACKUP", label: "备用" }, { value: "BOTH", label: "补充 + 备用" }]} onChange={(role) => updateRole(index, role)} aria-label={`刮削器 ${pluginName(scraper.scraperId)} 角色`} />}
+        <button className="lux-library-dialog-icon" type="button" aria-label={`上移刮削器 ${pluginName(scraper.scraperId)}`} disabled={index === 0} onClick={() => reorder(index, index - 1)}>↑</button>
+        <button className="lux-library-dialog-icon" type="button" aria-label={`下移刮削器 ${pluginName(scraper.scraperId)}`} disabled={index === value.length - 1} onClick={() => reorder(index, index + 1)}>↓</button>
+        <button className="lux-library-dialog-icon" type="button" aria-label={`移除刮削器 ${pluginName(scraper.scraperId)}`} onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index).map((item, position) => ({ ...item, position, role: position === 0 ? "PRIMARY" : item.role === "PRIMARY" ? "BACKUP" : item.role })))}>×</button>
+      </div>)}
+    </div> : <p className="lux-admin-muted">未配置在线刮削器。</p>}
+    {value.length > 0 ? <button className="lux-library-dialog-icon lux-admin-scraper-clear" type="button" aria-label="清除刮削器配置" onClick={() => onChange([])}>清除全部刮削器</button> : null}
+  </div>;
 }
 
 function ScraperSelect({ id, value, plugins, onChange }: { id: string; value: string; plugins: AdminPlugin[]; onChange: (value: string) => void }) {

@@ -1626,6 +1626,36 @@ impl Database {
         Ok(value.filter(|value| !value.trim().is_empty()))
     }
 
+    pub(crate) async fn find_item_scrapers(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<StoredLibraryScraper>, StorageError> {
+        self.query(
+            "SELECT ls.scraper_id, ls.position, ls.role
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN library_scrapers ls ON ls.library_id = l.id
+             WHERE mi.id = ? AND mi.removed_at IS NULL
+             ORDER BY ls.position",
+        )
+        .bind(item_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredLibraryScraper {
+                    scraper_id: row.get("scraper_id"),
+                    position: row.get("position"),
+                    role: row.get("role"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) async fn replace_person_credits(
         &self,
@@ -3499,6 +3529,23 @@ impl Database {
             source,
         })?;
 
+        for scraper in library.scrapers {
+            self.query(
+                "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(library.id)
+            .bind(&scraper.scraper_id)
+            .bind(scraper.position)
+            .bind(scraper.role.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+
         let registrations = [
             (
                 "RECONCILIATION_SCAN",
@@ -3640,42 +3687,25 @@ impl Database {
         }))
     }
 
-    pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
+    pub(crate) async fn list_library_scrapers(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredLibraryScraper>, StorageError> {
         self.query(
-            "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
-                    realtime_metadata_auto_match_enabled,
-                    incremental_schedule, reconciliation_schedule, metadata_schedule,
-                    scan_concurrency, probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
-                    cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
-                    media_strategy_json
-             FROM libraries ORDER BY name, id",
+            "SELECT scraper_id, position, role
+             FROM library_scrapers
+             WHERE library_id = ?
+             ORDER BY position",
         )
+        .bind(library_id)
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredLibrary {
-                    id: row.get("id"),
-                    name: row.get("name"),
-                    kind: row.get("kind"),
-                    is_enabled: row.get::<i64, _>("is_enabled") != 0,
-                    realtime_watch_enabled: row.get::<i64, _>("realtime_watch_enabled") != 0,
-                    realtime_metadata_auto_match_enabled: row
-                        .get::<i64, _>("realtime_metadata_auto_match_enabled")
-                        != 0,
-                    incremental_schedule: row.get("incremental_schedule"),
-                    reconciliation_schedule: row.get("reconciliation_schedule"),
-                    metadata_schedule: row.get("metadata_schedule"),
-                    scan_concurrency: row.get("scan_concurrency"),
-                    probe_concurrency: row.get("probe_concurrency"),
-                    last_scan_at: row.get("last_scan_at"),
+                .map(|row| StoredLibraryScraper {
                     scraper_id: row.get("scraper_id"),
-                    chapter_source_id: row.get("chapter_source_id"),
-                    cover_image_path: row.get("cover_image_path"),
-                    cover_image_content_type: row.get("cover_image_content_type"),
-                    cover_image_size: row.get("cover_image_size"),
-                    cover_image_tag: row.get("cover_image_tag"),
-                    media_strategy_json: row.get("media_strategy_json"),
+                    position: row.get("position"),
+                    role: row.get("role"),
                 })
                 .collect()
         })
@@ -3685,25 +3715,28 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_library(
-        &self,
-        id: &str,
-    ) -> Result<Option<StoredLibrary>, StorageError> {
-        self.query(
+    pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
+        let rows = self
+            .query(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     realtime_metadata_auto_match_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
                     media_strategy_json
-             FROM libraries WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| {
-            row.map(|row| StoredLibrary {
-                id: row.get("id"),
+             FROM libraries ORDER BY name, id",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        let mut libraries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.get("id");
+            libraries.push(StoredLibrary {
+                id: id.clone(),
                 name: row.get("name"),
                 kind: row.get("kind"),
                 is_enabled: row.get::<i64, _>("is_enabled") != 0,
@@ -3718,18 +3751,67 @@ impl Database {
                 probe_concurrency: row.get("probe_concurrency"),
                 last_scan_at: row.get("last_scan_at"),
                 scraper_id: row.get("scraper_id"),
+                scrapers: self.list_library_scrapers(&id).await?,
                 chapter_source_id: row.get("chapter_source_id"),
                 cover_image_path: row.get("cover_image_path"),
                 cover_image_content_type: row.get("cover_image_content_type"),
                 cover_image_size: row.get("cover_image_size"),
                 cover_image_tag: row.get("cover_image_tag"),
                 media_strategy_json: row.get("media_strategy_json"),
-            })
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            });
+        }
+        Ok(libraries)
+    }
+
+    pub(crate) async fn find_library(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredLibrary>, StorageError> {
+        let row = self
+            .query(
+            "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
+                    realtime_metadata_auto_match_enabled,
+                    incremental_schedule, reconciliation_schedule, metadata_schedule,
+                    scan_concurrency, probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
+                    cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
+                    media_strategy_json
+             FROM libraries WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let stored_id: String = row.get("id");
+        Ok(Some(StoredLibrary {
+            id: stored_id.clone(),
+            name: row.get("name"),
+            kind: row.get("kind"),
+            is_enabled: row.get::<i64, _>("is_enabled") != 0,
+            realtime_watch_enabled: row.get::<i64, _>("realtime_watch_enabled") != 0,
+            realtime_metadata_auto_match_enabled: row
+                .get::<i64, _>("realtime_metadata_auto_match_enabled")
+                != 0,
+            incremental_schedule: row.get("incremental_schedule"),
+            reconciliation_schedule: row.get("reconciliation_schedule"),
+            metadata_schedule: row.get("metadata_schedule"),
+            scan_concurrency: row.get("scan_concurrency"),
+            probe_concurrency: row.get("probe_concurrency"),
+            last_scan_at: row.get("last_scan_at"),
+            scraper_id: row.get("scraper_id"),
+            scrapers: self.list_library_scrapers(&stored_id).await?,
+            chapter_source_id: row.get("chapter_source_id"),
+            cover_image_path: row.get("cover_image_path"),
+            cover_image_content_type: row.get("cover_image_content_type"),
+            cover_image_size: row.get("cover_image_size"),
+            cover_image_tag: row.get("cover_image_tag"),
+            media_strategy_json: row.get("media_strategy_json"),
+        }))
     }
 
     pub(crate) async fn register_auto_library_cover_task(
@@ -4116,7 +4198,68 @@ impl Database {
                 source,
             })?;
         }
-        if let Some(value) = settings.scraper_id {
+        if let Some(scrapers) = settings.scrapers {
+            self.query("DELETE FROM library_scrapers WHERE library_id = ?")
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for scraper in scrapers {
+                self.query(
+                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(library_id)
+                .bind(&scraper.scraper_id)
+                .bind(scraper.position)
+                .bind(scraper.role.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            let primary_scraper = scrapers.first().map(|scraper| scraper.scraper_id.as_str());
+            self.query(
+                "UPDATE libraries
+                 SET scraper_id = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(primary_scraper)
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        } else if let Some(value) = settings.scraper_id {
+            self.query("DELETE FROM library_scrapers WHERE library_id = ?")
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if let Some(scraper_id) = value {
+                self.query(
+                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                     VALUES (?, ?, 0, 'PRIMARY')",
+                )
+                .bind(library_id)
+                .bind(scraper_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
             self.query(
                 "UPDATE libraries
                  SET scraper_id = ?, updated_at = unixepoch()
@@ -4948,18 +5091,117 @@ impl Database {
     }
 
     pub(crate) async fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let library_ids = self
+            .query_scalar::<String>(
+                "SELECT DISTINCT library_id FROM library_scrapers WHERE scraper_id = ?",
+            )
+            .bind(plugin_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query("DELETE FROM library_scrapers WHERE scraper_id = ?")
+            .bind(plugin_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for library_id in library_ids {
+            let rows = self
+                .query(
+                    "SELECT scraper_id, role FROM library_scrapers
+                     WHERE library_id = ? ORDER BY position, scraper_id",
+                )
+                .bind(&library_id)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query("DELETE FROM library_scrapers WHERE library_id = ?")
+                .bind(&library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for (position, row) in rows.into_iter().enumerate() {
+                let stored_role: String = row.get("role");
+                let role = if position == 0 {
+                    "PRIMARY"
+                } else if stored_role.as_str() == "PRIMARY" {
+                    "BACKUP"
+                } else {
+                    stored_role.as_str()
+                };
+                let position = i64::try_from(position)
+                    .map_err(|_| StorageError::Serialization("刮削器位置超出范围".to_owned()))?;
+                self.query(
+                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(&library_id)
+                .bind(row.get::<String, _>("scraper_id"))
+                .bind(position)
+                .bind(role)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            let primary = self
+                .query_scalar::<String>(
+                    "SELECT scraper_id FROM library_scrapers
+                     WHERE library_id = ? AND position = 0",
+                )
+                .bind(&library_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "UPDATE libraries SET scraper_id = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(primary)
+            .bind(&library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         self.query(
             "UPDATE libraries
-             SET scraper_id = CASE WHEN scraper_id = ? THEN NULL ELSE scraper_id END,
-                 chapter_source_id = CASE WHEN chapter_source_id = ? THEN NULL ELSE chapter_source_id END,
+             SET chapter_source_id = CASE WHEN chapter_source_id = ? THEN NULL ELSE chapter_source_id END,
+                 scraper_id = CASE WHEN scraper_id = ? THEN NULL ELSE scraper_id END,
                  updated_at = unixepoch()
-             WHERE scraper_id = ? OR chapter_source_id = ?",
+             WHERE chapter_source_id = ? OR scraper_id = ?",
         )
         .bind(plugin_id)
         .bind(plugin_id)
         .bind(plugin_id)
         .bind(plugin_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
@@ -4967,9 +5209,15 @@ impl Database {
         })?;
         self.query("DELETE FROM installed_plugins WHERE plugin_id = ?")
             .bind(plugin_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
@@ -9226,11 +9474,13 @@ impl Database {
         self.query(
             "SELECT mi.item_type, mi.title, mi.original_title, mi.overview, mi.production_year,
                     mi.premiere_date, mi.last_air_date, mi.status, mi.original_language, mi.rating,
-                    mi.provider_ids_json, mi.metadata_provenance_json, mi.locked_fields_json,
+                    mi.provider_ids_json, mi.metadata_scraper_id,
+                    mi.metadata_provenance_json, mi.locked_fields_json,
                     mi.series_id, mi.season_number, mi.episode_number,
                     series.title AS series_title,
                     series.production_year AS series_production_year,
                     series.provider_ids_json AS series_provider_ids_json,
+                    series.metadata_scraper_id AS series_metadata_scraper_id,
                     libraries.scraper_id AS scraper_id
              FROM media_items mi
              LEFT JOIN media_items series ON series.id = mi.series_id
@@ -9243,10 +9493,13 @@ impl Database {
         .map(|row| {
             row.map(|row| {
                 let scraper_id = row.get::<Option<String>, _>("scraper_id");
+                let series_scraper_id = row
+                    .get::<Option<String>, _>("series_metadata_scraper_id")
+                    .or_else(|| scraper_id.clone());
                 let series_provider = first_provider_id(
                     row.get("series_provider_ids_json"),
                     None,
-                    scraper_id.as_deref(),
+                    series_scraper_id.as_deref(),
                 );
                 StoredMediaMetadata {
                     item_type: row.get("item_type"),
@@ -9260,6 +9513,7 @@ impl Database {
                     original_language: row.get("original_language"),
                     rating: row.get("rating"),
                     provider_ids_json: row.get("provider_ids_json"),
+                    metadata_scraper_id: row.get("metadata_scraper_id"),
                     scraper_id,
                     provenance_json: row.get("metadata_provenance_json"),
                     locked_fields_json: row.get("locked_fields_json"),
@@ -9333,8 +9587,9 @@ impl Database {
         self.query(
             "SELECT mi.item_type, mi.provider_ids_json,
                     series.provider_ids_json AS series_provider_ids_json,
+                    COALESCE(series.metadata_scraper_id, l.scraper_id) AS series_scraper_id,
                     mi.season_number, mi.episode_number,
-                    l.scraper_id
+                    COALESCE(mi.metadata_scraper_id, l.scraper_id) AS scraper_id
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
              LEFT JOIN media_items series
@@ -9346,10 +9601,12 @@ impl Database {
         .await
         .map(|row| {
             row.map(|row| {
+                let series_scraper_id = row.get::<Option<String>, _>("series_scraper_id");
+                let scraper_id = row.get::<Option<String>, _>("scraper_id");
                 let provider = first_provider_id(
                     row.get("provider_ids_json"),
                     row.get("series_provider_ids_json"),
-                    row.get::<Option<String>, _>("scraper_id").as_deref(),
+                    series_scraper_id.as_deref().or(scraper_id.as_deref()),
                 );
                 StoredImageIdentity {
                     item_type: row.get("item_type"),
@@ -9371,7 +9628,8 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredMovieIdentity>, StorageError> {
         self.query(
-            "SELECT mi.library_id, mi.provider_ids_json, l.scraper_id
+            "SELECT mi.library_id, mi.provider_ids_json,
+                    COALESCE(mi.metadata_scraper_id, l.scraper_id) AS scraper_id
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
              WHERE mi.id = ? AND mi.item_type = 'MOVIE' AND mi.removed_at IS NULL",
@@ -9904,6 +10162,7 @@ impl Database {
                  rating = COALESCE(?, rating),
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  provider_ids_json = ?,
+                 metadata_scraper_id = CASE WHEN ? IS NULL THEN metadata_scraper_id ELSE ? END,
                  identification_status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
                  poster_fallback_required = ?
@@ -9922,6 +10181,8 @@ impl Database {
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.provider_ids_json)
+        .bind(update.metadata_scraper_id)
+        .bind(update.metadata_scraper_id)
         .bind(database_flag(update.keep_pending))
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
@@ -14821,6 +15082,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 identity_key TEXT,
                 rating REAL,
                 rating_source TEXT,
+                metadata_scraper_id TEXT,
                 last_air_date TEXT,
                 status TEXT,
                 original_language TEXT,
@@ -14834,7 +15096,8 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 absolute_number, title, sort_title, original_title, overview, production_year,
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
                 locked_fields_json, identification_status, added_at, removed_at,
-                metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
+                metadata_fingerprint, identity_key, rating, rating_source, metadata_scraper_id,
+                last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
              )
@@ -14843,7 +15106,8 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 absolute_number, title, sort_title, original_title, overview, production_year,
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
                 locked_fields_json, identification_status, added_at, removed_at,
-                metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
+                metadata_fingerprint, identity_key, rating, rating_source, metadata_scraper_id,
+                last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
              FROM media_items",
@@ -15108,12 +15372,20 @@ pub(crate) struct StoredLibrary {
     pub(crate) probe_concurrency: i64,
     pub(crate) last_scan_at: Option<i64>,
     pub(crate) scraper_id: Option<String>,
+    pub(crate) scrapers: Vec<StoredLibraryScraper>,
     pub(crate) chapter_source_id: Option<String>,
     pub(crate) cover_image_path: Option<String>,
     pub(crate) cover_image_content_type: Option<String>,
     pub(crate) cover_image_size: Option<i64>,
     pub(crate) cover_image_tag: Option<String>,
     pub(crate) media_strategy_json: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredLibraryScraper {
+    pub(crate) scraper_id: String,
+    pub(crate) position: i64,
+    pub(crate) role: String,
 }
 
 #[derive(Debug)]
@@ -15694,6 +15966,7 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) original_language: Option<String>,
     pub(crate) rating: Option<f64>,
     pub(crate) provider_ids_json: Option<String>,
+    pub(crate) metadata_scraper_id: Option<String>,
     pub(crate) scraper_id: Option<String>,
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
@@ -16702,6 +16975,7 @@ pub(crate) struct NewLibrary<'a> {
     pub(crate) scan_concurrency: i64,
     pub(crate) probe_concurrency: i64,
     pub(crate) scraper_id: Option<&'a str>,
+    pub(crate) scrapers: &'a [crate::library::LibraryScraper],
     pub(crate) chapter_source_id: Option<&'a str>,
 }
 
@@ -16740,6 +17014,7 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
     pub(crate) rating: Option<f64>,
     pub(crate) rating_source: Option<&'a str>,
     pub(crate) provider_ids_json: &'a str,
+    pub(crate) metadata_scraper_id: Option<&'a str>,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
@@ -16758,6 +17033,7 @@ pub(crate) struct LibrarySettingsUpdate<'a> {
     pub(crate) scan_concurrency: Option<i64>,
     pub(crate) probe_concurrency: Option<i64>,
     pub(crate) scraper_id: Option<Option<&'a str>>,
+    pub(crate) scrapers: Option<&'a [crate::library::LibraryScraper]>,
     pub(crate) chapter_source_id: Option<Option<&'a str>>,
     pub(crate) media_strategy_json: Option<Option<&'a str>>,
 }
@@ -18656,6 +18932,7 @@ mod tests {
             rating: None,
             rating_source: None,
             provider_ids_json: "{}",
+            metadata_scraper_id: None,
             metadata_fingerprint: &[],
             provenance_json: "{}",
             locked_fields_json: "[]",

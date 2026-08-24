@@ -14,6 +14,7 @@ use crate::{
         },
         plugins::{PluginService, PluginServiceError},
     },
+    library::LibraryScraperRole,
     storage::{Database, StorageError},
 };
 
@@ -1018,6 +1019,13 @@ pub struct ScraperResolver {
     plugins: PluginService,
 }
 
+#[derive(Clone)]
+pub struct ResolvedScraper {
+    pub scraper_id: String,
+    pub role: LibraryScraperRole,
+    pub provider: ScraperProvider,
+}
+
 impl ScraperResolver {
     pub fn new(database: Database, plugins: PluginService) -> Self {
         Self { database, plugins }
@@ -1027,18 +1035,62 @@ impl ScraperResolver {
         &self,
         item_id: &str,
     ) -> Result<Option<ScraperPluginClient>, ScraperError> {
-        let Some(scraper_id) = self.database.find_item_scraper_id(item_id).await? else {
+        let Some(scraper) = self.for_item_ordered(item_id).await?.into_iter().next() else {
             return Ok(None);
         };
-        let scraper_id = scraper_id.trim();
-        if scraper_id.is_empty() {
-            return Ok(None);
+        match scraper.provider {
+            ScraperProvider::Generic(client) => Ok(Some(*client)),
+            ScraperProvider::Adapter(_) => Ok(None),
         }
-        self.plugins
-            .scraper_client(scraper_id)
-            .await
-            .map(Some)
-            .map_err(ScraperError::Plugin)
+    }
+
+    pub async fn for_item_ordered(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<ResolvedScraper>, ScraperError> {
+        let configured = self.database.find_item_scrapers(item_id).await?;
+        let mut resolved = Vec::with_capacity(configured.len());
+        let mut first_error = None;
+        for scraper in configured {
+            let role = scraper
+                .role
+                .parse::<LibraryScraperRole>()
+                .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
+            let client = match self.plugins.scraper_client(&scraper.scraper_id).await {
+                Ok(client) => client,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(ScraperError::Plugin(error));
+                    }
+                    continue;
+                }
+            };
+            resolved.push(ResolvedScraper {
+                scraper_id: scraper.scraper_id,
+                role,
+                provider: ScraperProvider::from_scraper(client),
+            });
+        }
+        if resolved.is_empty()
+            && let Some(scraper_id) = self.database.find_item_scraper_id(item_id).await?
+        {
+            let scraper_id = scraper_id.trim();
+            if !scraper_id.is_empty()
+                && let Ok(client) = self.plugins.scraper_client(scraper_id).await
+            {
+                resolved.push(ResolvedScraper {
+                    scraper_id: scraper_id.to_owned(),
+                    role: LibraryScraperRole::Primary,
+                    provider: ScraperProvider::from_scraper(client),
+                });
+            }
+        }
+        if resolved.is_empty()
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
+        Ok(resolved)
     }
 }
 

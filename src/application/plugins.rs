@@ -1428,6 +1428,7 @@ impl PluginService {
                             scan_concurrency: None,
                             probe_concurrency: None,
                             scraper_id: None,
+                            scrapers: None,
                             chapter_source_id: Some(Some(&plugin.manifest.id)),
                             media_strategy_json: None,
                         },

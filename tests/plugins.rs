@@ -266,9 +266,41 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(created.status(), reqwest::StatusCode::CREATED);
     let created_body: Value = created.json().await?;
     assert_eq!(created_body["library"]["scraperId"], "tmdb");
+    assert_eq!(
+        created_body["library"]["scrapers"],
+        json!([{ "scraperId": "tmdb", "position": 0, "role": "PRIMARY" }])
+    );
     let library_id = created_body["library"]["id"]
         .as_str()
         .ok_or("missing library ID")?;
+
+    let role_updated = client
+        .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "scrapers": [{ "scraperId": "tmdb", "role": "PRIMARY" }]
+        }))
+        .send()
+        .await?;
+    assert_eq!(role_updated.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        role_updated.json::<Value>().await?["library"]["scrapers"],
+        json!([{ "scraperId": "tmdb", "position": 0, "role": "PRIMARY" }])
+    );
+
+    let invalid_role = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "name": "Invalid role",
+            "kind": "MOVIE",
+            "scrapers": [{ "scraperId": "tmdb", "role": "BACKUP" }]
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_role.status(), reqwest::StatusCode::BAD_REQUEST);
 
     let cleared = client
         .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))

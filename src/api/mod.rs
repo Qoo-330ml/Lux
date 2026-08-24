@@ -82,6 +82,7 @@ use crate::{
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::{ScraperPluginClient, ScraperProvider, ScraperResolver},
         settings::{read_network_proxy_url_async, write_network_proxy_url},
+        strm_playback::{StrmPlaybackError, StrmPlaybackResolver},
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{
             StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
@@ -99,7 +100,7 @@ use crate::{
         sessions::WebAuthService,
     },
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
-    library::{LibraryKind, LibraryRecord, LibraryRootRecord},
+    library::{LibraryKind, LibraryRecord, LibraryRootRecord, LibraryScraper, LibraryScraperRole},
     network::{
         RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
         redact_proxy_url,
@@ -143,6 +144,7 @@ pub struct AppState {
     metadata_selection: Option<MetadataSelectionService>,
     metadata_writes: Option<MetadataWriteService>,
     downloads: Option<DownloadService>,
+    strm_playback: Option<StrmPlaybackResolver>,
     metadata_reidentify: Option<MetadataReidentifyService>,
     deletion: Option<MediaDeleteService>,
     probe: Option<MediaProbeService>,
@@ -345,6 +347,9 @@ impl AppState {
             metadata_writes: Some(MetadataWriteService::new(database.clone())),
             downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
                 .ok(),
+            // STRM targets can be internal NAS services. This resolver is
+            // deliberately outside the global proxy configuration.
+            strm_playback: StrmPlaybackResolver::new().ok(),
             metadata_reidentify,
             deletion: Some(match webhooks.clone() {
                 Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
@@ -391,6 +396,12 @@ impl AppState {
             ),
         );
         self.with_scraper(tmdb)
+    }
+
+    #[doc(hidden)]
+    pub fn with_strm_playback_resolver(mut self, resolver: StrmPlaybackResolver) -> Self {
+        self.strm_playback = Some(resolver);
+        self
     }
 
     pub fn with_scraper<T>(mut self, scraper: T) -> Self
@@ -6497,19 +6508,18 @@ fn emby_media_source_json_with_resolver_and_chapters(
         })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
-    let direct_stream_url =
-        if source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_resolver_target {
-            Some(format!(
-                "/Videos/{item_id}/{}/stream{stream_suffix}",
-                source.id
-            ))
-        } else if is_remote {
-            // The upstream STRM service may require the media client's User-Agent.
-            // Return the original URL so the client requests it directly.
-            source.external_url.clone()
-        } else {
-            None
-        };
+    let direct_stream_url = if source.source_kind == "LOCAL_FILE"
+        || is_local_strm_target
+        || is_remote
+        || is_resolver_target
+    {
+        Some(format!(
+            "/Videos/{item_id}/{}/stream{stream_suffix}",
+            source.id
+        ))
+    } else {
+        None
+    };
     let is_remote_playback = is_remote || is_resolver_target;
     let is_playable =
         source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_remote_playback;
@@ -10168,7 +10178,22 @@ async fn serve_media_file(
             return StatusCode::NOT_FOUND.into_response();
         };
         match classify_strm_target(&external_url).kind {
-            StrmTargetKind::Url => return redirect_strm_playback(&external_url),
+            StrmTargetKind::Url => {
+                let Some(resolver) = state.strm_playback.as_ref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                let user_agent = headers
+                    .get("user-agent")
+                    .and_then(|value| value.to_str().ok());
+                let location = match resolver.resolve(&external_url, user_agent).await {
+                    Ok(url) => url,
+                    Err(StrmPlaybackError::ClientBuild(_)) => {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+                };
+                return redirect_strm_playback(location.as_str());
+            }
             StrmTargetKind::Path => {
                 let path = match canonical_local_strm_target(
                     &source.root_path,
@@ -11455,7 +11480,15 @@ struct CreateLibraryRequest {
     #[serde(default = "default_realtime_metadata_auto_match_enabled")]
     realtime_metadata_auto_match_enabled: bool,
     scraper_id: Option<String>,
+    scrapers: Option<Vec<LibraryScraperRequest>>,
     chapter_source_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryScraperRequest {
+    scraper_id: String,
+    role: LibraryScraperRole,
 }
 
 fn default_realtime_watch_enabled() -> bool {
@@ -11489,6 +11522,8 @@ struct UpdateLibraryRequest {
     metadata_schedule: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     scraper_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    scrapers: Option<Option<Vec<LibraryScraperRequest>>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     chapter_source_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
@@ -18616,6 +18651,73 @@ async fn validate_scraper_selection(
         .map_err(|error| plugin_error(headers, error).into_response())
 }
 
+fn create_library_scrapers(
+    request: &CreateLibraryRequest,
+) -> Result<Vec<LibraryScraper>, &'static str> {
+    if request.scrapers.is_some() && request.scraper_id.is_some() {
+        return Err("scraperId 和 scrapers 不能同时提交");
+    }
+    if let Some(scrapers) = request.scrapers.as_deref() {
+        return Ok(scrapers
+            .iter()
+            .enumerate()
+            .map(|(position, scraper)| LibraryScraper {
+                scraper_id: scraper.scraper_id.clone(),
+                position: i64::try_from(position).unwrap_or(i64::MAX),
+                role: scraper.role,
+            })
+            .collect());
+    }
+    Ok(request
+        .scraper_id
+        .as_deref()
+        .map(|scraper_id| LibraryScraper {
+            scraper_id: scraper_id.to_owned(),
+            position: 0,
+            role: LibraryScraperRole::Primary,
+        })
+        .into_iter()
+        .collect())
+}
+
+type LibraryScraperUpdate = (Option<Option<String>>, Option<Option<Vec<LibraryScraper>>>);
+
+fn update_library_scrapers(
+    request: &UpdateLibraryRequest,
+) -> Result<LibraryScraperUpdate, &'static str> {
+    if request.scrapers.is_some() && request.scraper_id.is_some() {
+        return Err("scraperId 和 scrapers 不能同时提交");
+    }
+    if let Some(scrapers) = request.scrapers.as_ref() {
+        return Ok((
+            None,
+            Some(scrapers.as_ref().map(|scrapers| {
+                scrapers
+                    .iter()
+                    .enumerate()
+                    .map(|(position, scraper)| LibraryScraper {
+                        scraper_id: scraper.scraper_id.clone(),
+                        position: i64::try_from(position).unwrap_or(i64::MAX),
+                        role: scraper.role,
+                    })
+                    .collect()
+            })),
+        ));
+    }
+    Ok((request.scraper_id.clone(), None))
+}
+
+async fn validate_scraper_selections(
+    headers: &HeaderMap,
+    state: &AppState,
+    scrapers: &[LibraryScraper],
+) -> Result<(), Response> {
+    for scraper in scrapers {
+        validate_scraper_selection(headers, state, Some(&scraper.scraper_id)).await?;
+    }
+    Ok(())
+}
+
 async fn validate_chapter_source_selection(
     headers: &HeaderMap,
     state: &AppState,
@@ -18670,9 +18772,19 @@ async fn admin_create_library(
         )
         .into_response();
     };
-    if let Err(response) =
-        validate_scraper_selection(&headers, &state, request.scraper_id.as_deref()).await
-    {
+    let scrapers = match create_library_scrapers(&request) {
+        Ok(scrapers) => scrapers,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    if let Err(response) = validate_scraper_selections(&headers, &state, &scrapers).await {
         return response;
     }
     let kind = match request.kind.parse::<LibraryKind>() {
@@ -18698,11 +18810,11 @@ async fn admin_create_library(
         return response;
     }
     match libraries
-        .create_library_with_scraper_and_chapter_source(
+        .create_library_with_scrapers_and_chapter_source(
             &request.name,
             kind,
             request.realtime_watch_enabled,
-            request.scraper_id.as_deref(),
+            &scrapers,
             request.chapter_source_id.as_deref(),
             request.realtime_metadata_auto_match_enabled,
         )
@@ -18830,6 +18942,23 @@ async fn admin_update_library(
             }
         }
     };
+    let (scraper_id, scrapers) = match update_library_scrapers(&request) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    if let Some(scrapers) = scrapers.as_ref().and_then(|value| value.as_ref())
+        && let Err(response) = validate_scraper_selections(&headers, &state, scrapers).await
+    {
+        return response;
+    }
     let settings = LibrarySettingsPatch {
         name: request.name,
         kind,
@@ -18838,22 +18967,13 @@ async fn admin_update_library(
         realtime_metadata_auto_match_enabled: request.realtime_metadata_auto_match_enabled,
         reconciliation_schedule: request.reconciliation_schedule,
         metadata_schedule: request.metadata_schedule,
-        scraper_id: request.scraper_id.clone(),
+        scraper_id,
+        scrapers: scrapers.map(|value| value.unwrap_or_default()),
         chapter_source_id,
         media_strategy_json,
         scan_concurrency: request.scan_concurrency,
         probe_concurrency: request.probe_concurrency,
     };
-    if let Some(scraper_id) = request
-        .scraper_id
-        .as_ref()
-        .and_then(|value| value.as_deref())
-    {
-        if let Err(response) = validate_scraper_selection(&headers, &state, Some(scraper_id)).await
-        {
-            return response;
-        }
-    }
     match libraries.update_settings(library_id, settings).await {
         Ok(view) => {
             if let Some(home) = state.home.as_ref() {
@@ -19337,6 +19457,8 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
         | LibraryServiceError::InvalidRootId(_)
         | LibraryServiceError::InvalidKind(_)
         | LibraryServiceError::InvalidScraperId
+        | LibraryServiceError::InvalidScraperRole(_)
+        | LibraryServiceError::InvalidScraperOrder(_)
         | LibraryServiceError::InvalidChapterSourceId
         | LibraryServiceError::InvalidLibraryOrder(_) => (
             StatusCode::BAD_REQUEST,
@@ -19674,6 +19796,11 @@ fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
         "name": library.name,
         "kind": library.kind.as_str(),
         "scraperId": library.scraper_id,
+        "scrapers": library.scrapers.iter().map(|scraper| json!({
+            "scraperId": scraper.scraper_id,
+            "position": scraper.position,
+            "role": scraper.role.as_str(),
+        })).collect::<Vec<_>>(),
         "chapterSourceId": library.chapter_source_id,
         "coverImageUrl": library_cover_url(library),
         "isEnabled": library.is_enabled,
@@ -20208,7 +20335,10 @@ mod tests {
         assert_eq!(body["Size"], 1_234_567);
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(body["SupportsDirectStream"], true);
-        assert_eq!(body["DirectStreamUrl"], "https://example.invalid/media.mkv");
+        assert_eq!(
+            body["DirectStreamUrl"],
+            "/Videos/item-1/source-1/stream.mkv"
+        );
         assert_eq!(body["DefaultAudioStreamIndex"], -1);
         assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);

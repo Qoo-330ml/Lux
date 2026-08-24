@@ -20,7 +20,7 @@ use crate::{
             MetadataCandidateView, MetadataSelectionError, MetadataSelectionMode,
             MetadataSelectionService,
         },
-        scraper::{ScraperError, ScraperProvider, ScraperResolver},
+        scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
         webhooks::{WebhookEventType, WebhookService},
     },
     observability::resources::ResourceMetrics,
@@ -118,6 +118,11 @@ impl MetadataJobOwners {
 struct MetadataJobOwnerGuard {
     job_id: String,
     active: Arc<Mutex<HashSet<String>>>,
+}
+
+enum RefreshItemOutcome {
+    Confirmed(i64),
+    NeedsReview(i64),
 }
 
 impl Drop for MetadataJobOwnerGuard {
@@ -588,14 +593,17 @@ impl MetadataReidentifyService {
                         Ok(true) => Ok(0),
                         Ok(false) => {
                             match self
-                                .provider_for_item_with_requirement(
+                                .providers_for_item(
                                     item_id,
                                     !matches!(mode, MetadataRefreshMode::Reidentify),
                                 )
                                 .await
                             {
-                                Ok(Some(provider)) => {
-                                    self.refresh_item(item_id, &item, mode, &provider).await
+                                Ok(Some(providers)) => {
+                                    self.refresh_with_scraper_roles(
+                                        item_id, &item, mode, &providers,
+                                    )
+                                    .await
                                 }
                                 Ok(None) => Ok(0),
                                 Err(error) => Err(MetadataReidentifyError::Scraper(error)),
@@ -699,23 +707,119 @@ impl MetadataReidentifyService {
         self.admin_events.publish(AdminEventScope::Jobs);
     }
 
-    async fn provider_for_item_with_requirement(
+    async fn providers_for_item(
         &self,
         item_id: &str,
         require_selected_scraper: bool,
-    ) -> Result<Option<ScraperProvider>, ScraperError> {
+    ) -> Result<Option<Vec<ResolvedScraper>>, ScraperError> {
         let Some(resolver) = &self.resolver else {
-            return Ok(Some(self.scraper.clone()));
+            return Ok(Some(vec![ResolvedScraper {
+                scraper_id: self
+                    .scraper
+                    .plugin_id()
+                    .unwrap_or(self.scraper.provider_key())
+                    .to_owned(),
+                role: crate::library::LibraryScraperRole::Primary,
+                provider: self.scraper.clone(),
+            }]));
         };
-        let client = resolver.for_item(item_id).await?;
-        if require_selected_scraper && client.is_none() {
+        let clients = resolver.for_item_ordered(item_id).await?;
+        if require_selected_scraper && clients.is_empty() {
             return Ok(None);
         }
-        Ok(Some(
-            client
-                .map(ScraperProvider::from_scraper)
-                .unwrap_or_else(|| self.scraper.clone()),
-        ))
+        if clients.is_empty() {
+            return Ok(Some(vec![ResolvedScraper {
+                scraper_id: self
+                    .scraper
+                    .plugin_id()
+                    .unwrap_or(self.scraper.provider_key())
+                    .to_owned(),
+                role: crate::library::LibraryScraperRole::Primary,
+                provider: self.scraper.clone(),
+            }]));
+        }
+        Ok(Some(clients))
+    }
+
+    async fn refresh_with_scraper_roles(
+        &self,
+        item_id: &str,
+        item: &crate::storage::StoredMediaMetadata,
+        mode: MetadataRefreshMode,
+        scrapers: &[ResolvedScraper],
+    ) -> Result<i64, MetadataReidentifyError> {
+        let mut candidate_count = 0_i64;
+        let mut selected_scraper_id = None;
+        let mut last_recoverable_error = None;
+        let mut saw_needs_review = false;
+        for scraper in scrapers.iter().filter(|scraper| {
+            matches!(
+                scraper.role,
+                crate::library::LibraryScraperRole::Primary
+                    | crate::library::LibraryScraperRole::Backup
+                    | crate::library::LibraryScraperRole::Both
+            )
+        }) {
+            match self
+                .refresh_item(
+                    item_id,
+                    item,
+                    mode,
+                    &scraper.provider,
+                    Some(scraper.scraper_id.as_str()),
+                    false,
+                )
+                .await
+            {
+                Ok(RefreshItemOutcome::Confirmed(count)) => {
+                    candidate_count = candidate_count.saturating_add(count);
+                    selected_scraper_id = Some(scraper.scraper_id.as_str());
+                    break;
+                }
+                Ok(RefreshItemOutcome::NeedsReview(count)) => {
+                    candidate_count = candidate_count.saturating_add(count);
+                    last_recoverable_error = Some(MetadataReidentifyError::LowConfidence);
+                    saw_needs_review = true;
+                }
+                Err(error) if recoverable_scraper_attempt(&error) => {
+                    last_recoverable_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if selected_scraper_id.is_none() {
+            if saw_needs_review {
+                return Ok(candidate_count);
+            }
+            return Err(last_recoverable_error.unwrap_or(MetadataReidentifyError::LowConfidence));
+        }
+        if !matches!(mode, MetadataRefreshMode::Reidentify) {
+            for scraper in scrapers.iter().filter(|scraper| {
+                matches!(
+                    scraper.role,
+                    crate::library::LibraryScraperRole::Supplement
+                        | crate::library::LibraryScraperRole::Both
+                )
+            }) {
+                match self
+                    .refresh_item(item_id, item, mode, &scraper.provider, None, true)
+                    .await
+                {
+                    Ok(
+                        RefreshItemOutcome::Confirmed(count)
+                        | RefreshItemOutcome::NeedsReview(count),
+                    ) => candidate_count = candidate_count.saturating_add(count),
+                    Err(error) if recoverable_scraper_attempt(&error) => {}
+                    Err(error) => tracing::warn!(
+                        item_id,
+                        scraper_id = %scraper.scraper_id,
+                        %error,
+                        "supplemental scraper attempt failed"
+                    ),
+                }
+            }
+        }
+        Ok(candidate_count)
     }
 
     async fn refresh_item(
@@ -724,7 +828,9 @@ impl MetadataReidentifyService {
         item: &crate::storage::StoredMediaMetadata,
         mode: MetadataRefreshMode,
         provider: &ScraperProvider,
-    ) -> Result<i64, MetadataReidentifyError> {
+        scraper_id: Option<&str>,
+        supplemental: bool,
+    ) -> Result<RefreshItemOutcome, MetadataReidentifyError> {
         let page = self
             .candidates
             .search_and_store_for_automatic_match(
@@ -737,7 +843,9 @@ impl MetadataReidentifyService {
             .await
             .map_err(MetadataReidentifyError::Candidate)?;
         if matches!(mode, MetadataRefreshMode::Reidentify) {
-            return Ok(i64::try_from(page.items.len()).unwrap_or(i64::MAX));
+            return Ok(RefreshItemOutcome::Confirmed(
+                i64::try_from(page.items.len()).unwrap_or(i64::MAX),
+            ));
         }
         let Some(selection) = self.selection.as_ref() else {
             return Err(MetadataReidentifyError::SelectionUnavailable);
@@ -746,18 +854,33 @@ impl MetadataReidentifyService {
             return Err(MetadataReidentifyError::LowConfidence);
         };
         let needs_review = best_automatic_candidate(&page).is_none();
+        if supplemental && needs_review {
+            return Err(MetadataReidentifyError::LowConfidence);
+        }
         let selection_mode = match mode {
             MetadataRefreshMode::FillMissing => MetadataSelectionMode::FillMissing,
             MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
-            MetadataRefreshMode::Reidentify => return Ok(0),
+            MetadataRefreshMode::Reidentify => return Ok(RefreshItemOutcome::Confirmed(0)),
         };
         if needs_review {
             selection
-                .select_for_review(item_id, &candidate.id, selection_mode)
+                .select_for_review_with_scraper(
+                    item_id,
+                    &candidate.id,
+                    selection_mode,
+                    scraper_id,
+                    supplemental,
+                )
                 .await
         } else {
             selection
-                .select(item_id, &candidate.id, selection_mode)
+                .select_with_scraper(
+                    item_id,
+                    &candidate.id,
+                    selection_mode,
+                    scraper_id,
+                    supplemental,
+                )
                 .await
         }
         .map_err(MetadataReidentifyError::Selection)?;
@@ -784,7 +907,12 @@ impl MetadataReidentifyService {
                 "actor metadata enrichment failed"
             ),
         }
-        Ok(i64::try_from(page.items.len()).unwrap_or(i64::MAX))
+        let candidate_count = i64::try_from(page.items.len()).unwrap_or(i64::MAX);
+        Ok(if needs_review {
+            RefreshItemOutcome::NeedsReview(candidate_count)
+        } else {
+            RefreshItemOutcome::Confirmed(candidate_count)
+        })
     }
 
     pub async fn get_job(
@@ -1021,6 +1149,15 @@ fn best_pending_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandi
         .iter()
         .filter(|candidate| candidate.status == "PENDING")
         .max_by(|left, right| left.score.total_cmp(&right.score))
+}
+
+fn recoverable_scraper_attempt(error: &MetadataReidentifyError) -> bool {
+    matches!(
+        error,
+        MetadataReidentifyError::LowConfidence
+            | MetadataReidentifyError::Scraper(_)
+            | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(_))
+    )
 }
 
 fn unix_now() -> i64 {

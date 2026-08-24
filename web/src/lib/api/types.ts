@@ -266,6 +266,7 @@ export type AdminRoot = {
 
 export type AdminLibrary = Library & {
   scraperId?: string | null;
+  scrapers?: AdminLibraryScraper[];
   chapterSourceId?: string | null;
   isEnabled: boolean;
   realtimeWatchEnabled: boolean;
@@ -279,6 +280,14 @@ export type AdminLibrary = Library & {
   probeConcurrency?: number;
   lastScanAt?: string | null;
   roots: AdminRoot[];
+};
+
+export type AdminLibraryScraperRole = "PRIMARY" | "SUPPLEMENT" | "BACKUP" | "BOTH" | string;
+
+export type AdminLibraryScraper = {
+  scraperId: string;
+  position: number;
+  role: AdminLibraryScraperRole;
 };
 
 export type AdminPlugin = {

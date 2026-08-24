@@ -4,9 +4,14 @@ use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
 
 use luxd::{
-    application::libraries::{LibraryService, LibraryServiceError, LibraryWarningCode},
+    application::libraries::{
+        LibraryService, LibraryServiceError, LibrarySettingsPatch, LibraryWarningCode,
+    },
     config::Config,
-    library::{LibraryKind, RootOverlap, classify_root_overlap, inspect_root_path},
+    library::{
+        LibraryKind, LibraryScraper, LibraryScraperRole, RootOverlap, classify_root_overlap,
+        inspect_root_path,
+    },
     storage::Database,
 };
 
@@ -145,6 +150,65 @@ async fn new_libraries_register_safe_default_schedules() -> Result<(), Box<dyn s
     .fetch_one(database.pool())
     .await?;
     assert_eq!(online_metadata, (Some("0 4 * * 0".to_owned()), 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordered_library_scrapers_persist_roles_and_legacy_primary_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let service = LibraryService::new(database.clone());
+    let scrapers = vec![
+        LibraryScraper {
+            scraper_id: "tmdb".to_owned(),
+            position: 0,
+            role: LibraryScraperRole::Primary,
+        },
+        LibraryScraper {
+            scraper_id: "douban".to_owned(),
+            position: 1,
+            role: LibraryScraperRole::Both,
+        },
+    ];
+
+    let library = service
+        .create_library_with_scrapers("Movies", LibraryKind::Movie, false, &scrapers, false)
+        .await?;
+    assert_eq!(library.scraper_id.as_deref(), Some("tmdb"));
+    assert_eq!(library.scrapers, scrapers);
+
+    let updated = service
+        .update_settings(
+            library.id,
+            LibrarySettingsPatch {
+                scrapers: Some(vec![LibraryScraper {
+                    scraper_id: "imdb".to_owned(),
+                    position: 0,
+                    role: LibraryScraperRole::Primary,
+                }]),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(updated.library.scraper_id.as_deref(), Some("imdb"));
+    assert_eq!(updated.library.scrapers.len(), 1);
+    assert_eq!(
+        updated.library.scrapers[0].role,
+        LibraryScraperRole::Primary
+    );
+
+    let stored_scraper: Option<String> = sqlx::query_scalar(
+        "SELECT scraper_id FROM library_scrapers WHERE library_id = ? AND position = 0",
+    )
+    .bind(library.id.to_string())
+    .fetch_optional(database.pool())
+    .await?;
+    assert_eq!(stored_scraper.as_deref(), Some("imdb"));
     Ok(())
 }
 

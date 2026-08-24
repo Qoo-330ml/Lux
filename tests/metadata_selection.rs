@@ -274,6 +274,87 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
 }
 
 #[tokio::test]
+async fn selection_records_the_scraper_that_confirmed_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({ "title": "Backup Match", "productionYear": 2020 }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+    );
+
+    selection
+        .select_with_scraper(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+            Some("org.lux.backup"),
+            false,
+        )
+        .await?;
+
+    let source: Option<String> =
+        sqlx::query_scalar("SELECT metadata_scraper_id FROM media_items WHERE id = ?")
+            .bind(&fixture.item_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(source.as_deref(), Some("org.lux.backup"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn supplemental_selection_preserves_existing_rich_nfo_and_fills_missing_lists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(true).await?;
+    tokio::fs::write(
+        fixture.movie_dir.join("movie.nfo"),
+        "<movie><title>本地标题</title><genre>本地类型</genre></movie>",
+    )
+    .await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Supplement Title",
+            "genres": ["在线类型"],
+            "studios": ["补充制作公司"]
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+    );
+
+    selection
+        .select_with_scraper(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+            Some("org.lux.supplement"),
+            true,
+        )
+        .await?;
+
+    let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<genre>本地类型</genre>"));
+    assert!(!nfo.contains("<genre>在线类型</genre>"));
+    assert!(nfo.contains("<studio>补充制作公司</studio>"));
+    let source: Option<String> =
+        sqlx::query_scalar("SELECT metadata_scraper_id FROM media_items WHERE id = ?")
+            .bind(&fixture.item_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(source, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn batch_confirmation_selects_the_highest_scored_pending_candidate()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;

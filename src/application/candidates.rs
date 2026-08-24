@@ -858,7 +858,11 @@ fn selected_scraper_provider_id(
     current: &StoredMediaMetadata,
     scraper: &ScraperProvider,
 ) -> Option<String> {
-    let selected_scraper = current.scraper_id.as_deref()?.trim();
+    let selected_scraper = current
+        .metadata_scraper_id
+        .as_deref()
+        .or(current.scraper_id.as_deref())?
+        .trim();
     let scraper_matches = match scraper.plugin_id() {
         Some(plugin_id) => selected_scraper.eq_ignore_ascii_case(plugin_id),
         None => selected_scraper.eq_ignore_ascii_case(scraper.provider_key()),
@@ -1260,7 +1264,31 @@ impl MetadataSelectionService {
         candidate_id: &str,
         mode: MetadataSelectionMode,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, false)
+        self.select_internal(item_id, candidate_id, mode, false, None, false)
+            .await
+    }
+
+    pub async fn select_with_scraper(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        mode: MetadataSelectionMode,
+        scraper_id: Option<&str>,
+        supplemental: bool,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        self.select_internal(item_id, candidate_id, mode, false, scraper_id, supplemental)
+            .await
+    }
+
+    pub(crate) async fn select_for_review_with_scraper(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        mode: MetadataSelectionMode,
+        scraper_id: Option<&str>,
+        supplemental: bool,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        self.select_internal(item_id, candidate_id, mode, true, scraper_id, supplemental)
             .await
     }
 
@@ -1270,7 +1298,7 @@ impl MetadataSelectionService {
         candidate_id: &str,
         mode: MetadataSelectionMode,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, true)
+        self.select_internal(item_id, candidate_id, mode, true, None, false)
             .await
     }
 
@@ -1320,6 +1348,8 @@ impl MetadataSelectionService {
         candidate_id: &str,
         mode: MetadataSelectionMode,
         keep_pending: bool,
+        scraper_id: Option<&str>,
+        supplemental: bool,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         let current = self
             .database
@@ -1344,6 +1374,12 @@ impl MetadataSelectionService {
             }
         }
         payload.movie_nfo.actors = payload.actors.clone();
+        if supplemental {
+            let projection = self.nfo.read_item_projection(item_id).await?;
+            merge_supplemental_movie_nfo(&mut payload.movie_nfo, projection.as_ref());
+            preserve_supplemental_scalar_values(&mut payload, &current);
+        }
+        let image_source = scraper_id.unwrap_or(candidate.provider.as_str());
         let image_policy = self.image_selection_policy(item_id).await?;
         let mut state = metadata_state(&current);
         let metadata_candidate = MetadataCandidate {
@@ -1365,7 +1401,7 @@ impl MetadataSelectionService {
                     continue;
                 };
                 if self
-                    .write_selected_image(item_id, image_type, url, &candidate.provider, mode)
+                    .write_selected_image(item_id, image_type, url, image_source, mode)
                     .await?
                     .is_some()
                 {
@@ -1375,7 +1411,7 @@ impl MetadataSelectionService {
         } else {
             if let Some(url) = payload.poster_url.as_deref() {
                 if self
-                    .write_selected_image(item_id, "POSTER", url, &candidate.provider, mode)
+                    .write_selected_image(item_id, "POSTER", url, image_source, mode)
                     .await?
                     .is_some()
                 {
@@ -1384,7 +1420,7 @@ impl MetadataSelectionService {
             }
             if let Some(url) = payload.fanart_url.as_deref() {
                 if self
-                    .write_selected_image(item_id, "FANART", url, &candidate.provider, mode)
+                    .write_selected_image(item_id, "FANART", url, image_source, mode)
                     .await?
                     .is_some()
                 {
@@ -1407,10 +1443,22 @@ impl MetadataSelectionService {
             self.nfo.write_item_nfo(item_id, &state.metadata).await?
         };
         let mut provider_ids = movie_nfo.provider_ids.clone();
-        provider_ids.insert(
-            candidate.provider.to_ascii_lowercase(),
-            candidate.provider_id.clone(),
-        );
+        if supplemental {
+            if !provider_ids
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(&candidate.provider))
+            {
+                provider_ids.insert(
+                    candidate.provider.to_ascii_lowercase(),
+                    candidate.provider_id.clone(),
+                );
+            }
+        } else {
+            provider_ids.insert(
+                candidate.provider.to_ascii_lowercase(),
+                candidate.provider_id.clone(),
+            );
+        }
         let provider_ids_json = serde_json::to_string(&provider_ids)
             .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))?;
         let selected = self
@@ -1429,6 +1477,9 @@ impl MetadataSelectionService {
                 rating: payload.rating,
                 rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
                 provider_ids_json: &provider_ids_json,
+                metadata_scraper_id: (!supplemental && !keep_pending)
+                    .then_some(scraper_id)
+                    .flatten(),
                 metadata_fingerprint: &nfo_report.fingerprint,
                 provenance_json: &state.provenance_json(),
                 locked_fields_json: &state.locked_fields_json(),
@@ -1499,6 +1550,96 @@ impl MetadataSelectionService {
     }
 }
 
+fn merge_supplemental_movie_nfo(
+    candidate: &mut MovieNfoMetadata,
+    existing: Option<&crate::application::nfo::LocalNfoProjection>,
+) {
+    let Some(existing) = existing else {
+        return;
+    };
+    let details = &existing.details;
+    macro_rules! preserve {
+        ($field:ident) => {
+            if candidate.$field.is_none() {
+                candidate.$field = details.$field.clone();
+            }
+        };
+    }
+    preserve!(rating);
+    preserve!(votes);
+    preserve!(tagline);
+    preserve!(premiered);
+    if candidate.releasedate.is_none() {
+        candidate.releasedate = details.release_date.clone();
+    }
+    preserve!(runtime);
+    preserve!(status);
+    preserve!(original_language);
+    preserve!(website);
+    preserve!(set_name);
+    preserve!(set_id);
+    preserve!(certification);
+    if !details.countries.is_empty() {
+        candidate.countries = details.countries.clone();
+    }
+    if !details.genres.is_empty() {
+        candidate.genres = details.genres.clone();
+    }
+    if !details.studios.is_empty() {
+        candidate.studios = details.studios.clone();
+    }
+    if !details.directors.is_empty() {
+        candidate.directors = details
+            .directors
+            .iter()
+            .map(|credit| MovieNfoCredit {
+                provider_id: credit.provider_id.clone(),
+                name: credit.name.clone(),
+            })
+            .collect();
+    }
+    if !details.writers.is_empty() {
+        candidate.writers = details
+            .writers
+            .iter()
+            .map(|credit| MovieNfoCredit {
+                provider_id: credit.provider_id.clone(),
+                name: credit.name.clone(),
+            })
+            .collect();
+    }
+    if !details.trailers.is_empty() {
+        candidate.trailers = details.trailers.clone();
+    }
+    if !existing.actors.is_empty() {
+        candidate.actors = existing.actors.clone();
+    }
+    for (provider, id) in &details.provider_ids {
+        candidate.provider_ids.insert(provider.clone(), id.clone());
+    }
+}
+
+fn preserve_supplemental_scalar_values(
+    candidate: &mut CandidatePayload,
+    current: &StoredMediaMetadata,
+) {
+    if current.premiere_date.is_some() {
+        candidate.premiere_date = None;
+    }
+    if current.last_air_date.is_some() {
+        candidate.end_date = None;
+    }
+    if current.status.is_some() {
+        candidate.status = None;
+    }
+    if current.original_language.is_some() {
+        candidate.original_language = None;
+    }
+    if current.rating.is_some() {
+        candidate.rating = None;
+    }
+}
+
 const MOVIE_FILL_MISSING_FIELDS: &[MetadataField] = &[
     MetadataField::Title,
     MetadataField::OriginalTitle,
@@ -1554,7 +1695,11 @@ fn fill_missing_scalar_values_complete(current: &StoredMediaMetadata) -> bool {
 }
 
 fn has_selected_provider_id(current: &StoredMediaMetadata) -> bool {
-    let Some(scraper) = current.scraper_id.as_deref() else {
+    let Some(scraper) = current
+        .metadata_scraper_id
+        .as_deref()
+        .or(current.scraper_id.as_deref())
+    else {
         return true;
     };
     let Some(raw) = current.provider_ids_json.as_deref() else {
