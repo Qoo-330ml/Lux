@@ -585,6 +585,7 @@ mod tests {
                 category: "UTILITY".to_owned(),
                 version: "1.0.0".to_owned(),
                 runtime: "process".to_owned(),
+                provider_key: None,
                 capabilities: Vec::new(),
                 packages: Vec::new(),
                 package_url: "packages/example.zip".to_owned(),
@@ -632,6 +633,7 @@ mod tests {
             category: "UTILITY".to_owned(),
             version: "1.0.0".to_owned(),
             runtime: "process".to_owned(),
+            provider_key: None,
             capabilities: Vec::new(),
             packages: vec![
                 PluginStorePackage {
