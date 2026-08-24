@@ -72,10 +72,12 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
         .iter()
         .find(|field| field.key == "libraryIds")
         .ok_or("libraryIds field missing")?;
-    assert!(library_field
-        .options
-        .iter()
-        .any(|option| option.value == library.id.to_string()));
+    assert!(
+        library_field
+            .options
+            .iter()
+            .any(|option| option.value == library.id.to_string())
+    );
     assert_eq!(plugin.config_values["libraryIds"], json!([]));
     assert_eq!(plugin.config_values["matchOriginalFilename"], true);
     assert_eq!(
