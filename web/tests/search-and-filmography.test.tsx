@@ -34,7 +34,7 @@ describe("actor search and filmography", () => {
 
   it("shows actor results alongside media results and links to the person page", async () => {
     vi.spyOn(api, "search").mockResolvedValue({
-      items: [{ id: "movie-1", title: "演员甲电影", itemType: "MOVIE" }],
+      items: [{ id: "movie-1", title: "演员甲电影", itemType: "MOVIE", rating: 7.5, ratingSource: "TMDb" }],
       total: 1,
       page: 1,
       pageSize: 24,
@@ -64,14 +64,18 @@ describe("actor search and filmography", () => {
     expect(personLink?.textContent).toContain("演员甲");
     expect(personLink?.getAttribute("href")).toBe("/people/42");
     expect(container?.textContent).toContain("演员甲电影");
+    const mediaResults = container?.querySelector("section[aria-labelledby='media-search-heading']");
+    expect(mediaResults?.querySelector(".lux-rating.is-compact")).not.toBeNull();
+    expect(mediaResults?.querySelector(".lux-rating-source")).toBeNull();
+    expect(mediaResults?.querySelector(".lux-rating svg")).toBeNull();
   });
 
   it("loads and displays the actor's accessible movie and series works", async () => {
     vi.spyOn(api, "person").mockResolvedValue({ id: "42", name: "演员甲" });
     vi.spyOn(api, "personItems").mockResolvedValue({
       items: [
-        { id: "movie-1", title: "演员甲电影", itemType: "MOVIE" },
-        { id: "series-1", title: "演员甲剧集", itemType: "SERIES" },
+        { id: "movie-1", title: "演员甲电影", itemType: "MOVIE", rating: 7.5, ratingSource: "TMDb" },
+        { id: "series-1", title: "演员甲剧集", itemType: "SERIES", rating: 8.2, ratingSource: "TMDb" },
       ],
       total: 2,
       page: 1,
@@ -95,6 +99,9 @@ describe("actor search and filmography", () => {
     expect(container?.querySelector(".lux-person-works")?.textContent).toContain("参演作品");
     expect(container?.textContent).toContain("演员甲电影");
     expect(container?.textContent).toContain("演员甲剧集");
+    expect(container?.querySelectorAll(".lux-person-works .lux-rating.is-compact")).toHaveLength(2);
+    expect(container?.querySelectorAll(".lux-person-works .lux-rating-source")).toHaveLength(0);
+    expect(container?.querySelectorAll(".lux-person-works .lux-rating svg")).toHaveLength(0);
     expect(api.personItems).toHaveBeenCalledWith("42", 1);
   });
 

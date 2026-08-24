@@ -38,7 +38,7 @@ describe("MediaDetailPage series hierarchy", () => {
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
       items: options?.itemType === "SEASON"
-        ? [{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8, imageTags: { poster: "season-poster" } }]
+        ? [{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8, rating: 7.1, ratingSource: "TMDb", imageTags: { poster: "season-poster" } }]
         : [{ id: "episode-1", title: "第一集", itemType: "EPISODE" }],
       total: 1,
       page: 1,
@@ -73,6 +73,9 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-season-rail")?.textContent).toContain("第一季");
     expect(container.querySelector(".lux-season-card img")?.getAttribute("src"))
       .toBe("/api/v1/items/season-1/images/poster?tag=season-poster");
+    expect(container.querySelector(".lux-season-card .lux-rating.is-compact")).not.toBeNull();
+    expect(container.querySelector(".lux-season-card .lux-rating-source")).toBeNull();
+    expect(container.querySelector(".lux-season-card .lux-rating svg")).toBeNull();
     expect(container.querySelector(".lux-season-card .lux-media-episode-count")?.textContent).toBe("8 集");
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.item("series-1") })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.mediaSurface);

@@ -49,7 +49,7 @@ export function SearchPage() {
       {result.data?.items?.length ? (
         <section className="lux-search-results-section" aria-labelledby="media-search-heading">
           <div className="lux-section-heading"><h2 id="media-search-heading">媒体</h2><span>{result.data.total ?? result.data.items.length} 项</span></div>
-          <div className="lux-poster-grid">{result.data.items.map((item) => <MediaCard item={item} key={item.id} />)}</div>
+          <div className="lux-poster-grid">{result.data.items.map((item) => <MediaCard item={item} compactRating key={item.id} />)}</div>
         </section>
       ) : null}
       {!result.isPending && !people.isPending && initial && !result.data?.items?.length && !people.data?.items?.length && !result.error && !people.error ? <div className="lux-empty-card"><span>没有找到匹配内容。</span></div> : null}
