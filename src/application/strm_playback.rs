@@ -1,11 +1,11 @@
 use std::{fmt, net::IpAddr, time::Duration};
 
 use reqwest::{
-    Client, Url,
+    Client, ClientBuilder, Proxy, Url,
     header::{LOCATION, RANGE},
 };
 
-use crate::network::{NetworkProxyError, client_builder_from_env_or};
+use crate::network::{NetworkProxyError, normalize_proxy_url};
 
 const MAX_REDIRECTS: usize = 8;
 const MAX_URL_CHARS: usize = 8 * 1024;
@@ -54,9 +54,21 @@ pub struct StrmPlaybackResolver {
 }
 
 impl StrmPlaybackResolver {
-    pub fn new(proxy_url: Option<String>) -> Result<Self, StrmPlaybackError> {
-        let client = client_builder_from_env_or(proxy_url.as_deref())
-            .map_err(StrmPlaybackError::ProxyConfiguration)?
+    pub fn new() -> Result<Self, StrmPlaybackError> {
+        Self::from_builder(Client::builder().no_proxy())
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_proxy_for_tests(proxy_url: String) -> Result<Self, StrmPlaybackError> {
+        let proxy_url =
+            normalize_proxy_url(&proxy_url).map_err(StrmPlaybackError::ProxyConfiguration)?;
+        let proxy = Proxy::all(proxy_url)
+            .map_err(|_| StrmPlaybackError::ProxyConfiguration(NetworkProxyError::InvalidUrl))?;
+        Self::from_builder(Client::builder().proxy(proxy))
+    }
+
+    fn from_builder(builder: ClientBuilder) -> Result<Self, StrmPlaybackError> {
+        let client = builder
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))

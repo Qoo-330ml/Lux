@@ -1,6 +1,9 @@
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    application::{
+        libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
+        strm_playback::StrmPlaybackResolver,
+    },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
@@ -122,14 +125,12 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
             .await?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready_with_proxy(
-        config,
-        database.clone(),
-        setup,
-        auth,
-        emby_auth,
-        Some(format!("http://{proxy_address}")),
-    ));
+    let app = app_with_state(
+        AppState::ready(config, database.clone(), setup, auth, emby_auth)
+            .with_strm_playback_resolver(StrmPlaybackResolver::new_with_proxy_for_tests(format!(
+                "http://{proxy_address}"
+            ))?),
+    );
     let proxy_server = tokio::spawn(async move {
         for _ in 0..3 {
             respond_once(

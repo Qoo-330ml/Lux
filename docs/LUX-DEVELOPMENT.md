@@ -289,7 +289,7 @@ Lux 的核心价值不是功能数量，而是：
 - Lux 不实现公网穿透、UPnP 端口映射或自带证书签发。
 - 外网通过 Tailscale、反向代理或用户域名接入。
 - 网络代理设置是全局出站配置，支持 HTTP、HTTPS、SOCKS4、SOCKS4a、SOCKS5 和 SOCKS5h；可通过代理 URL 携带认证信息。
-- 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 Lux 发出的网络请求，包括 `.strm` 下载的上游请求，但不代理播放时由客户端直连的 `.strm` 地址和入站反向代理。
+- 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求，但不进入 URL 型 `.strm` 播放解析器。STRM resolver 始终直连已登记的 HTTP(S) 目标；播放时也不代理客户端最终读取的媒体字节和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
 - 远程访问权限由用户策略控制。
 - Lux 会优先使用 X-Forwarded-For、X-Forwarded-Proto 等反代请求头；远程访问权限不再依据来源 IP 判断。
@@ -2527,7 +2527,7 @@ services:
 验收：
 
 - 读取首个非空行并处理 BOM。
-- URL 型目标的播放和 PlaybackInfo 不校验、不请求、不代理；下载端点的远程请求按 LUX-091 单独执行。
+- URL 型 `PlaybackInfo` 不访问目标；视频播放入口由独立的 STRM resolver 校验并请求 HTTP(S) 目标，且不使用全局出站代理。下载端点的远程请求按 LUX-091 单独执行。
 - URL 不进入日志。
 
 验证：http、https、含查询令牌和空文件 fixtures。
@@ -3631,7 +3631,7 @@ HTTP(S) 目标，有限跟随并校验重定向，遇到 200/206 媒体响应后
 
 - [x] SQLite 和 PostgreSQL 空数据库迁移成功，旧数据库可增加可空 `strm_target_kind` 字段。
 - [x] 电影、剧集和未解析 `.strm` 扫描均保存首个非空目标及其分类；重扫会更新分类和目标。
-- [x] URL 型 `PlaybackInfo`/视频请求保持现有兼容行为；本地路径通过受保护的视频入口读取实际
+- [x] URL 型 `PlaybackInfo`/视频请求保持现有兼容行为；STRM resolver 不使用全局网络代理，本地路径通过受保护的视频入口读取实际
       文件，SMB/FTP 仅在解析器成功后播放，其他目标不伪造直链，也不会把 `.strm` 文件当作媒体返回。
 - [x] 后台 STRM 探测继续使用原始目标；仅 HTTP/HTTPS、本地路径、SMB 和 FTP 进入探测。扫描和
       `PlaybackInfo` 不因分类发起网络访问；URL 型视频请求按播放契约解析 HTTP(S) 响应。

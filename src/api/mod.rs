@@ -343,7 +343,10 @@ impl AppState {
             metadata_writes: Some(MetadataWriteService::new(database.clone())),
             downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
                 .ok(),
-            strm_playback: StrmPlaybackResolver::new(network_proxy_url.clone()).ok(),
+            // STRM targets may be internal NAS services. Keep their resolver
+            // outside the global proxy scope so internal URLs are requested
+            // directly from the Lux host.
+            strm_playback: StrmPlaybackResolver::new().ok(),
             metadata_reidentify,
             deletion: Some(match webhooks.clone() {
                 Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
@@ -430,6 +433,12 @@ impl AppState {
             );
             self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
         }
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_strm_playback_resolver(mut self, resolver: StrmPlaybackResolver) -> Self {
+        self.strm_playback = Some(resolver);
         self
     }
 

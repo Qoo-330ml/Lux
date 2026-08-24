@@ -107,6 +107,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - SenPlayer 列表兼容修复：当请求的 `Fields` 未包含 `MediaSources` 或 `MediaStreams` 时，Emby 列表响应不再携带这些字段；详情和 `PlaybackInfo` 仍返回完整媒体源。自动化回归已覆盖，真实客户端需要清理缓存或重新进入库后复测。
 - 2026-08-17 SenPlayer `.strm` 直放地址编码修复：HTTP(S) 目标包含 Unicode 路径或查询参数时，Emby 视频端点现在先将 URL 规范化为合法的百分号编码 `Location`，再返回原有 307 直连；数据库仍保留原始目标，不代理媒体字节。新增 API 单测和 `.strm` 集成回归，真实 SenPlayer UI 需重新部署后复测。
 - 2026-08-24 STRM 服务端解析修复：HTTP(S) `.strm` 的 `PlaybackInfo.MediaSources[].DirectStreamUrl` 现在指向 Lux 受保护的视频入口；Lux 在 NAS 内部请求原始目标、有限跟随重定向并校验 `Location`，然后以 307 返回最终地址。该行为不写死 `/strm/api/302` 或端口，允许登记的内网 HTTP(S) 目标，且不代理媒体字节；已由 `tests/strm.rs` 和 `tests/strm_playback.rs` 覆盖，真实 VidHub/SenPlayer 播放需部署后复测。
+- 2026-08-24 STRM 代理隔离修复：全局 `networkProxyUrl` 不再作用于 Lux 的 URL 型 `.strm` resolver，避免内网 STRM 请求被外部代理返回 403；TMDb、插件、图片和下载等其他出站能力继续使用全局代理。需重新部署 Lux 后生效。
 - Emby `GET /Items` 对标准 ItemId 仍按逗号分隔的 `Ids` 严格过滤；不存在的 ItemId 或 UUID 返回空 `Items` 和 `TotalRecordCount: 0`。针对 Redia 的兼容兜底见下一条。
 - Redia 兼容兜底：`GET /Items?Ids=<MediaSourceId>` 在没有同名 ItemId 时会解析到该媒体源所属条目；未知 ID 仍返回空结果，不会回退到媒体库第一条。`/Videos/{ItemId}/original.strm`（含 `/emby` 和大小写路径变体）复用 Emby 播放逻辑并对 STRM 返回 307 直连；其他未注册 `/Videos/...` 路径返回 404，不再落入 Web 前端 fallback 返回 HTML。标准客户端仍应使用 ItemId 和 `/Items/{ItemId}/PlaybackInfo`。
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
