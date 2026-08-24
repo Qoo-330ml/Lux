@@ -82,6 +82,7 @@ use crate::{
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::{ScraperPluginClient, ScraperProvider, ScraperResolver},
         settings::{read_network_proxy_url_async, write_network_proxy_url},
+        strm_playback::{StrmPlaybackError, StrmPlaybackResolver},
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{
             StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
@@ -143,6 +144,7 @@ pub struct AppState {
     metadata_selection: Option<MetadataSelectionService>,
     metadata_writes: Option<MetadataWriteService>,
     downloads: Option<DownloadService>,
+    strm_playback: Option<StrmPlaybackResolver>,
     metadata_reidentify: Option<MetadataReidentifyService>,
     deletion: Option<MediaDeleteService>,
     probe: Option<MediaProbeService>,
@@ -345,6 +347,9 @@ impl AppState {
             metadata_writes: Some(MetadataWriteService::new(database.clone())),
             downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
                 .ok(),
+            // STRM targets can be internal NAS services. This resolver is
+            // deliberately outside the global proxy configuration.
+            strm_playback: StrmPlaybackResolver::new().ok(),
             metadata_reidentify,
             deletion: Some(match webhooks.clone() {
                 Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
@@ -391,6 +396,12 @@ impl AppState {
             ),
         );
         self.with_scraper(tmdb)
+    }
+
+    #[doc(hidden)]
+    pub fn with_strm_playback_resolver(mut self, resolver: StrmPlaybackResolver) -> Self {
+        self.strm_playback = Some(resolver);
+        self
     }
 
     pub fn with_scraper<T>(mut self, scraper: T) -> Self
@@ -6498,15 +6509,15 @@ fn emby_media_source_json_with_resolver_and_chapters(
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
     let direct_stream_url =
-        if source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_resolver_target {
+        if source.source_kind == "LOCAL_FILE"
+            || is_local_strm_target
+            || is_remote
+            || is_resolver_target
+        {
             Some(format!(
                 "/Videos/{item_id}/{}/stream{stream_suffix}",
                 source.id
             ))
-        } else if is_remote {
-            // The upstream STRM service may require the media client's User-Agent.
-            // Return the original URL so the client requests it directly.
-            source.external_url.clone()
         } else {
             None
         };
@@ -10168,7 +10179,20 @@ async fn serve_media_file(
             return StatusCode::NOT_FOUND.into_response();
         };
         match classify_strm_target(&external_url).kind {
-            StrmTargetKind::Url => return redirect_strm_playback(&external_url),
+            StrmTargetKind::Url => {
+                let Some(resolver) = state.strm_playback.as_ref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                let user_agent = headers.get("user-agent").and_then(|value| value.to_str().ok());
+                let location = match resolver.resolve(&external_url, user_agent).await {
+                    Ok(url) => url,
+                    Err(StrmPlaybackError::ClientBuild(_)) => {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+                };
+                return redirect_strm_playback(location.as_str());
+            }
             StrmTargetKind::Path => {
                 let path = match canonical_local_strm_target(
                     &source.root_path,
@@ -18655,9 +18679,11 @@ fn create_library_scrapers(
         .collect())
 }
 
+type LibraryScraperUpdate = (Option<Option<String>>, Option<Option<Vec<LibraryScraper>>>);
+
 fn update_library_scrapers(
     request: &UpdateLibraryRequest,
-) -> Result<(Option<Option<String>>, Option<Option<Vec<LibraryScraper>>>), &'static str> {
+) -> Result<LibraryScraperUpdate, &'static str> {
     if request.scrapers.is_some() && request.scraper_id.is_some() {
         return Err("scraperId 和 scrapers 不能同时提交");
     }

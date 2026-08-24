@@ -136,7 +136,7 @@ impl LibraryService {
                 id: &id.to_string(),
                 name,
                 kind: kind.as_str(),
-                scraper_id: scraper_id.as_deref(),
+                scraper_id,
                 scrapers: &scrapers,
                 realtime_watch_enabled: true,
                 realtime_metadata_auto_match_enabled,
