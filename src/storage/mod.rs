@@ -9474,11 +9474,13 @@ impl Database {
         self.query(
             "SELECT mi.item_type, mi.title, mi.original_title, mi.overview, mi.production_year,
                     mi.premiere_date, mi.last_air_date, mi.status, mi.original_language, mi.rating,
-                    mi.provider_ids_json, mi.metadata_provenance_json, mi.locked_fields_json,
+                    mi.provider_ids_json, mi.metadata_scraper_id,
+                    mi.metadata_provenance_json, mi.locked_fields_json,
                     mi.series_id, mi.season_number, mi.episode_number,
                     series.title AS series_title,
                     series.production_year AS series_production_year,
                     series.provider_ids_json AS series_provider_ids_json,
+                    series.metadata_scraper_id AS series_metadata_scraper_id,
                     libraries.scraper_id AS scraper_id
              FROM media_items mi
              LEFT JOIN media_items series ON series.id = mi.series_id
@@ -9491,10 +9493,13 @@ impl Database {
         .map(|row| {
             row.map(|row| {
                 let scraper_id = row.get::<Option<String>, _>("scraper_id");
+                let series_scraper_id = row
+                    .get::<Option<String>, _>("series_metadata_scraper_id")
+                    .or_else(|| scraper_id.clone());
                 let series_provider = first_provider_id(
                     row.get("series_provider_ids_json"),
                     None,
-                    scraper_id.as_deref(),
+                    series_scraper_id.as_deref(),
                 );
                 StoredMediaMetadata {
                     item_type: row.get("item_type"),
@@ -9508,6 +9513,7 @@ impl Database {
                     original_language: row.get("original_language"),
                     rating: row.get("rating"),
                     provider_ids_json: row.get("provider_ids_json"),
+                    metadata_scraper_id: row.get("metadata_scraper_id"),
                     scraper_id,
                     provenance_json: row.get("metadata_provenance_json"),
                     locked_fields_json: row.get("locked_fields_json"),
@@ -9581,8 +9587,9 @@ impl Database {
         self.query(
             "SELECT mi.item_type, mi.provider_ids_json,
                     series.provider_ids_json AS series_provider_ids_json,
+                    COALESCE(series.metadata_scraper_id, l.scraper_id) AS series_scraper_id,
                     mi.season_number, mi.episode_number,
-                    l.scraper_id
+                    COALESCE(mi.metadata_scraper_id, l.scraper_id) AS scraper_id
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
              LEFT JOIN media_items series
@@ -9594,10 +9601,12 @@ impl Database {
         .await
         .map(|row| {
             row.map(|row| {
+                let series_scraper_id = row.get::<Option<String>, _>("series_scraper_id");
+                let scraper_id = row.get::<Option<String>, _>("scraper_id");
                 let provider = first_provider_id(
                     row.get("provider_ids_json"),
                     row.get("series_provider_ids_json"),
-                    row.get::<Option<String>, _>("scraper_id").as_deref(),
+                    series_scraper_id.as_deref().or(scraper_id.as_deref()),
                 );
                 StoredImageIdentity {
                     item_type: row.get("item_type"),
@@ -9619,7 +9628,8 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredMovieIdentity>, StorageError> {
         self.query(
-            "SELECT mi.library_id, mi.provider_ids_json, l.scraper_id
+            "SELECT mi.library_id, mi.provider_ids_json,
+                    COALESCE(mi.metadata_scraper_id, l.scraper_id) AS scraper_id
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
              WHERE mi.id = ? AND mi.item_type = 'MOVIE' AND mi.removed_at IS NULL",
@@ -10152,6 +10162,7 @@ impl Database {
                  rating = COALESCE(?, rating),
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  provider_ids_json = ?,
+                 metadata_scraper_id = CASE WHEN ? IS NULL THEN metadata_scraper_id ELSE ? END,
                  identification_status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
                  poster_fallback_required = ?
@@ -10170,6 +10181,8 @@ impl Database {
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.provider_ids_json)
+        .bind(update.metadata_scraper_id)
+        .bind(update.metadata_scraper_id)
         .bind(database_flag(update.keep_pending))
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
@@ -15069,6 +15082,7 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 identity_key TEXT,
                 rating REAL,
                 rating_source TEXT,
+                metadata_scraper_id TEXT,
                 last_air_date TEXT,
                 status TEXT,
                 original_language TEXT,
@@ -15082,7 +15096,8 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 absolute_number, title, sort_title, original_title, overview, production_year,
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
                 locked_fields_json, identification_status, added_at, removed_at,
-                metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
+                metadata_fingerprint, identity_key, rating, rating_source, metadata_scraper_id,
+                last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
              )
@@ -15091,7 +15106,8 @@ async fn remove_sqlite_title_year_unique(pool: &AnyPool, path: &Path) -> Result<
                 absolute_number, title, sort_title, original_title, overview, production_year,
                 premiere_date, runtime_ticks, provider_ids_json, metadata_provenance_json,
                 locked_fields_json, identification_status, added_at, removed_at,
-                metadata_fingerprint, identity_key, rating, rating_source, last_air_date, status,
+                metadata_fingerprint, identity_key, rating, rating_source, metadata_scraper_id,
+                last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
                 nfo_metadata_json, nfo_metadata_fingerprint
              FROM media_items",
@@ -15950,6 +15966,7 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) original_language: Option<String>,
     pub(crate) rating: Option<f64>,
     pub(crate) provider_ids_json: Option<String>,
+    pub(crate) metadata_scraper_id: Option<String>,
     pub(crate) scraper_id: Option<String>,
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
@@ -16997,6 +17014,7 @@ pub(crate) struct SelectedMetadataUpdate<'a> {
     pub(crate) rating: Option<f64>,
     pub(crate) rating_source: Option<&'a str>,
     pub(crate) provider_ids_json: &'a str,
+    pub(crate) metadata_scraper_id: Option<&'a str>,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
@@ -18914,6 +18932,7 @@ mod tests {
             rating: None,
             rating_source: None,
             provider_ids_json: "{}",
+            metadata_scraper_id: None,
             metadata_fingerprint: &[],
             provenance_json: "{}",
             locked_fields_json: "[]",

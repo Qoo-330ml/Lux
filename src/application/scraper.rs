@@ -1050,13 +1050,20 @@ impl ScraperResolver {
     ) -> Result<Vec<ResolvedScraper>, ScraperError> {
         let configured = self.database.find_item_scrapers(item_id).await?;
         let mut resolved = Vec::with_capacity(configured.len());
+        let mut first_error = None;
         for scraper in configured {
             let role = scraper
                 .role
                 .parse::<LibraryScraperRole>()
                 .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
-            let Ok(client) = self.plugins.scraper_client(&scraper.scraper_id).await else {
-                continue;
+            let client = match self.plugins.scraper_client(&scraper.scraper_id).await {
+                Ok(client) => client,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(ScraperError::Plugin(error));
+                    }
+                    continue;
+                }
             };
             resolved.push(ResolvedScraper {
                 scraper_id: scraper.scraper_id,
@@ -1077,6 +1084,11 @@ impl ScraperResolver {
                     provider: ScraperProvider::from_scraper(client),
                 });
             }
+        }
+        if resolved.is_empty()
+            && let Some(error) = first_error
+        {
+            return Err(error);
         }
         Ok(resolved)
     }

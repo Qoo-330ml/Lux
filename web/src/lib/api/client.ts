@@ -711,6 +711,7 @@ export class LuxApiClient {
     name: string;
     kind: string;
     scraperId?: string | null;
+    scrapers?: Array<{ scraperId: string; role: string }>;
     chapterSourceId?: string | null;
     realtimeMetadataAutoMatchEnabled?: boolean;
   }) {

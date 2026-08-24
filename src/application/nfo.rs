@@ -1437,6 +1437,21 @@ impl NfoWriteService {
         Self { database }
     }
 
+    pub async fn read_item_projection(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
+        let target = self.item_nfo_target(item_id).await?;
+        let bytes = match fs::read(&target).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(&target, error)),
+        };
+        parse_local_nfo_projection(&bytes)
+            .map(Some)
+            .map_err(NfoWriteError::Nfo)
+    }
+
     pub async fn write_item_nfo(
         &self,
         item_id: &str,
