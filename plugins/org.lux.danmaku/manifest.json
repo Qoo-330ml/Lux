@@ -21,6 +21,37 @@
       "required": true,
       "sensitive": true,
       "description": "Dandanplay 兼容 API 或 danmu_api 基地址，可包含脱敏 token 路径。"
+    },
+    {
+      "key": "libraryIds",
+      "label": "媒体库",
+      "type": "select",
+      "required": false,
+      "multiple": true,
+      "optionsSource": "media-libraries",
+      "defaultValue": [],
+      "description": "只对选中的媒体库执行弹幕匹配；不选择任何媒体库时不会创建匹配任务。"
+    },
+    {
+      "key": "matchOriginalFilename",
+      "label": "使用原始文件名",
+      "type": "toggle",
+      "defaultValue": true,
+      "description": "优先使用视频文件名请求上游匹配接口。"
+    },
+    {
+      "key": "matchSimplifiedTraditionalTitles",
+      "label": "尝试简繁标题",
+      "type": "toggle",
+      "defaultValue": true,
+      "description": "没有匹配结果时，尝试已登记的本地标题候选。"
+    },
+    {
+      "key": "matchEnglishTitle",
+      "label": "尝试英文标题",
+      "type": "toggle",
+      "defaultValue": false,
+      "description": "没有匹配结果时，尝试已登记的英文或原始标题。是否支持取决于上游接口。"
     }
   ],
   "permissions": {

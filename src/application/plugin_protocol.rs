@@ -483,6 +483,8 @@ pub struct PluginRpcError {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DanmakuMatchRpcRequest {
     pub file_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternate_file_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

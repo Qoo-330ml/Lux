@@ -382,7 +382,17 @@ async fn match_danmaku(request: DanmakuMatchRpcRequest) -> Result<Value, Danmaku
     let provider_url = provider_url().ok_or(DanmakuProviderError::InvalidRequest)?;
     let proxy_url = std::env::var("LUX_PROXY_URL").ok();
     let provider = DanmakuProviderClient::new(&provider_url, proxy_url.as_deref())?;
-    let Some(matched) = provider.match_filename(&request.file_name).await? else {
+    let mut candidate_file_names = Vec::with_capacity(1 + request.alternate_file_names.len());
+    candidate_file_names.push(request.file_name);
+    candidate_file_names.extend(request.alternate_file_names);
+    let mut matched = None;
+    for file_name in candidate_file_names {
+        if let Some(value) = provider.match_filename(&file_name).await? {
+            matched = Some(value);
+            break;
+        }
+    }
+    let Some(matched) = matched else {
         let result = DanmakuMatchRpcResult {
             status: DanmakuMatchStatus::NoMatch,
             provider: None,
