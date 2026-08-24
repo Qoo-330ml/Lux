@@ -123,7 +123,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 首版仅支持直接播放，不支持音视频转码、容器转换或字幕转换。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。
-- URL 型 `.strm` 在 `Path` 保留原始播放地址，并通过受保护的 Lux 视频端点播放；播放端点由 Lux 服务端请求首个 HTTP(S) 目标，有限跟随 HTTP 重定向并校验 `Location`，遇到 200/206 媒体响应时回退为原始地址，最终只向客户端返回可访问的 HTTP(S) 地址。Lux 不代理媒体字节，不写死任何 STRM 服务路径。服务端请求允许访问管理员已登记的内网目标，但必须有 URL 校验、重定向上限、连接/读取超时且不得记录含令牌的 URL；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
+- URL 型 `.strm` 在 `Path` 和 `DirectStreamUrl` 保留原始播放地址，由实际播放器直接请求上游，以保留播放器 User-Agent；受保护的 Lux 视频端点仅对兼容客户端返回原始地址的 307，不请求或解析 HTTP(S) 目标，也不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
 - 浏览器无法原生播放的编码直接显示不支持，不提供转码兜底。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -289,7 +289,7 @@ Lux 的核心价值不是功能数量，而是：
 - Lux 不实现公网穿透、UPnP 端口映射或自带证书签发。
 - 外网通过 Tailscale、反向代理或用户域名接入。
 - 网络代理设置是全局出站配置，支持 HTTP、HTTPS、SOCKS4、SOCKS4a、SOCKS5 和 SOCKS5h；可通过代理 URL 携带认证信息。
-- 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求，但不进入 URL 型 `.strm` 播放解析器。STRM resolver 始终直连已登记的 HTTP(S) 目标；播放时也不代理客户端最终读取的媒体字节和入站反向代理。
+- 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求，但 URL 型 `.strm` 由客户端直接请求，不进入 Lux 的出站请求链路；播放时也不代理客户端最终读取的媒体字节和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
 - 远程访问权限由用户策略控制。
 - Lux 会优先使用 X-Forwarded-For、X-Forwarded-Proto 等反代请求头；远程访问权限不再依据来源 IP 判断。
@@ -2528,7 +2528,7 @@ services:
 验收：
 
 - 读取首个非空行并处理 BOM。
-- URL 型 `PlaybackInfo` 不访问目标；视频播放入口由独立的 STRM resolver 校验并请求 HTTP(S) 目标，且不使用全局出站代理。下载端点的远程请求按 LUX-091 单独执行。
+- URL 型 `PlaybackInfo` 不访问目标，`DirectStreamUrl` 返回原始 URL；视频播放入口只对兼容客户端返回原始 URL 的 307，确保上游收到客户端 User-Agent。下载端点的远程请求按 LUX-091 单独执行。
 - URL 不进入日志。
 
 验证：http、https、含查询令牌和空文件 fixtures。
@@ -3621,21 +3621,19 @@ stdout 日志并在启动阶段报告降级原因。
 `strm_target_kind` 持久化字段。扫描器在新增、重扫和文件内容变化时保存 `URL`、`PATH`、
 `OPAQUE` 或 `EMPTY` 分类；旧记录分类为空时由播放表面按原始目标执行同一纯词法回退。
 
-URL 型目标在 `PlaybackInfo` 中通过受保护的 Lux 视频入口播放；播放入口由 Lux 服务端请求原始
-HTTP(S) 目标，有限跟随并校验重定向，遇到 200/206 媒体响应后把当前可播放 URL 以 307 返回给
-客户端，不绑定具体 STRM 服务路径，也不代理媒体字节。本地路径型目标生成 Lux 受保护的视频
-入口并读取根目录内的实际文件；SMB/FTP 和空目标、不支持目标不会被伪造为直链。STRM 后台探测
-仍将原始目标交给受监督插件；普通扫描和 `PlaybackInfo` 不访问 HTTP/SMB/FTP 目标，URL 型视频
-请求只按上面的播放契约解析 HTTP(S) 响应和重定向。
+URL 型目标在 `PlaybackInfo` 中直接返回原始 URL；兼容视频入口仅把原始 HTTP(S) 目标以 307 返回给
+客户端，不绑定具体 STRM 服务路径，也不代理媒体字节。本地路径型目标生成 Lux 受保护的视频入口
+并读取根目录内的实际文件；SMB/FTP 和空目标、不支持目标不会被伪造为直链。STRM 后台探测仍将
+原始目标交给受监督插件；普通扫描、`PlaybackInfo` 和 URL 型视频请求都不访问 HTTP/SMB/FTP 目标。
 
 验收：
 
 - [x] SQLite 和 PostgreSQL 空数据库迁移成功，旧数据库可增加可空 `strm_target_kind` 字段。
 - [x] 电影、剧集和未解析 `.strm` 扫描均保存首个非空目标及其分类；重扫会更新分类和目标。
-- [x] URL 型 `PlaybackInfo`/视频请求保持现有兼容行为；STRM resolver 不使用全局网络代理，本地路径通过受保护的视频入口读取实际
+- [x] URL 型 `PlaybackInfo`/视频请求保持现有兼容行为并由客户端请求原始 URL，本地路径通过受保护的视频入口读取实际
       文件，SMB/FTP 仅在解析器成功后播放，其他目标不伪造直链，也不会把 `.strm` 文件当作媒体返回。
-- [x] 后台 STRM 探测继续使用原始目标；仅 HTTP/HTTPS、本地路径、SMB 和 FTP 进入探测。扫描和
-      `PlaybackInfo` 不因分类发起网络访问；URL 型视频请求按播放契约解析 HTTP(S) 响应。
+- [x] 后台 STRM 探测继续使用原始目标；仅 HTTP/HTTPS、本地路径、SMB 和 FTP 进入探测。扫描、
+      `PlaybackInfo` 和 URL 型视频请求不因分类发起网络访问；客户端按原始 URL 直接播放。
 - [x] 通过专项 Rust 测试、格式化、Clippy，并记录 ARM 本机 `uname -m`；本机为 `arm64`。
 
 验证：`cargo test --locked --test strm --test strm_target`、`cargo fmt --all -- --check`、

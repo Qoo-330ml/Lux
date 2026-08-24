@@ -1,9 +1,6 @@
 use luxd::{
     api::{AppState, app_with_state},
-    application::{
-        libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
-        strm_playback::StrmPlaybackResolver,
-    },
+    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
@@ -11,19 +8,10 @@ use luxd::{
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-async fn respond_once(listener: &TcpListener, response: &str) -> std::io::Result<()> {
-    let (mut stream, _) = listener.accept().await?;
-    let mut request = [0_u8; 4096];
-    let _ = stream.read(&mut request).await?;
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await
-}
-
 #[tokio::test]
-async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_side()
+async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -38,8 +26,6 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
         .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let proxy_address = proxy_listener.local_addr()?;
     let remote_target =
         "http://media.example.test/video/剧集?id=7&title=第1集&token=secret".to_owned();
     tokio::fs::write(
@@ -125,27 +111,13 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
             .await?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(
-        AppState::ready(config, database.clone(), setup, auth, emby_auth)
-            .with_strm_playback_resolver(StrmPlaybackResolver::new_with_proxy_for_tests(format!(
-                "http://{proxy_address}"
-            ))?),
-    );
-    let proxy_server = tokio::spawn(async move {
-        for _ in 0..3 {
-            respond_once(
-                &proxy_listener,
-                "HTTP/1.1 302 Found\r\nLocation: /resolved.mkv\r\nContent-Length: 0\r\n\r\n",
-            )
-            .await?;
-            respond_once(
-                &proxy_listener,
-                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/1\r\nContent-Type: video/x-matroska\r\n\r\nx",
-            )
-            .await?;
-        }
-        Ok::<(), std::io::Error>(())
-    });
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -208,7 +180,7 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
     );
     assert_eq!(
         popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{remote_item_id}/{remote_source_id}/stream")
+        remote_target
     );
 
     let playback = client
@@ -224,10 +196,7 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
     assert_eq!(body["MediaSources"][0]["IsRemote"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
-    assert_eq!(
-        body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{remote_item_id}/{remote_source_id}/stream")
-    );
+    assert_eq!(body["MediaSources"][0]["DirectStreamUrl"], remote_target);
 
     let path_playback = client
         .get(format!(
@@ -261,7 +230,7 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
     );
     assert_eq!(
         senplayer_stream.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/resolved.mkv"
+        "http://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
     );
 
     let duplicate_source_query_stream = no_redirect_client
@@ -282,7 +251,7 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
     );
     assert_eq!(
         duplicate_source_query_stream.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/resolved.mkv"
+        "http://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
     );
 
     let path_stream = no_redirect_client
@@ -314,7 +283,7 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
     );
     assert_eq!(
         unmatched_video_path.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/resolved.mkv"
+        "http://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
     );
 
     let missing_source_video_path = no_redirect_client
@@ -374,7 +343,6 @@ async fn strm_sources_store_first_non_empty_line_and_resolves_playback_server_si
         Some("https://media.example.test/path-movie.mkv")
     );
     assert_eq!(updated_path.1.as_deref(), Some("URL"));
-    proxy_server.await??;
     server.abort();
     Ok(())
 }

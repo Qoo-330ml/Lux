@@ -62,7 +62,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/admin/chapter-detection-jobs/{jobId}/cancel`、`POST /api/v1/admin/chapter-detection-jobs/{jobId}/retry`：取消或重试检测任务；写操作需要管理员 Web session 和 CSRF。
 - `POST /api/v1/admin/libraries/{libraryId}/danmaku/match`：管理员提交 `{ "concurrency": 2, "overwrite": false }`，为已索引的本地视频创建异步弹幕匹配任务；成功返回 202，默认不覆盖已有同名 XML。
 - `GET /api/v1/admin/danmaku/match-jobs?page=1&pageSize=50&status=FAILED`：分页查看弹幕匹配任务；详情、取消和重试分别使用 `/api/v1/admin/danmaku/match-jobs/{jobId}`、`/cancel` 和 `/retry`。
-- `GET/PATCH /api/v1/admin/settings`：读取或调整 `serverName`、兼容保留的 `resumePlayedPercent`、`resumeMinTicks`（非负）和 `mediaStrategy`。自动标记已看的个人阈值请使用 `/api/v1/auth/settings`；`resumePlayedPercent` 不再控制个人自动已看或继续观看。`serverName` 会去除首尾空格，长度限制为 1-80 个字符，不接受控制字符。媒体策略的图像开关为 `poster`、`logo`、`thumbnail`、`banner`、`disc`、`artwork`、`wallpaper`，另有元数据/图片语言、地区、默认刮削器、`metadataRefreshMode`（`FILL_MISSING` 或 `FULL_REFRESH`）、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。旧策略 JSON 缺少新增字段时默认按 `FILL_MISSING` 处理。网络代理设置通过 `networkProxyUrl` 写入，支持 `http`、`https`、`socks4`、`socks4a`、`socks5` 和 `socks5h`；传 `null` 清除。响应中的 `networkProxy` 只返回脱敏地址、是否配置认证、来源和重启提示，不返回认证信息。全局网络代理不作用于 URL 型 `.strm` 播放解析；STRM resolver 始终直连其已登记的 HTTP(S) 目标。写操作需要管理员 Web session 和 CSRF，响应不包含任何插件凭据。
+- `GET/PATCH /api/v1/admin/settings`：读取或调整 `serverName`、兼容保留的 `resumePlayedPercent`、`resumeMinTicks`（非负）和 `mediaStrategy`。自动标记已看的个人阈值请使用 `/api/v1/auth/settings`；`resumePlayedPercent` 不再控制个人自动已看或继续观看。`serverName` 会去除首尾空格，长度限制为 1-80 个字符，不接受控制字符。媒体策略的图像开关为 `poster`、`logo`、`thumbnail`、`banner`、`disc`、`artwork`、`wallpaper`，另有元数据/图片语言、地区、默认刮削器、`metadataRefreshMode`（`FILL_MISSING` 或 `FULL_REFRESH`）、最大背景图数量、最小下载宽度、字幕默认值和 `applyScope`（`NEW_CONTENT`、`SELECTED_CONTENT`、`ALL_CONTENT`）。旧策略 JSON 缺少新增字段时默认按 `FILL_MISSING` 处理。网络代理设置通过 `networkProxyUrl` 写入，支持 `http`、`https`、`socks4`、`socks4a`、`socks5` 和 `socks5h`；传 `null` 清除。响应中的 `networkProxy` 只返回脱敏地址、是否配置认证、来源和重启提示，不返回认证信息。URL 型 `.strm` 由客户端直接请求原始地址，因此不经过 Lux 的出站代理。写操作需要管理员 Web session 和 CSRF，响应不包含任何插件凭据。
 - `GET/PATCH /api/v1/auth/settings`：读取或调整当前登录用户的 `playedPercent`（1-100），默认 95；写操作需要当前用户 Web session 和 CSRF。该设置只影响当前用户的自动已看阈值。
 - `GET/PATCH /api/v1/auth/library-order`：读取或调整当前登录用户的媒体库顺序；写入 `{ "libraryOrder": ["<libraryId>", ...] }`，只接受当前用户可访问的媒体库 ID，未提交的可访问媒体库稳定追加到末尾；写操作需要当前用户 Web session 和 CSRF。该顺序同时用于 Lux Web 和 Emby `Views`、虚拟根目录、`VirtualFolders` 及 `OrderedViews`。
 - 弹幕插件 `org.lux.danmaku` 的配置通过通用 `PUT /api/v1/admin/plugins/{pluginId}/config` 保存；`providerBaseUrl` 只在插件配置响应中以脱敏值展示，主设置页不再保存弹幕配置。
@@ -197,7 +197,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Videos/{itemId}/{mediaSourceId}/Subtitles/{streamIndex}/Stream`：按指定媒体源读取外挂字幕。
 - `GET|HEAD /Items/{itemId}/Subtitles/{streamIndex}/Stream`：按条目读取默认媒体源的外挂字幕。
 - `GET|HEAD /Videos/{itemId}/stream`、`/Videos/{itemId}/stream.{container}`：读取默认媒体源；同时接受客户端常用的小写 `/videos` 变体。
-- `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定媒体源；本地源返回文件流，HTTP `.strm` 源由 Lux 服务端请求并有限解析首个非空 HTTP(S) 目标后返回 `307 Location`，200/206 媒体响应回退为原始目标，路径型/其他 `.strm` 源按解析器结果返回 `307 Location`。
+- `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定媒体源；本地源返回文件流，HTTP `.strm` 源直接返回原始目标的 `307 Location`，由客户端带自身 User-Agent 请求上游；路径型/其他 `.strm` 源按解析器结果返回 `307 Location`。
 - `GET|HEAD /Items/{itemId}/Download`：需要 `can_download` 和媒体库 ACL，返回所选单个媒体源的附件下载流；不打包同目录旁车文件。`mediaSourceId` 可选择源，`LOCAL_FILE` 直接读取库内文件，`STRM_URL` 读取 `.strm` 的首个非空 URL 后由 Lux 流式转发远程资源。
 - `GET|HEAD /api/v1/items/{itemId}/download`：Lux 下载端点，需要 Web session、`can_download` 和媒体库 ACL；返回所选单个媒体源，不打包 ZIP。`sourceId` 可选择源；本地源直接流式读取，`.strm` 读取首个非空远程 URL 并由 Lux 请求、流式转发该资源，不返回 `.strm` 文本。
 - `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流、DirectPlay 能力和服务端生成的 `PlaySessionId`；支持 `MediaSourceId` 显式选择，支持 DirectPlay/DirectStream，不声明转码。每个媒体源可带 `Edition`/`Quality` 版本标签。
@@ -206,7 +206,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `MediaStreams` 不返回 Matroska/MP4 中标记为 `attached_pic` 的封面附加图轨，避免客户端将封面误认为可播放视频轨。
 - `GET /Items/{collectionId}/Children`：返回按当前用户媒体库权限过滤的合集成员。
 
-`.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 返回；`Path` 保存原始上游地址，`DirectStreamUrl` 指向受保护的 Lux `/Videos/.../stream` 端点。该端点由不使用全局网络代理的 Lux STRM resolver 请求 HTTP(S) 目标、有限跟随重定向并校验 `Location`；如果上游直接返回 200/206 媒体响应，则向客户端回退原始 URL。Lux 不代理媒体字节，不依赖具体的 STRM 服务路径；具有媒体库访问权限的客户端仍可能获得包含令牌的 `Path`，因此 URL 中的令牌仍按产品设计明文保存和返回。
+`.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 返回；`Path` 和 `DirectStreamUrl` 都保存原始上游地址，由客户端直接请求，因此 302 服务可以看到客户端自身的 User-Agent。Lux 不代理媒体字节，也不请求或解析 URL 型 `.strm` 的上游响应；具有媒体库访问权限的客户端仍可能获得包含令牌的地址，因此 URL 中的令牌仍按产品设计明文保存和返回。
 
 - `GET /Sessions`：返回当前用户的活动播放会话；管理员可查看全部活动会话。每个会话按 Emby 兼容字段返回 `Client`、`DeviceName`、`DeviceId`、`DeviceType`、`ApplicationVersion` 和 `RemoteEndPoint`；无法获得的值为 `null`。
 - `POST /Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`：幂等记录播放事件，并将位置单调写入用户状态；事件体中的设备/客户端字段优先，缺失时从上述认证头回填。
