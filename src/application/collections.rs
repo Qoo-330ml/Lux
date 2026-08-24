@@ -3,7 +3,9 @@ use std::fmt;
 use crate::{
     application::{
         metadata_objects::{MetadataObjectError, MetadataObjectSnapshot, MetadataObjectStore},
-        scraper::{ScraperError, ScraperGetRequest, ScraperItemType, ScraperResolver},
+        scraper::{
+            ScraperError, ScraperGetRequest, ScraperItemType, ScraperResolver, provider_id_for_key,
+        },
         tmdb_plugin::ScraperProvider,
     },
     storage::{Database, NewCollection, StorageError},
@@ -55,6 +57,7 @@ impl CollectionService {
             return Err(CollectionError::MovieProviderIdMissing);
         };
         let tmdb = self.provider_for_item(item_id).await?;
+        let provider_name = tmdb.provider_key().to_owned();
         let movie = tmdb
             .get_generic(ScraperGetRequest::new(
                 ScraperItemType::Movie,
@@ -78,7 +81,9 @@ impl CollectionService {
             ))
             .await
             .map_err(CollectionError::Scraper)?;
-        if details.first_provider_id().is_none() {
+        let selected_provider_id = provider_id_for_key(&details.provider_ids, &provider_name)
+            .or_else(|| provider_id_for_key(&details.provider_ids, &identity.provider_name));
+        if selected_provider_id.is_none() {
             return Err(CollectionError::InvalidProviderId);
         }
         let title = details
@@ -87,21 +92,13 @@ impl CollectionService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("Scraper Collection");
-        let provider_name = identity.provider_name.clone();
         let member_provider_ids = details
             .items
             .iter()
             .filter_map(|part| {
-                let id = part
-                    .provider_ids
-                    .get(&provider_name)
-                    .or_else(|| {
-                        part.provider_ids.iter().find_map(|(name, id)| {
-                            name.eq_ignore_ascii_case(&provider_name).then_some(id)
-                        })
-                    })
-                    .or_else(|| part.provider_ids.values().next())?
-                    .clone();
+                let id = provider_id_for_key(&part.provider_ids, &provider_name)
+                    .or_else(|| provider_id_for_key(&part.provider_ids, &identity.provider_name))?
+                    .to_owned();
                 Some((provider_name.clone(), id, 0))
             })
             .collect::<Vec<_>>();
