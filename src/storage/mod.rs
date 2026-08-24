@@ -1626,6 +1626,36 @@ impl Database {
         Ok(value.filter(|value| !value.trim().is_empty()))
     }
 
+    pub(crate) async fn find_item_scrapers(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<StoredLibraryScraper>, StorageError> {
+        self.query(
+            "SELECT ls.scraper_id, ls.position, ls.role
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN library_scrapers ls ON ls.library_id = l.id
+             WHERE mi.id = ? AND mi.removed_at IS NULL
+             ORDER BY ls.position",
+        )
+        .bind(item_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredLibraryScraper {
+                    scraper_id: row.get("scraper_id"),
+                    position: row.get("position"),
+                    role: row.get("role"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) async fn replace_person_credits(
         &self,
@@ -5061,18 +5091,117 @@ impl Database {
     }
 
     pub(crate) async fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let library_ids = self
+            .query_scalar::<String>(
+                "SELECT DISTINCT library_id FROM library_scrapers WHERE scraper_id = ?",
+            )
+            .bind(plugin_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query("DELETE FROM library_scrapers WHERE scraper_id = ?")
+            .bind(plugin_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for library_id in library_ids {
+            let rows = self
+                .query(
+                    "SELECT scraper_id, role FROM library_scrapers
+                     WHERE library_id = ? ORDER BY position, scraper_id",
+                )
+                .bind(&library_id)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query("DELETE FROM library_scrapers WHERE library_id = ?")
+                .bind(&library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for (position, row) in rows.into_iter().enumerate() {
+                let stored_role: String = row.get("role");
+                let role = if position == 0 {
+                    "PRIMARY"
+                } else if stored_role.as_str() == "PRIMARY" {
+                    "BACKUP"
+                } else {
+                    stored_role.as_str()
+                };
+                let position = i64::try_from(position)
+                    .map_err(|_| StorageError::Serialization("刮削器位置超出范围".to_owned()))?;
+                self.query(
+                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(&library_id)
+                .bind(row.get::<String, _>("scraper_id"))
+                .bind(position)
+                .bind(role)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            let primary = self
+                .query_scalar::<String>(
+                    "SELECT scraper_id FROM library_scrapers
+                     WHERE library_id = ? AND position = 0",
+                )
+                .bind(&library_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "UPDATE libraries SET scraper_id = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(primary)
+            .bind(&library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         self.query(
             "UPDATE libraries
-             SET scraper_id = CASE WHEN scraper_id = ? THEN NULL ELSE scraper_id END,
-                 chapter_source_id = CASE WHEN chapter_source_id = ? THEN NULL ELSE chapter_source_id END,
+             SET chapter_source_id = CASE WHEN chapter_source_id = ? THEN NULL ELSE chapter_source_id END,
+                 scraper_id = CASE WHEN scraper_id = ? THEN NULL ELSE scraper_id END,
                  updated_at = unixepoch()
-             WHERE scraper_id = ? OR chapter_source_id = ?",
+             WHERE chapter_source_id = ? OR scraper_id = ?",
         )
         .bind(plugin_id)
         .bind(plugin_id)
         .bind(plugin_id)
         .bind(plugin_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
@@ -5080,9 +5209,15 @@ impl Database {
         })?;
         self.query("DELETE FROM installed_plugins WHERE plugin_id = ?")
             .bind(plugin_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
