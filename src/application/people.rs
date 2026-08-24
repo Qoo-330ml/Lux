@@ -458,6 +458,8 @@ struct PersonManifestRestoreReport {
 #[serde(rename_all = "camelCase")]
 pub struct ActorView {
     pub id: String,
+    #[serde(skip)]
+    pub(crate) lookup_id: String,
     pub provider: Option<String>,
     pub name: String,
     pub character: Option<String>,
@@ -1435,10 +1437,12 @@ impl PeopleService {
             .filter(|actor| !actor.name.trim().is_empty())
         {
             let id = actor_id_from_stored_actor(&actor);
+            let lookup_id = actor.lux_person_id.clone().unwrap_or_else(|| id.clone());
             let provider = actor_provider_from_stored_actor(&actor);
             let image_url = self.person_image_url(provider.as_deref(), &id).await;
             views.push(ActorView {
                 id,
+                lookup_id,
                 provider,
                 name: actor.name,
                 character: actor.character,
@@ -3750,6 +3754,10 @@ impl PeopleService {
     async fn actor_views_from_credits(&self, credits: Vec<StoredPersonCredit>) -> Vec<ActorView> {
         let mut views = Vec::with_capacity(credits.len());
         for credit in credits {
+            let lookup_id = credit
+                .lux_person_id
+                .clone()
+                .unwrap_or_else(|| credit.person_id.clone());
             let provider = (!credit.provider.is_empty()).then(|| credit.provider.clone());
             let image_url = if let Some(lux_person_id) = credit.lux_person_id.as_deref()
                 && matches!(self.profile_image(lux_person_id).await, Ok(Some(_)))
@@ -3789,6 +3797,7 @@ impl PeopleService {
                 .unwrap_or(stored_metadata);
             views.push(ActorView {
                 id: credit.person_id,
+                lookup_id,
                 provider,
                 name: credit.person_name,
                 character: (!credit.role.is_empty()).then_some(credit.role),

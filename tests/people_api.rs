@@ -135,6 +135,10 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
         .bind("unavailable-movie")
         .execute(database.pool())
         .await?;
+    sqlx::query("UPDATE media_items SET has_available_source = 0 WHERE id = ?")
+        .bind("series-1")
+        .execute(database.pool())
+        .await?;
     PeopleService::new(config.config_dir.clone())
         .with_database(database.clone())
         .persist_item_actors(
@@ -183,6 +187,50 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
             )
             .await?;
     }
+    PeopleService::new(config.config_dir.clone())
+        .with_database(database.clone())
+        .persist_item_actors(
+            "series-1",
+            "tmdb",
+            &[ActorCredit {
+                id: "44".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "Series Actor".to_owned(),
+                character: Some("Series Role".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    for (item_id, title, premiere_date) in [
+        ("cross-provider-movie-1", "跨来源电影一", "2020-01-01"),
+        ("cross-provider-movie-2", "跨来源电影二", "2019-01-01"),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, premiere_date,
+                identification_status, has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(title)
+        .bind(title)
+        .bind(premiere_date)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO person_credits (
+            item_id, person_id, person_type, person_name, provider, lux_person_id
+         ) VALUES
+            ('cross-provider-movie-1', '50', 'Actor', '跨来源演员', 'tmdb', 'lux-999999'),
+            ('cross-provider-movie-2', 'nm50', 'Actor', '跨来源演员', 'imdb', 'lux-999999')",
+    )
+    .execute(database.pool())
+    .await?;
     PeopleService::new(config.config_dir.clone())
         .with_database(database.clone())
         .persist_item_actors(
@@ -258,6 +306,50 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
     let english_search_body: Value = english_search.json().await?;
     assert_eq!(english_search_body["total"], 1);
     assert_eq!(english_search_body["items"][0]["name"], "John Actor");
+
+    let series_actor_search = client
+        .get(format!(
+            "{base_url}/api/v1/people?q=Series%20Actor&page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(series_actor_search.status(), reqwest::StatusCode::OK);
+    assert_eq!(series_actor_search.json::<Value>().await?["total"], 1);
+
+    let series_actor_works = client
+        .get(format!(
+            "{base_url}/api/v1/people/44/items?page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(series_actor_works.status(), reqwest::StatusCode::OK);
+    let series_actor_works_body: Value = series_actor_works.json().await?;
+    assert_eq!(series_actor_works_body["total"], 1);
+    assert_eq!(series_actor_works_body["items"][0]["id"], "series-1");
+
+    let cross_provider_search = client
+        .get(format!(
+            "{base_url}/api/v1/people?q=%E8%B7%A8%E6%9D%A5%E6%BA%90%E6%BC%94%E5%91%98&page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(cross_provider_search.status(), reqwest::StatusCode::OK);
+    let cross_provider_search_body: Value = cross_provider_search.json().await?;
+    assert_eq!(cross_provider_search_body["total"], 1);
+    assert_eq!(cross_provider_search_body["items"][0]["id"], "50");
+
+    let cross_provider_works = client
+        .get(format!(
+            "{base_url}/api/v1/people/50/items?page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(cross_provider_works.status(), reqwest::StatusCode::OK);
+    assert_eq!(cross_provider_works.json::<Value>().await?["total"], 2);
 
     let works = client
         .get(format!(

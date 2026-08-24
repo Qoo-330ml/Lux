@@ -16091,7 +16091,22 @@ fn catalog_filter_where_clause<'a>(
                        OR identity_filter.person_id = ?
                    )
                    AND credit_item.removed_at IS NULL
-                   AND credit_item.has_available_source = 1
+                   AND (
+                       credit_item.has_available_source = 1
+                       OR (
+                           credit_item.item_type IN ('SERIES', 'SEASON', 'BOX_SET', 'FOLDER')
+                           AND EXISTS (
+                               SELECT 1
+                               FROM media_items visible_credit_child
+                               WHERE visible_credit_child.removed_at IS NULL
+                                 AND visible_credit_child.has_available_source = 1
+                                 AND (
+                                     visible_credit_child.parent_id = credit_item.id
+                                     OR visible_credit_child.series_id = credit_item.id
+                                 )
+                           )
+                       )
+                   )
                    AND (
                        person_filter.item_id = mi.id
                        OR credit_item.series_id = mi.id

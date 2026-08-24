@@ -11046,7 +11046,7 @@ async fn lux_get_person_items(
     };
     let filter = CatalogFilter {
         item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
-        person_id: Some(person.id),
+        person_id: Some(person.lookup_id),
         sort_by: CatalogSort::PremiereDate,
         descending: true,
         ..CatalogFilter::default()
