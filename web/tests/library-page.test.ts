@@ -189,9 +189,8 @@ describe("LibraryPage infinite scroll", () => {
     });
 
     const badge = container.querySelector(".lux-media-card .lux-rating");
-    expect(badge?.classList.contains("is-compact")).toBe(true);
+    expect(badge?.classList.contains("lux-rating")).toBe(true);
     expect(badge?.textContent).toBe("6.7");
-    expect(badge?.querySelector(".lux-rating-source")).toBeNull();
     expect(badge?.querySelector("svg")).toBeNull();
   });
 

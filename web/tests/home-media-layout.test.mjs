@@ -10,8 +10,8 @@ test("home media actions are hidden until the poster is hovered and sit in its u
   const visibleRule = stylesheet.match(/\.lux-media-art-shell:hover\s*>\s*\.lux-media-actions,\s*\.lux-media-art-shell:focus-within\s*>\s*\.lux-media-actions\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(mediaSource, /className="lux-media-art-shell"/);
-  assert.match(mediaSource, /<Rating value=\{item\.rating\} source=\{item\.ratingSource\} compact=\{compactRating\} placement="card" \/>/);
-  assert.match(mediaSource, /<Rating value=\{item\.rating\} source=\{item\.ratingSource\} compact placement="card" \/>/);
+  assert.match(mediaSource, /<Rating value=\{item\.rating\} placement="card" \/>/);
+  assert.doesNotMatch(mediaSource, /compactRating/);
   assert.match(actionsRule, /top:\s*9px/);
   assert.match(actionsRule, /bottom:\s*auto/);
   assert.match(actionsRule, /opacity:\s*0/);
@@ -29,10 +29,7 @@ test("detail ratings stay upper-right while home and library card ratings move u
   assert.match(ratingRule, /right:\s*9px/);
   assert.match(cardRatingRule, /left:\s*9px/);
   assert.match(cardRatingRule, /right:\s*auto/);
-  const compactRatingRule = stylesheet.match(/\.lux-rating\.is-compact\s*\{([^}]*)\}/)?.[1] ?? "";
-
-  assert.match(compactRatingRule, /background:\s*#01b4e4/);
-  assert.match(mediaSource, /ratingSource/);
+  assert.match(ratingRule, /background:\s*#01b4e4/);
 });
 
 test("series cards render the episode count in the poster upper-right corner", () => {

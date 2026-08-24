@@ -65,8 +65,7 @@ describe("actor search and filmography", () => {
     expect(personLink?.getAttribute("href")).toBe("/people/42");
     expect(container?.textContent).toContain("演员甲电影");
     const mediaResults = container?.querySelector("section[aria-labelledby='media-search-heading']");
-    expect(mediaResults?.querySelector(".lux-rating.is-compact")).not.toBeNull();
-    expect(mediaResults?.querySelector(".lux-rating-source")).toBeNull();
+    expect(mediaResults?.querySelector(".lux-rating")).not.toBeNull();
     expect(mediaResults?.querySelector(".lux-rating svg")).toBeNull();
   });
 
@@ -99,8 +98,7 @@ describe("actor search and filmography", () => {
     expect(container?.querySelector(".lux-person-works")?.textContent).toContain("参演作品");
     expect(container?.textContent).toContain("演员甲电影");
     expect(container?.textContent).toContain("演员甲剧集");
-    expect(container?.querySelectorAll(".lux-person-works .lux-rating.is-compact")).toHaveLength(2);
-    expect(container?.querySelectorAll(".lux-person-works .lux-rating-source")).toHaveLength(0);
+    expect(container?.querySelectorAll(".lux-person-works .lux-rating")).toHaveLength(2);
     expect(container?.querySelectorAll(".lux-person-works .lux-rating svg")).toHaveLength(0);
     expect(api.personItems).toHaveBeenCalledWith("42", 1);
   });

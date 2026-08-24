@@ -16,19 +16,20 @@ describe("Rating", () => {
     container.remove();
   });
 
-  it("shows the scraper source and score on the rating badge", () => {
+  it("always renders the standard compact numeric badge", () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
 
     act(() => {
-      root.render(<Rating value={8.6} source="TMDb" />);
+      root.render(<Rating value={8.6} />);
     });
 
     const badge = container.querySelector(".lux-rating");
-    expect(badge?.textContent).toContain("TMDb");
-    expect(badge?.textContent).toContain("8.6");
-    expect(badge?.getAttribute("aria-label")).toBe("TMDb 评分 8.6");
+    expect(badge?.classList.contains("lux-rating")).toBe(true);
+    expect(badge?.textContent).toBe("8.6");
+    expect(badge?.querySelector("svg")).toBeNull();
+    expect(badge?.getAttribute("aria-label")).toBe("评分 8.6");
   });
 
   it("does not render for a missing or invalid score", () => {
@@ -37,7 +38,7 @@ describe("Rating", () => {
     root = createRoot(container);
 
     act(() => {
-      root.render(<Rating value={null} source="TMDb" />);
+      root.render(<Rating value={null} />);
     });
 
     expect(container.querySelector(".lux-rating")).toBeNull();

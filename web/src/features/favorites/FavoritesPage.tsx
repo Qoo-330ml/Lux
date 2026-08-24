@@ -27,7 +27,7 @@ export function FavoritesPage() {
       <div className="lux-page-heading"><h1>我的收藏</h1><p>共 {total} 项</p></div>
       {items.length ? (
         <div className="lux-poster-grid">
-          {items.map((item) => <MediaCard item={item} compactRating key={item.id} />)}
+          {items.map((item) => <MediaCard item={item} key={item.id} />)}
         </div>
       ) : (
         <div className="lux-empty-card"><span>还没有收藏内容。</span><Link to="/libraries">去媒体库看看</Link></div>

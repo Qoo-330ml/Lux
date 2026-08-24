@@ -247,7 +247,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div>
       <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} compactRating key={item.id} metadataAttention={showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
+        {loadedItems.map((item) => <MediaCard item={item} key={item.id} metadataAttention={showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
       </div>
       {!loadedItems.length ? <div className="lux-empty-card"><span>这个媒体库还没有内容。</span><Link to="/libraries">返回媒体库</Link></div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />

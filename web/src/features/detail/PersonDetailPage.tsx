@@ -189,7 +189,7 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
         {works.isPending ? <p className="lux-muted-copy">正在加载参演作品…</p> : null}
         {works.error ? <p className="lux-error-copy" role="alert">参演作品加载失败：{works.error.message}</p> : null}
         {!works.isPending && !works.error && !workItems.length ? <p className="lux-muted-copy">暂无已入库的参演电影或剧集。</p> : null}
-        {workItems.length ? <div className="lux-person-works-grid lux-poster-grid">{workItems.map((item) => <MediaCard item={item} compactRating key={item.id} />)}</div> : null}
+        {workItems.length ? <div className="lux-person-works-grid lux-poster-grid">{workItems.map((item) => <MediaCard item={item} key={item.id} />)}</div> : null}
         {works.hasNextPage ? <div className="lux-person-works-actions"><button className="lux-button lux-button-secondary" type="button" onClick={() => void works.fetchNextPage()} disabled={works.isFetchingNextPage}>{works.isFetchingNextPage ? "加载中…" : "加载更多"}</button></div> : null}
       </section>
     </article>

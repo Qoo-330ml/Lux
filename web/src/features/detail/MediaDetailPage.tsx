@@ -575,7 +575,7 @@ function SeriesChildren({
           >
             <span className="lux-season-card-art">
               {imageUrl(season) ? <img src={imageUrl(season)} alt={`${mediaTitle(season)} 海报`} loading="lazy" /> : <span className="lux-season-card-placeholder">{mediaTitle(season)}</span>}
-              <Rating value={season.rating} source={season.ratingSource} compact placement="card" />
+              <Rating value={season.rating} placement="card" />
               <EpisodeCount item={season} />
             </span>
             <strong>{mediaTitle(season)}</strong>

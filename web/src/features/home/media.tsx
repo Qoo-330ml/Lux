@@ -1,4 +1,4 @@
-import { Database, MoreHorizontal, Play, ScanLine, ScanSearch, Star } from "lucide-react";
+import { Database, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
@@ -96,7 +96,7 @@ export function EpisodeCount({ item }: { item: MediaItem }) {
   return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
 }
 
-export function MediaCard({ item, landscape = false, compactRating = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; compactRating?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; onSelectionChange?: (selected: boolean) => void }) {
+export function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; onSelectionChange?: (selected: boolean) => void }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
@@ -160,7 +160,7 @@ export function MediaCard({ item, landscape = false, compactRating = false, meta
           <Link className="lux-media-card-link" to={detailHref} aria-label={`查看 ${mediaTitle(item)} 详情`}>
             <div className="lux-media-art">
               {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
-              <Rating value={item.rating} source={item.ratingSource} compact={compactRating} placement="card" />
+              <Rating value={item.rating} placement="card" />
               <EpisodeCount item={item} />
               <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
               {progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
@@ -211,7 +211,7 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
     <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={`继续播放 ${mediaTitle(item)}`}>
       <div className="lux-media-art">
         {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
-        <Rating value={item.rating} source={item.ratingSource} compact placement="card" />
+        <Rating value={item.rating} placement="card" />
         <EpisodeCount item={item} />
         <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
         {progress > 0 && progress < 100 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
@@ -231,7 +231,7 @@ export function MediaRail({ title, items, landscape = false, linkTo }: { title: 
       <div className="lux-section-heading"><h2>{linkTo ? <Link className="lux-section-title-link" to={linkTo}>{title}</Link> : title}</h2><span>{items.length} 项</span></div>
       <HorizontalScrollRail className="lux-home-rail" ariaLabel={title}>
         <div className={landscape ? "lux-media-rail lux-media-rail-landscape" : "lux-media-rail"}>
-          {items.map((item) => <MediaCard item={item} landscape={landscape} compactRating key={item.id} />)}
+          {items.map((item) => <MediaCard item={item} landscape={landscape} key={item.id} />)}
         </div>
       </HorizontalScrollRail>
     </section>
@@ -407,14 +407,11 @@ export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefe
   );
 }
 
-export function Rating({ value, source, compact = false, placement = "default" }: { value?: number | null; source?: string | null; compact?: boolean; placement?: "default" | "card" }) {
+export function Rating({ value, placement = "default" }: { value?: number | null; placement?: "default" | "card" }) {
   if (value == null || !Number.isFinite(value) || value < 0 || value > 10) return null;
   const score = value.toFixed(1);
-  const label = compact ? "评分 " + score : source ? source + " 评分 " + score : "评分 " + score;
   return (
-    <span className={["lux-rating", compact ? "is-compact" : "", placement === "card" ? "lux-card-rating" : ""].filter(Boolean).join(" ")} aria-label={label} title={label}>
-      {compact ? null : <Star size={14} fill="currentColor" aria-hidden="true" />}
-      {compact ? null : source ? <span className="lux-rating-source">{source}</span> : null}
+    <span className={["lux-rating", placement === "card" ? "lux-card-rating" : ""].filter(Boolean).join(" ")} aria-label={`评分 ${score}`} title={`评分 ${score}`}>
       <strong>{score}</strong>
     </span>
   );

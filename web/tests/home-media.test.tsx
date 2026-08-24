@@ -49,7 +49,6 @@ describe("ContinueWatchingRail", () => {
       "/watch/episode-1",
     );
     expect(container.querySelector(".lux-continue-card .lux-rating")?.textContent).toBe("8.4");
-    expect(container.querySelector(".lux-continue-card .lux-rating-source")).toBeNull();
     expect(container.querySelector(".lux-continue-card .lux-rating svg")).toBeNull();
     expect(container.querySelector(".lux-continue-card img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-1/images/thumb?tag=episode-thumb-tag");
@@ -76,8 +75,7 @@ describe("ContinueWatchingRail", () => {
     const badge = container.querySelector(".lux-media-card .lux-rating");
     expect(container.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
     expect(badge?.textContent).toBe("7.6");
-    expect(badge?.classList.contains("is-compact")).toBe(true);
-    expect(badge?.querySelector(".lux-rating-source")).toBeNull();
+    expect(badge?.classList.contains("lux-rating")).toBe(true);
     expect(badge?.querySelector("svg")).toBeNull();
   });
 
@@ -91,7 +89,6 @@ describe("ContinueWatchingRail", () => {
         <MemoryRouter>
           <MediaCard
             item={{ id: "series-1", title: "示例剧集", itemType: "SERIES", rating: 8.1, episodeCount: 12 }}
-            compactRating
           />
         </MemoryRouter>,
       );
@@ -112,7 +109,6 @@ describe("ContinueWatchingRail", () => {
         <MemoryRouter>
           <MediaCard
             item={{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8 }}
-            compactRating
           />
         </MemoryRouter>,
       );
