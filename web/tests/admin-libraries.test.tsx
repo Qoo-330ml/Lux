@@ -616,6 +616,7 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(container.textContent).toContain("TMDb 元数据插件");
     expect(container.textContent).toContain("备用元数据插件");
+    expect(container.querySelectorAll(".lux-admin-scraper-actions")).toHaveLength(2);
     const role = container.querySelector<HTMLButtonElement>("[aria-label='刮削器 备用元数据插件 角色']");
     expect(role).toBeTruthy();
     await act(async () => role?.click());
@@ -652,6 +653,13 @@ describe("AdminLibrariesPage library cards", () => {
       .find((button) => button.textContent?.includes("编辑"))?.click());
 
     expect(container.textContent).toContain("org.lux.removed（暂不可用）");
+  });
+
+  it("keeps scraper row actions inline and the clear action readable", () => {
+    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+
+    expect(stylesheet).toMatch(/\.lux-admin-scraper-actions\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s);
+    expect(stylesheet).toMatch(/\.lux-admin-scraper-field\s+\.lux-admin-scraper-clear\s*\{[^}]*width:\s*auto;[^}]*min-height:\s*32px;[^}]*white-space:\s*nowrap;/s);
   });
 
   it("shows global image and subtitle defaults in the strategy view", async () => {

@@ -569,9 +569,11 @@ function ScraperListEditor({ value, plugins, onChange }: { value: AdminLibrarySc
         <span className="lux-admin-scraper-position">{index + 1}</span>
         <span className="lux-admin-scraper-name" title={scraper.scraperId}>{pluginName(scraper.scraperId)}</span>
         {index === 0 ? <span className="lux-admin-scraper-role">主刮削器</span> : <LuxSelect id={`library-scraper-role-${index}`} value={scraper.role} options={[{ value: "SUPPLEMENT", label: "补充" }, { value: "BACKUP", label: "备用" }, { value: "BOTH", label: "补充 + 备用" }]} onChange={(role) => updateRole(index, role)} aria-label={`刮削器 ${pluginName(scraper.scraperId)} 角色`} />}
-        <button className="lux-library-dialog-icon" type="button" aria-label={`上移刮削器 ${pluginName(scraper.scraperId)}`} disabled={index === 0} onClick={() => reorder(index, index - 1)}>↑</button>
-        <button className="lux-library-dialog-icon" type="button" aria-label={`下移刮削器 ${pluginName(scraper.scraperId)}`} disabled={index === value.length - 1} onClick={() => reorder(index, index + 1)}>↓</button>
-        <button className="lux-library-dialog-icon" type="button" aria-label={`移除刮削器 ${pluginName(scraper.scraperId)}`} onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index).map((item, position) => ({ ...item, position, role: position === 0 ? "PRIMARY" : item.role === "PRIMARY" ? "BACKUP" : item.role })))}>×</button>
+        <div className="lux-admin-scraper-actions" role="group" aria-label="刮削器操作">
+          <button className="lux-library-dialog-icon" type="button" aria-label={`上移刮削器 ${pluginName(scraper.scraperId)}`} disabled={index === 0} onClick={() => reorder(index, index - 1)}>↑</button>
+          <button className="lux-library-dialog-icon" type="button" aria-label={`下移刮削器 ${pluginName(scraper.scraperId)}`} disabled={index === value.length - 1} onClick={() => reorder(index, index + 1)}>↓</button>
+          <button className="lux-library-dialog-icon" type="button" aria-label={`移除刮削器 ${pluginName(scraper.scraperId)}`} onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index).map((item, position) => ({ ...item, position, role: position === 0 ? "PRIMARY" : item.role === "PRIMARY" ? "BACKUP" : item.role })))}>×</button>
+        </div>
       </div>)}
     </div> : <p className="lux-admin-muted">未配置在线刮削器。</p>}
     {value.length > 0 ? <button className="lux-library-dialog-icon lux-admin-scraper-clear" type="button" aria-label="清除刮削器配置" onClick={() => onChange([])}>清除全部刮削器</button> : null}
