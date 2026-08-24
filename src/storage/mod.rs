@@ -2804,6 +2804,123 @@ impl Database {
         Ok(stored)
     }
 
+    pub(crate) async fn person_manifest_restore_needed(
+        &self,
+        schema_version: i64,
+    ) -> Result<bool, StorageError> {
+        let status = self
+            .query_scalar::<String>(
+                "SELECT status FROM person_manifest_restore_state
+                 WHERE id = 1 AND schema_version = ?",
+            )
+            .bind(schema_version)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(status.as_deref() != Some("COMPLETED"))
+    }
+
+    pub(crate) async fn mark_person_manifest_restore_pending(
+        &self,
+        schema_version: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO person_manifest_restore_state (id, status, schema_version, updated_at)
+             VALUES (1, 'PENDING', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                schema_version = excluded.schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(schema_version)
+        .bind(current_unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) async fn mark_person_manifest_restore_completed(
+        &self,
+        schema_version: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO person_manifest_restore_state (id, status, schema_version, updated_at)
+             VALUES (1, 'COMPLETED', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                schema_version = excluded.schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(schema_version)
+        .bind(current_unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) async fn restore_canonical_person_if_manifest_changed(
+        &self,
+        person_id: &str,
+        display_name: &str,
+        identities: &[(&str, &str)],
+        manifest_checksum: &str,
+        manifest_schema_version: i64,
+    ) -> Result<bool, StorageError> {
+        let unchanged = self
+            .query_scalar::<String>(
+                "SELECT manifest_checksum FROM person_manifest_index_state
+                 WHERE person_id = ? AND manifest_checksum = ?
+                   AND manifest_schema_version = ?",
+            )
+            .bind(person_id)
+            .bind(manifest_checksum)
+            .bind(manifest_schema_version)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if unchanged {
+            return Ok(false);
+        }
+
+        self.restore_canonical_person(person_id, display_name, identities)
+            .await?;
+        self.query(
+            "INSERT INTO person_manifest_index_state (
+                person_id, manifest_checksum, manifest_schema_version, updated_at
+             ) VALUES (?, ?, ?, ?)
+             ON CONFLICT(person_id) DO UPDATE SET
+                manifest_checksum = excluded.manifest_checksum,
+                manifest_schema_version = excluded.manifest_schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(person_id)
+        .bind(manifest_checksum)
+        .bind(manifest_schema_version)
+        .bind(current_unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(true)
+    }
+
     pub(crate) async fn attach_canonical_person_identity(
         &self,
         person_id: &str,
