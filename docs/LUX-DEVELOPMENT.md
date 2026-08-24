@@ -116,14 +116,14 @@ Lux 的核心价值不是功能数量，而是：
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
 - Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径必须落在配置的媒体库根目录内；扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
-- HTTP(S) 目标沿用直接播放语义；本地路径在 Lux 进程可安全读取时按本地文件提供；SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
+- HTTP(S) 目标沿用直接播放语义，但 `DirectStreamUrl` 指向 Lux 播放入口，由 Lux 用播放器 User-Agent 解析有限重定向后返回 307；媒体字节仍由播放器直连最终地址。本地路径在 Lux 进程可安全读取时按本地文件提供；SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
 ### 3.3 播放
 
 - 首版仅支持直接播放，不支持音视频转码、容器转换或字幕转换。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。
-- URL 型 `.strm` 在 `Path` 和 `DirectStreamUrl` 保留原始播放地址，由实际播放器直接请求上游，以保留播放器 User-Agent；受保护的 Lux 视频端点仅对兼容客户端返回原始地址的 307，不请求或解析 HTTP(S) 目标，也不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
+- URL 型 `.strm` 在 `Path` 保留原始播放地址，`DirectStreamUrl` 指向受保护的 Lux 视频端点；端点使用入站播放器 User-Agent 和单区间请求解析 HTTP(S) 目标的有限重定向，再返回最终地址的 307，不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
 - 浏览器无法原生播放的编码直接显示不支持，不提供转码兜底。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -289,7 +289,7 @@ Lux 的核心价值不是功能数量，而是：
 - Lux 不实现公网穿透、UPnP 端口映射或自带证书签发。
 - 外网通过 Tailscale、反向代理或用户域名接入。
 - 网络代理设置是全局出站配置，支持 HTTP、HTTPS、SOCKS4、SOCKS4a、SOCKS5 和 SOCKS5h；可通过代理 URL 携带认证信息。
-- 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求，但 URL 型 `.strm` 由客户端直接请求，不进入 Lux 的出站请求链路；播放时也不代理客户端最终读取的媒体字节和入站反向代理。
+- 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求。URL 型 `.strm` 的解析请求由 Lux 直连目标并绕过全局出站代理，但不代理客户端最终读取的媒体字节和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
 - 远程访问权限由用户策略控制。
 - Lux 会优先使用 X-Forwarded-For、X-Forwarded-Proto 等反代请求头；远程访问权限不再依据来源 IP 判断。
@@ -917,7 +917,7 @@ pub async fn get_item(
 - is_default
 - probe_status
 
-根据已确认需求，.strm URL 需要返回客户端。首版按明文保存，因为客户端最终必须拿到原 URL；必须保证数据库文件权限和日志脱敏。
+根据已确认需求，.strm URL 需要保留并可用于播放。首版按明文保存，因为有权限的客户端仍需看到原始 Path；播放时 `DirectStreamUrl` 使用 Lux 入口，由 Lux 用播放器 User-Agent 解析有限重定向后返回 307，媒体字节不经过 Lux。必须保证数据库文件权限和日志脱敏。
 
 #### media_streams
 
@@ -1269,7 +1269,7 @@ locked local value
 
 - 读取文件的首个非空行并 trim BOM 与首尾空白，保存为原始播放目标。
 - 目标只做词法分类：HTTP(S) URL、路径、未知/其他目标；不在扫描或 PlaybackInfo 请求中访问目标。
-- URL 型目标沿用直接媒体源返回；路径型和其他目标不得被标记为已解析的 HTTP URL，需由路径转发或解析器策略决定播放方式。
+- URL 型目标由 `PlaybackInfo` 返回 Lux 的受保护播放入口；播放入口使用入站播放器 User-Agent 请求原始目标并有限跟随重定向后返回 307，路径型和其他目标不得被标记为已解析的 HTTP URL，需由路径转发或解析器策略决定播放方式。
 - 下载路径按 LUX-091 使用独立的 URL 安全策略和上游流式转发，不能把路径型目标直接当作远程 URL 请求。
 
 ### 14.3 PlaybackInfo
@@ -1281,7 +1281,7 @@ locked local value
 - MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
 - 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
   `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。
-- `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放仍由客户端直接访问外部地址。
+- `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放由 Lux 撷取上游响应头并返回 307，媒体内容仍由客户端直接访问最终地址。
 - 不伪造客户端能播放的编码。
 - 选择默认版本使用稳定策略，并允许客户端显式选择 source ID。
 
@@ -2541,7 +2541,7 @@ services:
 验收：
 
 - 读取首个非空行并处理 BOM。
-- URL 型 `PlaybackInfo` 不访问目标，`DirectStreamUrl` 返回原始 URL；视频播放入口只对兼容客户端返回原始 URL 的 307，确保上游收到客户端 User-Agent。下载端点的远程请求按 LUX-091 单独执行。
+- URL 型 `PlaybackInfo` 不访问目标，`DirectStreamUrl` 返回 Lux 播放入口；视频播放入口用入站客户端 User-Agent 直连目标、有限解析重定向并返回 307，确保 302 服务收到客户端 User-Agent。下载端点的远程请求按 LUX-091 单独执行。
 - URL 不进入日志。
 
 验证：http、https、含查询令牌和空文件 fixtures。

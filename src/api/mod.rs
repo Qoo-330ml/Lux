@@ -6508,19 +6508,18 @@ fn emby_media_source_json_with_resolver_and_chapters(
         })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
-    let direct_stream_url =
-        if source.source_kind == "LOCAL_FILE"
-            || is_local_strm_target
-            || is_remote
-            || is_resolver_target
-        {
-            Some(format!(
-                "/Videos/{item_id}/{}/stream{stream_suffix}",
-                source.id
-            ))
-        } else {
-            None
-        };
+    let direct_stream_url = if source.source_kind == "LOCAL_FILE"
+        || is_local_strm_target
+        || is_remote
+        || is_resolver_target
+    {
+        Some(format!(
+            "/Videos/{item_id}/{}/stream{stream_suffix}",
+            source.id
+        ))
+    } else {
+        None
+    };
     let is_remote_playback = is_remote || is_resolver_target;
     let is_playable =
         source.source_kind == "LOCAL_FILE" || is_local_strm_target || is_remote_playback;
@@ -10183,7 +10182,9 @@ async fn serve_media_file(
                 let Some(resolver) = state.strm_playback.as_ref() else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };
-                let user_agent = headers.get("user-agent").and_then(|value| value.to_str().ok());
+                let user_agent = headers
+                    .get("user-agent")
+                    .and_then(|value| value.to_str().ok());
                 let location = match resolver.resolve(&external_url, user_agent).await {
                     Ok(url) => url,
                     Err(StrmPlaybackError::ClientBuild(_)) => {
@@ -20334,7 +20335,10 @@ mod tests {
         assert_eq!(body["Size"], 1_234_567);
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(body["SupportsDirectStream"], true);
-        assert_eq!(body["DirectStreamUrl"], "https://example.invalid/media.mkv");
+        assert_eq!(
+            body["DirectStreamUrl"],
+            "/Videos/item-1/source-1/stream.mkv"
+        );
         assert_eq!(body["DefaultAudioStreamIndex"], -1);
         assert!(body.get("Chapters").is_none());
         assert_eq!(body["MediaStreams"][0]["Width"], 1920);

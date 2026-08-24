@@ -1,6 +1,9 @@
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    application::{
+        libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
+        strm_playback::StrmPlaybackResolver,
+    },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
@@ -8,6 +11,8 @@ use luxd::{
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -27,7 +32,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     let remote_target =
-        "http://media.example.test/video/剧集?id=7&title=第1集&token=secret".to_owned();
+        "http://media.example.test/video/剧集?id=7&title=第1集&token=fixture".to_owned();
     tokio::fs::write(
         root.join("Remote.Movie.2024.strm"),
         format!("\u{feff}\n  \n {remote_target} \nignored\n"),
@@ -111,13 +116,53 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
             .await?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(
-        config,
-        database.clone(),
-        setup,
-        auth,
-        emby_auth,
-    ));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_address = proxy_listener.local_addr()?;
+    let forwarded_user_agents = Arc::new(Mutex::new(Vec::new()));
+    let forwarded_user_agents_for_proxy = Arc::clone(&forwarded_user_agents);
+    let proxy_server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = proxy_listener.accept().await else {
+                break;
+            };
+            let user_agents = Arc::clone(&forwarded_user_agents_for_proxy);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).await.ok()?;
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).ok()?;
+                if let Some(user_agent) = request.lines().find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                        .map(|(_, value)| value.trim().to_owned())
+                }) {
+                    user_agents.lock().ok()?.push(user_agent);
+                }
+                let response = if request.contains("/video/") {
+                    "HTTP/1.1 302 Found\r\nLocation: http://media.example.test/cdn.mkv\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/1\r\nConnection: close\r\n\r\nX"
+                };
+                stream.write_all(response.as_bytes()).await.ok()?;
+                Some(())
+            });
+        }
+    });
+    let resolver =
+        StrmPlaybackResolver::new_with_proxy_for_tests(format!("http://{proxy_address}"))?;
+    let app = app_with_state(
+        AppState::ready(config, database.clone(), setup, auth, emby_auth)
+            .with_strm_playback_resolver(resolver),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -180,7 +225,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"],
-        remote_target
+        format!("/Videos/{remote_item_id}/{remote_source_id}/stream")
     );
 
     let playback = client
@@ -196,7 +241,10 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(body["MediaSources"][0]["IsRemote"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
-    assert_eq!(body["MediaSources"][0]["DirectStreamUrl"], remote_target);
+    assert_eq!(
+        body["MediaSources"][0]["DirectStreamUrl"],
+        format!("/Videos/{remote_item_id}/{remote_source_id}/stream")
+    );
 
     let path_playback = client
         .get(format!(
@@ -218,10 +266,12 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let player_user_agent = "VidHub/9.0 (iPhone; iOS 18.0)";
     let senplayer_stream = no_redirect_client
         .get(format!(
             "http://{address}/emby/videos/{remote_item_id}/stream.mkv%3FMediaSourceId={remote_source_id}&X-Emby-Token={token}"
         ))
+        .header(reqwest::header::USER_AGENT, player_user_agent)
         .send()
         .await?;
     assert_eq!(
@@ -230,7 +280,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         senplayer_stream.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
+        "http://media.example.test/cdn.mkv"
     );
 
     let duplicate_source_query_stream = no_redirect_client
@@ -243,6 +293,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
             ("api_key", token.as_str()),
             ("api_key", "invalid-second-token"),
         ])
+        .header(reqwest::header::USER_AGENT, player_user_agent)
         .send()
         .await?;
     assert_eq!(
@@ -251,7 +302,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         duplicate_source_query_stream.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
+        "http://media.example.test/cdn.mkv"
     );
 
     let path_stream = no_redirect_client
@@ -275,6 +326,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
             ("MediaSourceId", remote_source_id.as_str()),
             ("api_key", token.as_str()),
         ])
+        .header(reqwest::header::USER_AGENT, player_user_agent)
         .send()
         .await?;
     assert_eq!(
@@ -283,7 +335,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         unmatched_video_path.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/video/%E5%89%A7%E9%9B%86?id=7&title=%E7%AC%AC1%E9%9B%86&token=secret"
+        "http://media.example.test/cdn.mkv"
     );
 
     let missing_source_video_path = no_redirect_client
@@ -343,6 +395,16 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         Some("https://media.example.test/path-movie.mkv")
     );
     assert_eq!(updated_path.1.as_deref(), Some("URL"));
+    let forwarded_user_agents = forwarded_user_agents
+        .lock()
+        .map_err(|_| "proxy mutex poisoned")?;
+    assert!(!forwarded_user_agents.is_empty());
+    assert!(
+        forwarded_user_agents
+            .iter()
+            .all(|user_agent| user_agent == player_user_agent)
+    );
     server.abort();
+    proxy_server.abort();
     Ok(())
 }
