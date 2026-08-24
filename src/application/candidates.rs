@@ -860,8 +860,11 @@ fn selected_scraper_provider_id(
     scraper: &ScraperProvider,
 ) -> Option<String> {
     let selected_scraper = current.scraper_id.as_deref()?.trim();
-    let scraper_plugin_id = scraper.plugin_id()?;
-    if !selected_scraper.eq_ignore_ascii_case(scraper_plugin_id) {
+    let scraper_matches = match scraper.plugin_id() {
+        Some(plugin_id) => selected_scraper.eq_ignore_ascii_case(plugin_id),
+        None => selected_scraper.eq_ignore_ascii_case(scraper.provider_key()),
+    };
+    if !scraper_matches {
         return None;
     }
     let raw = current.provider_ids_json.as_deref()?;
