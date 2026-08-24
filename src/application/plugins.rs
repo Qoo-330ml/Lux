@@ -476,6 +476,31 @@ impl PluginService {
         self.sync_media_info_scheduled_task().await
     }
 
+    pub async fn prune_danmaku_library_ids(&self) -> Result<(), PluginServiceError> {
+        let mut values = self.read_plugin_config(DANMAKU_PLUGIN_ID).await?;
+        let Some(library_ids) = values.get_mut("libraryIds").and_then(Value::as_array_mut) else {
+            return Ok(());
+        };
+        let valid_library_ids = self
+            .database
+            .list_libraries()
+            .await?
+            .into_iter()
+            .filter(|library| library.is_enabled)
+            .map(|library| library.id)
+            .collect::<HashSet<_>>();
+        let before = library_ids.len();
+        library_ids.retain(|value| {
+            value
+                .as_str()
+                .is_some_and(|library_id| valid_library_ids.contains(library_id))
+        });
+        if library_ids.len() == before {
+            return Ok(());
+        }
+        self.write_plugin_config(DANMAKU_PLUGIN_ID, &values).await
+    }
+
     pub async fn update(&self, plugin_id: &str) -> Result<PluginView, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);

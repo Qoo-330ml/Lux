@@ -113,6 +113,12 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
     assert!(!settings.match_simplified_traditional_titles);
     assert!(settings.match_english_title);
 
+    LibraryService::new(database.clone())
+        .delete_library(library.id)
+        .await?;
+    plugins.prune_danmaku_library_ids().await?;
+    assert!(plugins.danmaku_settings().await?.library_ids.is_empty());
+
     let danmaku = DanmakuService::new(database).with_plugins(plugins);
     let error = danmaku
         .create_job(other_library.id, 2, false)

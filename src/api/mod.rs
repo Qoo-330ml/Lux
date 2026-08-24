@@ -19190,6 +19190,15 @@ async fn admin_delete_library(
                     "library deleted but STRM media-info plugin configuration could not be pruned"
                 );
             }
+            if let Some(plugins) = state.plugins.as_ref()
+                && let Err(error) = plugins.prune_danmaku_library_ids().await
+            {
+                tracing::error!(
+                    library_id = %library_id,
+                    %error,
+                    "library deleted but danmaku plugin configuration could not be pruned"
+                );
+            }
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }
