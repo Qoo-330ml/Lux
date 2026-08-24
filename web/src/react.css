@@ -361,6 +361,16 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(235px, 1fr)); gap: 16px; }
 .lux-search-panel { display: flex; align-items: center; gap: 12px; max-width: 760px; margin-bottom: 36px; padding: 8px 8px 8px 18px; border: 1px solid var(--lux-line); border-radius: 999px; color: var(--lux-muted); background: rgba(255,255,255,.055); }
 .lux-search-panel input { flex: 1; min-width: 0; border: 0; outline: 0; color: #fff; background: transparent; }
+.lux-search-results-section { margin-top: 38px; }
+.lux-person-search-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin-top: 18px; }
+.lux-person-search-card { display: flex; align-items: center; gap: 13px; min-width: 0; padding: 12px; border: 1px solid var(--lux-line-soft); border-radius: 12px; color: inherit; background: rgba(255,255,255,.025); text-decoration: none; transition: border-color .18s ease, background .18s ease, transform .18s ease; }
+.lux-person-search-card:hover { border-color: color-mix(in srgb, var(--lux-accent) 54%, var(--lux-line)); background: rgba(255,255,255,.06); transform: translateY(-1px); }
+.lux-person-search-card:focus-visible { outline: 2px solid var(--lux-accent); outline-offset: 3px; }
+.lux-person-search-avatar { display: grid; place-items: center; flex: 0 0 52px; width: 52px; height: 52px; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 50%; color: var(--lux-subtle); background: rgba(255,255,255,.06); }
+.lux-person-search-avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.lux-person-search-copy { display: grid; min-width: 0; gap: 5px; }
+.lux-person-search-copy strong { overflow: hidden; color: var(--lux-text); font-size: .86rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-person-search-copy span { color: var(--lux-subtle); font-size: .7rem; }
 .lux-muted-copy { color: var(--lux-muted); }
 .lux-error-copy { color: #f4a7ba; }
 .lux-account-card { display: flex; align-items: center; gap: 17px; max-width: 640px; padding: 20px; border: 1px solid var(--lux-line-soft); border-radius: 16px; background: var(--lux-surface); }
@@ -474,6 +484,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-person-overview { margin-top: 34px; }
 .lux-person-overview h2 { margin: 0; color: var(--lux-text); font-size: 1rem; }
 .lux-person-overview p { max-width: 70ch; margin: 12px 0 0; color: var(--lux-subtle); line-height: 1.8; white-space: pre-wrap; }
+.lux-person-works { margin-top: 58px; padding-top: 26px; border-top: 1px solid var(--lux-line-soft); }
+.lux-person-works-grid { margin-top: 20px; }
+.lux-person-works-actions { display: flex; justify-content: center; margin-top: 28px; }
 @media (max-width: 700px) {
   .lux-person-detail-page { padding-top: 0; }
   .lux-person-detail-grid { grid-template-columns: 1fr; gap: 28px; }

@@ -16072,6 +16072,15 @@ fn catalog_filter_where_clause<'a>(
                    AND (
                        person_filter.item_id = mi.id
                        OR credit_item.series_id = mi.id
+                       OR EXISTS (
+                           SELECT 1
+                           FROM media_items credit_parent
+                           WHERE credit_parent.id = credit_item.parent_id
+                             AND (
+                                 credit_parent.series_id = mi.id
+                                 OR credit_parent.parent_id = mi.id
+                             )
+                       )
                    )
              )",
         );

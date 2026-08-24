@@ -94,7 +94,7 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
             "EPISODE",
             "第二集",
             Some("season-1"),
-            Some("series-1"),
+            None,
             Some("2023-01-03"),
         ),
         (
@@ -208,7 +208,7 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
 
     let works = client
         .get(format!(
-            "{base_url}/api/v1/people/42/items?page=1&pageSize=12"
+            "{base_url}/api/v1/people/42/items?page=1&pageSize=1"
         ))
         .header(COOKIE, &cookies)
         .send()
@@ -216,14 +216,19 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
     assert_eq!(works.status(), reqwest::StatusCode::OK);
     let works_body: Value = works.json().await?;
     assert_eq!(works_body["total"], 2);
+    assert_eq!(works_body["items"][0]["id"], "movie-1");
+
+    let works_page_two = client
+        .get(format!(
+            "{base_url}/api/v1/people/42/items?page=2&pageSize=1"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(works_page_two.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        works_body["items"]
-            .as_array()
-            .expect("works array")
-            .iter()
-            .map(|item| item["id"].as_str().unwrap_or_default())
-            .collect::<Vec<_>>(),
-        vec!["movie-1", "series-1"]
+        works_page_two.json::<Value>().await?["items"][0]["id"],
+        "series-1"
     );
 
     let denied_login = client

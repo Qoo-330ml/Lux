@@ -1,10 +1,11 @@
 import { ArrowLeft, Cake, Heart, MapPin, UserRound } from "lucide-react";
 import { Fragment, type FormEvent, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { LuxUser, PersonDetail } from "../../lib/api/types";
+import { MediaCard } from "../home/media";
 
 type PersonDetailPageProps = { user?: LuxUser };
 
@@ -33,6 +34,18 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
     queryFn: () => api.person(personId),
     enabled: Boolean(personId),
   });
+  const works = useInfiniteQuery({
+    queryKey: queryKeys.personItems(personId),
+    queryFn: ({ pageParam }) => api.personItems(personId, pageParam),
+    initialPageParam: 1,
+    enabled: Boolean(personId && person.data),
+    getNextPageParam: (lastPage) => {
+      const page = lastPage.page ?? 1;
+      const pageSize = lastPage.pageSize ?? 24;
+      const total = lastPage.total ?? 0;
+      return page * pageSize < total ? page + 1 : undefined;
+    },
+  });
   const [imageFailed, setImageFailed] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<PersonDraft>();
@@ -49,6 +62,7 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
   }
 
   const detail = person.data;
+  const workItems = works.data?.pages.flatMap((page) => page.items ?? []) ?? [];
   const image = detail.imageUrl && !imageFailed ? (
     <img className="lux-person-detail-photo" src={detail.imageUrl} alt={`${detail.name} 照片`} onError={() => setImageFailed(true)} />
   ) : (
@@ -170,6 +184,14 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
           </>}
         </div>
       </div>
+      <section className="lux-person-works" aria-labelledby="person-works-heading">
+        <div className="lux-section-heading"><h2 id="person-works-heading">参演作品</h2><span>{works.data?.pages[0]?.total ?? workItems.length} 项</span></div>
+        {works.isPending ? <p className="lux-muted-copy">正在加载参演作品…</p> : null}
+        {works.error ? <p className="lux-error-copy" role="alert">参演作品加载失败：{works.error.message}</p> : null}
+        {!works.isPending && !works.error && !workItems.length ? <p className="lux-muted-copy">暂无已入库的参演电影或剧集。</p> : null}
+        {workItems.length ? <div className="lux-person-works-grid lux-poster-grid">{workItems.map((item) => <MediaCard item={item} key={item.id} />)}</div> : null}
+        {works.hasNextPage ? <div className="lux-person-works-actions"><button className="lux-button lux-button-secondary" type="button" onClick={() => void works.fetchNextPage()} disabled={works.isFetchingNextPage}>{works.isFetchingNextPage ? "加载中…" : "加载更多"}</button></div> : null}
+      </section>
     </article>
   );
 }
