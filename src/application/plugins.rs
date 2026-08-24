@@ -1738,11 +1738,20 @@ impl PluginService {
         if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
             return Err(PluginServiceError::Unavailable(plugin_id));
         }
-        Ok(crate::application::scraper::ScraperPluginClient::new(
-            self.clone(),
-            plugin_id,
-            self.provider_cache(),
-        ))
+        let provider_key = catalog
+            .get(&plugin_id)
+            .and_then(|plugin| plugin.manifest.provider_key.clone())
+            .unwrap_or_else(|| {
+                crate::application::scraper::provider_key_from_plugin_id(&plugin_id)
+            });
+        Ok(
+            crate::application::scraper::ScraperPluginClient::new_with_provider_key(
+                self.clone(),
+                plugin_id,
+                provider_key,
+                self.provider_cache(),
+            ),
+        )
     }
 
     pub async fn restart(&self, plugin_id: &str) {

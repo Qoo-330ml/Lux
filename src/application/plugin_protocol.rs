@@ -58,6 +58,8 @@ pub struct PluginManifest {
     #[serde(default = "default_plugin_category")]
     pub category: String,
     #[serde(default)]
+    pub provider_key: Option<String>,
+    #[serde(default)]
     pub supported_item_types: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -96,6 +98,9 @@ impl PluginManifest {
         validate_text("name", &self.name, 256)?;
         validate_semver(&self.version)?;
         validate_identifier("category", &self.category, 64)?;
+        if let Some(provider_key) = self.provider_key.as_deref() {
+            validate_identifier("providerKey", provider_key, 64)?;
+        }
         match self.plugin_type.as_str() {
             "metadata" => {}
             PLUGIN_TYPE_MEDIA_PROBE => {

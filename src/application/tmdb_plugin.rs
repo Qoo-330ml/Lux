@@ -28,9 +28,10 @@ pub struct TmdbPluginClient {
 impl TmdbPluginClient {
     pub fn new(plugins: PluginService) -> Self {
         Self {
-            scraper: ScraperPluginClient::new(
+            scraper: ScraperPluginClient::new_with_provider_key(
                 plugins.clone(),
                 TMDB_DYNAMIC_PLUGIN_ID,
+                "tmdb",
                 plugins.provider_cache(),
             ),
         }
@@ -38,6 +39,10 @@ impl TmdbPluginClient {
 
     pub fn from_scraper(scraper: ScraperPluginClient) -> Self {
         Self { scraper }
+    }
+
+    pub fn provider_key(&self) -> &str {
+        self.scraper.provider_key()
     }
 
     pub(crate) async fn clear_response_cache(&self) {
@@ -775,6 +780,14 @@ impl From<TmdbClient> for ScraperProvider {
 }
 
 impl ScraperProvider {
+    pub fn provider_key(&self) -> &str {
+        match self {
+            Self::Direct(_) => "tmdb",
+            Self::Plugin(client) => client.provider_key(),
+            Self::Generic(client) => client.provider_key(),
+        }
+    }
+
     pub fn from_scraper(client: ScraperPluginClient) -> Self {
         if client.plugin_id() == TMDB_DYNAMIC_PLUGIN_ID {
             Self::Plugin(TmdbPluginClient::from_scraper(client))
@@ -787,11 +800,7 @@ impl ScraperProvider {
         &self,
         result: &'a ScraperSearchResult,
     ) -> Option<(&'a str, &'a str)> {
-        let provider = match self {
-            Self::Direct(_) | Self::Plugin(_) => "tmdb",
-            Self::Generic(client) => client.plugin_id(),
-        };
-        result.selected_provider_entry(provider)
+        result.selected_provider_entry(self.provider_key())
     }
 }
 

@@ -195,7 +195,7 @@ mod tests {
 
     use super::{
         PluginServiceError, ScraperError, ScraperSearchResult, decode_bundle_response,
-        retryable_scraper_error,
+        provider_key_from_plugin_id, retryable_scraper_error,
     };
     use crate::application::plugin_runtime::PluginRuntimeError;
     use serde_json::json;
@@ -225,6 +225,13 @@ mod tests {
             ..ScraperSearchResult::default()
         };
         assert_eq!(only_other_provider.selected_provider_entry("tmdb"), None);
+    }
+
+    #[test]
+    fn derives_legacy_provider_key_from_plugin_id() {
+        assert_eq!(provider_key_from_plugin_id("org.lux.imdb"), "imdb");
+        assert_eq!(provider_key_from_plugin_id("org.example.douban"), "douban");
+        assert_eq!(provider_key_from_plugin_id("tmdb"), "tmdb");
     }
 
     #[test]
@@ -297,6 +304,17 @@ impl ScraperSearchResult {
     pub fn first_provider_id(&self) -> Option<&str> {
         self.provider_ids.values().next().map(String::as_str)
     }
+}
+
+/// Derives the provider namespace used by legacy manifests that predate the
+/// explicit `providerKey` metadata field.
+pub fn provider_key_from_plugin_id(plugin_id: &str) -> String {
+    plugin_id
+        .trim()
+        .rsplit(['.', ':', '/'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -519,24 +537,31 @@ pub struct ScraperTrailer {
 pub struct ScraperPluginClient {
     plugins: PluginService,
     plugin_id: String,
+    provider_key: String,
     response_cache: ProviderResponseCache,
 }
 
 impl ScraperPluginClient {
-    pub(crate) fn new(
+    pub(crate) fn new_with_provider_key(
         plugins: PluginService,
         plugin_id: impl Into<String>,
+        provider_key: impl Into<String>,
         response_cache: ProviderResponseCache,
     ) -> Self {
         Self {
             plugins,
             plugin_id: plugin_id.into(),
+            provider_key: provider_key.into(),
             response_cache,
         }
     }
 
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+
+    pub fn provider_key(&self) -> &str {
+        &self.provider_key
     }
 
     pub(crate) async fn clear_response_cache(&self) {
