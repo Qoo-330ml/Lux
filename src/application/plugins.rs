@@ -1758,6 +1758,13 @@ impl PluginService {
         )
     }
 
+    pub(crate) async fn scraper_capabilities(&self, plugin_id: &str) -> Option<Vec<String>> {
+        self.catalog_snapshot()
+            .await
+            .get(plugin_id)
+            .map(|plugin| plugin.manifest.capabilities.clone())
+    }
+
     pub async fn restart(&self, plugin_id: &str) {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);

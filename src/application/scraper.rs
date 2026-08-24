@@ -733,14 +733,18 @@ impl ScraperPluginClient {
         method: &str,
         params: Value,
     ) -> Result<Value, ScraperError> {
-        if let (Some(capabilities), Some(capability)) = (
-            self.capabilities.as_ref(),
-            metadata_capability_for_method(method),
-        ) && !capabilities
-            .iter()
-            .any(|declared| declared.eq_ignore_ascii_case(capability))
-        {
-            return Err(ScraperError::UnsupportedCapability(capability.to_owned()));
+        if let Some(capability) = metadata_capability_for_method(method) {
+            let capabilities = match self.capabilities.as_ref() {
+                Some(capabilities) => Some(capabilities.clone()),
+                None => self.plugins.scraper_capabilities(&self.plugin_id).await,
+            };
+            if capabilities.is_some_and(|capabilities| {
+                !capabilities
+                    .iter()
+                    .any(|declared| declared.eq_ignore_ascii_case(capability))
+            }) {
+                return Err(ScraperError::UnsupportedCapability(capability.to_owned()));
+            }
         }
         let Some(cache_key) = cache_key(&self.plugin_id, method, &params) else {
             return self.call_scraper_with_retry(method, params).await;
