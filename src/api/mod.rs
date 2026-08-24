@@ -1023,6 +1023,11 @@ pub fn app_with_state(state: AppState) -> Router {
             get(lux_list_library_items),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route("/api/v1/people", get(lux_search_people))
+        .route(
+            "/api/v1/people/{person_id}/items",
+            get(lux_get_person_items),
+        )
         .route(
             "/api/v1/people/{person_id}",
             get(lux_get_person).patch(lux_update_person),
@@ -2385,6 +2390,7 @@ fn catalog_filter_from_values(
         item_types,
         excluded_item_types: Vec::new(),
         item_ids: None,
+        person_id: None,
         media_source_ids: None,
         years,
         is_played,
@@ -3044,6 +3050,7 @@ async fn emby_group_latest_page(
             item_types: vec!["SERIES".to_owned()],
             excluded_item_types: Vec::new(),
             item_ids: Some(series_ids.clone()),
+            person_id: None,
             media_source_ids: None,
             years: Vec::new(),
             is_played: None,
@@ -8301,6 +8308,14 @@ struct LuxSearchQuery {
     page_size: Option<i64>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LuxPeopleSearchQuery {
+    q: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
 async fn lux_search(
     headers: HeaderMap,
     Query(query): Query<LuxSearchQuery>,
@@ -10901,6 +10916,161 @@ fn lux_user_data_json(state: Option<&crate::storage::StoredUserItemState>) -> Va
         "isFavorite": state.map(|value| value.is_favorite).unwrap_or(false),
         "isPlayed": state.map(|value| value.is_played).unwrap_or(false),
     })
+}
+
+async fn lux_search_people(
+    headers: HeaderMap,
+    Query(query): Query<LuxPeopleSearchQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(raw_query) = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物搜索关键词不能为空",
+        )
+        .into_response();
+    };
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match people
+        .search_actors(&library_ids, raw_query, offset, limit)
+        .await
+    {
+        Ok((actors, total)) => Json(json!({
+            "items": actors,
+            "total": total,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(PeopleError::InvalidComponent(_)) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物搜索关键词无效",
+        )
+        .into_response(),
+        Err(PeopleError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn lux_get_person_items(
+    headers: HeaderMap,
+    Path(person_id): Path<String>,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match lux_page_params(&query) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(people) = state.people.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let person = match people.find_person(&library_ids, "Actor", &person_id).await {
+        Ok(Some(person)) => person,
+        Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "人物不存在",
+            )
+            .into_response();
+        }
+        Err(PeopleError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let filter = CatalogFilter {
+        item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+        person_id: Some(person.id),
+        sort_by: CatalogSort::PremiereDate,
+        descending: true,
+        ..CatalogFilter::default()
+    };
+    match catalog
+        .list_all_items_filtered(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &filter,
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 async fn lux_get_person_image(

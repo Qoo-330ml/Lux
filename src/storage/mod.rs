@@ -3175,6 +3175,118 @@ impl Database {
         Ok((rows, total))
     }
 
+    pub(crate) async fn search_person_credits_for_libraries(
+        &self,
+        library_ids: &[String],
+        person_type: &str,
+        query: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredPersonCredit>, i64), StorageError> {
+        if library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like_query = format!("%{escaped}%");
+        let person_group = "COALESCE(
+            NULLIF(pc.lux_person_id, ''),
+            NULLIF(pi.person_id, ''),
+            pc.provider || ':' || pc.person_id
+        )";
+        let count_query = format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT {person_group}
+                 FROM person_credits pc
+                 JOIN media_items mi ON mi.id = pc.item_id
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN person_identities pi
+                   ON pi.provider = pc.provider
+                  AND pi.provider_id = pc.person_id
+                 WHERE mi.library_id IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   AND pc.person_type = ?
+                   AND pc.person_name LIKE ? ESCAPE '\\'
+                 GROUP BY {person_group}
+             )"
+        );
+        let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        for library_id in library_ids {
+            count_statement = count_statement.bind(library_id);
+        }
+        let total = count_statement
+            .bind(person_type)
+            .bind(&like_query)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let list_query = format!(
+            "SELECT MIN(pc.item_id) AS item_id,
+                    MIN(pc.person_id) AS person_id,
+                    MIN(pc.lux_person_id) AS lux_person_id,
+                    MIN(pc.provider) AS provider,
+                    MIN(pc.person_name) AS person_name,
+                    MIN(pc.role) AS role,
+                    MIN(mi.added_at) AS date_created,
+                    MIN(pc.biography) AS biography,
+                    MIN(pc.birthday) AS birthday,
+                    MIN(pc.deathday) AS deathday,
+                    MIN(pc.known_for_department) AS known_for_department,
+                    MIN(pc.place_of_birth) AS place_of_birth,
+                    MIN(pc.provider_ids_json) AS provider_ids_json,
+                    MIN(pc.genres_json) AS genres_json,
+                    MIN(pc.tags_json) AS tags_json,
+                    MIN(pc.production_locations_json) AS production_locations_json,
+                    MIN(pc.premiere_date) AS premiere_date,
+                    MIN(pc.production_year) AS production_year,
+                    MIN(pc.taglines_json) AS taglines_json
+             FROM person_credits pc
+             JOIN media_items mi ON mi.id = pc.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             LEFT JOIN person_identities pi
+               ON pi.provider = pc.provider
+              AND pi.provider_id = pc.person_id
+             WHERE mi.library_id IN ({placeholders})
+               AND mi.removed_at IS NULL
+               AND pc.person_type = ?
+               AND pc.person_name LIKE ? ESCAPE '\\'
+             GROUP BY {person_group}
+             ORDER BY CASE WHEN LOWER(MIN(pc.person_name)) = LOWER(?) THEN 0 ELSE 1 END,
+                      LOWER(MIN(pc.person_name)) ASC,
+                      MIN(pc.provider) ASC,
+                      MIN(pc.person_id) ASC
+             LIMIT ? OFFSET ?"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(list_query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        let rows = statement
+            .bind(person_type)
+            .bind(&like_query)
+            .bind(query.trim())
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .bind(offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(stored_person_credit)
+            .collect();
+        Ok((rows, total))
+    }
+
     pub(crate) async fn find_person_credits_for_libraries(
         &self,
         library_ids: &[String],
@@ -15881,6 +15993,7 @@ fn catalog_filter_where_clause<'a>(
     let user_id = filter.user_id;
     let item_types = filter.item_types;
     let item_ids = filter.item_ids;
+    let person_id = filter.person_id;
     let media_source_ids = filter.media_source_ids;
     let excluded_item_types = filter.excluded_item_types;
     let years = filter.years;
@@ -15940,6 +16053,32 @@ fn catalog_filter_where_clause<'a>(
         } else {
             where_clause.push_str(&format!(" AND ({})", id_predicates.join(" OR ")));
         }
+    }
+    if let Some(person_id) = person_id {
+        where_clause.push_str(
+            " AND EXISTS (
+                 SELECT 1
+                 FROM person_credits person_filter
+                 JOIN media_items credit_item ON credit_item.id = person_filter.item_id
+                 LEFT JOIN person_identities identity_filter
+                   ON identity_filter.provider = person_filter.provider
+                  AND identity_filter.provider_id = person_filter.person_id
+                 WHERE person_filter.person_type = ?
+                   AND (
+                       person_filter.person_id = ?
+                       OR person_filter.lux_person_id = ?
+                       OR identity_filter.person_id = ?
+                   )
+                   AND (
+                       person_filter.item_id = mi.id
+                       OR credit_item.series_id = mi.id
+                   )
+             )",
+        );
+        binds.push(CatalogBind::Text("Actor"));
+        binds.push(CatalogBind::Text(person_id));
+        binds.push(CatalogBind::Text(person_id));
+        binds.push(CatalogBind::Text(person_id));
     }
     if !item_types.is_empty() {
         where_clause.push_str(&format!(
@@ -16128,6 +16267,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) item_types: &'a [String],
     pub(crate) excluded_item_types: &'a [String],
     pub(crate) item_ids: Option<&'a [String]>,
+    pub(crate) person_id: Option<&'a str>,
     pub(crate) media_source_ids: Option<&'a [String]>,
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
@@ -17648,6 +17788,7 @@ mod tests {
                 item_types: &item_types,
                 excluded_item_types: &empty,
                 item_ids: None,
+                person_id: None,
                 media_source_ids: None,
                 years: &empty_years,
                 is_played: None,

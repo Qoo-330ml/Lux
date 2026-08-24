@@ -28,6 +28,225 @@ const PNG_1X1: &[u8] = &[
 const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
 
 #[tokio::test]
+async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let viewer = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let _denied = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user("denied", "Denied", "denied password", false)
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Mixed", LibraryKind::Mixed, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(viewer.id.to_string())
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    for (id, item_type, title, parent_id, series_id, premiere_date) in [
+        (
+            "movie-1",
+            "MOVIE",
+            "演员甲电影",
+            None,
+            None,
+            Some("2024-01-01"),
+        ),
+        (
+            "series-1",
+            "SERIES",
+            "演员甲剧集",
+            None,
+            None,
+            Some("2023-01-01"),
+        ),
+        (
+            "season-1",
+            "SEASON",
+            "第一季",
+            Some("series-1"),
+            Some("series-1"),
+            None,
+        ),
+        (
+            "episode-1",
+            "EPISODE",
+            "第一集",
+            Some("season-1"),
+            Some("series-1"),
+            Some("2023-01-02"),
+        ),
+        (
+            "episode-2",
+            "EPISODE",
+            "第二集",
+            Some("season-1"),
+            Some("series-1"),
+            Some("2023-01-03"),
+        ),
+        (
+            "denied-movie",
+            "MOVIE",
+            "隐藏电影",
+            None,
+            None,
+            Some("2022-01-01"),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, parent_id, series_id,
+                premiere_date, identification_status, has_available_source
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(id)
+        .bind(library.id.to_string())
+        .bind(item_type)
+        .bind(title)
+        .bind(title.to_lowercase())
+        .bind(parent_id)
+        .bind(series_id)
+        .bind(premiere_date)
+        .execute(database.pool())
+        .await?;
+    }
+    PeopleService::new(config.config_dir.clone())
+        .with_database(database.clone())
+        .persist_item_actors(
+            "movie-1",
+            "tmdb",
+            &[ActorCredit {
+                id: "42".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    for item_id in ["episode-1", "episode-2"] {
+        PeopleService::new(config.config_dir.clone())
+            .with_database(database.clone())
+            .persist_item_actors(
+                item_id,
+                "tmdb",
+                &[ActorCredit {
+                    id: "42".to_owned(),
+                    provider: None,
+                    identities: Vec::new(),
+                    name: "演员甲".to_owned(),
+                    character: Some("角色甲".to_owned()),
+                    order: Some(0),
+                    profile_url: None,
+                    person: None,
+                }],
+            )
+            .await?;
+    }
+    PeopleService::new(config.config_dir.clone())
+        .with_database(database.clone())
+        .persist_item_actors(
+            "denied-movie",
+            "tmdb",
+            &[ActorCredit {
+                id: "99".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "隐藏演员".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config, database, setup, web_auth, emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{address}");
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "viewer", "password": "viewer password"}))
+        .send()
+        .await?;
+    let cookies = cookie_pair(login.headers());
+
+    let search = client
+        .get(format!(
+            "{base_url}/api/v1/people?q=演员甲&page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(search.status(), reqwest::StatusCode::OK);
+    let search_body: Value = search.json().await?;
+    assert_eq!(search_body["total"], 1);
+    assert_eq!(search_body["items"][0]["id"], "42");
+
+    let works = client
+        .get(format!(
+            "{base_url}/api/v1/people/42/items?page=1&pageSize=12"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(works.status(), reqwest::StatusCode::OK);
+    let works_body: Value = works.json().await?;
+    assert_eq!(works_body["total"], 2);
+    assert_eq!(
+        works_body["items"]
+            .as_array()
+            .expect("works array")
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["movie-1", "series-1"]
+    );
+
+    let denied_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "denied", "password": "denied password"}))
+        .send()
+        .await?;
+    let denied_cookies = cookie_pair(denied_login.headers());
+    let denied_search = client
+        .get(format!(
+            "{base_url}/api/v1/people?q=隐藏演员&page=1&pageSize=12"
+        ))
+        .header(COOKIE, &denied_cookies)
+        .send()
+        .await?;
+    assert_eq!(denied_search.status(), reqwest::StatusCode::OK);
+    assert_eq!(denied_search.json::<Value>().await?["total"], 0);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn lux_person_favorites_are_user_scoped_and_require_person_acl_and_csrf()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

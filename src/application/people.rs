@@ -3441,6 +3441,29 @@ impl PeopleService {
         Ok((self.actor_views_from_credits(credits).await, total))
     }
 
+    pub async fn search_actors(
+        &self,
+        library_ids: &[String],
+        query: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<ActorView>, i64), PeopleError> {
+        let query = query.trim();
+        if !is_valid_person_lookup(query) {
+            return Err(PeopleError::InvalidComponent(query.to_owned()));
+        }
+        let Some(database) = &self.database else {
+            return Err(PeopleError::Storage(
+                "people database index is unavailable".to_owned(),
+            ));
+        };
+        let (credits, total) = database
+            .search_person_credits_for_libraries(library_ids, "Actor", query, offset, limit)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        Ok((self.actor_views_from_credits(credits).await, total))
+    }
+
     pub async fn find_person(
         &self,
         library_ids: &[String],
