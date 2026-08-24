@@ -808,7 +808,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-emby-report-row { display: grid; grid-template-columns: minmax(150px, 1.2fr) auto minmax(150px, 1fr); align-items: center; gap: 13px; min-height: 56px; border-bottom: 1px solid var(--lux-line-soft); font-size: .72rem; }
 .lux-emby-report-row > div { display: grid; gap: 4px; min-width: 0; }
 .lux-emby-report-row strong { overflow: hidden; color: #fff; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
-.lux-emby-report-row small, .lux-emby-report-row > span:last-child { overflow: hidden; color: var(--lux-subtle); text-overflow: ellipsis; white-space: nowrap; }
+.lux-emby-report-row small { overflow: hidden; color: var(--lux-subtle); text-overflow: ellipsis; white-space: nowrap; }
+.lux-emby-report-row > span:last-child { color: var(--lux-subtle); line-height: 1.45; overflow-wrap: anywhere; }
 .lux-emby-pagination { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 15px; color: var(--lux-subtle); font-size: .7rem; }
 .lux-emby-state, .lux-emby-empty { display: flex; align-items: center; gap: 9px; min-height: 74px; color: var(--lux-subtle); font-size: .74rem; }
 .lux-emby-empty { display: grid; align-content: center; justify-items: center; gap: 5px; min-height: 105px; border: 1px dashed var(--lux-line-soft); border-radius: 10px; text-align: center; }

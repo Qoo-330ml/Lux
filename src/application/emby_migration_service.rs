@@ -695,12 +695,9 @@ impl EmbyMigrationService {
                     };
                     processed += 1;
                     let outcome = match_item(&item, &identities);
-                    let detail = serde_json::to_string(&json!({
-                        "sourceTitle": item.name,
-                        "sourceType": item.item_type,
-                        "productionYear": item.production_year,
-                    }))
-                    .unwrap_or_else(|_| "{}".to_owned());
+                    let detail =
+                        serde_json::to_string(&migration_item_detail(&item, &outcome, &identities))
+                            .unwrap_or_else(|_| "{}".to_owned());
                     self.database
                         .upsert_emby_migration_item_match(&NewEmbyMigrationItemMatch {
                             job_id,
@@ -1300,6 +1297,31 @@ fn unmatched(_reason: &str) -> MatchOutcome {
     }
 }
 
+fn migration_item_detail(
+    item: &MigrationItem,
+    outcome: &MatchOutcome,
+    identities: &[StoredMigrationMediaIdentity],
+) -> serde_json::Value {
+    let lux_identity = outcome
+        .lux_item_id
+        .as_deref()
+        .and_then(|id| identities.iter().find(|identity| identity.id == id));
+    let lux_series_identity = lux_identity
+        .and_then(|identity| identity.series_id.as_deref())
+        .and_then(|series_id| identities.iter().find(|identity| identity.id == series_id));
+
+    json!({
+        "sourceTitle": item.name,
+        "sourceType": item.item_type,
+        "productionYear": item.production_year,
+        "luxTitle": lux_identity.map(|identity| identity.title.as_str()),
+        "luxItemType": lux_identity.map(|identity| identity.item_type.as_str()),
+        "luxSeriesTitle": lux_series_identity.map(|identity| identity.title.as_str()),
+        "luxSeasonNumber": lux_identity.and_then(|identity| identity.season_number),
+        "luxEpisodeNumber": lux_identity.and_then(|identity| identity.episode_number),
+    })
+}
+
 fn normalize_title(value: &str) -> String {
     value
         .chars()
@@ -1427,6 +1449,58 @@ mod tests {
         let outcome = match_item(&item, &[identity("lux-1", "{}"), identity("lux-2", "{}")]);
         assert_eq!(outcome.lux_item_id, None);
         assert_eq!(outcome.status, "CONFLICT");
+    }
+
+    #[test]
+    fn migration_match_detail_includes_lux_series_context() {
+        let item = MigrationItem {
+            id: "emby-episode-1".to_owned(),
+            name: "第十集".to_owned(),
+            item_type: "Episode".to_owned(),
+            production_year: Some(1986),
+            provider_ids: BTreeMap::new(),
+            parent_id: None,
+            series_id: Some("emby-series-1".to_owned()),
+            season_id: Some("emby-season-2".to_owned()),
+            index_number: Some(10),
+            parent_index_number: Some(2),
+            user_data: None,
+        };
+        let identities = vec![
+            StoredMigrationMediaIdentity {
+                id: "lux-series-1".to_owned(),
+                item_type: "SERIES".to_owned(),
+                title: "西游记".to_owned(),
+                production_year: Some(1986),
+                provider_ids_json: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+            },
+            StoredMigrationMediaIdentity {
+                id: "lux-episode-1".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                title: "第十集".to_owned(),
+                production_year: Some(1986),
+                provider_ids_json: None,
+                series_id: Some("lux-series-1".to_owned()),
+                season_number: Some(2),
+                episode_number: Some(10),
+            },
+        ];
+        let outcome = MatchOutcome {
+            lux_item_id: Some("lux-episode-1".to_owned()),
+            method: "EPISODE_KEY",
+            confidence: Some(95),
+            status: "MATCHED",
+        };
+
+        let detail = migration_item_detail(&item, &outcome, &identities);
+
+        assert_eq!(detail["luxTitle"], "第十集");
+        assert_eq!(detail["luxSeriesTitle"], "西游记");
+        assert_eq!(detail["luxSeasonNumber"], 2);
+        assert_eq!(detail["luxEpisodeNumber"], 10);
     }
 
     #[test]
