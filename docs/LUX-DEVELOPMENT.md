@@ -1464,7 +1464,9 @@ Web 使用 HttpOnly、Secure（HTTPS 下）、SameSite Cookie。改变状态的 
 - GET /api/v1/libraries
 - GET /api/v1/libraries/{id}/items（支持 `metadataStatus=PENDING` 待确认筛选）
 - GET /api/v1/items/{id}
+- GET /api/v1/people
 - GET /api/v1/people/{personId}
+- GET /api/v1/people/{personId}/items
 - GET /api/v1/search
 - GET /api/v1/items/{id}/playback
 - POST /api/v1/items/{id}/progress
@@ -1530,6 +1532,8 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 账户设置可调整首页媒体库顺序；顺序按用户持久化到服务端，并同步用于 Web 与 Emby 兼容视图。
 - 媒体库列表：类型、年份、已看、收藏筛选；名称、最近添加、发行日期、评分排序。
 - 搜索结果。
+- 演员搜索结果可进入人物详情；人物详情显示当前用户有权限访问的全部参演电影和剧集，分
+  页加载并按发行日期倒序。分集出演关系聚合为所属剧集，同一剧集只展示一次。
 - 电影详情：海报、背景、简介、年份、时长、版本、字幕信息、播放、收藏。
 - 电影和剧集详情显示本地 NFO 或所选刮削器提供的主要演员；演员姓名和角色不要求存在 provider ID，
   无头像时显示姓名首字母占位。已确认的人物身份和头像使用规范人物资源，可由 TMDb、IMDb、豆瓣等
@@ -1913,6 +1917,7 @@ services:
 | LUX-190 | docs/LUX-DEVELOPMENT.md、docs/LUX-190-PLAN.md、docs/decisions/022-emby-migration-plugin.md、docs/COMPATIBILITY.md |
 | LUX-191+ | src/application/emby_migration*.rs、src/storage/emby_migration.rs、src/api/mod.rs、src/auth/users.rs、migrations/、migrations-postgres/、docs/LUX-191-PLAN.md |
 | LUX-193 | migrations/、migrations-postgres/、src/storage/mod.rs、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/、tests/people_api.rs、web/tests/、docs/ |
+| LUX-194 | src/application/catalog.rs、src/application/people.rs、src/storage/mod.rs、src/api/mod.rs、web/src/features/search/、web/src/features/detail/、web/src/lib/api/、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4351,6 +4356,35 @@ API：
 
 - 不把演员收藏混入 Emby `FavoriteItems` 或媒体条目的 `user_item_state`。
 - 不在本任务增加演员收藏列表页面；后续如需要，单独设计分页列表接口和页面。
+
+#### LUX-194：演员搜索与人物参演作品
+
+范围：扩展 Lux Web 搜索，使用户可以按演员姓名搜索人物；人物详情显示当前用户有权限访问的全部
+参演电影和剧集。该能力只使用已持久化的 `person_credits` 关系，不调用 TMDb、不扫描 metadata
+目录，也不改变 Emby `/Persons` 的 DTO 合同。
+
+API：
+
+- `GET /api/v1/people?q={query}&page={page}&pageSize={pageSize}` 返回分页演员摘要。
+- `GET /api/v1/people/{personId}/items?page={page}&pageSize={pageSize}` 返回人物的分页参演作品。
+- 作品只返回 `MOVIE` 和 `SERIES`；分集出演关系聚合到所属剧集，同一剧集只返回一次。
+- 两个接口都严格执行当前用户的媒体库 ACL、启用状态、条目可用性和分页上限。
+- 人物搜索结果和人物作品结果不暴露媒体路径、完整外部 URL 或内部文件信息。
+
+Web 验收：
+
+- 搜索页显示人物结果和现有媒体标题搜索结果；点击人物结果进入人物详情。
+- 人物详情显示人物资料、头像和“参演作品”区域，作品使用现有媒体卡片和用户状态字段。
+- 作品列表分页加载；无作品、无头像、加载失败和无权限状态均有明确界面反馈。
+
+验证：
+
+- Rust 集成测试覆盖中文/英文人物搜索、同一人物去重、电影/剧集/分集聚合、分页和 ACL。
+- Web 单测覆盖搜索结果、人物详情作品加载和继续加载。
+- Playwright 覆盖搜索演员、进入人物详情和查看参演作品。
+- 运行 Rust/Web 基线检查，并记录 ARM64 验证。
+
+依赖：LUX-080、LUX-164、LUX-178、LUX-193。
 
 ## 26. 风险与缓解
 
