@@ -122,17 +122,22 @@ fn generic_scraper_identification_keeps_opaque_provider_ids() {
     let candidates = vec![luxd::application::scraper::ScraperSearchResult {
         title: Some("二毛".to_owned()),
         production_year: Some(2019),
-        provider_ids: [("Douban".to_owned(), "douban-123".to_owned())]
-            .into_iter()
-            .collect(),
+        provider_ids: [
+            ("Imdb".to_owned(), "tt123".to_owned()),
+            ("Douban".to_owned(), "douban-123".to_owned()),
+        ]
+        .into_iter()
+        .collect(),
         ..Default::default()
     }];
-    let decision = identify_scraper_movie(&identity, &candidates);
+    let decision = identify_scraper_movie(&identity, &candidates, "douban");
     assert_eq!(decision.status, IdentificationStatus::Confirmed);
     assert_eq!(
-        decision
-            .candidate
-            .and_then(|value| value.first_provider_id().map(str::to_owned)),
+        decision.candidate.and_then(|value| {
+            value
+                .selected_provider_entry("douban")
+                .map(|(_, id)| id.to_owned())
+        }),
         Some("douban-123".to_owned())
     );
 }

@@ -76,7 +76,7 @@ impl IdentificationCandidate for TmdbMovieSummary {
 
 impl IdentificationCandidate for ScraperSearchResult {
     fn provider_id(&self) -> Option<String> {
-        self.first_provider_id().map(str::to_owned)
+        None
     }
 
     fn title(&self) -> Option<&str> {
@@ -158,7 +158,11 @@ impl MovieIdentifier {
                 .await?
                 .items
         };
-        Ok(identify_scraper_movie(identity, &candidates))
+        Ok(identify_scraper_movie(
+            identity,
+            &candidates,
+            self.client.provider_key(),
+        ))
     }
 }
 
@@ -174,21 +178,25 @@ where
             .map(|value| value.to_string())
             .as_deref(),
         candidates,
+        |candidate| candidate.provider_id(),
     )
 }
 
-pub fn identify_scraper_movie<C>(
+pub fn identify_scraper_movie(
     identity: &ScraperMovieIdentity,
-    candidates: &[C],
-) -> IdentificationDecision<C>
-where
-    C: IdentificationCandidate,
-{
+    candidates: &[ScraperSearchResult],
+    provider_key: &str,
+) -> IdentificationDecision<ScraperSearchResult> {
     identify_with_provider(
         &identity.title,
         identity.year,
         identity.provider_id.as_deref(),
         candidates,
+        |candidate| {
+            candidate
+                .selected_provider_entry(provider_key)
+                .map(|(_, id)| id.to_owned())
+        },
     )
 }
 
@@ -197,6 +205,7 @@ fn identify_with_provider<C>(
     year: Option<i32>,
     provider_id: Option<&str>,
     candidates: &[C],
+    candidate_provider_id: impl Fn(&C) -> Option<String> + Copy,
 ) -> IdentificationDecision<C>
 where
     C: IdentificationCandidate,
@@ -204,7 +213,7 @@ where
     if let Some(provider_id) = provider_id {
         if let Some(candidate) = candidates
             .iter()
-            .find(|candidate| candidate.provider_id().as_deref() == Some(provider_id))
+            .find(|candidate| candidate_provider_id(candidate).as_deref() == Some(provider_id))
         {
             return IdentificationDecision {
                 status: IdentificationStatus::Confirmed,
@@ -237,7 +246,7 @@ where
         right
             .0
             .cmp(&left.0)
-            .then_with(|| left.1.provider_id().cmp(&right.1.provider_id()))
+            .then_with(|| candidate_provider_id(left.1).cmp(&candidate_provider_id(right.1)))
     });
     let (top_score, top_candidate) = scored[0];
     let tied = scored.get(1).is_some_and(|(score, _)| *score == top_score);
