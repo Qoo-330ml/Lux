@@ -1921,6 +1921,7 @@ services:
 | LUX-191+ | src/application/emby_migration*.rs、src/storage/emby_migration.rs、src/api/mod.rs、src/auth/users.rs、migrations/、migrations-postgres/、docs/LUX-191-PLAN.md |
 | LUX-193 | migrations/、migrations-postgres/、src/storage/mod.rs、src/api/mod.rs、web/src/features/detail/、web/src/lib/api/、tests/people_api.rs、web/tests/、docs/ |
 | LUX-194 | src/application/catalog.rs、src/application/people.rs、src/storage/mod.rs、src/api/mod.rs、web/src/features/search/、web/src/features/detail/、web/src/lib/api/、tests/、docs/ |
+| LUX-195 | src/application/scraper.rs、src/application/tmdb_plugin.rs、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/candidates.rs、src/application/reidentify.rs、src/application/images.rs、src/application/collections.rs、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4391,6 +4392,34 @@ Web 验收：
 - 运行 Rust/Web 基线检查，并记录 ARM64 验证。
 
 依赖：LUX-080、LUX-164、LUX-178、LUX-193。
+
+#### LUX-195：Provider-neutral 元数据刮削器边界
+
+范围：将 TMDb、IMDb、豆瓣及后续元数据来源统一置于 provider-neutral 的应用层合同之后。TMDb
+仍可保留自己的 endpoint façade、语言回退和数字 ID 适配，但候选匹配、重新识别、NFO/图片写回、
+人物关联、合集和后台任务不得依赖 TMDb 类型、数字 ID 或固定 provider 名称。
+
+每个 metadata 插件必须声明稳定的 `providerKey`，插件安装 ID 与元数据身份命名空间分离。内部
+provider ID 统一按字符串和 provider namespace 处理，兼容 `tmdb:123`、`imdb:tt123`、
+`imdb:nm123` 以及豆瓣等来源的非数字 ID。插件能力由 manifest 和通用 capability 读取，业务层
+不得通过插件 ID 或字符串包含关系判断能力。
+
+验收：
+
+- [ ] 通用 metadata RPC 不再通过 TMDb typed adapter 转换；TMDb endpoint façade 只属于 TMDb adapter。
+- [ ] provider ID 精确匹配、候选保存、NFO 写回、图片 source 和人物身份均使用当前所选 provider。
+- [ ] TMDb、IMDb 风格字母数字 ID、豆瓣风格任意字符串 ID 各有同一套 provider-neutral 单测和集成 fixture。
+- [ ] TMDb 现有搜索、语言回退、合集、图片、人物和重新识别行为保持不变；不新增数据库 migration。
+- [ ] 不支持某项 capability 的 provider 返回稳定的“不支持”结果，不伪造 TMDb 数据或把错误报告为 TMDb 故障。
+
+验证：
+
+- 先运行 provider、scraper、candidate、metadata selection 和 reidentify 相关 Rust 测试。
+- 运行 `cargo fmt --all -- --check`、`cargo build --locked`、`cargo test --locked --all-targets` 和
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`。
+- 更新 `docs/COMPATIBILITY.md` 和本任务 ADR，记录插件 ID、provider key、能力和 provider ID 规则。
+
+依赖：LUX-142、LUX-168、LUX-178、LUX-194。
 
 ## 26. 风险与缓解
 
