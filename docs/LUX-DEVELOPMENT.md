@@ -4404,11 +4404,11 @@ provider ID 统一按字符串和 provider namespace 处理，兼容 `tmdb:123`�
 
 验收：
 
-- [ ] 通用 metadata RPC 不再通过 TMDb typed adapter 转换；TMDb endpoint façade 只属于 TMDb adapter。
-- [ ] provider ID 精确匹配、候选保存、NFO 写回、图片 source 和人物身份均使用当前所选 provider。
-- [ ] TMDb、IMDb 风格字母数字 ID、豆瓣风格任意字符串 ID 各有同一套 provider-neutral 单测和集成 fixture。
-- [ ] TMDb 现有搜索、语言回退、合集、图片、人物和重新识别行为保持不变；不新增数据库 migration。
-- [ ] 不支持某项 capability 的 provider 返回稳定的“不支持”结果，不伪造 TMDb 数据或把错误报告为 TMDb 故障。
+- [x] 通用 metadata RPC 不再通过 TMDb typed adapter 转换；TMDb endpoint façade 只属于 TMDb adapter。
+- [x] provider ID 精确匹配、候选保存、NFO 写回、图片 source 和人物身份均使用当前所选 provider。
+- [x] TMDb、IMDb 风格字母数字 ID、豆瓣风格任意字符串 ID 各有同一套 provider-neutral 单测和集成 fixture。
+- [x] TMDb 现有搜索、语言回退、合集、图片、人物和重新识别行为保持不变；不新增数据库 migration。
+- [x] 不支持某项 capability 的 provider 返回稳定的“不支持”结果，不伪造 TMDb 数据或把错误报告为 TMDb 故障。
 
 验证：
 

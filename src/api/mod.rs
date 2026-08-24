@@ -75,12 +75,12 @@ use crate::{
             NfoWriteError,
         },
         people::{PeopleError, PeopleService, PersonMetadataUpdate},
-        plugins::{PluginPage, PluginService, PluginServiceError},
+        plugins::{PluginPage, PluginService, PluginServiceError, TMDB_DYNAMIC_PLUGIN_ID},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::validate_cron,
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
-        scraper::ScraperResolver,
+        scraper::{ScraperPluginClient, ScraperResolver},
         settings::{read_network_proxy_url_async, write_network_proxy_url},
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{
@@ -88,7 +88,7 @@ use crate::{
         },
         thumbnails::ThumbnailService,
         tmdb::TmdbClient,
-        tmdb_plugin::{ScraperProvider, TmdbPluginClient},
+        tmdb_plugin::ScraperProvider,
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
         webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
@@ -157,7 +157,7 @@ pub struct AppState {
     plugins: Option<PluginService>,
     emby_migration: Option<Arc<EmbyMigrationService>>,
     scraper_resolver: Option<ScraperResolver>,
-    tmdb: Option<ScraperProvider>,
+    scraper: Option<ScraperProvider>,
     collections: Option<CollectionService>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
@@ -229,12 +229,17 @@ impl AppState {
             plugins.clone(),
             config_dir.clone(),
         )));
-        let tmdb = ScraperProvider::Plugin(TmdbPluginClient::new(plugins.clone()));
+        let scraper = ScraperProvider::Generic(ScraperPluginClient::new_with_provider_key(
+            plugins.clone(),
+            TMDB_DYNAMIC_PLUGIN_ID,
+            "tmdb",
+            plugins.provider_cache(),
+        ));
         let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
         let collections = Some(
             CollectionService::with_resolver(
                 database.clone(),
-                tmdb.clone(),
+                scraper.clone(),
                 scraper_resolver.clone(),
             )
             .with_config_dir(config.config_dir.clone()),
@@ -242,7 +247,7 @@ impl AppState {
         let metadata_reidentify = Some(
             MetadataReidentifyService::with_resolver_and_selection(
                 database.clone(),
-                tmdb.clone(),
+                scraper.clone(),
                 scraper_resolver.clone(),
                 metadata_selection.clone(),
             )
@@ -251,7 +256,7 @@ impl AppState {
         );
         let image_candidates = Some(ImageCandidateService::with_resolver(
             database.clone(),
-            tmdb.clone(),
+            scraper.clone(),
             scraper_resolver.clone(),
         ));
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
@@ -361,7 +366,7 @@ impl AppState {
             plugins: Some(plugins.clone()),
             emby_migration,
             scraper_resolver: Some(scraper_resolver),
-            tmdb: Some(tmdb),
+            scraper: Some(scraper),
             collections,
             people: Some(people),
             local_nfo: Some(local_nfo),
@@ -375,10 +380,7 @@ impl AppState {
         }
     }
 
-    pub fn with_tmdb_client(mut self, tmdb: TmdbClient) -> Self {
-        let Some(database) = self.database.clone() else {
-            return self;
-        };
+    pub fn with_tmdb_client(self, tmdb: TmdbClient) -> Self {
         let tmdb = ScraperProvider::from(
             tmdb.with_cache_dir(
                 self.config_dir
@@ -389,10 +391,24 @@ impl AppState {
                     }),
             ),
         );
-        self.tmdb = Some(tmdb.clone());
+        self.with_scraper(tmdb)
+    }
+
+    pub fn with_scraper<T>(mut self, scraper: T) -> Self
+    where
+        T: Into<ScraperProvider>,
+    {
+        let Some(database) = self.database.clone() else {
+            return self;
+        };
+        let scraper = scraper.into();
+        self.scraper = Some(scraper.clone());
         if let Some(resolver) = self.scraper_resolver.clone() {
-            let mut collections =
-                CollectionService::with_resolver(database.clone(), tmdb.clone(), resolver.clone());
+            let mut collections = CollectionService::with_resolver(
+                database.clone(),
+                scraper.clone(),
+                resolver.clone(),
+            );
             if let Some(config_dir) = self.config_dir.clone() {
                 collections = collections.with_config_dir(config_dir);
             }
@@ -400,7 +416,7 @@ impl AppState {
             self.metadata_reidentify = Some(
                 MetadataReidentifyService::with_resolver_and_selection(
                     database.clone(),
-                    tmdb.clone(),
+                    scraper.clone(),
                     resolver.clone(),
                     self.metadata_selection.clone(),
                 )
@@ -408,10 +424,10 @@ impl AppState {
                 .with_resource_metrics(self.resources.clone()),
             );
             self.image_candidates = Some(ImageCandidateService::with_resolver(
-                database, tmdb, resolver,
+                database, scraper, resolver,
             ));
         } else {
-            let mut collections = CollectionService::new(database.clone(), tmdb.clone());
+            let mut collections = CollectionService::new(database.clone(), scraper.clone());
             if let Some(config_dir) = self.config_dir.clone() {
                 collections = collections.with_config_dir(config_dir);
             }
@@ -419,13 +435,13 @@ impl AppState {
             self.metadata_reidentify = Some(
                 MetadataReidentifyService::with_selection(
                     database.clone(),
-                    tmdb.clone(),
+                    scraper.clone(),
                     self.metadata_selection.clone(),
                 )
                 .with_admin_events(self.admin_events.clone())
                 .with_resource_metrics(self.resources.clone()),
             );
-            self.image_candidates = Some(ImageCandidateService::new(database, tmdb));
+            self.image_candidates = Some(ImageCandidateService::new(database, scraper));
         }
         self
     }
@@ -15965,7 +15981,7 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
         },
         "config": { "available": config_available, "writable": config_writable },
         "ffprobe": { "available": ffprobe_available },
-        "tmdb": { "configured": state.tmdb.is_some() },
+        "tmdb": { "configured": state.scraper.is_some() },
         "jobs": {
             "scanRunning": jobs["scanRunning"],
             "scanFailed": jobs["scanFailed"],
@@ -17181,7 +17197,7 @@ async fn admin_search_item_candidates(
         )
         .into_response();
     }
-    let Some(fallback_tmdb) = state.tmdb.as_ref().cloned() else {
+    let Some(fallback_scraper) = state.scraper.as_ref().cloned() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -17190,10 +17206,10 @@ async fn admin_search_item_candidates(
         )
         .into_response();
     };
-    let tmdb = if let Some(resolver) = state.scraper_resolver.as_ref() {
+    let scraper = if let Some(resolver) = state.scraper_resolver.as_ref() {
         match resolver.for_item(&item_id).await {
             Ok(Some(scraper)) => ScraperProvider::from_scraper(scraper),
-            Ok(None) => fallback_tmdb,
+            Ok(None) => fallback_scraper,
             Err(error) => {
                 return api_error(
                     &headers,
@@ -17205,7 +17221,7 @@ async fn admin_search_item_candidates(
             }
         }
     } else {
-        fallback_tmdb
+        fallback_scraper
     };
     let Some(candidates) = state.metadata_candidates.as_ref() else {
         return api_error(
@@ -17217,7 +17233,7 @@ async fn admin_search_item_candidates(
         .into_response();
     };
     match candidates
-        .search_and_store(&item_id, &request.query, request.year, &tmdb)
+        .search_and_store(&item_id, &request.query, request.year, &scraper)
         .await
     {
         Ok(page) => {
@@ -18553,9 +18569,10 @@ async fn admin_update_plugin_config(
             if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID
                 || plugin_id == crate::application::plugins::TMDB_DYNAMIC_PLUGIN_ID
             {
-                if let Some(tmdb) = state.tmdb.as_ref() {
+                if let Some(scraper) = state.scraper.as_ref() {
                     if let Some(api_key) = api_key {
-                        tmdb.set_api_key((!api_key.is_empty()).then_some(api_key))
+                        scraper
+                            .set_api_key((!api_key.is_empty()).then_some(api_key))
                             .await;
                     }
                 }
@@ -19617,6 +19634,7 @@ fn plugin_json(plugin: &crate::application::plugins::PluginView) -> Value {
         "category": plugin.category,
         "version": plugin.version,
         "runtime": plugin.runtime,
+        "providerKey": plugin.provider_key,
         "capabilities": plugin.capabilities,
         "status": plugin.status,
         "running": plugin.running,

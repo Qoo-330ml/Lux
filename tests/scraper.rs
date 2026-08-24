@@ -74,12 +74,18 @@ fn generic_scraper_decodes_provider_neutral_responses() {
             "OriginalTitle": "Er Mao",
             "ProductionYear": 2019,
             "Rating": 8.6,
-            "ProviderIds": {"Douban": "douban-123"},
+            "ProviderIds": {
+                "Tmdb": "123",
+                "Imdb": "tt1234567",
+                "Douban": "douban-123"
+            },
             "SearchProviderName": "Douban"
         }]
     }))
     .expect("search response should decode");
     assert_eq!(search.items[0].provider_id("Douban"), Some("douban-123"));
+    assert_eq!(search.items[0].provider_id("Imdb"), Some("tt1234567"));
+    assert_eq!(search.items[0].provider_id("Tmdb"), Some("123"));
     assert_eq!(search.items[0].title.as_deref(), Some("二毛"));
     assert_eq!(search.items[0].rating, Some(8.6));
 
@@ -88,7 +94,11 @@ fn generic_scraper_decodes_provider_neutral_responses() {
             "Type": "Movie",
             "Name": "二毛",
             "Rating": 8.6,
-            "ProviderIds": {"Douban": "douban-123"}
+            "ProviderIds": {
+                "Tmdb": "123",
+                "Imdb": "tt1234567",
+                "Douban": "douban-123"
+            }
         }
     }))
     .expect("metadata response should decode");
@@ -139,5 +149,37 @@ fn generic_scraper_identification_keeps_opaque_provider_ids() {
                 .map(|(_, id)| id.to_owned())
         }),
         Some("douban-123".to_owned())
+    );
+}
+
+#[test]
+fn generic_scraper_identification_selects_imdb_ids_without_numeric_assumptions() {
+    let identity = ScraperMovieIdentity {
+        title: "Example Movie".to_owned(),
+        year: Some(2024),
+        provider_id: Some("tt1234567".to_owned()),
+    };
+    let candidates = vec![luxd::application::scraper::ScraperSearchResult {
+        title: Some("Example Movie".to_owned()),
+        production_year: Some(2024),
+        provider_ids: [
+            ("Tmdb".to_owned(), "987".to_owned()),
+            ("Imdb".to_owned(), "tt1234567".to_owned()),
+            ("Douban".to_owned(), "douban-456".to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    }];
+
+    let decision = identify_scraper_movie(&identity, &candidates, "imdb");
+    assert_eq!(decision.status, IdentificationStatus::Confirmed);
+    assert_eq!(
+        decision.candidate.and_then(|value| {
+            value
+                .selected_provider_entry("imdb")
+                .map(|(_, id)| id.to_owned())
+        }),
+        Some("tt1234567".to_owned())
     );
 }

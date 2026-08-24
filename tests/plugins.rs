@@ -23,6 +23,7 @@ fn signed_dynamic_manifest() -> Value {
         "apiVersion": 1,
         "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
         "type": "metadata",
+        "providerKey": "tmdb",
         "supportedItemTypes": ["Movie"],
         "capabilities": ["metadata.search"],
         "configFields": [{
@@ -74,10 +75,11 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
             "description": "从 TMDb 提供 Emby 风格电影、剧集和图片元数据。",
             "version": "0.1.5",
             "apiVersion": 1,
-            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
-            "type": "metadata",
-            "category": "SCRAPER",
-            "supportedItemTypes": ["Movie"],
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "category": "SCRAPER",
+            "providerKey": "tmdb",
+        "supportedItemTypes": ["Movie"],
             "capabilities": ["metadata.search"],
             "configFields": [{
                 "key": "apiKey",
@@ -189,6 +191,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
             .is_some_and(|total| total >= 6)
     );
     assert_eq!(tmdb["category"], "SCRAPER");
+    assert_eq!(tmdb["providerKey"], "tmdb");
     assert_eq!(tmdb["version"], "0.1.5");
     // The default store is intentionally live, so its published version can
     // advance independently of this local-package installation test.

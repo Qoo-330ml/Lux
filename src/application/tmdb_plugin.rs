@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use crate::application::{
-    plugins::{PluginService, TMDB_DYNAMIC_PLUGIN_ID},
     scraper::{
         ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse, ScraperGetRequest,
         ScraperImage, ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
@@ -15,95 +14,11 @@ use crate::application::{
     },
 };
 
-#[derive(Clone)]
-pub struct TmdbPluginClient {
-    scraper: ScraperPluginClient,
-}
-
-impl TmdbPluginClient {
-    pub fn new(plugins: PluginService) -> Self {
-        Self {
-            scraper: ScraperPluginClient::new_with_provider_key(
-                plugins.clone(),
-                TMDB_DYNAMIC_PLUGIN_ID,
-                "tmdb",
-                plugins.provider_cache(),
-            ),
-        }
-    }
-
-    pub fn from_scraper(scraper: ScraperPluginClient) -> Self {
-        Self { scraper }
-    }
-
-    pub fn provider_key(&self) -> &str {
-        self.scraper.provider_key()
-    }
-
-    pub fn plugin_id(&self) -> &str {
-        self.scraper.plugin_id()
-    }
-
-    pub(crate) async fn clear_response_cache(&self) {
-        self.scraper.clear_response_cache().await;
-    }
-
-    pub async fn search_generic(
-        &self,
-        request: ScraperSearchRequest,
-    ) -> Result<ScraperSearchResponse, ScraperError> {
-        self.scraper.search(request).await
-    }
-
-    pub async fn get_generic(
-        &self,
-        request: ScraperGetRequest,
-    ) -> Result<ScraperMetadata, ScraperError> {
-        self.scraper.get(request).await
-    }
-
-    pub async fn bundle_generic(
-        &self,
-        request: ScraperGetRequest,
-    ) -> Result<ScraperMetadataBundle, ScraperError> {
-        self.scraper.bundle(request).await
-    }
-
-    pub async fn images_generic(
-        &self,
-        request: ScraperImageRequest,
-    ) -> Result<ScraperImagesResponse, ScraperError> {
-        self.scraper.images(request).await
-    }
-
-    pub async fn credits_generic(
-        &self,
-        request: ScraperGetRequest,
-    ) -> Result<ScraperCreditsResponse, ScraperError> {
-        self.scraper.credits(request).await
-    }
-
-    pub async fn external_ids_generic(
-        &self,
-        request: ScraperGetRequest,
-    ) -> Result<ScraperExternalIdsResponse, ScraperError> {
-        self.scraper.external_ids(request).await
-    }
-
-    pub async fn trailers_generic(
-        &self,
-        request: ScraperGetRequest,
-    ) -> Result<ScraperTrailersResponse, ScraperError> {
-        self.scraper.trailers(request).await
-    }
-}
-
 /// Provider-neutral application adapter. TMDb's typed endpoint models stay in the
 /// direct adapter helpers below; external plugins use the generic scraper RPC.
 #[derive(Clone)]
 pub enum ScraperProvider {
     Direct(TmdbClient),
-    Plugin(TmdbPluginClient),
     Generic(ScraperPluginClient),
 }
 
@@ -117,7 +32,6 @@ impl ScraperProvider {
     pub fn plugin_id(&self) -> Option<&str> {
         match self {
             Self::Direct(_) => None,
-            Self::Plugin(client) => Some(client.plugin_id()),
             Self::Generic(client) => Some(client.plugin_id()),
         }
     }
@@ -125,17 +39,12 @@ impl ScraperProvider {
     pub fn provider_key(&self) -> &str {
         match self {
             Self::Direct(_) => "tmdb",
-            Self::Plugin(client) => client.provider_key(),
             Self::Generic(client) => client.provider_key(),
         }
     }
 
     pub fn from_scraper(client: ScraperPluginClient) -> Self {
-        if client.plugin_id() == TMDB_DYNAMIC_PLUGIN_ID {
-            Self::Plugin(TmdbPluginClient::from_scraper(client))
-        } else {
-            Self::Generic(client)
-        }
+        Self::Generic(client)
     }
 
     pub fn selected_provider_entry<'a>(
@@ -153,7 +62,6 @@ impl ScraperProvider {
     ) -> Result<ScraperSearchResponse, ScraperError> {
         match self {
             Self::Direct(client) => direct_search_generic(client, request).await,
-            Self::Plugin(client) => client.search_generic(request).await,
             Self::Generic(client) => client.search(request).await,
         }
     }
@@ -164,7 +72,6 @@ impl ScraperProvider {
     ) -> Result<ScraperMetadata, ScraperError> {
         match self {
             Self::Direct(client) => direct_get_generic(client, request).await,
-            Self::Plugin(client) => client.get_generic(request).await,
             Self::Generic(client) => client.get(request).await,
         }
     }
@@ -174,10 +81,9 @@ impl ScraperProvider {
         request: ScraperGetRequest,
     ) -> Result<ScraperMetadataBundle, ScraperError> {
         match self {
-            Self::Direct(_) => Err(ScraperError::Provider(
-                "metadata bundle is not available for the direct provider".to_owned(),
+            Self::Direct(_) => Err(ScraperError::UnsupportedCapability(
+                "metadata.bundle".to_owned(),
             )),
-            Self::Plugin(client) => client.bundle_generic(request).await,
             Self::Generic(client) => client.bundle(request).await,
         }
     }
@@ -188,7 +94,6 @@ impl ScraperProvider {
     ) -> Result<ScraperImagesResponse, ScraperError> {
         match self {
             Self::Direct(client) => direct_images_generic(client, request).await,
-            Self::Plugin(client) => client.images_generic(request).await,
             Self::Generic(client) => client.images(request).await,
         }
     }
@@ -199,7 +104,6 @@ impl ScraperProvider {
     ) -> Result<ScraperCreditsResponse, ScraperError> {
         match self {
             Self::Direct(client) => direct_credits_generic(client, request).await,
-            Self::Plugin(client) => client.credits_generic(request).await,
             Self::Generic(client) => client.credits(request).await,
         }
     }
@@ -210,7 +114,6 @@ impl ScraperProvider {
     ) -> Result<ScraperExternalIdsResponse, ScraperError> {
         match self {
             Self::Direct(client) => direct_external_ids_generic(client, request).await,
-            Self::Plugin(client) => client.external_ids_generic(request).await,
             Self::Generic(client) => client.external_ids(request).await,
         }
     }
@@ -221,7 +124,6 @@ impl ScraperProvider {
     ) -> Result<ScraperTrailersResponse, ScraperError> {
         match self {
             Self::Direct(client) => direct_trailers_generic(client, request).await,
-            Self::Plugin(client) => client.trailers_generic(request).await,
             Self::Generic(client) => client.trailers(request).await,
         }
     }
@@ -235,7 +137,6 @@ impl ScraperProvider {
     pub(crate) async fn clear_response_cache(&self) {
         match self {
             Self::Direct(client) => client.clear_response_cache().await,
-            Self::Plugin(client) => client.clear_response_cache().await,
             Self::Generic(client) => client.clear_response_cache().await,
         }
     }

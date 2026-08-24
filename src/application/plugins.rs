@@ -1744,11 +1744,15 @@ impl PluginService {
             .unwrap_or_else(|| {
                 crate::application::scraper::provider_key_from_plugin_id(&plugin_id)
             });
+        let capabilities = catalog
+            .get(&plugin_id)
+            .map(|plugin| plugin.manifest.capabilities.clone());
         Ok(
-            crate::application::scraper::ScraperPluginClient::new_with_provider_key(
+            crate::application::scraper::ScraperPluginClient::new_with_provider_key_and_capabilities(
                 self.clone(),
                 plugin_id,
                 provider_key,
+                capabilities,
                 self.provider_cache(),
             ),
         )
@@ -1987,6 +1991,7 @@ impl PluginService {
             category: plugin.manifest.category.clone(),
             version: Some(plugin.manifest.version.clone()),
             runtime: Some(plugin.manifest.runtime.kind.clone()),
+            provider_key: plugin.manifest.provider_key.clone(),
             capabilities: plugin.manifest.capabilities.clone(),
             status: if disabled_by_other_ip_provider {
                 "DISABLED".to_owned()
@@ -2249,6 +2254,7 @@ fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) 
         category: entry.category.clone(),
         version: Some(entry.version.clone()),
         runtime: (!entry.runtime.is_empty()).then(|| entry.runtime.clone()),
+        provider_key: entry.provider_key.clone(),
         capabilities: entry.capabilities.clone(),
         status: if enabled {
             "READY".to_owned()
@@ -2469,6 +2475,7 @@ pub struct PluginView {
     pub category: String,
     pub version: Option<String>,
     pub runtime: Option<String>,
+    pub provider_key: Option<String>,
     pub capabilities: Vec<String>,
     pub status: String,
     pub running: bool,

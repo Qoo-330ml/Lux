@@ -5,8 +5,15 @@ use serde_json::Value;
 use tokio::time::{Duration, sleep};
 
 use crate::{
-    application::plugins::{PluginService, PluginServiceError},
     application::provider_cache::{CacheLookup, ProviderResponseCache, cache_key, ttl_for_method},
+    application::{
+        plugin_protocol::{
+            METADATA_BUNDLE_CAPABILITY, METADATA_CREDITS_CAPABILITY,
+            METADATA_EXTERNAL_IDS_CAPABILITY, METADATA_GET_CAPABILITY, METADATA_IMAGES_CAPABILITY,
+            METADATA_SEARCH_CAPABILITY, METADATA_TRAILERS_CAPABILITY,
+        },
+        plugins::{PluginService, PluginServiceError},
+    },
     storage::{Database, StorageError},
 };
 
@@ -195,7 +202,8 @@ mod tests {
 
     use super::{
         PluginServiceError, ScraperError, ScraperSearchResult, decode_bundle_response,
-        provider_id_for_key, provider_key_from_plugin_id, retryable_scraper_error,
+        metadata_capability_for_method, provider_id_for_key, provider_key_from_plugin_id,
+        retryable_scraper_error,
     };
     use crate::application::plugin_runtime::PluginRuntimeError;
     use serde_json::json;
@@ -285,6 +293,28 @@ mod tests {
             "invalid payload".to_owned(),
         )));
     }
+
+    #[test]
+    fn metadata_methods_map_to_declared_capabilities() {
+        assert_eq!(
+            metadata_capability_for_method("metadata.search"),
+            Some("metadata.search")
+        );
+        assert_eq!(
+            metadata_capability_for_method("metadata.externalIds"),
+            Some("metadata.externalIds")
+        );
+        assert_eq!(metadata_capability_for_method("chapters.lookup"), None);
+    }
+
+    #[test]
+    fn unsupported_metadata_capability_has_stable_error_text() {
+        let error = ScraperError::UnsupportedCapability("metadata.images".to_owned());
+        assert_eq!(
+            error.to_string(),
+            "scraper capability unavailable: metadata.images"
+        );
+    }
 }
 
 impl ScraperSearchResult {
@@ -353,6 +383,19 @@ pub fn provider_id_for_key<'a>(
                     || provider.eq_ignore_ascii_case(&short_provider))
         })
         .map(|(_, value)| value.as_str())
+}
+
+pub(crate) fn metadata_capability_for_method(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "metadata.search" => METADATA_SEARCH_CAPABILITY,
+        "metadata.get" => METADATA_GET_CAPABILITY,
+        "metadata.bundle" => METADATA_BUNDLE_CAPABILITY,
+        "metadata.images" => METADATA_IMAGES_CAPABILITY,
+        "metadata.credits" => METADATA_CREDITS_CAPABILITY,
+        "metadata.externalIds" => METADATA_EXTERNAL_IDS_CAPABILITY,
+        "metadata.trailers" => METADATA_TRAILERS_CAPABILITY,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -576,6 +619,7 @@ pub struct ScraperPluginClient {
     plugins: PluginService,
     plugin_id: String,
     provider_key: String,
+    capabilities: Option<Vec<String>>,
     response_cache: ProviderResponseCache,
 }
 
@@ -586,10 +630,27 @@ impl ScraperPluginClient {
         provider_key: impl Into<String>,
         response_cache: ProviderResponseCache,
     ) -> Self {
+        Self::new_with_provider_key_and_capabilities(
+            plugins,
+            plugin_id,
+            provider_key,
+            None,
+            response_cache,
+        )
+    }
+
+    pub(crate) fn new_with_provider_key_and_capabilities(
+        plugins: PluginService,
+        plugin_id: impl Into<String>,
+        provider_key: impl Into<String>,
+        capabilities: Option<Vec<String>>,
+        response_cache: ProviderResponseCache,
+    ) -> Self {
         Self {
             plugins,
             plugin_id: plugin_id.into(),
             provider_key: provider_key.into(),
+            capabilities,
             response_cache,
         }
     }
@@ -672,6 +733,15 @@ impl ScraperPluginClient {
         method: &str,
         params: Value,
     ) -> Result<Value, ScraperError> {
+        if let (Some(capabilities), Some(capability)) = (
+            self.capabilities.as_ref(),
+            metadata_capability_for_method(method),
+        ) && !capabilities
+            .iter()
+            .any(|declared| declared.eq_ignore_ascii_case(capability))
+        {
+            return Err(ScraperError::UnsupportedCapability(capability.to_owned()));
+        }
         let Some(cache_key) = cache_key(&self.plugin_id, method, &params) else {
             return self.call_scraper_with_retry(method, params).await;
         };
@@ -749,9 +819,10 @@ fn is_negative_scraper_error(error: &ScraperError) -> bool {
             let code = code.to_ascii_lowercase();
             code == "not_found" || code == "notfound" || code == "404"
         }
-        ScraperError::Plugin(_) | ScraperError::Storage(_) | ScraperError::InvalidResponse(_) => {
-            false
-        }
+        ScraperError::Plugin(_)
+        | ScraperError::Storage(_)
+        | ScraperError::UnsupportedCapability(_)
+        | ScraperError::InvalidResponse(_) => false,
     }
 }
 
@@ -833,6 +904,7 @@ fn decode_wrapped<T: serde::de::DeserializeOwned>(
 pub enum ScraperError {
     Plugin(PluginServiceError),
     Storage(StorageError),
+    UnsupportedCapability(String),
     Provider(String),
     InvalidResponse(String),
 }
@@ -842,6 +914,9 @@ impl fmt::Display for ScraperError {
         match self {
             Self::Plugin(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
+            Self::UnsupportedCapability(capability) => {
+                write!(formatter, "scraper capability unavailable: {capability}")
+            }
             Self::Provider(error) => formatter.write_str(error),
             Self::InvalidResponse(message) => {
                 write!(formatter, "invalid scraper response: {message}")

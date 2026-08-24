@@ -509,21 +509,6 @@ impl ImageWriteService {
         Ok(canonical_directory)
     }
 
-    pub async fn download_item_image_from_tmdb_candidate(
-        &self,
-        item_id: &str,
-        image_type: &str,
-        image_url: &str,
-    ) -> Result<ImageWriteReport, ImageWriteError> {
-        if !is_allowed_tmdb_image_url(image_url) {
-            return Err(ImageWriteError::InvalidUrl(
-                "selected image URL must be an HTTPS TMDb image path".to_owned(),
-            ));
-        }
-        self.download_item_image_with_source(item_id, image_type, image_url, "TMDB")
-            .await
-    }
-
     pub async fn download_item_image_from_scraper_candidate(
         &self,
         item_id: &str,
@@ -1539,22 +1524,6 @@ impl From<StorageError> for ImageWriteError {
     }
 }
 
-fn is_allowed_tmdb_image_url(value: &str) -> bool {
-    let Ok(url) = Url::parse(value) else {
-        return false;
-    };
-    url.scheme().eq_ignore_ascii_case("https")
-        && url
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case("image.tmdb.org"))
-        && url.port().is_none()
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.path().starts_with("/t/p/")
-        && url.query().is_none()
-        && url.fragment().is_none()
-}
-
 fn is_allowed_scraper_image_url(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
@@ -1582,7 +1551,7 @@ fn retryable_image_status(status: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_scraper_image_url, is_allowed_tmdb_image_url, retryable_image_status};
+    use super::{is_allowed_scraper_image_url, retryable_image_status};
 
     #[test]
     fn image_retries_only_transient_upstream_statuses() {
@@ -1591,22 +1560,6 @@ mod tests {
         assert!(retryable_image_status(503));
         assert!(!retryable_image_status(200));
         assert!(!retryable_image_status(404));
-    }
-
-    #[test]
-    fn selected_image_urls_are_limited_to_tmdb_image_paths() {
-        assert!(is_allowed_tmdb_image_url(
-            "https://image.tmdb.org/t/p/w780/poster.jpg"
-        ));
-        assert!(!is_allowed_tmdb_image_url(
-            "http://image.tmdb.org/t/p/w780/poster.jpg"
-        ));
-        assert!(!is_allowed_tmdb_image_url(
-            "https://image.tmdb.org/t/p/w780/poster.jpg?redirect=http://127.0.0.1"
-        ));
-        assert!(!is_allowed_tmdb_image_url(
-            "https://example.com/t/p/w780/poster.jpg"
-        ));
     }
 
     #[test]
