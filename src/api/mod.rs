@@ -99,7 +99,7 @@ use crate::{
         sessions::WebAuthService,
     },
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
-    library::{LibraryKind, LibraryRecord, LibraryRootRecord},
+    library::{LibraryKind, LibraryRecord, LibraryRootRecord, LibraryScraper, LibraryScraperRole},
     network::{
         RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
         redact_proxy_url,
@@ -11455,7 +11455,15 @@ struct CreateLibraryRequest {
     #[serde(default = "default_realtime_metadata_auto_match_enabled")]
     realtime_metadata_auto_match_enabled: bool,
     scraper_id: Option<String>,
+    scrapers: Option<Vec<LibraryScraperRequest>>,
     chapter_source_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryScraperRequest {
+    scraper_id: String,
+    role: LibraryScraperRole,
 }
 
 fn default_realtime_watch_enabled() -> bool {
@@ -11489,6 +11497,8 @@ struct UpdateLibraryRequest {
     metadata_schedule: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     scraper_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    scrapers: Option<Option<Vec<LibraryScraperRequest>>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     chapter_source_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
@@ -18616,6 +18626,71 @@ async fn validate_scraper_selection(
         .map_err(|error| plugin_error(headers, error).into_response())
 }
 
+fn create_library_scrapers(
+    request: &CreateLibraryRequest,
+) -> Result<Vec<LibraryScraper>, &'static str> {
+    if request.scrapers.is_some() && request.scraper_id.is_some() {
+        return Err("scraperId 和 scrapers 不能同时提交");
+    }
+    if let Some(scrapers) = request.scrapers.as_deref() {
+        return Ok(scrapers
+            .iter()
+            .enumerate()
+            .map(|(position, scraper)| LibraryScraper {
+                scraper_id: scraper.scraper_id.clone(),
+                position: i64::try_from(position).unwrap_or(i64::MAX),
+                role: scraper.role,
+            })
+            .collect());
+    }
+    Ok(request
+        .scraper_id
+        .as_deref()
+        .map(|scraper_id| LibraryScraper {
+            scraper_id: scraper_id.to_owned(),
+            position: 0,
+            role: LibraryScraperRole::Primary,
+        })
+        .into_iter()
+        .collect())
+}
+
+fn update_library_scrapers(
+    request: &UpdateLibraryRequest,
+) -> Result<(Option<Option<String>>, Option<Option<Vec<LibraryScraper>>>), &'static str> {
+    if request.scrapers.is_some() && request.scraper_id.is_some() {
+        return Err("scraperId 和 scrapers 不能同时提交");
+    }
+    if let Some(scrapers) = request.scrapers.as_ref() {
+        return Ok((
+            None,
+            Some(scrapers.as_ref().map(|scrapers| {
+                scrapers
+                    .iter()
+                    .enumerate()
+                    .map(|(position, scraper)| LibraryScraper {
+                        scraper_id: scraper.scraper_id.clone(),
+                        position: i64::try_from(position).unwrap_or(i64::MAX),
+                        role: scraper.role,
+                    })
+                    .collect()
+            })),
+        ));
+    }
+    Ok((request.scraper_id.clone(), None))
+}
+
+async fn validate_scraper_selections(
+    headers: &HeaderMap,
+    state: &AppState,
+    scrapers: &[LibraryScraper],
+) -> Result<(), Response> {
+    for scraper in scrapers {
+        validate_scraper_selection(headers, state, Some(&scraper.scraper_id)).await?;
+    }
+    Ok(())
+}
+
 async fn validate_chapter_source_selection(
     headers: &HeaderMap,
     state: &AppState,
@@ -18670,9 +18745,19 @@ async fn admin_create_library(
         )
         .into_response();
     };
-    if let Err(response) =
-        validate_scraper_selection(&headers, &state, request.scraper_id.as_deref()).await
-    {
+    let scrapers = match create_library_scrapers(&request) {
+        Ok(scrapers) => scrapers,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    if let Err(response) = validate_scraper_selections(&headers, &state, &scrapers).await {
         return response;
     }
     let kind = match request.kind.parse::<LibraryKind>() {
@@ -18698,11 +18783,11 @@ async fn admin_create_library(
         return response;
     }
     match libraries
-        .create_library_with_scraper_and_chapter_source(
+        .create_library_with_scrapers_and_chapter_source(
             &request.name,
             kind,
             request.realtime_watch_enabled,
-            request.scraper_id.as_deref(),
+            &scrapers,
             request.chapter_source_id.as_deref(),
             request.realtime_metadata_auto_match_enabled,
         )
@@ -18830,6 +18915,23 @@ async fn admin_update_library(
             }
         }
     };
+    let (scraper_id, scrapers) = match update_library_scrapers(&request) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    if let Some(scrapers) = scrapers.as_ref().and_then(|value| value.as_ref())
+        && let Err(response) = validate_scraper_selections(&headers, &state, scrapers).await
+    {
+        return response;
+    }
     let settings = LibrarySettingsPatch {
         name: request.name,
         kind,
@@ -18838,23 +18940,13 @@ async fn admin_update_library(
         realtime_metadata_auto_match_enabled: request.realtime_metadata_auto_match_enabled,
         reconciliation_schedule: request.reconciliation_schedule,
         metadata_schedule: request.metadata_schedule,
-        scraper_id: request.scraper_id.clone(),
-        scrapers: None,
+        scraper_id,
+        scrapers: scrapers.map(|value| value.unwrap_or_default()),
         chapter_source_id,
         media_strategy_json,
         scan_concurrency: request.scan_concurrency,
         probe_concurrency: request.probe_concurrency,
     };
-    if let Some(scraper_id) = request
-        .scraper_id
-        .as_ref()
-        .and_then(|value| value.as_deref())
-    {
-        if let Err(response) = validate_scraper_selection(&headers, &state, Some(scraper_id)).await
-        {
-            return response;
-        }
-    }
     match libraries.update_settings(library_id, settings).await {
         Ok(view) => {
             if let Some(home) = state.home.as_ref() {
@@ -19677,6 +19769,11 @@ fn library_json(library: &LibraryRecord, roots: &[LibraryRootRecord]) -> Value {
         "name": library.name,
         "kind": library.kind.as_str(),
         "scraperId": library.scraper_id,
+        "scrapers": library.scrapers.iter().map(|scraper| json!({
+            "scraperId": scraper.scraper_id,
+            "position": scraper.position,
+            "role": scraper.role.as_str(),
+        })).collect::<Vec<_>>(),
         "chapterSourceId": library.chapter_source_id,
         "coverImageUrl": library_cover_url(library),
         "isEnabled": library.is_enabled,
