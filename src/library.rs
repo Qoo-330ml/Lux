@@ -17,12 +17,65 @@ pub enum LibraryKind {
     Mixed,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LibraryScraperRole {
+    Primary,
+    Supplement,
+    Backup,
+    Both,
+}
+
+impl LibraryScraperRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "PRIMARY",
+            Self::Supplement => "SUPPLEMENT",
+            Self::Backup => "BACKUP",
+            Self::Both => "BOTH",
+        }
+    }
+}
+
+impl FromStr for LibraryScraperRole {
+    type Err = LibraryScraperRoleError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "PRIMARY" => Ok(Self::Primary),
+            "SUPPLEMENT" => Ok(Self::Supplement),
+            "BACKUP" => Ok(Self::Backup),
+            "BOTH" => Ok(Self::Both),
+            _ => Err(LibraryScraperRoleError(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryScraperRoleError(String);
+
+impl fmt::Display for LibraryScraperRoleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unsupported library scraper role: {}", self.0)
+    }
+}
+
+impl std::error::Error for LibraryScraperRoleError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryScraper {
+    pub scraper_id: String,
+    pub position: i64,
+    pub role: LibraryScraperRole,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LibraryRecord {
     pub id: LibraryId,
     pub name: String,
     pub kind: LibraryKind,
     pub scraper_id: Option<String>,
+    pub scrapers: Vec<LibraryScraper>,
     pub chapter_source_id: Option<String>,
     pub cover_image_path: Option<String>,
     pub cover_image_content_type: Option<String>,

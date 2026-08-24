@@ -18839,6 +18839,7 @@ async fn admin_update_library(
         reconciliation_schedule: request.reconciliation_schedule,
         metadata_schedule: request.metadata_schedule,
         scraper_id: request.scraper_id.clone(),
+        scrapers: None,
         chapter_source_id,
         media_strategy_json,
         scan_concurrency: request.scan_concurrency,
@@ -19337,6 +19338,8 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
         | LibraryServiceError::InvalidRootId(_)
         | LibraryServiceError::InvalidKind(_)
         | LibraryServiceError::InvalidScraperId
+        | LibraryServiceError::InvalidScraperRole(_)
+        | LibraryServiceError::InvalidScraperOrder(_)
         | LibraryServiceError::InvalidChapterSourceId
         | LibraryServiceError::InvalidLibraryOrder(_) => (
             StatusCode::BAD_REQUEST,

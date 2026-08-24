@@ -10,8 +10,8 @@ use crate::{
     },
     domain::ids::{LibraryId, LibraryRootId},
     library::{
-        LibraryKind, LibraryRecord, LibraryRootRecord, RootOverlap, RootPathError,
-        classify_root_overlap, inspect_root_path,
+        LibraryKind, LibraryRecord, LibraryRootRecord, LibraryScraper, LibraryScraperRole,
+        RootOverlap, RootPathError, classify_root_overlap, inspect_root_path,
     },
     storage::{
         Database, LibrarySettingsUpdate, NewLibrary, NewLibraryRoot, StorageError, StoredLibrary,
@@ -23,6 +23,7 @@ const DEFAULT_SCAN_CONCURRENCY: i64 = 2;
 const DEFAULT_PROBE_CONCURRENCY: i64 = 1;
 const MAX_LIBRARY_CONCURRENCY: i64 = 64;
 const MAX_SCHEDULE_LENGTH: usize = 128;
+const MAX_LIBRARY_SCRAPERS: usize = 16;
 
 #[derive(Clone)]
 pub struct LibraryService {
@@ -63,6 +64,25 @@ impl LibraryService {
         .await
     }
 
+    pub async fn create_library_with_scrapers(
+        &self,
+        name: &str,
+        kind: LibraryKind,
+        realtime_watch_enabled: bool,
+        scrapers: &[LibraryScraper],
+        realtime_metadata_auto_match_enabled: bool,
+    ) -> Result<LibraryRecord, LibraryServiceError> {
+        self.create_library_with_scrapers_and_chapter_source(
+            name,
+            kind,
+            realtime_watch_enabled,
+            scrapers,
+            None,
+            realtime_metadata_auto_match_enabled,
+        )
+        .await
+    }
+
     pub async fn create_library_with_scraper_and_chapter_source(
         &self,
         name: &str,
@@ -72,11 +92,40 @@ impl LibraryService {
         chapter_source_id: Option<&str>,
         realtime_metadata_auto_match_enabled: bool,
     ) -> Result<LibraryRecord, LibraryServiceError> {
+        let scrapers = scraper_id
+            .map(|scraper_id| LibraryScraper {
+                scraper_id: scraper_id.to_owned(),
+                position: 0,
+                role: LibraryScraperRole::Primary,
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.create_library_with_scrapers_and_chapter_source(
+            name,
+            kind,
+            _realtime_watch_enabled,
+            &scrapers,
+            chapter_source_id,
+            realtime_metadata_auto_match_enabled,
+        )
+        .await
+    }
+
+    pub async fn create_library_with_scrapers_and_chapter_source(
+        &self,
+        name: &str,
+        kind: LibraryKind,
+        _realtime_watch_enabled: bool,
+        requested_scrapers: &[LibraryScraper],
+        chapter_source_id: Option<&str>,
+        realtime_metadata_auto_match_enabled: bool,
+    ) -> Result<LibraryRecord, LibraryServiceError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 128 {
             return Err(LibraryServiceError::InvalidName);
         }
-        let scraper_id = normalize_scraper_id(scraper_id)?;
+        let scrapers = normalize_scrapers(requested_scrapers)?;
+        let scraper_id = scrapers.first().map(|scraper| scraper.scraper_id.as_str());
         let chapter_source_id = normalize_chapter_source_id(chapter_source_id)?;
         if chapter_source_id.is_some() && !kind.supports_chapter_source() {
             return Err(LibraryServiceError::InvalidChapterSourceId);
@@ -88,10 +137,11 @@ impl LibraryService {
                 name,
                 kind: kind.as_str(),
                 scraper_id: scraper_id.as_deref(),
+                scrapers: &scrapers,
                 realtime_watch_enabled: true,
                 realtime_metadata_auto_match_enabled,
                 reconciliation_schedule: Some(DEFAULT_RECONCILIATION_SCHEDULE),
-                metadata_schedule: scraper_id.is_some().then_some(DEFAULT_METADATA_SCHEDULE),
+                metadata_schedule: (!scrapers.is_empty()).then_some(DEFAULT_METADATA_SCHEDULE),
                 scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
                 probe_concurrency: DEFAULT_PROBE_CONCURRENCY,
                 chapter_source_id: chapter_source_id.as_deref(),
@@ -226,6 +276,11 @@ impl LibraryService {
         let requested_kind = settings.kind;
         let kind = requested_kind.map(LibraryKind::as_str);
         let scraper_id = normalize_scraper_patch(settings.scraper_id)?;
+        let scrapers = settings
+            .scrapers
+            .as_deref()
+            .map(normalize_scrapers)
+            .transpose()?;
         let mut chapter_source_id = normalize_chapter_source_patch(settings.chapter_source_id)?;
         let current = self
             .database
@@ -264,6 +319,7 @@ impl LibraryService {
                         .map(|value| value.as_deref()),
                     metadata_schedule: metadata_schedule.as_ref().map(|value| value.as_deref()),
                     scraper_id: scraper_id.as_ref().map(|value| value.as_deref()),
+                    scrapers: scrapers.as_deref(),
                     chapter_source_id: chapter_source_id.as_ref().map(|value| value.as_deref()),
                     media_strategy_json: settings
                         .media_strategy_json
@@ -427,6 +483,7 @@ pub struct LibrarySettingsPatch {
     pub reconciliation_schedule: Option<Option<String>>,
     pub metadata_schedule: Option<Option<String>>,
     pub scraper_id: Option<Option<String>>,
+    pub scrapers: Option<Vec<LibraryScraper>>,
     pub chapter_source_id: Option<Option<String>>,
     pub media_strategy_json: Option<Option<String>>,
     pub scan_concurrency: Option<i64>,
@@ -458,6 +515,8 @@ pub enum LibraryServiceError {
     InvalidRootId(String),
     InvalidKind(String),
     InvalidScraperId,
+    InvalidScraperRole(String),
+    InvalidScraperOrder(String),
     InvalidChapterSourceId,
     LibraryNotFound,
     LibraryBusy,
@@ -487,6 +546,12 @@ impl fmt::Display for LibraryServiceError {
             Self::InvalidRootId(error) => write!(formatter, "invalid library root ID: {error}"),
             Self::InvalidKind(error) => write!(formatter, "invalid library kind: {error}"),
             Self::InvalidScraperId => formatter.write_str("invalid library scraper ID"),
+            Self::InvalidScraperRole(error) => {
+                write!(formatter, "invalid library scraper role: {error}")
+            }
+            Self::InvalidScraperOrder(error) => {
+                write!(formatter, "invalid library scraper order: {error}")
+            }
             Self::InvalidChapterSourceId => {
                 formatter.write_str("invalid library chapter source ID")
             }
@@ -519,6 +584,8 @@ impl std::error::Error for LibraryServiceError {
             | Self::InvalidRootId(_)
             | Self::InvalidKind(_)
             | Self::InvalidScraperId
+            | Self::InvalidScraperRole(_)
+            | Self::InvalidScraperOrder(_)
             | Self::InvalidChapterSourceId
             | Self::LibraryNotFound
             | Self::LibraryBusy
@@ -591,6 +658,51 @@ fn normalize_scraper_patch(
         Some(None) => Ok(Some(None)),
         Some(Some(value)) => normalize_scraper_id(Some(&value)).map(Some),
     }
+}
+
+fn normalize_scrapers(
+    requested: &[LibraryScraper],
+) -> Result<Vec<LibraryScraper>, LibraryServiceError> {
+    if requested.len() > MAX_LIBRARY_SCRAPERS {
+        return Err(LibraryServiceError::InvalidScraperOrder(format!(
+            "刮削器数量不能超过 {MAX_LIBRARY_SCRAPERS}"
+        )));
+    }
+    let mut seen = HashSet::with_capacity(requested.len());
+    let mut normalized = Vec::with_capacity(requested.len());
+    for (position, scraper) in requested.iter().enumerate() {
+        let scraper_id = normalize_scraper_id(Some(&scraper.scraper_id))?
+            .ok_or(LibraryServiceError::InvalidScraperId)?;
+        if !seen.insert(scraper_id.clone()) {
+            return Err(LibraryServiceError::InvalidScraperOrder(
+                "刮削器不能重复".to_owned(),
+            ));
+        }
+        let position = i64::try_from(position).map_err(|_| {
+            LibraryServiceError::InvalidScraperOrder("刮削器位置超出范围".to_owned())
+        })?;
+        if scraper.position != position {
+            return Err(LibraryServiceError::InvalidScraperOrder(
+                "刮削器位置必须连续且从 0 开始".to_owned(),
+            ));
+        }
+        if position == 0 && scraper.role != LibraryScraperRole::Primary {
+            return Err(LibraryServiceError::InvalidScraperRole(
+                "首位刮削器必须是 PRIMARY".to_owned(),
+            ));
+        }
+        if position > 0 && scraper.role == LibraryScraperRole::Primary {
+            return Err(LibraryServiceError::InvalidScraperRole(
+                "只有首位刮削器可以是 PRIMARY".to_owned(),
+            ));
+        }
+        normalized.push(LibraryScraper {
+            scraper_id,
+            position,
+            role: scraper.role,
+        });
+    }
+    Ok(normalized)
 }
 
 fn normalize_chapter_source_id(value: Option<&str>) -> Result<Option<String>, LibraryServiceError> {
@@ -673,6 +785,22 @@ fn stored_library(stored: StoredLibrary) -> Result<LibraryRecord, LibraryService
         name: stored.name,
         kind,
         scraper_id: stored.scraper_id,
+        scrapers: stored
+            .scrapers
+            .into_iter()
+            .map(|scraper| {
+                Ok(LibraryScraper {
+                    scraper_id: scraper.scraper_id,
+                    position: scraper.position,
+                    role: scraper
+                        .role
+                        .parse::<LibraryScraperRole>()
+                        .map_err(|error| {
+                            LibraryServiceError::InvalidScraperRole(error.to_string())
+                        })?,
+                })
+            })
+            .collect::<Result<Vec<_>, LibraryServiceError>>()?,
         chapter_source_id: stored.chapter_source_id,
         cover_image_path: stored.cover_image_path,
         cover_image_content_type: stored.cover_image_content_type,
