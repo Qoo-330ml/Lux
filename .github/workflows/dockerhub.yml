@@ -13,8 +13,6 @@ env:
   # namespace for metadata while keeping publishing disabled.
   IMAGE_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}
   IMAGE_NAME: lux
-  RUNTIME_IMAGE_NAME: lux-runtime
-  RUNTIME_IMAGE_TAG: trixie-ffmpeg-v2
 
 jobs:
   build:
@@ -60,54 +58,46 @@ jobs:
             type=ref,event=pr
             type=raw,value=test,enable={{is_default_branch}}
 
-      - name: Determine runtime image
-        id: runtime
+      - name: Build and publish architecture image
         shell: bash
+        env:
+          APP_TAGS: ${{ steps.meta.outputs.tags }}
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+          APP_REVISION: ${{ github.sha }}
+          APP_PLATFORM: ${{ matrix.platform }}
+          APP_ARCH: ${{ matrix.arch }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          local_tag="${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}-${{ matrix.arch }}"
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "image=$local_tag" >> "$GITHUB_OUTPUT"
-            echo "tag=$local_tag" >> "$GITHUB_OUTPUT"
+
+          app_tags="$(printf '%s\n' "$APP_TAGS" | paste -sd, -)"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            app_output="app.output=type=docker"
           else
-            remote_tag="docker.io/${IMAGE_NAMESPACE}/${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}-${{ matrix.arch }}"
-            echo "image=$remote_tag" >> "$GITHUB_OUTPUT"
-            echo "tag=$remote_tag" >> "$GITHUB_OUTPUT"
+            app_output="app.output=type=registry"
           fi
 
-      - name: Build and publish runtime image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./runtime/Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
-          tags: ${{ steps.runtime.outputs.tag }}
-          build-args: |
-            LUX_RUNTIME_VERSION=${{ env.RUNTIME_IMAGE_TAG }}
-          cache-from: type=gha,scope=lux-runtime-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=lux-runtime-${{ matrix.arch }}
-          provenance: mode=max
-          sbom: true
+          bake_args=(
+            --file ./docker-bake.hcl
+            --set "runtime.platform=$APP_PLATFORM"
+            --set "app.platform=$APP_PLATFORM"
+            --set "app.tags=$app_tags"
+            --set "app.args.LUX_VERSION=$APP_VERSION"
+            --set "app.args.LUX_REVISION=$APP_REVISION"
+            --set "runtime.cache-from=type=gha,scope=lux-runtime-$APP_ARCH"
+            --set "runtime.cache-to=type=gha,mode=max,scope=lux-runtime-$APP_ARCH"
+            --set "app.cache-from=type=gha,scope=lux-$APP_ARCH"
+            --set "app.cache-to=type=gha,mode=max,scope=lux-$APP_ARCH"
+            --set "$app_output"
+          )
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            bake_args+=(
+              --set "app.attest=type=provenance,mode=max"
+              --set "app.attest=type=sbom"
+            )
+          fi
 
-      - name: Build and publish architecture image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            LUX_VERSION=${{ steps.meta.outputs.version }}
-            LUX_REVISION=${{ github.sha }}
-            LUX_RUNTIME_IMAGE=${{ steps.runtime.outputs.image }}
-          cache-from: type=gha,scope=lux-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=lux-${{ matrix.arch }}
-          provenance: mode=max
-          sbom: true
+          docker buildx bake "${bake_args[@]}" app
 
   manifest:
     name: Merge Docker Hub manifest
@@ -148,9 +138,3 @@ jobs:
               "${tag}-amd64" \
               "${tag}-arm64"
           done <<< "${{ steps.meta.outputs.tags }}"
-
-          runtime_image="docker.io/${IMAGE_NAMESPACE}/${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}"
-          docker buildx imagetools create \
-            --tag "$runtime_image" \
-            "${runtime_image}-amd64" \
-            "${runtime_image}-arm64"

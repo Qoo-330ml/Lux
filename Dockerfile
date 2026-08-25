@@ -1,4 +1,4 @@
-ARG LUX_RUNTIME_IMAGE=pdzhou/lux-runtime:trixie-ffmpeg-v2
+ARG LUX_RUNTIME_IMAGE=lux-runtime:trixie-ffmpeg-v2
 
 FROM node:22-bookworm-slim AS web-builder
 
@@ -38,8 +38,9 @@ COPY --from=web-builder /src/web/dist ./web/dist
 
 RUN cargo build --release --locked --bin luxd
 
-# Keep the OS and media-tool dependencies in a separately published image so
-# application releases can reuse that large, stable layer.
+# The CI bake target supplies the local `lux-runtime` build context here. It
+# remains part of the application image, so registry pulls can reuse its layer
+# digest without publishing a separate runtime repository.
 FROM ${LUX_RUNTIME_IMAGE}
 
 ARG LUX_VERSION=dev

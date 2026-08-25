@@ -70,9 +70,9 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 
 ### Docker Hub 镜像
 
-`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送或 `v*.*.*` 标签推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。每个架构先构建并发布固定版本的 `lux-runtime:trixie-ffmpeg-v2-<arch>`，应用镜像再引用该 runtime 层；runtime 只有在 Debian/FFmpeg 依赖变化并提升版本时才应替换。主分支构建会更新 `test` 标签，不会自动覆盖 `latest`。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`，runtime 镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux-runtime`。
+`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。每个架构通过 `docker-bake.hcl` 在同一个 BuildKit 构建图中生成 runtime target，runtime 不设置 registry 输出，也不会自动发布 `pdzhou/lux-runtime:trixie-ffmpeg-v2-*`；只有应用镜像发布 `test-amd64`、`test-arm64`，随后合并为 `test`。应用镜像仍会携带 runtime 层，Docker Hub 按 layer digest 复用它，因此普通应用更新不需要重复下载约 417 MiB 的依赖层。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`。
 
-确认测试镜像可发布后，在 GitHub Actions 手动运行 `.github/workflows/promote-dockerhub.yml`，它会把 Docker Hub 上的 `test` 多架构 manifest 晋级为 `latest`。语义化版本标签仍由构建 workflow 单独发布，部署时应优先使用版本标签或 digest。
+确认测试镜像可发布后，在 GitHub Actions 手动运行 `.github/workflows/promote-dockerhub.yml`，它会把 Docker Hub 上的 `test` 多架构 manifest 晋级为 `latest` 和版本标签。当前 Docker Hub 构建 workflow 只自动维护 `test`，不会自动发布 `latest` 或版本标签；部署时应优先使用版本标签或 digest。
 
 建议显式设置：
 
@@ -137,31 +137,27 @@ http://127.0.0.1:8097
 
 ## 升级与回滚边界
 
-发布镜像使用不可变版本标签和 digest，不使用 `latest` 作为唯一发布标识。应用镜像的 runtime 依赖层来自固定的 `lux-runtime:trixie-ffmpeg-v2`；普通应用更新只会产生新的 `luxd` 和 Web 层，Docker 会按 layer digest 复用 runtime 层：
+发布镜像使用不可变版本标签和 digest，不使用 `latest` 作为唯一发布标识。应用镜像通过 `docker-bake.hcl` 内部复用固定的 `lux-runtime:trixie-ffmpeg-v2` 构建内容；普通应用更新只会产生新的 `luxd` 和 Web 层，Docker 会按 layer digest 复用 runtime 层。推荐使用和 CI 相同的构建图：
 
 ```bash
-docker build --platform linux/arm64 \
-  -f runtime/Dockerfile \
-  -t lux-runtime:trixie-ffmpeg-v2 .
-docker build --platform linux/arm64 \
-  --build-arg LUX_RUNTIME_IMAGE=lux-runtime:trixie-ffmpeg-v2 \
-  --build-arg LUX_VERSION=0.2.7 \
-  -t lux:0.2.7 .
+docker buildx bake --load \
+  --set app.platform=linux/arm64 \
+  --set app.args.LUX_VERSION=0.2.7 \
+  --set app.tags=lux:0.2.7 \
+  app
 docker compose up -d
 ```
 
 启动时会自动执行当前已选择数据库的 migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。当前版本不提供应用内备份/恢复或跨数据库迁移工具，也不提供 SQLite 与 PostgreSQL 之间的数据迁移；正式 NAS 发布前必须由运维侧完成配置目录、媒体目录和（如使用）PostgreSQL 数据库的快照与恢复演练。
 
-插件兼容性：运行时镜像使用 Debian Trixie，以满足当前官方 Linux 插件包的 glibc 要求。只替换 `/config/plugins` 中的插件包不会升级容器运行时；升级到包含此修复的 Lux 镜像后，应重新创建容器并确认插件进程能够启动：
+插件兼容性：runtime target 使用 Debian Trixie，以满足当前官方 Linux 插件包的 glibc 要求。只替换 `/config/plugins` 中的插件包不会升级容器运行时；升级到包含此修复的 Lux 镜像后，应重新创建容器并确认插件进程能够启动：
 
 ```bash
-docker build --platform linux/arm64 \
-  -f runtime/Dockerfile \
-  -t lux-runtime:trixie-ffmpeg-v2 .
-docker build --platform linux/arm64 \
-  --build-arg LUX_RUNTIME_IMAGE=lux-runtime:trixie-ffmpeg-v2 \
-  --build-arg LUX_VERSION=0.2.7-plugin-runtime \
-  -t pdzhou/lux:0.2.7-plugin-runtime .
+docker buildx bake --load \
+  --set app.platform=linux/arm64 \
+  --set app.args.LUX_VERSION=0.2.7-plugin-runtime \
+  --set app.tags=pdzhou/lux:0.2.7-plugin-runtime \
+  app
 # 将 compose.yaml 中 lux.image 临时改为 pdzhou/lux:0.2.7-plugin-runtime
 docker compose up -d --force-recreate lux
 docker exec lux sh -c 'uname -m; command -v ffprobe; command -v ffmpeg'
