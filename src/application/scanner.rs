@@ -295,7 +295,30 @@ impl LibraryScanner {
             }
             let mut walker = FileBatchWalker::new(&root_path);
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
+                let relative_paths = files
+                    .iter()
+                    .map(|path| {
+                        path.strip_prefix(&root_path)
+                            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                            .to_str()
+                            .map(str::to_owned)
+                            .ok_or(ScannerError::NonUtf8Path)
+                    })
+                    .collect::<Result<Vec<_>, ScannerError>>()?;
+                let existing_entries = self
+                    .database
+                    .list_filesystem_entries_for_paths(&root.id, &relative_paths)
+                    .await?;
+                let mut seen_entry_ids = Vec::with_capacity(files.len());
                 for path in files {
+                    if let Some((entry_id, quick_report)) = self
+                        .scan_episode_file_if_unchanged(&root, &root_path, &path, &existing_entries)
+                        .await?
+                    {
+                        seen_entry_ids.push(entry_id);
+                        report.merge(quick_report);
+                        continue;
+                    }
                     report.merge(
                         self.scan_episode_file_with_provider_cache(
                             &library_id_text,
@@ -308,6 +331,9 @@ impl LibraryScanner {
                         .await?,
                     );
                 }
+                self.database
+                    .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
+                    .await?;
             }
             report.marked_missing += usize::try_from(
                 self.database
@@ -356,8 +382,59 @@ impl LibraryScanner {
             }
             let mut walker = FileBatchWalker::new(&root_path);
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
+                let relative_paths = files
+                    .iter()
+                    .map(|path| {
+                        path.strip_prefix(&root_path)
+                            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                            .to_str()
+                            .map(str::to_owned)
+                            .ok_or(ScannerError::NonUtf8Path)
+                    })
+                    .collect::<Result<Vec<_>, ScannerError>>()?;
+                let existing_entries = self
+                    .database
+                    .list_filesystem_entries_for_paths(&root.id, &relative_paths)
+                    .await?;
+                let mut seen_entry_ids = Vec::with_capacity(files.len());
                 for path in files {
                     let classification = classify_mixed_file(&root_path, &path).await;
+                    let quick_report = match classification {
+                        MixedClassification::Movie => {
+                            self.scan_movie_file_if_unchanged(
+                                &library_id_text,
+                                &root.id,
+                                &root_path,
+                                &path,
+                                &existing_entries,
+                            )
+                            .await?
+                        }
+                        MixedClassification::Episode => {
+                            self.scan_episode_file_if_unchanged(
+                                &root,
+                                &root_path,
+                                &path,
+                                &existing_entries,
+                            )
+                            .await?
+                        }
+                        MixedClassification::Unresolved => {
+                            self.scan_unresolved_file_if_unchanged(
+                                &library_id_text,
+                                &root,
+                                &root_path,
+                                &path,
+                                &existing_entries,
+                            )
+                            .await?
+                        }
+                    };
+                    if let Some((entry_id, quick_report)) = quick_report {
+                        seen_entry_ids.push(entry_id);
+                        report.merge(quick_report);
+                        continue;
+                    }
                     let result = match classification {
                         MixedClassification::Movie => {
                             self.scan_movie_file(
@@ -393,6 +470,9 @@ impl LibraryScanner {
                     };
                     report.merge(result);
                 }
+                self.database
+                    .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
+                    .await?;
             }
             report.marked_missing += usize::try_from(
                 self.database
@@ -1174,6 +1254,108 @@ impl LibraryScanner {
             {
                 return Ok(None);
             }
+        }
+        Ok(Some((
+            existing_entry.id.clone(),
+            ScanReport {
+                discovered_files: 1,
+                skipped_files: 1,
+                ..ScanReport::default()
+            },
+        )))
+    }
+
+    async fn scan_episode_file_if_unchanged(
+        &self,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+    ) -> Result<Option<(String, ScanReport)>, ScannerError> {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        let Some(parsed) = parse_episode_filename(file_name) else {
+            return Ok(None);
+        };
+        if is_strm_file(path) {
+            return Ok(None);
+        }
+        let (relative_path, fingerprint) = current_file_fingerprint(root_path, path).await?;
+        let Some(existing_entry) = existing_entries.get(&relative_path) else {
+            return Ok(None);
+        };
+        if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+            return Ok(None);
+        }
+        let Some(item_id) = existing_entry.item_id.as_deref() else {
+            return Ok(None);
+        };
+        let hierarchy = episode_hierarchy(&relative_path, &parsed);
+        let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
+        let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
+        let episode_identity = Self::episode_identity_key(root, &hierarchy, &parsed);
+        let Some(current_identity_item) = self
+            .database
+            .find_media_item_by_identity(&episode_identity)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current_identity_item.id != item_id {
+            return Ok(None);
+        }
+        self.database
+            .repair_episode_hierarchy_identities(
+                item_id,
+                &series_identity,
+                &season_identity,
+                &episode_identity,
+            )
+            .await?;
+        if !hierarchy.provider_ids.is_empty() {
+            let provider_ids_json = provider_ids_json(&hierarchy.provider_ids);
+            if let Some(provider_ids_json) = provider_ids_json.as_deref() {
+                self.database
+                    .update_local_provider_ids_for_identity_if_empty(
+                        &series_identity,
+                        provider_ids_json,
+                    )
+                    .await?;
+            }
+        }
+        Ok(Some((
+            existing_entry.id.clone(),
+            ScanReport {
+                discovered_files: 1,
+                skipped_files: 1,
+                ..ScanReport::default()
+            },
+        )))
+    }
+
+    async fn scan_unresolved_file_if_unchanged(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+    ) -> Result<Option<(String, ScanReport)>, ScannerError> {
+        if is_strm_file(path) {
+            return Ok(None);
+        }
+        let (relative_path, fingerprint) = current_file_fingerprint(root_path, path).await?;
+        let Some(existing_entry) = existing_entries.get(&relative_path) else {
+            return Ok(None);
+        };
+        if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+            return Ok(None);
+        }
+        if let Some(item_id) = existing_entry.item_id.as_deref() {
+            self.database
+                .repair_movie_parent_folder(library_id_text, &root.id, &relative_path, item_id)
+                .await?;
         }
         Ok(Some((
             existing_entry.id.clone(),
@@ -1977,6 +2159,14 @@ impl ScanJobService {
         if job.cancel_requested {
             cancellation.store(true, Ordering::Release);
         }
+        if job.scan_phase == "POSTPROCESSING" {
+            return Ok(ScanBatchReport {
+                status: "COMPLETED".to_owned(),
+                processed: 0,
+                created_items: 0,
+                completed: true,
+            });
+        }
         if job.job_type == "INCREMENTAL_SCAN" {
             return self
                 .run_incremental_batch(job_id, batch_size, &cancellation)
@@ -2209,9 +2399,7 @@ impl ScanJobService {
             self.database
                 .clear_reconciliation_scan_entries(&job.id)
                 .await?;
-            self.database
-                .finish_scan_job(&job.id, "COMPLETED", None)
-                .await?;
+            self.database.mark_scan_job_postprocessing(&job.id).await?;
             self.record_event(&job.id, "INFO", "JOB_COMPLETED", "任务已完成", "{}")
                 .await;
             if removed_count > 0 {
@@ -2249,6 +2437,25 @@ impl ScanJobService {
         let mut next_count = job.processed_count;
         let mut completed_entries = Vec::<StoredReconciliationScanEntry>::new();
         let mut created_items = 0_usize;
+        let mut existing_entries_by_root =
+            HashMap::<String, HashMap<String, StoredFilesystemEntry>>::new();
+        let mut batch_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut changed_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut new_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut quick_seen_entry_ids = Vec::<String>::new();
+        for entry in &batch {
+            batch_paths_by_root
+                .entry(entry.library_root_id.clone())
+                .or_default()
+                .push(entry.relative_path.clone());
+        }
+        for (root_id, paths) in batch_paths_by_root {
+            let existing_entries = self
+                .database
+                .list_filesystem_entries_for_paths(&root_id, &paths)
+                .await?;
+            existing_entries_by_root.insert(root_id, existing_entries);
+        }
         for entry in &batch {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(&job.id).await;
@@ -2309,6 +2516,77 @@ impl ScanJobService {
                 completed_entries.push(entry.clone());
                 continue;
             }
+
+            let existing_entries = existing_entries_by_root
+                .get(&root.id)
+                .ok_or_else(|| ScannerError::LibraryNotFound)?;
+            let quick_result = match library_kind {
+                "SERIES" => {
+                    self.scanner
+                        .scan_episode_file_if_unchanged(
+                            root,
+                            Path::new(&root.canonical_path),
+                            &path,
+                            existing_entries,
+                        )
+                        .await?
+                }
+                "MIXED" => {
+                    match classify_mixed_file(Path::new(&root.canonical_path), &path).await {
+                        MixedClassification::Movie => {
+                            self.scanner
+                                .scan_movie_file_if_unchanged(
+                                    &job.library_id,
+                                    &root.id,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    existing_entries,
+                                )
+                                .await?
+                        }
+                        MixedClassification::Episode => {
+                            self.scanner
+                                .scan_episode_file_if_unchanged(
+                                    root,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    existing_entries,
+                                )
+                                .await?
+                        }
+                        MixedClassification::Unresolved => {
+                            self.scanner
+                                .scan_unresolved_file_if_unchanged(
+                                    &job.library_id,
+                                    root,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    existing_entries,
+                                )
+                                .await?
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Some((entry_id, quick_report)) = quick_result {
+                quick_seen_entry_ids.push(entry_id);
+                next_count = next_count.saturating_add(1);
+                processed = processed.saturating_add(1);
+                created_items = created_items.saturating_add(quick_report.created_items);
+                completed_entries.push(entry.clone());
+                continue;
+            }
+            let target_paths = if existing_entries.contains_key(&entry.relative_path) {
+                &mut changed_paths_by_root
+            } else {
+                &mut new_paths_by_root
+            };
+            target_paths
+                .entry(root.id.clone())
+                .or_default()
+                .push(entry.relative_path.clone());
+
             let result = match library_kind {
                 "MOVIE" => {
                     self.scanner
@@ -2384,6 +2662,19 @@ impl ScanJobService {
             processed = processed.saturating_add(1);
             completed_entries.push(entry.clone());
         }
+        self.database
+            .mark_filesystem_entries_seen_batch(&quick_seen_entry_ids, &job.generation)
+            .await?;
+        for (root_id, paths) in new_paths_by_root {
+            self.database
+                .record_scan_job_targets(&job.id, &root_id, &paths, "NEW")
+                .await?;
+        }
+        for (root_id, paths) in changed_paths_by_root {
+            self.database
+                .record_scan_job_targets(&job.id, &root_id, &paths, "CHANGED")
+                .await?;
+        }
         self.finish_reconciliation_file_batch(
             job,
             completed_entries,
@@ -2408,8 +2699,12 @@ impl ScanJobService {
         let mut created_items = 0_usize;
         let mut completed_entries = Vec::<(usize, StoredReconciliationScanEntry)>::new();
         let mut unavailable_root_ids = HashSet::<String>::new();
-        let mut existing_paths_by_root = HashMap::<String, HashSet<String>>::new();
+        let mut existing_entries_by_root =
+            HashMap::<String, HashMap<String, StoredFilesystemEntry>>::new();
         let mut batch_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut changed_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut new_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut quick_seen_entry_ids = Vec::<String>::new();
         let mut new_files = Vec::<(
             usize,
             String,
@@ -2427,13 +2722,11 @@ impl ScanJobService {
             }
         }
         for (root_id, paths) in batch_paths_by_root {
-            let existing_paths = self
+            let existing_entries = self
                 .database
-                .list_existing_filesystem_paths(&root_id, &paths)
-                .await?
-                .into_iter()
-                .collect();
-            existing_paths_by_root.insert(root_id, existing_paths);
+                .list_filesystem_entries_for_paths(&root_id, &paths)
+                .await?;
+            existing_entries_by_root.insert(root_id, existing_entries);
         }
 
         for (index, entry) in batch.iter().enumerate() {
@@ -2504,10 +2797,36 @@ impl ScanJobService {
                 continue;
             }
 
-            if existing_paths_by_root
+            if existing_entries_by_root
                 .get(&root.id)
-                .is_some_and(|paths| paths.contains(&entry.relative_path))
+                .and_then(|entries| entries.get(&entry.relative_path))
+                .is_some()
             {
+                let existing_entries = existing_entries_by_root
+                    .get(&root.id)
+                    .ok_or_else(|| ScannerError::LibraryNotFound)?;
+                if let Some((entry_id, quick_report)) = self
+                    .scanner
+                    .scan_movie_file_if_unchanged(
+                        &job.library_id,
+                        &root.id,
+                        Path::new(&root.canonical_path),
+                        &path,
+                        existing_entries,
+                    )
+                    .await?
+                {
+                    quick_seen_entry_ids.push(entry_id);
+                    next_count = next_count.saturating_add(1);
+                    processed = processed.saturating_add(1);
+                    completed_entries.push((index, entry.clone()));
+                    created_items = created_items.saturating_add(quick_report.created_items);
+                    continue;
+                }
+                changed_paths_by_root
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push(entry.relative_path.clone());
                 if let Err(error) = self
                     .scanner
                     .scan_movie_file(
@@ -2533,6 +2852,10 @@ impl ScanJobService {
                 continue;
             }
 
+            new_paths_by_root
+                .entry(root.id.clone())
+                .or_default()
+                .push(entry.relative_path.clone());
             new_files.push((
                 index,
                 root.id.clone(),
@@ -2634,6 +2957,20 @@ impl ScanJobService {
                 }
             };
             created_items = created_items.saturating_add(inserted);
+        }
+
+        self.database
+            .mark_filesystem_entries_seen_batch(&quick_seen_entry_ids, &job.generation)
+            .await?;
+        for (root_id, paths) in new_paths_by_root {
+            self.database
+                .record_scan_job_targets(&job.id, &root_id, &paths, "NEW")
+                .await?;
+        }
+        for (root_id, paths) in changed_paths_by_root {
+            self.database
+                .record_scan_job_targets(&job.id, &root_id, &paths, "CHANGED")
+                .await?;
         }
 
         completed_entries.sort_by_key(|(index, _)| *index);
@@ -3080,9 +3417,16 @@ impl ScanJobService {
                         .await;
                     return Ok(());
                 }
+                self.database.retry_failed_scan_job_targets(job_id).await?;
                 self.run_probe_after_scan(job_id, probe).await?;
                 self.run_metadata_after_scan(job_id).await?;
                 self.run_thumbnails_after_scan(job_id, thumbnails).await?;
+                self.database
+                    .clear_completed_scan_job_targets(job_id)
+                    .await?;
+                self.database
+                    .complete_scan_job_postprocessing(job_id)
+                    .await?;
                 self.run_auto_library_cover_after_scan(job_id).await?;
                 if completed_job.auto_metadata_match {
                     if let Some(metadata) = metadata {
@@ -3166,21 +3510,16 @@ impl ScanJobService {
         job_id: &str,
         thumbnails: Option<ThumbnailService>,
     ) -> Result<(), ScanJobError> {
-        let Some(thumbnails) = thumbnails else {
-            return Ok(());
-        };
-        let Some(job) = self.database.find_scan_job(job_id).await? else {
+        if self.database.find_scan_job(job_id).await?.is_none() {
             return Err(ScanJobError::JobNotFound);
-        };
-        let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
-            tracing::warn!(
-                job_id,
-                library_id = %job.library_id,
-                "scan thumbnails skipped for invalid library ID"
-            );
+        }
+        let Some(thumbnails) = thumbnails else {
+            self.database
+                .skip_pending_scan_job_target_stage(job_id, "ITEM", "THUMBNAIL")
+                .await?;
             return Ok(());
         };
-        match thumbnails.generate_library(library_id).await {
+        match thumbnails.generate_scan_job(job_id).await {
             Ok(report) if report.failed == 0 => {
                 let details = format!(
                     r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
@@ -3437,13 +3776,9 @@ impl ScanJobService {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Err(ScanJobError::JobNotFound);
         };
-        let Some(library) = self.database.find_library(&job.library_id).await? else {
+        if self.database.find_library(&job.library_id).await?.is_none() {
             return Err(ScanJobError::LibraryNotFound);
-        };
-        let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
-            tracing::warn!(job_id, library_id = %job.library_id, "local metadata enrichment skipped for invalid library ID");
-            return Ok(());
-        };
+        }
         let enricher = MetadataEnricher::new(self.database.clone());
         let enricher = match self.people.clone() {
             Some(people) => enricher.with_people(people),
@@ -3453,12 +3788,7 @@ impl ScanJobService {
             Some(local_nfo) => enricher.with_nfo_store(local_nfo),
             None => enricher,
         };
-        let result = match library.kind.as_str() {
-            "MOVIE" => enricher.enrich_movie_library(library_id).await,
-            "SERIES" => enricher.enrich_series_library(library_id).await,
-            "MIXED" => enricher.enrich_mixed_library(library_id).await,
-            _ => return Ok(()),
-        };
+        let result = enricher.enrich_scan_job(job_id).await;
         match result {
             Ok(report) => {
                 let details = format!(
@@ -3601,17 +3931,21 @@ impl ScanJobService {
         job_id: &str,
         probe: Option<MediaProbeService>,
     ) -> Result<(), ScanJobError> {
-        let Some(probe) = probe else {
-            return Ok(());
-        };
-        let Some(job) = self.database.find_scan_job(job_id).await? else {
+        if self.database.find_scan_job(job_id).await?.is_none() {
             return Err(ScanJobError::JobNotFound);
-        };
-        let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
-            tracing::warn!(job_id, library_id = %job.library_id, "scan probe skipped for invalid library ID");
+        }
+        let Some(probe) = probe else {
+            self.database
+                .skip_pending_scan_job_target_stage(job_id, "SOURCE", "PROBE")
+                .await?;
             return Ok(());
         };
-        match probe.probe_movie_library(library_id).await {
+        let job = self
+            .database
+            .find_scan_job(job_id)
+            .await?
+            .ok_or(ScanJobError::JobNotFound)?;
+        match probe.probe_scan_job(job_id, &job.library_id).await {
             Ok(report) => {
                 let details = format!(
                     r#"{{"attempted":{},"ready":{},"failed":{},"timedOut":{},"skipped":{}}}"#,
@@ -3964,6 +4298,35 @@ pub fn compute_file_fingerprint(
     hasher.finalize().to_vec()
 }
 
+async fn current_file_fingerprint(
+    root_path: &Path,
+    path: &Path,
+) -> Result<(String, Vec<u8>), ScannerError> {
+    let relative_path = path
+        .strip_prefix(root_path)
+        .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+        .to_str()
+        .ok_or(ScannerError::NonUtf8Path)?
+        .to_owned();
+    let metadata = fs::metadata(path)
+        .await
+        .map_err(|source| ScannerError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    let size = i64::try_from(metadata.len())
+        .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0);
+    let (device, inode) = file_identity(&metadata);
+    let fingerprint = compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+    Ok((relative_path, fingerprint))
+}
+
 fn file_identity(metadata: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
     #[cfg(unix)]
     {
@@ -3999,6 +4362,7 @@ pub struct ParsedEpisodeFilename {
     pub provider_ids: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy)]
 enum MixedClassification {
     Movie,
     Episode,

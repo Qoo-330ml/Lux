@@ -778,6 +778,23 @@ type ProbeTaskResult = (
     Result<Option<MediaProbeResult>, ProbeError>,
 );
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProbeTargetState {
+    Done,
+    Failed,
+    Skipped,
+}
+
+impl ProbeTargetState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "DONE",
+            Self::Failed => "FAILED",
+            Self::Skipped => "SKIPPED",
+        }
+    }
+}
+
 impl MediaProbeService {
     pub fn new(database: Database, runner: FfprobeRunner) -> Self {
         Self {
@@ -802,13 +819,7 @@ impl MediaProbeService {
     ) -> Result<ProbeReport, ProbeServiceError> {
         let mut report = ProbeReport::default();
         let library_id = library_id.to_string();
-        let configured = self
-            .database
-            .find_library(&library_id)
-            .await?
-            .and_then(|library| usize::try_from(library.probe_concurrency).ok())
-            .unwrap_or(DEFAULT_PROBE_CONCURRENCY)
-            .clamp(1, 64);
+        let configured = self.configured_concurrency(&library_id).await?;
         let mut offset = 0_i64;
         loop {
             let sources = self
@@ -820,36 +831,9 @@ impl MediaProbeService {
                 )
                 .await?;
             let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            let concurrency = self
-                .resources
-                .probe_concurrency(configured, MAX_EFFECTIVE_PROBE_CONCURRENCY)
-                .await
-                .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY);
-            let mut inputs = Vec::with_capacity(sources.len());
-            for source in sources {
-                if source.probe_status != "PENDING" {
-                    report.skipped += 1;
-                    continue;
-                }
-                report.attempted += 1;
-                let path = safe_media_path(&source.root_path, &source.relative_path)?;
-                inputs.push((source, path));
-            }
-
-            let mut pending = JoinSet::<ProbeTaskResult>::new();
-            for (source, path) in inputs {
-                while pending.len() >= concurrency {
-                    self.collect_probe_task(&mut pending, &mut report).await?;
-                }
-                let service = self.clone();
-                pending.spawn(async move {
-                    let result = service.probe_source_with_slot(&path).await;
-                    (source, path, result)
-                });
-            }
-            while !pending.is_empty() {
-                self.collect_probe_task(&mut pending, &mut report).await?;
-            }
+            let concurrency = self.effective_concurrency(configured).await;
+            self.probe_source_page(sources, concurrency, &mut report)
+                .await?;
             if last_page {
                 break;
             }
@@ -858,18 +842,116 @@ impl MediaProbeService {
         Ok(report)
     }
 
+    pub async fn probe_scan_job(
+        &self,
+        job_id: &str,
+        library_id: &str,
+    ) -> Result<ProbeReport, ProbeServiceError> {
+        let configured = self.configured_concurrency(library_id).await?;
+        let mut report = ProbeReport::default();
+        loop {
+            let sources = self
+                .database
+                .list_scan_job_target_sources_page(job_id, LIBRARY_SOURCE_PAGE_SIZE as i64, 0)
+                .await?;
+            if sources.is_empty() {
+                break;
+            }
+            let concurrency = self.effective_concurrency(configured).await;
+            let states = self
+                .probe_source_page(sources, concurrency, &mut report)
+                .await?;
+            for state in [
+                ProbeTargetState::Done,
+                ProbeTargetState::Failed,
+                ProbeTargetState::Skipped,
+            ] {
+                let target_ids = states
+                    .iter()
+                    .filter(|(_, target_state)| *target_state == state)
+                    .map(|(source_id, _)| source_id.clone())
+                    .collect::<Vec<_>>();
+                self.database
+                    .mark_scan_job_target_stage(
+                        job_id,
+                        "SOURCE",
+                        &target_ids,
+                        "PROBE",
+                        state.as_str(),
+                    )
+                    .await?;
+            }
+        }
+        Ok(report)
+    }
+
+    async fn configured_concurrency(&self, library_id: &str) -> Result<usize, ProbeServiceError> {
+        Ok(self
+            .database
+            .find_library(library_id)
+            .await?
+            .and_then(|library| usize::try_from(library.probe_concurrency).ok())
+            .unwrap_or(DEFAULT_PROBE_CONCURRENCY)
+            .clamp(1, 64))
+    }
+
+    async fn effective_concurrency(&self, configured: usize) -> usize {
+        self.resources
+            .probe_concurrency(configured, MAX_EFFECTIVE_PROBE_CONCURRENCY)
+            .await
+            .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
+    }
+
+    async fn probe_source_page(
+        &self,
+        sources: Vec<StoredMediaSourcePath>,
+        concurrency: usize,
+        report: &mut ProbeReport,
+    ) -> Result<Vec<(String, ProbeTargetState)>, ProbeServiceError> {
+        let mut states = Vec::new();
+        let mut inputs = Vec::with_capacity(sources.len());
+        for source in sources {
+            if source.probe_status != "PENDING" {
+                report.skipped += 1;
+                states.push((source.source_id, ProbeTargetState::Skipped));
+                continue;
+            }
+            report.attempted += 1;
+            let path = safe_media_path(&source.root_path, &source.relative_path)?;
+            inputs.push((source, path));
+        }
+
+        let mut pending = JoinSet::<ProbeTaskResult>::new();
+        for (source, path) in inputs {
+            while pending.len() >= concurrency {
+                states.push(self.collect_probe_task(&mut pending, report).await?);
+            }
+            let service = self.clone();
+            pending.spawn(async move {
+                let result = service.probe_source_with_slot(&path).await;
+                (source, path, result)
+            });
+        }
+        while !pending.is_empty() {
+            states.push(self.collect_probe_task(&mut pending, report).await?);
+        }
+        Ok(states)
+    }
+
     async fn collect_probe_task(
         &self,
         pending: &mut JoinSet<ProbeTaskResult>,
         report: &mut ProbeReport,
-    ) -> Result<(), ProbeServiceError> {
+    ) -> Result<(String, ProbeTargetState), ProbeServiceError> {
         let task = pending
             .join_next()
             .await
             .ok_or_else(|| ProbeServiceError::Worker("probe task set was empty".to_owned()))?
             .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
-        self.persist_probe_attempt(&task.0, &task.1, task.2, report)
-            .await
+        let state = self
+            .persist_probe_attempt(&task.0, &task.1, task.2, report)
+            .await?;
+        Ok((task.0.source_id.clone(), state))
     }
 
     async fn persist_probe_attempt(
@@ -878,7 +960,7 @@ impl MediaProbeService {
         path: &Path,
         result: Result<Option<MediaProbeResult>, ProbeError>,
         report: &mut ProbeReport,
-    ) -> Result<(), ProbeServiceError> {
+    ) -> Result<ProbeTargetState, ProbeServiceError> {
         match result {
             Ok(Some(result)) => {
                 let detail_json = result
@@ -944,11 +1026,13 @@ impl MediaProbeService {
                     })
                     .await?;
                 report.ready += 1;
+                Ok(ProbeTargetState::Done)
             }
             Ok(None) => {
                 // A STRM without a sidecar is owned by the STRM plugin;
                 // leave it pending instead of making SKIP suppress it.
                 report.skipped += 1;
+                Ok(ProbeTargetState::Skipped)
             }
             Err(error) => {
                 if matches!(error, ProbeError::Timeout) {
@@ -963,9 +1047,9 @@ impl MediaProbeService {
                         &error.to_string(),
                     )
                     .await?;
+                Ok(ProbeTargetState::Failed)
             }
         }
-        Ok(())
     }
 
     async fn probe_source_with_slot(

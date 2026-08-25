@@ -99,6 +99,37 @@ impl ThumbnailService {
         Ok(report)
     }
 
+    pub async fn generate_scan_job(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<ThumbnailReport, ThumbnailError> {
+        let mut report = ThumbnailReport::default();
+        loop {
+            let candidates = self
+                .database
+                .list_scan_job_thumbnail_sources_page(
+                    scan_job_id,
+                    LIBRARY_SOURCE_PAGE_SIZE as i64,
+                    0,
+                )
+                .await?;
+            if candidates.is_empty() {
+                break;
+            }
+            let item_ids = candidates
+                .iter()
+                .map(|candidate| candidate.item_id.clone())
+                .collect::<Vec<_>>();
+            let mut seen_items = HashSet::new();
+            self.generate_sources(candidates, &mut seen_items, &mut report)
+                .await;
+            self.database
+                .mark_scan_job_target_stage(scan_job_id, "ITEM", &item_ids, "THUMBNAIL", "DONE")
+                .await?;
+        }
+        Ok(report)
+    }
+
     async fn generate_sources(
         &self,
         candidates: Vec<StoredThumbnailSource>,

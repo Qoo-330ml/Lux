@@ -575,6 +575,80 @@ impl MetadataEnricher {
         Ok(report)
     }
 
+    pub async fn enrich_scan_job(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<MetadataReport, MetadataError> {
+        let mut report = MetadataReport::default();
+        loop {
+            let sources = self
+                .database
+                .list_scan_job_target_movie_items_page(
+                    scan_job_id,
+                    LIBRARY_SOURCE_PAGE_SIZE as i64,
+                    0,
+                )
+                .await?;
+            if sources.is_empty() {
+                break;
+            }
+            let item_ids = sources
+                .iter()
+                .map(|source| source.item_id.clone())
+                .collect::<Vec<_>>();
+            self.enrich_movie_sources(sources, &mut report).await;
+            self.database
+                .mark_scan_job_target_stage(scan_job_id, "ITEM", &item_ids, "METADATA", "DONE")
+                .await?;
+        }
+
+        let mut last_series_id = None;
+        let mut last_season_id = None;
+        let mut last_episode_id = None;
+        loop {
+            let sources = self
+                .database
+                .list_scan_job_target_series_items_page(
+                    scan_job_id,
+                    LIBRARY_SOURCE_PAGE_SIZE as i64,
+                    0,
+                )
+                .await?;
+            if sources.is_empty() {
+                break;
+            }
+            let item_ids = sources
+                .iter()
+                .map(|source| source.episode_id.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = self
+                .enrich_series_sources(
+                    sources,
+                    &mut report,
+                    last_series_id.as_mut(),
+                    last_season_id.as_mut(),
+                    last_episode_id.as_mut(),
+                )
+                .await
+            {
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &item_ids,
+                        "METADATA",
+                        "FAILED",
+                    )
+                    .await?;
+                return Err(error);
+            }
+            self.database
+                .mark_scan_job_target_stage(scan_job_id, "ITEM", &item_ids, "METADATA", "DONE")
+                .await?;
+        }
+        Ok(report)
+    }
+
     pub async fn enrich_movie_library(
         &self,
         library_id: LibraryId,

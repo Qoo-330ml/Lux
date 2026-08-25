@@ -6315,23 +6315,34 @@ impl Database {
                 source,
             })?;
         for (entry_type, paths) in [("DIRECTORY", child_directories), ("FILE", media_files)] {
-            for path in paths {
-                self.query(
+            for chunk in paths.chunks(BATCH_INSERT_CHUNK_SIZE) {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
                     "INSERT INTO reconciliation_scan_entries (
-                        job_id, library_root_id, relative_path, entry_type
-                     ) VALUES (?, ?, ?, ?)
-                     ON CONFLICT(job_id, library_root_id, entry_type, relative_path) DO NOTHING",
-                )
-                .bind(job_id)
-                .bind(library_root_id)
-                .bind(path)
-                .bind(entry_type)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                         job_id, library_root_id, relative_path, entry_type
+                     ) VALUES {values}
+                     ON CONFLICT(job_id, library_root_id, entry_type, relative_path) DO NOTHING"
+                );
+                let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                for path in chunk {
+                    statement = statement
+                        .bind(job_id)
+                        .bind(library_root_id)
+                        .bind(path)
+                        .bind(entry_type);
+                }
+                statement
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
             }
         }
         self.query(
@@ -6439,21 +6450,39 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let mut entries_by_root = HashMap::<&str, Vec<&str>>::new();
         for entry in entries {
-            self.query(
-                "DELETE FROM reconciliation_scan_entries
-                 WHERE job_id = ? AND library_root_id = ?
-                   AND relative_path = ? AND entry_type = 'FILE'",
-            )
-            .bind(job_id)
-            .bind(&entry.library_root_id)
-            .bind(&entry.relative_path)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            entries_by_root
+                .entry(entry.library_root_id.as_str())
+                .or_default()
+                .push(entry.relative_path.as_str());
+        }
+        for (library_root_id, paths) in entries_by_root {
+            for chunk in paths.chunks(BATCH_INSERT_CHUNK_SIZE) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
+                    "DELETE FROM reconciliation_scan_entries
+                     WHERE job_id = ? AND library_root_id = ?
+                       AND entry_type = 'FILE'
+                       AND relative_path IN ({placeholders})"
+                );
+                let mut statement = self
+                    .query(sqlx::AssertSqlSafe(query))
+                    .bind(job_id)
+                    .bind(library_root_id);
+                for path in chunk {
+                    statement = statement.bind(path);
+                }
+                statement
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            }
         }
         self.query(
             "UPDATE scan_jobs
@@ -6539,6 +6568,379 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn record_scan_job_targets(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        relative_paths: &[String],
+        change_kind: &str,
+    ) -> Result<(), StorageError> {
+        if relative_paths.is_empty() {
+            return Ok(());
+        }
+        for paths in relative_paths.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source_query = format!(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, source_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'SOURCE', ms.id, ms.id, ms.item_id, ?,
+                        'PENDING', 'SKIPPED', 'SKIPPED'
+                 FROM media_sources ms
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 WHERE fe.library_root_id = ? AND fe.is_missing = 0
+                   AND fe.relative_path IN ({placeholders})
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING"
+            );
+            let mut source_statement = self
+                .query(sqlx::AssertSqlSafe(source_query))
+                .bind(job_id)
+                .bind(change_kind)
+                .bind(library_root_id);
+            for path in paths {
+                source_statement = source_statement.bind(path);
+            }
+            source_statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            let item_query = format!(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'ITEM', ms.item_id, ms.item_id, ?,
+                        'SKIPPED', 'PENDING', 'PENDING'
+                 FROM media_sources ms
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 WHERE fe.library_root_id = ? AND fe.is_missing = 0
+                   AND fe.relative_path IN ({placeholders})
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING"
+            );
+            let mut item_statement = self
+                .query(sqlx::AssertSqlSafe(item_query))
+                .bind(job_id)
+                .bind(change_kind)
+                .bind(library_root_id);
+            for path in paths {
+                item_statement = item_statement.bind(path);
+            }
+            item_statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn list_scan_job_target_sources_page(
+        &self,
+        job_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM scan_job_targets t
+             JOIN media_sources ms ON ms.id = t.source_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE t.job_id = ? AND t.target_type = 'SOURCE'
+               AND t.probe_state = 'PENDING'
+               AND ms.probe_status = 'PENDING'
+               AND fe.is_missing = 0
+             ORDER BY t.target_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_job_target_movie_items_page(
+        &self,
+        job_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM scan_job_targets t
+             JOIN media_items mi ON mi.id = t.item_id
+             JOIN media_sources ms ON ms.id = (
+                 SELECT preferred.id FROM media_sources preferred
+                 JOIN filesystem_entries preferred_fe
+                   ON preferred_fe.id = preferred.filesystem_entry_id
+                 WHERE preferred.item_id = t.item_id
+                   AND preferred_fe.is_missing = 0
+                 ORDER BY preferred.is_default DESC, preferred.id
+                 LIMIT 1
+             )
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE t.job_id = ? AND t.target_type = 'ITEM'
+               AND t.metadata_state = 'PENDING'
+               AND mi.item_type = 'MOVIE'
+               AND fe.is_missing = 0
+             ORDER BY t.target_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_job_target_series_items_page(
+        &self,
+        job_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
+        self.query(
+            "SELECT series.id AS series_id, season.id AS season_id,
+                    episode.id AS episode_id, season.season_number,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM scan_job_targets t
+             JOIN media_items episode ON episode.id = t.item_id
+             JOIN media_items season ON season.id = episode.parent_id
+             JOIN media_items series ON series.id = episode.series_id
+             JOIN media_sources ms ON ms.id = (
+                 SELECT preferred.id FROM media_sources preferred
+                 JOIN filesystem_entries preferred_fe
+                   ON preferred_fe.id = preferred.filesystem_entry_id
+                 WHERE preferred.item_id = episode.id
+                   AND preferred_fe.is_missing = 0
+                 ORDER BY preferred.is_default DESC, preferred.id
+                 LIMIT 1
+             )
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE t.job_id = ? AND t.target_type = 'ITEM'
+               AND t.metadata_state = 'PENDING'
+               AND episode.item_type = 'EPISODE'
+               AND season.item_type = 'SEASON'
+               AND series.item_type = 'SERIES'
+               AND fe.is_missing = 0
+             ORDER BY t.target_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredSeriesMetadataSource {
+                    series_id: row.get("series_id"),
+                    season_id: row.get("season_id"),
+                    episode_id: row.get("episode_id"),
+                    season_number: row.get("season_number"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_scan_job_target_stage(
+        &self,
+        job_id: &str,
+        target_type: &str,
+        target_ids: &[String],
+        stage: &str,
+        state: &str,
+    ) -> Result<(), StorageError> {
+        if target_ids.is_empty() {
+            return Ok(());
+        }
+        let column = match stage {
+            "PROBE" => "probe_state",
+            "METADATA" => "metadata_state",
+            "THUMBNAIL" => "thumbnail_state",
+            _ => {
+                return Err(StorageError::Conflict(
+                    "invalid scan target stage".to_owned(),
+                ));
+            }
+        };
+        for chunk in target_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE scan_job_targets
+                 SET {column} = ?, updated_at = unixepoch()
+                 WHERE job_id = ? AND target_type = ? AND target_id IN ({placeholders})"
+            );
+            let mut statement = self
+                .query(sqlx::AssertSqlSafe(query))
+                .bind(state)
+                .bind(job_id)
+                .bind(target_type);
+            for target_id in chunk {
+                statement = statement.bind(target_id);
+            }
+            statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn skip_pending_scan_job_target_stage(
+        &self,
+        job_id: &str,
+        target_type: &str,
+        stage: &str,
+    ) -> Result<(), StorageError> {
+        let column = match stage {
+            "PROBE" => "probe_state",
+            "METADATA" => "metadata_state",
+            "THUMBNAIL" => "thumbnail_state",
+            _ => {
+                return Err(StorageError::Conflict(
+                    "invalid scan target stage".to_owned(),
+                ));
+            }
+        };
+        let query = format!(
+            "UPDATE scan_job_targets
+             SET {column} = 'SKIPPED', updated_at = unixepoch()
+             WHERE job_id = ? AND target_type = ? AND {column} = 'PENDING'"
+        );
+        self.query(sqlx::AssertSqlSafe(query))
+            .bind(job_id)
+            .bind(target_type)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn clear_completed_scan_job_targets(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "DELETE FROM scan_job_targets
+                 WHERE job_id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_job_targets pending
+                       WHERE pending.job_id = scan_job_targets.job_id
+                         AND (
+                             pending.probe_state IN ('PENDING', 'FAILED')
+                             OR pending.metadata_state IN ('PENDING', 'FAILED')
+                             OR pending.thumbnail_state IN ('PENDING', 'FAILED')
+                         )
+                   )",
+            )
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub(crate) async fn retry_failed_scan_job_targets(
+        &self,
+        job_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_sources
+             SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+             WHERE id IN (
+                 SELECT source_id FROM scan_job_targets
+                 WHERE job_id = ? AND target_type = 'SOURCE'
+                   AND probe_state = 'FAILED' AND source_id IS NOT NULL
+             )",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_job_targets
+             SET probe_state = CASE WHEN probe_state = 'FAILED' THEN 'PENDING' ELSE probe_state END,
+                 metadata_state = CASE WHEN metadata_state = 'FAILED' THEN 'PENDING' ELSE metadata_state END,
+                 thumbnail_state = CASE WHEN thumbnail_state = 'FAILED' THEN 'PENDING' ELSE thumbnail_state END,
+                 updated_at = unixepoch()
+             WHERE job_id = ?",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn list_active_strm_probe_job_ids(&self) -> Result<Vec<String>, StorageError> {
@@ -7872,6 +8274,55 @@ impl Database {
         })
     }
 
+    pub(crate) async fn mark_scan_job_postprocessing(&self, id: &str) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scan_jobs
+             SET current_item = NULL, scan_phase = 'POSTPROCESSING',
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn complete_scan_job_postprocessing(
+        &self,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE scan_jobs
+                 SET status = 'COMPLETED', current_item = NULL, scan_phase = 'IDLE',
+                     finished_at = unixepoch(), updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'
+                   AND scan_phase = 'POSTPROCESSING'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_job_targets
+                       WHERE job_id = ?
+                         AND (
+                             probe_state IN ('PENDING', 'FAILED')
+                             OR metadata_state IN ('PENDING', 'FAILED')
+                             OR thumbnail_state IN ('PENDING', 'FAILED')
+                         )
+                   )",
+            )
+            .bind(id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn retry_scan_job(&self, id: &str) -> Result<bool, StorageError> {
         self.query(
             "UPDATE scan_jobs
@@ -8134,40 +8585,6 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
-    }
-
-    pub(crate) async fn list_existing_filesystem_paths(
-        &self,
-        library_root_id: &str,
-        relative_paths: &[String],
-    ) -> Result<Vec<String>, StorageError> {
-        let mut existing_paths = Vec::new();
-        for chunk in relative_paths.chunks(500) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "SELECT relative_path FROM filesystem_entries
-                 WHERE library_root_id = ? AND relative_path IN ({placeholders})"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_root_id);
-            for relative_path in chunk {
-                statement = statement.bind(relative_path);
-            }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-            existing_paths.extend(rows.into_iter().map(|row| row.get("relative_path")));
-        }
-        Ok(existing_paths)
     }
 
     pub(crate) async fn mark_filesystem_entries_seen_batch(
@@ -12645,6 +13062,59 @@ impl Database {
              LIMIT ? OFFSET ?",
         )
         .bind(scan_job_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredThumbnailSource {
+                    item_id: row.get("item_id"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                    thumbnail_path: row.get("thumbnail_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_job_thumbnail_sources_page(
+        &self,
+        job_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
+        self.query(
+            "SELECT t.item_id, lr.canonical_path AS root_path, fe.relative_path,
+                    ii.local_path AS thumbnail_path
+             FROM scan_job_targets t
+             JOIN media_sources ms ON ms.id = (
+                 SELECT preferred.id FROM media_sources preferred
+                 JOIN filesystem_entries preferred_fe
+                   ON preferred_fe.id = preferred.filesystem_entry_id
+                 WHERE preferred.item_id = t.item_id
+                   AND preferred.source_kind = 'LOCAL_FILE'
+                   AND preferred_fe.is_missing = 0
+                 ORDER BY preferred.is_default DESC, preferred.id
+                 LIMIT 1
+             )
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             LEFT JOIN item_images ii
+               ON ii.item_id = t.item_id
+              AND ii.image_type = 'THUMB'
+              AND ii.image_index = 0
+             WHERE t.job_id = ? AND t.target_type = 'ITEM'
+               AND t.thumbnail_state = 'PENDING'
+               AND fe.is_missing = 0
+             ORDER BY t.target_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .bind(offset.max(0))
         .fetch_all(&self.pool)

@@ -127,16 +127,25 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(final_status.0, "COMPLETED");
+    assert_eq!(final_status.0, "RUNNING");
     assert_eq!(final_status.1, 3);
     assert_eq!(final_status.2, None);
-    assert!(final_status.3.is_some());
+    assert_eq!(final_status.3, None);
     let completed_activity: (Option<String>, String) =
         sqlx::query_as("SELECT current_item, scan_phase FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(completed_activity, (None, "IDLE".to_owned()));
+    assert_eq!(completed_activity, (None, "POSTPROCESSING".to_owned()));
+    restarted_jobs.run_to_completion(&job.id, 10, None).await?;
+    let final_status: (String, Option<i64>, String) =
+        sqlx::query_as("SELECT status, finished_at, scan_phase FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(final_status.0, "COMPLETED");
+    assert!(final_status.1.is_some());
+    assert_eq!(final_status.2, "IDLE");
     assert!(
         !restarted_jobs
             .active_job_ids()
@@ -251,6 +260,55 @@ async fn completed_scan_enqueues_new_media_once_for_webhook_destinations()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(media_added_after_rescan, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_reconciliation_skips_index_targets() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Stable.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&first.id, 100).await?.completed {
+            break;
+        }
+    }
+    let first_target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&first.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(first_target_count, 2);
+    jobs.run_to_completion(&first.id, 100, None).await?;
+
+    let second = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&second.id, 100).await?.completed {
+            break;
+        }
+    }
+    let second_target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&second.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(second_target_count, 0);
     Ok(())
 }
 
@@ -1120,6 +1178,12 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
         source,
         ("mp4".to_owned(), 300_000_000, 128_000, "READY".to_owned())
     );
+    let remaining_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_targets, 0);
     let event_codes: Vec<String> = sqlx::query_scalar(
         "SELECT event_code FROM scan_job_events WHERE job_id = ? ORDER BY created_at, id",
     )
@@ -1292,10 +1356,6 @@ async fn finish_scan(
     jobs: &ScanJobService,
     job_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..10 {
-        if jobs.run_batch(job_id, 100).await?.completed {
-            return Ok(());
-        }
-    }
-    Err("scan did not complete within the test batch limit".into())
+    jobs.run_to_completion(job_id, 100, None).await?;
+    Ok(())
 }
