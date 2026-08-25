@@ -33,19 +33,23 @@
 
 ## LUX-197 ffprobe 并发记录
 
-同一条命令同时运行 60,000 文件扫描基准和以下 ffprobe 合成基准；ffprobe 夹具包含 256 个文件，`observed`
-是 fake ffprobe 进程的最大重叠数。资源背压会根据本机 CPU、内存和前台压力把实际值压低，因此
-`requested` 是配置值，不是强制启动数。
+ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的最大重叠数。资源背压会根据本机 CPU、内存
+和前台压力把实际值压低，因此 `requested` 是配置值，不是强制启动数。fake ffprobe 使用单进程 Python helper，
+只用文件锁保护计数，不额外派生 sleep 子进程，避免测试工具自身放大高并发压力。
 
 | 日期 | 提交 | 架构 | 请求并发 | 实测最大并发 | 耗时 | 命令 |
 |---|---|---|---:|---:|---:|---|
+| 2026-08-25 | 345c6d3a | macOS ARM64 (`uname -m=arm64`) | 128 | 62 | 3,191 ms | `cargo test --release --locked --test performance lux_197_ffprobe_concurrency_benchmark -- --ignored --nocapture --test-threads=1` |
+| 2026-08-25 | 345c6d3a | macOS ARM64 (`uname -m=arm64`) | 256 | 68 | 2,898 ms | 同上 |
+| 2026-08-25 | 345c6d3a | macOS ARM64 (`uname -m=arm64`) | 384 | 63 | 2,917 ms | 同上 |
+| 2026-08-25 | 345c6d3a | macOS ARM64 (`uname -m=arm64`) | 512 | 89 | 2,913 ms | 同上 |
 | 2026-08-25 | 4b0561b2 | macOS ARM64 (`uname -m=arm64`) | 64 | 45 | 20,512 ms | `LUX_PERF_FILE_COUNT=60000 ./scripts/run-performance.sh` |
 | 2026-08-25 | 4b0561b2 | macOS ARM64 (`uname -m=arm64`) | 128 | 69 | 35,961 ms | 同上 |
 | 2026-08-25 | 4b0561b2 | macOS ARM64 (`uname -m=arm64`) | 192 | 82 | 41,628 ms | 同上 |
 | 2026-08-25 | 4b0561b2 | macOS ARM64 (`uname -m=arm64`) | 256 | 89 | 41,898 ms | 同上 |
 
-这组结果证明 256 路配置可被接受且全局 semaphore 没有超过硬上限；当前开发机观察值受动态背压和进程启动开销影响，
-不能据此声称目标 NAS 的实际吞吐。ffprobe 默认配置为 128；4/8/16 核环境的正常有效目标分别为 64/128/256，压力升高时会降档。本次 256 个源均成功完成。
+这组结果证明 512 路配置可被接受且全局 semaphore 没有超过硬上限；当前开发机观察值受动态背压和进程启动开销影响，
+不能据此声称目标 NAS 的实际吞吐。ffprobe 默认配置为 256；4/8/16 核环境的正常有效目标分别为 128/256/512，压力升高时会降档。本次 512 个源在四档请求下均成功完成。
 
 ## Web 首屏资源记录
 
