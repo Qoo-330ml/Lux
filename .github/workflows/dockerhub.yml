@@ -13,6 +13,8 @@ env:
   # namespace for metadata while keeping publishing disabled.
   IMAGE_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}
   IMAGE_NAME: lux
+  RUNTIME_IMAGE_NAME: lux-runtime
+  RUNTIME_IMAGE_TAG: trixie-ffmpeg-v2
 
 jobs:
   build:
@@ -58,6 +60,37 @@ jobs:
             type=ref,event=pr
             type=raw,value=test,enable={{is_default_branch}}
 
+      - name: Determine runtime image
+        id: runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          local_tag="${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}-${{ matrix.arch }}"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "image=$local_tag" >> "$GITHUB_OUTPUT"
+            echo "tag=$local_tag" >> "$GITHUB_OUTPUT"
+          else
+            remote_tag="docker.io/${IMAGE_NAMESPACE}/${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}-${{ matrix.arch }}"
+            echo "image=$remote_tag" >> "$GITHUB_OUTPUT"
+            echo "tag=$remote_tag" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and publish runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./runtime/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.runtime.outputs.tag }}
+          build-args: |
+            LUX_RUNTIME_VERSION=${{ env.RUNTIME_IMAGE_TAG }}
+          cache-from: type=gha,scope=lux-runtime-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=lux-runtime-${{ matrix.arch }}
+          provenance: mode=max
+          sbom: true
+
       - name: Build and publish architecture image
         uses: docker/build-push-action@v6
         with:
@@ -70,6 +103,7 @@ jobs:
           build-args: |
             LUX_VERSION=${{ steps.meta.outputs.version }}
             LUX_REVISION=${{ github.sha }}
+            LUX_RUNTIME_IMAGE=${{ steps.runtime.outputs.image }}
           cache-from: type=gha,scope=lux-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=lux-${{ matrix.arch }}
           provenance: mode=max
@@ -114,3 +148,9 @@ jobs:
               "${tag}-amd64" \
               "${tag}-arm64"
           done <<< "${{ steps.meta.outputs.tags }}"
+
+          runtime_image="docker.io/${IMAGE_NAMESPACE}/${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}"
+          docker buildx imagetools create \
+            --tag "$runtime_image" \
+            "${runtime_image}-amd64" \
+            "${runtime_image}-arm64"

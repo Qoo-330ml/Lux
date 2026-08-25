@@ -1,3 +1,5 @@
+ARG LUX_RUNTIME_IMAGE=pdzhou/lux-runtime:trixie-ffmpeg-v2
+
 FROM node:22-bookworm-slim AS web-builder
 
 WORKDIR /src/web
@@ -36,22 +38,15 @@ COPY --from=web-builder /src/web/dist ./web/dist
 
 RUN cargo build --release --locked --bin luxd
 
-# External process plugins are distributed as Linux/glibc binaries. The
-# current official STRM media-info plugin requires GLIBC_2.39, while
-# bookworm ships GLIBC_2.36. Keep the runtime on a newer Debian release so
-# the supported plugin packages can start inside the Lux container.
-FROM debian:trixie-slim
+# Keep the OS and media-tool dependencies in a separately published image so
+# application releases can reuse that large, stable layer.
+FROM ${LUX_RUNTIME_IMAGE}
 
 ARG LUX_VERSION=dev
 ARG LUX_REVISION=unknown
 LABEL org.opencontainers.image.title="Lux" \
       org.opencontainers.image.version="$LUX_VERSION" \
       org.opencontainers.image.revision="$LUX_REVISION"
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg fonts-noto-cjk \
-    && mkdir -p /config /media /usr/share/doc/lux \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
 COPY --from=builder /src/assets/fonts/SmileySans-LICENSE.txt /usr/share/doc/lux/SmileySans-LICENSE.txt
