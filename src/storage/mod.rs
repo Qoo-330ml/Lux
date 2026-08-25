@@ -6645,6 +6645,76 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) async fn record_scan_job_sidecar_targets(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        sidecar_paths: &[String],
+    ) -> Result<(), StorageError> {
+        let mut directories = sidecar_paths
+            .iter()
+            .filter_map(|path| {
+                Path::new(path)
+                    .parent()
+                    .and_then(|parent| parent.to_str())
+                    .map(|parent| {
+                        if parent.is_empty() {
+                            ".".to_owned()
+                        } else {
+                            parent.to_owned()
+                        }
+                    })
+            })
+            .collect::<Vec<_>>();
+        directories.sort();
+        directories.dedup();
+        for chunk in directories.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let predicates = chunk
+                .iter()
+                .map(|_| {
+                    "(? = '.' OR fe.relative_path = ? OR substr(fe.relative_path, 1, length(?) + 1) = ? || '/')"
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let query = format!(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'ITEM', ms.item_id, ms.item_id, 'SIDECAR',
+                        'SKIPPED', 'PENDING', 'PENDING'
+                 FROM media_sources ms
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 WHERE fe.library_root_id = ? AND fe.is_missing = 0
+                   AND ({predicates})
+                 GROUP BY ms.item_id
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING"
+            );
+            let mut statement = self
+                .query(sqlx::AssertSqlSafe(query))
+                .bind(job_id)
+                .bind(library_root_id);
+            for directory in chunk {
+                statement = statement
+                    .bind(directory)
+                    .bind(directory)
+                    .bind(directory)
+                    .bind(directory);
+            }
+            statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn list_scan_job_target_sources_page(
         &self,
         job_id: &str,

@@ -1367,6 +1367,66 @@ impl LibraryScanner {
         )))
     }
 
+    async fn scan_sidecar_file(
+        &self,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+        generation: &str,
+    ) -> Result<(String, bool), ScannerError> {
+        let (relative_path, fingerprint) = current_file_fingerprint(root_path, path).await?;
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let size = i64::try_from(metadata.len())
+            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        let (_, inode) = file_identity(&metadata);
+        let inode = inode.and_then(|value| i64::try_from(value).ok());
+        if let Some(existing_entry) = existing_entries.get(&relative_path) {
+            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+                return Ok((existing_entry.id.clone(), false));
+            }
+            self.database
+                .update_filesystem_entry(
+                    &existing_entry.id,
+                    size,
+                    modified_at,
+                    &fingerprint,
+                    generation,
+                )
+                .await?;
+            self.database
+                .update_filesystem_entry_inode(&existing_entry.id, inode)
+                .await?;
+            return Ok((existing_entry.id.clone(), true));
+        }
+        let entry_id = FilesystemEntryId::new().to_string();
+        self.database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &entry_id,
+                library_root_id: &root.id,
+                relative_path: &relative_path,
+                entry_kind: "FILE",
+                size,
+                modified_at,
+                inode,
+                fingerprint: &fingerprint,
+                last_seen_generation: generation,
+            })
+            .await?;
+        Ok((entry_id, true))
+    }
+
     async fn prepare_new_movie_file(
         &self,
         root_path: &Path,
@@ -2442,6 +2502,7 @@ impl ScanJobService {
         let mut batch_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut changed_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut new_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut changed_sidecar_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut quick_seen_entry_ids = Vec::<String>::new();
         for entry in &batch {
             batch_paths_by_root
@@ -2511,6 +2572,34 @@ impl ScanJobService {
                 self.database
                     .mark_filesystem_entry_missing_by_path(&root.id, &entry.relative_path)
                     .await?;
+                next_count = next_count.saturating_add(1);
+                processed = processed.saturating_add(1);
+                completed_entries.push(entry.clone());
+                continue;
+            }
+
+            if !is_supported_movie_file(&path) {
+                let existing_entries = existing_entries_by_root
+                    .get(&root.id)
+                    .ok_or_else(|| ScannerError::LibraryNotFound)?;
+                let (entry_id, changed) = self
+                    .scanner
+                    .scan_sidecar_file(
+                        root,
+                        Path::new(&root.canonical_path),
+                        &path,
+                        existing_entries,
+                        &job.generation,
+                    )
+                    .await?;
+                if changed {
+                    changed_sidecar_paths_by_root
+                        .entry(root.id.clone())
+                        .or_default()
+                        .push(entry.relative_path.clone());
+                } else {
+                    quick_seen_entry_ids.push(entry_id);
+                }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
                 completed_entries.push(entry.clone());
@@ -2675,6 +2764,11 @@ impl ScanJobService {
                 .record_scan_job_targets(&job.id, &root_id, &paths, "CHANGED")
                 .await?;
         }
+        for (root_id, paths) in changed_sidecar_paths_by_root {
+            self.database
+                .record_scan_job_sidecar_targets(&job.id, &root_id, &paths)
+                .await?;
+        }
         self.finish_reconciliation_file_batch(
             job,
             completed_entries,
@@ -2704,6 +2798,7 @@ impl ScanJobService {
         let mut batch_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut changed_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut new_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut changed_sidecar_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut quick_seen_entry_ids = Vec::<String>::new();
         let mut new_files = Vec::<(
             usize,
@@ -2791,6 +2886,34 @@ impl ScanJobService {
                 self.database
                     .mark_filesystem_entry_missing_by_path(&root.id, &entry.relative_path)
                     .await?;
+                next_count = next_count.saturating_add(1);
+                processed = processed.saturating_add(1);
+                completed_entries.push((index, entry.clone()));
+                continue;
+            }
+
+            if !is_supported_movie_file(&path) {
+                let existing_entries = existing_entries_by_root
+                    .get(&root.id)
+                    .ok_or_else(|| ScannerError::LibraryNotFound)?;
+                let (entry_id, changed) = self
+                    .scanner
+                    .scan_sidecar_file(
+                        root,
+                        Path::new(&root.canonical_path),
+                        &path,
+                        existing_entries,
+                        &job.generation,
+                    )
+                    .await?;
+                if changed {
+                    changed_sidecar_paths_by_root
+                        .entry(root.id.clone())
+                        .or_default()
+                        .push(entry.relative_path.clone());
+                } else {
+                    quick_seen_entry_ids.push(entry_id);
+                }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
                 completed_entries.push((index, entry.clone()));
@@ -2970,6 +3093,11 @@ impl ScanJobService {
         for (root_id, paths) in changed_paths_by_root {
             self.database
                 .record_scan_job_targets(&job.id, &root_id, &paths, "CHANGED")
+                .await?;
+        }
+        for (root_id, paths) in changed_sidecar_paths_by_root {
+            self.database
+                .record_scan_job_sidecar_targets(&job.id, &root_id, &paths)
                 .await?;
         }
 
@@ -4714,7 +4842,10 @@ async fn discover_reconciliation_directory(
             path: path.clone(),
             source,
         })?;
-        if !(file_type.is_dir() || file_type.is_file() && is_supported_movie_file(&path)) {
+        if !(file_type.is_dir()
+            || file_type.is_file()
+                && (is_supported_movie_file(&path) || is_supported_sidecar_file(&path)))
+        {
             continue;
         }
         let relative_path = path
@@ -4741,6 +4872,17 @@ fn is_supported_movie_file(path: &Path) -> bool {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
                 "mkv" | "mp4" | "strm"
+            )
+        })
+}
+
+fn is_supported_sidecar_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "nfo" | "jpg" | "jpeg" | "png" | "webp" | "edl" | "xml"
             )
         })
 }
