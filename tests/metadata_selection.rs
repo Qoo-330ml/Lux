@@ -1019,13 +1019,14 @@ async fn automatic_candidate_search_expands_only_the_best_result()
         requests_per_second: 0,
     })?;
     let candidates = MetadataCandidateService::new(fixture.database.clone());
+    let scraper = ScraperProvider::from(tmdb);
 
     let page = candidates
         .search_and_store_for_automatic_match(
             &fixture.item_id,
             "Example Movie",
             Some(2020),
-            &ScraperProvider::from(tmdb),
+            &scraper,
         )
         .await?;
 
@@ -1033,6 +1034,23 @@ async fn automatic_candidate_search_expands_only_the_best_result()
     assert_eq!(page.items[0].provider_id, "1");
     assert_eq!(page.items[1].provider_id, "2");
     assert_eq!(non_best_details_requests.load(Ordering::SeqCst), 0);
+
+    let repeated_page = candidates
+        .search_and_store_for_automatic_match(
+            &fixture.item_id,
+            "Example Movie",
+            Some(2020),
+            &scraper,
+        )
+        .await?;
+    assert_eq!(repeated_page.items.len(), 2);
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ? AND status = 'PENDING'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(stored_count, 2);
 
     tmdb_server.abort();
     Ok(())

@@ -148,6 +148,7 @@ export function AdminOperationsPage() {
   const jobs = useQuery({
     queryKey: queryKeys.adminJobs(status),
     queryFn: () => api.adminJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
   });
   const metadataJobs = useQuery({
     queryKey: queryKeys.adminMetadataJobs(status),
@@ -156,21 +157,25 @@ export function AdminOperationsPage() {
   const strmJobs = useQuery({
     queryKey: queryKeys.adminStrmProbeJobs(status),
     queryFn: () => api.adminStrmProbeJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
   const chapterJobs = useQuery({
     queryKey: queryKeys.adminChapterDetectionJobs(status),
     queryFn: () => api.adminChapterDetectionJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
   const danmakuJobs = useQuery({
     queryKey: queryKeys.adminDanmakuMatchJobs(status),
     queryFn: () => api.adminDanmakuMatchJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
   const libraryCoverJobs = useQuery({
     queryKey: queryKeys.adminLibraryCoverJobs(status),
     queryFn: () => api.adminLibraryCoverJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
@@ -253,7 +258,7 @@ export function AdminOperationsPage() {
     });
   }, [logLevel, logSearch, logs.data?.events]);
 
-  if (tasks.isPending || libraries.isPending || jobs.isPending || metadataJobs.isPending || strmJobs.isPending || chapterJobs.isPending || danmakuJobs.isPending || libraryCoverJobs.isPending || logs.isPending) {
+  if (tasks.isLoading || libraries.isLoading || jobs.isLoading || metadataJobs.isLoading || strmJobs.isLoading || chapterJobs.isLoading || danmakuJobs.isLoading || libraryCoverJobs.isLoading || logs.isLoading) {
     return <AdminOperationsState label="正在读取注册任务、运行记录与日志…" />;
   }
   if (tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error || logs.error) {
@@ -437,7 +442,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
         <div className="lux-registered-task-heading"><strong>{name}</strong><span className={`lux-registered-task-status ${task.isEnabled && configured ? "is-enabled" : configured ? "is-disabled" : "is-unconfigured"}`}>{stateLabel}</span></div>
         <p>{task.description || "由后台注册的任务。"}</p>
         <div className="lux-registered-task-meta"><span>{task.ownerName || (task.ownerType === "GLOBAL" ? "全局" : "指定媒体库")}</span><span>{task.sourceType === "PLUGIN" ? `插件注册${task.pluginId ? ` · ${task.pluginId}` : ""}` : "系统注册"}</span><code>{task.taskType}</code></div>
-        {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><label htmlFor={`schedule-${task.id ?? task.taskType}`}>Cron 执行计划<input id={`schedule-${task.id ?? task.taskType}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} required={pluginSchedule} /><small>标准五段式：分 时 日 月 周，按 UTC 执行</small></label>{pluginSchedule ? null : <label className="lux-admin-toggle" htmlFor={`enabled-${task.id ?? task.taskType}`}><input id={`enabled-${task.id ?? task.taskType}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此任务</span></label>}<div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></button></div>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.schedule || "尚未配置执行计划"}</span>}
+        {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><label htmlFor={`schedule-${task.id ?? task.taskType}`}>Cron 执行计划<input id={`schedule-${task.id ?? task.taskType}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} required={pluginSchedule} /></label>{pluginSchedule ? null : <label className="lux-admin-toggle" htmlFor={`enabled-${task.id ?? task.taskType}`}><input id={`enabled-${task.id ?? task.taskType}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此任务</span></label>}<div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></button></div><small className="lux-registered-task-editor-help">标准五段式：分 时 日 月 周，按 UTC 执行</small>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.schedule || "尚未配置执行计划"}</span>}
       </div>
       {!editing ? <div className="lux-registered-task-actions">
         {canRunNow ? <button className="lux-button lux-button-compact lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button> : null}
@@ -597,6 +602,10 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
 
 function metadataStatusFilter(status: string) {
   return status === "PENDING" ? "QUEUED" : status || undefined;
+}
+
+function isMetadataOnlyJobStatus(status: string) {
+  return status === "COMPLETED_WITH_ISSUES" || status === "DEFERRED";
 }
 
 function jobTypeForMetadataJob(job: AdminMetadataReidentifyJob) {

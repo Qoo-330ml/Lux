@@ -2853,6 +2853,48 @@ impl Database {
         Ok(status.as_deref() != Some("COMPLETED"))
     }
 
+    pub(crate) async fn legacy_person_migration_needed(
+        &self,
+        schema_version: i64,
+    ) -> Result<bool, StorageError> {
+        let status = self
+            .query_scalar::<String>(
+                "SELECT status FROM legacy_person_migration_state
+                 WHERE id = 1 AND schema_version = ?",
+            )
+            .bind(schema_version)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(status.as_deref() != Some("COMPLETED"))
+    }
+
+    pub(crate) async fn mark_legacy_person_migration_completed(
+        &self,
+        schema_version: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO legacy_person_migration_state (id, status, schema_version, updated_at)
+             VALUES (1, 'COMPLETED', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                schema_version = excluded.schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(schema_version)
+        .bind(current_unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
     pub(crate) async fn mark_person_manifest_restore_pending(
         &self,
         schema_version: i64,
@@ -10651,7 +10693,25 @@ impl Database {
         self.query(
             "INSERT INTO metadata_candidates (
                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
+            ON CONFLICT (item_id, provider, provider_id) WHERE status = 'PENDING'
+            DO UPDATE SET
+                candidate_json = CASE
+                    WHEN excluded.score >= metadata_candidates.score
+                    THEN excluded.candidate_json
+                    ELSE metadata_candidates.candidate_json
+                END,
+                score = CASE
+                    WHEN excluded.score >= metadata_candidates.score
+                    THEN excluded.score
+                    ELSE metadata_candidates.score
+                END,
+                expires_at = CASE
+                    WHEN excluded.score >= metadata_candidates.score
+                    THEN excluded.expires_at
+                    ELSE metadata_candidates.expires_at
+                END,
+                updated_at = unixepoch()",
         )
         .bind(candidate.id)
         .bind(candidate.item_id)
