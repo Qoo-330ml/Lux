@@ -1136,6 +1136,9 @@ fn best_automatic_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCan
         .items
         .iter()
         .filter(|item| item.status == "PENDING" && item.id != candidate.id)
+        .filter(|item| {
+            item.provider != candidate.provider || item.provider_id != candidate.provider_id
+        })
         .map(|item| item.score)
         .max_by(f64::total_cmp);
     if second_score.is_some_and(|score| candidate.score - score < AUTO_MATCH_MIN_MARGIN) {
@@ -1235,6 +1238,22 @@ mod tests {
         };
 
         assert!(best_automatic_candidate(&page).is_none());
+    }
+
+    #[test]
+    fn automatic_matching_ignores_duplicate_candidates_for_margin() {
+        let mut duplicate = candidate("duplicate-1", 95.0);
+        duplicate.provider_id = "same-provider-id".to_owned();
+        let mut repeated = candidate("duplicate-2", 95.0);
+        repeated.provider_id = "same-provider-id".to_owned();
+        let page = MetadataCandidatePage {
+            items: vec![duplicate, repeated],
+            total: 2,
+            offset: 0,
+            limit: 50,
+        };
+
+        assert!(best_automatic_candidate(&page).is_some());
     }
 
     #[test]
