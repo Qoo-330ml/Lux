@@ -10651,7 +10651,25 @@ impl Database {
         self.query(
             "INSERT INTO metadata_candidates (
                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
+            ON CONFLICT (item_id, provider, provider_id) WHERE status = 'PENDING'
+            DO UPDATE SET
+                candidate_json = CASE
+                    WHEN excluded.score >= metadata_candidates.score
+                    THEN excluded.candidate_json
+                    ELSE metadata_candidates.candidate_json
+                END,
+                score = CASE
+                    WHEN excluded.score >= metadata_candidates.score
+                    THEN excluded.score
+                    ELSE metadata_candidates.score
+                END,
+                expires_at = CASE
+                    WHEN excluded.score >= metadata_candidates.score
+                    THEN excluded.expires_at
+                    ELSE metadata_candidates.expires_at
+                END,
+                updated_at = unixepoch()",
         )
         .bind(candidate.id)
         .bind(candidate.item_id)

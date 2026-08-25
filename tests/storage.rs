@@ -30,6 +30,73 @@ fn postgres_bootstrap_migration_keeps_its_original_checksum() {
 }
 
 #[tokio::test]
+async fn metadata_candidate_identity_migration_collapses_pending_duplicates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+    sqlx::query(
+        "CREATE TABLE metadata_candidates (
+            id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            candidate_json TEXT NOT NULL,
+            score REAL NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    for (id, score, created_at) in [
+        ("older", 90.0, 10_i64),
+        ("best", 95.0, 11),
+        ("newest", 95.0, 12),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                id, item_id, provider, provider_id, candidate_json,
+                score, status, created_at, updated_at
+             ) VALUES (?, 'item', 'TMDB', '603', '{}', ?, 'PENDING', ?, ?)",
+        )
+        .bind(id)
+        .bind(score)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&pool)
+        .await?;
+    }
+
+    for statement in include_str!("../migrations/0095_metadata_candidate_identity.sql")
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        sqlx::query(statement).execute(&pool).await?;
+    }
+
+    let pending: (String, f64) =
+        sqlx::query_as("SELECT id, score FROM metadata_candidates WHERE status = 'PENDING'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(pending.0, "newest");
+    assert_eq!(pending.1, 95.0);
+    let rejected: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE status = 'REJECTED'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(rejected, 2);
+    let index_name: String = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_metadata_candidates_pending_identity'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(index_name, "idx_metadata_candidates_pending_identity");
+    Ok(())
+}
+
+#[tokio::test]
 async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -41,7 +108,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 94);
+    assert_eq!(database.schema_version().await?, 95);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -61,7 +128,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 94);
+    assert_eq!(second_database.schema_version().await?, 95);
     second_database.close().await;
     Ok(())
 }
@@ -81,7 +148,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 94);
+    assert_eq!(database.schema_version().await?, 95);
     Ok(())
 }
 
@@ -116,7 +183,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 94);
+    assert_eq!(database.schema_version().await?, 95);
     database.close().await;
     Ok(())
 }
@@ -243,7 +310,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 94);
+    assert_eq!(database.schema_version().await?, 95);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -425,7 +492,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 94);
+    assert_eq!(database.schema_version().await?, 95);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
