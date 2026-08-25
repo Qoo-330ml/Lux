@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.2.9",
+    date: "2026-08-25",
+    sections: [
+      { kind: "added", items: [
+        "增加 Emby 迁移对无效媒体记录的可追踪跳过报告，保留来源用户、分页位置和条目类型等诊断信息。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 Emby 迁移插件返回单条无效媒体记录导致整页无法解析、迁移提前中断的问题；现在会定位并跳过该条记录，继续处理后续页面。",
+        "修复迁移返回的用户和媒体名称包含控制字符时污染报告或界面显示的问题，名称会在不修改 Emby 源数据的前提下规范化。",
+      ] },
+      { kind: "changed", items: [
+        "Emby 迁移仅对可恢复的无效响应执行分页二分恢复；网络、认证、插件进程和数据库错误仍会暂停任务并保留失败阶段。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.8",
     date: "2026-08-25",
     sections: [
