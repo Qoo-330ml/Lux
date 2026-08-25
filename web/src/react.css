@@ -1288,8 +1288,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-mobile-nav .lux-mobile-nav-link:hover .lux-mobile-nav-icon { color: currentColor; }
   .lux-mobile-nav .lux-mobile-nav-link.is-active { border-color: rgba(255,255,255,.12); color: #fff; background: rgba(255,255,255,.1); }
   .lux-mobile-nav .lux-mobile-nav-link.is-active::after { content: none; }
-  .lux-mobile-nav .lux-mobile-nav-link.is-active .lux-mobile-nav-icon { color: #fff; }
-  .lux-mobile-admin { display: flex; align-items: center; gap: 7px; padding: 10px 12px; border-top: 1px solid var(--lux-line-soft); color: var(--lux-subtle); font-size: .72rem; }
+.lux-mobile-nav .lux-mobile-nav-link.is-active .lux-mobile-nav-icon { color: #fff; }
+.lux-mobile-admin { display: flex; align-items: center; gap: 7px; padding: 10px 12px; border-top: 1px solid var(--lux-line-soft); color: var(--lux-subtle); font-size: .72rem; }
   .lux-hero { min-height: 680px; }
   .lux-hero-copy { margin-bottom: 74px; }
   .lux-home-content, .lux-page, .lux-page-narrow { width: 92%; }
@@ -1304,7 +1304,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-admin-sidebar-heading { padding: 5px 5px 16px; }
   .lux-admin-nav { display: flex; overflow-x: auto; padding-bottom: 3px; scrollbar-width: none; }
   .lux-admin-nav::-webkit-scrollbar { display: none; }
-  .lux-admin-nav-link { flex: 0 0 auto; }
+.lux-admin-nav-link { flex: 0 0 auto; }
 .lux-admin-back { display: none; }
   .lux-admin-content { padding: 24px 20px 64px; }
   .lux-registered-task-row { position: relative; grid-template-columns: 38px minmax(0, 1fr); }
