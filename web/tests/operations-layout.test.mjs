@@ -19,3 +19,13 @@ test("operations page fills the available admin content width", () => {
   assert.match(changelogRule, /max-width:\s*none/);
   assert.doesNotMatch(changelogRule, /max-width:\s*940px/);
 });
+
+test("registered task actions share the compact button height", () => {
+  const editRule = rule(".lux-registered-task-edit");
+
+  assert.match(editRule, /min-width:\s*var\(--lux-button-height-compact\)/);
+  assert.match(editRule, /width:\s*var\(--lux-button-height-compact\)/);
+  assert.match(editRule, /min-height:\s*var\(--lux-button-height-compact\)/);
+  assert.match(editRule, /height:\s*var\(--lux-button-height-compact\)/);
+  assert.match(editRule, /margin-top:\s*0/);
+});

@@ -1181,7 +1181,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-registered-task-schedule { display: block; margin-top: 10px; color: var(--lux-subtle); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .66rem; }
 .lux-registered-task-actions { display: flex; align-items: flex-start; gap: 7px; }
 .lux-registered-task-run { padding: 0 11px; white-space: nowrap; }
-.lux-registered-task-edit { margin-top: 3px; }
+.lux-registered-task-edit { min-width: var(--lux-button-height-compact); width: var(--lux-button-height-compact); min-height: var(--lux-button-height-compact); height: var(--lux-button-height-compact); margin-top: 0; }
 .lux-registered-task-error { grid-column: 2 / -1; margin: 0; }
 .lux-registered-task-editor { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; align-items: end; gap: 10px 13px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--lux-line-soft); }
 .lux-registered-task-editor label:not(.lux-admin-toggle) { display: grid; gap: 7px; color: var(--lux-muted); font-size: .7rem; }
@@ -1328,6 +1328,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-back-button { display: none; }
   .lux-grid-button { display: none; }
   .lux-icon-button, .lux-user-button { min-width: 46px; height: 46px; }
+  .lux-registered-task-edit { min-width: var(--lux-button-height-compact); width: var(--lux-button-height-compact); min-height: var(--lux-button-height-compact); height: var(--lux-button-height-compact); }
   .lux-scan-activity-trigger { width: 46px; height: 46px; }
   .lux-scan-activity-popover { right: -61px; }
   .lux-avatar { width: 36px; height: 36px; }
