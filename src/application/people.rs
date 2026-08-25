@@ -1287,13 +1287,14 @@ impl PeopleService {
                 })
                 .transpose()?
                 .unwrap_or_default();
+            let existing_checksum =
+                (!manifest.checksum.is_empty()).then(|| manifest.checksum.clone());
             if !manifest.lux_person_id.is_empty() && manifest.lux_person_id != lux_person_id {
                 return Err(PeopleError::Serialization(
                     "person manifest identity does not match directory".to_owned(),
                 ));
             }
             manifest.schema_version = PERSON_MANIFEST_SCHEMA_VERSION;
-            manifest.generation = manifest.generation.saturating_add(1).max(1);
             manifest.lux_person_id = lux_person_id.to_owned();
             if !display_name.trim().is_empty() {
                 if !manifest.display_name.trim().is_empty()
@@ -1352,6 +1353,18 @@ impl PeopleService {
                         .unwrap_or_else(|| metadata.clone()),
                 );
             }
+            manifest.checksum.clear();
+            let checksum_source = serde_json::to_vec(&manifest)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            let digest = Sha256::digest(checksum_source);
+            let candidate_checksum = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if existing_checksum.as_deref() == Some(candidate_checksum.as_str()) {
+                return Ok(());
+            }
+            manifest.generation = manifest.generation.saturating_add(1).max(1);
             manifest.checksum.clear();
             let checksum_source = serde_json::to_vec(&manifest)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
@@ -5762,6 +5775,20 @@ mod tests {
             .fetch_one(database.pool())
             .await?;
         assert_eq!(updated_at, 1);
+
+        assert!(
+            !database
+                .person_manifest_restore_needed(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+                .await?
+        );
+        service
+            .persist_person_assets(&actor, "tmdb", "57975", Some(&person_id), &identities)
+            .await;
+        assert!(
+            !database
+                .person_manifest_restore_needed(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+                .await?
+        );
 
         service
             .set_person_field_locks(&person_id, &["name".to_owned()], "{}")
