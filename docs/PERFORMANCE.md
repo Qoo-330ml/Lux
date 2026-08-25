@@ -33,6 +33,7 @@
 
 | 2026-08-25 | 2f4bf2cf | macOS ARM64 (`aarch64-apple-darwin`, `uname -m=arm64`) | 确定性 60,000 MKV / 600 目录 | `cargo test --release --locked --test performance lux_045_catalog_scan_benchmark -- --ignored --nocapture --test-threads=1`（fixture 由 `tools/catalog-fixture/generate.py` 生成） | 首次扫描 / 无变化重扫 / 单目录增量；目录列表 / 搜索 | 4,489 / 1,301 / 1,444 ms；40 / 217 ms | 4,489 / 1,301 / 1,444 ms；50 / 322 ms | 0% | - | release；同一用户、权限范围、查询和分页的在途搜索请求使用 singleflight；ffprobe 配额为默认 256、硬上限 512；扫描期间前台 p95 183 ms，`foregroundErrors=0`、`metadataFingerprintCount=0`、`nonPendingProbeCount=0`；搜索 p95 已低于 500 ms；仅代表本机 ARM64，不外推 NAS/x86_64 性能 |
 | 2026-08-25 | 80aacea3 | macOS ARM64 (`aarch64-apple-darwin`, `uname -m=arm64`) | 同上 | 同上 | 首次扫描 / 无变化重扫 / 单目录增量；目录列表 / 搜索 | 4,730 / 1,420 / 1,537 ms；46 / 284 ms | 4,730 / 1,420 / 1,537 ms；53 / 394 ms | 0% | - | release；补充失败 search flight 唤醒修复；singleflight、ffprobe 256 默认/512 硬上限保持；扫描期间前台 p95 193 ms，`foregroundErrors=0`、`metadataFingerprintCount=0`、`nonPendingProbeCount=0`；搜索 p95 仍低于 500 ms；仅代表本机 ARM64，不外推 NAS/x86_64 性能 |
+| 2026-08-25 | cf8a567a | macOS ARM64 (`aarch64-apple-darwin`, `uname -m=arm64`) | 确定性 60,000 MKV / 600 目录 | `LUX_PERF_FILE_COUNT=60000 ./scripts/run-performance.sh` | 首次扫描 / 无变化重扫 / 单目录增量；目录列表 / 搜索 | 4,651 / 1,368 / 1,519 ms；46 / 302 ms | 4,651 / 1,368 / 1,519 ms；54 / 412 ms | 0% | - | release；完整 LUX-045/LUX-197 脚本；singleflight 失败唤醒修复、ffprobe 256 默认/512 硬上限；扫描期间前台 p95 196 ms，`foregroundErrors=0`、`metadataFingerprintCount=0`、`nonPendingProbeCount=0`；搜索 p95 低于 500 ms；仅代表本机 ARM64，不外推 NAS/x86_64 性能 |
 
 ## LUX-197 ffprobe 并发记录
 
@@ -42,6 +43,10 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 
 | 日期 | 提交 | 架构 | 请求并发 | 实测最大并发 | 耗时 | 命令 |
 |---|---|---|---:|---:|---:|---|
+| 2026-08-25 | cf8a567a | macOS ARM64 (`uname -m=arm64`) | 128 | 49 | 3,506 ms | `LUX_PERF_FILE_COUNT=60000 ./scripts/run-performance.sh` |
+| 2026-08-25 | cf8a567a | macOS ARM64 (`uname -m=arm64`) | 256 | 91 | 3,192 ms | 同上 |
+| 2026-08-25 | cf8a567a | macOS ARM64 (`uname -m=arm64`) | 384 | 72 | 3,115 ms | 同上 |
+| 2026-08-25 | cf8a567a | macOS ARM64 (`uname -m=arm64`) | 512 | 75 | 3,120 ms | 同上 |
 | 2026-08-25 | 345c6d3a | macOS ARM64 (`uname -m=arm64`) | 128 | 62 | 3,191 ms | `cargo test --release --locked --test performance lux_197_ffprobe_concurrency_benchmark -- --ignored --nocapture --test-threads=1` |
 | 2026-08-25 | 345c6d3a | macOS ARM64 (`uname -m=arm64`) | 256 | 68 | 2,898 ms | 同上 |
 | 2026-08-25 | 345c6d3a | macOS ARM64 (`uname -m=arm64`) | 384 | 63 | 2,917 ms | 同上 |
