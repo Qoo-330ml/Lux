@@ -3,7 +3,7 @@ use std::{
     fmt,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -71,6 +71,7 @@ struct SearchFlightKey {
 
 struct SearchFlight {
     result: Mutex<Option<Arc<CatalogPage>>>,
+    completed: AtomicBool,
     notify: Notify,
 }
 
@@ -101,6 +102,7 @@ impl SearchFlightRegistry {
         }
         let flight = Arc::new(SearchFlight {
             result: Mutex::new(None),
+            completed: AtomicBool::new(false),
             notify: Notify::new(),
         });
         flights.insert(key.clone(), flight.clone());
@@ -114,6 +116,7 @@ impl SearchFlightRegistry {
         page: Option<Arc<CatalogPage>>,
     ) {
         *flight.result.lock().await = page;
+        flight.completed.store(true, Ordering::Release);
         flight.notify.notify_waiters();
         let mut flights = self.flights.lock().await;
         if flights
@@ -127,16 +130,19 @@ impl SearchFlightRegistry {
 
 impl SearchFlight {
     async fn wait(&self) -> Option<Arc<CatalogPage>> {
+        if self.completed.load(Ordering::Acquire) {
+            return self.result.lock().await.clone();
+        }
         {
             let result = self.result.lock().await;
-            if result.is_some() {
+            if self.completed.load(Ordering::Acquire) {
                 return result.clone();
             }
         }
         let notified = self.notify.notified();
         {
             let result = self.result.lock().await;
-            if result.is_some() {
+            if self.completed.load(Ordering::Acquire) {
                 return result.clone();
             }
         }
@@ -1448,7 +1454,10 @@ mod tests {
 
     use crate::application::recommendations::daily_recommendation_items;
 
-    use super::{CatalogItem, reorder_catalog_items};
+    use super::{
+        CatalogItem, SearchFlightHandle, SearchFlightKey, SearchFlightRegistry,
+        reorder_catalog_items,
+    };
 
     fn catalog_item(id: &str) -> CatalogItem {
         CatalogItem {
@@ -1518,5 +1527,30 @@ mod tests {
 
         assert_eq!(day_one, same_day);
         assert_ne!(day_one, next_day);
+    }
+
+    #[tokio::test]
+    async fn failed_search_flight_does_not_leave_waiters_blocked() {
+        let registry = SearchFlightRegistry::new();
+        let key = SearchFlightKey {
+            user_id: "user-1".to_owned(),
+            is_admin: false,
+            library_ids: Some(vec!["library-1".to_owned()]),
+            query: "query".to_owned(),
+            like_query: "%query%".to_owned(),
+            offset: 0,
+            limit: 50,
+        };
+        let (key, handle) = registry.begin(key).await;
+        let SearchFlightHandle::Leader(flight) = handle else {
+            panic!("first request must become the search flight leader");
+        };
+
+        registry.finish(&key, &flight, None).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), flight.wait())
+            .await
+            .expect("a failed search flight must wake waiters");
+        assert!(result.is_none());
     }
 }
